@@ -33,25 +33,45 @@ func startS3Server(
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
 ) (*adapter.S3Server, error) {
+	s3Server, _, err := prepareS3Server(ctx, lc, s3Addr, shardStore, coordinate, leaderS3, region, credentialsFile, pathStyleOnly, readTracker)
+	if err != nil {
+		return nil, err
+	}
+	runS3Server(ctx, eg, s3Server)
+	return s3Server, nil
+}
+
+func prepareS3Server(
+	ctx context.Context,
+	lc *net.ListenConfig,
+	s3Addr string,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	leaderS3 map[string]string,
+	region string,
+	credentialsFile string,
+	pathStyleOnly bool,
+	readTracker *kv.ActiveTimestampTracker,
+) (*adapter.S3Server, net.Listener, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
 	if s3Addr == "" {
 		// (nil, nil) is the explicit "S3 disabled" signal — the empty
 		// flag value is a valid configuration, not an error. The
 		// nilnil linter is not enabled in .golangci.yaml so no
 		// suppression directive is needed.
-		return nil, nil
+		return nil, nil, nil
 	}
 	if !pathStyleOnly {
-		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
+		return nil, nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
 	s3L, err := lc.Listen(ctx, "tcp", s3Addr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen on %s", s3Addr)
+		return nil, nil, errors.Wrapf(err, "failed to listen on %s", s3Addr)
 	}
 	staticCreds, err := loadS3StaticCredentials(credentialsFile)
 	if err != nil {
 		_ = s3L.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	s3Server := adapter.NewS3Server(
 		s3L,
@@ -63,6 +83,13 @@ func startS3Server(
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
 	)
+	return s3Server, s3L, nil
+}
+
+func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Server) {
+	if s3Server == nil {
+		return
+	}
 	runDoneCtx, runDoneCancel := context.WithCancel(context.Background())
 	eg.Go(func() error {
 		select {
@@ -80,7 +107,6 @@ func startS3Server(
 		}
 		return errors.WithStack(err)
 	})
-	return s3Server, nil
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,6 +113,22 @@ func (b *blockingDoneRotateStartupRunner) Done() bool {
 	return false
 }
 
+type blockingRunRotateStartupRunner struct {
+	started chan struct{}
+	release chan struct{}
+	done    atomic.Bool
+	once    sync.Once
+}
+
+func (b *blockingRunRotateStartupRunner) Run(context.Context) error {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	b.done.Store(true)
+	return nil
+}
+
+func (b *blockingRunRotateStartupRunner) Done() bool { return b.done.Load() }
+
 func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderBlocks(t *testing.T) {
 	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
@@ -180,6 +197,60 @@ func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *t
 	case <-runner.doneEntered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("async rotation did not reach Done")
+	}
+}
+
+func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testing.T) {
+	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
+	runner := &blockingRunRotateStartupRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
+	defer deregister()
+
+	controller.becomeLeader()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async rotation did not start")
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitStartup(context.Background())
+	}()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("startup wait returned before async rotation finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(runner.release)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("startup wait returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup wait did not finish after rotation completed")
+	}
+}
+
+func TestInstallEncryptionRotateOnStartupRequest_WaitReturnsPermanentError(t *testing.T) {
+	t.Parallel()
+	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
+	runner := &fakeRotateStartupRunner{err: errors.New("bad sidecar")}
+	_, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := waitStartup(waitCtx)
+	if err == nil || !strings.Contains(err.Error(), "bad sidecar") {
+		t.Fatalf("startup wait err=%v, want bad sidecar", err)
+	}
+	if got := runner.runs.Load(); got != 1 {
+		t.Fatalf("permanent error must not be retried; runs=%d", got)
 	}
 }
 
@@ -346,6 +417,36 @@ func TestEncryptionRotateOnStartupTask_RetryRereadsSidecarKeyID(t *testing.T) {
 		t.Fatalf("successful proposals=%d, want 1", got)
 	}
 	assertRotateProposal(t, rec.proposals[0], pb.RotateDEKRequest_PURPOSE_STORAGE, 9, 0)
+}
+
+func TestEncryptionRotateOnStartupTask_KeyIDExhaustionDoesNotMarkDone(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 1,
+		Active:           encryption.ActiveKeys{Storage: 7},
+		Keys: map[string]encryption.SidecarKey{
+			"7":          {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage")},
+			"4294967295": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft")},
+		},
+	}
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	task := &encryptionRotateOnStartupTask{
+		server:      adapterServerForRotateStartup(t, sidecarPath, &recordingRotateProposer{}),
+		sidecarPath: sidecarPath,
+		kekWrapper:  fakeStartupKEK{},
+		fullNodeID:  0xCAFE,
+	}
+	if err := task.Run(context.Background()); err == nil {
+		t.Fatal("Run returned nil, want key-id exhaustion error")
+	}
+	if task.Done() {
+		t.Fatal("key-id exhaustion must not mark rotation done")
+	}
 }
 
 func TestRetryableEncryptionRotateOnStartupError_UnwrapsStatus(t *testing.T) {

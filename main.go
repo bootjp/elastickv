@@ -1223,20 +1223,10 @@ type serversInput struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
-// startServers wires up the AdminServer, builds the runtime runner, and
-// kicks off both the per-group raft listeners and the admin HTTP listener.
-// Extracted from run() to keep cyclomatic complexity within budget.
+// startServersAfterStartupRotation wires up the AdminServer, starts the
+// per-group Raft listeners needed for quorum traffic, waits for any requested
+// startup rotation, then opens the public service listeners.
 func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) error, in serversInput) error {
-	if waitRotateOnStartup != nil {
-		if err := waitRotateOnStartup(in.ctx); err != nil {
-			in.cancel()
-			return errors.Wrap(err, "encryption rotate-on-startup: wait before serving")
-		}
-	}
-	return startServers(in)
-}
-
-func startServers(in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
 		return err
@@ -1324,10 +1314,20 @@ func startServers(in serversInput) error {
 		roleStore:                       roleStore,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 	}
-	if err := runner.start(); err != nil {
+	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	// runner.start() populates runner.dynamoServer for the admin
+	if waitRotateOnStartup != nil {
+		if err := waitRotateOnStartup(in.ctx); err != nil {
+			runner.closePreparedExternalListeners()
+			in.cancel()
+			return errors.Wrap(err, "encryption rotate-on-startup: wait before serving")
+		}
+	}
+	if err := runner.startPublicServices(); err != nil {
+		return err
+	}
+	// runner.startPublicServices() populates runner.dynamoServer for the admin
 	// listener's SigV4-bypass entrypoints (see adapter/dynamodb_admin.go).
 	// Passing nil here would leave the admin dashboard with no
 	// access to table metadata; the admin handler answers
@@ -1344,7 +1344,7 @@ func startServers(in serversInput) error {
 		Timeout: *keyvizFanoutTimeout,
 	}
 	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler, fanoutCfg); err != nil {
-		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+		return runner.startupFailure(err)
 	}
 	return nil
 }
@@ -1809,10 +1809,10 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, error) {
+func prepareDynamoDBServer(ctx context.Context, lc *net.ListenConfig, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, net.Listener, error) {
 	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
+		return nil, nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
 	}
 	dynamoServer := adapter.NewDynamoDBServer(
 		dynamoL,
@@ -1822,6 +1822,10 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 		adapter.WithDynamoDBLeaderMap(leaderDynamo),
 	)
+	return dynamoServer, dynamoL, nil
+}
+
+func runDynamoDBServer(ctx context.Context, eg *errgroup.Group, dynamoServer *adapter.DynamoDBServer) {
 	eg.Go(func() error {
 		defer dynamoServer.Stop()
 		stop := make(chan struct{})
@@ -1839,7 +1843,6 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		}
 		return errors.WithStack(err)
 	})
-	return dynamoServer, nil
 }
 
 func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
@@ -2006,13 +2009,15 @@ type runtimeServerRunner struct {
 	// adapter/dynamodb_admin.go) without going through HTTP. The
 	// field is unexported on purpose — it is package-private state,
 	// not a public API. Nil until start() reaches the dynamo step.
-	dynamoServer *adapter.DynamoDBServer
+	dynamoServer   *adapter.DynamoDBServer
+	dynamoListener net.Listener
 
 	// s3Server is the parallel field for the S3 admin endpoints
 	// (read-only in this slice). Nil when --s3Address is empty,
 	// in which case the admin handler answers /s3/buckets* with
 	// 404, mirroring the dynamoServer == nil contract.
-	s3Server *adapter.S3Server
+	s3Server   *adapter.S3Server
+	s3Listener net.Listener
 
 	// sqsServer plays the same role for the SQS admin entrypoints
 	// (adapter/sqs_admin.go). Always non-nil after startup —
@@ -2049,28 +2054,10 @@ type runtimeServerRunner struct {
 	roleStore admin.RoleStore
 }
 
-func (r *runtimeServerRunner) start() error {
-	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+func (r *runtimeServerRunner) startRaftTransport() error {
+	if err := r.prepareAdminForwardServers(); err != nil {
+		return r.startupFailure(err)
 	}
-	// startDynamoDBServer + startS3Server must run BEFORE
-	// startRaftServers so the resulting *DynamoDBServer / *S3Server
-	// are available to the leader-side gRPC AdminForward registration
-	// in startRaftServers (design 3.3, P2 slice 2b). Each server
-	// listens on its own address; them accepting traffic before the
-	// raft TCP listeners are up is no different from the existing
-	// startup-race semantics — a hit in that window already returned
-	// 503 before this reorder.
-	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	r.dynamoServer = dynamoServer
-	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	r.s3Server = s3Server
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
 		buckets: newBucketsSource(r.s3Server),
@@ -2095,11 +2082,54 @@ func (r *runtimeServerRunner) start() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 	); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return r.startupFailure(err)
 	}
+	return nil
+}
+
+func (r *runtimeServerRunner) prepareAdminForwardServers() error {
+	dynamoServer, dynamoListener, err := prepareDynamoDBServer(r.ctx, r.lc, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	if err != nil {
+		return err
+	}
+	r.dynamoServer = dynamoServer
+	r.dynamoListener = dynamoListener
+	s3Server, s3Listener, err := prepareS3Server(r.ctx, r.lc, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	if err != nil {
+		return err
+	}
+	r.s3Server = s3Server
+	r.s3Listener = s3Listener
+	return nil
+}
+
+func (r *runtimeServerRunner) closePreparedExternalListeners() {
+	if r.dynamoListener != nil {
+		_ = r.dynamoListener.Close()
+		r.dynamoListener = nil
+	}
+	if r.s3Listener != nil {
+		_ = r.s3Listener.Close()
+		r.s3Listener = nil
+	}
+}
+
+func (r *runtimeServerRunner) startupFailure(err error) error {
+	r.closePreparedExternalListeners()
+	return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+}
+
+func (r *runtimeServerRunner) startPublicServices() error {
+	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
+		return r.startupFailure(err)
+	}
+	runDynamoDBServer(r.ctx, r.eg, r.dynamoServer)
+	r.dynamoListener = nil
+	runS3Server(r.ctx, r.eg, r.s3Server)
+	r.s3Listener = nil
 	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver, r.sqsPartitionObserver)
 	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return r.startupFailure(err)
 	}
 	r.sqsServer = sqsServer
 	// Plug the SQS adapter into the monitoring registry's depth
@@ -2110,10 +2140,10 @@ func (r *runtimeServerRunner) start() error {
 		startSQSDepthObserver(r.ctx, r.metricsRegistry, r.sqsServer)
 	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return r.startupFailure(err)
 	}
 	if err := startPprofServer(r.ctx, r.lc, r.eg, r.pprofAddress, r.pprofToken); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return r.startupFailure(err)
 	}
 	return nil
 }

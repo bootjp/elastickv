@@ -22,6 +22,7 @@ import (
 )
 
 var encryptionRotateOnStartupRetryDelay = 200 * time.Millisecond
+var encryptionRotateOnStartupFlightPublishPoll = 10 * time.Millisecond
 
 type encryptionRotateOnStartupController interface {
 	raftengine.LeaderView
@@ -31,6 +32,14 @@ type encryptionRotateOnStartupController interface {
 type encryptionRotateOnStartupRunner interface {
 	Run(context.Context) error
 	Done() bool
+}
+
+type encryptionRotateOnStartupFlightState struct {
+	inFlight atomic.Bool
+
+	mu          sync.Mutex
+	done        <-chan struct{}
+	terminalErr error
 }
 
 type encryptionRotateOnStartupTask struct {
@@ -127,17 +136,9 @@ func installEncryptionRotateOnStartupRequestWithWait(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	var inFlight atomic.Bool
-	var flightMu sync.Mutex
-	var flightDone <-chan struct{}
+	var flight encryptionRotateOnStartupFlightState
 	fire := func(block bool) {
-		done := fireEncryptionRotateOnStartup(ctx, controller, task, logger, &inFlight, block)
-		if done == nil {
-			return
-		}
-		flightMu.Lock()
-		flightDone = done
-		flightMu.Unlock()
+		_ = fireEncryptionRotateOnStartup(ctx, controller, task, logger, &flight, block)
 	}
 	wasLeaderBefore := controller.State() == raftengine.StateLeader
 	if wasLeaderBefore {
@@ -150,9 +151,46 @@ func installEncryptionRotateOnStartupRequestWithWait(
 		fire(false)
 	}
 	waitStartup := func(waitCtx context.Context) error {
-		return waitEncryptionRotateOnStartupIdle(waitCtx, controller, task, logger, &inFlight, &flightMu, &flightDone)
+		return waitEncryptionRotateOnStartupIdle(waitCtx, controller, task, logger, &flight)
 	}
 	return deregister, waitStartup
+}
+
+func (s *encryptionRotateOnStartupFlightState) publishDone(done <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.done = done
+}
+
+func (s *encryptionRotateOnStartupFlightState) currentDone() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
+
+func (s *encryptionRotateOnStartupFlightState) clearDone(done <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done == done {
+		s.done = nil
+	}
+}
+
+func (s *encryptionRotateOnStartupFlightState) setTerminalError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminalErr == nil {
+		s.terminalErr = err
+	}
+}
+
+func (s *encryptionRotateOnStartupFlightState) terminalError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalErr
 }
 
 func fireEncryptionRotateOnStartup(
@@ -160,19 +198,23 @@ func fireEncryptionRotateOnStartup(
 	controller encryptionRotateOnStartupController,
 	task encryptionRotateOnStartupRunner,
 	logger *slog.Logger,
-	inFlight *atomic.Bool,
+	flight *encryptionRotateOnStartupFlightState,
 	block bool,
 ) <-chan struct{} {
+	if flight.terminalError() != nil {
+		return nil
+	}
 	if controller.State() != raftengine.StateLeader {
 		return nil
 	}
-	if !inFlight.CompareAndSwap(false, true) {
+	if !flight.inFlight.CompareAndSwap(false, true) {
 		return nil
 	}
 	done := make(chan struct{})
+	flight.publishDone(done)
 	run := func() {
 		defer close(done)
-		runEncryptionRotateOnStartup(ctx, controller, task, logger, inFlight)
+		flight.setTerminalError(runEncryptionRotateOnStartup(ctx, controller, task, logger, &flight.inFlight))
 	}
 	if block {
 		run()
@@ -188,25 +230,25 @@ func runEncryptionRotateOnStartup(
 	task encryptionRotateOnStartupRunner,
 	logger *slog.Logger,
 	inFlight *atomic.Bool,
-) {
+) error {
 	defer inFlight.Store(false)
 	for {
 		if task.Done() || controller.State() != raftengine.StateLeader {
-			return
+			return nil
 		}
 		err := task.Run(ctx)
 		if err == nil || task.Done() || controller.State() != raftengine.StateLeader {
-			return
+			return nil
 		}
 		logEncryptionRotateOnStartupError(logger, err)
 		if !retryableEncryptionRotateOnStartupError(err) {
-			return
+			return errors.Wrap(err, "encryption rotate-on-startup: permanent failure")
 		}
 		timer := time.NewTimer(encryptionRotateOnStartupRetryDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return
+			return errors.Wrap(ctx.Err(), "encryption rotate-on-startup: retry wait")
 		case <-timer.C:
 		}
 	}
@@ -217,34 +259,57 @@ func waitEncryptionRotateOnStartupIdle(
 	controller encryptionRotateOnStartupController,
 	task encryptionRotateOnStartupRunner,
 	logger *slog.Logger,
-	inFlight *atomic.Bool,
-	flightMu *sync.Mutex,
-	flightDone *<-chan struct{},
+	flight *encryptionRotateOnStartupFlightState,
 ) error {
 	for {
-		flightMu.Lock()
-		done := *flightDone
-		flightMu.Unlock()
-		if done != nil {
-			select {
-			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "encryption rotate-on-startup: wait for in-flight attempt")
-			case <-done:
-			}
-			flightMu.Lock()
-			if *flightDone == done {
-				*flightDone = nil
-			}
-			flightMu.Unlock()
+		if err := flight.terminalError(); err != nil {
+			return err
+		}
+		waited, err := waitCurrentEncryptionRotateOnStartupFlight(ctx, flight)
+		if err != nil {
+			return err
+		}
+		if waited {
 			continue
 		}
 		if task.Done() || controller.State() != raftengine.StateLeader {
 			return nil
 		}
-		done = fireEncryptionRotateOnStartup(ctx, controller, task, logger, inFlight, true)
+		if flight.inFlight.Load() {
+			if err := waitEncryptionRotateOnStartupFlightPublish(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+		done := fireEncryptionRotateOnStartup(ctx, controller, task, logger, flight, true)
 		if done == nil {
 			return nil
 		}
+	}
+}
+
+func waitCurrentEncryptionRotateOnStartupFlight(ctx context.Context, flight *encryptionRotateOnStartupFlightState) (bool, error) {
+	done := flight.currentDone()
+	if done == nil {
+		return false, nil
+	}
+	select {
+	case <-ctx.Done():
+		return true, errors.Wrap(ctx.Err(), "encryption rotate-on-startup: wait for in-flight attempt")
+	case <-done:
+	}
+	flight.clearDone(done)
+	return true, nil
+}
+
+func waitEncryptionRotateOnStartupFlightPublish(ctx context.Context) error {
+	timer := time.NewTimer(encryptionRotateOnStartupFlightPublishPoll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "encryption rotate-on-startup: wait for in-flight publication")
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -280,8 +345,6 @@ func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if err := t.prepareNextKeyIDLocked(sc); err != nil {
-		t.storageDone = true
-		t.raftDone = true
 		return err
 	}
 	if err := t.rotatePurposeIfActiveLocked(
