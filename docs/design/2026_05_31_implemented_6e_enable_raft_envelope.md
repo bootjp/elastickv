@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial |
+| Status | implemented |
 | Date | 2026-05-31 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.2 raft envelope, §6.3 engine apply-hook, §6.6 admin RPC, §7.1 Phase-2 cutover) |
 | Builds on | Stage 6A–6D (capability gate, storage envelope cutover, sidecar field plumbing), Stage 7 (writer registry), Stage 8a (snapshot header v2 cutover carriage) |
@@ -66,13 +66,13 @@ prerequisite (6D Phase-1 storage envelope, 7 writer registry, 8a
 snapshot cutover carriage) has shipped.
 
 This design (sliced into milestones 6E-1a / 6E-1b / 6E-2 / 6E-3 —
-see the Implementation status table above) lands the Phase-2 raft
+see the Implementation status table above) shipped the Phase-2 raft
 cutover end-to-end: admin RPC and sidecar cutover-index recording
 (6E-1, shipped), engine unwrap-on-apply + coordinator
 wrap-on-propose + §7.1 proposal-quiescence barrier that prevents
 the unwrap path from seeing a plaintext entry at
 `index > cutover` (6E-2, shipped), and the §6C-4 fail-closed
-guards (6E-3, planned).
+guards (6E-3, shipped).
 
 ## 1. Out of scope
 
