@@ -113,6 +113,22 @@ func TestRunPrepareRestoreClassifiesTruncatedHeaderAsDataErr(t *testing.T) {
 	require.Equal(t, exitDataErr, code)
 }
 
+func TestRunPrepareRestoreClassifiesMalformedEncodeInfoAsDataErr(t *testing.T) {
+	dir := t.TempDir()
+	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
+	require.NoError(t, os.WriteFile(backup.EncodeInfoSidecarPath(input), []byte("{"), 0o600))
+
+	code, err := run([]string{
+		"--input", input,
+		"--data-dir", filepath.Join(dir, "raft"),
+		"--index", "5",
+		"--peers", "n1=127.0.0.1:12001",
+		"--target-cluster-id", "cluster-a",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, errRestoreEncodeInfoMalformed)
+	require.Equal(t, exitDataErr, code)
+}
+
 func TestRunPrepareRestoreRejectsEntryTimestampAboveHeader(t *testing.T) {
 	dir := t.TempDir()
 	input := writeSingleEntryFSM(t, filepath.Join(dir, "encoded.fsm"), 10, 11)
@@ -224,12 +240,20 @@ func TestClassifyErrorTreatsMalformedSnapshotEntriesAsDataErr(t *testing.T) {
 		require.Equal(t, exitDataErr, classifyError(err))
 	}
 	require.Equal(t, exitDataErr, classifyError(errRestoreEncodeInfoTooLarge))
+	require.Equal(t, exitDataErr, classifyError(errRestoreEncodeInfoMalformed))
+	require.Equal(t, exitDataErr, classifyError(errRestoreHLCCeilingOverflow))
 	require.Equal(t, exitDataErr, classifyError(errRestoreSnapshotTimestampCeiling))
 }
 
 func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {
-	require.Equal(t, uint64(0), hlcCeilingMsAfterLastCommitTS(0))
-	require.Equal(t, uint64(124), hlcCeilingMsAfterLastCommitTS((123<<hlcLogicalBits)|42))
+	got, err := hlcCeilingMsAfterLastCommitTS(0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), got)
+	got, err = hlcCeilingMsAfterLastCommitTS((123 << hlcLogicalBits) | 42)
+	require.NoError(t, err)
+	require.Equal(t, uint64(124), got)
+	_, err = hlcCeilingMsAfterLastCommitTS(maxHLCPhysicalMs << hlcLogicalBits)
+	require.ErrorIs(t, err, errRestoreHLCCeilingOverflow)
 }
 
 func writeHeaderOnlyFSM(t *testing.T, path string) string {

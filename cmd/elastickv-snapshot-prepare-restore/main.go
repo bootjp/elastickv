@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -32,7 +33,9 @@ const (
 var (
 	errRestoreClusterIDMismatch        = errors.New("snapshot restore: cluster_id mismatch")
 	errRestoreClusterIDMissing         = errors.New("snapshot restore: cluster_id missing")
+	errRestoreEncodeInfoMalformed      = errors.New("snapshot restore: ENCODE_INFO sidecar malformed")
 	errRestoreEncodeInfoTooLarge       = errors.New("snapshot restore: ENCODE_INFO sidecar too large")
+	errRestoreHLCCeilingOverflow       = errors.New("snapshot restore: HLC ceiling overflow")
 	errRestoreKeyFormatMismatch        = errors.New("snapshot restore: encoder key-format version mismatch")
 	errRestoreSHA256Mismatch           = errors.New("snapshot restore: encoded FSM SHA-256 mismatch")
 	errRestoreSHA256Missing            = errors.New("snapshot restore: encoded FSM SHA-256 missing")
@@ -40,7 +43,11 @@ var (
 	errRestoreSnapshotTimestampCeiling = errors.New("snapshot restore: entry commit_ts exceeds snapshot header last_commit_ts")
 )
 
-const hlcLogicalBits = 16
+const (
+	hlcLogicalBits   = 16
+	hlcPhysicalBits  = 64 - hlcLogicalBits
+	maxHLCPhysicalMs = (uint64(1) << hlcPhysicalBits) - 1
+)
 
 type config struct {
 	inputPath               string
@@ -88,7 +95,9 @@ func classifyError(err error) int {
 		errors.Is(err, backup.ErrUnsupportedEncodeInfoFormatVersion),
 		errors.Is(err, errRestoreClusterIDMismatch),
 		errors.Is(err, errRestoreClusterIDMissing),
+		errors.Is(err, errRestoreEncodeInfoMalformed),
 		errors.Is(err, errRestoreEncodeInfoTooLarge),
+		errors.Is(err, errRestoreHLCCeilingOverflow),
 		errors.Is(err, errRestoreKeyFormatMismatch),
 		errors.Is(err, errRestoreSHA256Mismatch),
 		errors.Is(err, errRestoreSHA256Missing),
@@ -158,13 +167,17 @@ func prepare(cfg *config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	snapshotCeilingMs, err := hlcCeilingMsAfterLastCommitTS(header.LastCommitTS)
+	if err != nil {
+		return err
+	}
 	result, err := etcd.PrepareExternalSnapshotRestore(etcd.ExternalSnapshotRestoreOptions{
 		InputFSMPath:          cfg.inputPath,
 		DataDir:               cfg.dataDir,
 		Index:                 cfg.index,
 		Term:                  cfg.term,
 		Peers:                 peers,
-		SnapshotCeilingMs:     hlcCeilingMsAfterLastCommitTS(header.LastCommitTS),
+		SnapshotCeilingMs:     snapshotCeilingMs,
 		ExpectedPayloadSHA256: info.OutputFSMSHA256,
 	})
 	if err != nil {
@@ -184,12 +197,9 @@ func prepare(cfg *config, logger *slog.Logger) error {
 }
 
 func readEncodeInfo(path string) (backup.EncodeInfo, error) {
-	if err := requireRegularRestoreFile(path, restoreInputKindSidecar); err != nil {
-		return backup.EncodeInfo{}, err
-	}
-	f, err := os.Open(path) //nolint:gosec // operator-supplied sidecar path
+	f, err := openRegularRestoreFile(path, restoreInputKindSidecar)
 	if err != nil {
-		return backup.EncodeInfo{}, errors.WithStack(err)
+		return backup.EncodeInfo{}, err
 	}
 	defer func() { _ = f.Close() }()
 	body, err := io.ReadAll(io.LimitReader(f, maxEncodeInfoBytes+1))
@@ -201,18 +211,18 @@ func readEncodeInfo(path string) (backup.EncodeInfo, error) {
 	}
 	info, err := backup.ReadEncodeInfo(bytes.NewReader(body))
 	if err != nil {
-		return backup.EncodeInfo{}, errors.Wrap(err, "read encode info")
+		if errors.Is(err, backup.ErrUnsupportedEncodeInfoFormatVersion) {
+			return backup.EncodeInfo{}, errors.Wrap(err, "read encode info")
+		}
+		return backup.EncodeInfo{}, errors.Wrapf(errRestoreEncodeInfoMalformed, "%v", err)
 	}
 	return info, nil
 }
 
 func validatePayload(path string) (backup.SnapshotHeader, string, error) {
-	if err := requireRegularRestoreFile(path, restoreInputKindPayload); err != nil {
-		return backup.SnapshotHeader{}, "", err
-	}
-	f, err := os.Open(path) //nolint:gosec // operator-supplied restore artifact path
+	f, err := openRegularRestoreFile(path, restoreInputKindPayload)
 	if err != nil {
-		return backup.SnapshotHeader{}, "", errors.WithStack(err)
+		return backup.SnapshotHeader{}, "", err
 	}
 	defer func() { _ = f.Close() }()
 	h := sha256.New()
@@ -236,15 +246,32 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 	return header, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func requireRegularRestoreFile(path string, kind string) error {
-	info, err := os.Lstat(path)
+func openRegularRestoreFile(path string, kind string) (*os.File, error) {
+	f, err := openNoFollowNonblocking(path)
 	if err != nil {
-		return errors.WithStack(err)
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is a symlink", kind, path)
+		}
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, errors.WithStack(err)
 	}
 	if !info.Mode().IsRegular() {
-		return errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is not a regular file", kind, path)
+		_ = f.Close()
+		return nil, errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is not a regular file", kind, path)
 	}
-	return nil
+	return f, nil
+}
+
+func openNoFollowNonblocking(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // operator-supplied restore artifact path
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return os.NewFile(uintptr(fd), path), nil
 }
 
 func validateEncodeInfo(info backup.EncodeInfo, gotSHA string, cfg *config) error {
@@ -309,9 +336,13 @@ func parsePeers(raw string) ([]etcd.Peer, error) {
 	return peers, nil
 }
 
-func hlcCeilingMsAfterLastCommitTS(ts uint64) uint64 {
+func hlcCeilingMsAfterLastCommitTS(ts uint64) (uint64, error) {
 	if ts == 0 {
-		return 0
+		return 0, nil
 	}
-	return (ts >> hlcLogicalBits) + 1
+	physicalMs := ts >> hlcLogicalBits
+	if physicalMs == maxHLCPhysicalMs {
+		return 0, errors.Wrapf(errRestoreHLCCeilingOverflow, "last_commit_ts %d has physical ms %d", ts, physicalMs)
+	}
+	return physicalMs + 1, nil
 }

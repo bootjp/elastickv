@@ -49,6 +49,24 @@ func TestRunPrepareRestoreRejectsFIFOEncodeInfoBeforeOpen(t *testing.T) {
 	require.Equal(t, exitUserErr, code)
 }
 
+func TestRunPrepareRestoreRejectsSymlinkInputBeforeOpen(t *testing.T) {
+	dir := t.TempDir()
+	target := writeHeaderOnlyFSM(t, filepath.Join(dir, "target.fsm"))
+	input := filepath.Join(dir, "encoded.fsm")
+	require.NoError(t, os.Symlink(target, input))
+	writeEncodeInfo(t, input, "cluster-a", true, true)
+
+	code, err := run([]string{
+		"--input", input,
+		"--data-dir", filepath.Join(dir, "raft"),
+		"--index", "5",
+		"--peers", "n1=127.0.0.1:12001",
+		"--target-cluster-id", "cluster-a",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, etcd.ErrExternalSnapshotRestoreInvalid)
+	require.Equal(t, exitUserErr, code)
+}
+
 func writeEncodeInfoWithRecordedSHA(t *testing.T, input, clusterID, shaHex string) {
 	t.Helper()
 	info := backup.NewEncodeInfo(time.Unix(0, 0))

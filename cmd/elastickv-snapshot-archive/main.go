@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/cockroachdb/errors"
@@ -217,23 +218,37 @@ func openArchiveInput(path string) (io.Reader, func() error, error) {
 	if path == "-" {
 		return os.Stdin, func() error { return nil }, nil
 	}
-	if err := requireRegularArchiveInput(path); err != nil {
-		return nil, nil, err
-	}
-	f, err := os.Open(path) //nolint:gosec // operator-supplied input path
+	f, err := openRegularArchiveInput(path)
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return nil, nil, err
 	}
 	return f, func() error { return errors.WithStack(f.Close()) }, nil
 }
 
-func requireRegularArchiveInput(path string) error {
-	info, err := os.Lstat(path)
+func openRegularArchiveInput(path string) (*os.File, error) {
+	f, err := openNoFollowNonblocking(path)
 	if err != nil {
-		return errors.WithStack(err)
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, errors.Wrapf(backup.ErrArchiveNonRegular, "%s is a symlink archive input", path)
+		}
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, errors.WithStack(err)
 	}
 	if !info.Mode().IsRegular() {
-		return errors.Wrapf(backup.ErrArchiveNonRegular, "%s is not a regular archive input", path)
+		_ = f.Close()
+		return nil, errors.Wrapf(backup.ErrArchiveNonRegular, "%s is not a regular archive input", path)
 	}
-	return nil
+	return f, nil
+}
+
+func openNoFollowNonblocking(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // operator-supplied input path
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return os.NewFile(uintptr(fd), path), nil
 }
