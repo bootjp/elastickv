@@ -38,7 +38,7 @@ func buildShardGroupsWithEncryptionWiring(
 	encryptionEnabled bool,
 	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
-	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
+	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore, groups)
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
@@ -63,6 +63,18 @@ func configureRaftEnvelopeFactory(factory raftengine.Factory, w encryptionWriteW
 		return
 	}
 	configurable.SetRaftEnvelope(w.cipher, w.raftEnvelope.engineCutoverIndex)
+}
+
+func validateRaftEnvelopeStartupScope(cutoverIdx uint64, groups []groupSpec) error {
+	if cutoverIdx == 0 {
+		return nil
+	}
+	if len(groups) == 1 {
+		return nil
+	}
+	return pkgerrors.Errorf(
+		"encryption: active raft envelope sidecar requires exactly one shard group until per-group raft cutover indexes are implemented (got %d)",
+		len(groups))
 }
 
 func encryptionApplierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string, w encryptionWriteWiring) []encryption.ApplierOption {
@@ -124,6 +136,9 @@ type encryptionWriteWiring struct {
 	// raftEnvelope coordinates wrap publication across shard groups
 	// and supplies the applier installer hook.
 	raftEnvelope *raftEnvelopeRuntime
+	// raftRegistration gates raft-envelope wrapping until this load has
+	// committed a writer-registry row for (active raft DEK, raftEpoch).
+	raftRegistration *raftRegistrationGate
 }
 
 // withDefaultedCache returns a copy of w with a non-nil StateCache.
@@ -174,19 +189,21 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 // Inputs are explicit parameters rather than the package-level flag
 // globals so the nonce factory's node_id is provably derived from the
 // same raftID the shard stores use, and so the helper is testable in
-// isolation (codex P2 on PR #826). run()'s orchestrator
-// buildShardGroupsWithEncryptionWiring threads its own raftID /
-// sidecarPath params plus *encryptionEnabled in.
+// isolation. run()'s orchestrator buildShardGroupsWithEncryptionWiring
+// threads its own raftID / sidecarPath params plus *encryptionEnabled in.
 //
 // When a storage DEK is already active on disk (the restart path),
 // the function hydrates the keystore from the sidecar so the cipher
 // can decrypt pre-existing envelopes whose bootstrap entry may have
 // been compacted, and bumps the §4.1 local_epoch so the per-load
-// write_count reset stays nonce-safe. On a pre-bootstrap binary the
-// epoch defaults to 0 — the value a future runtime Bootstrap assigns
-// to the freshly minted DEK, which is that DEK's first-ever use and
-// therefore nonce-safe; a later restart will then take the bump path.
-func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore) (encryptionWriteWiring, error) {
+// write_count reset stays nonce-safe. The raft DEK's local_epoch is bumped
+// only after raft-envelope cutover is active; before cutover no raft-envelope
+// nonces can be emitted, so consuming the finite epoch space gives no safety
+// benefit. On a pre-bootstrap binary the epoch defaults to 0 — the value a
+// future runtime Bootstrap assigns to the freshly minted DEK, which is that
+// DEK's first-ever use and therefore nonce-safe; a later restart will then
+// take the bump path.
+func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []groupSpec) (encryptionWriteWiring, error) {
 	w := encryptionWriteWiring{cache: encryption.NewStateCache()}
 	if !encryptionEnabled || kekWrapper == nil || sidecarPath == "" {
 		return w, nil
@@ -200,11 +217,18 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, pkgerrors.Wrap(err, "build encryption write wiring: new cipher")
 	}
+	cutoverIdx, activeRaftDEKID, err := readRaftEnvelopeStartupState(sidecarPath)
+	if err != nil {
+		return w, err
+	}
+	if err := validateRaftEnvelopeStartupState(cutoverIdx, activeRaftDEKID, groups); err != nil {
+		return w, err
+	}
 	epoch, err := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, w.cache)
 	if err != nil {
 		return w, err
 	}
-	raftEpoch, err := prepareRaftNonceEpoch(sidecarPath, kekWrapper, keystore)
+	raftEpoch, err := prepareRaftNonceEpoch(sidecarPath, kekWrapper, keystore, cutoverIdx)
 	if err != nil {
 		return w, err
 	}
@@ -214,12 +238,9 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	w.raftEpoch = raftEpoch
 	w.nonceFactory = encryption.NewDeterministicNonceFactory(nodeID, epoch)
 	w.raftNonceFactory = encryption.NewDeterministicNonceFactory(nodeID, raftEpoch)
-	cutoverIdx, activeRaftDEKID, err := readRaftEnvelopeStartupState(sidecarPath)
-	if err != nil {
-		return w, err
-	}
 	w.raftCutoverIndex = &atomic.Uint64{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex)
+	w.raftRegistration = &raftRegistrationGate{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.raftEpoch, w.raftRegistration)
 	if err != nil {
 		return w, err
 	}
@@ -238,7 +259,20 @@ func readRaftEnvelopeStartupState(sidecarPath string) (cutoverIdx uint64, active
 	return sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, nil
 }
 
-func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore) (uint16, error) {
+func validateRaftEnvelopeStartupState(cutoverIdx uint64, activeRaftDEKID uint32, groups []groupSpec) error {
+	if cutoverIdx == 0 {
+		return nil
+	}
+	if activeRaftDEKID == 0 {
+		return pkgerrors.New("encryption: active raft envelope sidecar requires active raft DEK")
+	}
+	return validateRaftEnvelopeStartupScope(cutoverIdx, groups)
+}
+
+func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, cutoverIdx uint64) (uint16, error) {
+	if cutoverIdx == 0 {
+		return 0, nil
+	}
 	sc, err := encryption.ReadSidecar(sidecarPath)
 	if err != nil {
 		if encryption.IsNotExist(err) {
@@ -247,7 +281,7 @@ func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrappe
 		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: read sidecar")
 	}
 	if sc.Active.Raft == 0 {
-		return 0, nil
+		return 0, pkgerrors.New("prepare raft nonce epoch: active cutover requires active raft DEK")
 	}
 	if err := encryption.HydrateKeystoreFromSidecar(keystore, kekWrapper, sc); err != nil {
 		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: hydrate keystore")

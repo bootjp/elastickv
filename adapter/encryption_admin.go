@@ -67,18 +67,20 @@ type EncryptionAdminServer struct {
 	// acquisition can honor ctx cancellation: an admin RPC with
 	// a short deadline whose mutator lock is held by an in-flight
 	// fan-out + propose call surfaces Canceled / DeadlineExceeded
-	// at the gRPC boundary rather than blocking indefinitely
-	// (codex P2 round-3 on PR812).
+	// at the gRPC boundary rather than blocking indefinitely.
 	//
-	// The design also calls for a shared lock with RotateDEK so
-	// a RotateDEK cannot interleave between a cutover's propose
-	// and apply; that piece is left to a follow-up because
-	// RotateDEK has no existing serialization and extending it
-	// would change a hot-path mutator's semantics — see the
-	// §2.1 #3 stale-DEKID benign no-op for the FALLBACK that
-	// handles the un-serialized RotateDEK/cutover interleave
-	// today.
+	// The same semaphore also serializes RotateDEK and
+	// RegisterEncryptionWriter around their proposal step. Before the
+	// raft-envelope wrap is installed, barrier-exempt admin proposals
+	// must not slip in at indexes greater than the raft cutover marker
+	// while the wrap-aware proposer still has nil wrap.
 	cutoverSem chan struct{}
+	// unsafeRaftCutoverAdminBlocked latches after EnableRaftEnvelope
+	// reaches an ambiguous/post-propose failure that leaves the user
+	// barrier open. Once set, non-cutover admin proposals must fail
+	// closed instead of committing cleartext above a marker whose
+	// eventual outcome is unknown on this process.
+	unsafeRaftCutoverAdminBlocked atomic.Bool
 	// cutoverBarrier drives the §7.1 6-step quiescence barrier that
 	// EnableRaftEnvelope wraps around its cutover proposal. nil means
 	// the barrier is unwired — EnableRaftEnvelope refuses with
@@ -140,6 +142,10 @@ type CutoverBarrierController interface {
 	// Idempotent against double-End. Pair with Begin via defer in
 	// the handler.
 	End()
+}
+
+type cutoverBarrierScopeValidator interface {
+	ValidateCutoverScope() error
 }
 
 // CapabilityFanoutFn is the closure the server invokes to run the
@@ -594,7 +600,7 @@ func (s *EncryptionAdminServer) BootstrapEncryption(ctx context.Context, req *pb
 		BatchRegistry:  batch,
 	}
 	body := fsmwire.EncodeBootstrap(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpBootstrap, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpBootstrap, body)
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +802,7 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 		},
 	}
 	body := fsmwire.EncodeRotation(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpRotation, body)
 	if err != nil {
 		return nil, err
 	}
@@ -900,8 +906,7 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 // semaphore frees, the wait returns immediately with a gRPC
 // status matching the ctx error — Canceled or DeadlineExceeded.
 // A plain sync.Mutex would block past the caller's deadline,
-// breaking RPC cancellation semantics (codex P2 round-3 on
-// PR812).
+// breaking RPC cancellation semantics.
 //
 // The explicit ctx.Err() check before the select is load-bearing:
 // Go's select picks uniformly at random among ready cases (it
@@ -910,8 +915,11 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 // the slot (and running precheck / fan-out / propose against an
 // aborted caller) and the cancellation return. Checking
 // ctx.Err() first turns the cancellation into a deterministic
-// short-circuit (codex P1 round-4 on PR812).
+// short-circuit.
 func (s *EncryptionAdminServer) acquireCutoverSemaphore(ctx context.Context) error {
+	if s.cutoverSem == nil {
+		return grpcStatusError(codes.FailedPrecondition, "encryption: cutover semaphore is not configured on this node")
+	}
 	if err := ctx.Err(); err != nil {
 		return cutoverSemaphoreErrorToStatus(err)
 	}
@@ -1187,19 +1195,17 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 }
 
 // raftEnvelopeWrapEnabled gates fresh EnableRaftEnvelope cutovers.
-// Stage 6E-2f flips the production default to true only after the
-// wrap-on-propose, unwrap-on-apply, cutover barrier, applier
-// installer, startup install, and post-cutover admin proposer wiring
-// are all present. The remaining per-request fail-closed checks
-// (barrier, latest-applied-index, fan-out) still run before any
-// proposal is composed.
+// Keep the production default closed until the fan-out can prove
+// every voter and learner runs a build with the raft-envelope
+// wrap/unwrap/cutover wiring. Tests open it explicitly around cases
+// that exercise the fresh cutover state machine.
 //
 // Kept as atomic.Bool rather than a const so tests can override the
 // gate without racing sibling t.Parallel cases.
 var raftEnvelopeWrapEnabled atomic.Bool
 
 func init() {
-	raftEnvelopeWrapEnabled.Store(true)
+	raftEnvelopeWrapEnabled.Store(false)
 }
 
 // EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
@@ -1220,13 +1226,11 @@ func init() {
 // sequence, and error mapping match the storage variant verbatim;
 // see EnableStorageEnvelope for the full design rationale.
 //
-// **Gate posture**: raftEnvelopeWrapEnabled existed to hold fresh
-// cutovers closed while only the 6E-1 operator surface existed.
-// Production now defaults it open after 6E-2 wiring, while tests can
-// still force the fail-closed branch. If closed, the pre-gate
-// validation surface (leader, semaphore acquire, request shape) still
-// fires, but no Raft proposal is composed and no sidecar mutation
-// occurs.
+// **Gate posture**: raftEnvelopeWrapEnabled holds fresh cutovers
+// closed until the capability fan-out can verify a raft-envelope-aware
+// build on every participant. If closed, the pre-gate validation
+// surface (leader, semaphore acquire, request shape) still fires, but
+// no Raft proposal is composed and no sidecar mutation occurs.
 func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
 	if err := s.acquireCutoverSemaphore(ctx); err != nil {
 		return nil, err
@@ -1269,6 +1273,9 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return nil, grpcStatusError(codes.FailedPrecondition,
 			"encryption: latest-applied-index callback is not wired — wire WithEncryptionAdminLatestAppliedIndex before enabling the raft envelope cutover")
 	}
+	if err := s.validateCutoverBarrierScope(); err != nil {
+		return nil, err
+	}
 	fanoutResult, err := s.runCutoverFanout(ctx)
 	if err != nil {
 		return nil, err
@@ -1285,6 +1292,17 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return nil, err
 	}
 	return s.raftCutoverPostcheck(proposedIdx, fanoutResult)
+}
+
+func (s *EncryptionAdminServer) validateCutoverBarrierScope() error {
+	validator, ok := s.cutoverBarrier.(cutoverBarrierScopeValidator)
+	if !ok {
+		return nil
+	}
+	if err := validator.ValidateCutoverScope(); err != nil {
+		return grpcStatusError(codes.FailedPrecondition, err.Error())
+	}
+	return nil
 }
 
 // runRaftEnvelopeCutoverBarrier executes the §7.1 step-1..6
@@ -1377,10 +1395,12 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 
 	proposedIdx, err := s.proposeRaftCutoverEntry(ctx, preSidecar, req)
 	if err != nil {
+		s.blockNonCutoverAdminAfterUnsafeRaftCutover()
 		return 0, err
 	}
 
 	if err := s.awaitCutoverApply(ctx, proposedIdx); err != nil {
+		s.blockNonCutoverAdminAfterUnsafeRaftCutover()
 		return 0, err
 	}
 
@@ -1412,6 +1432,7 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 		// the barrier open (releaseSafe stays false) — operator
 		// must intervene because we can't safely install or skip
 		// the wrap without knowing the actual outcome.
+		s.blockNonCutoverAdminAfterUnsafeRaftCutover()
 		return 0, statusFromSidecarErr(err)
 	}
 	if postSidecar.RaftEnvelopeCutoverIndex == 0 {
@@ -1721,11 +1742,34 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 		LocalEpoch: uint32ToLocalEpoch(w.GetLocalEpoch()),
 	}
 	body := fsmwire.EncodeRegistration(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRegistration, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpRegistration, body)
 	if err != nil {
 		return nil, err
 	}
 	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: idx}, nil
+}
+
+func (s *EncryptionAdminServer) proposeSerializedEncryptionEntry(ctx context.Context, opcode byte, body []byte) (uint64, error) {
+	if err := s.acquireCutoverSemaphore(ctx); err != nil {
+		return 0, err
+	}
+	defer s.releaseCutoverSemaphore()
+	if err := s.refuseNonCutoverAdminAfterUnsafeRaftCutover(); err != nil {
+		return 0, err
+	}
+	return s.proposeEncryptionEntry(ctx, opcode, body)
+}
+
+func (s *EncryptionAdminServer) blockNonCutoverAdminAfterUnsafeRaftCutover() {
+	s.unsafeRaftCutoverAdminBlocked.Store(true)
+}
+
+func (s *EncryptionAdminServer) refuseNonCutoverAdminAfterUnsafeRaftCutover() error {
+	if !s.unsafeRaftCutoverAdminBlocked.Load() {
+		return nil
+	}
+	return grpcStatusError(codes.FailedPrecondition,
+		"encryption: raft envelope cutover outcome is unsafe on this process; refusing non-cutover admin proposals until restart")
 }
 
 // proposeEncryptionEntry prepends the §11.3 opcode tag to a

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 )
 
 // stubGapEngine satisfies encryptionGapEngine for the
@@ -49,6 +52,35 @@ func (s *stubRestoredCutoverStateMachine) RestoredCutover() uint64 {
 	return s.cutover
 }
 
+type testCutoverSource struct {
+	cutover uint64
+}
+
+func (s testCutoverSource) RaftEnvelopeCutoverIndex() uint64 { return s.cutover }
+
+func snapshotPayloadWithCutover(t *testing.T, cutover uint64) []byte {
+	t.Helper()
+	fsm := kv.NewKvFSMWithHLC(store.NewMVCCStore(), kv.NewHLC(), kv.WithCutoverSource(testCutoverSource{cutover: cutover}))
+	snap, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	defer snap.Close()
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatalf("snapshot WriteTo: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_SidecarZeroRefusesSnapshotCutover(t *testing.T) {
+	payload := snapshotPayloadWithCutover(t, 99)
+	err := checkEnvelopeCutoverDivergenceSnapshotPayload(bytes.NewReader(payload), 0, 1)
+	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
+		t.Fatalf("checkEnvelopeCutoverDivergenceSnapshotPayload error = %v, want ErrEnvelopeCutoverDivergence", err)
+	}
+}
+
 // writeMinimalSidecar writes a valid §5.1 sidecar with the
 // supplied RaftAppliedIndex into a freshly created temp dir, and
 // returns the sidecar path.
@@ -67,7 +99,7 @@ func writeMinimalSidecar(t *testing.T, raftAppliedIdx uint64) string {
 	return path
 }
 
-func writeRaftCutoverSidecarForStartup(t *testing.T, activeStorage, activeRaft uint32, localEpoch uint16, cutover uint64) string {
+func writeRaftCutoverSidecarForStartup(t *testing.T, activeRaft uint32, localEpoch uint16, cutover uint64) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, encryption.SidecarFilename)
@@ -76,9 +108,9 @@ func writeRaftCutoverSidecarForStartup(t *testing.T, activeStorage, activeRaft u
 		RaftAppliedIndex:         cutover,
 		StorageEnvelopeActive:    true,
 		RaftEnvelopeCutoverIndex: cutover,
-		Active:                   encryption.ActiveKeys{Storage: activeStorage, Raft: activeRaft},
+		Active:                   encryption.ActiveKeys{Storage: testRegDEKID, Raft: activeRaft},
 		Keys: map[string]encryption.SidecarKey{
-			strconv.FormatUint(uint64(activeStorage), 10): {
+			strconv.FormatUint(uint64(testRegDEKID), 10): {
 				Purpose:    encryption.SidecarPurposeStorage,
 				Wrapped:    []byte("wrapped-storage"),
 				Created:    "2026-07-07T00:00:00Z",
@@ -286,7 +318,7 @@ func TestChainEncryptionStartupGuard_NilPrevRunsGuard(t *testing.T) {
 
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 	t.Parallel()
-	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
 		spec:         groupSpec{id: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
@@ -299,13 +331,30 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 	t.Parallel()
-	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
 		spec:         groupSpec{id: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
 		t.Fatalf("matching snapshot/sidecar cutover must pass, got %v", err)
+	}
+}
+
+func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_Fires(t *testing.T) {
+	t.Parallel()
+	payload := snapshotPayloadWithCutover(t, 200)
+	err := checkEnvelopeCutoverDivergenceSnapshotPayload(bytes.NewReader(payload), 100, 1)
+	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
+		t.Fatalf("snapshot payload cutover guard must fire ErrEnvelopeCutoverDivergence, got %v", err)
+	}
+}
+
+func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_Match(t *testing.T) {
+	t.Parallel()
+	payload := snapshotPayloadWithCutover(t, 100)
+	if err := checkEnvelopeCutoverDivergenceSnapshotPayload(bytes.NewReader(payload), 100, 1); err != nil {
+		t.Fatalf("matching snapshot payload/sidecar cutover must pass, got %v", err)
 	}
 }
 

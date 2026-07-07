@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/kv"
 	pkgerrors "github.com/cockroachdb/errors"
 )
 
@@ -223,6 +227,60 @@ func checkEnvelopeCutoverDivergenceStartupGuard(
 		return err
 	}
 	return checkEnvelopeCutoverDivergenceForRuntime(runtimes, defaultGroup, sc)
+}
+
+func checkEnvelopeCutoverDivergenceBeforeNonceBump(
+	raftID string,
+	raftDir string,
+	groups []groupSpec,
+	defaultGroup uint64,
+	multi bool,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil {
+		return err
+	}
+	sidecarCutover := uint64(0)
+	if sc != nil {
+		sidecarCutover = sc.RaftEnvelopeCutoverIndex
+	}
+	dir := groupDataDir(raftDir, raftID, defaultGroup, multi)
+	if !hasGroup(defaultGroup, groups) {
+		return nil
+	}
+	payload, ok, err := etcdraftengine.OpenNewestFSMSnapshotPayload(dir)
+	if err != nil || !ok {
+		return pkgerrors.Wrap(err, "encryption startup guard: open newest FSM snapshot payload")
+	}
+	defer payload.Close()
+	return checkEnvelopeCutoverDivergenceSnapshotPayload(payload, sidecarCutover, defaultGroup)
+}
+
+func checkEnvelopeCutoverDivergenceSnapshotPayload(payload io.Reader, sidecarCutover, defaultGroup uint64) error {
+	_, snapshotCutover, err := kv.ReadSnapshotHeader(bufio.NewReader(payload))
+	if err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: read restored snapshot header")
+	}
+	if snapshotCutover == 0 || snapshotCutover == sidecarCutover {
+		return nil
+	}
+	return pkgerrors.Wrapf(encryption.ErrEnvelopeCutoverDivergence,
+		"encryption startup guard: restored_snapshot_cutover=%d sidecar_raft_envelope_cutover=%d default_group=%d",
+		snapshotCutover, sidecarCutover, defaultGroup)
+}
+
+func hasGroup(groupID uint64, groups []groupSpec) bool {
+	for _, g := range groups {
+		if g.id == groupID {
+			return true
+		}
+	}
+	return false
 }
 
 func readExistingSidecarForStartupGuard(sidecarPath string) (*encryption.Sidecar, error) {

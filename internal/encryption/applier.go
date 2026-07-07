@@ -971,17 +971,30 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 	if err := a.keystore.Set(p.DEKID, dek); err != nil {
 		return errors.Wrap(err, "applier: keystore set rotation DEK")
 	}
-	sc, err := a.writeRotationSidecar(raftIdx, p)
-	if err != nil {
+	if _, err := a.writeRotationSidecar(raftIdx, p); err != nil {
 		return err
 	}
 	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
 		return errors.Wrap(err, "applier: rotation proposer-registration insert")
 	}
-	if p.Purpose == fsmwire.PurposeRaft && sc.RaftEnvelopeCutoverIndex != 0 {
-		return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, "rotate-dek apply")
+	if err := a.reinstallRaftWrapAfterRotation(p); err != nil {
+		return err
 	}
 	return nil
+}
+
+func (a *Applier) reinstallRaftWrapAfterRotation(p fsmwire.RotationPayload) error {
+	if p.Purpose != fsmwire.PurposeRaft {
+		return nil
+	}
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for raft rotation wrap reinstall")
+	}
+	if sc.RaftEnvelopeCutoverIndex == 0 {
+		return nil
+	}
+	return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, p.DEKID, "raft-dek rotation")
 }
 
 // applyEnableStorageEnvelope handles the

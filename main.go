@@ -362,7 +362,7 @@ func run() error {
 	// are only attached to the applier when --kekFile is non-empty
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
-	kekWrapper, err := loadKEKAndRunStartupGuards()
+	kekWrapper, err := loadKEKAfterPreNonceStartupGuards(cfg)
 	if err != nil {
 		return err
 	}
@@ -447,30 +447,16 @@ func run() error {
 		ctx, runtimes, cfg.sqsFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
-	cleanup.Add(installEncryptionRotateOnStartup(
-		ctx,
-		*encryptionRotateOnStartup,
-		defaultRuntime,
-		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
-		*encryptionSidecarPath,
-		kekWrapper,
-		encWiring.raftEnvelope,
-		etcdraftengine.DeriveNodeID(*raftId),
-		encWiring.epoch,
-		encWiring.raftEpoch,
-		slog.Default(),
-	))
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
 	// gate are bundled so run() has a single startup-fault path: a
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
-	// run with no registration gate installed (codex P1 on PR #839).
+	// run with no registration gate installed.
 	distCatalog, err := setupDistributionAndRegistration(
 		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
 	if err != nil {
 		cancel()
 		return err
@@ -514,8 +500,23 @@ func run() error {
 	// nil when encryption is not wired (no StateCache or no default
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
-		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, etcdraftengine.DeriveNodeID)
-	if err := startServers(serversInput{
+		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
+	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
+		runCtx,
+		*encryptionRotateOnStartup,
+		defaultRuntime,
+		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+		*encryptionSidecarPath,
+		kekWrapper,
+		encWiring.raftEnvelope,
+		etcdraftengine.DeriveNodeID(*raftId),
+		encWiring.epoch,
+		encWiring.raftEpoch,
+		slog.Default(),
+	)
+	cleanup.Add(rotateOnStartupDeregister)
+	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
 		shardStore: shardStore, coordinate: coordinate,
@@ -911,10 +912,7 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock,
-			kv.WithEncryption(applier),
-			kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), g.id),
-		)
+		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring)...)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -946,6 +944,17 @@ func buildShardGroups(
 	return runtimes, shardGroups, nil
 }
 
+func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring) []kv.FSMOption {
+	opts := []kv.FSMOption{
+		kv.WithEncryption(applier),
+		kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), groupID),
+	}
+	if encWiring.raftEnvelope != nil {
+		opts = append(opts, kv.WithCutoverSource(encWiring.raftEnvelope))
+	}
+	return opts
+}
+
 func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) kv.ProposalObserver {
 	if factory == nil {
 		return nil
@@ -975,6 +984,29 @@ func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]
 		return nil
 	}
 	return proposerForGroup(rt, shardGroups)
+}
+
+func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
+	applied, ok := engine.(interface{ AppliedIndex() uint64 })
+	if !ok {
+		return nil
+	}
+	return applied.AppliedIndex
+}
+
+func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
+	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
+		*raftId,
+		*raftDir,
+		cfg.groups,
+		cfg.defaultGroup,
+		cfg.multi,
+		*encryptionSidecarPath,
+		*encryptionEnabled,
+	); err != nil {
+		return nil, err
+	}
+	return loadKEKAndRunStartupGuards()
 }
 
 // loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
@@ -1194,6 +1226,16 @@ type serversInput struct {
 // startServers wires up the AdminServer, builds the runtime runner, and
 // kicks off both the per-group raft listeners and the admin HTTP listener.
 // Extracted from run() to keep cyclomatic complexity within budget.
+func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) error, in serversInput) error {
+	if waitRotateOnStartup != nil {
+		if err := waitRotateOnStartup(in.ctx); err != nil {
+			in.cancel()
+			return errors.Wrap(err, "encryption rotate-on-startup: wait before serving")
+		}
+	}
+	return startServers(in)
+}
+
 func startServers(in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
@@ -1676,6 +1718,7 @@ func startRaftServers(
 			enableMutators,
 			rt.engine,
 			encryptionCapabilityFanout,
+			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)

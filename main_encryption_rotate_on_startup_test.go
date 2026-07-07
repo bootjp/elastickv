@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -81,11 +82,41 @@ func (f *fakeRotateStartupRunner) Run(context.Context) error {
 
 func (f *fakeRotateStartupRunner) Done() bool { return f.done.Load() }
 
+type retryOnceRotateStartupRunner struct {
+	runs atomic.Int32
+	done atomic.Bool
+	err  error
+}
+
+func (r *retryOnceRotateStartupRunner) Run(context.Context) error {
+	if r.runs.Add(1) == 1 {
+		return r.err
+	}
+	r.done.Store(true)
+	return nil
+}
+
+func (r *retryOnceRotateStartupRunner) Done() bool { return r.done.Load() }
+
+type blockingDoneRotateStartupRunner struct {
+	doneEntered chan struct{}
+	releaseDone chan struct{}
+	once        sync.Once
+}
+
+func (b *blockingDoneRotateStartupRunner) Run(context.Context) error { return nil }
+
+func (b *blockingDoneRotateStartupRunner) Done() bool {
+	b.once.Do(func() { close(b.doneEntered) })
+	<-b.releaseDone
+	return false
+}
+
 func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderBlocks(t *testing.T) {
 	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
 	runner := &fakeRotateStartupRunner{}
-	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, slog.Default())
 	defer deregister()
 	if got := runner.runs.Load(); got != 1 {
 		t.Fatalf("immediate leader must run rotation synchronously before returning; runs=%d", got)
@@ -111,18 +142,44 @@ func TestInstallEncryptionRotateOnStartupRequest_FollowerFiresOnLeadership(t *te
 	}
 }
 
-func TestInstallEncryptionRotateOnStartupRequest_RechecksLeaderAfterRegister(t *testing.T) {
-	t.Parallel()
+func TestInstallEncryptionRotateOnStartupRequest_RetriesTransientWhileLeader(t *testing.T) {
+	oldDelay := encryptionRotateOnStartupRetryDelay
+	encryptionRotateOnStartupRetryDelay = time.Millisecond
+	defer func() { encryptionRotateOnStartupRetryDelay = oldDelay }()
+
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
-	runner := &fakeRotateStartupRunner{err: raftengine.ErrLeadershipLost}
+	runner := &retryOnceRotateStartupRunner{err: status.Error(codes.Unavailable, "try again")}
 	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
 	defer deregister()
-	deadline := time.Now().Add(2 * time.Second)
-	for runner.runs.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	if got := runner.runs.Load(); got != 2 {
+		t.Fatalf("transient startup rotation must retry before returning; runs=%d", got)
 	}
-	if got := runner.runs.Load(); got < 2 {
-		t.Fatalf("leader recheck after callback registration did not retry pending rotation; runs=%d", got)
+}
+
+func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *testing.T) {
+	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
+	runner := &blockingDoneRotateStartupRunner{
+		doneEntered: make(chan struct{}),
+		releaseDone: make(chan struct{}),
+	}
+	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	defer deregister()
+	defer close(runner.releaseDone)
+
+	returned := make(chan struct{})
+	go func() {
+		controller.becomeLeader()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("leader-acquired callback blocked before starting async rotation")
+	}
+	select {
+	case <-runner.doneEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async rotation did not reach Done")
 	}
 }
 
