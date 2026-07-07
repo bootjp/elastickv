@@ -23,7 +23,7 @@ import (
 // per-node status surfaced in the response.
 //
 // Merge semantics differ from the matrix fan-out — see
-// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §6:
+// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md §6:
 //
 //   - count per key:      SUM across peers (responses already carry
 //     scaled-to-true estimates from buildHotKeysResponse).

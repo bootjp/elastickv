@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Per-cell hot-key drill-down (design 2026_05_28_proposed_keyviz_hot_key_topk).
+// Per-cell hot-key drill-down (design 2026_05_28_implemented_keyviz_hot_key_topk).
 // Off by default; opt in via MemSamplerOptions.HotKeysEnabled. Disabled-case
 // overhead is one early-return branch on Observe; enabled-case overhead is a
 // length check, the splitmix64 `nextSampleRoll() % R == 0` sample gate (see

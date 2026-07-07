@@ -271,7 +271,7 @@ memory each group's private cache/memtable pins.
   with proposed extensions for cluster fan-out
   (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
   subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
-  hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
+  hot-key top-K (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell
   conflict (implemented). It is the detection signal M3 reuses. Current
   adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
   coordinator sampler, so read-heavy hotspots remain invisible until read-path

@@ -196,7 +196,7 @@ var (
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
 
-	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_implemented_keyviz_hot_key_topk).
 	// Off by default — the disabled-case adds one early-return branch
 	// to Observe and retains zero real key bytes. When enabled, the
 	// sampler retains actual hot key bytes in memory and exposes them
