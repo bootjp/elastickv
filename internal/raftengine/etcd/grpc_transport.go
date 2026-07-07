@@ -15,6 +15,8 @@ import (
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const defaultSnapshotChunkSize = 16 << 20
@@ -41,6 +43,12 @@ var grpcNewClient = grpc.NewClient
 
 type MessageHandler func(context.Context, raftpb.Message) error
 
+type peerStream struct {
+	mu     sync.Mutex
+	stream pb.EtcdRaft_SendStreamClient
+	cancel context.CancelFunc
+}
+
 type GRPCTransport struct {
 	pb.UnimplementedEtcdRaftServer
 
@@ -48,6 +56,9 @@ type GRPCTransport struct {
 	peers             map[uint64]Peer
 	clients           map[string]pb.EtcdRaftClient
 	conns             map[string]*grpc.ClientConn
+	streams           map[string]*peerStream
+	streamSupported   map[string]bool
+	streamUnsupported map[string]bool
 	handler           MessageHandler
 	snapshotChunkSize int
 	spoolDir          string
@@ -86,6 +97,9 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		peers:             peerMap,
 		clients:           make(map[string]pb.EtcdRaftClient),
 		conns:             make(map[string]*grpc.ClientConn),
+		streams:           make(map[string]*peerStream),
+		streamSupported:   make(map[string]bool),
+		streamUnsupported: make(map[string]bool),
 		snapshotChunkSize: defaultSnapshotChunkSize,
 		bridgeSem:         make(chan struct{}, defaultBridgeMaterializeLimit),
 	}
@@ -201,6 +215,10 @@ func (t *GRPCTransport) Close() error {
 	defer t.mu.Unlock()
 
 	var err error
+	for addr, stream := range t.streams {
+		delete(t.streams, addr)
+		stream.cancel()
+	}
 	for addr, conn := range t.conns {
 		delete(t.conns, addr)
 		delete(t.clients, addr)
@@ -213,6 +231,9 @@ func (t *GRPCTransport) closePeerConnLocked(address string) {
 	if address == "" {
 		return
 	}
+	t.closePeerStreamLocked(address)
+	delete(t.streamSupported, address)
+	delete(t.streamUnsupported, address)
 	conn, ok := t.conns[address]
 	if !ok {
 		delete(t.clients, address)
@@ -223,6 +244,28 @@ func (t *GRPCTransport) closePeerConnLocked(address string) {
 	if err := conn.Close(); err != nil {
 		slog.Warn("failed to close etcd raft peer connection", "address", address, "error", err)
 	}
+}
+
+func (t *GRPCTransport) closePeerStream(address string, expected *peerStream) {
+	if address == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stream, ok := t.streams[address]
+	if !ok || (expected != nil && stream != expected) {
+		return
+	}
+	t.closePeerStreamLocked(address)
+}
+
+func (t *GRPCTransport) closePeerStreamLocked(address string) {
+	stream, ok := t.streams[address]
+	if !ok {
+		return
+	}
+	delete(t.streams, address)
+	stream.cancel()
 }
 
 func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error {
@@ -376,12 +419,130 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	client, err := t.clientFor(msg.To)
+	peer, err := t.peerFor(msg.To)
 	if err != nil {
 		return err
 	}
-	_, err = client.Send(ctx, &pb.EtcdRaftMessage{Message: raw})
+	client, err := t.clientForPeer(peer)
+	if err != nil {
+		return err
+	}
+	req := &pb.EtcdRaftMessage{Message: raw}
+	if t.peerStreamUnsupported(peer.Address) {
+		return t.dispatchRegularUnary(ctx, client, req)
+	}
+	err = t.dispatchRegularStream(ctx, peer.Address, client, req)
+	if err == nil {
+		return nil
+	}
+	if grpcStatusCode(err) == codes.Unimplemented {
+		t.markPeerStreamUnsupported(peer.Address)
+		return t.dispatchRegularUnary(ctx, client, req)
+	}
 	return errors.WithStack(err)
+}
+
+func (t *GRPCTransport) dispatchRegularUnary(ctx context.Context, client pb.EtcdRaftClient, req *pb.EtcdRaftMessage) error {
+	_, err := client.Send(ctx, req)
+	return errors.WithStack(err)
+}
+
+func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address string, client pb.EtcdRaftClient, req *pb.EtcdRaftMessage) error {
+	stream, err := t.streamFor(ctx, address, client)
+	if err != nil {
+		return err
+	}
+	stream.mu.Lock()
+	err = stream.stream.Send(req)
+	stream.mu.Unlock()
+	if err != nil {
+		t.closePeerStream(address, stream)
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (t *GRPCTransport) streamFor(ctx context.Context, address string, client pb.EtcdRaftClient) (*peerStream, error) {
+	t.mu.RLock()
+	stream, ok := t.streams[address]
+	unsupported := t.streamUnsupported[address]
+	t.mu.RUnlock()
+	if ok {
+		return stream, nil
+	}
+	if unsupported {
+		return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
+	}
+	if err := t.probeSendStream(ctx, address, client); err != nil {
+		return nil, err
+	}
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	sendStream, err := client.SendStream(streamCtx)
+	if err != nil {
+		cancel()
+		return nil, errors.WithStack(err)
+	}
+	opened := &peerStream{stream: sendStream, cancel: cancel}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if existing, ok := t.streams[address]; ok {
+		cancel()
+		return existing, nil
+	}
+	t.streams[address] = opened
+	return opened, nil
+}
+
+func (t *GRPCTransport) probeSendStream(ctx context.Context, address string, client pb.EtcdRaftClient) error {
+	t.mu.RLock()
+	supported := t.streamSupported[address]
+	unsupported := t.streamUnsupported[address]
+	t.mu.RUnlock()
+	switch {
+	case supported:
+		return nil
+	case unsupported:
+		return errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
+	}
+
+	stream, err := client.SendStream(ctx)
+	if err != nil {
+		if grpcStatusCode(err) == codes.Unimplemented {
+			t.markPeerStreamUnsupported(address)
+		}
+		return errors.WithStack(err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		if grpcStatusCode(err) == codes.Unimplemented {
+			t.markPeerStreamUnsupported(address)
+		}
+		return errors.WithStack(err)
+	}
+	t.markPeerStreamSupported(address)
+	return nil
+}
+
+func (t *GRPCTransport) peerStreamUnsupported(address string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.streamUnsupported[address]
+}
+
+func (t *GRPCTransport) markPeerStreamSupported(address string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streamSupported[address] = true
+	delete(t.streamUnsupported, address)
+}
+
+func (t *GRPCTransport) markPeerStreamUnsupported(address string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streamUnsupported[address] = true
+	delete(t.streamSupported, address)
+	t.closePeerStreamLocked(address)
 }
 
 func (t *GRPCTransport) DispatchSnapshotSpool(ctx context.Context, msg raftpb.Message, spool *snapshotSpool) error {
@@ -413,6 +574,23 @@ func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) erro
 		return err
 	}
 	return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
+}
+
+func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
+	for {
+		req, err := stream.Recv()
+		switch {
+		case errors.Is(err, io.EOF):
+			return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
+		case err != nil:
+			return errors.WithStack(err)
+		case req == nil:
+			continue
+		}
+		if err := t.handleRaftRequest(stream.Context(), req); err != nil {
+			return err
+		}
+	}
 }
 
 // removeOrphanedFSMSnapshot deletes the .fsm file that
@@ -457,14 +635,21 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 	if req == nil {
 		return &pb.EtcdRaftAck{}, nil
 	}
-	var msg raftpb.Message
-	if err := msg.Unmarshal(req.Message); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if err := t.handle(ctx, msg); err != nil {
+	if err := t.handleRaftRequest(ctx, req); err != nil {
 		return nil, err
 	}
 	return &pb.EtcdRaftAck{}, nil
+}
+
+func (t *GRPCTransport) handleRaftRequest(ctx context.Context, req *pb.EtcdRaftMessage) error {
+	var msg raftpb.Message
+	if err := msg.Unmarshal(req.Message); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := t.handle(ctx, msg); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) error {
@@ -520,7 +705,10 @@ func (t *GRPCTransport) clientFor(to uint64) (pb.EtcdRaftClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	return t.clientForPeer(peer)
+}
 
+func (t *GRPCTransport) clientForPeer(peer Peer) (pb.EtcdRaftClient, error) {
 	t.mu.RLock()
 	client, ok := t.clients[peer.Address]
 	t.mu.RUnlock()
@@ -560,6 +748,13 @@ func (t *GRPCTransport) clientFor(to uint64) (pb.EtcdRaftClient, error) {
 		return nil, errors.New("etcd raft transport dial returned unexpected client type")
 	}
 	return client, nil
+}
+
+func grpcStatusCode(err error) codes.Code {
+	if err == nil {
+		return codes.OK
+	}
+	return status.Code(err)
 }
 
 func (t *GRPCTransport) chunkSize() int {

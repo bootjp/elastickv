@@ -776,6 +776,115 @@ func TestNewGRPCTransportDerivesPeerNodeIDs(t *testing.T) {
 	require.Equal(t, "127.0.0.1:65530", peer.Address)
 }
 
+func TestSendStreamReceivesRegularMessages(t *testing.T) {
+	reqs := []*pb.EtcdRaftMessage{
+		mustEtcdRaftMessage(t, raftpb.Message{Type: raftpb.MsgApp, From: 1, To: 2, Term: 3, Index: 10}),
+		mustEtcdRaftMessage(t, raftpb.Message{Type: raftpb.MsgHeartbeat, From: 1, To: 2, Term: 3, Commit: 9}),
+	}
+	transport := NewGRPCTransport(nil)
+	var got []raftpb.Message
+	transport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
+		got = append(got, msg)
+		return nil
+	})
+	stream := &testSendStreamServer{messages: reqs}
+
+	require.NoError(t, transport.SendStream(stream))
+	require.True(t, stream.closed)
+	require.Len(t, got, 2)
+	require.Equal(t, raftpb.MsgApp, got[0].Type)
+	require.Equal(t, uint64(10), got[0].Index)
+	require.Equal(t, raftpb.MsgHeartbeat, got[1].Type)
+	require.Equal(t, uint64(9), got[1].Commit)
+}
+
+func TestDispatchRegularUsesSendStream(t *testing.T) {
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lis.Close() })
+
+	recvTransport := NewGRPCTransport(nil)
+	gotCh := make(chan raftpb.Message, 2)
+	recvTransport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
+		gotCh <- msg
+		return nil
+	})
+
+	server := grpc.NewServer()
+	recvTransport.Register(server)
+	t.Cleanup(server.Stop)
+	go func() { _ = server.Serve(lis) }()
+
+	sendTransport := NewGRPCTransport([]Peer{{NodeID: 2, Address: lis.Addr().String()}})
+	t.Cleanup(func() { require.NoError(t, sendTransport.Close()) })
+
+	require.NoError(t, sendTransport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  raftpb.MsgApp,
+		From:  1,
+		To:    2,
+		Term:  4,
+		Index: 22,
+	}))
+	require.NoError(t, sendTransport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:   raftpb.MsgHeartbeat,
+		From:   1,
+		To:     2,
+		Term:   4,
+		Commit: 22,
+	}))
+
+	got := collectRaftMessages(t, gotCh, 2)
+	require.Equal(t, raftpb.MsgApp, got[0].Type)
+	require.Equal(t, uint64(22), got[0].Index)
+	require.Equal(t, raftpb.MsgHeartbeat, got[1].Type)
+	require.Equal(t, uint64(22), got[1].Commit)
+
+	sendTransport.mu.RLock()
+	_, streamCached := sendTransport.streams[lis.Addr().String()]
+	streamSupported := sendTransport.streamSupported[lis.Addr().String()]
+	sendTransport.mu.RUnlock()
+	require.True(t, streamCached)
+	require.True(t, streamSupported)
+}
+
+func TestDispatchRegularFallsBackToUnaryWhenSendStreamUnimplemented(t *testing.T) {
+	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lis.Close() })
+
+	legacy := &legacyEtcdRaftServer{got: make(chan raftpb.Message, 2)}
+	server := grpc.NewServer()
+	pb.RegisterEtcdRaftServer(server, legacy)
+	t.Cleanup(server.Stop)
+	go func() { _ = server.Serve(lis) }()
+
+	sendTransport := NewGRPCTransport([]Peer{{NodeID: 2, Address: lis.Addr().String()}})
+	t.Cleanup(func() { require.NoError(t, sendTransport.Close()) })
+
+	require.NoError(t, sendTransport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  raftpb.MsgApp,
+		From:  1,
+		To:    2,
+		Term:  5,
+		Index: 30,
+	}))
+	require.True(t, sendTransport.peerStreamUnsupported(lis.Addr().String()))
+
+	require.NoError(t, sendTransport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  raftpb.MsgAppResp,
+		From:  1,
+		To:    2,
+		Term:  5,
+		Index: 31,
+	}))
+
+	got := collectRaftMessages(t, legacy.got, 2)
+	require.Equal(t, raftpb.MsgApp, got[0].Type)
+	require.Equal(t, uint64(30), got[0].Index)
+	require.Equal(t, raftpb.MsgAppResp, got[1].Type)
+	require.Equal(t, uint64(31), got[1].Index)
+}
+
 type testSendSnapshotServer struct {
 	chunks []*pb.EtcdRaftSnapshotChunk
 	index  int
@@ -814,6 +923,83 @@ func (*testSendSnapshotServer) SendMsg(any) error {
 
 func (*testSendSnapshotServer) RecvMsg(any) error {
 	return nil
+}
+
+type testSendStreamServer struct {
+	messages []*pb.EtcdRaftMessage
+	index    int
+	closed   bool
+}
+
+func (s *testSendStreamServer) Recv() (*pb.EtcdRaftMessage, error) {
+	if s.index >= len(s.messages) {
+		return nil, io.EOF
+	}
+	msg := s.messages[s.index]
+	s.index++
+	return msg, nil
+}
+
+func (s *testSendStreamServer) SendAndClose(*pb.EtcdRaftAck) error {
+	s.closed = true
+	return nil
+}
+
+func (*testSendStreamServer) SetHeader(metadata.MD) error {
+	return nil
+}
+
+func (*testSendStreamServer) SendHeader(metadata.MD) error {
+	return nil
+}
+
+func (*testSendStreamServer) SetTrailer(metadata.MD) {}
+
+func (*testSendStreamServer) Context() context.Context {
+	return context.Background()
+}
+
+func (*testSendStreamServer) SendMsg(any) error {
+	return nil
+}
+
+func (*testSendStreamServer) RecvMsg(any) error {
+	return nil
+}
+
+type legacyEtcdRaftServer struct {
+	pb.UnimplementedEtcdRaftServer
+	got chan raftpb.Message
+}
+
+func (s *legacyEtcdRaftServer) Send(_ context.Context, req *pb.EtcdRaftMessage) (*pb.EtcdRaftAck, error) {
+	var msg raftpb.Message
+	if err := msg.Unmarshal(req.GetMessage()); err != nil {
+		return nil, err
+	}
+	s.got <- msg
+	return &pb.EtcdRaftAck{}, nil
+}
+
+func mustEtcdRaftMessage(t *testing.T, msg raftpb.Message) *pb.EtcdRaftMessage {
+	t.Helper()
+	raw, err := msg.Marshal()
+	require.NoError(t, err)
+	return &pb.EtcdRaftMessage{Message: raw}
+}
+
+func collectRaftMessages(t *testing.T, ch <-chan raftpb.Message, count int) []raftpb.Message {
+	t.Helper()
+	got := make([]raftpb.Message, 0, count)
+	for len(got) < count {
+		select {
+		case msg := <-ch:
+			got = append(got, msg)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for raft message %d/%d", len(got)+1, count)
+		}
+	}
+	return got
 }
 
 // --- applyBridgeMode tests ---
@@ -936,16 +1122,46 @@ func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
 // testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
 // SendSnapshot calls to a pre-wired testSnapshotSendClient.
 type testEtcdRaftClient struct {
-	stream *testSnapshotSendClient
+	stream     *testSnapshotSendClient
+	raftStream *testRaftSendStreamClient
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
 	return &pb.EtcdRaftAck{}, nil
 }
 
+func (c *testEtcdRaftClient) SendStream(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
+	if c.raftStream != nil {
+		return c.raftStream, nil
+	}
+	return &testRaftSendStreamClient{}, nil
+}
+
 func (c *testEtcdRaftClient) SendSnapshot(_ context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendSnapshotClient, error) {
 	return c.stream, nil
 }
+
+type testRaftSendStreamClient struct {
+	messages []*pb.EtcdRaftMessage
+	closed   bool
+}
+
+func (c *testRaftSendStreamClient) Send(msg *pb.EtcdRaftMessage) error {
+	c.messages = append(c.messages, msg)
+	return nil
+}
+
+func (c *testRaftSendStreamClient) CloseAndRecv() (*pb.EtcdRaftAck, error) {
+	c.closed = true
+	return &pb.EtcdRaftAck{}, nil
+}
+
+func (*testRaftSendStreamClient) Header() (metadata.MD, error) { return nil, nil }
+func (*testRaftSendStreamClient) Trailer() metadata.MD         { return nil }
+func (*testRaftSendStreamClient) CloseSend() error             { return nil }
+func (*testRaftSendStreamClient) Context() context.Context     { return context.Background() }
+func (*testRaftSendStreamClient) SendMsg(any) error            { return nil }
+func (*testRaftSendStreamClient) RecvMsg(any) error            { return nil }
 
 // injectClient pre-populates the transport's client cache for the given peer
 // address so calls to clientFor return the mock without dialling.
