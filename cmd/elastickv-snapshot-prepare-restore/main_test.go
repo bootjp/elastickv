@@ -113,6 +113,22 @@ func TestRunPrepareRestoreClassifiesTruncatedHeaderAsDataErr(t *testing.T) {
 	require.Equal(t, exitDataErr, code)
 }
 
+func TestRunPrepareRestoreRejectsEntryTimestampAboveHeader(t *testing.T) {
+	dir := t.TempDir()
+	input := writeSingleEntryFSM(t, filepath.Join(dir, "encoded.fsm"), 10, 11)
+	writeEncodeInfo(t, input, "cluster-a", true, true)
+
+	code, err := run([]string{
+		"--input", input,
+		"--data-dir", filepath.Join(dir, "raft"),
+		"--index", "5",
+		"--peers", "n1=127.0.0.1:12001",
+		"--target-cluster-id", "cluster-a",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, errRestoreSnapshotTimestampCeiling)
+	require.Equal(t, exitDataErr, code)
+}
+
 func TestRunPrepareRestoreAcceptedFlagCombinations(t *testing.T) {
 	testCases := []struct {
 		name            string
@@ -207,6 +223,8 @@ func TestClassifyErrorTreatsMalformedSnapshotEntriesAsDataErr(t *testing.T) {
 	} {
 		require.Equal(t, exitDataErr, classifyError(err))
 	}
+	require.Equal(t, exitDataErr, classifyError(errRestoreEncodeInfoTooLarge))
+	require.Equal(t, exitDataErr, classifyError(errRestoreSnapshotTimestampCeiling))
 }
 
 func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {
@@ -221,6 +239,32 @@ func writeHeaderOnlyFSM(t *testing.T, path string) string {
 	_, err = f.WriteString(backup.PebbleSnapshotMagic)
 	require.NoError(t, err)
 	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(1234)))
+	require.NoError(t, f.Close())
+	return path
+}
+
+func writeSingleEntryFSM(t *testing.T, path string, headerTS uint64, entryTS uint64) string {
+	t.Helper()
+	const (
+		testSnapshotTSSize          = 8
+		testSnapshotValueHeaderSize = 9
+	)
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = f.WriteString(backup.PebbleSnapshotMagic)
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(f, binary.LittleEndian, headerTS))
+	key := make([]byte, len("key")+testSnapshotTSSize)
+	copy(key, "key")
+	binary.BigEndian.PutUint64(key[len("key"):], ^entryTS)
+	value := make([]byte, testSnapshotValueHeaderSize+len("value"))
+	copy(value[testSnapshotValueHeaderSize:], "value")
+	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(key))))
+	_, err = f.Write(key)
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(len(value))))
+	_, err = f.Write(value)
+	require.NoError(t, err)
 	require.NoError(t, f.Close())
 	return path
 }

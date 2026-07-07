@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -20,18 +21,23 @@ import (
 )
 
 const (
-	exitSuccess = 0
-	exitUserErr = 1
-	exitDataErr = 2
+	exitSuccess             = 0
+	exitUserErr             = 1
+	exitDataErr             = 2
+	maxEncodeInfoBytes      = 1 << 20
+	restoreInputKindPayload = "payload"
+	restoreInputKindSidecar = "encode-info"
 )
 
 var (
-	errRestoreClusterIDMismatch = errors.New("snapshot restore: cluster_id mismatch")
-	errRestoreClusterIDMissing  = errors.New("snapshot restore: cluster_id missing")
-	errRestoreKeyFormatMismatch = errors.New("snapshot restore: encoder key-format version mismatch")
-	errRestoreSHA256Mismatch    = errors.New("snapshot restore: encoded FSM SHA-256 mismatch")
-	errRestoreSHA256Missing     = errors.New("snapshot restore: encoded FSM SHA-256 missing")
-	errRestoreSelfTestMissing   = errors.New("snapshot restore: encoder self-test did not pass")
+	errRestoreClusterIDMismatch        = errors.New("snapshot restore: cluster_id mismatch")
+	errRestoreClusterIDMissing         = errors.New("snapshot restore: cluster_id missing")
+	errRestoreEncodeInfoTooLarge       = errors.New("snapshot restore: ENCODE_INFO sidecar too large")
+	errRestoreKeyFormatMismatch        = errors.New("snapshot restore: encoder key-format version mismatch")
+	errRestoreSHA256Mismatch           = errors.New("snapshot restore: encoded FSM SHA-256 mismatch")
+	errRestoreSHA256Missing            = errors.New("snapshot restore: encoded FSM SHA-256 missing")
+	errRestoreSelfTestMissing          = errors.New("snapshot restore: encoder self-test did not pass")
+	errRestoreSnapshotTimestampCeiling = errors.New("snapshot restore: entry commit_ts exceeds snapshot header last_commit_ts")
 )
 
 const hlcLogicalBits = 16
@@ -82,11 +88,13 @@ func classifyError(err error) int {
 		errors.Is(err, backup.ErrUnsupportedEncodeInfoFormatVersion),
 		errors.Is(err, errRestoreClusterIDMismatch),
 		errors.Is(err, errRestoreClusterIDMissing),
+		errors.Is(err, errRestoreEncodeInfoTooLarge),
 		errors.Is(err, errRestoreKeyFormatMismatch),
 		errors.Is(err, errRestoreSHA256Mismatch),
 		errors.Is(err, errRestoreSHA256Missing),
 		errors.Is(err, etcd.ErrExternalSnapshotRestoreSHA256),
-		errors.Is(err, errRestoreSelfTestMissing):
+		errors.Is(err, errRestoreSelfTestMissing),
+		errors.Is(err, errRestoreSnapshotTimestampCeiling):
 		return exitDataErr
 	default:
 		return exitUserErr
@@ -176,12 +184,22 @@ func prepare(cfg *config, logger *slog.Logger) error {
 }
 
 func readEncodeInfo(path string) (backup.EncodeInfo, error) {
+	if err := requireRegularRestoreFile(path, restoreInputKindSidecar); err != nil {
+		return backup.EncodeInfo{}, err
+	}
 	f, err := os.Open(path) //nolint:gosec // operator-supplied sidecar path
 	if err != nil {
 		return backup.EncodeInfo{}, errors.WithStack(err)
 	}
 	defer func() { _ = f.Close() }()
-	info, err := backup.ReadEncodeInfo(f)
+	body, err := io.ReadAll(io.LimitReader(f, maxEncodeInfoBytes+1))
+	if err != nil {
+		return backup.EncodeInfo{}, errors.WithStack(err)
+	}
+	if int64(len(body)) > maxEncodeInfoBytes {
+		return backup.EncodeInfo{}, errors.Wrapf(errRestoreEncodeInfoTooLarge, "%s exceeds %d bytes", path, maxEncodeInfoBytes)
+	}
+	info, err := backup.ReadEncodeInfo(bytes.NewReader(body))
 	if err != nil {
 		return backup.EncodeInfo{}, errors.Wrap(err, "read encode info")
 	}
@@ -189,7 +207,7 @@ func readEncodeInfo(path string) (backup.EncodeInfo, error) {
 }
 
 func validatePayload(path string) (backup.SnapshotHeader, string, error) {
-	if err := requireRegularRestoreInput(path); err != nil {
+	if err := requireRegularRestoreFile(path, restoreInputKindPayload); err != nil {
 		return backup.SnapshotHeader{}, "", err
 	}
 	f, err := os.Open(path) //nolint:gosec // operator-supplied restore artifact path
@@ -198,7 +216,11 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 	}
 	defer func() { _ = f.Close() }()
 	h := sha256.New()
-	header, err := backup.ReadSnapshotWithHeader(io.TeeReader(f, h), func(backup.SnapshotHeader, backup.SnapshotEntry) error {
+	var maxEntryCommitTS uint64
+	header, err := backup.ReadSnapshotWithHeader(io.TeeReader(f, h), func(_ backup.SnapshotHeader, entry backup.SnapshotEntry) error {
+		if entry.CommitTS > maxEntryCommitTS {
+			maxEntryCommitTS = entry.CommitTS
+		}
 		return nil
 	})
 	if err != nil {
@@ -207,16 +229,20 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 		}
 		return backup.SnapshotHeader{}, "", errors.Wrap(err, "read encoded snapshot payload")
 	}
+	if maxEntryCommitTS > header.LastCommitTS {
+		return backup.SnapshotHeader{}, "", errors.Wrapf(errRestoreSnapshotTimestampCeiling,
+			"max entry commit_ts %d > header last_commit_ts %d", maxEntryCommitTS, header.LastCommitTS)
+	}
 	return header, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func requireRegularRestoreInput(path string) error {
+func requireRegularRestoreFile(path string, kind string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	if !info.Mode().IsRegular() {
-		return errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s is not a regular file", path)
+		return errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is not a regular file", kind, path)
 	}
 	return nil
 }

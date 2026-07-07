@@ -217,9 +217,23 @@ func openArchiveInput(path string) (io.Reader, func() error, error) {
 	if path == "-" {
 		return os.Stdin, func() error { return nil }, nil
 	}
+	if err := requireRegularArchiveInput(path); err != nil {
+		return nil, nil, err
+	}
 	f, err := os.Open(path) //nolint:gosec // operator-supplied input path
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
 	return f, func() error { return errors.WithStack(f.Close()) }, nil
+}
+
+func requireRegularArchiveInput(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(backup.ErrArchiveNonRegular, "%s is not a regular archive input", path)
+	}
+	return nil
 }
