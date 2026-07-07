@@ -10,7 +10,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const ttlInlineMigrationTickScanLimit = 512
+const (
+	ttlInlineMigrationTickScanLimit = 512
+	ttlInlineMigrationBatchKeyLimit = 32
+)
 
 type ttlInlineMigrationHandler struct {
 	typeName       string
@@ -142,11 +145,12 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 			if err != nil {
 				return nil, err
 			}
-			if ttlMs == 0 {
-				ttlMs, err = legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-				if err != nil {
-					return nil, err
-				}
+			legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+			if err != nil {
+				return nil, err
+			}
+			if legacyTTL != 0 && legacyTTL != ttlMs {
+				ttlMs = legacyTTL
 			}
 			desired := marshal(n, ttlMs)
 			elems := putIfChanged(pair.Key, pair.Value, desired)
@@ -160,7 +164,20 @@ func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlin
 	if err != nil {
 		return err
 	}
-	var elems []*kv.Elem[kv.OP]
+	var (
+		elems      []*kv.Elem[kv.OP]
+		batchKeys  int
+		flushBatch = func() error {
+			if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
+				c.logger.WarnContext(ctx, "ttl inline migrator: batch dispatch failed",
+					"type", h.typeName, "error", err)
+				return err
+			}
+			elems = nil
+			batchKeys = 0
+			return nil
+		}
+	)
 	for _, pair := range kvs {
 		userKey := h.extractUserKey(pair.Key)
 		if len(userKey) == 0 || !c.coord.IsLeaderForKey(userKey) {
@@ -173,10 +190,14 @@ func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlin
 			continue
 		}
 		elems = append(elems, built...)
+		batchKeys++
+		if batchKeys >= ttlInlineMigrationBatchKeyLimit {
+			if err := flushBatch(); err != nil {
+				return err
+			}
+		}
 	}
-	if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
-		c.logger.WarnContext(ctx, "ttl inline migrator: batch dispatch failed",
-			"type", h.typeName, "error", err)
+	if err := flushBatch(); err != nil {
 		return err
 	}
 	c.advanceCursor(h.typeName, lastKVKey(kvs), truncated)
@@ -255,11 +276,12 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if meta.ExpireAt == 0 {
-		meta.ExpireAt, err = legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-		if err != nil {
-			return nil, err
-		}
+	legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if legacyTTL != 0 && legacyTTL != meta.ExpireAt {
+		meta.ExpireAt = legacyTTL
 	}
 	desired, err := store.MarshalListMeta(meta)
 	if err != nil {
@@ -278,11 +300,12 @@ func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if meta.ExpireAt == 0 {
-		meta.ExpireAt, err = legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-		if err != nil {
-			return nil, err
-		}
+	legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if legacyTTL != 0 && legacyTTL != meta.ExpireAt {
+		meta.ExpireAt = legacyTTL
 	}
 	desired, err := store.MarshalStreamMeta(meta)
 	if err != nil {

@@ -103,6 +103,10 @@ type txnContext struct {
 	zsetStates map[string]*zsetTxnState
 	ttlStates  map[string]*ttlTxnState
 	readKeys   map[string][]byte
+	// collectionExpireTypes remembers non-string keys whose TTL was changed in
+	// this transaction so commit can rewrite the collection metadata anchor in
+	// the same Raft transaction as the !redis|ttl| scan index.
+	collectionExpireTypes map[string]redisValueType
 	// streamDeletions tracks user keys whose stream wide-column layout must
 	// be tombstoned on commit: the !stream|meta|<key> record plus every
 	// !stream|entry|<key><ID> row. stageKeyDeletion seeds this (MULTI/EXEC
@@ -663,6 +667,13 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
 	state.value = &expireAt
 	state.dirty = true
+	if isNonStringCollectionType(typ) {
+		if t.collectionExpireTypes == nil {
+			t.collectionExpireTypes = map[string]redisValueType{}
+		}
+		t.collectionExpireTypes[string(key)] = typ
+		return redisResult{typ: resultInt, integer: 1}, nil
+	}
 	if typ != redisTypeString {
 		return redisResult{typ: resultInt, integer: 1}, nil
 	}
@@ -897,6 +908,12 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 
 	elems = append(elems, listElems...)
 	elems = append(elems, zsetElems...)
+	collectionTTLElems, err := t.buildCollectionTTLElems(ctx)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	elems = append(elems, collectionTTLElems...)
 	elems = append(elems, ttlElems...)
 	elems = append(elems, streamElems...)
 
@@ -1210,6 +1227,35 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 	return elems
 }
 
+func (t *txnContext) buildCollectionTTLElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	if len(t.collectionExpireTypes) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(t.collectionExpireTypes))
+	for key := range t.collectionExpireTypes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var elems []*kv.Elem[kv.OP]
+	for _, key := range keys {
+		st := t.ttlStates[key]
+		if st == nil || !st.dirty || st.value == nil {
+			continue
+		}
+		userKey := []byte(key)
+		typ := t.collectionExpireTypes[key]
+		built, ok, err := t.server.collectionExpireElems(ctx, userKey, t.startTS, typ, redisExpireAtMillis(*st.value))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			elems = append(elems, built...)
+		}
+	}
+	return elems, nil
+}
+
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
 	if r.onePhaseTxnDedup {
 		return r.runTransactionWithDedup(queue)
@@ -1225,15 +1271,16 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 		defer readPin.Release()
 
 		txn := &txnContext{
-			server:          r,
-			ctx:             dispatchCtx,
-			working:         map[string]*txnValue{},
-			listStates:      map[string]*listTxnState{},
-			zsetStates:      map[string]*zsetTxnState{},
-			ttlStates:       map[string]*ttlTxnState{},
-			readKeys:        map[string][]byte{},
-			streamDeletions: map[string][]byte{},
-			startTS:         startTS,
+			server:                r,
+			ctx:                   dispatchCtx,
+			working:               map[string]*txnValue{},
+			listStates:            map[string]*listTxnState{},
+			zsetStates:            map[string]*zsetTxnState{},
+			ttlStates:             map[string]*ttlTxnState{},
+			readKeys:              map[string][]byte{},
+			collectionExpireTypes: map[string]redisValueType{},
+			streamDeletions:       map[string][]byte{},
+			startTS:               startTS,
 		}
 
 		nextResults := make([]redisResult, 0, len(queue))

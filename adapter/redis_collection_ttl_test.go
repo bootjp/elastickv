@@ -22,15 +22,15 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 	ttl := 30 * time.Second
 	cases := []struct {
 		name     string
-		key      string
-		create   func() error
+		keyBase  string
+		create   func(string) error
 		metaKey  func([]byte) []byte
 		expireAt func([]byte) (uint64, error)
 	}{
 		{
 			name:    "hash",
-			key:     "ttl:inline:hash",
-			create:  func() error { return rdb.HSet(ctx, "ttl:inline:hash", "field", "value").Err() },
+			keyBase: "ttl:inline:hash",
+			create:  func(key string) error { return rdb.HSet(ctx, key, "field", "value").Err() },
 			metaKey: store.HashMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalHashMeta(raw)
@@ -39,8 +39,8 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		},
 		{
 			name:    "set",
-			key:     "ttl:inline:set",
-			create:  func() error { return rdb.SAdd(ctx, "ttl:inline:set", "member").Err() },
+			keyBase: "ttl:inline:set",
+			create:  func(key string) error { return rdb.SAdd(ctx, key, "member").Err() },
 			metaKey: store.SetMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalSetMeta(raw)
@@ -48,10 +48,10 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 			},
 		},
 		{
-			name: "zset",
-			key:  "ttl:inline:zset",
-			create: func() error {
-				return rdb.ZAdd(ctx, "ttl:inline:zset", redis.Z{Score: 1, Member: "member"}).Err()
+			name:    "zset",
+			keyBase: "ttl:inline:zset",
+			create: func(key string) error {
+				return rdb.ZAdd(ctx, key, redis.Z{Score: 1, Member: "member"}).Err()
 			},
 			metaKey: store.ZSetMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
@@ -61,8 +61,8 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		},
 		{
 			name:    "list",
-			key:     "ttl:inline:list",
-			create:  func() error { return rdb.RPush(ctx, "ttl:inline:list", "item").Err() },
+			keyBase: "ttl:inline:list",
+			create:  func(key string) error { return rdb.RPush(ctx, key, "item").Err() },
 			metaKey: store.ListMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalListMeta(raw)
@@ -70,11 +70,11 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 			},
 		},
 		{
-			name: "stream",
-			key:  "ttl:inline:stream",
-			create: func() error {
+			name:    "stream",
+			keyBase: "ttl:inline:stream",
+			create: func(key string) error {
 				return rdb.XAdd(ctx, &redis.XAddArgs{
-					Stream: "ttl:inline:stream",
+					Stream: key,
 					Values: map[string]any{"field": "value"},
 				}).Err()
 			},
@@ -85,27 +85,57 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 			},
 		},
 	}
+	modes := []struct {
+		name   string
+		expire func(string) error
+	}{
+		{
+			name: "direct",
+			expire: func(key string) error {
+				return rdb.PExpire(ctx, key, ttl).Err()
+			},
+		},
+		{
+			name: "multi",
+			expire: func(key string) error {
+				pipe := rdb.TxPipeline()
+				pipe.PExpire(ctx, key, ttl)
+				_, err := pipe.Exec(ctx)
+				return err
+			},
+		},
+		{
+			name: "lua",
+			expire: func(key string) error {
+				_, err := rdb.Eval(ctx, `return redis.call("pexpire", KEYS[1], ARGV[1])`, []string{key}, int(ttl/time.Millisecond)).Result()
+				return err
+			},
+		},
+	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			require.NoError(t, tc.create())
-			require.NoError(t, rdb.PExpire(ctx, tc.key, ttl).Err())
+		for _, mode := range modes {
+			t.Run(tc.name+"/"+mode.name, func(t *testing.T) {
+				key := tc.keyBase + ":" + mode.name
+				require.NoError(t, tc.create(key))
+				require.NoError(t, mode.expire(key))
 
-			readTS := server.readTS()
-			raw, err := server.store.GetAt(ctx, tc.metaKey([]byte(tc.key)), readTS)
-			require.NoError(t, err)
-			expireAtMs, err := tc.expireAt(raw)
-			require.NoError(t, err)
-			require.Greater(t, expireAtMs, redisExpireAtMillis(time.Now().Add(ttl/2)))
+				readTS := server.readTS()
+				raw, err := server.store.GetAt(ctx, tc.metaKey([]byte(key)), readTS)
+				require.NoError(t, err)
+				expireAtMs, err := tc.expireAt(raw)
+				require.NoError(t, err)
+				require.Greater(t, expireAtMs, redisExpireAtMillis(time.Now().Add(ttl/2)))
 
-			commitTS, err := server.coordinator.Clock().NextFenced()
-			require.NoError(t, err)
-			require.NoError(t, server.store.DeleteAt(ctx, redisTTLKey([]byte(tc.key)), commitTS))
+				commitTS, err := server.coordinator.Clock().NextFenced()
+				require.NoError(t, err)
+				require.NoError(t, server.store.DeleteAt(ctx, redisTTLKey([]byte(key)), commitTS))
 
-			got, err := server.ttlAt(ctx, []byte(tc.key), commitTS)
-			require.NoError(t, err)
-			require.NotNil(t, got, "ttlAt should read inline metadata after the scan index is deleted")
-			require.Equal(t, expireAtMs, redisExpireAtMillis(*got))
-		})
+				got, err := server.ttlAt(ctx, []byte(key), commitTS)
+				require.NoError(t, err)
+				require.NotNil(t, got, "ttlAt should read inline metadata after the scan index is deleted")
+				require.Equal(t, expireAtMs, redisExpireAtMillis(*got))
+			})
+		}
 	}
 }

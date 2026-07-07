@@ -101,3 +101,20 @@ func TestRedisLoadHLLAtTreatsExpiredLegacyTTLAsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, live)
 }
+
+func TestRedisLoadHLLAtSkipsLegacyTTLWhenFallbackDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st, disableLegacyTTLReadFallback: true}
+	key := []byte("hll:expired-legacy-disabled")
+	payload, err := marshalSetValue(redisSetValue{Members: []string{"live"}})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 10, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Minute)), 11, 0))
+
+	value, err := server.loadSetAt(ctx, hllKind, key, 11)
+	require.NoError(t, err)
+	require.Equal(t, []string{"live"}, value.Members)
+}

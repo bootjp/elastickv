@@ -3172,7 +3172,7 @@ func (c *luaScriptContext) commit() error {
 		// Plain strings and HLL anchors handle their TTL/index mutations in
 		// their value commit helpers.
 		if isNonStringCollectionType(plan.finalType) {
-			ttlElems, err := c.nonStringTTLElems(key, plan.preserveExisting)
+			ttlElems, err := c.nonStringTTLElems(key, plan.finalType, plan.preserveExisting)
 			if err != nil {
 				return err
 			}
@@ -3201,9 +3201,11 @@ func (c *luaScriptContext) commit() error {
 	return nil
 }
 
-// nonStringTTLElems returns !redis|ttl| elements for a non-string key if the TTL
-// state is dirty (or the key was fully rewritten, requiring TTL to be included).
-func (c *luaScriptContext) nonStringTTLElems(key string, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
+// nonStringTTLElems returns TTL metadata elements for a non-string key if the
+// TTL state is dirty (or the key was fully rewritten, requiring the scan index
+// to be included). preserveExisting=true means the collection data anchor was
+// not rewritten by this script, so a dirty TTL must rewrite that anchor here.
+func (c *luaScriptContext) nonStringTTLElems(key string, typ redisValueType, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
 	st := c.ttls[key]
 	if preserveExisting && (st == nil || !st.dirty) {
 		return nil, nil
@@ -3212,10 +3214,23 @@ func (c *luaScriptContext) nonStringTTLElems(key string, preserveExisting bool) 
 	if err != nil {
 		return nil, err
 	}
-	if ttl == nil {
-		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey([]byte(key))}}, nil
+	keyBytes := []byte(key)
+	elems := []*kv.Elem[kv.OP]{}
+	if preserveExisting {
+		metaElems, ok, err := c.server.collectionExpireElems(context.Background(), keyBytes, c.startTS, typ, ttlMillis(ttl))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			elems = append(elems, metaElems...)
+		}
 	}
-	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)}}, nil
+	if ttl == nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(keyBytes)})
+		return elems, nil
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(keyBytes), Value: encodeRedisTTL(*ttl)})
+	return elems, nil
 }
 
 // commitPlanForKey builds the data Raft elements for a single key.
@@ -3385,6 +3400,17 @@ func (c *luaScriptContext) listCommitElems(key string, commitTS uint64) ([]*kv.E
 	if err != nil {
 		return nil, err
 	}
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	if ttl != nil {
+		meta, err := store.MarshalListMeta(store.ListMeta{ExpireAt: ttlMillis(ttl)})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		listElems = append(listElems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaKey([]byte(key)), Value: meta})
+	}
 	return listElems, nil
 }
 
@@ -3477,6 +3503,10 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	}
 	// Wide-column: write per-field keys and a base meta key with the final count.
 	// deleteLogicalKeyElems (called by the Lua commit flow) clears any old keys.
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.value)+1)
 	for field, val := range st.value {
 		elems = append(elems, &kv.Elem[kv.OP]{
@@ -3488,7 +3518,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey([]byte(key)),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(st.value))}),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(st.value)), ExpireAt: ttlMillis(ttl)}),
 	})
 	return elems, nil
 }
@@ -3503,6 +3533,10 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 		return nil, nil
 	}
 	// Wide-column: write per-member keys and a base meta key with the final count.
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+1)
 	for member := range st.members {
 		elems = append(elems, &kv.Elem[kv.OP]{
@@ -3514,7 +3548,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.SetMetaKey([]byte(key)),
-		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(st.members))}),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(st.members)), ExpireAt: ttlMillis(ttl)}),
 	})
 	return elems, nil
 }
@@ -3534,14 +3568,15 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	// full commit so deleteLogicalKeyElems removes stale wide-column rows
 	// (members, score-index, meta, TTL) that were left by the expired ZSet.
 	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
-		return c.zsetFullCommitWithMerge(key, st), nil
+		return c.zsetFullCommitWithMerge(key, st)
 	}
 	if st.legacyBlobBase {
 		// One-time migration: load legacy blob, write wide-column, let deleteLogicalKeyElems clean up.
 		if err := c.ensureZSetLoaded(st, []byte(key)); err != nil {
 			return luaCommitPlan{}, err
 		}
-		return luaCommitPlan{elems: c.zsetFullCommitElems(key)}, nil
+		elems, err := c.zsetFullCommitElems(key)
+		return luaCommitPlan{elems: elems}, err
 	}
 	// Delta path: write only changed members + score index + metadata delta.
 	return luaCommitPlan{preserveExisting: true, elems: c.zsetDeltaCommitElems(key, st, commitTS)}, nil
@@ -3551,7 +3586,7 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 // the key was deleted during the script but delta members were added afterwards
 // (membersLoaded=false), st.added is merged into st.members so that
 // zsetFullCommitElems does not silently drop the newly added entries.
-func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState) luaCommitPlan {
+func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState) (luaCommitPlan, error) {
 	if !st.membersLoaded && len(st.added) > 0 {
 		if st.members == nil {
 			st.members = make(map[string]float64, len(st.added))
@@ -3561,16 +3596,21 @@ func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState)
 		}
 		st.added = map[string]float64{}
 	}
-	return luaCommitPlan{elems: c.zsetFullCommitElems(key)} // preserveExisting=false → deleteLogicalKeyElems called
+	elems, err := c.zsetFullCommitElems(key)
+	return luaCommitPlan{elems: elems}, err // preserveExisting=false -> deleteLogicalKeyElems called
 }
 
 // zsetFullCommitElems writes all members in wide-column format (member keys,
 // score index keys, and a base meta key). deleteLogicalKeyElems is responsible
 // for cleaning up any previous storage before these ops are applied.
-func (c *luaScriptContext) zsetFullCommitElems(key string) []*kv.Elem[kv.OP] {
+func (c *luaScriptContext) zsetFullCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
 	st := c.zsets[key]
 	if st == nil || len(st.members) == 0 {
-		return nil
+		return nil, nil
+	}
+	ttl, err := c.finalTTL([]byte(key))
+	if err != nil {
+		return nil, err
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)*zsetElemsPerMember+zsetMetaBaseElems)
 	for member, score := range st.members {
@@ -3590,9 +3630,9 @@ func (c *luaScriptContext) zsetFullCommitElems(key string) []*kv.Elem[kv.OP] {
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.ZSetMetaKey([]byte(key)),
-		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(st.members))}),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(st.members)), ExpireAt: ttlMillis(ttl)}),
 	})
-	return elems
+	return elems, nil
 }
 
 // zsetDeltaCommitElems writes only the members that changed (added/updated/removed)
@@ -3676,6 +3716,10 @@ func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], err
 		return nil, err
 	}
 	keyBytes := []byte(key)
+	ttl, err := c.finalTTL(keyBytes)
+	if err != nil {
+		return nil, err
+	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.value.Entries)+1)
 	var meta store.StreamMeta
 	for _, entry := range st.value.Entries {
@@ -3700,6 +3744,7 @@ func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], err
 		}
 	}
 	meta.Length = int64(len(st.value.Entries))
+	meta.ExpireAt = ttlMillis(ttl)
 	metaBytes, err := store.MarshalStreamMeta(meta)
 	if err != nil {
 		return nil, errors.WithStack(err)

@@ -3,6 +3,8 @@ package adapter
 import (
 	"context"
 	"encoding/binary"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,6 +113,97 @@ func TestRedisTTLAt_LegacyFallbackCanBeDisabled(t *testing.T) {
 	got, err = withoutFallback.ttlAt(ctx, key, 2)
 	require.NoError(t, err)
 	require.Nil(t, got)
+}
+
+func TestRedisHasExpiredSkipsLegacyTTLWhenFallbackDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("ttl:fallback:non-string")
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Minute)), 2, 0))
+
+	withFallback := &RedisServer{store: st}
+	expired, err := withFallback.hasExpired(ctx, key, 2, true)
+	require.NoError(t, err)
+	require.True(t, expired)
+
+	withoutFallback := &RedisServer{store: st, disableLegacyTTLReadFallback: true}
+	expired, err = withoutFallback.hasExpired(ctx, key, 2, true)
+	require.NoError(t, err)
+	require.False(t, expired)
+}
+
+func TestDeltaCompactor_TTLInlineRefreshesStaleInlineHashMeta(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	key := []byte("ttl:migrate:stale-hash")
+	staleExpireAt := time.Now().Add(time.Hour)
+	latestExpireAt := time.Now().Add(2 * time.Hour)
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key),
+		store.MarshalHashMeta(store.HashMeta{Len: 3, ExpireAt: redisExpireAtMillis(staleExpireAt)}), 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(latestExpireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), meta.Len)
+	require.Equal(t, redisExpireAtMillis(latestExpireAt), meta.ExpireAt)
+}
+
+type trackingCompactionCoordinator struct {
+	*localAdapterCoordinator
+	mu        sync.Mutex
+	elemCount []int
+}
+
+func (c *trackingCompactionCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if req != nil && len(req.Elems) > 0 {
+		c.mu.Lock()
+		c.elemCount = append(c.elemCount, len(req.Elems))
+		c.mu.Unlock()
+	}
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+func (c *trackingCompactionCoordinator) counts() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.elemCount...)
+}
+
+func TestDeltaCompactor_TTLInlineMigrationDispatchesSmallBatches(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := &trackingCompactionCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st)}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	const totalKeys uint64 = ttlInlineMigrationBatchKeyLimit + 5
+	expireAt := time.Now().Add(time.Hour)
+	for i := uint64(0); i < totalKeys; i++ {
+		key := []byte("ttl:migrate:batch:" + strconv.FormatUint(i, 10))
+		require.NoError(t, st.PutAt(ctx, redisStrKey(key), []byte("value"), 1+i*2, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2+i*2, 0))
+	}
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	counts := coord.counts()
+	require.GreaterOrEqual(t, len(counts), 2)
+	for _, n := range counts {
+		require.LessOrEqual(t, n, ttlInlineMigrationBatchKeyLimit*redisPairWidth)
+	}
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {

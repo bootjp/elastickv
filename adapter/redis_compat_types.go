@@ -455,7 +455,7 @@ func (r *RedisServer) hasExpired(ctx context.Context, userKey []byte, readTS uin
 	if nonStringOnly {
 		var found bool
 		ttl, found, err = r.collectionTTLAt(ctx, userKey, readTS)
-		if err == nil && !found {
+		if err == nil && !found && !r.disableLegacyTTLReadFallback {
 			ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
 		}
 	} else {

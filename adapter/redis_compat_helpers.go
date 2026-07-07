@@ -609,7 +609,7 @@ func (r *RedisServer) decodeHLLSetValueAt(ctx context.Context, key []byte, readT
 	if err != nil {
 		return redisSetValue{}, err
 	}
-	if !embedded {
+	if !embedded && !r.disableLegacyTTLReadFallback {
 		ttl, err = r.legacyIndexTTLAt(ctx, key, readTS)
 		if err != nil {
 			return redisSetValue{}, err
