@@ -1,6 +1,6 @@
 # AdminDeleteBucket Orphan-Object Safety Net
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-28
 
@@ -10,7 +10,7 @@
 TOCTOU race resolved by this design and recorded in the
 implementation-status block of
 [`docs/design/2026_04_24_implemented_admin_dashboard.md`](2026_04_24_implemented_admin_dashboard.md).
-coderabbitai 🔴/🟠 flagged it during PR #669 review.
+A high-severity review finding flagged it during PR #669 review.
 
 The current shape:
 
@@ -174,7 +174,7 @@ The original revision of this design proposed a **single
 OperationGroup** carrying both the `Del BucketMetaKey` and the
 six `DelPrefix` ops, relying on the FSM to apply them all at one
 commitTS. That shape is rejected by the production coordinator
-(Codex P1 on PR #695):
+(P1 review finding on PR #695):
 
 - `kv/sharded_coordinator.go:dispatchDelPrefixBroadcast` rejects
   any `OperationGroup` containing `DelPrefix` when `IsTxn` is
@@ -238,7 +238,7 @@ well-defined audit trail in slog.
 mirrors the production rejection rules in `localAdapterCoordinator.
 validateDispatchShape`. Without that, the original single-group
 shape passed local tests while production rejected every bucket
-delete with `ErrInvalidRequest` — exactly the gap Codex P1 caught.
+delete with `ErrInvalidRequest` — exactly the gap the P1 review finding caught.
 
 ### 6.3 Apply-time cost
 
