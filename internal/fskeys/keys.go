@@ -34,6 +34,11 @@ func InodeKey(inode uint64) []byte {
 	return appendU64Key([]byte(inodePrefix), inode)
 }
 
+// InodeAllPrefix returns the scan prefix for every inode metadata row.
+func InodeAllPrefix() []byte {
+	return []byte(inodePrefix)
+}
+
 // HomeKey returns the home-placement key for an inode.
 func HomeKey(inode uint64) []byte {
 	return appendU64Key([]byte(homePrefix), inode)
@@ -87,6 +92,11 @@ func ChunkPrefix(homeSlot, inode uint64) []byte {
 	out = appendU64(out, homeSlot)
 	out = appendU64(out, inode)
 	return out
+}
+
+// ChunkAllPrefix returns the scan prefix for every file chunk payload.
+func ChunkAllPrefix() []byte {
+	return []byte(chunkPrefix)
 }
 
 // ChunkRouteKey returns the logical route domain for every chunk of the same

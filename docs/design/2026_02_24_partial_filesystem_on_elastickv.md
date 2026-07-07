@@ -1,9 +1,9 @@
 # Filesystem on Elastickv Design
 
 Status: Partial - FS Core API, filesystem chunk routing, manual split boundary
-snapping, and open-handle lease/orphan GC are implemented; FUSE adapter,
-whole-file migration, FILE_PINNED metrics, intent recovery, and capacity
-metrics remain open.
+snapping, open-handle lease/orphan GC, and capacity-aware `StatFS` are
+implemented; FUSE adapter, whole-file migration, FILE_PINNED metrics, intent
+recovery, and placement/operator metrics remain open.
 Author: bootjp
 Date: 2026-02-24
 Updated: 2026-07-07
@@ -37,6 +37,9 @@ Implemented:
    drops the last reference to an orphaned file, and
    `ReapExpiredOpenHandleLeases` removes expired refs before checking orphan
    inodes for physical chunk cleanup.
+8. `StatFS` reports visible inode count, configured file capacity/free files,
+   configured byte capacity, and free bytes based on visible chunk payload
+   bytes.
 
 Remaining:
 
@@ -44,7 +47,7 @@ Remaining:
 2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
 3. `FILE_PINNED_HOTSPOT` metrics/alerts for auto-split planner skips.
 4. Restart recovery for unfinished create/delete/move intents.
-5. Capacity-aware `StatFS` and placement/operator metrics.
+5. Placement/operator metrics.
 
 ## 2. Goals and Non-goals
 

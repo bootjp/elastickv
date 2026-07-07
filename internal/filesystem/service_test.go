@@ -257,6 +257,28 @@ func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2},
+		WithCapacity(16),
+		WithMaxFiles(10),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcde"))
+	require.NoError(t, err)
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, testChunkSize, stats.ChunkSize)
+	require.EqualValues(t, 2, stats.Files)
+	require.EqualValues(t, 8, stats.FreeFiles)
+	require.EqualValues(t, 16, stats.Capacity)
+	require.EqualValues(t, 11, stats.Free)
+}
+
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)

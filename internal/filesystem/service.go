@@ -33,6 +33,7 @@ const (
 	maxScanPageSize                  = 1024
 	defaultOpenHandleLeaseTTL        = 5 * time.Minute
 	defaultLeaseReaperLimit          = 256
+	statFSScanPageSize               = 512
 )
 
 var (
@@ -183,6 +184,8 @@ type Service struct {
 	dispatch     Dispatcher
 	chunkSize    uint64
 	openLeaseTTL time.Duration
+	capacity     uint64
+	maxFiles     uint64
 	now          func() time.Time
 	allocID      func() (uint64, error)
 	homeSlot     func(uint64) uint64
@@ -227,6 +230,18 @@ func WithOpenHandleLeaseTTL(ttl time.Duration) Option {
 		if ttl >= 0 {
 			s.openLeaseTTL = ttl
 		}
+	}
+}
+
+func WithCapacity(capacity uint64) Option {
+	return func(s *Service) {
+		s.capacity = capacity
+	}
+}
+
+func WithMaxFiles(maxFiles uint64) Option {
+	return func(s *Service) {
+		s.maxFiles = maxFiles
 	}
 }
 
@@ -728,8 +743,104 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 	return err
 }
 
-func (s *Service) StatFS(context.Context, uint64) (StatFS, error) {
-	return StatFS{ChunkSize: s.chunkSize, FreeFiles: math.MaxUint64}, nil
+func (s *Service) StatFS(ctx context.Context, _ uint64) (StatFS, error) {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return StatFS{}, err
+	}
+	usage, err := s.statFSUsage(ctx, ts)
+	if err != nil {
+		return StatFS{}, err
+	}
+	return StatFS{
+		ChunkSize: s.chunkSize,
+		Files:     usage.files,
+		FreeFiles: freeAfterUsed(s.maxFiles, usage.files, math.MaxUint64),
+		Capacity:  s.capacity,
+		Free:      freeAfterUsed(s.capacity, usage.bytes, 0),
+	}, nil
+}
+
+type statFSUsage struct {
+	files uint64
+	bytes uint64
+}
+
+func (s *Service) statFSUsage(ctx context.Context, ts uint64) (statFSUsage, error) {
+	files, err := s.countVisiblePrefix(ctx, fskeys.InodeAllPrefix(), ts)
+	if err != nil {
+		return statFSUsage{}, errors.Wrap(err, "filesystem count inodes")
+	}
+	bytes, err := s.sumVisibleValueBytes(ctx, fskeys.ChunkAllPrefix(), ts)
+	if err != nil {
+		return statFSUsage{}, errors.Wrap(err, "filesystem sum chunk bytes")
+	}
+	return statFSUsage{files: files, bytes: bytes}, nil
+}
+
+func (s *Service) countVisiblePrefix(ctx context.Context, prefix []byte, ts uint64) (uint64, error) {
+	var count uint64
+	err := s.scanVisiblePrefix(ctx, prefix, ts, func(*store.KVPair) error {
+		count++
+		return nil
+	})
+	return count, err
+}
+
+func (s *Service) sumVisibleValueBytes(ctx context.Context, prefix []byte, ts uint64) (uint64, error) {
+	var total uint64
+	err := s.scanVisiblePrefix(ctx, prefix, ts, func(pair *store.KVPair) error {
+		next, overflow := addUint64(total, uint64(len(pair.Value)))
+		if overflow {
+			return ErrInvalid
+		}
+		total = next
+		return nil
+	})
+	return total, err
+}
+
+func (s *Service) scanVisiblePrefix(
+	ctx context.Context,
+	prefix []byte,
+	ts uint64,
+	visit func(*store.KVPair) error,
+) error {
+	start := append([]byte(nil), prefix...)
+	end := prefixEnd(prefix)
+	for {
+		page, err := s.store.ScanAt(ctx, start, end, statFSScanPageSize, ts)
+		if err != nil {
+			return errors.Wrap(err, "filesystem scan prefix")
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, pair := range page {
+			if err := visit(pair); err != nil {
+				return err
+			}
+		}
+		if len(page) < statFSScanPageSize {
+			return nil
+		}
+		start = scanCursorAfter(page[len(page)-1].Key)
+	}
+}
+
+func scanCursorAfter(key []byte) []byte {
+	out := append([]byte(nil), key...)
+	return append(out, 0)
+}
+
+func freeAfterUsed(total uint64, used uint64, unknown uint64) uint64 {
+	if total == 0 {
+		return unknown
+	}
+	if used >= total {
+		return 0
+	}
+	return total - used
 }
 
 func (s *Service) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
