@@ -71,7 +71,7 @@ const (
 type Sampler interface {
 	// Observe records a single request against a route. Op identifies
 	// the counter family. The key drives sub-range bucketing (the hot
-	// key/sub-range heatmap, see docs/design/2026_05_25_proposed_keyviz_subrange_sampling.md);
+	// key/sub-range heatmap, see docs/design/2026_05_25_implemented_keyviz_subrange_sampling.md);
 	// len(key) and valueLen are summed into the matching *Bytes
 	// counter; pass valueLen 0 for read-only ops where the response
 	// size is irrelevant. Implementations must no-op (not panic) when

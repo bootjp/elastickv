@@ -270,7 +270,7 @@ memory each group's private cache/memtable pins.
   write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
   with proposed extensions for cluster fan-out
   (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
-  subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
+  subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
   hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
   conflict (implemented). It is the detection signal M3 reuses. Current
   adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
