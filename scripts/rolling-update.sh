@@ -238,10 +238,10 @@ SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
 # fails fast on genuine crash-loop bugs (which never finish (1) or (2)).
 # Operators with smaller FSMs can shrink HEALTH_TIMEOUT_SECONDS via env.
 # Root-cause fix (skip restoreSnapshotState when the on-disk FSM is
-# already at >= snapshot.Metadata.Index): see PR #910 and
-# docs/design/2026_06_02_idempotent_snapshot_restore.md. Once that
-# lands and steady-state skip rates are observed in production, this
-# default can be tightened back down.
+# already at >= snapshot.Metadata.Index) shipped in PR #915 / #934;
+# see docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md.
+# Once steady-state skip rates are observed in production, this default
+# can be tightened back down.
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
 # Maximum leader-commit-to-candidate-last-log lag tolerated for a targeted
