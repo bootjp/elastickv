@@ -151,7 +151,7 @@ memory each group's private cache/memtable pins.
   pipelines and independent serial apply loops (§1.7). Already in-tree
   structurally.
 - **Leader balance — PR #953**
-  (`docs/design/2026_06_11_proposed_leader_balance_scheduler.md`, branch
+  (`docs/design/2026_06_11_implemented_leader_balance_scheduler.md`, branch
   `design/leader-balance-scheduler`) spreads group leaderships across nodes so
   write-proposal load is not pinned to one node. Count-based v1 (TiKV
   balance-leader equivalent), embedded in the default-group leader, default

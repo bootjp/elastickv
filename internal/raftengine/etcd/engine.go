@@ -106,28 +106,31 @@ const (
 )
 
 var (
-	errNilEngine                    = errors.New("raft engine is not configured")
-	errClosed                       = errors.New("etcd raft engine is closed")
-	errNotLeader                    = errors.Mark(errors.New("etcd raft engine is not leader"), raftengine.ErrNotLeader)
-	errNodeIDRequired               = errors.New("etcd raft node id is required")
-	errDataDirRequired              = errors.New("etcd raft data dir is required")
-	errStateMachineUnset            = errors.New("etcd raft state machine is not configured")
-	errSnapshotRequired             = errors.New("etcd raft snapshot payload is required")
-	errStepQueueFull                = errors.New("etcd raft inbound step queue is full")
-	errClusterMismatch              = errors.New("etcd raft persisted cluster does not match configured peers")
-	errConfigIndexMismatch          = errors.New("etcd raft configuration index does not match")
-	errConfChangeContextTooLarge    = errors.New("etcd raft conf change context is too large")
-	errLeadershipTransferTarget     = errors.New("etcd raft leadership transfer target is required")
-	errLeadershipTransferNotReady   = errors.New("etcd raft leadership transfer target is not available")
-	errLeadershipTransferAborted    = errors.New("etcd raft leadership transfer aborted")
-	errLeadershipTransferRejected   = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
-	errLeadershipTransferNotLeader  = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
-	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
-	errTooManyPendingConfigs        = errors.New("etcd raft engine has too many pending config changes")
-	errPromoteLearnerNotLearner     = errors.New("etcd raft promote-learner target is not a learner")
-	errPromoteLearnerNoProgress     = errors.New("etcd raft promote-learner target has no leader-side progress entry")
-	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
-	errPromoteLearnerMinAppliedZero = errors.New("etcd raft promote-learner requires min_applied_index>0 unless skip_min_applied_check is set")
+	errNilEngine                           = errors.New("raft engine is not configured")
+	errClosed                              = errors.New("etcd raft engine is closed")
+	errNotLeader                           = errors.Mark(errors.New("etcd raft engine is not leader"), raftengine.ErrNotLeader)
+	errNodeIDRequired                      = errors.New("etcd raft node id is required")
+	errDataDirRequired                     = errors.New("etcd raft data dir is required")
+	errStateMachineUnset                   = errors.New("etcd raft state machine is not configured")
+	errSnapshotRequired                    = errors.New("etcd raft snapshot payload is required")
+	errStepQueueFull                       = errors.New("etcd raft inbound step queue is full")
+	errClusterMismatch                     = errors.New("etcd raft persisted cluster does not match configured peers")
+	errConfigIndexMismatch                 = errors.New("etcd raft configuration index does not match")
+	errConfChangeContextTooLarge           = errors.New("etcd raft conf change context is too large")
+	errLeadershipTransferTarget            = errors.New("etcd raft leadership transfer target is required")
+	errLeadershipTransferNotReady          = errors.New("etcd raft leadership transfer target is not available")
+	errLeadershipTransferAborted           = errors.New("etcd raft leadership transfer aborted")
+	errLeadershipTransferRejected          = errors.New("etcd raft leadership transfer was rejected by raft (target is not a voter)")
+	errLeadershipTransferNotLeader         = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
+	errLeadershipTransferInProgress        = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
+	errLeadershipTransferNoHealthyTarget   = errors.Mark(errors.New("etcd raft leadership transfer has no healthy target"), raftengine.ErrLeadershipTransferNoHealthyTarget)
+	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
+	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
+	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
+	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
+	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
+	errPromoteLearnerNotCaughtUp           = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
+	errPromoteLearnerMinAppliedZero        = errors.New("etcd raft promote-learner requires min_applied_index>0 unless skip_min_applied_check is set")
 )
 
 // joinRoleViolationCount counts the number of times the join-as-learner
@@ -305,6 +308,10 @@ type Engine struct {
 	// configIndex tracks the highest configuration index durably published to
 	// local raft snapshot state and peer metadata.
 	configIndex atomic.Uint64
+	// pendingConfChangeIndex tracks the highest ConfChange entry seen in Ready
+	// but not yet applied. It is maintained by the raft event loop and read
+	// lock-free by status publication.
+	pendingConfChangeIndex atomic.Uint64
 
 	lastLeaderContactAt   time.Time
 	lastLeaderContactFrom uint64
@@ -419,6 +426,9 @@ type adminRequest struct {
 	skipMinAppliedCheck bool
 	action              adminAction
 	peer                Peer
+	transferCandidates  []Peer
+	transferGated       bool
+	transferMaxLag      uint64
 	prevIndex           uint64
 	done                chan adminResult
 }
@@ -1441,6 +1451,23 @@ func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, addr
 	return e.waitForLeadershipTransfer(ctx, result.peer)
 }
 
+func (e *Engine) TransferLeadershipToServerIfEligible(ctx context.Context, candidates []raftengine.TransferTarget, maxLag uint64) error {
+	peers := make([]Peer, 0, len(candidates))
+	for _, candidate := range candidates {
+		peers = append(peers, Peer{ID: candidate.ID, Address: candidate.Address})
+	}
+	result, err := e.submitAdminEx(ctx, adminRequest{
+		action:             adminActionTransferLeadership,
+		transferCandidates: peers,
+		transferGated:      true,
+		transferMaxLag:     maxLag,
+	})
+	if err != nil {
+		return err
+	}
+	return e.waitForLeadershipTransfer(ctx, result.peer)
+}
+
 func (e *Engine) submitAdmin(ctx context.Context, action adminAction, peer Peer, prevIndex uint64) (adminResult, error) {
 	return e.submitAdminEx(ctx, adminRequest{
 		action:    action,
@@ -1821,10 +1848,13 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 		req.done <- adminResult{err: err}
 		return
 	}
+	lastIndex, _ := e.storage.LastIndex()
 	if err := e.rawNode.ProposeConfChange(cc); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
+		return
 	}
+	e.markPendingConfChange(lastIndex + 1)
 }
 
 func (e *Engine) handleRemoveServer(req adminRequest) {
@@ -1854,9 +1884,13 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 }
 
 func (e *Engine) handleTransferLeadership(req adminRequest) {
-	target, err := e.resolveTransferTarget(req.peer)
+	targets, err := e.resolveTransferTargets(req)
 	if err != nil {
 		req.done <- adminResult{err: err}
+		return
+	}
+	if len(targets) == 0 {
+		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferTarget)}
 		return
 	}
 	// Reject transfer requests when the local node is not leader — etcd/raft
@@ -1864,23 +1898,73 @@ func (e *Engine) handleTransferLeadership(req adminRequest) {
 	// leaving the caller to block until the deadline. handleTransferLeadership
 	// runs on the single-threaded event loop, so rawNode state reads here are
 	// not racy with other rawNode mutations.
-	if e.rawNode.BasicStatus().RaftState != etcdraft.StateLeader {
-		req.done <- adminResult{err: errors.WithStack(errLeadershipTransferNotLeader)}
+	basic, err := e.transferLeadershipPreflightStatus()
+	if err != nil {
+		req.done <- adminResult{err: err}
 		return
 	}
-	e.rawNode.TransferLeader(target.NodeID)
-	// TransferLeader is processed synchronously inside rawNode.TransferLeader.
-	// If raft accepted the request, r.leadTransferee now equals target.NodeID.
-	// If it was silently dropped (e.g. target has no progress entry, is a
-	// learner, or equals the local node), leadTransferee is still zero or
-	// unchanged — surface that as an immediate error rather than letting the
-	// caller poll until its deadline.
-	if e.rawNode.BasicStatus().LeadTransferee != target.NodeID {
-		req.done <- adminResult{err: errors.Wrapf(errLeadershipTransferRejected,
-			"target id=%d addr=%s", target.NodeID, target.Address)}
-		return
+	peer, err := e.transferLeadershipToTargets(req, targets, basic)
+	req.done <- adminResult{peer: peer, err: err}
+}
+
+func (e *Engine) transferLeadershipPreflightStatus() (etcdraft.BasicStatus, error) {
+	basic := e.rawNode.BasicStatus()
+	if basic.RaftState != etcdraft.StateLeader {
+		return basic, errors.WithStack(errLeadershipTransferNotLeader)
 	}
-	req.done <- adminResult{peer: target}
+	if e.hasPendingConfChange() {
+		return basic, errors.WithStack(errLeadershipTransferConfChangePending)
+	}
+	return basic, nil
+}
+
+func (e *Engine) transferLeadershipToTargets(req adminRequest, targets []Peer, basic etcdraft.BasicStatus) (Peer, error) {
+	var lastErr error
+	for _, target := range targets {
+		peer, handled, err := transferLeadershipInFlightResult(basic, target)
+		if handled {
+			return peer, err
+		}
+		if err := e.checkGatedTransferTarget(req, target); err != nil {
+			lastErr = err
+			continue
+		}
+		e.rawNode.TransferLeader(target.NodeID)
+		basic = e.rawNode.BasicStatus()
+		// TransferLeader is processed synchronously inside rawNode.TransferLeader.
+		// If raft accepted the request, r.leadTransferee now equals target.NodeID.
+		// If it was silently dropped (e.g. target has no progress entry, is a
+		// learner, or equals the local node), leadTransferee is still zero or
+		// unchanged. Try the next ordered candidate for gated calls; otherwise
+		// surface an immediate rejection instead of polling until deadline.
+		if basic.LeadTransferee == target.NodeID {
+			return target, nil
+		}
+		lastErr = errors.Wrapf(errLeadershipTransferRejected,
+			"target id=%d addr=%s", target.NodeID, target.Address)
+	}
+	if lastErr != nil {
+		return Peer{}, lastErr
+	}
+	return Peer{}, errors.WithStack(errLeadershipTransferNoHealthyTarget)
+}
+
+func transferLeadershipInFlightResult(basic etcdraft.BasicStatus, target Peer) (Peer, bool, error) {
+	if basic.LeadTransferee == 0 {
+		return Peer{}, false, nil
+	}
+	if basic.LeadTransferee == target.NodeID {
+		return target, true, nil
+	}
+	return Peer{}, true, errors.Wrapf(errLeadershipTransferInProgress,
+		"active target=%d requested target=%d", basic.LeadTransferee, target.NodeID)
+}
+
+func (e *Engine) checkGatedTransferTarget(req adminRequest, target Peer) error {
+	if !req.transferGated {
+		return nil
+	}
+	return e.transferTargetEligible(target, req.transferMaxLag)
 }
 
 func (e *Engine) drainReady() error {
@@ -2221,6 +2305,7 @@ func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
 	}
 	e.applied = snapshot.Metadata.Index
 	e.appliedIndex.Store(snapshot.Metadata.Index)
+	e.clearPendingConfChange(snapshot.Metadata.Index)
 	// Refresh the voter-cache from the snapshot's ConfState so
 	// downstream apply-loop reads (recordQuorumAck, refreshStatus,
 	// removePeer) see the post-snapshot voter set even before any
@@ -2263,6 +2348,11 @@ func (e *Engine) savePeersFileForSnapshot(snapshot raftpb.Snapshot) error {
 func (e *Engine) applyReadyEntries(entries []raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
+	}
+	for _, entry := range entries {
+		if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
+			e.markPendingConfChange(entry.Index)
+		}
 	}
 	return errors.WithStack(e.storage.Append(entries))
 }
@@ -2447,6 +2537,7 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 		return err
 	}
 	e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
+	e.clearPendingConfChange(entry.Index)
 	e.setApplied(entry.Index)
 	return nil
 }
@@ -2464,6 +2555,7 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 		return err
 	}
 	e.applyConfigChangeV2(cc, entry.Index, *confState)
+	e.clearPendingConfChange(entry.Index)
 	e.setApplied(entry.Index)
 	return nil
 }
@@ -3224,6 +3316,7 @@ func (e *Engine) refreshStatus() {
 		NumPeers:          numRemoteServers(config.Servers, e.localID),
 		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
 		LeadTransferee:    basic.LeadTransferee,
+		PendingConfChange: e.hasPendingConfChange(),
 	}
 
 	e.mu.Lock()
@@ -3545,6 +3638,34 @@ func (e *Engine) currentConfiguration() raftengine.Configuration {
 
 func (e *Engine) currentConfigIndex() uint64 {
 	return e.configIndex.Load()
+}
+
+func (e *Engine) markPendingConfChange(index uint64) {
+	for {
+		current := e.pendingConfChangeIndex.Load()
+		if index <= current {
+			return
+		}
+		if e.pendingConfChangeIndex.CompareAndSwap(current, index) {
+			return
+		}
+	}
+}
+
+func (e *Engine) clearPendingConfChange(appliedIndex uint64) {
+	for {
+		current := e.pendingConfChangeIndex.Load()
+		if current == 0 || appliedIndex < current {
+			return
+		}
+		if e.pendingConfChangeIndex.CompareAndSwap(current, 0) {
+			return
+		}
+	}
+}
+
+func (e *Engine) hasPendingConfChange() bool {
+	return e.pendingConfChangeIndex.Load() > e.appliedIndex.Load()
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
@@ -4165,6 +4286,53 @@ func (e *Engine) resolveTransferTarget(target Peer) (Peer, error) {
 		return e.defaultTransferTargetLocked()
 	}
 	return e.namedTransferTargetLocked(target)
+}
+
+func (e *Engine) resolveTransferTargets(req adminRequest) ([]Peer, error) {
+	if len(req.transferCandidates) == 0 {
+		target, err := e.resolveTransferTarget(req.peer)
+		if err != nil {
+			return nil, err
+		}
+		return []Peer{target}, nil
+	}
+	targets := make([]Peer, 0, len(req.transferCandidates))
+	for _, candidate := range req.transferCandidates {
+		target, err := e.resolveTransferTarget(candidate)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+func (e *Engine) transferTargetEligible(target Peer, maxLag uint64) error {
+	status := e.rawNode.Status()
+	progress, ok := status.Progress[target.NodeID]
+	if !ok {
+		return errors.Wrapf(errLeadershipTransferNoHealthyTarget, "target id=%d has no progress", target.NodeID)
+	}
+	if progress.IsLearner {
+		return errors.Wrapf(errLeadershipTransferNoHealthyTarget, "target id=%d is learner", target.NodeID)
+	}
+	if !progress.RecentActive {
+		return errors.Wrapf(errLeadershipTransferNoHealthyTarget, "target id=%d is not recently active", target.NodeID)
+	}
+	lastIndex, err := e.storage.LastIndex()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	threshold := uint64(0)
+	if lastIndex > maxLag {
+		threshold = lastIndex - maxLag
+	}
+	if progress.Match < threshold {
+		return errors.Wrapf(errLeadershipTransferTargetNotCaughtUp,
+			"target id=%d match=%d want>=%d last_index=%d max_lag=%d",
+			target.NodeID, progress.Match, threshold, lastIndex, maxLag)
+	}
+	return nil
 }
 
 func (e *Engine) defaultTransferTargetLocked() (Peer, error) {

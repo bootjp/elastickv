@@ -2,11 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
+	"time"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftengine"
+)
+
+const (
+	sqsLeadershipRefusalRetryDelay    = 50 * time.Millisecond
+	sqsLeadershipRefusalRetryDeadline = 5 * time.Second
 )
 
 // sqsLeadershipController is the subset of raftengine.Admin the
@@ -88,10 +95,7 @@ func installSQSLeadershipRefusal(
 		// nested goroutine is the documented pattern for the
 		// callback contract.
 		go func() {
-			if err := admin.TransferLeadership(ctx); err != nil {
-				logger.Warn("sqs: TransferLeadership failed",
-					"group", gid, "err", err)
-			}
+			refuseSQSLeadershipWithRetry(ctx, admin, gid, logger)
 		}()
 	}
 	// TOCTOU safety: read State() BEFORE registering the
@@ -118,6 +122,47 @@ func installSQSLeadershipRefusal(
 		refuse()
 	}
 	return deregister
+}
+
+func refuseSQSLeadershipWithRetry(ctx context.Context, admin sqsLeadershipController, gid uint64, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	deadline := time.NewTimer(sqsLeadershipRefusalRetryDeadline)
+	defer deadline.Stop()
+	for attempt := 1; ; attempt++ {
+		if admin.State() != raftengine.StateLeader {
+			return
+		}
+		err := admin.TransferLeadership(ctx)
+		if err == nil {
+			return
+		}
+		if !retryableSQSLeadershipTransferError(err) {
+			logger.Warn("sqs: TransferLeadership failed",
+				"group", gid, "attempt", attempt, "err", err)
+			return
+		}
+		logger.Warn("sqs: TransferLeadership retrying after transient refusal",
+			"group", gid, "attempt", attempt, "err", err)
+		timer := time.NewTimer(sqsLeadershipRefusalRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-deadline.C:
+			timer.Stop()
+			logger.Warn("sqs: TransferLeadership retry deadline expired",
+				"group", gid, "attempt", attempt, "err", err)
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func retryableSQSLeadershipTransferError(err error) bool {
+	return errors.Is(err, raftengine.ErrLeadershipTransferConfChangePending) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
 // partitionedGroupSet flattens the operator's --sqsFifoPartitionMap

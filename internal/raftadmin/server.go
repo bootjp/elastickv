@@ -156,19 +156,77 @@ func (s *Server) TransferLeadership(ctx context.Context, req *pb.RaftAdminTransf
 	if s == nil || s.admin == nil {
 		return nil, grpcStatus(codes.Unimplemented, "leadership transfer is not supported by this raft engine")
 	}
-	if req != nil && (req.TargetId != "" || req.TargetAddress != "") {
-		if req.TargetId == "" || req.TargetAddress == "" {
-			return nil, grpcStatus(codes.InvalidArgument, "target_id and target_address must be provided together")
-		}
-		if err := s.admin.TransferLeadershipToServer(ctx, req.TargetId, req.TargetAddress); err != nil {
-			return nil, adminError(err)
-		}
-		return &pb.RaftAdminTransferLeadershipResponse{}, nil
+	switch {
+	case req != nil && req.Gated:
+		return s.transferLeadershipGated(ctx, req)
+	case hasUngatedTransferTarget(req):
+		return s.transferLeadershipToServer(ctx, req)
+	default:
+		return s.transferLeadershipDefault(ctx)
 	}
+}
+
+func hasUngatedTransferTarget(req *pb.RaftAdminTransferLeadershipRequest) bool {
+	return req != nil && (req.TargetId != "" || req.TargetAddress != "")
+}
+
+func (s *Server) transferLeadershipToServer(ctx context.Context, req *pb.RaftAdminTransferLeadershipRequest) (*pb.RaftAdminTransferLeadershipResponse, error) {
+	if req.TargetId == "" || req.TargetAddress == "" {
+		return nil, grpcStatus(codes.InvalidArgument, "target_id and target_address must be provided together")
+	}
+	if err := s.admin.TransferLeadershipToServer(ctx, req.TargetId, req.TargetAddress); err != nil {
+		return nil, adminError(err)
+	}
+	return &pb.RaftAdminTransferLeadershipResponse{}, nil
+}
+
+func (s *Server) transferLeadershipDefault(ctx context.Context) (*pb.RaftAdminTransferLeadershipResponse, error) {
 	if err := s.admin.TransferLeadership(ctx); err != nil {
 		return nil, adminError(err)
 	}
 	return &pb.RaftAdminTransferLeadershipResponse{}, nil
+}
+
+func (s *Server) transferLeadershipGated(ctx context.Context, req *pb.RaftAdminTransferLeadershipRequest) (*pb.RaftAdminTransferLeadershipResponse, error) {
+	candidates, err := gatedTransferTargets(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.admin.TransferLeadershipToServerIfEligible(ctx, candidates, req.MaxLag); err != nil {
+		return nil, adminError(err)
+	}
+	return &pb.RaftAdminTransferLeadershipResponse{}, nil
+}
+
+func gatedTransferTargets(req *pb.RaftAdminTransferLeadershipRequest) ([]raftengine.TransferTarget, error) {
+	candidates, err := repeatedTransferTargets(req.TargetCandidates)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) > 0 {
+		return candidates, nil
+	}
+	if req.TargetId == "" || req.TargetAddress == "" {
+		return nil, grpcStatus(codes.InvalidArgument, "gated leadership transfer requires target_candidates or target_id and target_address")
+	}
+	return []raftengine.TransferTarget{{
+		ID:      req.TargetId,
+		Address: req.TargetAddress,
+	}}, nil
+}
+
+func repeatedTransferTargets(targets []*pb.TransferTarget) ([]raftengine.TransferTarget, error) {
+	candidates := make([]raftengine.TransferTarget, 0, len(targets))
+	for _, candidate := range targets {
+		if candidate == nil || candidate.TargetId == "" || candidate.TargetAddress == "" {
+			return nil, grpcStatus(codes.InvalidArgument, "target_candidates require target_id and target_address")
+		}
+		candidates = append(candidates, raftengine.TransferTarget{
+			ID:      candidate.TargetId,
+			Address: candidate.TargetAddress,
+		})
+	}
+	return candidates, nil
 }
 
 func stateToProto(state raftengine.State) pb.RaftAdminState {

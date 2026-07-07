@@ -1589,6 +1589,20 @@ func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
 	require.True(t, errors.Is(err, errTooManyPendingConfigs))
 }
 
+func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
+	engine := &Engine{}
+	engine.appliedIndex.Store(10)
+
+	engine.markPendingConfChange(12)
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(11)
+	require.True(t, engine.hasPendingConfChange(), "entry below the pending config index must not clear the fence")
+
+	engine.clearPendingConfChange(12)
+	require.False(t, engine.hasPendingConfChange())
+}
+
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
 	t.Helper()
 
@@ -1899,6 +1913,9 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNoHealthyTarget), raftengine.ErrLeadershipTransferNoHealthyTarget))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferTargetNotCaughtUp), raftengine.ErrLeadershipTransferTargetNotCaughtUp))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferConfChangePending), raftengine.ErrLeadershipTransferConfChangePending))
 }
 
 // TestSelectDispatchLane_LegacyTwoLane verifies that, when the 4-lane

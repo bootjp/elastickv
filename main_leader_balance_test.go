@@ -1,0 +1,117 @@
+package main
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/stretchr/testify/require"
+)
+
+func TestChooseLeaderBalanceMove_SeedsZeroCountVoters(t *testing.T) {
+	now := time.Unix(100, 0)
+	obs := leaderBalanceObservation{
+		counts: map[string]int{"n1": 3, "n2": 0, "n3": 0},
+		voters: map[string]raftengine.Server{
+			"n1": {ID: "n1", Address: "127.0.0.1:5001", Suffrage: "voter"},
+			"n2": {ID: "n2", Address: "127.0.0.1:5002", Suffrage: "voter"},
+			"n3": {ID: "n3", Address: "127.0.0.1:5003", Suffrage: "voter"},
+		},
+		groups: []leaderBalanceGroupSnapshot{
+			balanceGroup(1, "127.0.0.1:5001", "n1", "n2", "n3"),
+			balanceGroup(2, "127.0.0.1:5001", "n1", "n2", "n3"),
+			balanceGroup(3, "127.0.0.1:5001", "n1", "n2", "n3"),
+		},
+	}
+	decision := chooseLeaderBalanceMove(obs, leaderBalanceTestConfig(), nil, time.Time{}, time.Time{}, now)
+	require.Empty(t, decision.reason)
+	require.Equal(t, uint64(2), decision.move.groupID, "default group 1 should be considered after non-default groups")
+	require.Equal(t, "n2", decision.move.chosenTarget.ID)
+	require.Equal(t, []raftengine.TransferTarget{
+		{ID: "n2", Address: "127.0.0.1:5002"},
+		{ID: "n3", Address: "127.0.0.1:5003"},
+	}, decision.move.candidates)
+}
+
+func TestChooseLeaderBalanceMove_PartialObservationSkips(t *testing.T) {
+	now := time.Unix(100, 0)
+	obs := leaderBalanceObservation{
+		partial: true,
+		counts:  map[string]int{"n1": 2, "n2": 0},
+		voters:  map[string]raftengine.Server{"n1": {ID: "n1"}, "n2": {ID: "n2"}},
+		groups:  []leaderBalanceGroupSnapshot{balanceGroup(2, "a", "n1", "n2")},
+	}
+	decision := chooseLeaderBalanceMove(obs, leaderBalanceTestConfig(), nil, time.Time{}, time.Time{}, now)
+	require.Equal(t, "partial_observation", decision.reason)
+}
+
+func TestChooseLeaderBalanceMove_RespectsCooldownAndPins(t *testing.T) {
+	now := time.Unix(100, 0)
+	cfg := leaderBalanceTestConfig()
+	cfg.pinnedGroups = map[uint64]bool{2: true}
+	obs := leaderBalanceObservation{
+		counts: map[string]int{"n1": 3, "n2": 0},
+		voters: map[string]raftengine.Server{
+			"n1": {ID: "n1", Address: "a", Suffrage: "voter"},
+			"n2": {ID: "n2", Address: "b", Suffrage: "voter"},
+		},
+		groups: []leaderBalanceGroupSnapshot{
+			balanceGroup(1, "a", "n1", "n2"),
+			balanceGroup(2, "a", "n1", "n2"),
+			balanceGroup(3, "a", "n1", "n2"),
+		},
+	}
+	cooldowns := map[uint64]time.Time{3: now.Add(time.Minute)}
+	decision := chooseLeaderBalanceMove(obs, cfg, cooldowns, time.Time{}, time.Time{}, now)
+	require.Equal(t, uint64(1), decision.move.groupID, "default group is admitted only after pinned/cooling non-default groups are ineligible")
+}
+
+func TestChooseLeaderBalanceMove_StartupGraceSkips(t *testing.T) {
+	now := time.Unix(100, 0)
+	obs := leaderBalanceObservation{
+		counts: map[string]int{"n1": 2, "n2": 0},
+		voters: map[string]raftengine.Server{"n1": {ID: "n1"}, "n2": {ID: "n2"}},
+		groups: []leaderBalanceGroupSnapshot{balanceGroup(2, "a", "n1", "n2")},
+	}
+	decision := chooseLeaderBalanceMove(obs, leaderBalanceTestConfig(), nil, time.Time{}, now.Add(time.Second), now)
+	require.Equal(t, "startup_grace", decision.reason)
+}
+
+func leaderBalanceTestConfig() leaderBalanceConfig {
+	cfg := leaderBalanceConfig{
+		enabled:            true,
+		localNodeID:        "n1",
+		defaultGroupID:     1,
+		imbalanceThreshold: 2,
+	}
+	cfg.normalize()
+	return cfg
+}
+
+func balanceGroup(groupID uint64, leaderAddr string, voters ...string) leaderBalanceGroupSnapshot {
+	const leaderID = "n1"
+	servers := make([]raftengine.Server, 0, len(voters))
+	for i, id := range voters {
+		servers = append(servers, raftengine.Server{
+			ID:       id,
+			Address:  fmt.Sprintf("127.0.0.1:%d", 5001+i),
+			Suffrage: "voter",
+		})
+	}
+	for i := range servers {
+		if servers[i].ID == leaderID {
+			servers[i].Address = leaderAddr
+		}
+	}
+	return leaderBalanceGroupSnapshot{
+		groupID: groupID,
+		status: raftengine.Status{
+			State:  raftengine.StateLeader,
+			Leader: raftengine.LeaderInfo{ID: leaderID, Address: leaderAddr},
+		},
+		leader:      raftengine.LeaderInfo{ID: leaderID, Address: leaderAddr},
+		voters:      servers,
+		localLeader: leaderID == "n1",
+	}
+}
