@@ -1,14 +1,40 @@
 # Filesystem on Elastickv Design
 
+Status: Partial - FS Core API and filesystem chunk routing are implemented;
+FUSE adapter, whole-file migration, split planner guardrails, and lease reaper
+hardening remain open.
+Author: bootjp
+Date: 2026-02-24
+Updated: 2026-07-07
+
 ## 1. Background
 
 Elastickv already provides:
 
 1. Raft-replicated KV state per shard group.
 2. Range-based shard routing via `distribution.Engine`.
-3. Transactional write path, with current limitation that cross-shard transactions are not supported.
+3. Transactional write path, including sharded-coordinator support for multi-key operations.
 
 This design adds a filesystem layer on top of Elastickv with fixed-size file chunks and a placement policy that keeps chunks of the same file on one shard in normal operation. The backend API is protocol-neutral and can be exposed through multiple frontends, including FUSE.
+
+## 1.1 Implementation status
+
+Implemented:
+
+1. `internal/fskeys` provides the `!fs|ino|`, `!fs|dir|`, `!fs|dirv|`, `!fs|home|`, `!fs|chk|`, `!fs|ref|`, `!fs|intent|`, and `!fs|job|move|` key families.
+2. Directory-entry names use an order-preserving binary segment so `readdir` scans stay lexicographic and byte-safe.
+3. `kv.routeKey` normalizes `!fs|chk|<home_slot>|<inode>|<chunk_index>` to one route domain per `(home_slot, inode)`, including transaction-wrapped variants.
+4. `internal/filesystem.Service` implements the protocol-neutral core operations: `InitializeRoot`, `Resolve`, `GetAttr`, `SetAttr`, `Open`, `Read`, `Write`, `Flush`, `Fsync`, `Release`, `Create`, `Mkdir`, `Unlink`, `Rmdir`, `Rename`, `Readdir`, and `StatFS`.
+5. Fixed-size chunk read/write/truncate, sparse reads, same-directory rename, same-file chunk placement, and remove-while-open by inode are covered by unit tests.
+
+Remaining:
+
+1. Thin FUSE adapter and errno mapping tests.
+2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
+3. Split planner boundary snapping plus `FILE_PINNED_HOTSPOT` metrics/alerts.
+4. TTL-backed open-handle lease reaper and final orphan chunk GC after release.
+5. Restart recovery for unfinished create/delete/move intents.
+6. Capacity-aware `StatFS` and placement/operator metrics.
 
 ## 2. Goals and Non-goals
 

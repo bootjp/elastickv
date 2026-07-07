@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 )
@@ -71,6 +72,9 @@ func normalizeRouteKey(key []byte) []byte {
 		return route
 	}
 	if user := s3keys.ExtractRouteKey(key); user != nil {
+		return user
+	}
+	if user := fskeys.ExtractRouteKey(key); user != nil {
 		return user
 	}
 	if user := store.ExtractListUserKey(key); user != nil {
