@@ -83,6 +83,28 @@ func TestParseNodeIDsRequiresVoters(t *testing.T) {
 	require.ErrorContains(t, err, "node id must be > 0")
 }
 
+func TestParseRequiredUint64TrimsWhitespace(t *testing.T) {
+	t.Parallel()
+	got, err := parseRequiredUint64("--index", " 0x64 ")
+	require.NoError(t, err)
+	require.Equal(t, uint64(100), got)
+}
+
+func TestParseOneNodeIDTrimsExplicitID(t *testing.T) {
+	t.Parallel()
+	got, err := parseOneNodeID(" node: 2 ")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), got)
+}
+
+func TestEnsureCanWriteForceRemovesExistingTarget(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "target.fsm")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+	require.NoError(t, ensureCanWrite(path, true))
+	require.NoFileExists(t, path)
+}
+
 func be32(v uint32) []byte {
 	out := make([]byte, 4)
 	binary.BigEndian.PutUint32(out, v)

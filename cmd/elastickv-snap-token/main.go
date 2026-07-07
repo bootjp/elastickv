@@ -124,7 +124,8 @@ func parseFlags(argv []string) (config, error) {
 }
 
 func parseRequiredUint64(name string, raw string) (uint64, error) {
-	if strings.TrimSpace(raw) == "" {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return 0, errors.Errorf("%s is required", name)
 	}
 	v, err := strconv.ParseUint(raw, 0, 64)
@@ -177,10 +178,12 @@ func parseNodeIDs(name string, raw string, required bool) ([]uint64, error) {
 }
 
 func parseOneNodeID(raw string) (uint64, error) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return 0, errors.New("empty node id")
 	}
 	if explicit, ok := strings.CutPrefix(raw, "node:"); ok {
+		explicit = strings.TrimSpace(explicit)
 		id, err := strconv.ParseUint(explicit, 0, 64)
 		if err != nil {
 			return 0, errors.Wrap(err, "parse explicit node id")
@@ -223,11 +226,13 @@ func writeRestorePair(cfg config) (writeResult, error) {
 }
 
 func ensureCanWrite(path string, force bool) error {
-	if force {
-		return nil
-	}
 	if _, err := os.Lstat(path); err == nil {
-		return errors.Errorf("%s already exists; pass --force to overwrite", path)
+		if !force {
+			return errors.Errorf("%s already exists; pass --force to overwrite", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return errors.Wrapf(err, "remove existing %s", path)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.Wrapf(err, "stat %s", path)
 	}
