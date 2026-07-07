@@ -333,9 +333,9 @@ func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
 	}
 	fields := make(map[string][]byte, len(value))
 	origFields := make(map[string][]byte, len(value))
-	for field, value := range value {
-		raw := []byte(value)
-		fields[field] = bytes.Clone(raw)
+	for field, val := range value {
+		raw := []byte(val)
+		fields[field] = raw
 		origFields[field] = bytes.Clone(raw)
 	}
 	legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
@@ -709,14 +709,14 @@ func (t *txnContext) applyGet(cmd redcon.Command) (redisResult, error) {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 
-	tv, err := t.load(cmd.Args[1])
+	raw, _, ok, err := t.currentStringValue(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
-	if tv.deleted || tv.raw == nil {
+	if !ok {
 		return redisResult{typ: resultNil}, nil
 	}
-	return redisResult{typ: resultBulk, bulk: tv.raw}, nil
+	return redisResult{typ: resultBulk, bulk: raw}, nil
 }
 
 func (t *txnContext) applyExists(cmd redcon.Command) (redisResult, error) {
@@ -1238,7 +1238,7 @@ func (t *txnContext) buildWideDeletionElems(
 	}
 	keys := make([]string, 0, len(deletes))
 	for k := range deletes {
-		if t.hasReplacement([]byte(k)) {
+		if _, ok := t.replacers[k]; ok {
 			continue
 		}
 		keys = append(keys, k)
@@ -1409,7 +1409,7 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 	seqInTxn := uint32(0)
 	for _, k := range keys {
 		st := t.zsetStates[k]
-		if t.hasReplacement([]byte(k)) {
+		if _, ok := t.replacers[k]; ok {
 			continue
 		}
 		if !st.dirty {
@@ -1615,7 +1615,7 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 		if !st.dirty {
 			continue
 		}
-		if t.hasReplacement([]byte(k)) {
+		if _, ok := t.replacers[k]; ok {
 			continue
 		}
 		// String keys encode TTL inside the value in buildKeyElems; skip them here.
