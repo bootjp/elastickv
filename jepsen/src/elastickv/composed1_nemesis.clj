@@ -101,12 +101,16 @@
       (str (name node) ":" default-grpc-port)
       (str "127.0.0.1:" default-grpc-port))))
 
+(defn- without-nil-values [m]
+  (into {} (remove (comp nil? val)) m))
+
 (defn- runtime-opts [opts test]
   (merge {:list-routes-bin default-list-routes-bin
           :split-bin       default-split-bin
           :grpc-host-port  (default-grpc-host-port-for test)}
-         (select-keys test [:list-routes-bin :split-bin :grpc-host-port])
-         opts))
+         (without-nil-values
+           (select-keys test [:list-routes-bin :split-bin :grpc-host-port]))
+         (without-nil-values opts)))
 
 (defn- read-route-snapshot! [{:keys [list-routes-bin grpc-host-port]}]
   (let [result (shell/sh list-routes-bin "--address" grpc-host-port)]
@@ -150,8 +154,10 @@
                   snapshot (read-route-snapshot! opts)
                   plan     (plan-route-shuffle
                               snapshot
-                              {:counter (swap! counter inc)
-                               :anchor-tables (:route-shuffle-anchor-tables opts)})]
+                              (cond-> {:counter (swap! counter inc)}
+                                (some? (:route-shuffle-anchor-tables opts))
+                                (assoc :anchor-tables
+                                       (:route-shuffle-anchor-tables opts))))]
               (if-not plan
                 (do
                   (warn "route-shuffle skipped: no active route has an interior split key")
@@ -166,7 +172,11 @@
                                             :stderr (:err result)})))))
             (catch Throwable t
               (warn t "route-shuffle failed")
-              (assoc op :value {:error (.getMessage t)})))
+              (let [message (or (.getMessage t) (str t))]
+                (assoc op
+                       :type :fail
+                       :error message
+                       :value (merge {:error message} (ex-data t))))))
 
           op))
 

@@ -563,7 +563,7 @@
                                      (when local? {:dummy true})
                                      (:ssh opts))
              :remote          control/ssh
-             :nemesis         (:nemesis nemesis-p)
+             :nemesis         (or (:nemesis nemesis-p) nemesis/noop)
              :final-generator nil
              :concurrency     (or (:concurrency opts) 5)
              :generator       (->> (:generator workload)

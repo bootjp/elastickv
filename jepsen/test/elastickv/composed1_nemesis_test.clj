@@ -1,6 +1,10 @@
 (ns elastickv.composed1-nemesis-test
-  (:require [clojure.test :refer :all]
-            [elastickv.composed1-nemesis :as nem]))
+  (:require [clojure.java.shell :as shell]
+            [clojure.test :refer :all]
+            [elastickv.composed1-nemesis :as nem]
+            [jepsen.nemesis :as jepsen-nemesis]))
+
+(def ^:private runtime-opts (var-get #'nem/runtime-opts))
 
 (defn- b64 [s]
   (.encodeToString (java.util.Base64/getEncoder)
@@ -66,6 +70,62 @@
     (is (= 101 (:route-id plan)))
     (is (= "jepsen_append_t4" (:anchor-table plan)))
     (is (nem/route-covers? (second (:routes snapshot)) (:split-key plan)))))
+
+(deftest runtime-opts-ignore-nil-overrides
+  (let [resolved (runtime-opts
+                   {:list-routes-bin nil
+                    :split-bin       nil
+                    :grpc-host-port  nil}
+                   {:nodes           [:n1 :n2]
+                    :list-routes-bin nil
+                    :split-bin       nil
+                    :grpc-host-port  nil})]
+    (is (= "elastickv-list-routes" (:list-routes-bin resolved)))
+    (is (= "elastickv-split" (:split-bin resolved)))
+    (is (= "n1:50051" (:grpc-host-port resolved)))))
+
+(deftest route-shuffle-invoke-uses-defaults-when-opts-are-nil
+  (let [calls (atom [])]
+    (with-redefs [shell/sh (fn [& args]
+                             (swap! calls conj args)
+                             (case (first args)
+                               "elastickv-list-routes"
+                               {:exit 0 :out (routes-json) :err ""}
+
+                               "elastickv-split"
+                               {:exit 0 :out "split ok" :err ""}))]
+      (let [result (jepsen-nemesis/invoke!
+                     (nem/route-shuffle-nemesis
+                       {:list-routes-bin nil
+                        :split-bin       nil
+                        :grpc-host-port  nil})
+                     {:nodes           [:n1]
+                      :list-routes-bin nil
+                      :split-bin       nil
+                      :grpc-host-port  nil}
+                     {:type :info :f :route-shuffle})]
+        (is (= :info (:type result)))
+        (is (= "jepsen_append_t4" (get-in result [:value :anchor-table])))
+        (is (= [["elastickv-list-routes" "--address" "n1:50051"]
+                ["elastickv-split"
+                 "--address" "n1:50051"
+                 "--route-id" "101"
+                 "--split-key" (get-in result [:value :split-key])
+                 "--expected-version" "7"]]
+               @calls))))))
+
+(deftest route-shuffle-helper-failures-are-failed-ops
+  (with-redefs [shell/sh (fn [& _]
+                           {:exit 127 :out "" :err "missing helper"})]
+    (let [result (jepsen-nemesis/invoke!
+                   (nem/route-shuffle-nemesis {})
+                   {:nodes [:n1]}
+                   {:type :info :f :route-shuffle})]
+      (is (= :fail (:type result)))
+      (is (re-find #"elastickv-list-routes --address n1:50051 failed"
+                   (:error result)))
+      (is (= 127 (get-in result [:value :exit])))
+      (is (= "missing helper" (get-in result [:value :stderr]))))))
 
 (deftest route-shuffle-package-is-opt-in
   (is (nil? (:generator (nem/route-shuffle-package {}))))

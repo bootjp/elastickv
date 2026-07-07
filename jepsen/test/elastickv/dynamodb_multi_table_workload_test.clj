@@ -16,6 +16,12 @@
                     :dynamo-port 9000})]
     (is (= 10 (:concurrency test-map)))))
 
+(deftest local-test-uses-noop-nemesis-when-no-package-is-enabled
+  (let [test-map (workload/elastickv-dynamodb-multi-table-test
+                   {:local true
+                    :nodes ["n1"]})]
+    (is (some? (:nemesis test-map)))))
+
 (deftest host-override-creates-client
   (let [test-map (workload/elastickv-dynamodb-multi-table-test
                    {:dynamo-host "127.0.0.1"
