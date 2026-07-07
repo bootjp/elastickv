@@ -41,9 +41,9 @@ type keyWaiterRegistry struct {
 }
 
 type keyWaiter struct {
-	C         chan struct{}
-	keys      []string
-	forceFull atomic.Bool
+	C           chan struct{}
+	keys        []string
+	fullSignals atomic.Uint64
 }
 
 func newKeyWaiterRegistry() *keyWaiterRegistry {
@@ -139,7 +139,7 @@ func (reg *keyWaiterRegistry) signal(key []byte, forceFull bool) {
 	reg.mu.Unlock()
 	for _, w := range waiters {
 		if forceFull {
-			w.forceFull.Store(true)
+			w.fullSignals.Add(1)
 		}
 		select {
 		case w.C <- struct{}{}:
@@ -152,7 +152,19 @@ func (w *keyWaiter) fastSignalAllowed() bool {
 	if w == nil {
 		return false
 	}
-	return !w.forceFull.Swap(false)
+	return !w.consumeFullSignal()
+}
+
+func (w *keyWaiter) consumeFullSignal() bool {
+	for {
+		n := w.fullSignals.Load()
+		if n == 0 {
+			return false
+		}
+		if w.fullSignals.CompareAndSwap(n, n-1) {
+			return true
+		}
+	}
 }
 
 // dedupKeyWaiterKeys returns a new slice of stringified keys with

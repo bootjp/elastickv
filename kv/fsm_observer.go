@@ -20,16 +20,30 @@ func WithApplyObserver(observer ApplyObserver) FSMOption {
 	}
 }
 
-func (f *kvFSM) notifyApplyObservers(muts []*pb.Mutation) {
+func (f *kvFSM) notifyApplyObservers(commitTS uint64, muts []*pb.Mutation) {
+	f.observeAppliedCommitTS(commitTS)
 	for _, mut := range muts {
 		if mut == nil {
 			continue
 		}
-		f.notifyApplyObserver(mut.Op, mut.Key)
+		f.notifyApplyObserverAfterObserve(mut.Op, mut.Key)
 	}
 }
 
-func (f *kvFSM) notifyApplyObserver(op pb.Op, key []byte) {
+func (f *kvFSM) notifyApplyObserver(commitTS uint64, op pb.Op, key []byte) {
+	f.observeAppliedCommitTS(commitTS)
+	f.notifyApplyObserverAfterObserve(op, key)
+}
+
+// observeAppliedCommitTS pins the HLC-4 strategy (c) handoff invariant before
+// any observer can wake code that may allocate another persistence timestamp.
+func (f *kvFSM) observeAppliedCommitTS(commitTS uint64) {
+	if f.hlc != nil && commitTS > 0 {
+		f.hlc.Observe(commitTS)
+	}
+}
+
+func (f *kvFSM) notifyApplyObserverAfterObserve(op pb.Op, key []byte) {
 	if len(f.applyObservers) == 0 {
 		return
 	}

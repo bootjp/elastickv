@@ -116,6 +116,33 @@ func TestKeyWaiterRegistry_SignalFullDowngradesCoalescedFastSignal(t *testing.T)
 	}
 }
 
+func TestKeyWaiterRegistry_SignalFullPreservesQueuedFullWake(t *testing.T) {
+	t.Parallel()
+	reg := newKeyWaiterRegistry()
+	w, release := reg.Register([][]byte{[]byte("k")})
+	defer release()
+
+	reg.SignalFull([]byte("k"))
+	select {
+	case <-w.C:
+	case <-time.After(time.Second):
+		t.Fatal("first SignalFull did not wake waiter")
+	}
+
+	reg.SignalFull([]byte("k"))
+	if w.fastSignalAllowed() {
+		t.Fatal("first full wake was consumed as a fast signal")
+	}
+	select {
+	case <-w.C:
+	case <-time.After(time.Second):
+		t.Fatal("second SignalFull did not wake waiter")
+	}
+	if w.fastSignalAllowed() {
+		t.Fatal("second full wake lost its full classification")
+	}
+}
+
 func TestKeyWaiterRegistry_ReleaseStopsFurtherSignals(t *testing.T) {
 	t.Parallel()
 	reg := newKeyWaiterRegistry()

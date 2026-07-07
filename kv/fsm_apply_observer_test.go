@@ -22,6 +22,15 @@ func (o *recordingApplyObserver) OnApply(op pb.Op, key []byte) {
 	o.calls = append(o.calls, recordedApply{op: op, key: string(key)})
 }
 
+type hlcRecordingApplyObserver struct {
+	hlc      *HLC
+	currents []uint64
+}
+
+func (o *hlcRecordingApplyObserver) OnApply(pb.Op, []byte) {
+	o.currents = append(o.currents, o.hlc.Current())
+}
+
 func applyObserverTestRequest(t *testing.T, fsm *kvFSM, req *pb.Request) error {
 	t.Helper()
 	data, err := proto.Marshal(req)
@@ -33,6 +42,14 @@ func applyObserverTestRequest(t *testing.T, fsm *kvFSM, req *pb.Request) error {
 	err, ok := resp.(error)
 	require.True(t, ok, "unexpected Apply response type %T", resp)
 	return err
+}
+
+func requireObservedBeforeNotify(t *testing.T, currents []uint64, commitTS uint64) {
+	t.Helper()
+	require.NotEmpty(t, currents)
+	for _, current := range currents {
+		require.GreaterOrEqual(t, current, commitTS)
+	}
 }
 
 func TestFSMApplyObserverRawMutationsAfterSuccess(t *testing.T) {
@@ -139,4 +156,88 @@ func TestFSMApplyObserverOnePhaseTxnAfterSuccess(t *testing.T) {
 		{op: pb.Op_PUT, key: "stream"},
 		{op: pb.Op_DEL, key: "old-entry"},
 	}, observer.calls)
+}
+
+func TestFSMApplyObserverSeesObservedCommitTS(t *testing.T) {
+	t.Run("raw", func(t *testing.T) {
+		st := store.NewMVCCStore()
+		hlc := NewHLC()
+		observer := &hlcRecordingApplyObserver{hlc: hlc}
+		fsm, ok := NewKvFSMWithHLC(st, hlc, WithApplyObserver(observer)).(*kvFSM)
+		require.True(t, ok)
+
+		const commitTS = 100
+		req := &pb.Request{
+			Ts: commitTS,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte("put-key"), Value: []byte("v")},
+				{Op: pb.Op_DEL, Key: []byte("del-key")},
+			},
+		}
+		require.NoError(t, applyObserverTestRequest(t, fsm, req))
+		requireObservedBeforeNotify(t, observer.currents, commitTS)
+	})
+
+	t.Run("del-prefix", func(t *testing.T) {
+		st := store.NewMVCCStore()
+		hlc := NewHLC()
+		observer := &hlcRecordingApplyObserver{hlc: hlc}
+		fsm, ok := NewKvFSMWithHLC(st, hlc, WithApplyObserver(observer)).(*kvFSM)
+		require.True(t, ok)
+
+		const commitTS = 110
+		req := &pb.Request{
+			Ts:        commitTS,
+			Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("prefix/")}},
+		}
+		require.NoError(t, applyObserverTestRequest(t, fsm, req))
+		requireObservedBeforeNotify(t, observer.currents, commitTS)
+	})
+
+	t.Run("one-phase", func(t *testing.T) {
+		st := store.NewMVCCStore()
+		hlc := NewHLC()
+		observer := &hlcRecordingApplyObserver{hlc: hlc}
+		fsm, ok := NewKvFSMWithHLC(st, hlc, WithApplyObserver(observer)).(*kvFSM)
+		require.True(t, ok)
+
+		const commitTS = 120
+		req := &pb.Request{
+			IsTxn: true,
+			Phase: pb.Phase_NONE,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("primary"), CommitTS: commitTS})},
+				{Op: pb.Op_PUT, Key: []byte("primary"), Value: []byte("v")},
+			},
+		}
+		require.NoError(t, applyObserverTestRequest(t, fsm, req))
+		requireObservedBeforeNotify(t, observer.currents, commitTS)
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		st := store.NewMVCCStore()
+		hlc := NewHLC()
+		observer := &hlcRecordingApplyObserver{hlc: hlc}
+		fsm, ok := NewKvFSMWithHLC(st, hlc, WithApplyObserver(observer)).(*kvFSM)
+		require.True(t, ok)
+
+		primary := []byte("primary")
+		secondary := []byte("secondary")
+		prepareTxn(t, fsm, primary, 10, [][]byte{primary, secondary}, [][]byte{[]byte("p"), []byte("s")})
+
+		const commitTS = 130
+		commit := &pb.Request{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primary, CommitTS: commitTS})},
+				{Op: pb.Op_PUT, Key: primary},
+				{Op: pb.Op_PUT, Key: secondary},
+			},
+		}
+		require.NoError(t, applyObserverTestRequest(t, fsm, commit))
+		requireObservedBeforeNotify(t, observer.currents, commitTS)
+	})
 }
