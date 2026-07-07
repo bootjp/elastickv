@@ -1,7 +1,7 @@
 # S3 collision-rename reversal (Phase 0b M4-2b) — proposed
 
 **Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_partial_snapshot_logical_encoder.md`](2026_05_25_partial_snapshot_logical_encoder.md) — this resolves §"S3 — bodies re-chunked + manifest + collision/suffix reversal" by adding the inverse of the decoder's rename-collisions write path.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves §"S3 — bodies re-chunked + manifest + collision/suffix reversal" by adding the inverse of the decoder's rename-collisions write path.
 **Predecessor on disk:** M4-1 (`PR #847`) emits `!s3|bucket|meta|` + `!s3|bucket|gen|`. M4-2a (`PR #864`) emits `!s3|obj|head|` + `!s3|blob|` for every object whose key is recoverable from the on-disk path alone. Both currently fail closed via `ErrS3EncodeUnsupportedCollision` whenever a bucket's dump tree carries a `KEYMAP.jsonl` collision-tracker — i.e., any dump that exercised the decoder's rename-collisions path is rejected without a partial restore (`internal/backup/encode_s3_objects.go:95-98`).
 
 ## What needs to land
@@ -126,7 +126,7 @@ The slice ships as a single PR since the keymap loader, segment resolver, and in
 
 ## References
 
-- Parent: `2026_05_25_partial_snapshot_logical_encoder.md` §"S3"
+- Parent: `2026_05_25_implemented_snapshot_logical_encoder.md` §"S3"
 - Decoder write path: `internal/backup/s3.go:611-700` (`flushObjectWithCollision`, `closeBucketKeymap`)
 - Keymap format: `internal/backup/keymap.go` (single source of truth for `KeymapRecord`)
 - Sibling encoder pattern: `internal/backup/encode_redis.go:113-132` (Redis's `loadKeymap`)
