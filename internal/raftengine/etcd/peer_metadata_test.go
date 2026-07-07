@@ -84,12 +84,11 @@ func writeV1PeerEntry(w io.Writer, peer Peer) error {
 	return writeString(w, peer.Address)
 }
 
-// TestPersistedPeersWriterAlwaysEmitsV2 pins the writer-side
-// invariant that savePersistedPeers writes the v2 header and per-peer
-// suffrage byte even when the input peers carry no explicit
-// Suffrage. There is no v1->v2 read-side migration step in this
-// path; the writer is unconditionally v2.
-func TestPersistedPeersWriterAlwaysEmitsV2(t *testing.T) {
+// TestPersistedPeersWriterAlwaysEmitsV3 pins the writer-side
+// invariant that savePersistedPeers writes the v3 header: current
+// peers keep the v2 per-peer suffrage byte, followed by the bootstrap
+// seed marker fields.
+func TestPersistedPeersWriterAlwaysEmitsV3(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, savePersistedPeers(dir, 1, []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -102,7 +101,63 @@ func TestPersistedPeersWriterAlwaysEmitsV2(t *testing.T) {
 	reader := bufio.NewReader(file)
 	version, err := readPeersFileHeader(reader)
 	require.NoError(t, err)
-	require.Equal(t, peersFileVersionV2, version)
+	require.Equal(t, peersFileVersionV3, version)
+}
+
+func TestPersistedPeersBootstrapSeedRoundTripAndDeactivate(t *testing.T) {
+	dir := t.TempDir()
+	peers := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+	}
+	seed := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+	}
+
+	require.NoError(t, savePersistedPeersWithBootstrapSeed(dir, 1, peers, seed))
+	state, ok, err := loadPersistedPeersState(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, state.BootstrapSeedActive)
+	require.Equal(t, seed, state.BootstrapSeed)
+
+	changed := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:7003", Suffrage: SuffrageVoter},
+	}
+	require.NoError(t, writeCurrentPersistedPeers(dir, 2, changed))
+	state, ok, err = loadPersistedPeersState(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, state.BootstrapSeedActive)
+	require.Equal(t, seed, state.BootstrapSeed)
+	require.Equal(t, changed, state.Peers)
+}
+
+func TestValidateBootstrapSeedActiveMismatchRejected(t *testing.T) {
+	seed := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+	}
+	persisted := persistedPeers{BootstrapSeed: seed, BootstrapSeedActive: true}
+
+	require.NoError(t, validateBootstrapSeed(persisted, true, []Peer{
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+	}))
+
+	err := validateBootstrapSeed(persisted, true, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:7003"},
+	})
+	require.ErrorIs(t, err, errClusterMismatch)
+
+	inactive := persisted
+	inactive.BootstrapSeedActive = false
+	require.NoError(t, validateBootstrapSeed(inactive, true, []Peer{
+		{NodeID: 1, ID: "n1", Address: "changed:7001"},
+	}))
 }
 
 // TestPersistedPeersV2UnknownSuffrageRejected pins the validation in

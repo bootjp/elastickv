@@ -27,7 +27,7 @@ func buildShardGroupsWithEncryptionWiring(
 	groups []groupSpec,
 	multi bool,
 	bootstrap bool,
-	bootstrapServers []raftengine.Server,
+	bootstrapCfg raftBootstrapConfig,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -71,7 +71,7 @@ func buildShardGroupsWithEncryptionWiring(
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
-	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
+	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapCfg,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.
