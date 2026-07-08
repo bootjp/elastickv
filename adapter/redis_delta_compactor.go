@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -113,7 +114,7 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
 		st:       st,
-		coord:    coord,
+		coord:    kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
 		logger:   slog.Default(),
 		maxCount: defaultDeltaCompactorMaxDeltaCount,
 		interval: defaultDeltaCompactorScanInterval,

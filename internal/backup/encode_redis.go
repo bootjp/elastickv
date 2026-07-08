@@ -13,7 +13,7 @@ import (
 
 // encode_redis.go is the Phase 0b Redis reverse encoder — the inverse
 // of the RedisDB decoder in redis_*.go (design:
-// docs/design/2026_05_25_proposed_snapshot_logical_encoder.md §"Redis").
+// docs/design/2026_05_25_implemented_snapshot_logical_encoder.md §"Redis").
 // It walks a decoded redis/db_<n>/ subtree and feeds the reconstructed
 // internal records to a snapshotBuilder, which MVCC-frames and writes
 // them.

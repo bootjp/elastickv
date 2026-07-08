@@ -39,6 +39,14 @@ linters:
           - goconst
           - wrapcheck
         path: (.*)test(.*).go
+      - linters:
+          - govet
+        path: internal/raftengine/etcd/.*\.go
+        text: "copylocks: .*go.etcd.io/raft/v3/raftpb"
+      - linters:
+          - govet
+        path: internal/raftengine/etcd/.*\.go
+        text: "copylocks: .*go.etcd.io/etcd/server/v3/storage/wal/walpb"
     paths:
       - third_party$
       - builtin$

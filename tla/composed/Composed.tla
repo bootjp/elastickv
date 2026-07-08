@@ -1,7 +1,7 @@
 ------------------------------ MODULE Composed -------------------------------
 (***************************************************************************)
 (* TLA+ specification of the cross-module safety properties — the M5      *)
-(* milestone of docs/design/2026_05_28_partial_tla_safety_spec.md §5.5.   *)
+(* milestone of docs/design/2026_05_28_implemented_tla_safety_spec.md §5.5.   *)
 (*                                                                         *)
 (* M1..M4 each modelled a single subsystem in isolation.  M5 captures     *)
 (* what happens at the seams between them — specifically, two safety      *)

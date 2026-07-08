@@ -331,7 +331,7 @@ is tombstoned at the same `commitTS` rather than left as an
 unreachable orphan. The behaviour is intentional — the
 alternative was orphan objects that no API can enumerate or
 remove. See
-[`docs/design/2026_04_28_proposed_admin_delete_bucket_safety_net.md`](design/2026_04_28_proposed_admin_delete_bucket_safety_net.md)
+[`docs/design/2026_04_28_implemented_admin_delete_bucket_safety_net.md`](design/2026_04_28_implemented_admin_delete_bucket_safety_net.md)
 for the full race analysis.
 
 Operationally:
