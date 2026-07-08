@@ -287,7 +287,9 @@ mid-snapshot.
   2. If `cutover != 0`:
      - Entries with `raftIdx < cutover` are pre-Phase-2
        plaintext; pass through.
-     - Entries with `raftIdx >= cutover` are AEAD-wrapped;
+     - The entry with `raftIdx == cutover` is the plaintext cutover
+       marker itself; pass through.
+     - Entries with `raftIdx > cutover` are AEAD-wrapped;
        unwrap.
 
 The exact applier-side plumbing depends on Stage 6E's apply-hook

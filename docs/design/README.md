@@ -22,9 +22,10 @@ YYYY_MM_DD_<status>_<name>.md
   |---|---|
   | `proposed` | No matching code on `main`, or the doc itself declares itself a proposal. |
   | `partial` | Some components exist but the full scope described in the doc is not yet merged. |
-  | `implemented` | Concrete Go code exists on `main` that matches the design's central subsystem (the functions, types, or files named in the doc). |
+  | `implemented` | Concrete Go code exists on `main` that matches the design's central subsystem (the functions, types, or files named in the doc), or the document is a closure-only slice that explicitly records why no code changes are required and points to the existing implementation or final design decision that closes the scope. |
 
   Promote the status by renaming the file in a dedicated commit (e.g. `docs: promote <name> from proposed to implemented`). Do not introduce new statuses without updating this README.
+  Closure-only `implemented` documents must say that no implementation work follows and cite the code, parent design section, or operational decision that makes the slice complete.
 
 - `<name>` — short slug, lowercase with underscores, **without** the `_design` suffix (`s3_compatible_adapter`, not `s3_compatible_adapter_design`).
 
