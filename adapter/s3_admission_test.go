@@ -207,8 +207,40 @@ func TestS3Server_PutObjectAdmissionRejectsChunkedOverS3LimitBeforeSlowDown(t *t
 
 	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, rec.Body.String())
 	require.Contains(t, rec.Body.String(), "<Code>EntityTooLarge</Code>")
-	require.Equal(t, 1, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolChunked])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolChunked])
 	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolChunked])
+}
+
+func TestS3Server_PutObjectAdmissionValidatesProtocolBeforeSlowDown(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-protocol")
+
+	release, err := server.putAdmission.acquire(context.Background(), s3ChunkSize)
+	require.NoError(t, err)
+	defer release()
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-protocol/signed.bin", strings.NewReader("ignored"))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingSignedPayload)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "7")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>NotImplemented</Code>")
+
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodPut, "/admit-protocol/malformed.bin", nil)
+	req.Body = io.NopCloser(strings.NewReader("5\r\nhello\r\n0\r\n\r\n"))
+	req.ContentLength = -1
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", sha256Hex("hello"))
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolChunked])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
 }
 
 func TestS3Server_PutObjectAdmissionRequiresContentLengthForPlainPut(t *testing.T) {
@@ -282,6 +314,28 @@ func TestS3Server_PutObjectRejectsTruncatedFixedLengthBody(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+func TestS3Server_PutObjectAdmissionReportsReadErrorBeforeSlowDown(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, 5*time.Millisecond)
+	createS3AdmissionTestBucket(t, server, "admit-read-error")
+
+	reader := &s3AdmissionFillingErrorReader{
+		server:  server,
+		payload: []byte("bad"),
+		err:     newAwsChunkedError(io.ErrUnexpectedEOF),
+	}
+	defer reader.releaseHeld()
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-read-error/body.bin", reader)
+	req.ContentLength = int64(len(reader.payload))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed])
+}
+
 func TestS3Server_PutObjectAdmissionChunkedStreamsPastSingleChunkBudget(t *testing.T) {
 	t.Parallel()
 
@@ -306,6 +360,46 @@ func TestS3Server_PutObjectAdmissionChunkedStreamsPastSingleChunkBudget(t *testi
 	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-chunked/midstream.bin", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, string(payload), rec.Body.String())
+}
+
+func TestS3Server_UploadPartAdmissionValidatesProtocolBeforeSlowDown(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-protocol", "object.bin")
+
+	release, err := server.putAdmission.acquire(context.Background(), s3ChunkSize)
+	require.NoError(t, err)
+	defer release()
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-protocol/object.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader("ignored"),
+	)
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingSignedPayload)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "7")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNotImplemented, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>NotImplemented</Code>")
+
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-protocol/object.bin?uploadId=%s&partNumber=2", uploadID),
+		nil,
+	)
+	req.Body = io.NopCloser(strings.NewReader("5\r\nhello\r\n0\r\n\r\n"))
+	req.ContentLength = -1
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", sha256Hex("hello"))
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolChunked])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
 }
 
 func TestS3Server_UploadPartAdmissionAllowsFixedLengthLargerThanBudget(t *testing.T) {
@@ -341,6 +435,62 @@ func TestS3Server_UploadPartAdmissionAllowsFixedLengthLargerThanBudget(t *testin
 	require.Zero(t, server.putAdmission.inflight.Load())
 }
 
+func TestS3Server_UploadPartAdmissionReportsReadErrorBeforeSlowDown(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, 5*time.Millisecond)
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-read-error", "object.bin")
+
+	reader := &s3AdmissionFillingErrorReader{
+		server:  server,
+		payload: []byte("bad"),
+		err:     newAwsChunkedError(io.ErrUnexpectedEOF),
+	}
+	defer reader.releaseHeld()
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-read-error/object.bin?uploadId=%s&partNumber=1", uploadID),
+		reader,
+	)
+	req.ContentLength = int64(len(reader.payload))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed])
+}
+
+type s3AdmissionFillingErrorReader struct {
+	server  *S3Server
+	payload []byte
+	err     error
+	release func()
+	done    bool
+}
+
+func (r *s3AdmissionFillingErrorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	if r.server != nil && r.server.putAdmission != nil {
+		release, err := r.server.putAdmission.acquire(context.Background(), s3ChunkSize)
+		if err == nil {
+			r.release = release
+		}
+	}
+	r.done = true
+	return copy(p, r.payload), r.err
+}
+
+func (r *s3AdmissionFillingErrorReader) releaseHeld() {
+	if r.release == nil {
+		return
+	}
+	r.release()
+	r.release = nil
+}
+
 func newS3AdmissionTestServer(t *testing.T, timeout time.Duration) (*S3Server, *recordingS3PutAdmissionObserver) {
 	t.Helper()
 
@@ -364,4 +514,17 @@ func createS3AdmissionTestBucket(t *testing.T, server *S3Server, bucket string) 
 	rec := httptest.NewRecorder()
 	server.handle(rec, newS3TestRequest(http.MethodPut, "/"+bucket, nil))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+func initS3AdmissionMultipartUpload(t *testing.T, server *S3Server, bucket, object string) string {
+	t.Helper()
+
+	createS3AdmissionTestBucket(t, server, bucket)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, fmt.Sprintf("/%s/%s?uploads=", bucket, object), nil))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	require.NotEmpty(t, initResult.UploadId)
+	return initResult.UploadId
 }

@@ -872,12 +872,12 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
 	admissionProtocol := s3PutAdmissionProtocolForPayload(expectedPayloadSHA)
-	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
-		return
-	}
 	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
 		return
 	}
 	part := s3ObjectPart{PartNo: 1}
@@ -932,11 +932,21 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 				return
 			}
 		}
-		readBuf, exactLength := nextReadBuffer()
+		readBuf, finalRead := nextReadBuffer()
 		if len(readBuf) == 0 {
 			break
 		}
-		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
+		allowFinalPartial := admissionProtocol != s3PutAdmissionProtocolFixed
+		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, readErr)
+			return
+		}
 		if n > 0 {
 			releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
 			if admissionErr != nil {
@@ -978,15 +988,6 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
-		}
-		if readErr != nil {
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
 		}
 	}
 	if err := flushBatch(); err != nil {
@@ -1412,12 +1413,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 
 	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	admissionProtocol := s3PutAdmissionProtocolForPayload(partPayloadSHA)
-	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
-		return
-	}
 	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
 
@@ -1484,22 +1485,23 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 				return
 			}
 		}
-		readBuf, exactLength := nextReadBuffer()
+		readBuf, finalRead := nextReadBuffer()
 		if len(readBuf) == 0 {
 			break
 		}
-		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
+		allowFinalPartial := admissionProtocol != s3PutAdmissionProtocolFixed
+		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, readErr)
+			return
+		}
 		if n == 0 {
 			if errors.Is(readErr, io.EOF) {
 				break
-			}
-			if readErr != nil {
-				if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
-					writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-					return
-				}
-				writeS3InternalError(w, readErr)
-				return
 			}
 			continue
 		}
@@ -1533,14 +1535,6 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		chunkNo++
 		if errors.Is(readErr, io.EOF) {
 			break
-		}
-		if readErr != nil {
-			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
 		}
 	}
 	if err := flushBatch(); err != nil {
@@ -2546,13 +2540,13 @@ func nextS3PutReadBuffer(buf []byte, protocol string, contentLength int64, readB
 	if remaining <= 0 {
 		return nil, true
 	}
-	if remaining < int64(len(buf)) {
+	if remaining <= int64(len(buf)) {
 		return buf[:int(remaining)], true
 	}
-	return buf, true
+	return buf, false
 }
 
-func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error) {
+func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool, allowEOFWithFullBuffer bool) (int, error) {
 	total := 0
 	for total < len(buf) {
 		n, err := r.Read(buf[total:])
@@ -2560,7 +2554,7 @@ func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error
 			total += n
 		}
 		if errors.Is(err, io.EOF) {
-			return s3PutChunkEOFResult(total, len(buf), allowFinalPartial)
+			return s3PutChunkEOFResult(total, len(buf), allowFinalPartial, allowEOFWithFullBuffer)
 		}
 		if err != nil {
 			return total, errors.WithStack(err)
@@ -2572,7 +2566,10 @@ func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error
 	return total, nil
 }
 
-func s3PutChunkEOFResult(total, bufLen int, allowFinalPartial bool) (int, error) {
+func s3PutChunkEOFResult(total, bufLen int, allowFinalPartial bool, allowEOFWithFullBuffer bool) (int, error) {
+	if allowEOFWithFullBuffer && total == bufLen {
+		return total, io.EOF
+	}
 	if !allowFinalPartial && (total > 0 || bufLen > 0) {
 		return total, errS3PutIncompleteBody
 	}

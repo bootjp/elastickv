@@ -388,11 +388,35 @@ func TestReadS3PutChunkPreservesFullBufferReaderError(t *testing.T) {
 	buf := make([]byte, 4)
 	reader := &s3FullBufferErrorReader{err: newAwsChunkedError(io.ErrUnexpectedEOF)}
 
-	n, err := readS3PutChunk(reader, buf, true)
+	n, err := readS3PutChunk(reader, buf, true, false)
 
 	require.Equal(t, len(buf), n)
 	var chunkedErr *awsChunkedError
 	require.ErrorAs(t, err, &chunkedErr)
+}
+
+func TestReadS3PutChunkAcceptsFinalFullBufferEOF(t *testing.T) {
+	t.Parallel()
+
+	buf := make([]byte, 4)
+	reader := &s3FullBufferErrorReader{err: io.EOF}
+
+	n, err := readS3PutChunk(reader, buf, false, true)
+
+	require.Equal(t, len(buf), n)
+	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestReadS3PutChunkRejectsNonFinalFullBufferEOF(t *testing.T) {
+	t.Parallel()
+
+	buf := make([]byte, 4)
+	reader := &s3FullBufferErrorReader{err: io.EOF}
+
+	n, err := readS3PutChunk(reader, buf, false, false)
+
+	require.Equal(t, len(buf), n)
+	require.ErrorIs(t, err, errS3PutIncompleteBody)
 }
 
 type s3FullBufferErrorReader struct {
