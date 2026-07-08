@@ -342,7 +342,8 @@ func TestSQSServer_Throttle_DeleteCreateQueueSyncsMetrics(t *testing.T) {
 	if status, _ := callSQS(t, node, sqsDeleteQueueTarget, map[string]any{"QueueUrl": url}); status != http.StatusOK {
 		t.Fatalf("delete: %d", status)
 	}
-	require.Contains(t, observer.syncs, throttleSyncReport{queue: queue})
+	require.Empty(t, observer.syncs,
+		"DeleteQueue cleanup must use cutoff-scoped forgets instead of unconditional action sync")
 	require.ElementsMatch(t, []throttleForgetReport{
 		{queue: queue, action: SQSThrottleActionSend},
 		{queue: queue, action: SQSThrottleActionReceive},

@@ -205,6 +205,23 @@ func TestSQSServer_BeginThrottleResetSuppressesStaleMetricBeforeCleanup(t *testi
 		"reset cleanup must preserve token gauges observed after the reset gate")
 }
 
+func TestSQSServer_ObserveThrottleDeletePreservesFreshGaugeAfterCutoff(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+
+	observer.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 1, false)
+	deleteCutoff := observer.ThrottleGaugeSnapshotCutoff()
+	observer.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 9, false)
+
+	srv.observeThrottleDelete("orders.fifo", deleteCutoff)
+
+	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionSend},
+		"stale delete cleanup must not erase a same-name new incarnation gauge observed after the cutoff")
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionReceive})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionDefault})
+}
+
 func TestSQSServer_ChargeQueueWithThrottleCountsStaleRejectionAfterInvalidate(t *testing.T) {
 	t.Parallel()
 	observer := &recordingSQSThrottleObserver{}

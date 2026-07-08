@@ -1070,6 +1070,34 @@ func TestSQSObserver_ObserveOnce_DepthSeenFreshGaugeAfterCutoffSurvivesMiss(t *t
 	require.InDelta(t, 6.0, value, 0.001)
 }
 
+func TestSQSObserver_ObserveOnce_DepthSeenMarkerSurvivesFreshGaugeDuringLaterMiss(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{{Queue: "orders.fifo", Visible: 1}}, ok: true}},
+	})
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{}, ok: true}},
+	})
+	obs.ObserveOnce(callbackDepthSource{fn: func() ([]SQSQueueDepth, bool) {
+		m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 7, false)
+		return []SQSQueueDepth{}, true
+	}})
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{}, ok: true}},
+	})
+
+	value, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "fresh token gauge for a previously depth-seen queue must keep the depth-seen marker")
+	require.InDelta(t, 7.0, value, 0.001)
+}
+
 // TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges
 // pins the P2 fix from PR #743 r6: when the source returns
 // ok=false (transient catalog-scan failure on the leader, ctx

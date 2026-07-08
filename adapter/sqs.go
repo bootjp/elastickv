@@ -352,6 +352,20 @@ func (s *SQSServer) observeThrottleConfigChange(queue string, throttle *sqsQueue
 	}
 }
 
+func (s *SQSServer) observeThrottleDelete(queue string, resetCutoff uint64) {
+	if s == nil || s.throttleObserver == nil {
+		return
+	}
+	observer, ok := s.throttleObserver.(sqsThrottleGaugeResetObserver)
+	if !ok {
+		s.observeThrottleConfig(queue, nil)
+		return
+	}
+	for _, action := range sqsThrottleMetricActions {
+		observer.ForgetThrottleActionBefore(queue, action, resetCutoff)
+	}
+}
+
 func (s *SQSServer) throttleGaugeSnapshotCutoff() uint64 {
 	if s == nil || s.throttleObserver == nil {
 		return 0

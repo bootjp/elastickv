@@ -945,8 +945,9 @@ func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}, thr
 		clear(o.depthSeenThrottleQueues)
 		return
 	}
-	throttleQueues, activeThrottleQueues := o.snapshotThrottleQueues(throttleCutoff)
-	o.forgetDepthSeenThrottleQueuesWithoutGauge(activeThrottleQueues)
+	throttleQueues, _ := o.snapshotThrottleQueues(throttleCutoff)
+	_, currentThrottleQueues := o.snapshotThrottleQueues(^uint64(0))
+	o.forgetDepthSeenThrottleQueuesWithoutGauge(currentThrottleQueues)
 	o.forgetDepthQueuesMissingFrom(current, true)
 	o.forgetThrottleOnlyQueues(current, throttleQueues)
 }
