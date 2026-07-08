@@ -42,6 +42,8 @@ message RawPutResponse {
 }
 
 message RawGetRequest {
+  reserved 4;
+
   bytes key = 1;
   uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
 }
@@ -71,6 +73,8 @@ message RawLatestCommitTSResponse {
 }
 
 message RawScanAtRequest {
+  reserved 6;
+
   bytes start_key = 1;
   bytes end_key = 2;
   int64 limit = 3; // validated against host int size; large values may be rejected
