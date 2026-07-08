@@ -281,45 +281,88 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitReturnsPermanentError(t *te
 	}
 }
 
-func TestStartupPublicKVGate_BlocksOnlyPublicKVUntilReady(t *testing.T) {
+func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 	t.Parallel()
 	gate := &startupPublicKVGate{}
-	handlerCalled := false
-	handler := func(context.Context, interface{}) (interface{}, error) {
-		handlerCalled = true
-		return "ok", nil
+
+	blockedMethods := []string{
+		pb.RawKV_RawGet_FullMethodName,
+		pb.TransactionalKV_Get_FullMethodName,
+		pb.Internal_Forward_FullMethodName,
+		pb.AdminForward_Forward_FullMethodName,
+		pb.Distribution_SplitRange_FullMethodName,
+		pb.EncryptionAdmin_BootstrapEncryption_FullMethodName,
+		pb.EncryptionAdmin_RotateDEK_FullMethodName,
+		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
+		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
+		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
 	}
-	if _, err := gate.unaryInterceptor(
-		context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName},
-		handler,
-	); status.Code(err) != codes.Unavailable {
-		t.Fatalf("RawKV before ready err=%v, want Unavailable", err)
+
+	for _, method := range blockedMethods {
+		t.Run("blocked/"+method, func(t *testing.T) {
+			handlerCalled := false
+			handler := func(context.Context, interface{}) (interface{}, error) {
+				handlerCalled = true
+				return "ok", nil
+			}
+			if _, err := gate.unaryInterceptor(
+				context.Background(), nil,
+				&grpc.UnaryServerInfo{FullMethod: method},
+				handler,
+			); status.Code(err) != codes.Unavailable {
+				t.Fatalf("%s before ready err=%v, want Unavailable", method, err)
+			}
+			if handlerCalled {
+				t.Fatalf("%s handler ran before startup gate opened", method)
+			}
+		})
 	}
-	if handlerCalled {
-		t.Fatal("RawKV handler ran before startup gate opened")
+
+	allowedMethods := []string{
+		pb.Internal_RelayPublish_FullMethodName,
+		pb.EncryptionAdmin_GetCapability_FullMethodName,
+		pb.EncryptionAdmin_GetSidecarState_FullMethodName,
 	}
-	if _, err := gate.unaryInterceptor(
-		context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: "/Internal/GetTimestamp"},
-		handler,
-	); err != nil {
-		t.Fatalf("internal method before ready must pass: %v", err)
+	for _, method := range allowedMethods {
+		t.Run("allowed/"+method, func(t *testing.T) {
+			handlerCalled := false
+			handler := func(context.Context, interface{}) (interface{}, error) {
+				handlerCalled = true
+				return "ok", nil
+			}
+			if _, err := gate.unaryInterceptor(
+				context.Background(), nil,
+				&grpc.UnaryServerInfo{FullMethod: method},
+				handler,
+			); err != nil {
+				t.Fatalf("%s before ready must pass: %v", method, err)
+			}
+			if !handlerCalled {
+				t.Fatalf("%s handler did not run", method)
+			}
+		})
 	}
-	if !handlerCalled {
-		t.Fatal("internal handler did not run")
-	}
+
 	gate.markReady()
-	handlerCalled = false
-	if _, err := gate.unaryInterceptor(
-		context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: pb.TransactionalKV_Get_FullMethodName},
-		handler,
-	); err != nil {
-		t.Fatalf("TransactionalKV after ready err=%v", err)
-	}
-	if !handlerCalled {
-		t.Fatal("TransactionalKV handler did not run after gate opened")
+	for _, method := range blockedMethods {
+		t.Run("ready/"+method, func(t *testing.T) {
+			handlerCalled := false
+			handler := func(context.Context, interface{}) (interface{}, error) {
+				handlerCalled = true
+				return "ok", nil
+			}
+			if _, err := gate.unaryInterceptor(
+				context.Background(), nil,
+				&grpc.UnaryServerInfo{FullMethod: method},
+				handler,
+			); err != nil {
+				t.Fatalf("%s after ready err=%v", method, err)
+			}
+			if !handlerCalled {
+				t.Fatalf("%s handler did not run after startup gate opened", method)
+			}
+		})
 	}
 }
 

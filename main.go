@@ -1473,7 +1473,7 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	if g != nil && info != nil && !g.ready.Load() && startupPublicKVMethod(info.FullMethod) {
+	if g != nil && info != nil && !g.ready.Load() && startupRotationGatedMethod(info.FullMethod) {
 		// Return a raw gRPC status so clients and retry policy see Unavailable.
 		//nolint:wrapcheck
 		return nil, status.Error(codes.Unavailable, "startup rotation has not completed")
@@ -1481,9 +1481,22 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	return handler(ctx, req)
 }
 
-func startupPublicKVMethod(fullMethod string) bool {
-	return strings.HasPrefix(fullMethod, "/RawKV/") ||
-		strings.HasPrefix(fullMethod, "/TransactionalKV/")
+func startupRotationGatedMethod(fullMethod string) bool {
+	switch fullMethod {
+	case pb.Internal_Forward_FullMethodName,
+		pb.AdminForward_Forward_FullMethodName,
+		pb.Distribution_SplitRange_FullMethodName,
+		pb.EncryptionAdmin_BootstrapEncryption_FullMethodName,
+		pb.EncryptionAdmin_RotateDEK_FullMethodName,
+		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
+		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
+		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName:
+		return true
+	default:
+		return strings.HasPrefix(fullMethod, "/RawKV/") ||
+			strings.HasPrefix(fullMethod, "/TransactionalKV/")
+	}
 }
 
 // configureAdminService builds the node-side AdminServer plus the interceptor
