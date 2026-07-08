@@ -36,14 +36,27 @@ import (
 // created-at timestamps, tags, and throttle config are not represented in
 // the dump and restore to their zero values.
 //
-// Partitioned (HT-FIFO) queues (partition_count > 1) use a different key
-// family (SqsPartitionedMsg* in adapter/sqs_keys.go) that this slice does
-// not reproduce, so they fail closed rather than emit classic keys a
-// partitioned queue would never read.
+// Partitioned (HT-FIFO) queues (partition_count > 1) use the SqsPartitionedMsg*
+// key families mirrored from adapter/sqs_keys.go. The encoder validates the
+// queue metadata first so malformed partitioned dumps fail before any row is
+// staged.
 
 // sqsRestoreGeneration is the uniform generation stamped across the queue
 // meta, gen counter, and every message key (Option B; see file header).
 const sqsRestoreGeneration uint64 = 1
+
+const (
+	// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go's
+	// htfifoMaxPartitions. Keep this local to avoid importing adapter.
+	sqsMaxHTFIFOPartitions uint32 = 32
+	// sqsFifoThroughputPerMessageGroupID mirrors the live AWS-compatible
+	// FifoThroughputLimit enum.
+	sqsFifoThroughputPerMessageGroupID = "perMessageGroupId"
+	// sqsFifoDedupScopeMessageGroup and sqsFifoDedupScopeQueue mirror the
+	// live AWS-compatible DeduplicationScope enums.
+	sqsFifoDedupScopeMessageGroup = "messageGroup"
+	sqsFifoDedupScopeQueue        = "queue"
+)
 
 var (
 	// ErrSQSEncodeInvalidQueue is returned when a _queue.json cannot be
@@ -381,10 +394,10 @@ func pickDedupWinners(meta *sqsQueueMetaPublic, records []sqsMessageRecord, isPa
 	return winners
 }
 
-// validatePartitioning runs the four fail-closed gates from the M5-3
+// validatePartitioning runs the message-level fail-closed gates from the M5-3
 // design doc §"Validation invariants" before any message is staged.
-// All four use raw meta.PartitionCount > 1 as the partitioned-queue
-// predicate, never effectivePartitionCount (codex P2 v914 v7).
+// All gates use raw meta.PartitionCount > 1 as the partitioned-queue
+// predicate, never effectivePartitionCount.
 func validatePartitioning(meta *sqsQueueMetaPublic, records []sqsMessageRecord) error {
 	for i := range records {
 		if err := validatePartitioningOne(meta, &records[i]); err != nil {
@@ -622,21 +635,81 @@ func (e *SQSRecordEncoder) readQueueMeta(root *os.Root, queueDir string) (sqsQue
 	if err := decodeOneJSON(f, &pub); err != nil {
 		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue, "%s: %v", rel, err)
 	}
+	if err := validateSQSQueueMetaPublic(pub, rel); err != nil {
+		return sqsQueueMetaPublic{}, err
+	}
+	return pub, nil
+}
+
+func validateSQSQueueMetaPublic(pub sqsQueueMetaPublic, rel string) error {
 	if pub.FormatVersion != 1 {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
+	}
+	if err := validateSQSQueueMetaHTFIFOEnums(pub, rel); err != nil {
+		return err
 	}
 	// PartitionCount must be a power of two when > 1. The live
 	// validator (adapter/sqs_partitioning.go:isPowerOfTwo) enforces
 	// this so partitionFor's mask AND (h & (n-1)) is equivalent to
 	// (h % n). A malformed dump with e.g. partition_count=3 would
 	// hash inconsistently and route messages to wrong partitions.
-	// Coderabbit Major #929.
-	if pub.PartitionCount > 1 && pub.PartitionCount&(pub.PartitionCount-1) != 0 {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+	if pub.PartitionCount != 0 && pub.PartitionCount&(pub.PartitionCount-1) != 0 {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d must be a power of two", rel, pub.PartitionCount)
 	}
-	return pub, nil
+	if pub.PartitionCount > sqsMaxHTFIFOPartitions {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: partition_count %d exceeds max %d", rel, pub.PartitionCount, sqsMaxHTFIFOPartitions)
+	}
+	if !pub.FIFO {
+		return validateSQSStandardQueueRejectsHTFIFO(pub, rel)
+	}
+	return validateSQSQueueMetaFIFOHTFIFO(pub, rel)
+}
+
+func validateSQSQueueMetaHTFIFOEnums(pub sqsQueueMetaPublic, rel string) error {
+	switch pub.FifoThroughputLimit {
+	case "", sqsFifoThroughputPerMessageGroupID, sqsFifoThroughputPerQueue:
+	default:
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: unsupported fifo_throughput_limit %q", rel, pub.FifoThroughputLimit)
+	}
+	switch pub.DeduplicationScope {
+	case "", sqsFifoDedupScopeMessageGroup, sqsFifoDedupScopeQueue:
+	default:
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: unsupported deduplication_scope %q", rel, pub.DeduplicationScope)
+	}
+	return nil
+}
+
+func validateSQSStandardQueueRejectsHTFIFO(pub sqsQueueMetaPublic, rel string) error {
+	if pub.PartitionCount > 1 {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: partition_count %d is only valid on FIFO queues", rel, pub.PartitionCount)
+	}
+	if pub.FifoThroughputLimit != "" {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: fifo_throughput_limit=%q is only valid on FIFO queues", rel, pub.FifoThroughputLimit)
+	}
+	if pub.DeduplicationScope != "" {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: deduplication_scope=%q is only valid on FIFO queues", rel, pub.DeduplicationScope)
+	}
+	return nil
+}
+
+func validateSQSQueueMetaFIFOHTFIFO(pub sqsQueueMetaPublic, rel string) error {
+	if pub.PartitionCount > 1 && pub.DeduplicationScope == sqsFifoDedupScopeQueue {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: deduplication_scope=%q is incompatible with partition_count %d", rel, pub.DeduplicationScope, pub.PartitionCount)
+	}
+	if pub.FifoThroughputLimit == sqsFifoThroughputPerMessageGroupID && pub.PartitionCount <= 1 {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: fifo_throughput_limit=%q requires partition_count > 1", rel, pub.FifoThroughputLimit)
+	}
+	return nil
 }
 
 // readMessages reads <queue>/messages.jsonl (one sqsMessageRecord per

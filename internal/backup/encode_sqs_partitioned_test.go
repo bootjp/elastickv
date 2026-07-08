@@ -420,6 +420,137 @@ func TestSQSEncodeAcceptsPowerOfTwoPartitionCount(t *testing.T) {
 	}
 }
 
+func TestSQSEncodeRejectsTooLargePartitionCount(t *testing.T) {
+	t.Parallel()
+	for _, n := range []uint32{64, 128} {
+		t.Run(fmt.Sprintf("count=%d", n), func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "too-large.fifo",
+				[]byte(fmt.Sprintf(`{"format_version":1,"name":"too-large.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":%d,"fifo_throughput_limit":"perMessageGroupId"}`, n)),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("partition_count=%d: err = %v, want ErrSQSEncodeInvalidQueue", n, err)
+			}
+		})
+	}
+}
+
+func TestSQSEncodeRejectsPartitionedStandardQueue(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "standard",
+		[]byte(`{"format_version":1,"name":"standard","fifo":false,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+func TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "queue-scope.fifo",
+		[]byte(`{"format_version":1,"name":"queue-scope.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2,"deduplication_scope":"queue"}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+func TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "throughput limit",
+			body: `"fifo_throughput_limit":"perQueue"`,
+		},
+		{
+			name: "dedup scope",
+			body: `"deduplication_scope":"messageGroup"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "standard",
+				[]byte(`{"format_version":1,"name":"standard","fifo":false,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,`+tc.body+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
+func TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "single.fifo",
+		[]byte(`{"format_version":1,"name":"single.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":1,"fifo_throughput_limit":"perMessageGroupId"}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+func TestSQSEncodeRejectsUnknownHTFIFOAttributeValues(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown throughput",
+			body: `"fifo_throughput_limit":"perShard"`,
+		},
+		{
+			name: "unknown dedup scope",
+			body: `"deduplication_scope":"queueGroup"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo",
+				[]byte(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":2,`+tc.body+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
 // TestSQSEncodeClassicDedupKeepsLatestAcrossGroups pins codex P2
 // #929 (round 2): for classic FIFO queues the live dedup key is
 // (queue, generation, dedupID) — NO group / partition. Two retained
