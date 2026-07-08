@@ -93,6 +93,29 @@ func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("msg-2"), kvs[0].Value)
 }
 
+func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1:  {Store: store.NewMVCCStore()},
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("payload"), 7, 0))
+
+	val, err := st.GetGroupAt(ctx, 42, key, 7)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), val)
+
+	_, err = st.GetAt(ctx, key, 7)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 

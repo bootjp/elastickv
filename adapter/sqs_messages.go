@@ -1058,10 +1058,15 @@ type sqsMsgCandidate struct {
 	visKey    []byte
 	messageID string
 	partition uint32
+	groupID   uint64
 }
 
 type sqsGroupScanner interface {
 	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
+type sqsGroupGetter interface {
+	GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error)
 }
 
 // sqsVisScanWallClockBudget caps how long the scan + deliver loop may
@@ -1080,7 +1085,7 @@ const sqsVisScanWallClockBudget = 100 * time.Millisecond
 // helpers route to the same partition the vis-index entry was found
 // under (legacy queues always pass 0).
 func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64, partition uint32) ([]sqsMsgCandidate, []byte, bool, error) {
-	kvs, err := s.scanVisibleIndexAt(ctx, start, end, pageSize, readTS)
+	kvs, groupID, err := s.scanVisibleIndexAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
 		return nil, start, true, errors.WithStack(err)
 	}
@@ -1089,7 +1094,7 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 	}
 	out := make([]sqsMsgCandidate, 0, len(kvs))
 	for _, kvp := range kvs {
-		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value), partition: partition})
+		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value), partition: partition, groupID: groupID})
 	}
 	if len(kvs) < pageSize {
 		return out, start, true, nil
@@ -1101,21 +1106,21 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 	return out, next, false, nil
 }
 
-func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, error) {
+func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, uint64, error) {
 	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(start) {
 		kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
-		return kvs, errors.WithStack(err)
+		return kvs, 0, errors.WithStack(err)
 	}
 	groupID, ok := s.partitionResolver.ResolveGroup(start)
 	if !ok {
-		return nil, errors.Errorf("sqs receive partition scan: no route for partitioned visibility key %q", start)
+		return nil, 0, errors.Errorf("sqs receive partition scan: no route for partitioned visibility key %q", start)
 	}
 	groupScanner, ok := s.store.(sqsGroupScanner)
 	if !ok {
-		return nil, errors.New("sqs receive partition scan requires a group-aware shard store")
+		return nil, 0, errors.New("sqs receive partition scan requires a group-aware shard store")
 	}
 	kvs, err := groupScanner.ScanGroupAt(ctx, groupID, start, end, pageSize, readTS)
-	return kvs, errors.WithStack(err)
+	return kvs, groupID, errors.WithStack(err)
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to
@@ -1135,7 +1140,17 @@ func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, p
 //   - skip=false, err=nil : record loaded.
 func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, gen uint64, cand sqsMsgCandidate, readTS uint64) (*sqsMessageRecord, []byte, bool, error) {
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, cand.partition, gen, cand.messageID)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	var raw []byte
+	var err error
+	if cand.groupID != 0 {
+		groupGetter, ok := s.store.(sqsGroupGetter)
+		if !ok {
+			return nil, dataKey, false, errors.New("sqs receive candidate load requires a group-aware shard store")
+		}
+		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
+	} else {
+		raw, err = s.store.GetAt(ctx, dataKey, readTS)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, dataKey, true, nil
