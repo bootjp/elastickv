@@ -321,7 +321,7 @@ invariant
 so the apply-time fence is also spec-checked by TLC. That
 extension is out of scope for this proposal because it changes
 the M5 (`tla/composed`) module's state shape; tracked as an open
-follow-up in `docs/design/2026_05_28_partial_tla_safety_spec.md`'s
+follow-up in `docs/design/2026_05_28_implemented_tla_safety_spec.md`'s
 M6+ slot.
 
 ---

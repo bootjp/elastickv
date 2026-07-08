@@ -551,6 +551,7 @@ type rowMergeAcc struct {
 	routeIDs          []uint64
 	routeIDsTruncated bool
 	routeCount        uint64
+	label             string
 	cells             []cellMergeAcc
 }
 
@@ -628,6 +629,7 @@ func mergeRowInto(
 			routeIDs:          append([]uint64(nil), row.RouteIDs...),
 			routeIDsTruncated: row.RouteIDsTruncated,
 			routeCount:        row.RouteCount,
+			label:             row.Label,
 			cells:             make([]cellMergeAcc, mergedWidth),
 		}
 		accByBucket[row.BucketID] = acc
@@ -745,6 +747,7 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 	width := len(acc.cells)
 	row := KeyVizRow{
 		BucketID:          acc.bucketID,
+		Label:             acc.label,
 		Start:             acc.start,
 		End:               acc.end,
 		Aggregate:         acc.aggregate,

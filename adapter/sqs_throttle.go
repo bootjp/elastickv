@@ -582,23 +582,11 @@ func throttleChargeCount(entries int) int {
 // sendMessageWithRetry et al. would otherwise busy-loop on a
 // permanent rate-limit reject, burning leader CPU.
 func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueName, action string, count int) bool {
-	if s.throttle == nil {
-		return true
-	}
-	throttle, incarnation, err := s.queueThrottleConfig(r, queueName)
-	if err != nil {
-		// Fail closed on a transient storage error. Earlier code
-		// converted the error to (nil, 0)
-		// which made the throttle check short-circuit to "allowed";
-		// if the same storage hiccup did not also break the OCC
-		// commit a few lines later, the request would be processed
-		// unthrottled — a silent rate-limit bypass under storage
-		// instability. 500 here matches what the OCC layer would
-		// also surface for a meta read failure.
+	if err := s.chargeQueueErr(r.Context(), queueName, action, count); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return false
 	}
-	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation)
+	return true
 }
 
 // chargeQueueWithThrottle is the variant for handlers that already
@@ -613,15 +601,57 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 // Incarnation, so keying the bucket by Generation would let a caller
 // bypass the rate limit by repeatedly purging.
 func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) bool {
+	if err := s.chargeQueueWithThrottleErr(queueName, action, count, throttle, incarnation); err != nil {
+		writeSQSErrorFromErr(w, err)
+		return false
+	}
+	return true
+}
+
+func (s *SQSServer) chargeQueueErr(ctx context.Context, queueName, action string, count int) error {
 	if s.throttle == nil {
-		return true
+		return nil
+	}
+	throttle, incarnation, err := s.queueThrottleConfigContext(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	return s.chargeQueueWithThrottleErr(queueName, action, count, throttle, incarnation)
+}
+
+func (s *SQSServer) chargeQueueWithThrottleErr(queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) error {
+	if s.throttle == nil {
+		return nil
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
 	if outcome.allowed {
-		return true
+		return nil
 	}
-	writeSQSThrottlingError(w, queueName, action, outcome.retryAfter)
-	return false
+	return &sqsThrottlingError{queue: queueName, action: action, retryAfter: outcome.retryAfter}
+}
+
+type sqsThrottlingError struct {
+	queue      string
+	action     string
+	retryAfter time.Duration
+}
+
+func (e *sqsThrottlingError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return "Rate exceeded for queue '" + e.queue + "' action '" + e.action + "'"
+}
+
+func (e *sqsThrottlingError) retryAfterSeconds() int {
+	if e == nil {
+		return 0
+	}
+	retryAfter := e.retryAfter
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	return int(retryAfter / time.Second)
 }
 
 // queueThrottleConfig loads the Throttle config and Incarnation off a
@@ -638,15 +668,12 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 //     the request closed; converting an error to (nil, 0) silently
 //     would let traffic bypass the throttle check during a transient
 //     storage outage if the OCC commit later succeeded.
-//
-// Held as a method on *SQSServer so a test can swap the meta loader
-// via the existing nextTxnReadTS / loadQueueMetaAt seam.
-func (s *SQSServer) queueThrottleConfig(r *http.Request, queueName string) (*sqsQueueThrottle, uint64, error) {
+func (s *SQSServer) queueThrottleConfigContext(ctx context.Context, queueName string) (*sqsQueueThrottle, uint64, error) {
 	if s.store == nil {
 		return nil, 0, nil
 	}
-	readTS := s.nextTxnReadTS(r.Context())
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), queueName, readTS)
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}

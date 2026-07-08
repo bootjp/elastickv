@@ -8,7 +8,7 @@ package raftengine
 // behaviour for tests and callers that do not wire monitoring).
 //
 // Three outcomes match the design's strictly-additive policy
-// (docs/design/2026_06_02_idempotent_snapshot_restore.md §9):
+// (docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §9):
 //
 //   - RestoreSkipped: the gate fired. `gap = haveAppliedIndex -
 //     snapshot.Metadata.Index` (how far ahead the live store was).

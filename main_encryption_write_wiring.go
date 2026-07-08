@@ -16,15 +16,15 @@ import (
 
 // buildShardGroupsWithEncryptionWiring assembles the storage-envelope
 // write wiring from the process flags and then constructs the shard
-// groups with it. It exists so run() makes a single call (keeping its
-// cyclomatic complexity in budget) rather than building the wiring and
-// checking its error inline. The buildEncryptionWriteWiring error is
-// returned as the buildShardGroups error so run()'s existing
-// chainEncryptionStartupGuard composition handles it unchanged.
+// groups with it. The Stage 6C-3 membership guards run here before
+// buildEncryptionWriteWiring can bump sidecar local_epoch and before
+// buildShardGroups can replay committed Raft entries into encrypted
+// stores. The helper keeps run() to a single startup-fault branch.
 func buildShardGroupsWithEncryptionWiring(
 	raftID string,
 	raftDir string,
 	groups []groupSpec,
+	defaultGroup uint64,
 	multi bool,
 	bootstrap bool,
 	bootstrapCfg raftBootstrapConfig,
@@ -67,15 +67,38 @@ func buildShardGroupsWithEncryptionWiring(
 	if cutoverErr := refuseStartupOnActiveRaftCutover(sidecarPath); cutoverErr != nil {
 		return nil, nil, encryptionWriteWiring{}, cutoverErr
 	}
+	if guardErr := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            raftID,
+		raftDir:           raftDir,
+		groups:            groups,
+		multi:             multi,
+		defaultGroup:      defaultGroup,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: encryptionEnabled,
+		bootstrapServers:  bootstrapCfg.adminSeed(defaultGroup),
+	}); guardErr != nil {
+		return nil, nil, encryptionWriteWiring{}, guardErr
+	}
 	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapCfg,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
+	if err != nil {
+		return runtimes, shardGroups, encWiring, err
+	}
+	if guardErr := checkLocalEpochRollbackAfterReplay(raftID, runtimes, defaultGroup, sidecarPath, encryptionEnabled); guardErr != nil {
+		for _, rt := range runtimes {
+			if rt != nil {
+				rt.Close()
+			}
+		}
+		return nil, nil, encryptionWriteWiring{}, guardErr
+	}
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.
-	return runtimes, shardGroups, encWiring, err
+	return runtimes, shardGroups, encWiring, nil
 }
 
 // refuseStartupOnActiveRaftCutover reads the sidecar at process

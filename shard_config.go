@@ -43,7 +43,7 @@ var (
 
 // sqsFifoPartitionMaxPartitions caps the per-queue partition count so
 // the partitionFor mask + bucket-store sizing arguments in
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md §3.1 stay
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md §3.1 stay
 // honest: 32 partitions × ~1k RPS per shard ≈ 30k aggregate RPS per
 // queue, which matches the design's stated ceiling. Operators who
 // need more should split the workload across queues rather than
