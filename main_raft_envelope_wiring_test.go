@@ -35,7 +35,7 @@ func TestRaftEnvelopeRuntime_StartupCutoverInstallsWrapOnAttach(t *testing.T) {
 	const keyID uint32 = 4
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 1234, keyID, &cutover, 7, nil)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 1234, keyID, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestRaftEnvelopeRuntime_InactiveCutoverIsInert(t *testing.T) {
 	t.Parallel()
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, nil)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestRaftEnvelopeRuntime_InstallFromApplyPublishesWrap(t *testing.T) {
 	const keyID uint32 = 4
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, nil)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -109,7 +109,8 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
 	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, gate)
+	const fullNodeID uint64 = 0x1234
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -127,7 +128,7 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	}
 	registrationPayload := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(fsmwire.RegistrationPayload{
 		DEKID:      keyID,
-		FullNodeID: 0x1234,
+		FullNodeID: fullNodeID,
 		LocalEpoch: raftEpoch,
 	})...)
 	wrappedRegistration, err := wrap(registrationPayload)
@@ -151,6 +152,44 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	}
 }
 
+func TestRaftEnvelopeRuntime_WrapBypassRequiresLocalRaftRegistration(t *testing.T) {
+	t.Parallel()
+	const keyID uint32 = 4
+	const raftEpoch uint16 = 9
+	const fullNodeID uint64 = 0x1234
+	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
+	var cutover atomic.Uint64
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, &raftRegistrationGate{})
+	if err != nil {
+		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
+	}
+	sg := &kv.ShardGroup{}
+	runtime.attachGroup(7, sg)
+	if err := runtime.installFromApply(5678, keyID); err != nil {
+		t.Fatalf("installFromApply: %v", err)
+	}
+	wrap := sg.RaftPayloadWrap()
+	if wrap == nil {
+		t.Fatal("installFromApply did not publish wrap")
+	}
+	storageRegistration := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(fsmwire.RegistrationPayload{
+		DEKID:      keyID + 1,
+		FullNodeID: fullNodeID,
+		LocalEpoch: raftEpoch,
+	})...)
+	if _, err := wrap(storageRegistration); !errors.Is(err, store.ErrWriterNotRegistered) {
+		t.Fatalf("storage registration bypass error = %v, want ErrWriterNotRegistered", err)
+	}
+	foreignRaftRegistration := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(fsmwire.RegistrationPayload{
+		DEKID:      keyID,
+		FullNodeID: fullNodeID + 1,
+		LocalEpoch: raftEpoch,
+	})...)
+	if _, err := wrap(foreignRaftRegistration); !errors.Is(err, store.ErrWriterNotRegistered) {
+		t.Fatalf("foreign raft registration bypass error = %v, want ErrWriterNotRegistered", err)
+	}
+}
+
 func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testing.T) {
 	t.Parallel()
 	const keyID uint32 = 4
@@ -158,7 +197,7 @@ func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testi
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
 	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, gate)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, 0x1234, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}

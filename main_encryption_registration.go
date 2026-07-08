@@ -721,22 +721,13 @@ func proposeWriterRegistration(
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
 	if coordinate.IsLeader() {
-		// Writer registrations are control-plane entries that must
-		// remain admissible across the §7.1 quiescence barrier
-		// (Stage 6E-2d). Without the admin path, a new member
-		// joining mid-barrier — or a leader restart that triggers
-		// buildProcessStartRegistrationGate in the middle of a
-		// cutover window — could not register its writer entry;
-		// the barrier would reject the registration with
-		// ErrEnvelopeCutoverInProgress and the local epoch would
-		// never publish.
-		//
-		// ProposeAdmin is barrier-exempt only; the proposer itself
-		// remains the wrap-aware ShardGroup.Proposer() in production,
-		// so post-cutover local registrations still carry the §4.2
-		// raft envelope required by the strict-`>` apply hook.
-		if _, err := defaultProposer.ProposeAdmin(attemptCtx, entry); err != nil {
-			return errors.Wrap(err, "writer registration: local propose-admin")
+		// Local registration entries must honor the §7.1 cutover
+		// barrier. ProposeAdmin is intentionally barrier-exempt for
+		// the cutover marker itself; using it here could append a
+		// cleartext registration at index > cutover while the raft
+		// wrapper is not installed yet.
+		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
+			return errors.Wrap(err, "writer registration: local propose")
 		}
 		return nil
 	}

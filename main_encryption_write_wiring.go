@@ -232,7 +232,8 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, err
 	}
-	nodeID := encryption.NodeID16(etcdraftengine.DeriveNodeID(raftID))
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	nodeID := encryption.NodeID16(fullNodeID)
 	w.cipher = cipher
 	w.epoch = epoch
 	w.raftEpoch = raftEpoch
@@ -240,7 +241,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	w.raftNonceFactory = encryption.NewDeterministicNonceFactory(nodeID, raftEpoch)
 	w.raftCutoverIndex = &atomic.Uint64{}
 	w.raftRegistration = &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.raftEpoch, w.raftRegistration)
+	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.raftEpoch, fullNodeID, w.raftRegistration)
 	if err != nil {
 		return w, err
 	}

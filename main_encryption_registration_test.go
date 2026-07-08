@@ -745,7 +745,7 @@ func TestRuntimeRaftRegistrationTick_MarksCommittedRegistrationAfterWrapInstall(
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
 	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, gate)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -771,7 +771,7 @@ func TestRuntimeRaftRegistrationTick_LeaderUsesBarrieredPropose(t *testing.T) {
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
 	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, gate)
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -928,4 +928,31 @@ func TestBuildProcessStartRegistrationGate_ProposeBranchArmsBarrier(t *testing.T
 	}
 	cancel()
 	_ = eg.Wait()
+}
+
+func TestProposeWriterRegistration_LeaderUsesBarrieredPropose(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	proposer := &recordingMembershipProposer{}
+	groups := map[uint64]*kv.ShardGroup{1: {Engine: proposer}}
+	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), nil)
+	req := registrationRequest(testRegDEKID, 0x1234, 3)
+
+	err := proposeWriterRegistration(
+		context.Background(),
+		coord,
+		proposer,
+		&kv.GRPCConnCache{},
+		registrationEntry(testRegDEKID, 0x1234, 3),
+		req,
+	)
+	if err != nil {
+		t.Fatalf("proposeWriterRegistration: %v", err)
+	}
+	if proposer.proposeCalls != 1 {
+		t.Fatalf("Propose calls = %d, want 1", proposer.proposeCalls)
+	}
+	if proposer.proposeAdminCalls != 0 {
+		t.Fatalf("ProposeAdmin calls = %d, want 0", proposer.proposeAdminCalls)
+	}
 }

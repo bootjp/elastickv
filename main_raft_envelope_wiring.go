@@ -19,6 +19,7 @@ type raftEnvelopeRuntime struct {
 	cipher       *encryption.Cipher
 	nonceFactory store.NonceFactory
 	raftEpoch    uint16
+	fullNodeID   uint64
 	registration *raftRegistrationGate
 	registered   func(dekID uint32, epoch uint16) bool
 
@@ -52,7 +53,7 @@ func packRaftRegistration(dekID uint32, epoch uint16) uint64 {
 	return uint64(dekID)<<16 | uint64(epoch)
 }
 
-func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64, raftEpoch uint16, registration *raftRegistrationGate) (*raftEnvelopeRuntime, error) {
+func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64, raftEpoch uint16, fullNodeID uint64, registration *raftRegistrationGate) (*raftEnvelopeRuntime, error) {
 	if cell == nil {
 		return nil, errors.New("raft envelope runtime: nil cutover cell")
 	}
@@ -60,6 +61,7 @@ func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceF
 		cipher:       cipher,
 		nonceFactory: nonceFactory,
 		raftEpoch:    raftEpoch,
+		fullNodeID:   fullNodeID,
 		registration: registration,
 		groups:       map[uint64]*kv.ShardGroup{},
 		cutoverIndex: cell,
@@ -169,7 +171,7 @@ func (r *raftEnvelopeRuntime) wrapFor(activeRaftDEKID uint32) (kv.RaftPayloadWra
 		return nil, errors.New("raft envelope runtime: raft nonce factory is not configured")
 	}
 	return func(payload []byte) ([]byte, error) {
-		if r.registration != nil && !r.registration.Registered(activeRaftDEKID, r.raftEpoch) && !isRaftWriterRegistrationPayload(payload) {
+		if r.registration != nil && !r.registration.Registered(activeRaftDEKID, r.raftEpoch) && !isLocalRaftWriterRegistrationPayload(payload, activeRaftDEKID, r.raftEpoch, r.fullNodeID) {
 			return nil, errors.Wrapf(store.ErrWriterNotRegistered,
 				"raft envelope runtime: writer registration not committed for raft dek_id %d local_epoch %d",
 				activeRaftDEKID, r.raftEpoch)
@@ -182,8 +184,17 @@ func (r *raftEnvelopeRuntime) wrapFor(activeRaftDEKID uint32) (kv.RaftPayloadWra
 	}, nil
 }
 
-func isRaftWriterRegistrationPayload(payload []byte) bool {
-	return len(payload) > 0 && payload[0] == fsmwire.OpRegistration
+func isLocalRaftWriterRegistrationPayload(payload []byte, activeRaftDEKID uint32, raftEpoch uint16, fullNodeID uint64) bool {
+	if len(payload) == 0 || payload[0] != fsmwire.OpRegistration {
+		return false
+	}
+	registration, err := fsmwire.DecodeRegistration(payload[1:])
+	if err != nil {
+		return false
+	}
+	return registration.DEKID == activeRaftDEKID &&
+		registration.LocalEpoch == raftEpoch &&
+		registration.FullNodeID == fullNodeID
 }
 
 func (r *raftEnvelopeRuntime) barrier() adapter.CutoverBarrierController {
