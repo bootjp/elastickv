@@ -14,7 +14,7 @@ import (
 // encode_s3.go is the Phase 0b S3 reverse encoder — the inverse of the
 // S3 decoder in s3.go (type S3Encoder, which turns internal !s3|* records
 // into an s3/<bucket>/ dump tree). Design:
-// docs/design/2026_05_25_proposed_snapshot_logical_encoder.md §"S3".
+// docs/design/2026_05_25_implemented_snapshot_logical_encoder.md §"S3".
 //
 // This slice (M4-1) covers BUCKET metadata: it reconstructs the
 // !s3|bucket|meta| record (JSON s3LiveBucketMeta) and the

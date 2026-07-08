@@ -559,6 +559,57 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sqsSendMessageInput) (map[string]string, error) {
+	throttleEpoch := s.throttle.queueEpoch(queueName)
+	meta, readTS, apiErr := s.loadQueueMetaForSend(ctx, queueName, []byte(in.MessageBody))
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if err := s.chargeQueueWithThrottleErr(queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch); err != nil {
+		return nil, err
+	}
+	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
+		return nil, apiErr
+	}
+	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
+		return nil, apiErr
+	}
+	delay, apiErr := resolveSendDelay(meta, in.DelaySeconds)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if meta.IsFIFO {
+		return s.runFifoSendWithRetry(ctx, queueName, in)
+	}
+
+	rec, recordBytes, apiErr := buildSendRecord(meta, in, delay)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	const partition uint32 = 0
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, rec.MessageID)
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: dataKey, Value: recordBytes},
+			{Op: kv.Put, Key: visKey, Value: []byte(rec.MessageID)},
+			{Op: kv.Put, Key: byAgeKey, Value: []byte(rec.MessageID)},
+		},
+	}
+	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return map[string]string{
+		"MessageId":              rec.MessageID,
+		"MD5OfMessageBody":       rec.MD5OfBody,
+		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
+	}, nil
+}
+
 // sendMessageFifoLoop runs the dedup-aware OCC send for FIFO queues
 // under the standard retry budget. Stamping the dedup record + new
 // sequence number happens inside one transaction so a concurrent send
@@ -811,6 +862,45 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
 }
 
+func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in sqsReceiveMessageInput) ([]map[string]any, error) {
+	if _, err := kv.LeaseReadThrough(s.coordinator, ctx); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	throttleEpoch := s.throttle.queueEpoch(queueName)
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if err := s.chargeQueueWithThrottleErr(queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation, throttleEpoch); err != nil {
+		return nil, err
+	}
+	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)
+	if maxErr != nil {
+		return nil, maxErr
+	}
+	visibilityTimeout := meta.VisibilityTimeoutSeconds
+	if in.VisibilityTimeout != nil {
+		if *in.VisibilityTimeout < 0 || *in.VisibilityTimeout > sqsChangeVisibilityMaxSeconds {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "VisibilityTimeout out of range")
+		}
+		visibilityTimeout = *in.VisibilityTimeout
+	}
+	waitSeconds, waitErr := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	return s.longPollReceive(ctx, queueName, sqsReceiveOptions{
+		Max:                   max,
+		VisibilityTimeout:     visibilityTimeout,
+		WaitSeconds:           waitSeconds,
+		MessageAttributeNames: in.MessageAttributeNames,
+	})
+}
+
 // sqsReceiveOptions bundles the per-request settings that ride down
 // the receive call chain. Threading individual params through
 // longPollReceive → scanAndDeliverOnce → rotateMessagesForDelivery →
@@ -924,16 +1014,15 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	// shared across the whole receive call instead of being
 	// multiplied by N.
 	//
-	// Rotate the starting partition by readTS so a sustained backlog
-	// on a single partition cannot permanently starve the others: a
-	// fixed start at 0 lets opts.Max fill from partition 0 on every
-	// call, so messages in higher-index partitions are never observed
-	// while the head queue stays hot. readTS is HLC-derived and
-	// advances per call, giving a uniform-enough rotation without
-	// any per-server state. FIFO ordering is unaffected because a
-	// MessageGroupId hashes to exactly one partition (partitionFor is
-	// deterministic), so cross-partition iteration order does not
-	// reorder messages within any group.
+	// Rotate the starting partition with a per-queue counter so a
+	// sustained backlog on a single partition cannot permanently
+	// starve the others: a fixed start at 0 lets opts.Max fill from
+	// partition 0 on every call, so messages in higher-index
+	// partitions are never observed while the head queue stays hot.
+	// FIFO ordering is unaffected because a MessageGroupId hashes to
+	// exactly one partition (partitionFor is deterministic), so
+	// cross-partition iteration order does not reorder messages
+	// within any group.
 	partitions := effectivePartitionCount(meta)
 	startOffset := s.nextReceiveFanoutStart(queueName, partitions)
 	for i := uint32(0); i < partitions; i++ {
@@ -1061,6 +1150,15 @@ type sqsMsgCandidate struct {
 	visKey    []byte
 	messageID string
 	partition uint32
+	groupID   uint64
+}
+
+type sqsGroupScanner interface {
+	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
+type sqsGroupGetter interface {
+	GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error)
 }
 
 // sqsVisScanWallClockBudget caps how long the scan + deliver loop may
@@ -1079,7 +1177,7 @@ const sqsVisScanWallClockBudget = 100 * time.Millisecond
 // helpers route to the same partition the vis-index entry was found
 // under (legacy queues always pass 0).
 func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64, partition uint32) ([]sqsMsgCandidate, []byte, bool, error) {
-	kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+	kvs, groupID, err := s.scanVisibleIndexAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
 		return nil, start, true, errors.WithStack(err)
 	}
@@ -1088,7 +1186,7 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 	}
 	out := make([]sqsMsgCandidate, 0, len(kvs))
 	for _, kvp := range kvs {
-		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value), partition: partition})
+		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value), partition: partition, groupID: groupID})
 	}
 	if len(kvs) < pageSize {
 		return out, start, true, nil
@@ -1098,6 +1196,23 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 		return out, next, true, nil
 	}
 	return out, next, false, nil
+}
+
+func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, uint64, error) {
+	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(start) {
+		kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+		return kvs, 0, errors.WithStack(err)
+	}
+	groupID, ok := s.partitionResolver.ResolveGroup(start)
+	if !ok {
+		return nil, 0, errors.Errorf("sqs receive partition scan: no route for partitioned visibility key %q", start)
+	}
+	groupScanner, ok := s.store.(sqsGroupScanner)
+	if !ok {
+		return nil, 0, errors.New("sqs receive partition scan requires a group-aware shard store")
+	}
+	kvs, err := groupScanner.ScanGroupAt(ctx, groupID, start, end, pageSize, readTS)
+	return kvs, groupID, errors.WithStack(err)
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to
@@ -1117,7 +1232,17 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 //   - skip=false, err=nil : record loaded.
 func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, gen uint64, cand sqsMsgCandidate, readTS uint64) (*sqsMessageRecord, []byte, bool, error) {
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, cand.partition, gen, cand.messageID)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	var raw []byte
+	var err error
+	if cand.groupID != 0 {
+		groupGetter, ok := s.store.(sqsGroupGetter)
+		if !ok {
+			return nil, dataKey, false, errors.New("sqs receive candidate load requires a group-aware shard store")
+		}
+		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
+	} else {
+		raw, err = s.store.GetAt(ctx, dataKey, readTS)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, dataKey, true, nil
@@ -1468,6 +1593,13 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{})
 }
 
+func (s *SQSServer) deleteMessageCore(ctx context.Context, queueName string, handle *decodedReceiptHandle) error {
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, 1); err != nil {
+		return err
+	}
+	return s.deleteMessageWithRetry(ctx, queueName, handle)
+}
+
 // deleteMessageWithRetry runs the load-check-commit flow under one OCC
 // budget. AWS SQS semantics: a stale receipt handle (message already
 // gone, or token rotated by another consumer) is a 200 no-op, NOT an
@@ -1630,6 +1762,16 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) changeMessageVisibilityCore(ctx context.Context, queueName string, handle *decodedReceiptHandle, timeout int64) error {
+	if timeout < 0 || timeout > sqsChangeVisibilityMaxSeconds {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "VisibilityTimeout out of range")
+	}
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, 1); err != nil {
+		return err
+	}
+	return s.changeVisibilityWithRetry(ctx, queueName, handle, timeout)
 }
 
 // changeVisibilityWithRetry runs the validate-and-swap flow under an OCC

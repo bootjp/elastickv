@@ -167,7 +167,7 @@ func TestSamplerUnboundedRouteEmitsSubRanges(t *testing.T) {
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 4})
 	require.True(t, s.RegisterRoute(1, nil, nil, 0)) // whole keyspace, unbounded both ends
 	for _, key := range [][]byte{{0x10}, {0x50}, {0x90}, {0xD0}} {
-		s.Observe(1, key, OpWrite, 0)
+		s.Observe(1, key, OpWrite, 0, LabelLegacy)
 	}
 	s.Flush()
 	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
@@ -190,7 +190,7 @@ func TestSamplerUnboundedHighStartValidBounds(t *testing.T) {
 	start := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF} // window 0xFF..FD + suffix
 	require.True(t, s.RegisterRoute(1, start, nil, 0))
 	for _, key := range [][]byte{start, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}} {
-		s.Observe(1, key, OpWrite, 0)
+		s.Observe(1, key, OpWrite, 0, LabelLegacy)
 	}
 	s.Flush()
 	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
@@ -291,9 +291,9 @@ func TestSamplerSubRangeHotKeyOnDistinctRow(t *testing.T) {
 
 	// 100 writes into sub-bucket 3 ([0x30,0x40)), 1 into sub-bucket 0.
 	for i := 0; i < 100; i++ {
-		s.Observe(1, []byte{0x38}, OpWrite, 0)
+		s.Observe(1, []byte{0x38}, OpWrite, 0, LabelLegacy)
 	}
-	s.Observe(1, []byte{0x01}, OpWrite, 0)
+	s.Observe(1, []byte{0x01}, OpWrite, 0, LabelLegacy)
 	s.Flush()
 
 	cols := s.Snapshot(time.Time{}, time.Time{})
@@ -323,7 +323,7 @@ func TestSamplerSubRangeBoundsTileExactly(t *testing.T) {
 	require.True(t, s.RegisterRoute(1, routeStart, routeEnd, 0))
 	// Hit every sub-bucket so all K rows are emitted.
 	for _, key := range [][]byte{{0x00}, {0x10}, {0x20}, {0x30}} {
-		s.Observe(1, key, OpWrite, 0)
+		s.Observe(1, key, OpWrite, 0, LabelLegacy)
 	}
 	s.Flush()
 	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
@@ -349,15 +349,15 @@ func TestSamplerGraceWindowReRegistrationKeepsStaleLayout(t *testing.T) {
 
 	rangeAStart, rangeAEnd := []byte{0x00}, []byte{0x40}
 	require.True(t, s.RegisterRoute(1, rangeAStart, rangeAEnd, 0))
-	origStart := s.table.Load().slots[1].subStart
-	origSpan := s.table.Load().slots[1].subSpan
-	s.Observe(1, []byte{0x10}, OpWrite, 0)
+	origStart := s.table.Load().slots[slotKey{RouteID: 1, Label: LabelLegacy}].subStart
+	origSpan := s.table.Load().slots[slotKey{RouteID: 1, Label: LabelLegacy}].subSpan
+	s.Observe(1, []byte{0x10}, OpWrite, 0, LabelLegacy)
 
 	// Remove + re-register with a DIFFERENT range, inside the grace
 	// window -> reclaimRetiredSlot reuses the slot, layout unchanged.
 	s.RemoveRoute(1)
 	require.True(t, s.RegisterRoute(1, []byte{0x80}, []byte{0xC0}, 0))
-	reused := s.table.Load().slots[1]
+	reused := s.table.Load().slots[slotKey{RouteID: 1, Label: LabelLegacy}]
 	require.Equal(t, origStart, reused.subStart, "layout subStart must NOT be recomputed on in-grace re-registration")
 	require.Equal(t, origSpan, reused.subSpan, "layout subSpan must NOT be recomputed")
 
@@ -372,7 +372,7 @@ func TestSamplerGraceWindowReRegistrationKeepsStaleLayout(t *testing.T) {
 	clk.Advance(s.graceWindow() + time.Second)
 	s.Flush() // drop the retired slot
 	require.True(t, s.RegisterRoute(1, []byte{0x80}, []byte{0xC0}, 0))
-	fresh := s.table.Load().slots[1]
+	fresh := s.table.Load().slots[slotKey{RouteID: 1, Label: LabelLegacy}]
 	freshStart := windowUint64([]byte{0x80}, 0)
 	require.Equal(t, freshStart, fresh.subStart, "fresh post-grace registration must use the new range's layout")
 }
@@ -385,7 +385,7 @@ func TestSamplerK1MatchesRouteLevel(t *testing.T) {
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 1})
 	require.True(t, s.RegisterRoute(1, []byte{0x00}, []byte{0xFF}, 0))
 	for _, key := range [][]byte{{0x01}, {0x80}, {0xFE}} {
-		s.Observe(1, key, OpWrite, 0)
+		s.Observe(1, key, OpWrite, 0, LabelLegacy)
 	}
 	s.Flush()
 	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
@@ -421,7 +421,7 @@ func BenchmarkObserveSubRange(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				s.Observe(1, key, OpWrite, 64)
+				s.Observe(1, key, OpWrite, 64, LabelLegacy)
 			}
 		})
 	}

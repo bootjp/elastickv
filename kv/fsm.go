@@ -148,7 +148,7 @@ func (f *kvFSM) SetApplyIndex(idx uint64) {
 // (0, false, nil) propagates the strictly-additive fallback when
 // the store does not expose the seam — the future skip gate treats
 // "missing" as "fall back to full restore." See
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §3 / §4.
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3 / §4.
 func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
 	r, ok := f.store.(raftengine.AppliedIndexReader)
 	if !ok {

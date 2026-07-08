@@ -31,6 +31,7 @@ type stubHotKeysSource struct {
 
 type boundsKey struct {
 	routeID   uint64
+	label     keyviz.Label
 	subBucket int
 }
 
@@ -43,12 +44,16 @@ func (s *stubHotKeysSource) HotKeysOptions() (bool, int, int, int) {
 	return s.enabled, s.capacity, s.sampleRate, s.maxKeyLen
 }
 
-func (s *stubHotKeysSource) HotKeysSnapshot(routeID uint64) *keyviz.KeyvizHotKeysSnapshot {
-	return s.snapshots[routeID]
+func (s *stubHotKeysSource) HotKeysSnapshot(routeID uint64, label keyviz.Label) *keyviz.KeyvizHotKeysSnapshot {
+	snap := s.snapshots[routeID]
+	if snap == nil || snap.Label != label {
+		return nil
+	}
+	return snap
 }
 
-func (s *stubHotKeysSource) SubBucketBoundsFor(routeID uint64, subBucket int) ([]byte, []byte, bool) {
-	v, ok := s.bounds[boundsKey{routeID, subBucket}]
+func (s *stubHotKeysSource) SubBucketBoundsFor(routeID uint64, label keyviz.Label, subBucket int) ([]byte, []byte, bool) {
+	v, ok := s.bounds[boundsKey{routeID: routeID, label: label, subBucket: subBucket}]
 	if !ok {
 		return nil, nil, false
 	}
@@ -154,6 +159,31 @@ func TestHotKeysHandler_WholeRouteReturnsScaledTopN(t *testing.T) {
 	require.Equal(t, uint64(5*16), resp.Keys[1].Count)
 }
 
+func TestHotKeysHandler_LabelParamSelectsLabeledSnapshot(t *testing.T) {
+	t.Parallel()
+	src := newStubSource()
+	src.snapshots[1] = &keyviz.KeyvizHotKeysSnapshot{
+		RouteID:    1,
+		Label:      keyviz.LabelRedis,
+		SampledN:   1,
+		SampleRate: 1,
+		Capacity:   8,
+		SnapshotAt: time.Now().UTC(),
+		Entries:    []keyviz.KeyvizHotKeyEntry{{Key: []byte("redis-key"), Count: 1}},
+	}
+	h := newHandler(t, src)
+
+	unlabeled := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1", nil)
+	require.Equal(t, http.StatusNotFound, unlabeled.Code)
+
+	labeled := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1&label=redis", nil)
+	require.Equal(t, http.StatusOK, labeled.Code)
+	var resp hotKeyResponse
+	require.NoError(t, json.NewDecoder(labeled.Body).Decode(&resp))
+	require.Equal(t, "redis", resp.Label)
+	require.Equal(t, base64.StdEncoding.EncodeToString([]byte("redis-key")), resp.Keys[0].KeyB64)
+}
+
 func TestHotKeysHandler_SubBucketFiltersByBytes(t *testing.T) {
 	t.Parallel()
 	src := newStubSource()
@@ -172,7 +202,7 @@ func TestHotKeysHandler_SubBucketFiltersByBytes(t *testing.T) {
 		},
 	}
 	// Sub-bucket 3 spans [m, t).
-	src.bounds[boundsKey{1, 3}] = boundsValue{lo: []byte("m"), hi: []byte("t"), ok: true}
+	src.bounds[boundsKey{routeID: 1, label: keyviz.LabelLegacy, subBucket: 3}] = boundsValue{lo: []byte("m"), hi: []byte("t"), ok: true}
 	h := newHandler(t, src)
 	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1&sub_bucket=3", nil)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -201,7 +231,7 @@ func TestHotKeysHandler_SubBucketUnboundedTailFilter(t *testing.T) {
 			{Key: []byte("zzz"), Count: 5},
 		},
 	}
-	src.bounds[boundsKey{1, 7}] = boundsValue{lo: []byte("m"), hi: nil, ok: true}
+	src.bounds[boundsKey{routeID: 1, label: keyviz.LabelLegacy, subBucket: 7}] = boundsValue{lo: []byte("m"), hi: nil, ok: true}
 	h := newHandler(t, src)
 	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1&sub_bucket=7", nil)
 	require.Equal(t, http.StatusOK, rec.Code)
