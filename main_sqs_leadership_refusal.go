@@ -39,11 +39,12 @@ type sqsLeadershipController interface {
 // gate does nothing for queues created BEFORE a rollback. For groups
 // named by --sqsFifoPartitionMap, the leadership-refusal hook closes
 // that gap by stepping the affected node down via TransferLeadership;
-// the cluster picks a peer that still advertises htfifo, and the
-// partitioned queue stays correct. Single-shard deployments with no
-// --sqsFifoPartitionMap have no per-partition group map for this hook
-// to match, so rollback of an already-created partitioned queue remains
-// an operator drain/recreate boundary there.
+// TransferLeadership is best-effort rather than capability-aware, so a
+// downgraded transferee may gain leadership and refuse in turn until an
+// htfifo-capable peer leads the mapped group. Single-shard deployments
+// with no --sqsFifoPartitionMap have no per-partition group map for this
+// hook to match, so rollback of an already-created partitioned queue
+// remains an operator drain/recreate boundary there.
 //
 // When it does NOT fire
 //

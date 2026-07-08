@@ -267,7 +267,7 @@ These take a `ReceiptHandle` which already encodes the partition index. The rece
 
 Reads as: queue `orders.fifo` has `8` partitions, mapped to Raft groups `group-7` through `group-14` in partition order. The existing `--raftSqsMap` keeps doing what it does today — endpoint mapping for `proxyToLeader` — and is unchanged by this design.
 
-Backward compatibility: queues without an entry in `--sqsFifoPartitionMap` keep the single-partition layout. A queue whose `PartitionCount` in meta does not match the partition-map's entry count is a configuration error: the CreateQueue handler resolves the count from the `Attributes` first, then verifies the partition map agrees; mismatch returns 400 `InvalidParameterValue`. A queue with `PartitionCount > 1` and no entry in `--sqsFifoPartitionMap` is also rejected (the routing layer has no Raft-group mapping to use).
+Backward compatibility: deployments that do not configure `--sqsFifoPartitionMap` run with no partition resolver, so the routing-coverage gate is skipped and `PartitionCount > 1` queues are admitted on the single SQS shard. That shape is correct for single-shard/no-map installs but does not provide per-partition Raft-group placement. When a partition resolver is configured, a queue whose `PartitionCount` in meta does not match the partition-map's entry count is a configuration error: the CreateQueue handler resolves the count from the `Attributes` first, then verifies the partition map agrees; mismatch returns 400 `InvalidParameterValue`. With a resolver installed, a queue with `PartitionCount > 1` and no entry in `--sqsFifoPartitionMap` is rejected because the routing layer has no Raft-group mapping to use.
 
 ---
 
