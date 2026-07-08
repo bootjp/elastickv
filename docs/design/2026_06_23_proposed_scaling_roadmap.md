@@ -377,17 +377,17 @@ reverse). (M3) auto-merge in the M3 detector (cold-route hysteresis).
 **Depends-on:** M2 migration plane for cross-group merge; the Composed-1 guard
 for cutover coherence.
 
-### Gap 6 — Connection / transport scaling (streaming transport revival)
-**Problem.** Raft inter-node messages use unary gRPC per message
-(`docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md` §1): each
-send pays a full RTT, capping per-peer throughput at ~RTT⁻¹ regardless of
-bandwidth. This bites exactly when multi-node multi-group (Gap 1) puts real
-inter-node Raft traffic on the wire. **Rough milestones:** revive the existing
-streaming-transport proposal (client-streaming `SendStream` per peer, biased
-heartbeat select, backward-compat fallback). The blob-fetch RPC in the S3
-offload doc (§3.6) already wants to reuse the same chunked-streaming
-abstraction, so landing both behind one transport layer is the leverage.
-**Depends-on:** nothing hard; value scales with Gap 1.
+### Gap 6 — Connection / transport scaling (streaming transport soak)
+**Problem.** Raft inter-node messages previously used unary gRPC per message
+(`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md` §1),
+which paid a full RTT per send. The implemented `SendStream` transport removes
+that bottleneck, but multi-node multi-group (Gap 1) still needs transport soak
+coverage under real cross-node traffic. **Rough milestones:** (M1) run transport
+soak with multi-node multi-group traffic. (M2) decide whether the optional
+biased-select multiplexing worker from the implemented transport doc is needed.
+The blob-fetch RPC in the S3 offload doc (§3.6) can reuse the same
+chunked-streaming abstraction. **Depends-on:** Gap 1 for realistic traffic;
+value scales with Gap 1.
 
 ### Gap 7 — Auto group lifecycle (longest-term)
 **Problem.** Groups are static (`--raftGroups`). Elastic scale-out (add node →
