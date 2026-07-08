@@ -106,9 +106,9 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		}
 
 		// Pre-allocate commitTS so we can embed it in the Delta key.
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		commitTS, err := r.nextCommitTS(ctx, "listPushCore: allocate commitTS")
 		if err != nil {
-			return errors.Wrap(err, "listPushCore: allocate commitTS")
+			return errors.WithStack(err)
 		}
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
@@ -183,9 +183,9 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	// as non-retryable, so it exits retryRedisWrite directly to the
 	// client — same shape as the other persistence-grade Next call
 	// sites in this file.
-	commitTS, allocErr := r.coordinator.Clock().NextFenced()
+	commitTS, allocErr := r.nextCommitTS(ctx, "redis list-push reuse: allocate commitTS")
 	if allocErr != nil {
-		return 0, false, errors.Wrap(allocErr, "redis list-push reuse: allocate commitTS")
+		return 0, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
@@ -359,9 +359,9 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 
 		// HLC-4 parity with prepareDispatch / dispatchExecReuse —
 		// see dispatchListPushReuse above for the rationale.
-		commitTS, allocErr := r.coordinator.Clock().NextFenced()
+		commitTS, allocErr := r.nextCommitTS(ctx, "redis list-push first-attempt: allocate commitTS")
 		if allocErr != nil {
-			return errors.Wrap(allocErr, "redis list-push first-attempt: allocate commitTS")
+			return errors.WithStack(allocErr)
 		}
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
@@ -583,9 +583,9 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 	// n is the number of sequence positions claimed (including any holes).
 	// HeadDelta and LenDelta must use n, not len(values), so that Head
 	// advances past holes and the metadata stays consistent with Tail.
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	commitTS, err := r.nextCommitTS(ctx, "commitListPop: allocate commitTS")
 	if err != nil {
-		return errors.Wrap(err, "commitListPop: allocate commitTS")
+		return errors.WithStack(err)
 	}
 	var headDelta int64
 	if left {

@@ -839,9 +839,9 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 
 	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
 	// the coordinator assigns it during Dispatch.
-	commitTS, err := t.server.coordinator.Clock().NextFenced()
+	commitTS, err := t.server.nextCommitTS(context.Background(), "redis txn commit: allocate commitTS")
 	if err != nil {
-		return preparedTxnDispatch{cancel: func() {}}, errors.Wrap(err, "redis txn commit: allocate commitTS")
+		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
 	}
 	listElems := t.buildListElems(commitTS)
 	zsetElems, err := t.buildZSetElems(commitTS)
@@ -1281,9 +1281,9 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// could issue a timestamp that collides with a subsequent leader's
 	// window after renewal — the very class of bug option-2 is meant to
 	// rule out.
-	commitTS, allocErr := r.coordinator.Clock().NextFenced()
+	commitTS, allocErr := r.nextCommitTS(ctx, "redis exec reuse: allocate commitTS")
 	if allocErr != nil {
-		return nil, false, errors.Wrap(allocErr, "redis exec reuse: allocate commitTS")
+		return nil, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,

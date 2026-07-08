@@ -264,9 +264,9 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return err
 		}
 
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		commitTS, err := r.nextCommitTS(ctx, "mutateExactSetWide: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "mutateExactSetWide: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 
 		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)

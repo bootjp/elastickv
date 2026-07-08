@@ -34,6 +34,20 @@ type TimestampAllocator interface {
 	Next(ctx context.Context) (uint64, error)
 }
 
+type timestampIssuer interface {
+	IsTimestampLeader() bool
+}
+
+type timestampWindowInvalidator interface {
+	Invalidate()
+}
+
+func invalidateTimestampWindow(alloc TimestampAllocator) {
+	if inv, ok := alloc.(timestampWindowInvalidator); ok {
+		inv.Invalidate()
+	}
+}
+
 // NextTimestampThrough allocates a persistence-grade timestamp through coord's
 // optional TSO allocator when available, falling back to the legacy HLC clock
 // for older Coordinator implementations and tests.
@@ -62,9 +76,22 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 	if startTS == ^uint64(0) {
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)
 	}
-	if coord != nil && coord.Clock() != nil {
-		coord.Clock().Observe(startTS)
+	clock := coordinatorClock(coord)
+	if clock == nil {
+		return nextTimestampAfterFallback(startTS)
 	}
+	clock.Observe(startTS)
+	return nextTimestampAfterObserved(ctx, coord, clock, startTS, label)
+}
+
+func coordinatorClock(coord Coordinator) *HLC {
+	if coord == nil {
+		return nil
+	}
+	return coord.Clock()
+}
+
+func nextTimestampAfterObserved(ctx context.Context, coord Coordinator, clock *HLC, startTS uint64, label string) (uint64, error) {
 	ts, err := NextTimestampThrough(ctx, coord, label)
 	if err != nil {
 		return 0, err
@@ -72,9 +99,7 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 	if ts > startTS {
 		return ts, nil
 	}
-	if coord != nil && coord.Clock() != nil {
-		coord.Clock().Observe(startTS)
-	}
+	clock.Observe(startTS)
 	retry, err := NextTimestampThrough(ctx, coord, "re-"+label)
 	if err != nil {
 		return 0, err
@@ -83,6 +108,14 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)
 	}
 	return retry, nil
+}
+
+func nextTimestampAfterFallback(startTS uint64) (uint64, error) {
+	nextTS := startTS + 1
+	if nextTS == 0 {
+		return 0, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	return nextTS, nil
 }
 
 type tsoCoordinator interface {
@@ -143,7 +176,13 @@ func (a *LocalTSOAllocator) NextBatch(ctx context.Context, n int) (uint64, error
 }
 
 func (a *LocalTSOAllocator) IsLeader() bool {
-	return a.coord != nil && a.coord.IsLeader()
+	if a == nil || a.coord == nil {
+		return false
+	}
+	if issuer, ok := a.coord.(timestampIssuer); ok {
+		return issuer.IsTimestampLeader()
+	}
+	return a.coord.IsLeader()
 }
 
 func (a *LocalTSOAllocator) RunLeaseRenewal(ctx context.Context) {
@@ -189,6 +228,7 @@ type BatchAllocator struct {
 	tso       TSOAllocator
 	batchSize int
 	win       atomic.Pointer[windowSnapshot]
+	epoch     atomic.Uint64
 
 	mu         sync.Mutex
 	refillDone chan struct{}
@@ -198,10 +238,18 @@ func NewBatchAllocator(tso TSOAllocator, batchSize int) (*BatchAllocator, error)
 	if tso == nil {
 		return nil, ErrTSOAllocatorRequired
 	}
-	if batchSize <= 0 {
+	if batchSize <= 0 || batchSize > maxHLCBatchSize {
 		return nil, errors.WithStack(ErrInvalidTSOBatchSize)
 	}
 	return &BatchAllocator{tso: tso, batchSize: batchSize}, nil
+}
+
+func (b *BatchAllocator) Invalidate() {
+	if b == nil {
+		return
+	}
+	b.epoch.Add(1)
+	b.win.Store(nil)
 }
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
@@ -252,12 +300,13 @@ func (b *BatchAllocator) refill(ctx context.Context) error {
 
 	var (
 		base    uint64
+		epoch   = b.epoch.Load()
 		success bool
 	)
 	err := func() (retErr error) {
 		defer func() {
 			b.mu.Lock()
-			if success {
+			if success && epoch == b.epoch.Load() {
 				b.win.Store(&windowSnapshot{base: base, size: positiveIntToUint64(b.batchSize)})
 			}
 			b.refillDone = nil

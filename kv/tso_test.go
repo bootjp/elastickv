@@ -64,6 +64,72 @@ func TestBatchAllocatorReusesWindowUntilExhausted(t *testing.T) {
 	require.EqualValues(t, 2, tso.calls.Load())
 }
 
+func TestBatchAllocatorInvalidateDropsCachedWindow(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+
+	got, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, got)
+
+	alloc.Invalidate()
+
+	got, err = alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+testTSOBatchSize, got)
+	require.EqualValues(t, 2, tso.calls.Load())
+}
+
+func TestCoordinateLeaderLossInvalidatesTimestampWindow(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+	eng := &fakeLeaseEngine{leaseDur: time.Second}
+	coord := NewCoordinatorWithEngine(nil, eng, WithTSOAllocator(alloc))
+	defer func() { require.NoError(t, coord.Close()) }()
+
+	got, err := coord.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, got)
+
+	eng.fireLeaderLoss()
+
+	got, err = coord.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+testTSOBatchSize, got)
+	require.EqualValues(t, 2, tso.calls.Load())
+}
+
+func TestShardedCoordinatorLeaderLossInvalidatesTimestampWindow(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+	eng := &fakeLeaseEngine{leaseDur: time.Second}
+	dist := distribution.NewEngine()
+	dist.UpdateRoute(nil, nil, 1)
+	coord := NewShardedCoordinator(dist, map[uint64]*ShardGroup{
+		1: {Engine: eng},
+	}, 1, NewHLC(), nil).WithTSOAllocator(alloc)
+	defer func() { require.NoError(t, coord.Close()) }()
+
+	got, err := coord.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, got)
+
+	eng.fireLeaderLoss()
+
+	got, err = coord.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+testTSOBatchSize, got)
+	require.EqualValues(t, 2, tso.calls.Load())
+}
+
+func TestNewBatchAllocatorRejectsOversizedBatch(t *testing.T) {
+	_, err := NewBatchAllocator(&fakeTSOAllocator{leader: true}, maxHLCBatchSize+1)
+	require.ErrorIs(t, err, ErrInvalidTSOBatchSize)
+}
+
 func TestLocalTSOAllocatorWaitsForLeadership(t *testing.T) {
 	coord := &fakeTSOCoordinator{clock: NewHLC()}
 	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
@@ -79,6 +145,47 @@ func TestLocalTSOAllocatorWaitsForLeadership(t *testing.T) {
 	got, err := alloc.Next(context.Background())
 	require.NoError(t, err)
 	require.NotZero(t, got)
+}
+
+func TestLocalTSOAllocatorAcceptsTimestampLeader(t *testing.T) {
+	coord := &fakeTimestampLeaderCoordinator{clock: NewHLC()}
+	coord.clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	coord.timestampLeader.Store(true)
+
+	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
+	require.NoError(t, err)
+
+	got, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.NotZero(t, got)
+	require.False(t, coord.IsLeader())
+}
+
+func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Engine: stubLeaderEngine{}},
+	}, 1, NewHLC(), nil)
+
+	require.False(t, coord.IsLeader())
+	require.True(t, coord.IsTimestampLeader())
+}
+
+func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) {
+	got, err := NextTimestampAfterThrough(context.Background(), nil, testTSOInitialBase, "test")
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+1, got)
+
+	got, err = NextTimestampAfterThrough(context.Background(), &Coordinate{}, testTSOInitialBase, "test")
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+1, got)
+
+	_, err = NextTimestampAfterThrough(context.Background(), nil, ^uint64(0), "test")
+	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 }
 
 func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
@@ -186,5 +293,23 @@ func (f *fakeTSOCoordinator) IsLeader() bool {
 }
 
 func (f *fakeTSOCoordinator) Clock() *HLC {
+	return f.clock
+}
+
+type fakeTimestampLeaderCoordinator struct {
+	leader          atomic.Bool
+	timestampLeader atomic.Bool
+	clock           *HLC
+}
+
+func (f *fakeTimestampLeaderCoordinator) IsLeader() bool {
+	return f.leader.Load()
+}
+
+func (f *fakeTimestampLeaderCoordinator) IsTimestampLeader() bool {
+	return f.timestampLeader.Load()
+}
+
+func (f *fakeTimestampLeaderCoordinator) Clock() *HLC {
 	return f.clock
 }

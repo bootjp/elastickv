@@ -604,7 +604,11 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		// LeaseReadForKey on that shard takes the slow path.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
 			g.lp = lp
-			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
+			group := g
+			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(func() {
+				group.lease.invalidate()
+				c.invalidateTimestampWindow()
+			}))
 		}
 	}
 	c.deregisterLeaseCbs = deregisters
@@ -1504,6 +1508,25 @@ func (c *ShardedCoordinator) IsLeader() bool {
 		return false
 	}
 	return isLeaderEngine(engineForGroup(g))
+}
+
+func (c *ShardedCoordinator) IsTimestampLeader() bool {
+	if c == nil {
+		return false
+	}
+	for _, g := range c.groups {
+		if isLeaderEngine(engineForGroup(g)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ShardedCoordinator) invalidateTimestampWindow() {
+	if c == nil {
+		return
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 func (c *ShardedCoordinator) VerifyLeader(ctx context.Context) error {

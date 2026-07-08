@@ -143,7 +143,10 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// pointing into this Coordinate.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
 		c.lp = lp
-		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
+		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(func() {
+			c.lease.invalidate()
+			c.invalidateTimestampWindow()
+		})
 	}
 	return c
 }
@@ -710,6 +713,17 @@ func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err err
 
 func (c *Coordinate) IsLeader() bool {
 	return isLeaderEngine(c.engine)
+}
+
+func (c *Coordinate) IsTimestampLeader() bool {
+	return c.IsLeader()
+}
+
+func (c *Coordinate) invalidateTimestampWindow() {
+	if c == nil {
+		return
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 // IsLeaderAcceptingWrites reports whether this node is leader and not currently

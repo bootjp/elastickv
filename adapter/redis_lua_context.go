@@ -3154,14 +3154,15 @@ func (c *luaScriptContext) commit() error {
 	}
 	sort.Strings(keys)
 
+	ctx := context.Background()
+
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
-	commitTS, err := c.server.coordinator.Clock().NextFenced()
+	commitTS, err := c.server.nextCommitTS(ctx, "luaScriptContext.commit: allocate commitTS")
 	if err != nil {
-		return errors.Wrap(err, "luaScriptContext.commit: allocate commitTS")
+		return errors.WithStack(err)
 	}
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
-	ctx := context.Background()
 	for _, key := range keys {
 		plan, err := c.commitPlanForKey(ctx, key, commitTS)
 		if err != nil {

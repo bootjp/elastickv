@@ -1175,9 +1175,9 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	for _, value := range values {
 		rawValues = append(rawValues, []byte(value))
 	}
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	commitTS, err := r.nextCommitTS(ctx, "rewriteListTxn: allocate commitTS")
 	if err != nil {
-		return errors.Wrap(err, "rewriteListTxn: allocate commitTS")
+		return errors.WithStack(err)
 	}
 	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues, commitTS, 0)
 	if err != nil {
