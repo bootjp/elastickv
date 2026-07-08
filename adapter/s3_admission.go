@@ -16,6 +16,7 @@ import (
 const (
 	s3PutAdmissionDefaultMaxInflightBytes = 256 << 20
 	s3PutAdmissionDefaultTimeout          = 30 * time.Second
+	s3PutAdmissionDefaultRetryAfter       = time.Second
 	s3PutAdmissionDisableMaxInflightBytes = int64(1<<63 - 1)
 
 	s3PutAdmissionMaxInflightEnv = "ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES"
@@ -234,7 +235,7 @@ func (s *S3Server) admitS3PutRequest(w http.ResponseWriter, r *http.Request, buc
 	}
 	if err := s.putAdmission.peekHeadroom(bytes); err != nil {
 		s.observeS3PutAdmissionRejection(s3PutAdmissionStagePrereserve, protocol)
-		writeS3AdmissionError(w, bucket, objectKey, s.putAdmission.timeout)
+		writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
 		return false
 	}
 	return true
@@ -324,10 +325,7 @@ func (s *S3Server) shouldFlushS3PutBatchBeforeRead(protocol string, pendingAdmis
 }
 
 func (s *S3Server) s3PutAdmissionRetryAfter() time.Duration {
-	if s == nil || s.putAdmission == nil {
-		return s3PutAdmissionDefaultTimeout
-	}
-	return s.putAdmission.timeout
+	return s3PutAdmissionDefaultRetryAfter
 }
 
 func writeS3AdmissionError(w http.ResponseWriter, bucket, objectKey string, retryAfter time.Duration) {

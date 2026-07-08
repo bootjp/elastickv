@@ -279,6 +279,43 @@ func TestS3Server_PutObjectAdmissionAllowsSmallRequestAndReleasesBudget(t *testi
 	require.Equal(t, "ok", rec.Body.String())
 }
 
+func TestS3Server_PutObjectAdmissionAcquiresBeforeBodyRead(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-before-read")
+
+	reader := &s3AdmissionObservedReader{
+		server:  server,
+		payload: []byte("bounded"),
+	}
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-before-read/object.bin", reader)
+	req.ContentLength = int64(len(reader.payload))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.EqualValues(t, s3ChunkSize, reader.firstReadInflight)
+	require.Zero(t, observer.lastInflight)
+}
+
+func TestS3Server_PutObjectAdmissionRetryAfterIgnoresWaitTimeout(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newS3AdmissionTestServer(t, 45*time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-retry-after")
+	release, err := server.putAdmission.acquire(context.Background(), s3ChunkSize)
+	require.NoError(t, err)
+	defer release()
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/admit-retry-after/blocked.bin", strings.NewReader("blocked")))
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>SlowDown</Code>")
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+}
+
 func TestS3Server_PutObjectAdmissionExactFixedLengthChunkDoesNotChargeEOF(t *testing.T) {
 	t.Parallel()
 
@@ -362,11 +399,91 @@ func TestS3Server_PutObjectAdmissionChunkedStreamsPastSingleChunkBudget(t *testi
 	require.Equal(t, string(payload), rec.Body.String())
 }
 
+func TestS3Server_PutObjectAdmissionDisabledAllowsPlainChunkedEOF(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil,
+		"",
+		st,
+		newLocalAdapterCoordinator(st),
+		nil,
+		withS3PutAdmissionForTest(s3PutAdmissionDisableMaxInflightBytes, time.Second),
+	)
+	createS3AdmissionTestBucket(t, server, "admit-disabled")
+
+	payload := "plain chunked body"
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-disabled/chunked.bin", strings.NewReader(payload))
+	req.ContentLength = -1
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-disabled/chunked.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, payload, rec.Body.String())
+}
+
+func TestS3Server_UploadPartAdmissionAcquiresBeforeBodyRead(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-before-read")
+
+	reader := &s3AdmissionObservedReader{
+		server:  server,
+		payload: []byte("part"),
+	}
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-before-read/object.bin?uploadId=%s&partNumber=1", uploadID),
+		reader,
+	)
+	req.ContentLength = int64(len(reader.payload))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.EqualValues(t, s3ChunkSize, reader.firstReadInflight)
+	require.Zero(t, observer.lastInflight)
+}
+
+func TestS3Server_UploadPartAdmissionDisabledAllowsPlainChunkedEOF(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil,
+		"",
+		st,
+		newLocalAdapterCoordinator(st),
+		nil,
+		withS3PutAdmissionForTest(s3PutAdmissionDisableMaxInflightBytes, time.Second),
+	)
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-disabled")
+
+	payload := "plain chunked part"
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-disabled/object.bin?uploadId=%s&partNumber=1", uploadID),
+		strings.NewReader(payload),
+	)
+	req.ContentLength = -1
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, quoteS3ETag(md5Hex(payload)), rec.Header().Get("ETag"))
+}
+
 func TestS3Server_UploadPartAdmissionValidatesProtocolBeforeSlowDown(t *testing.T) {
 	t.Parallel()
 
 	server, observer := newS3AdmissionTestServer(t, time.Second)
-	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-protocol", "object.bin")
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-protocol")
 
 	release, err := server.putAdmission.acquire(context.Background(), s3ChunkSize)
 	require.NoError(t, err)
@@ -439,7 +556,7 @@ func TestS3Server_UploadPartAdmissionReportsReadErrorBeforeSlowDown(t *testing.T
 	t.Parallel()
 
 	server, observer := newS3AdmissionTestServer(t, 5*time.Millisecond)
-	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-read-error", "object.bin")
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-read-error")
 
 	reader := &s3AdmissionFillingErrorReader{
 		server:  server,
@@ -469,11 +586,29 @@ type s3AdmissionFillingErrorReader struct {
 	done    bool
 }
 
-func (r *s3AdmissionFillingErrorReader) Read(p []byte) (int, error) {
+type s3AdmissionObservedReader struct {
+	server            *S3Server
+	payload           []byte
+	firstReadInflight int64
+	done              bool
+}
+
+func (r *s3AdmissionObservedReader) Read(p []byte) (int, error) {
 	if r.done {
 		return 0, io.EOF
 	}
 	if r.server != nil && r.server.putAdmission != nil {
+		r.firstReadInflight = r.server.putAdmission.inflight.Load()
+	}
+	r.done = true
+	return copy(p, r.payload), io.EOF
+}
+
+func (r *s3AdmissionFillingErrorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	if r.server != nil && r.server.putAdmission != nil && r.server.putAdmission.inflight.Load() == 0 {
 		release, err := r.server.putAdmission.acquire(context.Background(), s3ChunkSize)
 		if err == nil {
 			r.release = release
@@ -516,12 +651,12 @@ func createS3AdmissionTestBucket(t *testing.T, server *S3Server, bucket string) 
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }
 
-func initS3AdmissionMultipartUpload(t *testing.T, server *S3Server, bucket, object string) string {
+func initS3AdmissionMultipartUpload(t *testing.T, server *S3Server, bucket string) string {
 	t.Helper()
 
 	createS3AdmissionTestBucket(t, server, bucket)
 	rec := httptest.NewRecorder()
-	server.handle(rec, newS3TestRequest(http.MethodPost, fmt.Sprintf("/%s/%s?uploads=", bucket, object), nil))
+	server.handle(rec, newS3TestRequest(http.MethodPost, fmt.Sprintf("/%s/object.bin?uploads=", bucket), nil))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	var initResult s3InitiateMultipartUploadResult
 	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))

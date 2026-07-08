@@ -936,9 +936,16 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		if len(readBuf) == 0 {
 			break
 		}
-		allowFinalPartial := admissionProtocol != s3PutAdmissionProtocolFixed
+		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, streamBody, sizeBytes)
+		if admissionErr != nil {
+			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
 		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			releaseAdmission()
 			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
 			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
 				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
@@ -948,12 +955,6 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			return
 		}
 		if n > 0 {
-			releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
-			if admissionErr != nil {
-				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-				writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-				return
-			}
 			pendingAdmission = append(pendingAdmission, releaseAdmission)
 			chunk := append([]byte(nil), readBuf[:n]...)
 			if _, err := hasher.Write(chunk); err != nil {
@@ -985,6 +986,8 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			}
 			sizeBytes += int64(n)
 			chunkNo++
+		} else {
+			releaseAdmission()
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
@@ -1489,9 +1492,15 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		if len(readBuf) == 0 {
 			break
 		}
-		allowFinalPartial := admissionProtocol != s3PutAdmissionProtocolFixed
+		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, partStreamBody, sizeBytes)
+		if admissionErr != nil {
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
 		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			releaseAdmission()
 			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
 				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
 				return
@@ -1500,15 +1509,11 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			return
 		}
 		if n == 0 {
+			releaseAdmission()
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
 			continue
-		}
-		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
-		if admissionErr != nil {
-			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-			return
 		}
 		pendingAdmission = append(pendingAdmission, releaseAdmission)
 		chunk := append([]byte(nil), readBuf[:n]...)
@@ -2544,6 +2549,17 @@ func nextS3PutReadBuffer(buf []byte, protocol string, contentLength int64, readB
 		return buf[:int(remaining)], true
 	}
 	return buf, false
+}
+
+func (s *S3Server) acquireS3PutAdmissionForRead(ctx context.Context, bytes int, protocol string, body *s3StreamingBody, readBytes int64) (func(), error) {
+	if body.decodedLengthReached(readBytes) {
+		return func() {}, nil
+	}
+	return s.acquireS3PutAdmission(ctx, int64(bytes), protocol)
+}
+
+func s3PutReadAllowsFinalPartial(protocol string, contentLength int64) bool {
+	return protocol != s3PutAdmissionProtocolFixed || contentLength < 0
 }
 
 func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool, allowEOFWithFullBuffer bool) (int, error) {
