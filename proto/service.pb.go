@@ -183,7 +183,8 @@ func (x *RawPutResponse) GetSuccess() bool {
 type RawGetRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Ts            uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"` // optional read timestamp; if zero, server uses current HLC
+	Ts            uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                          // optional read timestamp; if zero, server uses current HLC
+	GroupId       uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -228,6 +229,13 @@ func (x *RawGetRequest) GetKey() []byte {
 func (x *RawGetRequest) GetTs() uint64 {
 	if x != nil {
 		return x.Ts
+	}
+	return 0
+}
+
+func (x *RawGetRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
 	}
 	return 0
 }
@@ -491,6 +499,7 @@ type RawScanAtRequest struct {
 	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
 	Ts            uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
 	Reverse       bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
+	GroupId       uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -558,6 +567,13 @@ func (x *RawScanAtRequest) GetReverse() bool {
 		return x.Reverse
 	}
 	return false
+}
+
+func (x *RawScanAtRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
 }
 
 type RawKVPair struct {
@@ -2169,10 +2185,11 @@ const file_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"7\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"L\n" +
 	"\rRawGetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x0e\n" +
-	"\x02ts\x18\x03 \x01(\x04R\x02tsJ\x04\b\x04\x10\x05\"b\n" +
+	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12\x19\n" +
+	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\"b\n" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
@@ -2186,13 +2203,14 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x8e\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xa3\x01\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x03R\x05limit\x12\x0e\n" +
 	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
-	"\areverse\x18\x05 \x01(\bR\areverseJ\x04\b\x06\x10\a\"3\n" +
+	"\areverse\x18\x05 \x01(\bR\areverse\x12\x19\n" +
+	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +

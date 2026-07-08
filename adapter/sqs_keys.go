@@ -50,7 +50,7 @@ const (
 )
 
 // HT-FIFO partitioned-keyspace discriminator. Per the §3.1 design in
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md, partitioned
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md, partitioned
 // FIFO queues live in a separate keyspace so the legacy single-
 // partition layout can stay byte-identical on disk:
 //

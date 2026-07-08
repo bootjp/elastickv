@@ -36,6 +36,14 @@ type GRPCServer struct {
 
 type GRPCServerOption func(*GRPCServer)
 
+type rawGroupGetter interface {
+	GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error)
+}
+
+type rawGroupScanner interface {
+	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
 func WithCloseStore() GRPCServerOption {
 	return func(s *GRPCServer) {
 		s.closeStore = true
@@ -88,7 +96,17 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
 
-	v, err := r.store.GetAt(ctx, req.Key, readTS)
+	var v []byte
+	var err error
+	if groupID := req.GetGroupId(); groupID != 0 {
+		groupGetter, ok := r.store.(rawGroupGetter)
+		if !ok {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with explicit group requires a group-aware store"))
+		}
+		v, err = groupGetter.GetGroupAt(ctx, groupID, req.Key, readTS)
+	} else {
+		v, err = r.store.GetAt(ctx, req.Key, readTS)
+	}
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
 	}
@@ -142,7 +160,16 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	}
 
 	var res []*store.KVPair
-	if req.GetReverse() {
+	if groupID := req.GetGroupId(); groupID != 0 {
+		if req.GetReverse() {
+			return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
+		}
+		groupScanner, ok := r.store.(rawGroupScanner)
+		if !ok {
+			return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.FailedPrecondition, "raw scan with explicit group requires a group-aware store"))
+		}
+		res, err = groupScanner.ScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	} else if req.GetReverse() {
 		res, err = r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	} else {
 		res, err = r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
