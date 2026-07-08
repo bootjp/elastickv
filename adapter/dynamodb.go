@@ -288,6 +288,12 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 	return d
 }
 
+// SetListener installs the listener Run serves from. Startup wiring uses this
+// to build admin-forward sources before binding the public socket.
+func (d *DynamoDBServer) SetListener(listen net.Listener) {
+	d.listen = listen
+}
+
 func (d *DynamoDBServer) Run() error {
 	if err := d.httpServer.Serve(d.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)

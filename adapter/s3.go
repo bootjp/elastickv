@@ -343,6 +343,12 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	return s
 }
 
+// SetListener installs the listener Run serves from. Startup wiring uses this
+// to build admin-forward sources before binding the public socket.
+func (s *S3Server) SetListener(listen net.Listener) {
+	s.listen = listen
+}
+
 func (s *S3Server) Run() error {
 	if s.httpServer == nil {
 		return errors.New("s3 server httpServer is nil")

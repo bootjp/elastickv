@@ -34,7 +34,9 @@ import (
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -1265,6 +1267,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) 
 			return nil
 		})
 	}
+	publicKVGate := &startupPublicKVGate{}
 	runner := runtimeServerRunner{
 		ctx:             in.ctx,
 		lc:              in.lc,
@@ -1313,6 +1316,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) 
 		metricsRegistry:                 in.metricsRegistry,
 		roleStore:                       roleStore,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
+		publicKVGate:                    publicKVGate,
 	}
 	if err := runner.startRaftTransport(); err != nil {
 		return err
@@ -1324,6 +1328,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) 
 			return errors.Wrap(err, "encryption rotate-on-startup: wait before serving")
 		}
 	}
+	publicKVGate.markReady()
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -1450,6 +1455,35 @@ type adminGRPCInterceptors struct {
 
 func (a adminGRPCInterceptors) empty() bool {
 	return len(a.unary) == 0 && len(a.stream) == 0
+}
+
+type startupPublicKVGate struct {
+	ready atomic.Bool
+}
+
+func (g *startupPublicKVGate) markReady() {
+	if g != nil {
+		g.ready.Store(true)
+	}
+}
+
+func (g *startupPublicKVGate) unaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	if g != nil && info != nil && !g.ready.Load() && startupPublicKVMethod(info.FullMethod) {
+		// Return a raw gRPC status so clients and retry policy see Unavailable.
+		//nolint:wrapcheck
+		return nil, status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return handler(ctx, req)
+}
+
+func startupPublicKVMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, "/RawKV/") ||
+		strings.HasPrefix(fullMethod, "/TransactionalKV/")
 }
 
 // configureAdminService builds the node-side AdminServer plus the interceptor
@@ -1809,20 +1843,27 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	return nil
 }
 
-func prepareDynamoDBServer(ctx context.Context, lc *net.ListenConfig, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, net.Listener, error) {
-	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
-	}
-	dynamoServer := adapter.NewDynamoDBServer(
-		dynamoL,
+func newDynamoDBServer(shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) *adapter.DynamoDBServer {
+	return adapter.NewDynamoDBServer(
+		nil,
 		shardStore,
 		coordinate,
 		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 		adapter.WithDynamoDBLeaderMap(leaderDynamo),
 	)
-	return dynamoServer, dynamoL, nil
+}
+
+func bindDynamoDBServer(ctx context.Context, lc *net.ListenConfig, dynamoAddr string, dynamoServer *adapter.DynamoDBServer) (net.Listener, error) {
+	if dynamoServer == nil {
+		return nil, errors.New("dynamodb server is not prepared")
+	}
+	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
+	}
+	dynamoServer.SetListener(dynamoL)
+	return dynamoL, nil
 }
 
 func runDynamoDBServer(ctx context.Context, eg *errgroup.Group, dynamoServer *adapter.DynamoDBServer) {
@@ -2052,11 +2093,17 @@ type runtimeServerRunner struct {
 	// does not need to wait for the (later) admin-config parse.
 	// Nil when no admin access keys are configured.
 	roleStore admin.RoleStore
+
+	publicKVGate *startupPublicKVGate
 }
 
 func (r *runtimeServerRunner) startRaftTransport() error {
 	if err := r.prepareAdminForwardServers(); err != nil {
 		return r.startupFailure(err)
+	}
+	adminGRPCOpts := r.adminGRPCOpts
+	if r.publicKVGate != nil {
+		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
@@ -2077,7 +2124,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 			return r.metricsRegistry.RaftProposalObserver(groupID)
 		},
 		r.adminServer,
-		r.adminGRPCOpts,
+		adminGRPCOpts,
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
@@ -2088,18 +2135,12 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 }
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
-	dynamoServer, dynamoListener, err := prepareDynamoDBServer(r.ctx, r.lc, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
-	if err != nil {
-		return err
-	}
-	r.dynamoServer = dynamoServer
-	r.dynamoListener = dynamoListener
-	s3Server, s3Listener, err := prepareS3Server(r.ctx, r.lc, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	s3Server, err := newS3Server(r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
 	if err != nil {
 		return err
 	}
 	r.s3Server = s3Server
-	r.s3Listener = s3Listener
 	return nil
 }
 
@@ -2123,8 +2164,18 @@ func (r *runtimeServerRunner) startPublicServices() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return r.startupFailure(err)
 	}
+	dynamoListener, err := bindDynamoDBServer(r.ctx, r.lc, r.dynamoAddress, r.dynamoServer)
+	if err != nil {
+		return r.startupFailure(err)
+	}
+	r.dynamoListener = dynamoListener
 	runDynamoDBServer(r.ctx, r.eg, r.dynamoServer)
 	r.dynamoListener = nil
+	s3Listener, err := bindS3Server(r.ctx, r.lc, r.s3Address, r.s3Server)
+	if err != nil {
+		return r.startupFailure(err)
+	}
+	r.s3Listener = s3Listener
 	runS3Server(r.ctx, r.eg, r.s3Server)
 	r.s3Listener = nil
 	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver, r.sqsPartitionObserver)

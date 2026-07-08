@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,8 +16,10 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	crdberrors "github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -129,33 +132,42 @@ func (b *blockingRunRotateStartupRunner) Run(context.Context) error {
 
 func (b *blockingRunRotateStartupRunner) Done() bool { return b.done.Load() }
 
-func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderBlocks(t *testing.T) {
+func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderWaitRuns(t *testing.T) {
 	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
 	runner := &fakeRotateStartupRunner{}
-	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, slog.Default())
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, slog.Default())
 	defer deregister()
+	if got := runner.runs.Load(); got != 0 {
+		t.Fatalf("install must defer immediate-leader rotation until startup wait; runs=%d", got)
+	}
+	if err := waitStartup(context.Background()); err != nil {
+		t.Fatalf("waitStartup: %v", err)
+	}
 	if got := runner.runs.Load(); got != 1 {
-		t.Fatalf("immediate leader must run rotation synchronously before returning; runs=%d", got)
+		t.Fatalf("startup wait must run immediate-leader rotation once; runs=%d", got)
 	}
 }
 
-func TestInstallEncryptionRotateOnStartupRequest_FollowerFiresOnLeadership(t *testing.T) {
+func TestInstallEncryptionRotateOnStartupRequest_FollowerDefersUntilStartupWait(t *testing.T) {
 	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
 	runner := &fakeRotateStartupRunner{}
-	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
 	defer deregister()
 	if got := runner.runs.Load(); got != 0 {
 		t.Fatalf("follower install must not run immediately; runs=%d", got)
 	}
 	controller.becomeLeader()
-	deadline := time.Now().Add(2 * time.Second)
-	for runner.runs.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	if got := runner.runs.Load(); got != 0 {
+		t.Fatalf("leader callback before startup wait must not run rotation; runs=%d", got)
+	}
+	if err := waitStartup(context.Background()); err != nil {
+		t.Fatalf("waitStartup: %v", err)
 	}
 	if got := runner.runs.Load(); got != 1 {
-		t.Fatalf("leader-acquired callback must run rotation once; runs=%d", got)
+		t.Fatalf("startup wait must run deferred leader rotation once; runs=%d", got)
 	}
 }
 
@@ -166,10 +178,16 @@ func TestInstallEncryptionRotateOnStartupRequest_RetriesTransientWhileLeader(t *
 
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
 	runner := &retryOnceRotateStartupRunner{err: status.Error(codes.Unavailable, "try again")}
-	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
 	defer deregister()
+	if got := runner.runs.Load(); got != 0 {
+		t.Fatalf("install must defer immediate-leader retry loop until startup wait; runs=%d", got)
+	}
+	if err := waitStartup(context.Background()); err != nil {
+		t.Fatalf("waitStartup: %v", err)
+	}
 	if got := runner.runs.Load(); got != 2 {
-		t.Fatalf("transient startup rotation must retry before returning; runs=%d", got)
+		t.Fatalf("transient startup rotation must retry before startup wait returns; runs=%d", got)
 	}
 }
 
@@ -179,9 +197,15 @@ func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *t
 		doneEntered: make(chan struct{}),
 		releaseDone: make(chan struct{}),
 	}
-	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
 	defer deregister()
 	defer close(runner.releaseDone)
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitStartup(waitCtx); err != nil {
+		t.Fatalf("startup wait while follower: %v", err)
+	}
 
 	returned := make(chan struct{})
 	go func() {
@@ -209,6 +233,9 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
 	defer deregister()
 
+	if err := waitStartup(context.Background()); err != nil {
+		t.Fatalf("initial follower wait: %v", err)
+	}
 	controller.becomeLeader()
 	select {
 	case <-runner.started:
@@ -251,6 +278,85 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitReturnsPermanentError(t *te
 	}
 	if got := runner.runs.Load(); got != 1 {
 		t.Fatalf("permanent error must not be retried; runs=%d", got)
+	}
+}
+
+func TestStartupPublicKVGate_BlocksOnlyPublicKVUntilReady(t *testing.T) {
+	t.Parallel()
+	gate := &startupPublicKVGate{}
+	handlerCalled := false
+	handler := func(context.Context, interface{}) (interface{}, error) {
+		handlerCalled = true
+		return "ok", nil
+	}
+	if _, err := gate.unaryInterceptor(
+		context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName},
+		handler,
+	); status.Code(err) != codes.Unavailable {
+		t.Fatalf("RawKV before ready err=%v, want Unavailable", err)
+	}
+	if handlerCalled {
+		t.Fatal("RawKV handler ran before startup gate opened")
+	}
+	if _, err := gate.unaryInterceptor(
+		context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: "/Internal/GetTimestamp"},
+		handler,
+	); err != nil {
+		t.Fatalf("internal method before ready must pass: %v", err)
+	}
+	if !handlerCalled {
+		t.Fatal("internal handler did not run")
+	}
+	gate.markReady()
+	handlerCalled = false
+	if _, err := gate.unaryInterceptor(
+		context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: pb.TransactionalKV_Get_FullMethodName},
+		handler,
+	); err != nil {
+		t.Fatalf("TransactionalKV after ready err=%v", err)
+	}
+	if !handlerCalled {
+		t.Fatal("TransactionalKV handler did not run after gate opened")
+	}
+}
+
+func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListeners(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	lc := &net.ListenConfig{}
+	heldDynamo, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen held dynamo: %v", err)
+	}
+	defer heldDynamo.Close()
+	heldS3, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen held s3: %v", err)
+	}
+	defer heldS3.Close()
+
+	runner := runtimeServerRunner{
+		ctx:             ctx,
+		lc:              lc,
+		dynamoAddress:   heldDynamo.Addr().String(),
+		s3Address:       heldS3.Addr().String(),
+		s3PathStyleOnly: true,
+		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
+	}
+	if err := runner.prepareAdminForwardServers(); err != nil {
+		t.Fatalf("prepareAdminForwardServers: %v", err)
+	}
+	if runner.dynamoServer == nil {
+		t.Fatal("dynamo admin-forward server was not prepared")
+	}
+	if runner.s3Server == nil {
+		t.Fatal("s3 admin-forward server was not prepared")
+	}
+	if runner.dynamoListener != nil || runner.s3Listener != nil {
+		t.Fatalf("prepareAdminForwardServers bound listeners: dynamo=%v s3=%v", runner.dynamoListener, runner.s3Listener)
 	}
 }
 

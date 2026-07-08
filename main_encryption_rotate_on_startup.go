@@ -114,16 +114,6 @@ func installEncryptionRotateOnStartup(
 	return installEncryptionRotateOnStartupRequestWithWait(ctx, controller, task, logger)
 }
 
-func installEncryptionRotateOnStartupRequest(
-	ctx context.Context,
-	controller encryptionRotateOnStartupController,
-	task encryptionRotateOnStartupRunner,
-	logger *slog.Logger,
-) func() {
-	deregister, _ := installEncryptionRotateOnStartupRequestWithWait(ctx, controller, task, logger)
-	return deregister
-}
-
 func installEncryptionRotateOnStartupRequestWithWait(
 	ctx context.Context,
 	controller encryptionRotateOnStartupController,
@@ -137,20 +127,18 @@ func installEncryptionRotateOnStartupRequestWithWait(
 		logger = slog.Default()
 	}
 	var flight encryptionRotateOnStartupFlightState
+	var callbacksEnabled atomic.Bool
 	fire := func(block bool) {
 		_ = fireEncryptionRotateOnStartup(ctx, controller, task, logger, &flight, block)
 	}
-	wasLeaderBefore := controller.State() == raftengine.StateLeader
-	if wasLeaderBefore {
-		fire(true)
-	}
 	deregister := controller.RegisterLeaderAcquiredCallback(func() {
+		if !callbacksEnabled.Load() {
+			return
+		}
 		fire(false)
 	})
-	if controller.State() == raftengine.StateLeader {
-		fire(false)
-	}
 	waitStartup := func(waitCtx context.Context) error {
+		callbacksEnabled.Store(true)
 		return waitEncryptionRotateOnStartupIdle(waitCtx, controller, task, logger, &flight)
 	}
 	return deregister, waitStartup
@@ -233,11 +221,11 @@ func runEncryptionRotateOnStartup(
 ) error {
 	defer inFlight.Store(false)
 	for {
-		if task.Done() || controller.State() != raftengine.StateLeader {
+		if controller.State() != raftengine.StateLeader || task.Done() {
 			return nil
 		}
 		err := task.Run(ctx)
-		if err == nil || task.Done() || controller.State() != raftengine.StateLeader {
+		if err == nil || controller.State() != raftengine.StateLeader || task.Done() {
 			return nil
 		}
 		logEncryptionRotateOnStartupError(logger, err)
@@ -272,7 +260,7 @@ func waitEncryptionRotateOnStartupIdle(
 		if waited {
 			continue
 		}
-		if task.Done() || controller.State() != raftengine.StateLeader {
+		if controller.State() != raftengine.StateLeader || task.Done() {
 			return nil
 		}
 		if flight.inFlight.Load() {
