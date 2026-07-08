@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -285,7 +286,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 	s := &SQSServer{
 		listen:       listen,
 		store:        st,
-		coordinator:  coordinate,
+		coordinator:  kv.WithKeyVizLabel(coordinate, keyviz.LabelSQS),
 		reaperCtx:    reaperCtx,
 		reaperCancel: reaperCancel,
 		throttle:     newBucketStoreDefault(),
@@ -369,7 +370,7 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 	// pickSqsProtocol decides between the JSON path (X-Amz-Target +
 	// JSON body, the existing default) and the query path (form-
 	// encoded body, XML response) on a per-request basis. See
-	// docs/design/2026_04_26_proposed_sqs_query_protocol.md for the
+	// docs/design/2026_04_26_implemented_sqs_query_protocol.md for the
 	// detection rules.
 	if pickSqsProtocol(r) == sqsProtocolQuery {
 		s.handleQueryProtocol(w, r)

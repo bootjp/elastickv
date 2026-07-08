@@ -24,6 +24,7 @@ import (
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -141,6 +142,73 @@ var (
 // process lifetime.
 var joinRoleViolationCount atomic.Uint64
 
+func confStateValue(confState *raftpb.ConfState) raftpb.ConfState {
+	if confState == nil {
+		return raftpb.ConfState{}
+	}
+	return *confState
+}
+
+func entryValues(entries []*raftpb.Entry) []raftpb.Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]raftpb.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil {
+			out = append(out, *entry)
+		}
+	}
+	return out
+}
+
+func messageValues(messages []*raftpb.Message) []raftpb.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]raftpb.Message, 0, len(messages))
+	for _, message := range messages {
+		if message != nil {
+			out = append(out, *message)
+		}
+	}
+	return out
+}
+
+func hardStateValue(hardState *raftpb.HardState) raftpb.HardState {
+	if hardState == nil {
+		return raftpb.HardState{}
+	}
+	return *hardState
+}
+
+func snapshotValue(snapshot *raftpb.Snapshot) raftpb.Snapshot {
+	if snapshot == nil {
+		return raftpb.Snapshot{}
+	}
+	return *snapshot
+}
+
+func snapshotIndex(snapshot *raftpb.Snapshot) uint64 {
+	return snapshot.GetMetadata().GetIndex()
+}
+
+func confChangeTypePtr(changeType raftpb.ConfChangeType) *raftpb.ConfChangeType {
+	return &changeType
+}
+
+func entryTypePtr(entryType raftpb.EntryType) *raftpb.EntryType {
+	return &entryType
+}
+
+func messageTypePtr(messageType raftpb.MessageType) *raftpb.MessageType {
+	return &messageType
+}
+
+func uint64Ptr(value uint64) *uint64 {
+	return &value
+}
+
 // JoinRoleViolationCount returns the cumulative count of
 // --raftJoinAsLearner alarms that have fired since process start. See
 // docs/design/2026_04_26_proposed_raft_learner.md §4.5.
@@ -194,7 +262,7 @@ type OpenConfig struct {
 	// ColdStartObserver receives the cold-start snapshot-restore
 	// skip-gate lifecycle events (skipped / executed / fallback).
 	// nil disables metrics; the skip itself still runs. See
-	// docs/design/2026_06_02_idempotent_snapshot_restore.md §9 and
+	// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §9 and
 	// internal/raftengine/cold_start.go for the contract.
 	ColdStartObserver raftengine.ColdStartObserver
 }
@@ -572,9 +640,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
-		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
-		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
-		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
+		config:           configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
+		voterCount:       len(prepared.disk.LocalSnap.Metadata.GetConfState().GetVoters()),
+		isLearnerNode:    learnerSetFromConfState(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
 		applied:          initialApplied,
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
@@ -608,7 +676,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	// (joinAlarmFired.CompareAndSwap) guarantees it fires at most
 	// once per process even if a later snapshot or conf change
 	// reapplies the same role assignment. See learner design doc §4.5.
-	engine.alarmIfJoinedAsVoter(prepared.disk.LocalSnap.Metadata.ConfState)
+	engine.alarmIfJoinedAsVoter(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState()))
 	// Surface a misconfiguration where the tick settings produce a
 	// non-positive lease window: lease reads would never hit the fast
 	// path. Don't fail Open -- the engine is still functional via the
@@ -667,7 +735,7 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 	// every peer as a voter, then a learner's restart would land on
 	// a peers file that contradicts the snapshot's ConfState.Learners
 	// and validateConfState would reject the cluster on next open.
-	annotatePeerSuffrageInSlice(peers, disk.LocalSnap.Metadata.ConfState)
+	annotatePeerSuffrageInSlice(peers, confStateValue(disk.LocalSnap.GetMetadata().GetConfState()))
 	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
@@ -743,8 +811,8 @@ func rawNodeAppliedBounds(storage *etcdraft.MemoryStorage, applied uint64) (uint
 	if err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if !etcdraft.IsEmptyHardState(hardState) && hardState.Commit > committed {
-		committed = hardState.Commit
+	if !etcdraft.IsEmptyHardState(hardState) && hardState.GetCommit() > committed {
+		committed = hardState.GetCommit()
 	}
 	if applied > committed {
 		applied = committed
@@ -758,29 +826,32 @@ func trimRawNodeAppliedForReplay(storage *etcdraft.MemoryStorage, baseApplied, a
 		return applied
 	}
 	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
 		if coldStartEntryRequiresReplay(entry, cfg) {
-			return entry.Index - 1
+			return entry.GetIndex() - 1
 		}
 	}
 	return applied
 }
 
-func coldStartEntryRequiresReplay(entry raftpb.Entry, cfg OpenConfig) bool {
-	switch entry.Type {
+func coldStartEntryRequiresReplay(entry *raftpb.Entry, cfg OpenConfig) bool {
+	switch entry.GetType() {
 	case raftpb.EntryConfChange, raftpb.EntryConfChangeV2:
 		return true
 	case raftpb.EntryNormal:
 	default:
 		return false
 	}
-	if len(entry.Data) == 0 {
+	if len(entry.GetData()) == 0 {
 		return false
 	}
-	_, payload, ok := decodeProposalEnvelope(entry.Data)
+	_, payload, ok := decodeProposalEnvelope(entry.GetData())
 	if !ok {
 		return false
 	}
-	if entry.Index > orInertCutover(cfg.RaftCutoverIndex)() {
+	if entry.GetIndex() > orInertCutover(cfg.RaftCutoverIndex)() {
 		if cfg.RaftCipher == nil {
 			return true
 		}
@@ -1848,8 +1919,8 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 		return
 	}
 	cc := raftpb.ConfChange{
-		Type:    changeType,
-		NodeID:  peer.NodeID,
+		Type:    confChangeTypePtr(changeType),
+		NodeId:  uint64Ptr(peer.NodeID),
 		Context: contextBytes,
 	}
 	if err := e.storePendingConfig(req); err != nil {
@@ -1857,7 +1928,7 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 		return
 	}
 	lastIndex, _ := e.storage.LastIndex()
-	if err := e.rawNode.ProposeConfChange(cc); err != nil {
+	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
 		return
@@ -1877,15 +1948,15 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 		return
 	}
 	cc := raftpb.ConfChange{
-		Type:    raftpb.ConfChangeRemoveNode,
-		NodeID:  peer.NodeID,
+		Type:    confChangeTypePtr(raftpb.ConfChangeRemoveNode),
+		NodeId:  uint64Ptr(peer.NodeID),
 		Context: contextBytes,
 	}
 	if err := e.storePendingConfig(req); err != nil {
 		req.done <- adminResult{err: err}
 		return
 	}
-	if err := e.rawNode.ProposeConfChange(cc); err != nil {
+	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
 	}
@@ -1982,10 +2053,10 @@ func (e *Engine) drainReady() error {
 			return err
 		}
 		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
-		if err := e.sendMessages(rd.Messages); err != nil {
+		if err := e.sendMessages(messageValues(rd.Messages)); err != nil {
 			return err
 		}
-		if err := e.applyCommitted(rd.CommittedEntries); err != nil {
+		if err := e.applyCommitted(entryValues(rd.CommittedEntries)); err != nil {
 			return err
 		}
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
@@ -2025,13 +2096,13 @@ func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
 		return err
 	}
 	if e.persist == nil {
-		e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
+		e.releaseProtectedReceivedFSMSnapshotsUpToLocked(snapshotIndex(rd.Snapshot))
 		return nil
 	}
 	if err := persistReadyToWAL(e.persist, rd); err != nil {
 		return err
 	}
-	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(snapshotIndex(rd.Snapshot))
 	return nil
 }
 
@@ -2061,8 +2132,8 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	}
 	e.recordLeaderContact(msg)
 	e.recordQuorumAck(msg)
-	commitBeforeStep := e.rawNode.Status().Commit
-	if err := e.rawNode.Step(msg); err != nil {
+	commitBeforeStep := e.rawNode.Status().GetCommit()
+	if err := e.rawNode.Step(&msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
@@ -2096,10 +2167,11 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 // refreshStatus on every tick, which catches every role transition
 // before the next handleStep runs.
 func (e *Engine) recordQuorumAck(msg raftpb.Message) {
-	if !isFollowerResponse(msg.Type) {
+	if !isFollowerResponse(msg.GetType()) {
 		return
 	}
-	if msg.From == 0 || msg.From == e.nodeID {
+	from := msg.GetFrom()
+	if from == 0 || from == e.nodeID {
 		return
 	}
 	if !e.isLeader.Load() {
@@ -2112,7 +2184,7 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	// "ghost" entry that removePeer just pruned. Since we run on the
 	// event-loop goroutine (the sole writer to e.peers), the map read
 	// here is race-free.
-	if _, ok := e.peers[msg.From]; !ok {
+	if _, ok := e.peers[from]; !ok {
 		return
 	}
 	// Reject acks from learners. A learner does not vote and must not
@@ -2122,14 +2194,14 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	// apply loop (single writer for both), so reading here under the
 	// run-loop goroutine is race-free for the same reason as e.peers
 	// above.
-	if e.isLearnerNode[msg.From] {
+	if e.isLearnerNode[from] {
 		return
 	}
 	voterCount := e.voterCount
 	if voterCount <= 1 {
 		return
 	}
-	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(voterCount))
+	e.ackTracker.recordAck(from, followerQuorumForClusterSize(voterCount))
 }
 
 // followerQuorumForClusterSize returns the number of non-self peer
@@ -2173,7 +2245,7 @@ func (e *Engine) sendMessages(messages []raftpb.Message) error {
 }
 
 func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
-	if msg.To == 0 || msg.To == e.nodeID || etcdraft.IsLocalMsg(msg.Type) {
+	if msg.GetTo() == 0 || msg.GetTo() == e.nodeID || etcdraft.IsLocalMsg(msg.GetType()) {
 		return true
 	}
 	return e.transport == nil || e.peerDispatchers == nil
@@ -2184,12 +2256,12 @@ func (e *Engine) skipDispatchMessage(msg raftpb.Message) bool {
 // that calls removePeer. The delete-then-close ordering in removePeer therefore
 // guarantees that no send can race with a channel close.
 func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
-	pd, ok := e.peerDispatchers[msg.To]
+	pd, ok := e.peerDispatchers[msg.GetTo()]
 	if !ok {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
-	ch := e.selectDispatchLane(pd, msg.Type)
+	ch := e.selectDispatchLane(pd, msg.GetType())
 	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
 	// is already full. The len/cap check is safe here because this function is
 	// only ever called from the single engine event-loop goroutine.
@@ -2261,7 +2333,7 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	return pd.other
 }
 
-func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
+func (e *Engine) applyReadySnapshot(snapshot *raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
@@ -2270,23 +2342,23 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	return e.applyReadySnapshotLocked(snapshot)
 }
 
-func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
+func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
 	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
 	// requires FSM payload bytes so it can restore local state before applying
 	// the metadata snapshot to MemoryStorage.
-	if len(snapshot.Data) == 0 {
+	if len(snapshot.GetData()) == 0 {
 		return errors.WithStack(errSnapshotRequired)
 	}
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
-	if isSnapshotToken(snapshot.Data) {
-		tok, err := decodeSnapshotToken(snapshot.Data)
+	if isSnapshotToken(snapshot.GetData()) {
+		tok, err := decodeSnapshotToken(snapshot.GetData())
 		if err != nil {
-			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
 		}
 		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
 		// after Restore so peer-after-InstallSnapshot populates the meta
@@ -2294,7 +2366,7 @@ func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
 		// store (engine.persistLocalSnapshotPayload), but the receiving
 		// node's restored store inherits the pre-bump value embedded in
 		// the snapshot artifact. Design Non-Goals §
-		// docs/design/2026_06_02_idempotent_snapshot_restore.md:71-74
+		// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md#non-goals
 		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
 		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
@@ -2302,26 +2374,26 @@ func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
 		}
 	} else {
 		// Legacy format: full FSM payload in snapshot.Data.
-		if err := e.fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
-			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.Metadata.Index)
+		if err := e.fsm.Restore(bytes.NewReader(snapshot.GetData())); err != nil {
+			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
 		}
 	}
 
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
-			snapshot.Metadata.Index, snapshot.Metadata.Term)
+			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
 	}
-	e.applied = snapshot.Metadata.Index
-	e.appliedIndex.Store(snapshot.Metadata.Index)
-	e.clearPendingConfChange(snapshot.Metadata.Index)
+	e.applied = snapshot.GetMetadata().GetIndex()
+	e.appliedIndex.Store(snapshot.GetMetadata().GetIndex())
+	e.clearPendingConfChange(snapshot.GetMetadata().GetIndex())
 	// Refresh the voter-cache from the snapshot's ConfState so
 	// downstream apply-loop reads (recordQuorumAck, refreshStatus,
 	// removePeer) see the post-snapshot voter set even before any
 	// further conf-change entries arrive. Mirrors the apply-loop
 	// sequence in applyConfigChange. The order matches §4.6:
 	// voterCache first, then config.Servers.
-	e.refreshVoterCache(snapshot.Metadata.ConfState)
-	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
+	e.refreshVoterCache(confStateValue(snapshot.GetMetadata().GetConfState()))
+	e.setConfigurationFromConfState(confStateValue(snapshot.GetMetadata().GetConfState()), snapshot.GetMetadata().GetIndex())
 	// Persist the post-snapshot peers file with suffrage drawn from
 	// the snapshot's ConfState so a learner that received catch-up
 	// state via snapshot (the common case for fresh joiners) writes
@@ -2332,34 +2404,34 @@ func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
 	if err := e.savePeersFileForSnapshot(snapshot); err != nil {
 		return err
 	}
-	e.alarmIfJoinedAsVoter(snapshot.Metadata.ConfState)
+	e.alarmIfJoinedAsVoter(confStateValue(snapshot.GetMetadata().GetConfState()))
 	return nil
 }
 
 // savePeersFileForSnapshot writes the v2 peers file with suffrage
 // drawn from the snapshot's ConfState. Idempotent: savePersistedPeers
 // short-circuits when the on-disk index already covers `index`.
-func (e *Engine) savePeersFileForSnapshot(snapshot raftpb.Snapshot) error {
+func (e *Engine) savePeersFileForSnapshot(snapshot *raftpb.Snapshot) error {
 	e.mu.RLock()
 	peers := sortedPeerList(e.peers)
 	e.mu.RUnlock()
 	if len(peers) == 0 {
 		return nil
 	}
-	annotatePeerSuffrageInSlice(peers, snapshot.Metadata.ConfState)
-	if err := savePersistedPeers(e.dataDir, snapshot.Metadata.Index, peers); err != nil {
-		return errors.Wrapf(err, "save peers file from snapshot index=%d", snapshot.Metadata.Index)
+	annotatePeerSuffrageInSlice(peers, confStateValue(snapshot.GetMetadata().GetConfState()))
+	if err := savePersistedPeers(e.dataDir, snapshot.GetMetadata().GetIndex(), peers); err != nil {
+		return errors.Wrapf(err, "save peers file from snapshot index=%d", snapshot.GetMetadata().GetIndex())
 	}
 	return nil
 }
 
-func (e *Engine) applyReadyEntries(entries []raftpb.Entry) error {
+func (e *Engine) applyReadyEntries(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	for _, entry := range entries {
-		if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
-			e.markPendingConfChange(entry.Index)
+		if entry.GetType() == raftpb.EntryConfChange || entry.GetType() == raftpb.EntryConfChangeV2 {
+			e.markPendingConfChange(entry.GetIndex())
 		}
 	}
 	return errors.WithStack(e.storage.Append(entries))
@@ -2379,7 +2451,7 @@ func (e *Engine) restorePendingConfChangeFenceFromStorage(applied uint64) error 
 	return nil
 }
 
-func (e *Engine) pendingConfChangeRestoreEntries(applied uint64) ([]raftpb.Entry, error) {
+func (e *Engine) pendingConfChangeRestoreEntries(applied uint64) ([]*raftpb.Entry, error) {
 	if applied == math.MaxUint64 {
 		return nil, nil
 	}
@@ -2408,13 +2480,13 @@ func (e *Engine) pendingConfChangeRestoreEntries(applied uint64) ([]raftpb.Entry
 	return entries, nil
 }
 
-func (e *Engine) restorePendingConfChangeFenceFromEntry(entry raftpb.Entry) {
-	if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
-		e.markPendingConfChange(entry.Index)
+func (e *Engine) restorePendingConfChangeFenceFromEntry(entry *raftpb.Entry) {
+	if entry.GetType() == raftpb.EntryConfChange || entry.GetType() == raftpb.EntryConfChangeV2 {
+		e.markPendingConfChange(entry.GetIndex())
 	}
 }
 
-func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
+func (e *Engine) applyReadyHardState(hardState *raftpb.HardState) error {
 	if etcdraft.IsEmptyHardState(hardState) {
 		return nil
 	}
@@ -2435,7 +2507,8 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if e.applied <= current.Metadata.Index || e.applied-current.Metadata.Index < e.snapshotThreshold() {
+	currentIndex := current.GetMetadata().GetIndex()
+	if e.applied <= currentIndex || e.applied-currentIndex < e.snapshotThreshold() {
 		return nil
 	}
 	snapshot, err := e.fsm.Snapshot()
@@ -2471,7 +2544,7 @@ func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 	for _, entry := range entries {
 		var err error
-		switch entry.Type {
+		switch entry.GetType() {
 		case raftpb.EntryNormal:
 			err = e.applyNormalCommitted(entry)
 		case raftpb.EntryConfChange:
@@ -2479,7 +2552,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 		case raftpb.EntryConfChangeV2:
 			err = e.applyConfChangeV2Committed(entry)
 		default:
-			e.setApplied(entry.Index)
+			e.setApplied(entry.GetIndex())
 		}
 		if err != nil {
 			return err
@@ -2555,7 +2628,7 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 	// to fsm.Apply (which is monotonic and idempotent for HLC leases)
 	// and returns (nil, nil) for data-mutating duplicates so we fall
 	// through to the "no setApplied advance, no resolveProposal" arm.
-	duplicate := entry.Index <= e.applied
+	duplicate := entry.GetIndex() <= e.applied
 	response, err := e.applyNormalEntry(entry, duplicate)
 	if err != nil {
 		return err
@@ -2563,7 +2636,7 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 	if h, ok := response.(interface{ HaltApply() error }); ok {
 		if herr := h.HaltApply(); herr != nil {
 			slog.Error("encryption FSM apply requested halt; not advancing setApplied",
-				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("entry_index", entry.GetIndex()),
 				slog.Any("err", herr))
 			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
 		}
@@ -2575,8 +2648,8 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 		// applied pointer and pending-proposal map stay untouched.
 		return nil
 	}
-	e.setApplied(entry.Index)
-	e.resolveProposal(entry.Index, entry.Data, response)
+	e.setApplied(entry.GetIndex())
+	e.resolveProposal(entry.GetIndex(), entry.GetData(), response)
 	return nil
 }
 
@@ -2585,17 +2658,17 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 // applyNormalCommitted).
 func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	var cc raftpb.ConfChange
-	if err := cc.Unmarshal(entry.Data); err != nil {
+	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
 	}
-	confState := e.rawNode.ApplyConfChange(cc)
-	nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
-	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+	confState := e.rawNode.ApplyConfChange(&cc)
+	nextPeers := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
+	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
-	e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
-	e.clearPendingConfChange(entry.Index)
-	e.setApplied(entry.Index)
+	e.applyConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), entry.GetIndex(), confStateValue(confState))
+	e.clearPendingConfChange(entry.GetIndex())
+	e.setApplied(entry.GetIndex())
 	return nil
 }
 
@@ -2603,17 +2676,17 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 // applyCommitted.
 func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	var cc raftpb.ConfChangeV2
-	if err := cc.Unmarshal(entry.Data); err != nil {
+	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
 	}
-	confState := e.rawNode.ApplyConfChange(cc)
-	nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
-	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+	confState := e.rawNode.ApplyConfChange(&cc)
+	nextPeers := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
+	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
-	e.applyConfigChangeV2(cc, entry.Index, *confState)
-	e.clearPendingConfChange(entry.Index)
-	e.setApplied(entry.Index)
+	e.applyConfigChangeV2(cc, entry.GetIndex(), confStateValue(confState))
+	e.clearPendingConfChange(entry.GetIndex())
+	e.setApplied(entry.GetIndex())
 	return nil
 }
 
@@ -2637,10 +2710,10 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 // and returns (nil, nil) for data-mutating duplicates so the caller's
 // "no setApplied advance" arm fires unchanged.
 func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (any, error) {
-	if len(entry.Data) == 0 {
+	if len(entry.GetData()) == 0 {
 		return nil, nil
 	}
-	_, payload, ok := decodeProposalEnvelope(entry.Data)
+	_, payload, ok := decodeProposalEnvelope(entry.GetData())
 	if !ok {
 		return nil, nil
 	}
@@ -2680,7 +2753,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 	// or the cipher / no-cipher paths will diverge in ownership.
 	// Stage 6 plans a defensive copy at the apply boundary so the
 	// contract becomes uniform regardless of cipher state.
-	if entry.Index > e.raftCutoverIndex() {
+	if entry.GetIndex() > e.raftCutoverIndex() {
 		if e.raftCipher == nil {
 			// Cutover is active (a non-default cutover index has
 			// elected this entry as wrapped) but the cipher is
@@ -2688,7 +2761,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 			// Refuse to apply: a silent skip would diverge state
 			// permanently from peers that DID unwrap.
 			slog.Error("raft envelope cutover active but no cipher configured; halting apply",
-				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("entry_index", entry.GetIndex()),
 				slog.Uint64("cutover_index", e.raftCutoverIndex()))
 			return nil, errors.Wrap(ErrRaftUnwrapFailed,
 				"raftengine/etcd: entry past raft envelope cutover but no raft cipher wired")
@@ -2696,7 +2769,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 		plain, err := unwrapRaftPayload(e.raftCipher, payload)
 		if err != nil {
 			slog.Error("raft envelope unwrap failed; halting apply",
-				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("entry_index", entry.GetIndex()),
 				slog.Any("err", err))
 			return nil, err
 		}
@@ -2717,7 +2790,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 	// finding R7-F1.
 	if !dropIfNonVolatile {
 		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
-			aware.SetApplyIndex(entry.Index)
+			aware.SetApplyIndex(entry.GetIndex())
 		}
 	}
 	return e.fsm.Apply(payload), nil
@@ -2777,12 +2850,12 @@ func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
 	e.refreshVoterCache(confState)
-	for _, change := range cc.Changes {
-		e.applyConfigPeerChange(change.Type, change.NodeID, cc.Context)
+	for _, change := range cc.GetChanges() {
+		e.applyConfigPeerChange(change.GetType(), change.GetNodeId(), cc.GetContext())
 	}
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
-	e.resolveConfigChange(index, cc.Context)
+	e.resolveConfigChange(index, cc.GetContext())
 	e.alarmIfJoinedAsVoter(confState)
 }
 
@@ -3161,13 +3234,13 @@ func (e *Engine) releaseIgnoredReceivedFSMSnapshotSteps(rd etcdraft.Ready) {
 	if len(e.pendingReceivedFSMSnapshotStep) == 0 {
 		return
 	}
-	snapshotIndex := uint64(0)
+	readySnapshotIndex := uint64(0)
 	if !etcdraft.IsEmptySnap(rd.Snapshot) {
-		snapshotIndex = rd.Snapshot.Metadata.Index
+		readySnapshotIndex = snapshotIndex(rd.Snapshot)
 	}
 	for index, count := range e.pendingReceivedFSMSnapshotStep {
 		delete(e.pendingReceivedFSMSnapshotStep, index)
-		if index == snapshotIndex {
+		if index == readySnapshotIndex {
 			continue
 		}
 		for i := 0; i < count; i++ {
@@ -3185,10 +3258,10 @@ func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {
 }
 
 func receivedFSMSnapshotTokenIndex(msg raftpb.Message) (uint64, bool) {
-	if msg.Type != raftpb.MsgSnap || msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+	if msg.GetType() != raftpb.MsgSnap || msg.GetSnapshot() == nil || !isSnapshotToken(msg.GetSnapshot().GetData()) {
 		return 0, false
 	}
-	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	tok, err := decodeSnapshotToken(msg.GetSnapshot().GetData())
 	if err != nil || tok.Index == 0 {
 		return 0, false
 	}
@@ -3251,19 +3324,19 @@ func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	if current.Metadata.Index > index {
+	if current.GetMetadata().GetIndex() > index {
 		return true, nil
 	}
-	if current.Metadata.Index < index {
+	if current.GetMetadata().GetIndex() < index {
 		return false, nil
 	}
-	return equalConfState(current.Metadata.ConfState, confState), nil
+	return equalConfState(confStateValue(current.GetMetadata().GetConfState()), confState), nil
 }
 
 func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, payload []byte) (raftpb.Snapshot, error) {
 	snap, err := e.storage.CreateSnapshot(index, &confState, payload)
 	if err == nil {
-		return snap, nil
+		return snapshotValue(snap), nil
 	}
 	switch {
 	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
@@ -3301,16 +3374,16 @@ func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
 }
 
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
-	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
+	if etcdraft.IsEmptySnap(&snap) || e.persist == nil {
 		return nil
 	}
-	if err := e.bumpDurableAppliedIndexBeforeSave(snap.Metadata.Index); err != nil {
+	if err := e.bumpDurableAppliedIndexBeforeSave(snap.GetMetadata().GetIndex()); err != nil {
 		return err
 	}
-	if err := e.persist.SaveSnap(snap); err != nil {
+	if err := e.persist.SaveSnap(&snap); err != nil {
 		return errors.WithStack(err)
 	}
-	if err := e.persist.Release(snap); err != nil {
+	if err := e.persist.Release(&snap); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -3364,12 +3437,12 @@ func (e *Engine) refreshStatus() {
 	status := raftengine.Status{
 		State:             state,
 		Leader:            leader,
-		Term:              basic.Term,
-		CommitIndex:       basic.Commit,
+		Term:              basic.GetTerm(),
+		CommitIndex:       basic.GetCommit(),
 		AppliedIndex:      e.applied,
 		LastLogIndex:      lastLogIndex,
-		LastSnapshotIndex: snapshot.Metadata.Index,
-		FSMPending:        pendingEntries(basic.Commit, e.applied),
+		LastSnapshotIndex: snapshot.GetMetadata().GetIndex(),
+		FSMPending:        pendingEntries(basic.GetCommit(), e.applied),
 		NumPeers:          numRemoteServers(config.Servers, e.localID),
 		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
 		LeadTransferee:    basic.LeadTransferee,
@@ -3810,16 +3883,16 @@ func validateOpenPeers(snapshot raftpb.Snapshot, peers []Peer, persisted persist
 	if len(peers) == 0 {
 		return nil
 	}
-	if snapshot.Metadata.Index == 0 || len(snapshot.Metadata.ConfState.Voters) == 0 {
+	if snapshot.GetMetadata().GetIndex() == 0 || len(snapshot.GetMetadata().GetConfState().GetVoters()) == 0 {
 		return nil
 	}
 	if !persistedOK {
-		return validateConfState(snapshot.Metadata.ConfState, peers)
+		return validateConfState(confStateValue(snapshot.GetMetadata().GetConfState()), peers)
 	}
-	if persisted.Index > snapshot.Metadata.Index {
+	if persisted.Index > snapshot.GetMetadata().GetIndex() {
 		return nil
 	}
-	return validateConfState(snapshot.Metadata.ConfState, peers)
+	return validateConfState(confStateValue(snapshot.GetMetadata().GetConfState()), peers)
 }
 
 func normalizeIdentity(cfg OpenConfig) OpenConfig {
@@ -4005,7 +4078,7 @@ func readyNeedsPersistence(rd etcdraft.Ready) bool {
 }
 
 func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
-	return snapshot.Metadata.Index
+	return snapshot.GetMetadata().GetIndex()
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
@@ -4034,10 +4107,10 @@ func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message)
 }
 
 func (e *Engine) recordLeaderContact(msg raftpb.Message) {
-	if !isLeaderContactMessage(msg.Type) || msg.From == 0 {
+	if !isLeaderContactMessage(msg.GetType()) || msg.GetFrom() == 0 {
 		return
 	}
-	e.lastLeaderContactFrom = msg.From
+	e.lastLeaderContactFrom = msg.GetFrom()
 	e.lastLeaderContactAt = time.Now()
 }
 
@@ -4213,8 +4286,8 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if shouldLogDispatchEvent(count) {
 		slog.Warn("etcd raft outbound dispatch failed",
 			"node_id", e.nodeID,
-			"to", req.msg.To,
-			"type", req.msg.Type.String(),
+			"to", req.msg.GetTo(),
+			"type", req.msg.GetType().String(),
 			"dispatch_error_count", count,
 			"code", code,
 			"err", dispatchErr,
@@ -4224,7 +4297,7 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	// out of StateReplicate / StateSnapshot. Without this the leader keeps
 	// Progress stuck and never retries sendAppend/sendSnap for the peer,
 	// leaving the follower indefinitely stale even after heartbeats resume.
-	e.postDispatchReport(dispatchReport{to: req.msg.To, msgType: req.msg.Type})
+	e.postDispatchReport(dispatchReport{to: req.msg.GetTo(), msgType: req.msg.GetType()})
 }
 
 func (e *Engine) stopDispatchWorkers() {
@@ -4464,8 +4537,8 @@ func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState 
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
-	for _, change := range cc.Changes {
-		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
+	for _, change := range cc.GetChanges() {
+		applyConfigPeerChangeToMap(next, change.GetType(), change.GetNodeId(), cc.GetContext())
 	}
 	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
@@ -4611,8 +4684,8 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 	if shouldLogDispatchEvent(count) {
 		slog.Warn("dropping etcd raft outbound message",
 			"node_id", e.nodeID,
-			"to", msg.To,
-			"type", msg.Type.String(),
+			"to", msg.GetTo(),
+			"type", msg.GetType().String(),
 			"drop_count", count,
 		)
 	}
@@ -4623,7 +4696,7 @@ func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
 	if e.dispatchReportCh == nil {
 		return
 	}
-	e.postDispatchReport(dispatchReport{to: msg.To, msgType: msg.Type})
+	e.postDispatchReport(dispatchReport{to: msg.GetTo(), msgType: msg.GetType()})
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or
@@ -4670,25 +4743,35 @@ func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {
 	return cloned
 }
 
-func cloneDispatchMessages(messages []raftpb.Message) []raftpb.Message {
+func cloneDispatchMessages(messages []*raftpb.Message) []*raftpb.Message {
 	if len(messages) == 0 {
 		return nil
 	}
-	cloned := make([]raftpb.Message, len(messages))
-	for i, msg := range messages {
-		cloned[i] = cloneDispatchMessage(msg)
+	cloned := make([]*raftpb.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil {
+			cloned = append(cloned, nil)
+			continue
+		}
+		clonedMsg := cloneDispatchMessage(*msg)
+		cloned = append(cloned, &clonedMsg)
 	}
 	return cloned
 }
 
-func cloneDispatchEntries(entries []raftpb.Entry) []raftpb.Entry {
+func cloneDispatchEntries(entries []*raftpb.Entry) []*raftpb.Entry {
 	if len(entries) == 0 {
 		return nil
 	}
-	cloned := make([]raftpb.Entry, len(entries))
-	for i, entry := range entries {
-		cloned[i] = entry
-		cloned[i].Data = append([]byte(nil), entry.Data...)
+	cloned := make([]*raftpb.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil {
+			cloned = append(cloned, nil)
+			continue
+		}
+		clonedEntry := *entry
+		clonedEntry.Data = append([]byte(nil), entry.Data...)
+		cloned = append(cloned, &clonedEntry)
 	}
 	return cloned
 }
@@ -4699,16 +4782,24 @@ func cloneDispatchSnapshot(snapshot *raftpb.Snapshot) *raftpb.Snapshot {
 	}
 	cloned := *snapshot
 	cloned.Data = append([]byte(nil), snapshot.Data...)
-	cloned.Metadata.ConfState = cloneDispatchConfState(snapshot.Metadata.ConfState)
+	if snapshot.Metadata != nil {
+		metadata := *snapshot.Metadata
+		metadata.ConfState = cloneDispatchConfState(snapshot.Metadata.ConfState)
+		cloned.Metadata = &metadata
+	}
 	return &cloned
 }
 
-func cloneDispatchConfState(conf raftpb.ConfState) raftpb.ConfState {
-	conf.Voters = append([]uint64(nil), conf.Voters...)
-	conf.Learners = append([]uint64(nil), conf.Learners...)
-	conf.VotersOutgoing = append([]uint64(nil), conf.VotersOutgoing...)
-	conf.LearnersNext = append([]uint64(nil), conf.LearnersNext...)
-	return conf
+func cloneDispatchConfState(conf *raftpb.ConfState) *raftpb.ConfState {
+	if conf == nil {
+		return nil
+	}
+	cloned := *conf
+	cloned.Voters = append([]uint64(nil), conf.Voters...)
+	cloned.Learners = append([]uint64(nil), conf.Learners...)
+	cloned.VotersOutgoing = append([]uint64(nil), conf.VotersOutgoing...)
+	cloned.LearnersNext = append([]uint64(nil), conf.LearnersNext...)
+	return &cloned
 }
 
 func (e *Engine) handleSnapshotResult(result snapshotResult) error {
@@ -4764,7 +4855,7 @@ func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if index <= current.Metadata.Index {
+	if index <= current.GetMetadata().GetIndex() {
 		return nil
 	}
 

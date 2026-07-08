@@ -1,7 +1,7 @@
 name: TLA+ spec divergence — AI review
 
 # Whenever a PR touches a file that the TLA+ safety specification has an
-# anchor on (per docs/design/2026_05_28_partial_tla_safety_spec.md §3),
+# anchor on (per docs/design/2026_05_28_implemented_tla_safety_spec.md §3),
 # automatically post a comment that pings the AI reviewers so a focused
 # spec-divergence review always runs.
 #
@@ -113,7 +113,7 @@ jobs:
               `## TLA+ spec divergence review (auto-triggered)`,
               ``,
               `This PR touches files that the TLA+ safety spec has an anchor on (per`,
-              `[\`docs/design/2026_05_28_partial_tla_safety_spec.md\`](../blob/main/docs/design/2026_05_28_partial_tla_safety_spec.md) §3),`,
+              `[\`docs/design/2026_05_28_implemented_tla_safety_spec.md\`](../blob/main/docs/design/2026_05_28_implemented_tla_safety_spec.md) §3),`,
               `so an AI review is requested below to verify the implementation has not drifted`,
               `from the model.`,
               ``,

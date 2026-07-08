@@ -29,7 +29,7 @@ type sqsLeadershipController interface {
 // observer that refuses leadership of any Raft group hosting a
 // partitioned FIFO queue when this binary does NOT advertise the
 // htfifo capability. Implements §8 of
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md.
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md.
 //
 // # What it protects against
 //
@@ -38,13 +38,19 @@ type sqsLeadershipController interface {
 // partitioned queue would (1) scan the legacy single-prefix
 // keyspace and report no messages (false-empty reads), and (2)
 // accept SendMessage writes under the legacy keyspace, hiding
-// them from the partition-aware fanout reader. The §11 PR 2
-// "PartitionCount > 1 rejected" gate prevents NEW partitioned
-// queues from being created in such a cluster, but does nothing
-// for queues created BEFORE the rollback. The leadership-refusal
-// hook closes that gap by stepping the affected node down via
-// TransferLeadership; the cluster picks a peer that still
-// advertises htfifo, and the partitioned queue stays correct.
+// them from the partition-aware fanout reader. The CreateQueue
+// validateHTFIFOCapability gate prevents NEW partitioned queues from
+// being created unless every required peer advertises htfifo and, in
+// map-backed deployments, the partition routing map is complete. That
+// gate does nothing for queues created BEFORE a rollback. For groups
+// named by --sqsFifoPartitionMap, the leadership-refusal hook closes
+// that gap by stepping the affected node down via TransferLeadership;
+// TransferLeadership is best-effort rather than capability-aware, so a
+// downgraded transferee may gain leadership and refuse in turn until an
+// htfifo-capable peer leads the mapped group. Single-shard deployments
+// with no --sqsFifoPartitionMap have no per-partition group map for this
+// hook to match, so rollback of an already-created partitioned queue
+// remains an operator drain/recreate boundary there.
 //
 // When it does NOT fire
 //
@@ -52,7 +58,11 @@ type sqsLeadershipController interface {
 //     happy-path runtime — every binary past PR 4-B-3b advertises.
 //   - No partitioned queue maps to gid (partitionedGroups[gid] is
 //     false). Groups that only host non-partitioned data have no
-//     partitioned-keyspace contract to break.
+//     partitioned-keyspace contract to break. This also covers the
+//     supported single-shard/no-map deployment shape; the capability
+//     gate may admit partitioned queues there, but this refusal hook is
+//     intentionally map-driven and does not infer default-group
+//     ownership from catalog state.
 //
 // Both no-op cases return a no-op deregister so callers can defer
 // uniformly.

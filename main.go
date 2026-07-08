@@ -204,8 +204,9 @@ var (
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
+	keyvizLabelsEnabled          = flag.Bool("keyvizLabelsEnabled", false, "Enable per-adapter KeyViz row labels. Default false keeps legacy route-only rows during rolling upgrades")
 
-	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_implemented_keyviz_hot_key_topk).
 	// Off by default — the disabled-case adds one early-return branch
 	// to Observe and retains zero real key bytes. When enabled, the
 	// sampler retains actual hot key bytes in memory and exposes them
@@ -382,6 +383,7 @@ func run() error {
 		*raftId,
 		*raftDir,
 		cfg.groups,
+		cfg.defaultGroup,
 		cfg.multi,
 		bootstrap,
 		bootstrapServers,
@@ -434,6 +436,7 @@ func run() error {
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
+		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
 
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
@@ -978,13 +981,13 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 // unreachable mutator paths unreachable, the startup gate keeps
 // misconfigured nodes from booting at all.
 //
-// Scope of the guards covered in this PR is documented in
+// Scope of this pre-engine guard layer is documented in
 // internal/encryption/startup.go's CheckStartupGuards godoc and in
-// docs/design/2026_04_29_partial_data_at_rest_encryption.md (Stage 6C
-// sub-decomposition; 6C-1 is flag + sidecar-state guards only).
-// Later 6C-2 / 6D / 6E PRs add the guards that depend on raftengine
-// integration, the cluster-wide membership view, and the Phase-2
-// cutover record.
+// docs/design/2026_04_29_partial_data_at_rest_encryption.md. The
+// Stage 6C-3 membership/registry guards run next inside
+// buildShardGroupsWithEncryptionWiring, still before Raft engine
+// startup; the sidecar-behind-raft-log gap guard remains later
+// because it needs an opened engine's applied index and scanner.
 func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlag()
 	if err != nil {
@@ -2061,6 +2064,7 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
 		HotKeysEnabled:         *keyvizHotKeysEnabled,
 		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
 		HotKeysSampleRate:      *keyvizHotKeysSampleRate,

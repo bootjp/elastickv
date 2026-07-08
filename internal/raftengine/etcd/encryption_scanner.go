@@ -106,7 +106,7 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 			}
 		}
 		// Continue from one past the last returned index.
-		cursor = batch[len(batch)-1].Index + 1
+		cursor = batch[len(batch)-1].GetIndex() + 1
 	}
 	return false, nil
 }
@@ -128,11 +128,11 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 // version 0x01 — NEVER the FSM opcode. A scanner that misreads
 // the layout would return false for every entry in a real Raft
 // log, silently defeating the §9.1 ErrSidecarBehindRaftLog guard.
-func isEncryptionRelevantEntry(ent raftpb.Entry) bool {
-	if ent.Type != raftpb.EntryNormal {
+func isEncryptionRelevantEntry(ent *raftpb.Entry) bool {
+	if ent.GetType() != raftpb.EntryNormal {
 		return false
 	}
-	_, payload, ok := decodeProposalEnvelope(ent.Data)
+	_, payload, ok := decodeProposalEnvelope(ent.GetData())
 	if !ok || len(payload) == 0 {
 		return false
 	}

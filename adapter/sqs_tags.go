@@ -38,15 +38,22 @@ func (s *SQSServer) tagQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if len(in.Tags) == 0 {
-		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Tags is required")
+	if err := s.tagQueueCore(r.Context(), name, in.Tags); err != nil {
+		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if err := s.mutateQueueTagsWithRetry(r.Context(), name, func(meta *sqsQueueMeta) error {
+	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) tagQueueCore(ctx context.Context, name string, tags map[string]string) error {
+	if len(tags) == 0 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "Tags is required")
+	}
+	return s.mutateQueueTagsWithRetry(ctx, name, func(meta *sqsQueueMeta) error {
 		if meta.Tags == nil {
-			meta.Tags = make(map[string]string, len(in.Tags))
+			meta.Tags = make(map[string]string, len(tags))
 		}
-		for k, v := range in.Tags {
+		for k, v := range tags {
 			meta.Tags[k] = v
 		}
 		// Cap the per-queue tag count after merging so a follow-up
@@ -57,11 +64,7 @@ func (s *SQSServer) tagQueue(w http.ResponseWriter, r *http.Request) {
 				"queue tag count exceeds 50")
 		}
 		return nil
-	}); err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	writeSQSJSON(w, map[string]any{})
+	})
 }
 
 func (s *SQSServer) untagQueue(w http.ResponseWriter, r *http.Request) {
@@ -75,20 +78,23 @@ func (s *SQSServer) untagQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if len(in.TagKeys) == 0 {
-		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "TagKeys is required")
-		return
-	}
-	if err := s.mutateQueueTagsWithRetry(r.Context(), name, func(meta *sqsQueueMeta) error {
-		for _, k := range in.TagKeys {
-			delete(meta.Tags, k)
-		}
-		return nil
-	}); err != nil {
+	if err := s.untagQueueCore(r.Context(), name, in.TagKeys); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) untagQueueCore(ctx context.Context, name string, tagKeys []string) error {
+	if len(tagKeys) == 0 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "TagKeys is required")
+	}
+	return s.mutateQueueTagsWithRetry(ctx, name, func(meta *sqsQueueMeta) error {
+		for _, k := range tagKeys {
+			delete(meta.Tags, k)
+		}
+		return nil
+	})
 }
 
 func (s *SQSServer) listQueueTags(w http.ResponseWriter, r *http.Request) {
@@ -102,14 +108,21 @@ func (s *SQSServer) listQueueTags(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, s.nextTxnReadTS(r.Context()))
+	tags, err := s.listQueueTagsCore(r.Context(), name)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	writeSQSJSON(w, map[string]any{"Tags": tags})
+}
+
+func (s *SQSServer) listQueueTagsCore(ctx context.Context, name string) (map[string]string, error) {
+	meta, exists, err := s.loadQueueMetaAt(ctx, name, s.nextTxnReadTS(ctx))
+	if err != nil {
+		return nil, err
+	}
 	if !exists {
-		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		return
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	tags := meta.Tags
 	if tags == nil {
@@ -117,7 +130,7 @@ func (s *SQSServer) listQueueTags(w http.ResponseWriter, r *http.Request) {
 		// null and trip strict JSON consumers.
 		tags = map[string]string{}
 	}
-	writeSQSJSON(w, map[string]any{"Tags": tags})
+	return tags, nil
 }
 
 // mutateQueueTagsWithRetry runs an OCC-bounded read-modify-write of the

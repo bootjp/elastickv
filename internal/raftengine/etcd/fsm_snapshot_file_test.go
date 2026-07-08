@@ -488,10 +488,10 @@ func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing
 func createTokenSnapFileWithTerm(t *testing.T, dir string, term uint64, index uint64, crc32c uint32) {
 	t.Helper()
 	snapshot := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{Term: term, Index: index},
+		Metadata: &raftpb.SnapshotMetadata{Term: uint64Ptr(term), Index: uint64Ptr(index)},
 		Data:     encodeSnapshotToken(index, crc32c),
 	}
-	require.NoError(t, etcdsnap.New(zap.NewNop(), dir).SaveSnap(snapshot))
+	require.NoError(t, etcdsnap.New(zap.NewNop(), dir).SaveSnap(&snapshot))
 }
 
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
