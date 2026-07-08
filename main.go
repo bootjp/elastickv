@@ -81,33 +81,42 @@ func durationToTicks(timeout time.Duration, tick time.Duration, min int) int {
 }
 
 var (
-	myAddr                = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	redisAddr             = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
-	dynamoAddr            = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
-	s3Addr                = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
-	s3Region              = flag.String("s3Region", "us-east-1", "S3 signing region")
-	s3CredsFile           = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
-	s3PathStyleOnly       = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
-	sqsAddr               = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
-	sqsRegion             = flag.String("sqsRegion", "us-east-1", "SQS signing region")
-	sqsCredsFile          = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
-	metricsAddr           = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
-	metricsToken          = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
-	pprofAddr             = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
-	pprofToken            = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
-	raftId                = flag.String("raftId", "", "Node id used by Raft")
-	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
-	raftDir               = flag.String("raftDataDir", "data/", "Raft data dir")
-	redisLuaMaxIdleStates = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
-	raftBootstrap         = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
-	raftBootstrapMembers  = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
-	raftJoinAsLearner     = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
-	raftGroups            = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
-	shardRanges           = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
-	raftRedisMap          = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
-	raftS3Map             = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
-	raftDynamoMap         = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
-	raftSqsMap            = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
+	myAddr                          = flag.String("address", "localhost:50051", "TCP host+port for this node")
+	redisAddr                       = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
+	dynamoAddr                      = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	s3Addr                          = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
+	s3Region                        = flag.String("s3Region", "us-east-1", "S3 signing region")
+	s3CredsFile                     = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
+	s3PathStyleOnly                 = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
+	sqsAddr                         = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsRegion                       = flag.String("sqsRegion", "us-east-1", "SQS signing region")
+	sqsCredsFile                    = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
+	metricsAddr                     = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
+	metricsToken                    = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	pprofAddr                       = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	pprofToken                      = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
+	raftId                          = flag.String("raftId", "", "Node id used by Raft")
+	raftEngineName                  = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
+	raftDir                         = flag.String("raftDataDir", "data/", "Raft data dir")
+	redisLuaMaxIdleStates           = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
+	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
+	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
+	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
+	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
+	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
+	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", defaultLeaderBalanceGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
+	leaderBalanceGlobalCooldown     = flag.Duration("leaderBalanceGlobalCooldown", defaultLeaderBalanceGlobalCooldown, "Minimum time between any two automatic leadership transfers")
+	leaderBalanceStartupGrace       = flag.Duration("leaderBalanceStartupGrace", 0, "Grace period after acquiring default-group leadership before issuing transfers; 0 uses max(interval, global cooldown)")
+	leaderBalanceImbalanceThreshold = flag.Int("leaderBalanceImbalanceThreshold", defaultLeaderBalanceImbalanceThreshold, "Minimum leader-count spread required before balancing")
+	leaderBalanceMaxTargetLag       = flag.Uint64("leaderBalanceMaxTargetLag", defaultLeaderBalanceMaxTargetLag, "Maximum target lag in raft log entries for gated automatic leadership transfers; 0 requires the target to match the leader's last log index")
+	leaderBalancePinGroups          = flag.String("leaderBalancePinGroups", "", "Comma-separated raft group IDs excluded from automatic leader balancing")
+	leaderBalanceKillSwitchFile     = flag.String("leaderBalanceKillSwitchFile", "", "If non-empty and the file exists, the leader-balance scheduler observes but skips transfers")
+	raftGroups                      = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
+	shardRanges                     = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
+	raftRedisMap                    = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	raftS3Map                       = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
+	raftDynamoMap                   = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
+	raftSqsMap                      = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
 	// HT-FIFO partition assignment (Phase 3.D §5). Distinct from
 	// --raftSqsMap (which maps raftAddr=sqsAddr for the
 	// proxyToLeader endpoint resolution). The grammar is
@@ -508,6 +517,12 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	startLeaderBalanceScheduler(
+		runCtx,
+		eg,
+		runtimes,
+		leaderBalanceConfigFromFlags(*raftId, cfg.defaultGroup, cfg.sqsFifoPartitionMap, metricsRegistry.Registerer()),
+	)
 
 	if err := eg.Wait(); err != nil {
 		return errors.Wrapf(err, "failed to serve")

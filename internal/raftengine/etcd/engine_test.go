@@ -1461,6 +1461,66 @@ func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
 	require.True(t, errors.Is(err, errTooManyPendingConfigs))
 }
 
+func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
+	engine := &Engine{}
+	engine.appliedIndex.Store(10)
+
+	engine.markPendingConfChange(12)
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(11)
+	require.True(t, engine.hasPendingConfChange(), "entry below the pending config index must not clear the fence")
+
+	engine.clearPendingConfChange(12)
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(129)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(130)
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorageUsesReplayAppliedFloor(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(150)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(129))
+	require.True(t, engine.hasPendingConfChange(),
+		"RawNode replay can start before the FSM applied index after restart; the transfer fence must cover that replay window")
+}
+
+func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(130)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
+	require.False(t, engine.hasPendingConfChange())
+}
+
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
 	t.Helper()
 
@@ -1759,6 +1819,9 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNoHealthyTarget), raftengine.ErrLeadershipTransferNoHealthyTarget))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferTargetNotCaughtUp), raftengine.ErrLeadershipTransferTargetNotCaughtUp))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferConfChangePending), raftengine.ErrLeadershipTransferConfChangePending))
 }
 
 // TestSelectDispatchLane_LegacyTwoLane verifies that, when the 4-lane
