@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial |
+| Status | implemented |
 | Date | 2026-05-31 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.2 raft envelope, §6.3 engine apply-hook, §6.6 admin RPC, §7.1 Phase-2 cutover) |
 | Builds on | Stage 6A–6D (capability gate, storage envelope cutover, sidecar field plumbing), Stage 7 (writer registry), Stage 8a (snapshot header v2 cutover carriage) |
@@ -13,26 +13,24 @@
 | Milestone | Status | Shipped in |
 |---|---|---|
 | 6E-1a — FSM apply machinery (`applyEnableRaftEnvelope`, sidecar field plumbing, wire sub-tag whitelist) | shipped | #899 (3bffd344) |
-| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method **gated** until 6E-2; see §3.3 below) | shipped | #907 |
+| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method initially gated until 6E-2; see §3.3 below) | shipped | #907 |
 | 6E-2a — typed cutover sentinel + sidecar `RaftEnvelopeCutoverIndex` apply seam | shipped | (rolled into earlier slices) |
 | 6E-2b — `ProposeAdmin` sibling on `raftengine.Proposer` (barrier-exempt by interface contract) | shipped | (rolled into earlier slices) |
-| 6E-2c — Coordinator `dynamicWrappedProposer` + `ShardGroup.raftPayloadWrap` hot-swap + `Proposer()` accessor + Internal.Forward wrap-aware proposer + fail-closed startup guard on active cutover | shipped | #922 (eb371ca6) |
-| 6E-2d — §7.1 6-step quiescence barrier on `dynamicWrappedProposer.Propose` + `ShardGroup` barrier forwarders + `CutoverBarrierController` option + state-machine in `EnableRaftEnvelope` handler (gated behind `raftEnvelopeWrapEnabled = false`; flipped in 6E-2f) | shipped | #933 (aa4a7baa) |
-| 6E-2e-1 — Applier `WithRaftCutoverWrapInstaller` hook + invocation on fresh-success AND already-active branches of `applyEnableRaftEnvelope`. Closes BLOCKER (b) at the apply layer: every replica's FSM-apply of the cutover marker publishes the wrap closure on this node, so a follower that becomes leader post-cutover already has wrap active. Production wiring of the installer closure lives in 6E-2e-3. | shipped | this PR |
-| 6E-2e-2 — Admin RPCs (RotateDEK, RegisterEncryptionWriter) routed through the wrap-aware proposer so post-cutover admin entries are wrapped. Closes BLOCKER (a): the raw-engine ProposeAdmin path leaves cleartext admin entries at `index > cutoverIdx` and §6.3 halts the cluster (codex P1 #1 round-2 on PR933). The cutover marker itself remains on a separate raw-engine reference held by EnableRaftEnvelope. | not started | — |
-| 6E-2e-3 — `main.go` wiring: `OpenConfig.RaftCipher` + `RaftCutoverIndex` → `CutoverBarrierController` implementation fanning out over participating `ShardGroup`s + concrete `RaftCutoverWrapInstaller` closure that publishes the §4.2 wrap to every ShardGroup + startup-time install when `sidecar.RaftEnvelopeCutoverIndex != 0`. | not started | — |
-| 6E-2f — atomic flip of `raftEnvelopeWrapEnabled` to `true` (the §3.3 6E-1b gate release) | not started | — |
-| 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
+| 6E-2c — Coordinator `dynamicWrappedProposer` + `ShardGroup.raftPayloadWrap` hot-swap + `Proposer()` accessor + Internal.Forward wrap-aware proposer + startup posture for active cutover | shipped | #922 (eb371ca6) |
+| 6E-2d — §7.1 6-step quiescence barrier on `dynamicWrappedProposer.Propose` + `ShardGroup` barrier forwarders + `CutoverBarrierController` option + state-machine in `EnableRaftEnvelope` handler | shipped | #933 (aa4a7baa) |
+| 6E-2e-1 — Applier `WithRaftCutoverWrapInstaller` hook + invocation on fresh-success AND already-active branches of `applyEnableRaftEnvelope`. Closes BLOCKER (b) at the apply layer: every replica's FSM-apply of the cutover marker publishes the wrap closure on this node, so a follower that becomes leader post-cutover already has wrap active. | shipped | this PR |
+| 6E-2e-2 — Admin RPCs (RotateDEK, RegisterEncryptionWriter) routed through the wrap-aware proposer so post-cutover admin entries are wrapped. Closes BLOCKER (a): the raw-engine ProposeAdmin path leaves cleartext admin entries at `index > cutoverIdx` and §6.3 halts the cluster. The cutover marker itself remains on a separate raw-engine reference held by EnableRaftEnvelope. | shipped | this PR |
+| 6E-2e-3 — `main.go` wiring: `OpenConfig.RaftCipher` + `RaftCutoverIndex` → `CutoverBarrierController` implementation fanning out over participating `ShardGroup`s + concrete `RaftCutoverWrapInstaller` closure that publishes the §4.2 wrap to every ShardGroup + startup-time install when `sidecar.RaftEnvelopeCutoverIndex != 0`. | shipped | this PR |
+| 6E-2f — atomic flip of `raftEnvelopeWrapEnabled` to `true` (the §3.3 6E-1b gate release) | shipped | this PR |
+| 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | shipped | this PR |
 
-With 6E-1 (both sub-milestones) complete, the wire-format and
-operator surface for the cutover is reviewable end-to-end, but the
-6E-1b server method **refuses fresh cutover proposals with
-FailedPrecondition** until 6E-2 ships (see §3.3). With only 6E-1
-deployed, the cluster cannot enter Phase 2 — no
-`RaftEnvelopeCutoverIndex` value is ever written, so a 6E-2
-upgrade against a 6E-1-only cluster is safe.
+With 6E-3 complete, the operator can initiate the Phase-2 raft
+envelope cutover once the normal leader, bootstrap, capability,
+barrier, and latest-applied pre-checks pass. The Phase-2-specific
+startup/API guards now catch divergent snapshot/sidecar state,
+out-of-range local epochs, and pre-bootstrap raft cutover attempts.
 
-### 3.3 The 6E-1b gate (codex P1 round-1)
+### 3.3 The 6E-1b gate
 
 A naive 6E-1b that accepted cutover proposals immediately would
 record `RaftEnvelopeCutoverIndex=N` while subsequent Raft entries
@@ -43,22 +41,16 @@ through unwrap — would treat every cleartext entry committed at
 indexes greater than N as a wrapped envelope and halt apply
 cluster-wide.
 
-The gate is the package-level constant
+The gate is the package-level atomic
 `raftEnvelopeWrapEnabled` in `adapter/encryption_admin.go`. It
-starts at `false`. The server method's pre-check (leader gate,
-sidecar bootstrap gate, idempotent-retry short-circuit) still
-fires so operators get fast feedback on misconfigured wiring;
-only the propose path is refused. Idempotent retries against a
-sidecar that already carries `RaftEnvelopeCutoverIndex != 0`
-(operationally impossible until 6E-2 lifts the gate, but the
-short-circuit is preserved for future replay symmetry) flow
-through unchanged.
-
-6E-2 flips the constant to `true` atomically with the
-wrap/unwrap/barrier wiring. The flip and the rest of the 6E-2
-slice MUST land in one commit so an operator who pulls the new
-binary cannot enter the window where the gate is open but the
-wrap/unwrap path is incomplete.
+stayed false while only the 6E-1 operator surface existed, so the
+server method could run the cheap pre-checks but refused the fresh
+proposal path. 6E-2 flips the production default to true only after
+the wrap-on-propose, unwrap-on-apply, quiescence barrier,
+apply-time wrap installer, startup-time wrap install, and
+post-cutover admin proposer wiring are all present. Idempotent
+retries against a sidecar that already carries
+`RaftEnvelopeCutoverIndex != 0` continue to flow through unchanged.
 
 ## 0. Why this slice exists
 
@@ -68,19 +60,19 @@ decodes the proposal envelope and hands the FSM payload straight
 to `kv/fsm.go::Apply`. The §4.2 raft envelope is fully specified
 (DEK shape, KEK wrap, in-flight rotation), but the on-the-wire
 activation — flipping `wrap on Propose` on the leader and the
-matching `unwrap on Apply` on every replica — has not landed.
-Without 6E, the cluster cannot reach Phase 2 even though every
+matching `unwrap on Apply` on every replica — is now wired through
+6E-2. Without 6E, the cluster could not reach Phase 2 even though every
 prerequisite (6D Phase-1 storage envelope, 7 writer registry, 8a
 snapshot cutover carriage) has shipped.
 
 This design (sliced into milestones 6E-1a / 6E-1b / 6E-2 / 6E-3 —
-see the Implementation status table above) lands the Phase-2 raft
+see the Implementation status table above) shipped the Phase-2 raft
 cutover end-to-end: admin RPC and sidecar cutover-index recording
 (6E-1, shipped), engine unwrap-on-apply + coordinator
 wrap-on-propose + §7.1 proposal-quiescence barrier that prevents
 the unwrap path from seeing a plaintext entry at
-`index > cutover` (6E-2, **planned**), and the §6C-4 fail-closed
-guards (6E-3, planned).
+`index > cutover` (6E-2, shipped), and the §6C-4 fail-closed
+guards (6E-3, shipped).
 
 ## 1. Out of scope
 
@@ -261,19 +253,18 @@ properties chain:
 - Engine does not unwrap on apply (no §6.3 hook yet).
 - Quiescence barrier not yet in place.
 
-**Why this is safe to ship alone**: with no coordinator wrap
-and no engine unwrap, the cutover index advances on the
+**Why this was safe to ship alone**: with no coordinator wrap
+and no engine unwrap, the cutover index could advance on the
 sidecar but every Raft entry — including those at
-`index > cutover` — is still plaintext on the wire. Every
-replica sees plaintext, every FSM applies plaintext, every
-read returns the right answer. The sidecar field is
-load-bearing for 6E-2 / 6E-3 / 8a (already shipped — 8a
-emits v2 snapshots carrying this index from now on) but
-inert for the apply path until 6E-2 lands.
+`index > cutover` — still remained plaintext on the wire. Every
+replica saw plaintext, every FSM applied plaintext, every read
+returned the right answer. 6E-2 later made the sidecar field
+load-bearing for the apply path by wiring both the wrap and unwrap
+halves with the barrier.
 
-### 3.2 Milestone 6E-2 — Engine unwrap + coordinator wrap + quiescence barrier (the atomic flip)
+### 3.2 Milestone 6E-2 — Engine unwrap + coordinator wrap + quiescence barrier (shipped)
 
-**Scope** — all three pieces ship together because the
+**Scope** — these pieces ship together because the
 safety properties are interlocked:
 - Engine `applyNormalEntry` adds the §6.3 hook (strict-`>`
   index comparison, `raftDEK.Unwrap` on hit, `ErrRaftUnwrapFailed`
@@ -293,6 +284,13 @@ safety properties are interlocked:
   admin path passes `source = "encryption_admin"` to bypass
   the intake gate. ConfChange-time `RegisterEncryptionWriter`
   proposals (Stage 7c §3.1) also pass the same source.
+- Production wiring fans the barrier over all participating
+  `ShardGroup`s, installs the raft-envelope wrap closure from
+  FSM apply, installs the same wrap at startup when the sidecar
+  already records a cutover, and routes post-cutover admin
+  mutators through the wrap-aware proposer. The cutover marker
+  itself keeps a raw admin proposer reference so the entry at
+  `index == cutover` remains plaintext.
 
 **Why 6E-2 cannot be split further**:
 - Engine unwrap BEFORE coordinator wrap → coordinator sends
@@ -325,10 +323,10 @@ flip in a controlled sequence on a single goroutine.
 - `ErrEncryptionNotBootstrapped` — `EnableRaftEnvelope` returns
   this if `active.raft == 0` (no DEK pair yet). Pairs with
   the §7.1 step-4 sequencing rule.
-- `ErrLocalEpochOutOfRange` on the wire side of `GetCapability`
-  and `GetSidecarState` — pairs with Stage 7's writer-registry
-  out-of-range check (catches a binary that has rotated past
-  the cluster's expected epoch window).
+- `ErrLocalEpochOutOfRange` on wire-side `local_epoch` decode
+  boundaries — pairs with Stage 7's writer-registry out-of-range
+  check (catches a binary that has rotated past the cluster's
+  expected epoch window).
 
 **Why guards ship after 6E-2**: 6C-4 only matters once a node
 can actually be in Phase 2. Without 6E-2, the guards never
@@ -476,9 +474,9 @@ dispatch boundary from the snapshot header.
 | 6D | shipped | Phase-1 storage envelope cutover |
 | 7 | shipped | Writer registry + deterministic nonce |
 | 8a | shipped | Snapshot header v2 cutover carriage |
-| **6E-1** | this slice — milestone 1 | Admin RPC + sidecar plumbing |
-| **6E-2** | this slice — milestone 2 | Engine unwrap + coord wrap + barrier (the atomic flip) |
-| **6E-3** | this slice — milestone 3 | 6C-4 fail-closed guards |
+| **6E-1** | shipped | Admin RPC + sidecar plumbing |
+| **6E-2** | shipped | Engine unwrap + coord wrap + barrier + production runtime wiring |
+| **6E-3** | shipped | 6C-4 fail-closed guards |
 | 8b | independent sibling | WAL coverage |
 | 9 | future | KMS + compress + rotation/retire/rewrite + Jepsen |
 
