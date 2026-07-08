@@ -209,7 +209,9 @@ mkdir -p tmp-home .lein
 # --list-routes-bin / --grpc-host-port wire the setup-hook verification
 # (verify-multi-group-routing!) at the workload's first setup! call.
 # --split-bin / --composed1-route-shuffle wire the M5b route-shuffle
-# nemesis.
+# nemesis.  Use an interval short enough for the 30s run window to
+# reliably issue at least one SplitRange without turning the smoke
+# run into a split storm.
 # Without them the hook falls back to PATH lookup which fails when
 # run from this script's tmp build.
 #
@@ -233,6 +235,7 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --split-bin "$SPLIT_BIN" \
     --grpc-host-port  "$PROC_ADDR" \
     --composed1-route-shuffle \
+    --route-shuffle-interval 10 \
   || EXIT_CODE=$?
 
 EXIT_CODE=${EXIT_CODE:-0}
