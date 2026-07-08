@@ -373,6 +373,7 @@ func run() error {
 		*raftId,
 		*raftDir,
 		cfg.groups,
+		cfg.defaultGroup,
 		cfg.multi,
 		bootstrap,
 		bootstrapServers,
@@ -393,7 +394,6 @@ func run() error {
 		cfg.defaultGroup,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
-		*raftId,
 	); err != nil {
 		return err
 	}
@@ -966,9 +966,11 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 //
 // Scope of this pre-engine guard layer is documented in
 // internal/encryption/startup.go's CheckStartupGuards godoc and in
-// docs/design/2026_04_29_partial_data_at_rest_encryption.md. Guards
-// that need opened engines, the default-group registry store, or the
-// raft membership view run later in chainEncryptionStartupGuard.
+// docs/design/2026_04_29_partial_data_at_rest_encryption.md. The
+// Stage 6C-3 membership/registry guards run next inside
+// buildShardGroupsWithEncryptionWiring, still before Raft engine
+// startup; the sidecar-behind-raft-log gap guard remains later
+// because it needs an opened engine's applied index and scanner.
 func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlag()
 	if err != nil {
