@@ -95,20 +95,30 @@ type peerStream struct {
     mu     sync.Mutex
     stream pb.EtcdRaft_SendStreamClient
     cancel context.CancelFunc
+    done   chan struct{}
 }
 
 type GRPCTransport struct {
     // existing fields ...
-    streams           map[string]*peerStream // peer address -> active stream
-    streamSupported   map[string]bool
-    streamUnsupported map[string]bool
+    streams             map[string]*peerStream // peer address -> active stream
+    streamSupported     map[string]bool
+    streamUnsupported   map[string]bool
+    streamUnsupportedAt map[string]time.Time
 }
 ```
 
 `streamFor(address, client)` returns the existing stream or opens a new one.
-On error (network drop, server restart), the stream is torn down and the next
-send attempt reopens it. `RemovePeer`, address replacement, and
+Stream establishment is serialized with singleflight per peer address so
+concurrent dispatch workers do not open duplicate streams during first contact
+or reconnect.
+
+On error (network drop, server restart), a reader goroutine observes the
+terminal stream result, the stream is torn down, and the next send attempt
+reopens it. `RemovePeer`, address replacement, and
 `GRPCTransport.Close` cancel the stream context and delete the stream entry.
+If an in-flight dispatch context is cancelled or times out while `Send` is
+blocked in gRPC flow control, the dispatch closes the cached stream to unblock
+the sender.
 
 `dispatchRegular` changes from:
 
@@ -125,8 +135,9 @@ err = stream.Send(&pb.EtcdRaftMessage{Message: raw})
 ```
 
 `stream.Send()` returns as soon as the message enters the gRPC send buffer
-(non-blocking under normal conditions). The dispatch worker can immediately
-pick up the next message from the per-peer channel.
+(non-blocking under normal conditions). Priority control traffic such as
+heartbeats and votes keeps using unary `Send` so it does not wait behind a
+large replication send on the stream mutex.
 
 > **Concurrency constraint**: gRPC-go's `stream.Send` / `SendMsg` is **not**
 > goroutine-safe. Each per-peer stream must be written by exactly one goroutine.
@@ -171,7 +182,8 @@ func (t *GRPCTransport) SendStream(stream pb.EtcdRaft_SendStreamServer) error {
 | `stream.Send()` error | Close and delete stream; caller retries via `streamFor` |
 | `removePeer(nodeID)` / peer address replacement | Cancel stream context, delete from `streams` |
 | `GRPCTransport.Close()` | Cancel all stream contexts, close all streams |
-| Peer restart / network partition | Server closes stream → sender gets error on next `Send()` → reconnect |
+| Peer restart / network partition | Stream monitor observes terminal error → cached stream closes → reconnect on next stream send |
+| Dispatch context cancelled while `Send` is blocked | Close cached stream to unblock the dispatch worker |
 
 ### 3.5 Backward compatibility
 
@@ -179,8 +191,10 @@ Nodes that have not yet upgraded only register `Send()`. The sender opens an
 empty `SendStream` probe and calls `CloseAndRecv()` before caching support.
 If the peer returns `codes.Unimplemented`, the address is marked unsupported
 and `dispatchRegular` falls back to the existing unary `Send()` path. A
-successful probe marks the address supported and subsequent sends reuse a
-long-lived stream.
+successful probe marks the address supported and subsequent non-priority sends
+reuse a long-lived stream. Unsupported markers expire after a short reprobe
+interval so rolling upgrades can move from unary fallback to `SendStream`
+without waiting for a membership change or process restart.
 
 ---
 
@@ -195,17 +209,17 @@ long-lived stream.
 | **Memory** | gRPC stream send buffer (typically 32 KB) replaces per-peer channel as primary buffer; channel can be reduced |
 | **Complexity** | Stream state machine in `GRPCTransport`; backward-compat fallback path |
 | **Ordering** | Single stream per peer preserves FIFO — safe for Raft |
-| **Heartbeat starvation** | The existing heartbeat lane remains separate until `dispatchRegular`; `stream.Send` is serialized with a per-stream mutex. |
+| **Heartbeat starvation** | Priority control traffic stays on unary `Send`, preserving the dedicated heartbeat lane through the transport boundary. |
 
 ### 3.6 Heartbeat handling
 
-The implementation preserves the existing dispatcher lanes. Heartbeats still
-have a dedicated channel and worker before entering the transport, which keeps
-cross-peer and normal-message queueing isolated. At the stream boundary,
-`peerStream.mu` serializes `stream.Send` calls from the existing workers.
-If the stream breaks, the transport closes the cached stream and lets Raft's
-built-in retransmission recover any message lost during the reconnect window,
-matching the previous unary drop semantics.
+The implementation preserves the existing dispatcher lanes. Heartbeats and
+other priority control messages still have a dedicated channel and worker
+before entering the transport, and they use unary `Send` at the transport
+boundary. Normal replication traffic uses the cached stream and `peerStream.mu`
+serializes `stream.Send` calls. If the stream breaks, the transport closes the
+cached stream and lets Raft's built-in retransmission recover any message lost
+during the reconnect window, matching the previous drop semantics.
 
 ---
 

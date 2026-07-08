@@ -23,6 +23,7 @@ const defaultSnapshotChunkSize = 16 << 20
 
 const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
+const defaultSendStreamReprobeInterval = 30 * time.Second
 
 // defaultBridgeMaterializeLimit caps the number of bridge-mode snapshot
 // materializations that may hold memory concurrently. Each call allocates up
@@ -37,6 +38,7 @@ var (
 	errSnapshotMessageNil        = errors.New("etcd raft snapshot message is required")
 	errSnapshotStreamShort       = errors.New("etcd raft snapshot stream closed before final chunk")
 	errReceivedFSMSnapshotStale  = errors.New("etcd raft received fsm snapshot is stale")
+	errPeerStreamClosed          = errors.New("etcd raft SendStream closed")
 )
 
 var grpcNewClient = grpc.NewClient
@@ -47,25 +49,62 @@ type peerStream struct {
 	mu     sync.Mutex
 	stream pb.EtcdRaft_SendStreamClient
 	cancel context.CancelFunc
+	done   chan struct{}
+	errMu  sync.Mutex
+	err    error
+}
+
+func newPeerStream(stream pb.EtcdRaft_SendStreamClient, cancel context.CancelFunc) *peerStream {
+	peer := &peerStream{
+		stream: stream,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	go peer.watchTerminal()
+	return peer
+}
+
+func (s *peerStream) watchTerminal() {
+	var ack pb.EtcdRaftAck
+	err := s.stream.RecvMsg(&ack)
+	if err == nil {
+		err = errPeerStreamClosed
+	}
+	s.errMu.Lock()
+	s.err = err
+	s.errMu.Unlock()
+	close(s.done)
+}
+
+func (s *peerStream) terminalErr() error {
+	select {
+	case <-s.done:
+	default:
+		return nil
+	}
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
 }
 
 type GRPCTransport struct {
 	pb.UnimplementedEtcdRaftServer
 
-	mu                sync.RWMutex
-	peers             map[uint64]Peer
-	clients           map[string]pb.EtcdRaftClient
-	conns             map[string]*grpc.ClientConn
-	streams           map[string]*peerStream
-	streamSupported   map[string]bool
-	streamUnsupported map[string]bool
-	handler           MessageHandler
-	snapshotChunkSize int
-	spoolDir          string
-	fsmSnapDir        string
-	prepareFSMWrite   func(index uint64) error
-	protectFSMWrite   func(index uint64) bool
-	unprotectFSMWrite func(index uint64)
+	mu                  sync.RWMutex
+	peers               map[uint64]Peer
+	clients             map[string]pb.EtcdRaftClient
+	conns               map[string]*grpc.ClientConn
+	streams             map[string]*peerStream
+	streamSupported     map[string]bool
+	streamUnsupported   map[string]bool
+	streamUnsupportedAt map[string]time.Time
+	handler             MessageHandler
+	snapshotChunkSize   int
+	spoolDir            string
+	fsmSnapDir          string
+	prepareFSMWrite     func(index uint64) error
+	protectFSMWrite     func(index uint64) bool
+	unprotectFSMWrite   func(index uint64)
 	// readFSMPayload is the fallback bridge callback that materialises the full
 	// FSM payload into memory. Used only when openFSMPayload is not set.
 	readFSMPayload func(index uint64) ([]byte, error)
@@ -94,14 +133,15 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		peerMap[peer.NodeID] = peer
 	}
 	return &GRPCTransport{
-		peers:             peerMap,
-		clients:           make(map[string]pb.EtcdRaftClient),
-		conns:             make(map[string]*grpc.ClientConn),
-		streams:           make(map[string]*peerStream),
-		streamSupported:   make(map[string]bool),
-		streamUnsupported: make(map[string]bool),
-		snapshotChunkSize: defaultSnapshotChunkSize,
-		bridgeSem:         make(chan struct{}, defaultBridgeMaterializeLimit),
+		peers:               peerMap,
+		clients:             make(map[string]pb.EtcdRaftClient),
+		conns:               make(map[string]*grpc.ClientConn),
+		streams:             make(map[string]*peerStream),
+		streamSupported:     make(map[string]bool),
+		streamUnsupported:   make(map[string]bool),
+		streamUnsupportedAt: make(map[string]time.Time),
+		snapshotChunkSize:   defaultSnapshotChunkSize,
+		bridgeSem:           make(chan struct{}, defaultBridgeMaterializeLimit),
 	}
 }
 
@@ -234,6 +274,7 @@ func (t *GRPCTransport) closePeerConnLocked(address string) {
 	t.closePeerStreamLocked(address)
 	delete(t.streamSupported, address)
 	delete(t.streamUnsupported, address)
+	delete(t.streamUnsupportedAt, address)
 	conn, ok := t.conns[address]
 	if !ok {
 		delete(t.clients, address)
@@ -428,7 +469,7 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 		return err
 	}
 	req := &pb.EtcdRaftMessage{Message: raw}
-	if t.peerStreamUnsupported(peer.Address) {
+	if isPriorityMsg(msg.Type) || !t.allowPeerStreamProbe(peer.Address, time.Now()) {
 		return t.dispatchRegularUnary(ctx, client, req)
 	}
 	err = t.dispatchRegularStream(ctx, peer.Address, client, req)
@@ -452,9 +493,25 @@ func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address strin
 	if err != nil {
 		return err
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		t.closePeerStream(address, stream)
+	})
+	defer stopCancel()
+
 	stream.mu.Lock()
+	if err := stream.terminalErr(); err != nil {
+		stream.mu.Unlock()
+		t.closePeerStream(address, stream)
+		return errors.WithStack(err)
+	}
 	err = stream.stream.Send(req)
+	if err == nil {
+		err = stream.terminalErr()
+	}
 	stream.mu.Unlock()
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		t.closePeerStream(address, stream)
 		return errors.WithStack(err)
@@ -465,45 +522,67 @@ func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address strin
 func (t *GRPCTransport) streamFor(ctx context.Context, address string, client pb.EtcdRaftClient) (*peerStream, error) {
 	t.mu.RLock()
 	stream, ok := t.streams[address]
-	unsupported := t.streamUnsupported[address]
 	t.mu.RUnlock()
 	if ok {
 		return stream, nil
 	}
-	if unsupported {
+	if !t.allowPeerStreamProbe(address, time.Now()) {
 		return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 	}
-	if err := t.probeSendStream(ctx, address, client); err != nil {
-		return nil, err
-	}
 
-	streamCtx, cancel := context.WithCancel(context.Background())
-	sendStream, err := client.SendStream(streamCtx)
+	value, err, _ := t.dialGroup.Do("stream:"+address, func() (any, error) {
+		t.mu.RLock()
+		stream, ok := t.streams[address]
+		t.mu.RUnlock()
+		if ok {
+			return stream, nil
+		}
+		if !t.allowPeerStreamProbe(address, time.Now()) {
+			return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
+		}
+		if err := t.probeSendStream(ctx, address, client); err != nil {
+			return nil, err
+		}
+
+		streamCtx, cancel := context.WithCancel(context.Background())
+		sendStream, err := client.SendStream(streamCtx)
+		if err != nil {
+			cancel()
+			return nil, errors.WithStack(err)
+		}
+		opened := newPeerStream(sendStream, cancel)
+
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if existing, ok := t.streams[address]; ok {
+			cancel()
+			return existing, nil
+		}
+		t.streams[address] = opened
+		go func() {
+			<-opened.done
+			t.closePeerStream(address, opened)
+		}()
+		return opened, nil
+	})
 	if err != nil {
-		cancel()
 		return nil, errors.WithStack(err)
 	}
-	opened := &peerStream{stream: sendStream, cancel: cancel}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if existing, ok := t.streams[address]; ok {
-		cancel()
-		return existing, nil
+	stream, ok = value.(*peerStream)
+	if !ok {
+		return nil, errors.New("etcd raft transport stream group returned unexpected stream type")
 	}
-	t.streams[address] = opened
-	return opened, nil
+	return stream, nil
 }
 
 func (t *GRPCTransport) probeSendStream(ctx context.Context, address string, client pb.EtcdRaftClient) error {
 	t.mu.RLock()
 	supported := t.streamSupported[address]
-	unsupported := t.streamUnsupported[address]
 	t.mu.RUnlock()
-	switch {
-	case supported:
+	if supported {
 		return nil
-	case unsupported:
+	}
+	if !t.allowPeerStreamProbe(address, time.Now()) {
 		return errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 	}
 
@@ -530,17 +609,45 @@ func (t *GRPCTransport) peerStreamUnsupported(address string) bool {
 	return t.streamUnsupported[address]
 }
 
+func (t *GRPCTransport) allowPeerStreamProbe(address string, now time.Time) bool {
+	t.mu.RLock()
+	unsupported := t.streamUnsupported[address]
+	markedAt := t.streamUnsupportedAt[address]
+	t.mu.RUnlock()
+	if !unsupported {
+		return true
+	}
+	if markedAt.IsZero() || now.Before(markedAt.Add(defaultSendStreamReprobeInterval)) {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	currentMarkedAt := t.streamUnsupportedAt[address]
+	if !t.streamUnsupported[address] {
+		return true
+	}
+	if currentMarkedAt.IsZero() || now.Before(currentMarkedAt.Add(defaultSendStreamReprobeInterval)) {
+		return false
+	}
+	delete(t.streamUnsupported, address)
+	delete(t.streamUnsupportedAt, address)
+	return true
+}
+
 func (t *GRPCTransport) markPeerStreamSupported(address string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.streamSupported[address] = true
 	delete(t.streamUnsupported, address)
+	delete(t.streamUnsupportedAt, address)
 }
 
 func (t *GRPCTransport) markPeerStreamUnsupported(address string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.streamUnsupported[address] = true
+	t.streamUnsupportedAt[address] = time.Now()
 	delete(t.streamSupported, address)
 	t.closePeerStreamLocked(address)
 }
