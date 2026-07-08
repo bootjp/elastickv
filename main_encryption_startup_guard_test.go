@@ -293,7 +293,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_NodeIDCollisionFromP
 	}
 }
 
-func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochRollback(t *testing.T) {
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochEqualAllowedBeforeBump(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeActiveStorageSidecarForStartup(t, testRegDEKID, 2)
 	raftDir := t.TempDir()
@@ -318,8 +318,8 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochRollback(t
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,
 	})
-	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
-		t.Fatalf("membership guard must fire ErrLocalEpochRollback, got %v", err)
+	if err != nil {
+		t.Fatalf("pre-bump guard must allow sidecar==registry; got %v", err)
 	}
 	sc, err := encryption.ReadSidecar(sidecarPath)
 	if err != nil {
@@ -327,6 +327,36 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochRollback(t
 	}
 	if got := sc.Keys["7"].LocalEpoch; got != 2 {
 		t.Fatalf("pre-engine guard must not bump sidecar local_epoch; got %d", got)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochBehindRollback(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, testRegDEKID, 1)
+	raftDir := t.TempDir()
+	storePath := filepath.Join(groupDataDir(raftDir, "n1", 1, false), "fsm.db")
+	if err := os.MkdirAll(filepath.Dir(storePath), dirPerm); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	st, err := store.NewPebbleStore(storePath)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close registry fixture store: %v", err)
+	}
+	err = checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           raftDir,
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+	})
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("membership guard must fire ErrLocalEpochRollback when sidecar<registry, got %v", err)
 	}
 }
 

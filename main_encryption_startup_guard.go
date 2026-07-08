@@ -227,10 +227,11 @@ type encryptionMembershipStartupGuardInput struct {
 //     brand-new cluster) is narrowed with the same DeriveNodeID →
 //     NodeID16 path used by the nonce factory.
 //   - ErrLocalEpochRollback: the local sidecar's active storage DEK
-//     local_epoch must already be strictly ahead of this node's
-//     writer-registry LastSeenLocalEpoch. The check happens before
-//     prepareStorageNonceEpoch can mutate the sidecar, so a stale
-//     sidecar is refused without consuming a new epoch first.
+//     local_epoch must not be behind this node's writer-registry
+//     LastSeenLocalEpoch. Equality is allowed at this pre-bump phase:
+//     a healthy restart has sidecar == registry from the previous
+//     process load, and prepareStorageNonceEpoch will bump the sidecar
+//     before any encrypted write path opens.
 func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipStartupGuardInput) error {
 	if !in.encryptionEnabled || in.sidecarPath == "" {
 		return nil
@@ -340,7 +341,7 @@ func checkLocalEpochRollbackFromDisk(
 	storePath := filepath.Join(groupDataDir(raftDir, raftID, defaultGroup, multi), "fsm.db")
 	if _, err := os.Stat(storePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if err := encryption.CheckLocalEpochRollback(
+			if err := checkLocalEpochRollbackBeforeBump(
 				missingWriterRegistry{},
 				fullNodeID,
 				sc.Active.Storage,
@@ -368,7 +369,7 @@ func checkLocalEpochRollbackFromDisk(
 	if err != nil {
 		return pkgerrors.Wrap(err, "encryption startup guard: writer registry")
 	}
-	if err := encryption.CheckLocalEpochRollback(
+	if err := checkLocalEpochRollbackBeforeBump(
 		reg,
 		fullNodeID,
 		sc.Active.Storage,
@@ -376,6 +377,49 @@ func checkLocalEpochRollbackFromDisk(
 		sc.StorageEnvelopeActive,
 	); err != nil {
 		return pkgerrors.Wrap(err, "encryption startup guard: local_epoch rollback")
+	}
+	return nil
+}
+
+func checkLocalEpochRollbackBeforeBump(
+	registry encryption.WriterRegistryStore,
+	fullNodeID uint64,
+	activeStorageDEKID uint32,
+	sidecarLocalEpoch uint16,
+	storageEnvelopeActive bool,
+) error {
+	key := encryption.RegistryKey(activeStorageDEKID, encryption.NodeID16(fullNodeID))
+	rawVal, ok, err := registry.GetRegistryRow(key)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: read writer-registry row for full_node_id=%#x dek_id=%d",
+			fullNodeID, activeStorageDEKID)
+	}
+	if !ok {
+		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+	}
+	registryRow, err := encryption.DecodeRegistryValue(rawVal)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: decode writer-registry row for full_node_id=%#x dek_id=%d",
+			fullNodeID, activeStorageDEKID)
+	}
+	if registryRow.FullNodeID != fullNodeID {
+		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+	}
+	if sidecarLocalEpoch < registryRow.LastSeenLocalEpoch {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"sidecar local_epoch=%d < registry last_seen_local_epoch=%d (full_node_id=%#x dek_id=%d) before startup bump; sidecar must be at least registry before BumpLocalEpoch advances it",
+			sidecarLocalEpoch, registryRow.LastSeenLocalEpoch, fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
+func missingRegistryRowBeforeBump(storageEnvelopeActive bool, fullNodeID uint64, activeStorageDEKID uint32) error {
+	if storageEnvelopeActive {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"writer-registry has no row for full_node_id=%#x dek_id=%d but storage_envelope_active=true; cannot prove nonce monotonicity for the active DEK before startup bump",
+			fullNodeID, activeStorageDEKID)
 	}
 	return nil
 }
