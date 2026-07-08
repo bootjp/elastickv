@@ -4,8 +4,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -26,7 +29,7 @@ func TestEncryptionPreRegister_PreBootstrapSkips(t *testing.T) {
 	cache := encryption.NewStateCache() // zero-value: ActiveStorageKeyID()=(0,false)
 	st := newRegistrationTestStore(t)
 	defaultGroup := &kv.ShardGroup{Store: st}
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, defaultGroup, cache, stubDeriveNodeID)
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, defaultGroup, cache, "", stubDeriveNodeID)
 	if pre == nil {
 		t.Fatal("newEncryptionPreRegister returned nil despite non-nil cache+group")
 	}
@@ -41,13 +44,13 @@ func TestEncryptionPreRegister_PreBootstrapSkips(t *testing.T) {
 // runtime hook.
 func TestEncryptionPreRegister_NilCacheReturnsNilInterceptor(t *testing.T) {
 	t.Parallel()
-	if got := newEncryptionPreRegister(nil, nil, nil, nil); got != nil {
+	if got := newEncryptionPreRegister(nil, nil, nil, "", nil); got != nil {
 		t.Errorf("all-nil inputs: want nil interceptor, got %T", got)
 	}
-	if got := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{}, nil, stubDeriveNodeID); got != nil {
+	if got := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{}, nil, "", stubDeriveNodeID); got != nil {
 		t.Error("nil cache: want nil interceptor")
 	}
-	if got := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{}, encryption.NewStateCache(), nil); got != nil {
+	if got := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{}, encryption.NewStateCache(), "", nil); got != nil {
 		t.Error("nil deriveNodeID: want nil interceptor")
 	}
 }
@@ -82,7 +85,7 @@ func TestEncryptionPreRegister_IdempotentWhenRowExists(t *testing.T) {
 	sc.Active.Storage = testRegDEKID
 	cache.RefreshFromSidecar(sc)
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, stubDeriveNodeID)
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID)
 	if err := pre.PreAddMember(context.Background(), "raftN"); err != nil {
 		t.Errorf("PreAddMember should skip when matching row exists: got %v", err)
 	}
@@ -124,9 +127,104 @@ func TestEncryptionPreRegister_Uint16CollisionReturnsTypedError(t *testing.T) {
 	}
 	collidingDerive := func(string) uint64 { return collidingFullNodeID }
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, collidingDerive)
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", collidingDerive)
 	err = pre.PreAddMember(context.Background(), "raftN")
 	if !errors.Is(err, encryption.ErrWriterUint16Collision) {
 		t.Errorf("PreAddMember on §6.1 collision: want ErrWriterUint16Collision, got %v", err)
+	}
+}
+
+func TestEncryptionPreRegister_ActiveRaftDEKForPreRegister(t *testing.T) {
+	t.Parallel()
+	const activeRaftDEK uint32 = 22
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, activeRaftDEK, 0, 100)
+	pre := &encryptionPreRegister{sidecarPath: sidecarPath}
+	got, ok, err := pre.activeRaftDEKForPreRegister()
+	if err != nil {
+		t.Fatalf("activeRaftDEKForPreRegister: %v", err)
+	}
+	if !ok {
+		t.Fatal("activeRaftDEKForPreRegister returned ok=false for active raft cutover")
+	}
+	if got != activeRaftDEK {
+		t.Fatalf("activeRaftDEKForPreRegister = %d, want %d", got, activeRaftDEK)
+	}
+}
+
+func TestEncryptionPreRegister_ActiveRaftDEKForPreRegisterBeforeCutover(t *testing.T) {
+	t.Parallel()
+	const activeRaftDEK uint32 = 22
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, activeRaftDEK, 0, 0)
+	pre := &encryptionPreRegister{sidecarPath: sidecarPath}
+	got, ok, err := pre.activeRaftDEKForPreRegister()
+	if err != nil {
+		t.Fatalf("activeRaftDEKForPreRegister: %v", err)
+	}
+	if !ok {
+		t.Fatal("activeRaftDEKForPreRegister returned ok=false for active raft DEK before cutover")
+	}
+	if got != activeRaftDEK {
+		t.Fatalf("activeRaftDEKForPreRegister = %d, want %d", got, activeRaftDEK)
+	}
+}
+
+type recordingMembershipProposer struct {
+	raftengine.Engine
+	proposeCalls      int
+	proposeAdminCalls int
+}
+
+func (p *recordingMembershipProposer) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	p.proposeCalls++
+	return &raftengine.ProposalResult{CommitIndex: 1}, nil
+}
+
+func (p *recordingMembershipProposer) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	p.proposeAdminCalls++
+	return &raftengine.ProposalResult{CommitIndex: 1}, nil
+}
+
+func (p *recordingMembershipProposer) State() raftengine.State { return raftengine.StateLeader }
+func (p *recordingMembershipProposer) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
+}
+func (p *recordingMembershipProposer) VerifyLeader(context.Context) error { return nil }
+func (p *recordingMembershipProposer) LinearizableRead(context.Context) (uint64, error) {
+	return 0, nil
+}
+func (p *recordingMembershipProposer) Status() raftengine.Status {
+	return raftengine.Status{State: raftengine.StateLeader}
+}
+func (p *recordingMembershipProposer) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+func (p *recordingMembershipProposer) Close() error { return nil }
+
+func TestProposeWriterRegistrationBlockingOnCutover_LeaderUsesPropose(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	proposer := &recordingMembershipProposer{}
+	groups := map[uint64]*kv.ShardGroup{1: {Engine: proposer}}
+	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), nil)
+	req := &pb.RegisterEncryptionWriterRequest{DekId: 7, Writers: []*pb.WriterRegistryEntry{{
+		FullNodeId: 0x1234,
+		LocalEpoch: 0,
+	}}}
+	err := proposeWriterRegistrationBlockingOnCutover(
+		context.Background(),
+		coord,
+		proposer,
+		&kv.GRPCConnCache{},
+		[]byte{0x01, 0x02},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("proposeWriterRegistrationBlockingOnCutover: %v", err)
+	}
+	if proposer.proposeCalls != 1 {
+		t.Fatalf("Propose calls = %d, want 1", proposer.proposeCalls)
+	}
+	if proposer.proposeAdminCalls != 0 {
+		t.Fatalf("ProposeAdmin calls = %d, want 0", proposer.proposeAdminCalls)
 	}
 }
