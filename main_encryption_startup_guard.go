@@ -309,11 +309,7 @@ func memberFullNodeIDsFromDisk(
 		}
 		if ok {
 			for _, peer := range peers {
-				fullNodeID := peer.NodeID
-				if fullNodeID == 0 {
-					fullNodeID = etcdraftengine.DeriveNodeID(peer.ID)
-				}
-				add(fullNodeID)
+				add(fullNodeIDForPersistedPeer(peer))
 			}
 			continue
 		}
@@ -322,6 +318,13 @@ func memberFullNodeIDsFromDisk(
 		}
 	}
 	return out, nil
+}
+
+func fullNodeIDForPersistedPeer(peer etcdraftengine.Peer) uint64 {
+	if peer.ID != "" {
+		return etcdraftengine.DeriveNodeID(peer.ID)
+	}
+	return peer.NodeID
 }
 
 func checkLocalEpochRollbackFromDisk(
@@ -405,11 +408,108 @@ func checkLocalEpochRollbackBeforeBump(
 			fullNodeID, activeStorageDEKID)
 	}
 	if registryRow.FullNodeID != fullNodeID {
-		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+		return foreignRegistryRowBeforeBump(registryRow.FullNodeID, fullNodeID, activeStorageDEKID)
 	}
 	if sidecarLocalEpoch < registryRow.LastSeenLocalEpoch {
 		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
 			"sidecar local_epoch=%d < registry last_seen_local_epoch=%d (full_node_id=%#x dek_id=%d) before startup bump; sidecar must be at least registry before BumpLocalEpoch advances it",
+			sidecarLocalEpoch, registryRow.LastSeenLocalEpoch, fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
+func checkLocalEpochRollbackAfterReplay(
+	raftID string,
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, key, ok, err := activeStorageKeyForStartupGuard(sidecarPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	reg, err := writerRegistryAfterReplay(runtimes, defaultGroup)
+	if err != nil {
+		return err
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	if err := checkLocalEpochRollbackAfterBump(
+		reg,
+		fullNodeID,
+		sc.Active.Storage,
+		key.LocalEpoch,
+		sc.StorageEnvelopeActive,
+	); err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: local_epoch rollback after raft replay")
+	}
+	return nil
+}
+
+func activeStorageKeyForStartupGuard(sidecarPath string) (*encryption.Sidecar, encryption.SidecarKey, bool, error) {
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil || sc == nil {
+		return nil, encryption.SidecarKey{}, false, err
+	}
+	if sc.Active.Storage == 0 {
+		return sc, encryption.SidecarKey{}, false, nil
+	}
+	key, ok := sc.Keys[strconv.FormatUint(uint64(sc.Active.Storage), 10)]
+	if !ok {
+		return sc, encryption.SidecarKey{}, false, pkgerrors.Wrapf(encryption.ErrSidecarActiveKeyMissing,
+			"encryption startup guard: active storage DEK %d missing from sidecar keys after raft replay",
+			sc.Active.Storage)
+	}
+	return sc, key, true, nil
+}
+
+func writerRegistryAfterReplay(runtimes []*raftGroupRuntime, defaultGroup uint64) (encryption.WriterRegistryStore, error) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil || defaultRuntime.store == nil {
+		return nil, pkgerrors.Errorf("encryption startup guard: default group %d runtime unavailable after raft replay", defaultGroup)
+	}
+	reg, err := store.WriterRegistryFor(defaultRuntime.store)
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "encryption startup guard: writer registry after raft replay")
+	}
+	return reg, nil
+}
+
+func checkLocalEpochRollbackAfterBump(
+	registry encryption.WriterRegistryStore,
+	fullNodeID uint64,
+	activeStorageDEKID uint32,
+	sidecarLocalEpoch uint16,
+	storageEnvelopeActive bool,
+) error {
+	key := encryption.RegistryKey(activeStorageDEKID, encryption.NodeID16(fullNodeID))
+	rawVal, ok, err := registry.GetRegistryRow(key)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: read writer-registry row for full_node_id=%#x dek_id=%d after startup bump",
+			fullNodeID, activeStorageDEKID)
+	}
+	if !ok {
+		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+	}
+	registryRow, err := encryption.DecodeRegistryValue(rawVal)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: decode writer-registry row for full_node_id=%#x dek_id=%d after startup bump",
+			fullNodeID, activeStorageDEKID)
+	}
+	if registryRow.FullNodeID != fullNodeID {
+		return foreignRegistryRowBeforeBump(registryRow.FullNodeID, fullNodeID, activeStorageDEKID)
+	}
+	if sidecarLocalEpoch <= registryRow.LastSeenLocalEpoch {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"sidecar local_epoch=%d <= registry last_seen_local_epoch=%d (full_node_id=%#x dek_id=%d) after raft replay; startup bump must advance beyond every replayed registration",
 			sidecarLocalEpoch, registryRow.LastSeenLocalEpoch, fullNodeID, activeStorageDEKID)
 	}
 	return nil
@@ -422,6 +522,12 @@ func missingRegistryRowBeforeBump(storageEnvelopeActive bool, fullNodeID uint64,
 			fullNodeID, activeStorageDEKID)
 	}
 	return nil
+}
+
+func foreignRegistryRowBeforeBump(registryFullNodeID, fullNodeID uint64, activeStorageDEKID uint32) error {
+	return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+		"writer-registry row for node_id16=%#x dek_id=%d belongs to full_node_id=%#x, not this full_node_id=%#x; refusing startup to avoid nonce-prefix collision",
+		encryption.NodeID16(fullNodeID), activeStorageDEKID, registryFullNodeID, fullNodeID)
 }
 
 type missingWriterRegistry struct{}
