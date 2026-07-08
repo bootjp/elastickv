@@ -89,7 +89,7 @@ func TestPostDispatchReport_AbortsOnClose(t *testing.T) {
 func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
 	t.Parallel()
 	snapshotCh := make(chan dispatchRequest, 1)
-	snapshotCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgSnap, To: 2}}
+	snapshotCh <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}}
 	e := &Engine{
 		transport:              &GRPCTransport{},
 		dispatcherLanesEnabled: true,
@@ -100,7 +100,7 @@ func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgSnap, To: 2}))
+	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}))
 
 	require.Equal(t, uint64(1), e.DispatchDropCount())
 	select {
@@ -114,7 +114,7 @@ func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
 func TestEnqueueDispatchReportsDroppedRegularMessageWhenLaneFull(t *testing.T) {
 	t.Parallel()
 	replicationCh := make(chan dispatchRequest, 1)
-	replicationCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgApp, To: 2}}
+	replicationCh <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}}
 	e := &Engine{
 		transport:              &GRPCTransport{},
 		dispatcherLanesEnabled: true,
@@ -125,7 +125,7 @@ func TestEnqueueDispatchReportsDroppedRegularMessageWhenLaneFull(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}))
 
 	require.Equal(t, uint64(1), e.DispatchDropCount())
 	select {

@@ -585,13 +585,16 @@ function RowDetail({ row, index }: RowDetailProps) {
 //
 //   "virtual:<routeID>"            — coarsened aggregate, no drill-down
 //   "route:<routeID>"              — K=1 route, no sub-bucket axis
+//   "route:<routeID>:<label>"      — labeled K=1 route
 //   "route:<routeID>#<subBucket>"  — sub-bucket row of a K>1 route
+//   "route:<routeID>:<label>#<subBucket>" — labeled sub-bucket row
 //
 // Returns null when the format is unrecognised so the panel can render
 // a clear "unsupported bucket type" placeholder rather than throw.
 interface BucketIDParts {
   kind: "virtual" | "route";
   routeID: number;
+  label?: string;
   subBucket?: number;
 }
 
@@ -605,7 +608,18 @@ function parseUint(raw: string): number | null {
   return Number(raw);
 }
 
-function parseBucketID(id: string): BucketIDParts | null {
+function parseRouteAndLabel(raw: string): { routeID: number; label?: string } | null {
+  const parts = raw.split(":");
+  if (parts.length < 1 || parts.length > 2) return null;
+  const routeID = parseUint(parts[0]);
+  if (routeID === null) return null;
+  if (parts.length === 1) return { routeID };
+  const label = parts[1];
+  if (!/^[A-Za-z0-9_-]+$/.test(label)) return null;
+  return { routeID, label };
+}
+
+export function parseBucketID(id: string): BucketIDParts | null {
   // parseUint enforces digit-only segments. Belt-and-braces against
   // both Number.parseInt's prefix-tolerance (parseInt("42abc") → 42)
   // and Number's empty-string coercion (Number("") → 0); the server's
@@ -620,14 +634,14 @@ function parseBucketID(id: string): BucketIDParts | null {
     const rest = id.slice("route:".length);
     const hash = rest.indexOf("#");
     if (hash < 0) {
-      const n = parseUint(rest);
-      if (n === null) return null;
-      return { kind: "route", routeID: n };
+      const parsed = parseRouteAndLabel(rest);
+      if (parsed === null) return null;
+      return { kind: "route", ...parsed };
     }
-    const routeID = parseUint(rest.slice(0, hash));
+    const parsed = parseRouteAndLabel(rest.slice(0, hash));
     const sub = parseUint(rest.slice(hash + 1));
-    if (routeID === null || sub === null) return null;
-    return { kind: "route", routeID, subBucket: sub };
+    if (parsed === null || sub === null) return null;
+    return { kind: "route", ...parsed, subBucket: sub };
   }
   return null;
 }
@@ -692,7 +706,7 @@ function HotKeysPanel({ row, column, columnUnixMs, series, onClose }: HotKeysPan
         <HotKeysUnsupportedNotice row={row} parts={parts} series={series} />
       )}
       {supported && parts && parts.kind === "route" && (
-        <HotKeysContent routeID={parts.routeID} subBucket={parts.subBucket} />
+        <HotKeysContent routeID={parts.routeID} label={parts.label} subBucket={parts.subBucket} />
       )}
     </div>
   );
@@ -740,22 +754,24 @@ function HotKeysUnsupportedNotice({ row, parts, series }: HotKeysUnsupportedNoti
 
 interface HotKeysContentProps {
   routeID: number;
+  label?: string;
   subBucket?: number;
 }
 
-function HotKeysContent({ routeID, subBucket }: HotKeysContentProps) {
+function HotKeysContent({ routeID, label, subBucket }: HotKeysContentProps) {
   const query = useApiQuery(
     (signal) =>
       api.keyVizHotKeys(
         {
           route_id: routeID,
+          label,
           sub_bucket: subBucket,
           series: "writes",
           top: hotKeysTopK,
         },
         signal,
       ),
-    [routeID, subBucket],
+    [routeID, label, subBucket],
   );
   // useApiQuery keeps the previous response in `data` while a new
   // request is in flight (it doesn't reset on dep change), so when the
@@ -768,6 +784,7 @@ function HotKeysContent({ routeID, subBucket }: HotKeysContentProps) {
   const hasMatchingData =
     !!query.data &&
     query.data.route_id === routeID &&
+    (query.data.label ?? "") === (label ?? "") &&
     query.data.sub_bucket === subBucket;
   if (query.loading && !hasMatchingData) {
     return <p className="text-xs text-muted">Loading hot keys…</p>;

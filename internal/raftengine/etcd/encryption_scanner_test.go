@@ -21,9 +21,9 @@ import (
 // gemini CRITICAL on PR #783.
 func newEntry(index uint64, opcode byte) raftpb.Entry {
 	return raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Term:  1,
-		Index: index,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Term:  uint64Ptr(1),
+		Index: uint64Ptr(index),
 		Data:  encodeProposalEnvelope(index, []byte{opcode}),
 	}
 }
@@ -37,7 +37,7 @@ func scannerWithEntries(t *testing.T, entries ...raftpb.Entry) *encryptionScanne
 	t.Helper()
 	storage := etcdraft.NewMemoryStorage()
 	if len(entries) > 0 {
-		if err := storage.Append(entries); err != nil {
+		if err := storage.Append(entryPointers(entries)); err != nil {
 			t.Fatalf("storage.Append: %v", err)
 		}
 	}
@@ -140,8 +140,8 @@ func TestEncryptionScanner_RotationHit(t *testing.T) {
 // not falsely trigger the predicate.
 func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
 	entries := []raftpb.Entry{
-		{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: encodeProposalEnvelope(1, []byte{fsmwire.OpBootstrap})},
-		{Type: raftpb.EntryConfChangeV2, Term: 1, Index: 2, Data: encodeProposalEnvelope(2, []byte{fsmwire.OpRotation})},
+		{Type: entryTypePtr(raftpb.EntryConfChange), Term: uint64Ptr(1), Index: uint64Ptr(1), Data: encodeProposalEnvelope(1, []byte{fsmwire.OpBootstrap})},
+		{Type: entryTypePtr(raftpb.EntryConfChangeV2), Term: uint64Ptr(1), Index: uint64Ptr(2), Data: encodeProposalEnvelope(2, []byte{fsmwire.OpRotation})},
 	}
 	s := scannerWithEntries(t, entries...)
 	hit, err := s.HasEncryptionRelevantEntryInRange(0, 2)
@@ -161,8 +161,8 @@ func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
 // nil-deref or out-of-range panic.
 func TestEncryptionScanner_EmptyDataSkipped(t *testing.T) {
 	entries := []raftpb.Entry{
-		{Type: raftpb.EntryNormal, Term: 1, Index: 1, Data: nil},
-		{Type: raftpb.EntryNormal, Term: 1, Index: 2, Data: []byte{}},
+		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(1), Data: nil},
+		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(2), Data: []byte{}},
 	}
 	s := scannerWithEntries(t, entries...)
 	hit, err := s.HasEncryptionRelevantEntryInRange(0, 2)
@@ -186,10 +186,10 @@ func TestEncryptionScanner_EnvelopeStripping_RawBytesIgnored(t *testing.T) {
 	entries := []raftpb.Entry{
 		// Bare opcode byte, no envelope. decodeProposalEnvelope
 		// returns ok=false because len(data) < envelopeHeaderSize.
-		{Type: raftpb.EntryNormal, Term: 1, Index: 1, Data: []byte{fsmwire.OpBootstrap}},
+		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(1), Data: []byte{fsmwire.OpBootstrap}},
 		// Wrong version byte but full length. decodeProposalEnvelope
 		// returns ok=false because data[0] != proposalEnvelopeVersion.
-		{Type: raftpb.EntryNormal, Term: 1, Index: 2, Data: []byte{0x99, 0, 0, 0, 0, 0, 0, 0, 0, fsmwire.OpBootstrap}},
+		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(2), Data: []byte{0x99, 0, 0, 0, 0, 0, 0, 0, 0, fsmwire.OpBootstrap}},
 	}
 	s := scannerWithEntries(t, entries...)
 	hit, err := s.HasEncryptionRelevantEntryInRange(0, 2)
@@ -212,9 +212,9 @@ func TestEncryptionScanner_CompactedRange(t *testing.T) {
 	// Establish a snapshot at index 10 — entries below 10 become
 	// inaccessible via Entries().
 	snap := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{Index: 10, Term: 1},
+		Metadata: &raftpb.SnapshotMetadata{Index: uint64Ptr(10), Term: uint64Ptr(1)},
 	}
-	if err := storage.ApplySnapshot(snap); err != nil {
+	if err := storage.ApplySnapshot(&snap); err != nil {
 		t.Fatalf("ApplySnapshot: %v", err)
 	}
 	s := &encryptionScanner{storage: storage}

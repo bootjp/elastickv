@@ -785,8 +785,8 @@ func loadPrewriteWALSnapshotIndexes(snapDir string) (map[walSnapshotKey]bool, er
 	}
 	indexes := make(map[walSnapshotKey]bool, len(walSnaps))
 	for _, snap := range walSnaps {
-		if snap.Index > 0 {
-			indexes[walSnapshotKey{term: snap.Term, index: snap.Index}] = true
+		if snap.GetIndex() > 0 {
+			indexes[walSnapshotKey{term: snap.GetTerm(), index: snap.GetIndex()}] = true
 		}
 	}
 	return indexes, nil
@@ -839,7 +839,7 @@ func snapshotTokenFromSnapFile(snapDir, snapName string, term, index uint64) (sn
 	if err != nil {
 		return snapshotToken{}, false
 	}
-	if snapshot.Metadata.Term != term || snapshot.Metadata.Index != index || !isSnapshotToken(snapshot.Data) {
+	if snapshot.GetMetadata().GetTerm() != term || snapshot.GetMetadata().GetIndex() != index || !isSnapshotToken(snapshot.Data) {
 		return snapshotToken{}, false
 	}
 	tok, err := decodeSnapshotToken(snapshot.Data)

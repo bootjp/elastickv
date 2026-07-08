@@ -23,7 +23,7 @@ import (
 // per-node status surfaced in the response.
 //
 // Merge semantics differ from the matrix fan-out — see
-// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §6:
+// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md §6:
 //
 //   - count per key:      SUM across peers (responses already carry
 //     scaled-to-true estimates from buildHotKeysResponse).
@@ -258,6 +258,9 @@ func buildKeyVizHotKeysPeerURL(peer string, params hotKeysParams) (string, error
 	base.Path = pathKeyVizHotKeys
 	q := base.Query()
 	q.Set("route_id", strconv.FormatUint(params.routeID, 10))
+	if params.label != keyviz.LabelLegacy {
+		q.Set("label", string(params.label))
+	}
 	if params.subBucketSet {
 		q.Set("sub_bucket", strconv.Itoa(params.subBucket))
 	}
@@ -322,6 +325,7 @@ func mergeHotKeyResponses(responses []hotKeyResponse, params hotKeysParams) hotK
 		// cannot panic the merge step.
 		return hotKeyResponse{
 			RouteID:     params.routeID,
+			Label:       string(params.label),
 			Series:      params.series,
 			Approximate: true,
 			Keys:        []hotKeyResponseEntry{},
@@ -336,6 +340,7 @@ func mergeHotKeyResponses(responses []hotKeyResponse, params hotKeysParams) hotK
 	// the SUM identity and the loop folds responses[0] cleanly.
 	out := hotKeyResponse{
 		RouteID:     base.RouteID,
+		Label:       base.Label,
 		SubBucket:   base.SubBucket,
 		Series:      base.Series,
 		Approximate: true, // SS sketches are always approximate.

@@ -1,7 +1,7 @@
 --------------------------------- MODULE MVCC --------------------------------
 (***************************************************************************)
 (* TLA+ specification of the elastickv MVCC layer.                         *)
-(* Per docs/design/2026_05_28_partial_tla_safety_spec.md §5.3.             *)
+(* Per docs/design/2026_05_28_implemented_tla_safety_spec.md §5.3.             *)
 (*                                                                         *)
 (* Models a per-key version chain `versions[k]` and a `Compact` action     *)
 (* that drains older versions to bound storage growth.  The model focuses  *)

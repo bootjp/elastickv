@@ -699,6 +699,7 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *pb.KeyVizRow {
 	}
 	row := &pb.KeyVizRow{
 		BucketId:          bucketIDFor(mr),
+		Label:             string(mr.Label),
 		Start:             append([]byte(nil), mr.Start...),
 		End:               append([]byte(nil), mr.End...),
 		Aggregate:         mr.Aggregate,
@@ -722,6 +723,9 @@ func bucketIDFor(mr keyviz.MatrixRow) string {
 		return "virtual:" + strconv.FormatUint(mr.RouteID, 10)
 	}
 	id := "route:" + strconv.FormatUint(mr.RouteID, 10)
+	if mr.Label != keyviz.LabelLegacy {
+		id += ":" + string(mr.Label)
+	}
 	// Sub-bucket suffix only for genuinely sub-divided routes, so K=1 /
 	// aggregate / degenerate slots keep the exact legacy id. See §5.1.
 	if mr.SubBucketCount > 1 {

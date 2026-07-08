@@ -348,8 +348,8 @@ func TestS3Server_AdminListBuckets_PaginatesPastSinglePage(t *testing.T) {
 
 // TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes
 // is the regression test for the AdminDeleteBucket TOCTOU race
-// (design doc 2026_04_28_proposed_admin_delete_bucket_safety_net.md;
-// coderabbitai 🔴/🟠 on PR #669). The race lands when a concurrent
+// (design doc 2026_04_28_implemented_admin_delete_bucket_safety_net.md;
+// high-severity review finding on PR #669). The race lands when a concurrent
 // PutObject inserts data between AdminDeleteBucket's empty-probe
 // scan (at readTS) and its commit (at a later commitTS). Without
 // the DEL_PREFIX safety net, the BucketMetaKey delete commits but

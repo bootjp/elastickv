@@ -14,14 +14,14 @@ gen:
 	@$(MAKE)  -C proto gen
 
 # === TLA+ model-check support (M1 deliverable) ===
-# Per docs/design/2026_05_28_partial_tla_safety_spec.md §7.2.
+# Per docs/design/2026_05_28_implemented_tla_safety_spec.md §7.2.
 # Downloads a checksum-pinned tla2tools.jar on first use, then runs TLC on
 # both MCHLC.cfg (correct design — expected PASS) and MCHLC_gap.cfg
 # (preconditions disabled — expected FAIL on HLC-4 with a counterexample
 # that motivates the implementation gaps).
 TLA_VERSION  := v1.8.0
 TLA_JAR      := .cache/tla/tla2tools.jar
-TLA_SHA256   := 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
+TLA_SHA256   := 9e27b5e19a69ae1f56aabf8403a6ed5598dbfa6e638908e5278ac39736c1543d
 TLA_URL      := https://github.com/tlaplus/tlaplus/releases/download/$(TLA_VERSION)/tla2tools.jar
 TLA_LIB      := ../lib
 

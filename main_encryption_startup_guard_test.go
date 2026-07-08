@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 )
@@ -120,6 +121,30 @@ func writeRaftCutoverSidecarForStartup(t *testing.T, activeRaft uint32, localEpo
 				Purpose: encryption.SidecarPurposeRaft,
 				Wrapped: []byte("wrapped-raft"),
 				Created: "2026-07-07T00:00:00Z",
+			},
+		},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	return path
+}
+
+func writeActiveStorageSidecarForStartup(t *testing.T, localEpoch uint16) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:               encryption.SidecarVersion,
+		RaftAppliedIndex:      1,
+		StorageEnvelopeActive: true,
+		Active:                encryption.ActiveKeys{Storage: testRegDEKID},
+		Keys: map[string]encryption.SidecarKey{
+			"7": {
+				Purpose:    encryption.SidecarPurposeStorage,
+				Wrapped:    []byte("wrapped"),
+				Created:    "2026-07-07T00:00:00Z",
+				LocalEpoch: localEpoch,
 			},
 		},
 	}
@@ -367,5 +392,227 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
 		t.Fatalf("pre-bootstrap sidecar must skip cutover divergence guard, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_NodeIDCollisionFromPersistedPeers(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 3)
+	if gotA, gotB := etcdraftengine.DeriveNodeID("n498")&0xffff, etcdraftengine.DeriveNodeID("n784")&0xffff; gotA != gotB {
+		t.Fatalf("test fixture no longer collides: n498=%#x n784=%#x", gotA, gotB)
+	}
+	raftDir := t.TempDir()
+	peers := []etcdraftengine.Peer{
+		{NodeID: etcdraftengine.DeriveNodeID("n498"), ID: "n498", Address: "127.0.0.1:7001"},
+		{NodeID: etcdraftengine.DeriveNodeID("n784"), ID: "n784", Address: "127.0.0.1:7002"},
+	}
+	sourceStorePath := filepath.Join(t.TempDir(), "source-fsm.db")
+	if _, err := etcdraftengine.MigrateFSMStore(sourceStorePath, groupDataDir(raftDir, "n1", 1, false), peers); err != nil {
+		t.Fatalf("MigrateFSMStore fixture: %v", err)
+	}
+	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           raftDir,
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+	})
+	if !errors.Is(err, encryption.ErrNodeIDCollision) {
+		t.Fatalf("membership guard must fire ErrNodeIDCollision, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_DerivesPersistedPeerFullIDFromPeerID(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 3)
+	if gotA, gotB := etcdraftengine.DeriveNodeID("n498")&0xffff, etcdraftengine.DeriveNodeID("n784")&0xffff; gotA != gotB {
+		t.Fatalf("test fixture no longer collides: n498=%#x n784=%#x", gotA, gotB)
+	}
+	raftDir := t.TempDir()
+	peers := []etcdraftengine.Peer{
+		{NodeID: 1, ID: "n498", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n784", Address: "127.0.0.1:7002"},
+	}
+	sourceStorePath := filepath.Join(t.TempDir(), "source-fsm.db")
+	if _, err := etcdraftengine.MigrateFSMStore(sourceStorePath, groupDataDir(raftDir, "n1", 1, false), peers); err != nil {
+		t.Fatalf("MigrateFSMStore fixture: %v", err)
+	}
+	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           raftDir,
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+	})
+	if !errors.Is(err, encryption.ErrNodeIDCollision) {
+		t.Fatalf("membership guard must derive full IDs from peer.ID and fire ErrNodeIDCollision, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochEqualAllowedBeforeBump(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 2)
+	raftDir := t.TempDir()
+	storePath := filepath.Join(groupDataDir(raftDir, "n1", 1, false), "fsm.db")
+	if err := os.MkdirAll(filepath.Dir(storePath), dirPerm); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	st, err := store.NewPebbleStore(storePath)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close registry fixture store: %v", err)
+	}
+	err = checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           raftDir,
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("pre-bump guard must allow sidecar==registry; got %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar after guard: %v", err)
+	}
+	if got := sc.Keys["7"].LocalEpoch; got != 2 {
+		t.Fatalf("pre-engine guard must not bump sidecar local_epoch; got %d", got)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochBehindRollback(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 1)
+	raftDir := t.TempDir()
+	storePath := filepath.Join(groupDataDir(raftDir, "n1", 1, false), "fsm.db")
+	if err := os.MkdirAll(filepath.Dir(storePath), dirPerm); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	st, err := store.NewPebbleStore(storePath)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close registry fixture store: %v", err)
+	}
+	err = checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           raftDir,
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+	})
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("membership guard must fire ErrLocalEpochRollback when sidecar<registry, got %v", err)
+	}
+}
+
+func TestCheckLocalEpochRollbackBeforeBump_ForeignRowFailsPreCutover(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), "fsm.db"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("Close registry fixture store: %v", err)
+		}
+	})
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	foreignFullNodeID := fullNodeID ^ 0x1_0000
+	writeRegistryRow(t, st, foreignFullNodeID, 1)
+
+	err = checkLocalEpochRollbackBeforeBump(reg, fullNodeID, testRegDEKID, 1, false)
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("foreign registry row must fail closed before cutover, got %v", err)
+	}
+}
+
+func TestCheckLocalEpochRollbackAfterReplay_RejectsEqualEpochAfterBump(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 2)
+	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), "fsm.db"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("Close registry fixture store: %v", err)
+		}
+	})
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+
+	err = checkLocalEpochRollbackAfterReplay(
+		"n1",
+		[]*raftGroupRuntime{{spec: groupSpec{id: 1}, store: st}},
+		1,
+		sidecarPath,
+		true,
+	)
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("post-replay guard must reject sidecar==registry after bump, got %v", err)
+	}
+}
+
+func TestCheckLocalEpochRollbackAfterReplay_AllowsBumpedAheadEpoch(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, 3)
+	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), "fsm.db"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("Close registry fixture store: %v", err)
+		}
+	})
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+
+	err = checkLocalEpochRollbackAfterReplay(
+		"n1",
+		[]*raftGroupRuntime{{spec: groupSpec{id: 1}, store: st}},
+		1,
+		sidecarPath,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("post-replay guard must allow sidecar>registry after bump, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_PreBootstrapSkips(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeMinimalSidecar(t, 1)
+	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
+		raftID:            "n1",
+		raftDir:           t.TempDir(),
+		groups:            []groupSpec{{id: 1}},
+		defaultGroup:      1,
+		sidecarPath:       sidecarPath,
+		encryptionEnabled: true,
+		bootstrapServers: []raftengine.Server{
+			{ID: "n498"},
+			{ID: "n784"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("pre-bootstrap sidecar must skip 6C-3 membership guards, got %v", err)
 	}
 }
