@@ -592,7 +592,9 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 		conn.WriteInt(size)
 		return
 	}
-	if err := r.coordinator.VerifyLeader(r.handlerContext()); err != nil {
+	verifyCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+	if err := r.coordinator.VerifyLeader(verifyCtx); err != nil {
 		writeRedisError(conn, err)
 		return
 	}

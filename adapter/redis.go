@@ -179,8 +179,9 @@ type RedisServer struct {
 
 	// leaderClients caches go-redis clients per leader address to avoid
 	// creating a new connection pool for every proxied request.
-	leaderClientsMu sync.RWMutex
-	leaderClients   map[string]*redis.Client
+	leaderClientsMu       sync.RWMutex
+	leaderClients         map[string]*redis.Client
+	blockingLeaderClients map[string]*redis.Client
 
 	// compactor is the background DeltaCompactor for this node. When set,
 	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
@@ -457,6 +458,7 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 }
 
 type connState struct {
+	mu    sync.Mutex
 	inTxn bool
 	queue []redcon.Command
 	// connID is a monotonically increasing per-server connection
@@ -500,16 +502,17 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	}
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	r := &RedisServer{
-		listen:          listen,
-		store:           store,
-		coordinator:     coordinate,
-		redisTranscoder: newRedisTranscoder(),
-		redisAddr:       redisAddr,
-		relay:           relay,
-		leaderRedis:     leaderRedis,
-		leaderClients:   make(map[string]*redis.Client),
-		pubsub:          newRedisPubSub(),
-		scriptCache:     map[string]string{},
+		listen:                listen,
+		store:                 store,
+		coordinator:           coordinate,
+		redisTranscoder:       newRedisTranscoder(),
+		redisAddr:             redisAddr,
+		relay:                 relay,
+		leaderRedis:           leaderRedis,
+		leaderClients:         make(map[string]*redis.Client),
+		blockingLeaderClients: make(map[string]*redis.Client),
+		pubsub:                newRedisPubSub(),
+		scriptCache:           map[string]string{},
 		// luaPool is materialized after the option loop so
 		// WithLuaPoolMaxIdle can influence its sizing. Test fixtures
 		// that bypass NewRedisServer construct the pool lazily via
@@ -576,8 +579,11 @@ func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
 	}
 	peer, ok := r.peerLimiter.accept(conn.RemoteAddr())
 	st := getConnState(conn)
+	st.mu.Lock()
 	st.peerKey = peer
 	st.peerCounted = ok
+	st.pubsubDetached = false
+	st.mu.Unlock()
 	if !ok {
 		conn.WriteError(redisPeerLimitError)
 	}
@@ -589,23 +595,39 @@ func (r *RedisServer) closeConn(conn redcon.Conn) {
 		return
 	}
 	st, ok := conn.Context().(*connState)
-	if !ok || !st.peerCounted || st.pubsubDetached {
+	if !ok {
 		return
 	}
-	r.peerLimiter.release(st.peerKey)
-	st.peerCounted = false
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	r.releaseConnStateLocked(st)
 }
 
 func (r *RedisServer) detachPubSubConn(conn redcon.Conn) redcon.DetachedConn {
 	st := getConnState(conn)
+	st.mu.Lock()
 	st.pubsubDetached = true
+	st.mu.Unlock()
 	return conn.Detach()
 }
 
 func (r *RedisServer) releaseDetachedPubSubConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
 	st := getConnState(conn)
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.pubsubDetached = false
-	r.closeConn(conn)
+	r.releaseConnStateLocked(st)
+}
+
+func (r *RedisServer) releaseConnStateLocked(st *connState) {
+	if r == nil || r.peerLimiter == nil || !st.peerCounted || st.pubsubDetached {
+		return
+	}
+	r.peerLimiter.release(st.peerKey)
+	st.peerCounted = false
 }
 
 // ensureConnID assigns and returns a per-connection numeric ID for the

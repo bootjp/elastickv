@@ -15,7 +15,10 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-const defaultRedisLeaderClientPoolSize = 4
+const (
+	defaultRedisLeaderClientPoolSize         = 4
+	defaultRedisBlockingLeaderClientPoolSize = 1
+)
 
 func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 	leader := r.coordinator.RaftLeader()
@@ -107,6 +110,10 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 	}
 	// Fatal transport / context error: per-command results are unreliable.
 	if err != nil {
+		if isRedisHeavyCommandPoolFullError(err) {
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return true
+		}
 		var netErr net.Error
 		if isTransientLeaderRedisError(err) ||
 			errors.Is(err, context.DeadlineExceeded) ||
@@ -130,6 +137,10 @@ func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
 		err := cmd.Err()
 		if err == nil || errors.Is(err, redis.Nil) {
 			continue
+		}
+		if isRedisHeavyCommandPoolFullError(err) {
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return true
 		}
 		if isTransientLeaderRedisError(err) {
 			writeRedisError(conn, err)
@@ -246,6 +257,30 @@ func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
 	return cli
 }
 
+func (r *RedisServer) getOrCreateBlockingLeaderClient(addr string) *redis.Client {
+	r.leaderClientsMu.RLock()
+	cli, ok := r.blockingLeaderClients[addr]
+	r.leaderClientsMu.RUnlock()
+	if ok {
+		return cli
+	}
+
+	r.leaderClientsMu.Lock()
+	defer r.leaderClientsMu.Unlock()
+	if cli, ok = r.blockingLeaderClients[addr]; ok {
+		return cli
+	}
+	if r.blockingLeaderClients == nil {
+		r.blockingLeaderClients = make(map[string]*redis.Client)
+	}
+	cli = redis.NewClient(&redis.Options{
+		Addr:     addr,
+		PoolSize: defaultRedisBlockingLeaderClientPoolSize,
+	})
+	r.blockingLeaderClients[addr] = cli
+	return cli
+}
+
 func (r *RedisServer) leaderClientPoolSize() int {
 	n := defaultRedisLeaderClientPoolSize
 	if r != nil && r.peerLimiter != nil && r.peerLimiter.limit > 0 && r.peerLimiter.limit < n {
@@ -293,6 +328,43 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 	}
 	writeGoRedisResult(conn, cli.Do(ctx, args...))
 	return true
+}
+
+func (r *RedisServer) proxyBlockingToLeader(conn redcon.Conn, cmd redcon.Command, key []byte) bool {
+	if r.coordinator.IsLeaderForKey(key) {
+		return false
+	}
+	leader := r.coordinator.RaftLeaderForKey(key)
+	if leader == "" {
+		writeRedisError(conn, ErrLeaderNotFound)
+		return true
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		writeRedisError(conn, errors.Newf("ERR leader redis address unknown for %s", leader))
+		return true
+	}
+	cli := r.getOrCreateBlockingLeaderClient(leaderAddr)
+
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+
+	args := make([]interface{}, len(cmd.Args))
+	for i, a := range cmd.Args {
+		args[i] = a
+	}
+	writeGoRedisResult(conn, cli.Do(ctx, args...))
+	return true
+}
+
+func isRedisHeavyCommandPoolFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errRedisHeavyCommandPoolFull) {
+		return true
+	}
+	return err.Error() == errRedisHeavyCommandPoolFull.Error()
 }
 
 func writeGoRedisResult(conn redcon.Conn, cmd *redis.Cmd) {

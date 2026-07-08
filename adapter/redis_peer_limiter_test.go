@@ -46,6 +46,29 @@ func TestRedisPeerLimiterKeepsDetachedPubSubCountUntilCleanup(t *testing.T) {
 	require.Empty(t, server.peerLimiter.active)
 }
 
+func TestRedisPeerLimiterDetachedPubSubReleaseIsIdempotent(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
+	pubsub := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
+	other := &remoteCommandRecorder{remote: "192.168.0.64:10002"}
+	next := &remoteCommandRecorder{remote: "192.168.0.64:10003"}
+	extra := &remoteCommandRecorder{remote: "192.168.0.64:10004"}
+
+	require.True(t, server.acceptConn(pubsub))
+	require.True(t, server.acceptConn(other))
+	_ = server.detachPubSubConn(pubsub)
+
+	server.releaseDetachedPubSubConn(pubsub)
+	server.closeConn(pubsub)
+	server.releaseDetachedPubSubConn(pubsub)
+
+	require.True(t, server.acceptConn(next))
+	require.False(t, server.acceptConn(extra))
+
+	server.closeConn(other)
+	server.closeConn(next)
+	require.Empty(t, server.peerLimiter.active)
+}
+
 func TestRedisLeaderClientPoolStaysBelowPeerLimit(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(2))
 	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
@@ -61,6 +84,18 @@ func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
 
 	require.Equal(t, defaultRedisLeaderClientPoolSize, client.Options().PoolSize)
 	require.Less(t, client.Options().PoolSize, server.peerLimiter.limit)
+}
+
+func TestRedisBlockingLeaderClientUsesDedicatedPool(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(8))
+	shared := server.getOrCreateLeaderClient("127.0.0.1:6379")
+	defer shared.Close()
+	blocking := server.getOrCreateBlockingLeaderClient("127.0.0.1:6379")
+	defer blocking.Close()
+
+	require.NotSame(t, shared, blocking)
+	require.Equal(t, defaultRedisLeaderClientPoolSize, shared.Options().PoolSize)
+	require.Equal(t, defaultRedisBlockingLeaderClientPoolSize, blocking.Options().PoolSize)
 }
 
 func TestRedisPeerLimiterCanBeDisabled(t *testing.T) {

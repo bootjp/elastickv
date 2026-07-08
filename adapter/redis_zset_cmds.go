@@ -1152,7 +1152,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+	if r.proxyBlockingToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	timeoutSeconds, err := strconv.ParseFloat(string(cmd.Args[len(cmd.Args)-1]), 64)
