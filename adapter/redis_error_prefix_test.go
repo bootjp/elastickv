@@ -172,6 +172,22 @@ func TestHandleProxyTxnError(t *testing.T) {
 			t.Fatalf("unexpected error reply %q", c.lastErr)
 		}
 	})
+
+}
+
+func TestHandleProxyTxnHeavyCommandBusyError(t *testing.T) {
+	t.Parallel()
+	c := &captureConn{}
+	handled := handleProxyTxnError(c, errors.New(errRedisHeavyCommandPoolFull.Error()))
+	if !handled {
+		t.Fatal("handleProxyTxnError returned false")
+	}
+	if c.lastErr != errRedisHeavyCommandPoolFull.Error() {
+		t.Fatalf("last error = %q", c.lastErr)
+	}
+	if c.wroteArray {
+		t.Fatalf("unexpected array reply %d", c.lastArray)
+	}
 }
 
 func TestHandleProxyTxnCommandError(t *testing.T) {
@@ -202,6 +218,21 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 			t.Fatalf("unexpected error reply %q", c.lastErr)
 		}
 	})
+
+}
+
+func TestHandleProxyTxnCommandHeavyCommandBusyError(t *testing.T) {
+	t.Parallel()
+	cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
+	cmd.SetErr(errors.New(errRedisHeavyCommandPoolFull.Error()))
+	c := &captureConn{}
+	handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
+	if !handled {
+		t.Fatal("handleProxyTxnCommandError returned false")
+	}
+	if c.lastErr != errRedisHeavyCommandPoolFull.Error() {
+		t.Fatalf("last error = %q", c.lastErr)
+	}
 }
 
 // TestHasTransientLeaderSuffix_PinsSentinels closes the gap noted
