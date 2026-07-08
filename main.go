@@ -1506,7 +1506,9 @@ func startSQSDepthObserver(ctx context.Context, reg *monitoring.Registry, sqsSer
 // expects []monitoring.SQSQueueDepth). Same shape both sides; the
 // loop is a fixed-size copy.
 type sqsDepthSourceAdapter struct {
-	inner *adapter.SQSServer
+	inner interface {
+		SnapshotQueueDepths(context.Context) ([]adapter.SQSQueueDepth, bool)
+	}
 }
 
 func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monitoring.SQSQueueDepth, bool) {
@@ -1521,7 +1523,7 @@ func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monit
 		// existing gauges alone on a transient scan failure.
 		return nil, false
 	}
-	if len(snaps) == 0 {
+	if snaps == nil {
 		return nil, true
 	}
 	out := make([]monitoring.SQSQueueDepth, len(snaps))
