@@ -347,7 +347,7 @@ func TestSQSMetrics_SyncThrottleActions_DropsDisabledWithoutTraffic(t *testing.T
 	require.Empty(t, m.trackedThrottleGaugeQueues, "disabling the last action frees the gauge slot")
 }
 
-func TestSQSMetrics_ForgetQueue_OverflowThrottleGaugeClearsPerAction(t *testing.T) {
+func TestSQSMetrics_ForgetThrottleQueue_OverflowThrottleGaugeClearsPerAction(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
 	m := newSQSMetrics(reg)
@@ -373,7 +373,7 @@ func TestSQSMetrics_ForgetQueue_OverflowThrottleGaugeClearsPerAction(t *testing.
 	require.True(t, found)
 	require.InDelta(t, 20.0, receive, 0.001)
 
-	m.ForgetQueue("overflow-a.fifo")
+	m.ForgetThrottleQueue("overflow-a.fifo")
 	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
 		"queue":  sqsQueueOverflow,
 		"action": SQSThrottleActionSend,
@@ -386,7 +386,7 @@ func TestSQSMetrics_ForgetQueue_OverflowThrottleGaugeClearsPerAction(t *testing.
 	require.True(t, found, "_other/receive must survive while another overflow receive queue remains")
 	require.InDelta(t, 20.0, receive, 0.001)
 
-	m.ForgetQueue("overflow-b.fifo")
+	m.ForgetThrottleQueue("overflow-b.fifo")
 	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
 		"queue":  sqsQueueOverflow,
 		"action": SQSThrottleActionReceive,
@@ -442,11 +442,10 @@ func TestSQSMetrics_ObserveQueueDepth_DropsEmptyQueue(t *testing.T) {
 }
 
 // TestSQSMetrics_ForgetQueue_DropsThreeSeries pins that ForgetQueue
-// (a) removes all three state-labelled series so a deleted queue
-// stops reporting a frozen backlog, (b) frees the cardinality-
-// budget slot so a churn-heavy deployment doesn't permanently
-// exhaust the 512-entry budget, and (c) leaves the
-// (queue, partition, action) counter alone (cumulative-by-design).
+// (a) removes all three state-labelled depth series so a deleted queue stops
+// reporting a frozen backlog, (b) frees the depth cardinality-budget slot so a
+// churn-heavy deployment doesn't permanently exhaust the 512-entry budget, and
+// (c) leaves cumulative counters and throttle-token gauges alone.
 func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -466,9 +465,9 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	require.Equal(t, 0, count, "ForgetQueue must drop every state series for the queue")
 	throttleGaugeCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
 	require.NoError(t, err)
-	require.Equal(t, 0, throttleGaugeCount, "ForgetQueue must drop every throttle-token gauge for the queue")
+	require.Equal(t, 1, throttleGaugeCount, "ForgetQueue must not drop throttle-token gauges for a depth-only miss")
 	require.Empty(t, m.trackedDepthQueues, "ForgetQueue must free the depth-side cardinality slot")
-	require.Empty(t, m.trackedThrottleGaugeQueues, "ForgetQueue must free the throttle-gauge cardinality slot")
+	require.Len(t, m.trackedThrottleGaugeQueues, 1, "ForgetQueue must not free the throttle-gauge cardinality slot")
 	require.Len(t, m.trackedCounterQueues, 1, "ForgetQueue must NOT free the counter-side slot (counters are cumulative)")
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.partitionMessages.WithLabelValues("orders.fifo", "0", SQSPartitionActionSend)), 0.001,
 		"counter must survive ForgetQueue (cumulative metric)")
@@ -482,6 +481,25 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	m.ObserveQueueDepth("orders.fifo", 7, 0, 0)
 	require.InDelta(t, 7.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("orders.fifo", sqsQueueStateVisible)), 0.001,
 		"post-forget Observe must re-emit under the real queue name")
+}
+
+func TestSQSMetrics_ForgetThrottleQueue_DropsTokenGauges(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 4, true)
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionReceive, 7, false)
+	require.Len(t, m.trackedThrottleGaugeQueues, 1)
+
+	m.ForgetThrottleQueue("orders.fifo")
+
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "ForgetThrottleQueue must drop every token gauge for the queue")
+	require.Empty(t, m.trackedThrottleGaugeQueues, "ForgetThrottleQueue must free the throttle-gauge cardinality slot")
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001,
+		"throttled-request counter must survive ForgetThrottleQueue (cumulative metric)")
 }
 
 // TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp pins the
@@ -918,6 +936,35 @@ func TestSQSObserver_ObserveOnce_PreservesThrottleGaugeNewerThanDepthSnapshot(t 
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "the next successful depth tick can clear the now-old throttle-only gauge")
+}
+
+func TestSQSObserver_ObserveOnce_DepthMissPreservesThrottleGauge(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 4, false)
+	source := &fakeDepthSource{
+		ticks: []fakeDepthTick{
+			{snaps: []SQSQueueDepth{{Queue: "orders.fifo", Visible: 1}}, ok: true},
+			{snaps: nil, ok: true},
+		},
+	}
+
+	obs.ObserveOnce(source)
+	obs.ObserveOnce(source)
+
+	depthCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
+	require.NoError(t, err)
+	require.Equal(t, 0, depthCount, "depth miss still clears depth gauges through ForgetQueue")
+	value, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "depth-only miss must not delete throttle-token gauges")
+	require.InDelta(t, 4.0, value, 0.001)
+	require.Len(t, m.trackedThrottleGaugeQueues, 1, "depth-only miss must not reclaim the throttle-gauge budget slot")
 }
 
 // TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges

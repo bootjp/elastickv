@@ -474,12 +474,13 @@ func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (
 // OCC transaction (§4.2): a rejected request never reaches the
 // coordinator.
 func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
+	throttleEpoch := s.throttle.queueEpoch(queueName)
 	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
 		return nil, 0, 0, false
 	}
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch) {
 		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
@@ -759,6 +760,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	throttleEpoch := s.throttle.queueEpoch(queueName)
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
@@ -773,7 +775,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	// don't pay an extra meta read just to discover throttling is
 	// off. Sits AFTER the QueueDoesNotExist branch — a missing queue
 	// should not consume a Recv token.
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation, throttleEpoch) {
 		return
 	}
 	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)

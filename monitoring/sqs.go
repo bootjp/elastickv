@@ -129,10 +129,10 @@ type SQSQueueDepth struct {
 //     queue's slot in trackedDepthQueues so a churn-heavy deployment
 //     can reuse the budget.
 //   - throttleTokens is also a GaugeVec, but decisions are event-
-//     driven and action-labelled. It tracks the active actions per
-//     queue so disabling one bucket can drop just that action's
-//     gauge while preserving other configured actions for the same
-//     queue.
+//     driven and action-labelled. It has a separate queue/action
+//     lifetime from the depth scraper: throttle config changes or
+//     throttle-only cleanup drop token gauges, but transient depth
+//     scan misses must not delete them.
 //
 // Sharing one map across counters and gauges regresses the counter cap:
 // ForgetQueue would free a slot, a new queue would be admitted, and
@@ -344,11 +344,10 @@ func (m *SQSMetrics) SyncThrottleActions(queue string, enabledActions []string) 
 	m.mu.Unlock()
 }
 
-// ForgetQueue drops the three gauge series for a queue and frees
-// its slot in the depth-side cardinality budget so a long-running
-// deployment that regularly creates and deletes queues (CI
-// workloads, ephemeral per-job queues) doesn't permanently wedge
-// the 512-entry depth budget.
+// ForgetQueue drops the three depth gauge series for a queue and frees its slot
+// in the depth-side cardinality budget so a long-running deployment that
+// regularly creates and deletes queues (CI workloads, ephemeral per-job queues)
+// doesn't permanently wedge the 512-entry depth budget.
 //
 // Three cases, by membership at call time:
 //
@@ -378,27 +377,33 @@ func (m *SQSMetrics) SyncThrottleActions(queue string, enabledActions []string) 
 // have since been deleted.
 //
 // Caller-audit per the standing semantic-change rule: only
-// SQSObserver.observeOnce calls this (registry plumbing aside),
-// and it's invoked exactly when a queue is observed in the
-// previous tick but not the current one. The caller's contract —
-// "drop gauges for a queue that disappeared so dashboards don't
-// show frozen backlog" — is preserved AND extended consistently:
-// overflow queues, previously a silent no-op, now also stop
-// pinning the shared gauge once the last one disappears. The
-// narrowed-but-still-correct scope (counter budget never
-// reclaimed) is invisible to observeOnce because the observer
-// only writes gauges; counters are fed via ObservePartitionMessage
-// from a different code path entirely.
+// SQSObserver.observeOnce calls this (registry plumbing aside), and it is invoked
+// exactly when a queue was observed in the previous tick but not the current one.
+// The caller's depth contract is preserved, including overflow ref-counting, but
+// throttle token gauges are intentionally out of scope: a per-queue depth scan
+// miss is not evidence that throttle config changed.
 func (m *SQSMetrics) ForgetQueue(queue string) {
 	if m == nil || queue == "" {
 		return
 	}
 	m.mu.Lock()
 	depthForget := m.forgetDepthQueueLocked(queue)
+	m.mu.Unlock()
+	m.dropForgottenDepthQueue(queue, depthForget)
+}
+
+// ForgetThrottleQueue drops every token-balance gauge for queue and frees its
+// throttle-gauge budget slot. It is intentionally separate from ForgetQueue
+// because queue-depth snapshots can omit a live queue on a transient per-queue
+// scan error.
+func (m *SQSMetrics) ForgetThrottleQueue(queue string) {
+	if m == nil || queue == "" {
+		return
+	}
+	m.mu.Lock()
 	throttleForget := m.forgetThrottleQueueLocked(queue)
 	m.dropForgottenThrottleQueue(queue, throttleForget)
 	m.mu.Unlock()
-	m.dropForgottenDepthQueue(queue, depthForget)
 }
 
 type sqsGaugeForget struct {
@@ -826,7 +831,10 @@ func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}, thr
 	}
 	for _, prev := range o.metrics.snapshotThrottleGaugeQueues(throttleCutoff) {
 		if _, ok := current[prev]; !ok {
-			o.metrics.ForgetQueue(prev)
+			if _, wasDepthSeen := o.lastSeen[prev]; wasDepthSeen {
+				continue
+			}
+			o.metrics.ForgetThrottleQueue(prev)
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -131,6 +132,7 @@ type tokenBucket struct {
 // caller of sweep() is the sole goroutine the ticker drives.
 type bucketStore struct {
 	buckets      sync.Map // map[bucketKey]*tokenBucket
+	queueEpochs  sync.Map // map[string]*atomic.Uint64
 	clock        func() time.Time
 	evictedAfter time.Duration
 	sweepEvery   time.Duration
@@ -157,6 +159,35 @@ func newBucketStore(clock func() time.Time, evictedAfter time.Duration) *bucketS
 // time-window overrides.
 func newBucketStoreDefault() *bucketStore {
 	return newBucketStore(time.Now, throttleIdleEvictAfter)
+}
+
+func (b *bucketStore) queueEpoch(queue string) uint64 {
+	if b == nil || queue == "" {
+		return 0
+	}
+	v, ok := b.queueEpochs.Load(queue)
+	if !ok {
+		return 0
+	}
+	epoch, _ := v.(*atomic.Uint64)
+	if epoch == nil {
+		return 0
+	}
+	return epoch.Load()
+}
+
+func (b *bucketStore) bumpQueueEpoch(queue string) {
+	if b == nil || queue == "" {
+		return
+	}
+	b.queueEpochCell(queue).Add(1)
+}
+
+func (b *bucketStore) queueEpochCell(queue string) *atomic.Uint64 {
+	fresh := &atomic.Uint64{}
+	actual, _ := b.queueEpochs.LoadOrStore(queue, fresh)
+	epoch, _ := actual.(*atomic.Uint64)
+	return epoch
 }
 
 // chargeOutcome is returned from charge so the caller can build the
@@ -387,6 +418,7 @@ func (b *bucketStore) invalidateQueue(queue string) {
 	if b == nil {
 		return
 	}
+	b.bumpQueueEpoch(queue)
 	// Incarnation participates in the key: we do
 	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes
@@ -601,6 +633,7 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 	if s.throttle == nil {
 		return true
 	}
+	throttleEpoch := s.throttle.queueEpoch(queueName)
 	throttle, incarnation, err := s.queueThrottleConfig(r, queueName)
 	if err != nil {
 		// Fail closed on a transient storage error. Earlier code
@@ -614,26 +647,30 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 		writeSQSErrorFromErr(w, err)
 		return false
 	}
-	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation)
+	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation, throttleEpoch)
 }
 
-// chargeQueueWithThrottle is the variant for handlers that already
-// have the throttle config in hand from their own meta load. Drops
-// the per-request meta load chargeQueue does, avoiding redundant
-// storage reads on the hot path. incarnation is
-// sqsQueueMeta.Incarnation: it must come from the same meta snapshot
-// the throttle config was read from so a recreate committed
-// mid-request lands in a fresh bucket on the next call rather than
-// mixing tokens with the prior incarnation. NOTE: meta.Incarnation,
-// NOT meta.Generation — PurgeQueue bumps Generation but preserves
-// Incarnation, so keying the bucket by Generation would let a caller
+// chargeQueueWithThrottle is the variant for handlers that already have the
+// throttle config in hand from their own meta load. Drops the per-request meta
+// load chargeQueue does, avoiding redundant storage reads on the hot path.
+// incarnation is sqsQueueMeta.Incarnation: it must come from the same meta
+// snapshot the throttle config was read from so a recreate committed mid-request
+// lands in a fresh bucket on the next call rather than mixing tokens with the
+// prior incarnation. throttleEpoch must be captured before the same meta read;
+// if SetQueueAttributes/Delete/Create invalidates the queue after that snapshot,
+// the request result is still honoured but the stale token-balance metric is not
+// allowed to recreate a gauge the config path already reset. NOTE:
+// meta.Incarnation, NOT meta.Generation — PurgeQueue bumps Generation but
+// preserves Incarnation, so keying the bucket by Generation would let a caller
 // bypass the rate limit by repeatedly purging.
-func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) bool {
+func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64, throttleEpoch uint64) bool {
 	if s.throttle == nil {
 		return true
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
-	s.observeThrottleDecision(queueName, outcome)
+	if s.throttle.queueEpoch(queueName) == throttleEpoch {
+		s.observeThrottleDecision(queueName, outcome)
+	}
 	if outcome.allowed {
 		return true
 	}

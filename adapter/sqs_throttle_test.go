@@ -94,10 +94,10 @@ func TestSQSServer_ChargeQueueWithThrottleObservesMetrics(t *testing.T) {
 
 	for range 10 {
 		rec := httptest.NewRecorder()
-		require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+		require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, 0))
 	}
 	rec := httptest.NewRecorder()
-	require.False(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	require.False(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, 0))
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 
 	require.Len(t, observer.reports, 11)
@@ -115,16 +115,39 @@ func TestSQSServer_ChargeQueueWithThrottleDoesNotSyncMetricActions(t *testing.T)
 	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
 
 	rec := httptest.NewRecorder()
-	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, 0))
 	require.Empty(t, observer.syncs, "request-path throttle decisions must not sync enabled actions from a potentially stale meta snapshot")
 	require.Empty(t, observer.forgotten, "request-path throttle decisions must not forget gauges from a potentially stale meta snapshot")
 
 	observer.forgotten = nil
 	observer.syncs = nil
 	rec = httptest.NewRecorder()
-	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, nil, 1))
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, nil, 1, 0))
 	require.Empty(t, observer.syncs)
 	require.Empty(t, observer.forgotten)
+}
+
+func TestSQSServer_ChargeQueueWithThrottleSkipsStaleMetricAfterInvalidate(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	srv.throttle = newBucketStore(func() time.Time { return now }, throttleIdleEvictAfter)
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+
+	staleEpoch := srv.throttle.queueEpoch("orders.fifo")
+	srv.throttle.invalidateQueue("orders.fifo")
+
+	rec := httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, staleEpoch))
+	require.Empty(t, observer.reports, "stale pre-invalidation snapshot must not recreate a reset token gauge")
+
+	freshEpoch := srv.throttle.queueEpoch("orders.fifo")
+	rec = httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, freshEpoch))
+	require.Len(t, observer.reports, 1, "fresh post-invalidation snapshot may publish the new token gauge")
+	require.Equal(t, "orders.fifo", observer.reports[0].queue)
+	require.Equal(t, SQSThrottleActionSend, observer.reports[0].action)
 }
 
 // TestBucketStore_Empty_ShortCircuit covers the post-validator
