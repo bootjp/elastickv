@@ -134,10 +134,10 @@ func TestSkipGate_SkipsWhenFSMFreshEnough(t *testing.T) {
 	tok := snapshotToken{Index: snapIndex, CRC32C: crc}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(tok.Index, tok.CRC32C),
-		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.NoError(t, gateErr)
 
 	require.Empty(t, fsm.bodyBytes, "skip path MUST NOT call fsm.Restore")
@@ -164,10 +164,10 @@ func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
 	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(snapIndex, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.NoError(t, gateErr)
 
 	require.Equal(t, payload, fsm.bodyBytes, "executed path MUST call fsm.Restore with full payload")
@@ -196,9 +196,9 @@ func TestSkipGate_ReturnsEffectiveAppliedOnSkip(t *testing.T) {
 	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(snapIndex, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
-	effective, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	effective, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, appliedIdx, effective,
 		"skip path MUST return the FSM's durable applied index so Engine.Open seeds e.applied above snapshot.Index")
@@ -220,10 +220,10 @@ func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
 	fsm := &skipGateFSM{applied: snapIndex + 50, appliedPresent: true}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(snapIndex, wrongCRC),
-		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.Error(t, err, "CRC mismatch must surface")
 	require.Empty(t, obs.skipped, "skip metric MUST NOT fire when applyHeaderStateOnSkip errors")
 	require.Empty(t, obs.executed, "execute metric MUST NOT fire either")
@@ -239,7 +239,7 @@ func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
 func TestColdStartSkipThreshold(t *testing.T) {
 	t.Parallel()
 	mkSnap := func(idx uint64) raftpb.Snapshot {
-		return raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: idx}}
+		return raftTestSnapshot(idx, 0, nil, nil)
 	}
 	cases := []struct {
 		name     string
@@ -247,10 +247,10 @@ func TestColdStartSkipThreshold(t *testing.T) {
 		hs       raftpb.HardState
 		expected uint64
 	}{
-		{"hardState.Commit equals snapshot (fresh follower)", mkSnap(100), raftpb.HardState{Commit: 100}, 100},
-		{"hardState.Commit below snapshot (pre-replay)", mkSnap(100), raftpb.HardState{Commit: 50}, 100},
-		{"hardState.Commit above snapshot (post-replay)", mkSnap(100), raftpb.HardState{Commit: 150}, 150},
-		{"hardState.Commit zero", mkSnap(100), raftpb.HardState{Commit: 0}, 100},
+		{"hardState.Commit equals snapshot (fresh follower)", mkSnap(100), testHardState(0, 100), 100},
+		{"hardState.Commit below snapshot (pre-replay)", mkSnap(100), testHardState(0, 50), 100},
+		{"hardState.Commit above snapshot (post-replay)", mkSnap(100), testHardState(0, 150), 150},
+		{"hardState.Commit zero", mkSnap(100), testHardState(0, 0), 100},
 	}
 	for _, c := range cases {
 		got := coldStartSkipThreshold(c.snap, c.hs)
@@ -288,7 +288,7 @@ func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
 	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(snapIndex, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
 	_, gateErr := restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil)
@@ -316,10 +316,10 @@ func TestSkipGate_FallbackMissingMeta(t *testing.T) {
 	fsm := &skipGateFSM{appliedPresent: false} // missing
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(50, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: 50},
+		Metadata: testSnapshotMetadata(50, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.NoError(t, gateErr)
 	require.Equal(t, payload, fsm.bodyBytes, "missing meta MUST fall back to full restore")
 	require.Equal(t, []string{"missing_meta"}, obs.fallbacks)
@@ -335,10 +335,10 @@ func TestSkipGate_FallbackReadErr(t *testing.T) {
 	fsm := &skipGateFSM{appliedErr: io.ErrUnexpectedEOF}
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(50, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: 50},
+		Metadata: testSnapshotMetadata(50, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.NoError(t, gateErr)
 	require.Equal(t, payload, fsm.bodyBytes, "read_err MUST fall back to full restore")
 	require.Equal(t, []string{"read_err"}, obs.fallbacks)
@@ -354,10 +354,10 @@ func TestSkipGate_FallbackNotReader(t *testing.T) {
 	fsm := &dummyFSM{} // no LastAppliedIndex method
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(50, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: 50},
+		Metadata: testSnapshotMetadata(50, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, obs, nil)
 	require.NoError(t, gateErr)
 	require.NotEmpty(t, fsm.restored, "not_reader MUST fall back to full restore")
 	require.Equal(t, []string{"not_reader"}, obs.fallbacks)

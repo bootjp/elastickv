@@ -75,7 +75,7 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 	if err != nil {
 		t.Fatalf("WrapRaftPayload: %v", err)
 	}
-	return raftpb.Entry{Index: index, Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(7, wrapped)}
+	return raftpb.Entry{Index: uint64Ptr(index), Type: entryTypePtr(raftpb.EntryNormal), Data: encodeProposalEnvelope(7, wrapped)}
 }
 
 // TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure pins
@@ -129,8 +129,8 @@ func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 	// regardless of whether it's a real envelope or cleartext, because
 	// without a cipher we cannot tell them apart.
 	entry := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: cutover + 1,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(cutover + 1),
 		Data:  encodeProposalEnvelope(99, []byte("would-be wrapped payload")),
 	}
 	_, err := e.applyNormalEntry(entry, false)
@@ -147,8 +147,8 @@ func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 	// were written before encryption was activated and remain
 	// legitimately cleartext.)
 	belowCutoverEntry := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: cutover,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(cutover),
 		Data:  encodeProposalEnvelope(11, []byte("legacy cleartext")),
 	}
 	if _, err := e.applyNormalEntry(belowCutoverEntry, false); err != nil {
@@ -168,7 +168,7 @@ func TestApplyNormalEntry_NoCipher_PassThrough(t *testing.T) {
 	fsm := &fakeStateMachine{}
 	e := newTestEngine(fsm, nil, nil)
 	plain := []byte("op=put key=k1 v=hello")
-	entry := raftpb.Entry{Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(42, plain)}
+	entry := raftpb.Entry{Type: entryTypePtr(raftpb.EntryNormal), Data: encodeProposalEnvelope(42, plain)}
 	if _, err := e.applyNormalEntry(entry, false); err != nil {
 		t.Fatalf("applyNormalEntry: %v", err)
 	}
@@ -196,8 +196,8 @@ func TestApplyNormalEntry_BelowCutover_PassThrough(t *testing.T) {
 	for _, idx := range []uint64{1, 50, cutover - 1, cutover} {
 		fsm.calls.Store(0)
 		entry := raftpb.Entry{
-			Type:  raftpb.EntryNormal,
-			Index: idx,
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Index: uint64Ptr(idx),
 			Data:  encodeProposalEnvelope(11, cleartextPayload),
 		}
 		if _, err := e.applyNormalEntry(entry, false); err != nil {
@@ -322,8 +322,8 @@ func TestApplyNormalEntry_BoundaryCutover(t *testing.T) {
 	// cutover itself: cleartext payload — must NOT be unwrapped.
 	cleartext := []byte("enable-raft-envelope flag")
 	atCutover := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: cutover,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(cutover),
 		Data:  encodeProposalEnvelope(13, cleartext),
 	}
 	if _, err := e.applyNormalEntry(atCutover, false); err != nil {
@@ -364,7 +364,7 @@ func TestApplyNormalEntry_ProposalIDStillResolvable(t *testing.T) {
 		t.Fatalf("WrapRaftPayload: %v", err)
 	}
 	data := encodeProposalEnvelope(wantID, wrapped)
-	entry := raftpb.Entry{Type: raftpb.EntryNormal, Index: cutover + 1, Data: data}
+	entry := raftpb.Entry{Type: entryTypePtr(raftpb.EntryNormal), Index: uint64Ptr(cutover + 1), Data: data}
 	if _, err := e.applyNormalEntry(entry, false); err != nil {
 		t.Fatalf("applyNormalEntry: %v", err)
 	}
@@ -392,8 +392,8 @@ func TestApplyNormalEntry_NoCutoverDefault(t *testing.T) {
 	cleartext := []byte("legacy cleartext")
 	for _, idx := range []uint64{1, 1 << 20, 1 << 40, ^uint64(0) - 1} {
 		entry := raftpb.Entry{
-			Type:  raftpb.EntryNormal,
-			Index: idx,
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Index: uint64Ptr(idx),
 			Data:  encodeProposalEnvelope(7, cleartext),
 		}
 		if _, err := e.applyNormalEntry(entry, false); err != nil {
@@ -445,8 +445,8 @@ func TestApplyCommitted_HaltApply_DoesNotAdvanceApplied(t *testing.T) {
 	e.appliedIndex.Store(startApplied)
 
 	good := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: 100,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(100),
 		Data:  encodeProposalEnvelope(7, []byte("payload")),
 	}
 	err := e.applyCommitted([]raftpb.Entry{good})
@@ -475,8 +475,8 @@ func TestApplyCommitted_HaltApply_NilContinues(t *testing.T) {
 	fsm := &haltStateMachine{err: nil}
 	e := newTestEngine(fsm, nil, nil)
 	good := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: 100,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(100),
 		Data:  encodeProposalEnvelope(7, []byte("payload")),
 	}
 	if err := e.applyCommitted([]raftpb.Entry{good}); err != nil {
