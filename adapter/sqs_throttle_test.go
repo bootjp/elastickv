@@ -23,9 +23,15 @@ type throttleForgetReport struct {
 	action string
 }
 
+type throttleSyncReport struct {
+	queue   string
+	enabled []string
+}
+
 type recordingSQSThrottleObserver struct {
 	reports   []throttleObserveReport
 	forgotten []throttleForgetReport
+	syncs     []throttleSyncReport
 }
 
 func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
@@ -39,6 +45,28 @@ func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, act
 
 func (r *recordingSQSThrottleObserver) ForgetThrottleAction(queue string, action string) {
 	r.forgotten = append(r.forgotten, throttleForgetReport{queue: queue, action: action})
+}
+
+func (r *recordingSQSThrottleObserver) SyncThrottleActions(queue string, enabledActions []string) {
+	enabled := append([]string(nil), enabledActions...)
+	r.syncs = append(r.syncs, throttleSyncReport{queue: queue, enabled: enabled})
+	for _, action := range disabledThrottleMetricActionsFromEnabled(enabled) {
+		r.forgotten = append(r.forgotten, throttleForgetReport{queue: queue, action: action})
+	}
+}
+
+func disabledThrottleMetricActionsFromEnabled(enabledActions []string) []string {
+	enabled := make(map[string]struct{}, len(enabledActions))
+	for _, action := range enabledActions {
+		enabled[action] = struct{}{}
+	}
+	disabled := make([]string, 0, len(sqsThrottleMetricActions))
+	for _, action := range sqsThrottleMetricActions {
+		if _, ok := enabled[action]; !ok {
+			disabled = append(disabled, action)
+		}
+	}
+	return disabled
 }
 
 // TestBucketStore_DefaultOff_ShortCircuit pins the contract that a
@@ -86,12 +114,16 @@ func TestSQSServer_ChargeQueueWithThrottleForgetsDisabledMetrics(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	require.Contains(t, observer.syncs, throttleSyncReport{queue: "orders.fifo", enabled: []string{SQSThrottleActionSend}})
+	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionSend})
 	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionReceive})
 	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionDefault})
 
 	observer.forgotten = nil
+	observer.syncs = nil
 	rec = httptest.NewRecorder()
 	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, nil, 1))
+	require.Contains(t, observer.syncs, throttleSyncReport{queue: "orders.fifo"})
 	require.ElementsMatch(t, []throttleForgetReport{
 		{queue: "orders.fifo", action: SQSThrottleActionSend},
 		{queue: "orders.fifo", action: SQSThrottleActionReceive},

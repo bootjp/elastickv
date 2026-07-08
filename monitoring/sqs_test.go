@@ -318,6 +318,35 @@ func TestSQSMetrics_ForgetThrottleAction_DropsGaugeAndFreesSlot(t *testing.T) {
 	require.Empty(t, m.trackedThrottleGaugeQueues, "last disabled action frees the throttle gauge queue slot")
 }
 
+func TestSQSMetrics_SyncThrottleActions_DropsDisabledWithoutTraffic(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 5, false)
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionReceive, 7, false)
+
+	m.SyncThrottleActions("orders.fifo", []string{SQSThrottleActionSend})
+	send, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "configured send bucket must keep its token gauge")
+	require.InDelta(t, 5.0, send, 0.001)
+	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionReceive,
+	})
+	require.False(t, found, "disabled receive bucket must be removed without waiting for more traffic")
+	require.Len(t, m.trackedThrottleGaugeQueues, 1, "queue stays admitted while send remains configured")
+
+	m.SyncThrottleActions("orders.fifo", nil)
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count)
+	require.Empty(t, m.trackedThrottleGaugeQueues, "disabling the last action frees the gauge slot")
+}
+
 func TestSQSMetrics_ForgetQueue_OverflowThrottleGaugeClearsPerAction(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -763,6 +792,14 @@ func (f *fakeDepthSource) SnapshotQueueDepths(_ context.Context) ([]SQSQueueDept
 	return t.snaps, t.ok
 }
 
+type callbackDepthSource struct {
+	fn func() ([]SQSQueueDepth, bool)
+}
+
+func (f callbackDepthSource) SnapshotQueueDepths(context.Context) ([]SQSQueueDepth, bool) {
+	return f.fn()
+}
+
 // TestSQSObserver_ObserveOnce_EmitsAndForgets pins the observer's
 // state machine: queues present in the current tick get gauges
 // emitted, queues that disappeared since the last tick get
@@ -855,6 +892,32 @@ func TestSQSObserver_ObserveOnce_ForgetsThrottleOnlyQueues(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "successful depth tick must clear throttle-only queues absent from the snapshot")
 	require.Empty(t, m.trackedThrottleGaugeQueues, "throttle gauge budget slot must be reclaimed for the short-lived queue")
+}
+
+func TestSQSObserver_ObserveOnce_PreservesThrottleGaugeNewerThanDepthSnapshot(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	obs.ObserveOnce(callbackDepthSource{fn: func() ([]SQSQueueDepth, bool) {
+		m.ObserveThrottleDecision("newer.fifo", SQSThrottleActionSend, 4, false)
+		return nil, true
+	}})
+
+	value, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "newer.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "a throttle gauge emitted after the cleanup cutoff must survive until the next depth tick")
+	require.InDelta(t, 4.0, value, 0.001)
+
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: nil, ok: true}},
+	})
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "the next successful depth tick can clear the now-old throttle-only gauge")
 }
 
 // TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges

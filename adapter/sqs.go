@@ -229,6 +229,7 @@ type SQSPartitionObserver interface {
 type SQSThrottleObserver interface {
 	ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool)
 	ForgetThrottleAction(queue string, action string)
+	SyncThrottleActions(queue string, enabledActions []string)
 }
 
 // SQS metric action labels mirror the values from monitoring/sqs.go.
@@ -298,9 +299,7 @@ func (s *SQSServer) observeThrottleDecision(queue string, throttle *sqsQueueThro
 	if s == nil || s.throttleObserver == nil {
 		return
 	}
-	for _, action := range disabledThrottleMetricActions(throttle) {
-		s.throttleObserver.ForgetThrottleAction(queue, action)
-	}
+	s.observeThrottleConfig(queue, throttle)
 	if !outcome.bucketPresent && outcome.allowed {
 		return
 	}
@@ -312,21 +311,28 @@ func (s *SQSServer) observeThrottleDecision(queue string, throttle *sqsQueueThro
 	)
 }
 
-func disabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {
-	disabled := make([]string, 0, len(sqsThrottleMetricActions))
+func (s *SQSServer) observeThrottleConfig(queue string, throttle *sqsQueueThrottle) {
+	if s == nil || s.throttleObserver == nil {
+		return
+	}
+	s.throttleObserver.SyncThrottleActions(queue, enabledThrottleMetricActions(throttle))
+}
+
+func enabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {
 	if throttle == nil || throttle.IsEmpty() {
-		return append(disabled, sqsThrottleMetricActions[:]...)
+		return nil
 	}
-	if throttle.SendCapacity == 0 {
-		disabled = append(disabled, SQSThrottleActionSend)
+	enabled := make([]string, 0, len(sqsThrottleMetricActions))
+	if throttle.SendCapacity > 0 {
+		enabled = append(enabled, SQSThrottleActionSend)
 	}
-	if throttle.RecvCapacity == 0 {
-		disabled = append(disabled, SQSThrottleActionReceive)
+	if throttle.RecvCapacity > 0 {
+		enabled = append(enabled, SQSThrottleActionReceive)
 	}
-	if throttle.DefaultCapacity == 0 {
-		disabled = append(disabled, SQSThrottleActionDefault)
+	if throttle.DefaultCapacity > 0 {
+		enabled = append(enabled, SQSThrottleActionDefault)
 	}
-	return disabled
+	return enabled
 }
 
 // WithSQSPartitionResolver installs the cluster's partition

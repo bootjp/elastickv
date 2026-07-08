@@ -689,7 +689,7 @@ Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_pre
 
 1. Query-protocol full XML fidelity for older SDKs.
 2. `ApproximateNumberOfMessagesDelayed` / `NotVisible` accuracy.
-3. Per-queue throttling and fairness across tenants has landed; see [`2026_04_26_implemented_sqs_per_queue_throttling.md`](2026_04_26_implemented_sqs_per_queue_throttling.md).
+3. Per-queue throttling has landed; see [`2026_04_26_implemented_sqs_per_queue_throttling.md`](2026_04_26_implemented_sqs_per_queue_throttling.md).
 4. Split-queue FIFO for very hot queues.
 5. Console UI polish: in-flight tab with per-message countdown, filtering, dark mode.
 

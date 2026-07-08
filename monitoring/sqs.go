@@ -55,6 +55,7 @@ type SQSPartitionObserver interface {
 type SQSThrottleObserver interface {
 	ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool)
 	ForgetThrottleAction(queue string, action string)
+	SyncThrottleActions(queue string, enabledActions []string)
 }
 
 // SQSDepthSource is the contract a per-tick queue-depth source must
@@ -150,6 +151,8 @@ type SQSMetrics struct {
 	trackedThrottleCounterQueues map[string]struct{}
 	trackedDepthQueues           map[string]struct{}
 	trackedThrottleGaugeQueues   map[string]map[string]struct{}
+	throttleGaugeQueueSeq        map[string]uint64
+	throttleGaugeSeq             uint64
 	// overflowDepthQueues is the set of queue names whose depth
 	// gauge is currently collapsed onto the shared sqsQueueOverflow
 	// label. Tracked separately from trackedDepthQueues (which
@@ -210,6 +213,7 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 		trackedThrottleCounterQueues: map[string]struct{}{},
 		trackedDepthQueues:           map[string]struct{}{},
 		trackedThrottleGaugeQueues:   map[string]map[string]struct{}{},
+		throttleGaugeQueueSeq:        map[string]uint64{},
 		overflowDepthQueues:          map[string]struct{}{},
 		overflowThrottleGaugeQueues:  map[string]map[string]struct{}{},
 	}
@@ -283,11 +287,10 @@ func (m *SQSMetrics) ObserveThrottleDecision(queue string, action string, tokens
 		queueCounterLabel := m.admitForThrottleCounterBudget(queue)
 		m.throttledRequests.WithLabelValues(queueCounterLabel, action).Inc()
 	}
-	queueGaugeLabel, overflowActionsToDrop := m.admitForThrottleGaugeBudget(queue, action)
-	for _, action := range overflowActionsToDrop {
-		m.dropThrottleGaugeActionFor(sqsQueueOverflow, action)
-	}
+	m.mu.Lock()
+	queueGaugeLabel := m.admitForThrottleGaugeBudgetLocked(queue, action)
 	m.throttleTokens.WithLabelValues(queueGaugeLabel, action).Set(tokensRemaining)
+	m.mu.Unlock()
 }
 
 // ForgetThrottleAction removes the token-balance gauge for one queue/action
@@ -302,13 +305,43 @@ func (m *SQSMetrics) ForgetThrottleAction(queue string, action string) {
 	}
 	m.mu.Lock()
 	forget := m.forgetThrottleActionLocked(queue, action)
-	m.mu.Unlock()
 	if forget.tracked {
 		m.dropThrottleGaugeActionFor(queue, action)
 	}
 	if forget.overflowSetEmpty {
 		m.dropThrottleGaugeActionFor(sqsQueueOverflow, action)
 	}
+	m.mu.Unlock()
+}
+
+// SyncThrottleActions reconciles token-balance gauges after a queue's throttle
+// configuration changes, even when no later request touches the disabled
+// bucket. enabledActions is the configured metric-action set; omitted actions
+// have their gauges removed. Counters intentionally survive.
+func (m *SQSMetrics) SyncThrottleActions(queue string, enabledActions []string) {
+	if m == nil || queue == "" {
+		return
+	}
+	enabled := make(map[string]struct{}, len(enabledActions))
+	for _, action := range enabledActions {
+		if sqsValidThrottleAction(action) {
+			enabled[action] = struct{}{}
+		}
+	}
+	m.mu.Lock()
+	for _, action := range []string{SQSThrottleActionSend, SQSThrottleActionReceive, SQSThrottleActionDefault} {
+		if _, ok := enabled[action]; ok {
+			continue
+		}
+		forget := m.forgetThrottleActionLocked(queue, action)
+		if forget.tracked {
+			m.dropThrottleGaugeActionFor(queue, action)
+		}
+		if forget.overflowSetEmpty {
+			m.dropThrottleGaugeActionFor(sqsQueueOverflow, action)
+		}
+	}
+	m.mu.Unlock()
 }
 
 // ForgetQueue drops the three gauge series for a queue and frees
@@ -363,9 +396,9 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 	m.mu.Lock()
 	depthForget := m.forgetDepthQueueLocked(queue)
 	throttleForget := m.forgetThrottleQueueLocked(queue)
+	m.dropForgottenThrottleQueue(queue, throttleForget)
 	m.mu.Unlock()
 	m.dropForgottenDepthQueue(queue, depthForget)
-	m.dropForgottenThrottleQueue(queue, throttleForget)
 }
 
 type sqsGaugeForget struct {
@@ -404,6 +437,7 @@ func (m *SQSMetrics) forgetThrottleQueueLocked(queue string) sqsThrottleGaugeFor
 	if throttleTracked {
 		delete(m.trackedThrottleGaugeQueues, queue)
 	}
+	delete(m.throttleGaugeQueueSeq, queue)
 	return sqsThrottleGaugeForget{
 		tracked:         throttleTracked,
 		overflowActions: m.removeThrottleOverflowQueueLocked(queue),
@@ -430,6 +464,9 @@ func (m *SQSMetrics) forgetThrottleActionLocked(queue string, action string) sqs
 			}
 		}
 	}
+	if !m.throttleGaugeQueueTrackedLocked(queue) {
+		delete(m.throttleGaugeQueueSeq, queue)
+	}
 	return forget
 }
 
@@ -445,7 +482,22 @@ func (m *SQSMetrics) removeThrottleOverflowQueueLocked(queue string) []string {
 			emptyActions = append(emptyActions, action)
 		}
 	}
+	if !m.throttleGaugeQueueTrackedLocked(queue) {
+		delete(m.throttleGaugeQueueSeq, queue)
+	}
 	return emptyActions
+}
+
+func (m *SQSMetrics) throttleGaugeQueueTrackedLocked(queue string) bool {
+	if _, ok := m.trackedThrottleGaugeQueues[queue]; ok {
+		return true
+	}
+	for _, queues := range m.overflowThrottleGaugeQueues {
+		if _, ok := queues[queue]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *SQSMetrics) dropForgottenDepthQueue(queue string, forget sqsGaugeForget) {
@@ -544,17 +596,20 @@ func (m *SQSMetrics) admitForDepthBudget(queue string) string {
 	return queue
 }
 
-// admitForThrottleGaugeBudget mirrors admitForDepthBudget for the
-// event-driven throttle-token gauge. It is separate from queue depth
-// because a queue can emit throttle decisions without being present in
-// the next depth scrape yet.
-func (m *SQSMetrics) admitForThrottleGaugeBudget(queue string, action string) (string, []string) {
-	m.mu.Lock()
+// admitForThrottleGaugeBudgetLocked mirrors admitForDepthBudget for the
+// event-driven throttle-token gauge. It is separate from queue depth because a
+// queue can emit throttle decisions without being present in the next depth
+// scrape yet. m.mu must be held so _other deletions cannot race a concurrent
+// overflow Set for the same action.
+func (m *SQSMetrics) admitForThrottleGaugeBudgetLocked(queue string, action string) string {
+	m.throttleGaugeSeq++
+	m.throttleGaugeQueueSeq[queue] = m.throttleGaugeSeq
 	if actions, ok := m.trackedThrottleGaugeQueues[queue]; ok {
 		actions[action] = struct{}{}
-		overflowActionsToDrop := m.removeThrottleOverflowQueueLocked(queue)
-		m.mu.Unlock()
-		return queue, overflowActionsToDrop
+		for _, overflowAction := range m.removeThrottleOverflowQueueLocked(queue) {
+			m.dropThrottleGaugeActionFor(sqsQueueOverflow, overflowAction)
+		}
+		return queue
 	}
 	if len(m.trackedThrottleGaugeQueues) >= sqsMaxTrackedQueues {
 		queues := m.overflowThrottleGaugeQueues[action]
@@ -563,16 +618,25 @@ func (m *SQSMetrics) admitForThrottleGaugeBudget(queue string, action string) (s
 			m.overflowThrottleGaugeQueues[action] = queues
 		}
 		queues[queue] = struct{}{}
-		m.mu.Unlock()
-		return sqsQueueOverflow, nil
+		return sqsQueueOverflow
 	}
 	m.trackedThrottleGaugeQueues[queue] = map[string]struct{}{action: {}}
-	overflowActionsToDrop := m.removeThrottleOverflowQueueLocked(queue)
-	m.mu.Unlock()
-	return queue, overflowActionsToDrop
+	for _, overflowAction := range m.removeThrottleOverflowQueueLocked(queue) {
+		m.dropThrottleGaugeActionFor(sqsQueueOverflow, overflowAction)
+	}
+	return queue
 }
 
-func (m *SQSMetrics) snapshotThrottleGaugeQueues() []string {
+func (m *SQSMetrics) throttleGaugeSnapshotCutoff() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.throttleGaugeSeq
+}
+
+func (m *SQSMetrics) snapshotThrottleGaugeQueues(cutoff uint64) []string {
 	if m == nil {
 		return nil
 	}
@@ -581,11 +645,17 @@ func (m *SQSMetrics) snapshotThrottleGaugeQueues() []string {
 	seen := make(map[string]struct{}, len(m.trackedThrottleGaugeQueues))
 	queues := make([]string, 0, len(m.trackedThrottleGaugeQueues)+len(m.overflowThrottleGaugeQueues))
 	for queue := range m.trackedThrottleGaugeQueues {
+		if m.throttleGaugeQueueSeq[queue] > cutoff {
+			continue
+		}
 		seen[queue] = struct{}{}
 		queues = append(queues, queue)
 	}
 	for _, overflowQueues := range m.overflowThrottleGaugeQueues {
 		for queue := range overflowQueues {
+			if m.throttleGaugeQueueSeq[queue] > cutoff {
+				continue
+			}
 			if _, ok := seen[queue]; ok {
 				continue
 			}
@@ -710,6 +780,7 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	if o == nil || o.metrics == nil || source == nil {
 		return
 	}
+	throttleCutoff := o.metrics.throttleGaugeSnapshotCutoff()
 	snaps, ok := source.SnapshotQueueDepths(ctx)
 	if !ok {
 		// Source signalled "skip this tick" (transient catalog-scan
@@ -734,7 +805,7 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	// tick. Reclaiming first lets phase 2's admissions reuse the
 	// freed slots immediately.
 	o.mu.Lock()
-	o.forgetMissingQueuesLocked(current)
+	o.forgetMissingQueuesLocked(current, throttleCutoff)
 	o.lastSeen = current
 	o.mu.Unlock()
 	// Phase 2: emit gauges for the current tick. Slots freed in
@@ -747,13 +818,13 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	}
 }
 
-func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}) {
+func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}, throttleCutoff uint64) {
 	for prev := range o.lastSeen {
 		if _, ok := current[prev]; !ok {
 			o.metrics.ForgetQueue(prev)
 		}
 	}
-	for _, prev := range o.metrics.snapshotThrottleGaugeQueues() {
+	for _, prev := range o.metrics.snapshotThrottleGaugeQueues(throttleCutoff) {
 		if _, ok := current[prev]; !ok {
 			o.metrics.ForgetQueue(prev)
 		}

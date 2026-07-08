@@ -353,7 +353,7 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 	if strings.TrimSpace(name) == "" || len(attrs) == 0 {
 		return ErrAdminSQSValidation
 	}
-	throttleChanged, err := s.setQueueAttributesWithRetry(ctx, name, attrs)
+	throttleChanged, throttle, err := s.setQueueAttributesWithRetry(ctx, name, attrs)
 	if err != nil {
 		if isSQSAdminQueueDoesNotExist(err) {
 			return ErrAdminSQSNotFound
@@ -365,6 +365,7 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 	}
 	if throttleChanged {
 		s.throttle.invalidateQueue(name)
+		s.observeThrottleConfig(name, throttle)
 	}
 	return nil
 }
