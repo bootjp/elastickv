@@ -2169,10 +2169,10 @@ const file_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"1\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"A\n" +
 	"\rRawGetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x0e\n" +
-	"\x02ts\x18\x03 \x01(\x04R\x02ts\"b\n" +
+	"\x02ts\x18\x03 \x01(\x04R\x02tsJ\x04\b\x04\x10\x05R\bgroup_id\"b\n" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
@@ -2186,13 +2186,13 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x88\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x98\x01\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x03R\x05limit\x12\x0e\n" +
 	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
-	"\areverse\x18\x05 \x01(\bR\areverse\"3\n" +
+	"\areverse\x18\x05 \x01(\bR\areverseJ\x04\b\x06\x10\aR\bgroup_id\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +
