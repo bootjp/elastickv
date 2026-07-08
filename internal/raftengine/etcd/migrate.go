@@ -11,6 +11,8 @@ import (
 
 const migrationTempSuffix = ".migrating"
 
+var errMigrationDestinationExists = errors.New("etcd migration: destination already exists")
+
 type MigrationStats struct {
 	SnapshotBytes int64
 	Peers         int
@@ -108,8 +110,11 @@ func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {
 }
 
 func finalizeMigrationDir(tempDir string, destDataDir string) error {
-	if err := os.Rename(tempDir, destDataDir); err != nil {
+	if err := renameDirNoReplace(tempDir, destDataDir); err != nil {
 		_ = os.RemoveAll(tempDir)
+		if isRenameNoReplaceExists(err) {
+			return errors.Wrapf(errMigrationDestinationExists, "%s", destDataDir)
+		}
 		return errors.WithStack(err)
 	}
 	if err := syncDir(filepath.Dir(destDataDir)); err != nil {

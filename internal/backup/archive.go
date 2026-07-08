@@ -1,0 +1,523 @@
+package backup
+
+import (
+	"archive/tar"
+	"bufio"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/cockroachdb/errors"
+	"github.com/klauspost/compress/zstd"
+)
+
+const (
+	ArchiveCompressionNone = "none"
+	ArchiveCompressionZstd = "zstd"
+
+	archiveDefaultDirPerm   fs.FileMode = 0o755
+	archiveDefaultFilePerm  fs.FileMode = 0o600
+	archiveWritableDirPerm  fs.FileMode = 0o700
+	archiveMaxUnpackEntries             = 1_000_000
+	archiveMaxUnpackBytes   int64       = 1 << 40
+)
+
+var (
+	ErrArchiveCompressionUnsupported = errors.New("backup archive: unsupported compression")
+	ErrArchivePathUnsafe             = errors.New("backup archive: unsafe path")
+	ErrArchiveNonRegular             = errors.New("backup archive: non-regular file")
+	ErrArchiveDestinationExists      = errors.New("backup archive: destination exists")
+	ErrArchiveUnchecksummedFile      = errors.New("backup archive: file is not listed in CHECKSUMS")
+	ErrArchiveBudgetExceeded         = errors.New("backup archive: unpack budget exceeded")
+)
+
+// PackDumpTree writes root as a tar stream, optionally wrapped in zstd.
+// MANIFEST.json and CHECKSUMS are verified before the archive is emitted so a
+// corrupt tree is not shipped as a restore candidate.
+func PackDumpTree(root string, out io.Writer, compression string) error {
+	if out == nil {
+		return errors.New("backup archive: output writer is nil")
+	}
+	root, err := resolveArchiveDumpRoot(root)
+	if err != nil {
+		return err
+	}
+	if err := verifyDumpRoot(root); err != nil {
+		return err
+	}
+	w, closeFn, err := archiveWriter(out, compression)
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(w)
+	if err := writeTarTree(tw, root); err != nil {
+		_ = tw.Close()
+		_ = closeFn()
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		_ = closeFn()
+		return errors.WithStack(err)
+	}
+	return closeFn()
+}
+
+// UnpackDumpTree extracts a tar or tar+zstd stream into a new output root,
+// then verifies MANIFEST.json and CHECKSUMS. Existing output roots are refused
+// so an archive cannot merge into or overwrite unrelated data.
+func UnpackDumpTree(in io.Reader, outputRoot string, compression string) error {
+	if in == nil {
+		return errors.New("backup archive: input reader is nil")
+	}
+	if outputRoot == "" {
+		return errors.New("backup archive: output root is required")
+	}
+	outputRoot = filepath.Clean(outputRoot)
+	r, closeFn, err := archiveReader(in, compression)
+	if err != nil {
+		return err
+	}
+	if err := createArchiveOutputRoot(outputRoot); err != nil {
+		_ = closeFn()
+		return err
+	}
+	if err := readTarTree(tar.NewReader(r), outputRoot, newArchiveUnpackBudget()); err != nil {
+		_ = closeFn()
+		removeArchiveOutputRoot(outputRoot)
+		return err
+	}
+	if err := closeFn(); err != nil {
+		removeArchiveOutputRoot(outputRoot)
+		return err
+	}
+	if err := verifyDumpRoot(outputRoot); err != nil {
+		removeArchiveOutputRoot(outputRoot)
+		return err
+	}
+	return nil
+}
+
+func createArchiveOutputRoot(outputRoot string) error {
+	parent := filepath.Dir(outputRoot)
+	if parent != "." && parent != outputRoot {
+		if err := os.MkdirAll(parent, archiveDefaultDirPerm); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	if err := os.Mkdir(outputRoot, archiveDefaultDirPerm); err != nil {
+		if os.IsExist(err) {
+			return errors.Wrapf(ErrArchiveDestinationExists, "%s", outputRoot)
+		}
+		return errors.WithStack(err)
+	}
+	info, err := os.Lstat(outputRoot)
+	if err != nil {
+		removeArchiveOutputRoot(outputRoot)
+		return errors.WithStack(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		removeArchiveOutputRoot(outputRoot)
+		return errors.Wrapf(ErrArchiveDestinationExists, "%s", outputRoot)
+	}
+	return nil
+}
+
+func removeArchiveOutputRoot(outputRoot string) {
+	_ = filepath.WalkDir(outputRoot, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, archiveDefaultDirPerm|archiveWritableDirPerm)
+		}
+		return nil
+	})
+	_ = os.RemoveAll(outputRoot)
+}
+
+func resolveArchiveDumpRoot(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func verifyDumpRoot(root string) error {
+	if err := requireArchiveRegularPath(root, "MANIFEST.json"); err != nil {
+		return err
+	}
+	if err := requireArchiveRegularPath(root, CHECKSUMSFilename); err != nil {
+		return err
+	}
+
+	f, err := os.Open(filepath.Join(root, "MANIFEST.json")) //nolint:gosec // operator-supplied dump root
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	_, readErr := ReadManifest(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return errors.WithStack(closeErr)
+	}
+	if err := VerifyChecksums(root); err != nil {
+		return err
+	}
+	return verifyArchiveHasNoUnchecksummedFiles(root)
+}
+
+func archiveWriter(out io.Writer, compression string) (io.Writer, func() error, error) {
+	switch compression {
+	case ArchiveCompressionNone, "":
+		return out, func() error { return nil }, nil
+	case ArchiveCompressionZstd:
+		zw, err := zstd.NewWriter(out)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		return zw, zw.Close, nil
+	default:
+		return nil, nil, errors.Wrapf(ErrArchiveCompressionUnsupported, "%q", compression)
+	}
+}
+
+func archiveReader(in io.Reader, compression string) (io.Reader, func() error, error) {
+	switch compression {
+	case ArchiveCompressionNone, "":
+		return in, func() error { return nil }, nil
+	case ArchiveCompressionZstd:
+		zr, err := zstd.NewReader(in)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		return zr, func() error { zr.Close(); return nil }, nil
+	default:
+		return nil, nil, errors.Wrapf(ErrArchiveCompressionUnsupported, "%q", compression)
+	}
+}
+
+func writeTarTree(tw *tar.Writer, root string) error {
+	paths, err := collectArchivePaths(root)
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if err := writeTarPath(tw, root, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectArchivePaths(root string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if path == root {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return errors.Wrapf(ErrArchiveNonRegular, "%s", path)
+		}
+		if info.Mode().IsRegular() {
+			if err := refuseArchiveHardLink(info, path); err != nil {
+				return err
+			}
+		}
+		paths = append(paths, path)
+		return nil
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func writeTarPath(tw *tar.Writer, root, path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	var f *os.File
+	if info.Mode().IsRegular() {
+		opened, openedInfo, err := openArchiveRegularForRead(path)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = opened.Close() }()
+		if !os.SameFile(info, openedInfo) {
+			return errors.Wrapf(ErrArchiveNonRegular, "%s changed while archive was being packed", path)
+		}
+		info = openedInfo
+		f = opened
+	}
+	hdr, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	hdr.Name = filepath.ToSlash(rel)
+	if err := tw.WriteHeader(hdr); err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	_, err = io.Copy(tw, f)
+	return errors.WithStack(err)
+}
+
+func readTarTree(tr *tar.Reader, outputRoot string, budget *archiveUnpackBudget) error {
+	dirModes := make(map[string]fs.FileMode)
+	for {
+		hdr, err := tr.Next()
+		switch {
+		case errors.Is(err, io.EOF):
+			return applyArchiveDirModes(dirModes)
+		case err != nil:
+			return errors.WithStack(err)
+		}
+		if err := budget.reserveEntry(hdr.Name); err != nil {
+			return err
+		}
+		if err := extractTarEntry(tr, outputRoot, hdr, budget, dirModes); err != nil {
+			return err
+		}
+	}
+}
+
+func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget *archiveUnpackBudget, dirModes map[string]fs.FileMode) error {
+	rel, err := cleanArchiveRelPath(hdr.Name)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		if hdr.Typeflag == tar.TypeDir {
+			return nil
+		}
+		return errors.Wrapf(ErrArchiveNonRegular, "%s type %c", hdr.Name, hdr.Typeflag)
+	}
+	target := filepath.Join(outputRoot, rel)
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		mode := archiveMode(hdr.FileInfo().Mode().Perm(), archiveDefaultDirPerm)
+		if err := os.MkdirAll(target, writableArchiveDirMode(mode)); err != nil {
+			return errors.WithStack(err)
+		}
+		if dirModes != nil {
+			dirModes[target] = mode
+		}
+		return nil
+	case tar.TypeReg, 0:
+		return extractRegularTarEntry(tr, target, hdr, budget)
+	default:
+		return errors.Wrapf(ErrArchiveNonRegular, "%s type %c", hdr.Name, hdr.Typeflag)
+	}
+}
+
+func extractRegularTarEntry(tr *tar.Reader, target string, hdr *tar.Header, budget *archiveUnpackBudget) error {
+	if err := budget.reserveBytes(hdr.Name, hdr.Size); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), archiveDefaultDirPerm); err != nil {
+		return errors.WithStack(err)
+	}
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, archiveMode(hdr.FileInfo().Mode().Perm(), archiveDefaultFilePerm)) //nolint:gosec
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := io.CopyN(f, tr, hdr.Size); err != nil {
+		_ = f.Close()
+		return errors.WithStack(err)
+	}
+	if err := f.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func cleanArchiveRelPath(name string) (string, error) {
+	name = strings.TrimPrefix(name, "./")
+	if name == "" || name == "." {
+		return ".", nil
+	}
+	if !filepath.IsLocal(name) {
+		return "", errors.Wrapf(ErrArchivePathUnsafe, "%q", name)
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(name))
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) || filepath.IsAbs(cleaned) {
+		return "", errors.Wrapf(ErrArchivePathUnsafe, "%q", name)
+	}
+	return cleaned, nil
+}
+
+func archiveMode(mode fs.FileMode, fallback fs.FileMode) fs.FileMode {
+	if mode == 0 {
+		return fallback
+	}
+	return mode
+}
+
+func writableArchiveDirMode(mode fs.FileMode) fs.FileMode {
+	return archiveMode(mode, archiveDefaultDirPerm) | archiveWritableDirPerm
+}
+
+func applyArchiveDirModes(modes map[string]fs.FileMode) error {
+	dirs := make([]string, 0, len(modes))
+	for dir := range modes {
+		dirs = append(dirs, dir)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		if len(dirs[i]) == len(dirs[j]) {
+			return dirs[i] > dirs[j]
+		}
+		return len(dirs[i]) > len(dirs[j])
+	})
+	for _, dir := range dirs {
+		if err := os.Chmod(dir, modes[dir]); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+type archiveUnpackBudget struct {
+	entriesLeft int
+	bytesLeft   int64
+}
+
+func newArchiveUnpackBudget() *archiveUnpackBudget {
+	return &archiveUnpackBudget{
+		entriesLeft: archiveMaxUnpackEntries,
+		bytesLeft:   archiveMaxUnpackBytes,
+	}
+}
+
+func (b *archiveUnpackBudget) reserveEntry(name string) error {
+	if b == nil {
+		return nil
+	}
+	if b.entriesLeft <= 0 {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "too many entries before %q", name)
+	}
+	b.entriesLeft--
+	return nil
+}
+
+func (b *archiveUnpackBudget) reserveBytes(name string, size int64) error {
+	if size < 0 {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "%q has negative size %d", name, size)
+	}
+	if b == nil {
+		return nil
+	}
+	if size > b.bytesLeft {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "%q needs %d bytes, %d bytes left", name, size, b.bytesLeft)
+	}
+	b.bytesLeft -= size
+	return nil
+}
+
+func requireArchiveRegularPath(root string, rel string) error {
+	path := filepath.Join(root, rel)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(ErrArchiveNonRegular, "%s", path)
+	}
+	return refuseArchiveHardLink(info, path)
+}
+
+func refuseArchiveHardLink(info os.FileInfo, path string) error {
+	if err := refuseHardLink(info, path); err != nil {
+		return errors.Wrapf(ErrArchiveNonRegular, "hard-linked file %s: %v", path, err)
+	}
+	return nil
+}
+
+func verifyArchiveHasNoUnchecksummedFiles(root string) error {
+	expected, err := readChecksumManifestPaths(root)
+	if err != nil {
+		return err
+	}
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if path == root || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == CHECKSUMSFilename {
+			return nil
+		}
+		if _, ok := expected[rel]; !ok {
+			return errors.Wrapf(ErrArchiveUnchecksummedFile, "%s", rel)
+		}
+		return nil
+	})
+	return errors.WithStack(err)
+}
+
+func readChecksumManifestPaths(root string) (map[string]struct{}, error) {
+	f, err := os.Open(filepath.Join(root, CHECKSUMSFilename)) //nolint:gosec // operator-supplied dump root
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	paths := make(map[string]struct{})
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, maxChecksumLineLen), maxChecksumLineLen)
+	lineNum := 0
+	for sc.Scan() {
+		lineNum++
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		_, rel, ok := splitChecksumLine(line)
+		if !ok {
+			return nil, errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", lineNum, line)
+		}
+		cleaned, err := validateChecksumRelPath(rel)
+		if err != nil {
+			return nil, errors.Wrapf(err, "line %d", lineNum)
+		}
+		paths[filepath.ToSlash(cleaned)] = struct{}{}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return paths, nil
+}

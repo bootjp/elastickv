@@ -35,7 +35,7 @@ jobs:
       # 429s during peak hours have been knocking the scheduled stress
       # run out, and the per-push run uses the same dependency set.
       - name: Cache Maven and Leiningen artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.m2/repository
@@ -122,6 +122,11 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.redis-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
+      - name: Run Redis ZSet safety Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.redis-zset-safety-workload --time-limit 5 --rate 5 --concurrency 5 --ports 63791,63792,63793 --host 127.0.0.1
       - name: Run DynamoDB Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3

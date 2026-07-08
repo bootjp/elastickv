@@ -1,12 +1,11 @@
 # Redis one-phase txn dedup — flip default to on
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-06-10
 
-> **Status: proposed.** Flip
-> `adapter.RedisServer.onePhaseTxnDedup` from default-off to default-on,
-> closing the rollout of the option-2 idempotency design landed by
+> **Status: implemented.** `adapter.RedisServer.onePhaseTxnDedup` is
+> default-on, closing the rollout of the option-2 idempotency design landed by
 > [`2026_05_21_proposed_txn_secondary_idempotency.md`][parent]. No new
 > mechanism — the FSM probe (`dedupProbeOnePhase` in `kv/fsm.go`), the
 > wire change (`TxnMeta.PrevCommitTS`, V2-only when non-zero), and every

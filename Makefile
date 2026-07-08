@@ -21,7 +21,7 @@ gen:
 # that motivates the implementation gaps).
 TLA_VERSION  := v1.8.0
 TLA_JAR      := .cache/tla/tla2tools.jar
-TLA_SHA256   := 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
+TLA_SHA256   := 9e27b5e19a69ae1f56aabf8403a6ed5598dbfa6e638908e5278ac39736c1543d
 TLA_URL      := https://github.com/tlaplus/tlaplus/releases/download/$(TLA_VERSION)/tla2tools.jar
 TLA_LIB      := ../lib
 

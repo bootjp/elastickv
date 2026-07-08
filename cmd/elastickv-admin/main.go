@@ -662,6 +662,14 @@ func (f *fanout) currentTargets(ctx context.Context) []string {
 	f.mu.Unlock()
 
 	ch := f.refreshGroup.DoChan("members", func() (any, error) {
+		f.mu.Lock()
+		if f.members != nil && time.Since(f.members.fetchedAt) < f.refreshInterval {
+			addrs := append([]string(nil), f.members.addrs...)
+			f.mu.Unlock()
+			return addrs, nil
+		}
+		f.mu.Unlock()
+
 		bgCtx, cancel := context.WithTimeout(context.Background(), membershipRefreshBudget)
 		defer cancel()
 		return f.refreshMembership(bgCtx), nil

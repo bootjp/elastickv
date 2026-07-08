@@ -1,7 +1,7 @@
 # `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — proposed
 
 **Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_partial_snapshot_logical_encoder.md`](2026_05_25_partial_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
 
 ## What needs to land
 
@@ -111,7 +111,7 @@ Keep the schema minimal — restore operators need to confirm "encoded for the r
 
 The encoder fan-out order (`redis` first) intentionally differs from the decoder's finalize order at `decode.go:278-296` (`dynamodb` first). The final `.fsm` byte sequence is determined by encoded key sort (`snapshotBuilder.WriteTo` sorts entries before writing — see `encode.go:204`), not by adapter fan-out order, so either ordering is correct as long as it is fixed. The two sides pick differently for purely historical reasons: the decoder finalizes in alphabetical-with-tweaks order; the encoder follows the parent design doc's enumeration order. No-op for restore correctness.
 
-**`cluster_id` enforcement** is decoder-side (the restore runbook step refuses to place a file whose cluster_id differs from the target node — parent §"Risks"). The encoder just propagates the manifest value into `ENCODE_INFO.json`; it does not gate on it.
+**`cluster_id` enforcement** is restore-prepare-side (`cmd/elastickv-snapshot-prepare-restore` refuses to create a target data dir when the sidecar cluster_id differs from the target node — parent §"Risks"). The encoder just propagates the manifest value into `ENCODE_INFO.json`; it does not gate on it.
 
 ## Round-trip self-test (`--self-test`)
 
