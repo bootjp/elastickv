@@ -67,6 +67,119 @@ func installPartitionedMetaForTest(t *testing.T, node Node, queueName string, pa
 	require.NoError(t, err)
 }
 
+type recordingPartitionScanStore struct {
+	store.MVCCStore
+
+	groupID      uint64
+	groupStart   []byte
+	groupEnd     []byte
+	groupGetID   uint64
+	groupGetKey  []byte
+	fallbackScan bool
+	fallbackGet  bool
+}
+
+func (s *recordingPartitionScanStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	s.fallbackGet = true
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func (s *recordingPartitionScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.fallbackScan = true
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingPartitionScanStore) ScanGroupAt(_ context.Context, groupID uint64, start []byte, end []byte, _ int, _ uint64) ([]*store.KVPair, error) {
+	s.groupID = groupID
+	s.groupStart = bytes.Clone(start)
+	s.groupEnd = bytes.Clone(end)
+	return []*store.KVPair{{Key: bytes.Clone(start), Value: []byte("msg-2")}}, nil
+}
+
+func (s *recordingPartitionScanStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error) {
+	s.groupGetID = groupID
+	s.groupGetKey = bytes.Clone(key)
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func TestSQSServer_ScanOneVisibleMessagePage_UsesPartitionResolverGroup(t *testing.T) {
+	t.Parallel()
+
+	const queueName = "orders.fifo"
+	meta := &sqsQueueMeta{Name: queueName, PartitionCount: 4, Generation: 1}
+	start, end := sqsMsgVisScanBoundsDispatch(meta, queueName, 2, meta.Generation, time.Now().UnixMilli())
+	rec := &recordingPartitionScanStore{MVCCStore: store.NewMVCCStore()}
+	s := &SQSServer{
+		store: rec,
+		partitionResolver: NewSQSPartitionResolver(map[string][]uint64{
+			queueName: {10, 11, 42, 13},
+		}),
+	}
+
+	page, _, done, err := s.scanOneVisibleMessagePage(context.Background(), start, end, 10, 1, 2)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.False(t, rec.fallbackScan, "partitioned receive scan must not fall back to byte-range ScanAt")
+	require.Equal(t, uint64(42), rec.groupID)
+	require.Equal(t, start, rec.groupStart)
+	require.Equal(t, end, rec.groupEnd)
+	require.Len(t, page, 1)
+	require.Equal(t, "msg-2", page[0].messageID)
+	require.Equal(t, uint32(2), page[0].partition)
+	require.Equal(t, uint64(42), page[0].groupID)
+}
+
+func TestSQSServer_LoadCandidateRecord_UsesCandidateGroup(t *testing.T) {
+	t.Parallel()
+
+	const queueName = "orders.fifo"
+	meta := &sqsQueueMeta{Name: queueName, PartitionCount: 4, Generation: 1}
+	st := &recordingPartitionScanStore{MVCCStore: store.NewMVCCStore()}
+	s := &SQSServer{store: st}
+
+	msg := &sqsMessageRecord{
+		MessageID:       "msg-2",
+		Body:            []byte("body"),
+		QueueGeneration: meta.Generation,
+	}
+	raw, err := encodeSQSMessageRecord(msg)
+	require.NoError(t, err)
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, 2, meta.Generation, msg.MessageID)
+	require.NoError(t, st.PutAt(context.Background(), dataKey, raw, 7, 0))
+
+	got, gotKey, skip, err := s.loadCandidateRecord(context.Background(), queueName, meta, meta.Generation, sqsMsgCandidate{
+		messageID: msg.MessageID,
+		partition: 2,
+		groupID:   42,
+	}, 7)
+	require.NoError(t, err)
+	require.False(t, skip)
+	require.False(t, st.fallbackGet, "partitioned candidate loads must not fall back to byte-range GetAt")
+	require.Equal(t, uint64(42), st.groupGetID)
+	require.Equal(t, dataKey, st.groupGetKey)
+	require.Equal(t, dataKey, gotKey)
+	require.Equal(t, msg.MessageID, got.MessageID)
+}
+
+func TestSQSServer_ScanOneVisibleMessagePage_FailsClosedOnUnresolvedPartitionRoute(t *testing.T) {
+	t.Parallel()
+
+	const queueName = "orders.fifo"
+	meta := &sqsQueueMeta{Name: queueName, PartitionCount: 4, Generation: 1}
+	start, end := sqsMsgVisScanBoundsDispatch(meta, queueName, 2, meta.Generation, time.Now().UnixMilli())
+	rec := &recordingPartitionScanStore{MVCCStore: store.NewMVCCStore()}
+	s := &SQSServer{
+		store: rec,
+		partitionResolver: NewSQSPartitionResolver(map[string][]uint64{
+			queueName: {10},
+		}),
+	}
+
+	_, _, _, err := s.scanOneVisibleMessagePage(context.Background(), start, end, 10, 1, 2)
+	require.Error(t, err)
+	require.False(t, rec.fallbackScan, "unresolved partitioned key must not fall through to byte-range ScanAt")
+}
+
 // TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip is the
 // end-to-end smoke test for PR 5b-2's wiring: SendMessage on a
 // partitioned FIFO queue stores the message under the partitioned

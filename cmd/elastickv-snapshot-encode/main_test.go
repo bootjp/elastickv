@@ -163,6 +163,11 @@ func TestCLIRejectsUnsupportedManifestExclusions(t *testing.T) {
 			mutate:   func(e *backup.Exclusions) { e.PreserveSQSVisibility = true },
 			adapters: "sqs",
 		},
+		{
+			name:     "include_sqs_side_records with --adapter=sqs",
+			mutate:   func(e *backup.Exclusions) { e.IncludeSQSSideRecords = true },
+			adapters: "sqs",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

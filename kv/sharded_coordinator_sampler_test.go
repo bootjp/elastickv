@@ -22,12 +22,13 @@ type recordingSampler struct {
 type sampleCall struct {
 	routeID  uint64
 	op       keyviz.Op
+	label    keyviz.Label
 	key      []byte
 	keyLen   int
 	valueLen int
 }
 
-func (r *recordingSampler) Observe(routeID uint64, key []byte, op keyviz.Op, valueLen int) {
+func (r *recordingSampler) Observe(routeID uint64, key []byte, op keyviz.Op, valueLen int, label keyviz.Label) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Copy the key: the sampler contract lets callers reuse the buffer,
@@ -37,6 +38,7 @@ func (r *recordingSampler) Observe(routeID uint64, key []byte, op keyviz.Op, val
 	r.calls = append(r.calls, sampleCall{
 		routeID:  routeID,
 		op:       op,
+		label:    label,
 		key:      append([]byte(nil), key...),
 		keyLen:   len(key),
 		valueLen: valueLen,
@@ -102,6 +104,7 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 		require.Equal(t, sampleCall{
 			routeID:  route.RouteID,
 			op:       keyviz.OpWrite,
+			label:    keyviz.LabelLegacy,
 			key:      append([]byte(nil), elem.Key...),
 			keyLen:   len(elem.Key),
 			valueLen: len(elem.Value),
@@ -166,7 +169,7 @@ func TestShardedCoordinatorWithoutSamplerStaysSafe(t *testing.T) {
 
 // TestShardedCoordinatorObservesLeaseAndLinearizableReads pins the
 // read-side wiring: LeaseReadForKey and LinearizableReadForKey each
-// produce one Observe(routeID, OpRead, len(key), 0) call. valueLen
+// produce one Observe(routeID, key, OpRead, 0, label) call. valueLen
 // is always zero at this layer because the consistency check doesn't
 // fetch data — the actual GetAt happens further down the stack and
 // is sampled separately (Phase 2 follow-up for adapter direct reads).
@@ -199,12 +202,63 @@ func TestShardedCoordinatorObservesLeaseAndLinearizableReads(t *testing.T) {
 	want := sampleCall{
 		routeID:  route.RouteID,
 		op:       keyviz.OpRead,
+		label:    keyviz.LabelLegacy,
 		key:      append([]byte(nil), key...),
 		keyLen:   len(key),
 		valueLen: 0,
 	}
 	require.Equal(t, want, calls[0], "linearizable read must forward the full key bytes")
 	require.Equal(t, want, calls[1], "lease read must forward the full key bytes")
+}
+
+func TestShardedCoordinatorKeyVizLabelGate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	st := store.NewMVCCStore()
+	r, stop := newSingleRaft(t, "kv-sampler-label-gate", NewKvFSMWithHLC(st, NewHLC()))
+	t.Cleanup(stop)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: r, Store: st, Txn: NewLeaderProxyWithEngine(r)},
+	}
+
+	t.Run("disabled overrides to legacy", func(t *testing.T) {
+		rec := &recordingSampler{}
+		coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups)).WithSampler(rec)
+		_, err := coord.Dispatch(ctx, &OperationGroup[OP]{
+			KeyVizLabel: keyviz.LabelRedis,
+			Elems:       []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("v")}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, keyviz.LabelLegacy, rec.snapshot()[0].label)
+	})
+
+	t.Run("enabled preserves wrapper label", func(t *testing.T) {
+		rec := &recordingSampler{}
+		base := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups)).
+			WithSampler(rec).
+			WithKeyVizLabelsEnabled(true)
+		coord := WithKeyVizLabel(base, keyviz.LabelRedis)
+		ops := &OperationGroup[OP]{
+			Elems: []*Elem[OP]{{Op: Put, Key: []byte("c"), Value: []byte("v")}},
+		}
+		_, err := coord.Dispatch(ctx, ops)
+		require.NoError(t, err)
+		require.Equal(t, keyviz.LabelLegacy, ops.KeyVizLabel, "wrapper must not mutate caller-owned request")
+
+		reader, ok := coord.(interface {
+			LinearizableReadForKey(context.Context, []byte) (uint64, error)
+		})
+		require.True(t, ok, "wrapper must preserve key-routed read capability")
+		_, err = reader.LinearizableReadForKey(ctx, []byte("d"))
+		require.NoError(t, err)
+
+		calls := rec.snapshot()
+		require.Len(t, calls, 2)
+		require.Equal(t, keyviz.LabelRedis, calls[0].label)
+		require.Equal(t, keyviz.LabelRedis, calls[1].label)
+	})
 }
 
 // TestShardedCoordinatorSkipsObserveForLeadershipChecks pins the

@@ -16,7 +16,7 @@ import (
 // to the client.
 //
 // This implements HLC-4 precondition (iii) from
-// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1: every
+// docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1: every
 // persistence-grade ts allocation is gated on `wall_now <
 // physicalCeiling`. The TLA+ MCHLC_gap.cfg counterexample at depth 5
 // demonstrates the safety property this enforces.
@@ -145,7 +145,7 @@ func (h *HLC) Next() uint64 {
 //   - ceiling > 0 AND wall_now < ceiling: floor wall at ceiling, then proceed.
 //
 // The TLA+ proof for this lives in tla/hlc/MCHLC_gap.cfg (HLC-4
-// counterexample, depth 5) — see docs/design/2026_05_28_partial_tla_safety_spec.md §5.1.
+// counterexample, depth 5) — see docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1.
 func (h *HLC) NextFenced() (uint64, error) {
 	return h.nextLocked(true)
 }
@@ -294,7 +294,7 @@ func (h *HLC) PhysicalCeiling() int64 {
 //
 // A non-zero value here means the HLC-4 (i) bounded-skew assumption
 // (`MaxClockSkewMs < HlcPhysicalWindowMs` — see
-// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1) has at some
+// docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1) has at some
 // point been violated by enough margin that wall_now caught up to
 // physicalCeiling and the fence fired — typically because the leader's
 // lease renewal stopped (network partition, GC pause, …) for longer than

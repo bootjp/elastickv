@@ -615,7 +615,7 @@ corresponding Jepsen workload. The mapping:
 
 | Subsystem | Unit / property tests | Jepsen workload |
 | --- | --- | --- |
-| §3 (routing) | `distribution/engine_*_test.go` table-driven + `pgregory.net/rapid` for B-tree property tests | Route-shuffle workload (existing `2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md`) extended to 100 k routes |
+| §3 (routing) | `distribution/engine_*_test.go` table-driven + `pgregory.net/rapid` for B-tree property tests | Route-shuffle workload (existing `2026_06_02_implemented_composed1_m5_jepsen_route_shuffle.md`) extended to 100 k routes |
 | §4 (multi-region) | `internal/raftengine/etcd` WAN-tuning unit tests; `kv/hlc_*_test.go` / `kv/coordinator_*_test.go` property tests for per-region HLC ceilings, monotone-merge invariants, and region-local catalog mirror staleness | New `jepsen/multi-region/` partition-during-write and partition-stale-mirror workloads |
 | §5 (storage) | `store/snapshot_pebble_test.go` SST-ingest fixture; `store/lsm_store_compaction_test.go` stall test | Existing Jepsen workloads with 10x data; new "snapshot-transfer-during-write" partition |
 | §6 (coordinator) | `kv/sharded_coordinator_*_test.go` per-group HLC; `kv/follower_read_test.go` staleness bound; `kv/cross_shard_txn_*_test.go` 2PC | DynamoDB + Redis workloads extended with cross-shard txns; follower-read consistency workload |

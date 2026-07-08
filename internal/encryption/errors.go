@@ -293,4 +293,27 @@ var (
 	// `CheckLocalEpochRollback` (`local_epoch_rollback.go`) for
 	// the full split.
 	ErrLocalEpochRollback = errors.New("encryption: sidecar local_epoch for the active storage DEK is at or below the local writer-registry's last_seen_local_epoch, which would replay the GCM nonce prefix under the same DEK; refusing to start (verify the sidecar was not restored from an old backup; run `encryption resync-sidecar` if appropriate, or rotate the affected DEK — see §9.1 + §5.2 of the 6D design doc)")
+
+	// ErrEnvelopeCutoverDivergence is the Stage 6C-4 startup guard
+	// raised when a restored v2 snapshot header records a non-zero
+	// raft-envelope cutover index that disagrees with the local
+	// sidecar's RaftEnvelopeCutoverIndex. The two values are the
+	// same phase-2 boundary viewed through different crash-recovery
+	// artifacts: the sidecar drives post-cutover apply unwrap and the
+	// snapshot header preserves that boundary across snapshot restore.
+	// A mismatch would route entries at index > N through the wrong
+	// cleartext/envelope decoder, so the node refuses to start.
+	ErrEnvelopeCutoverDivergence = errors.New("encryption: raft envelope cutover index differs between restored snapshot header and sidecar; refusing to start (verify sidecar and snapshot belong to the same data dir)")
+
+	// ErrEncryptionNotBootstrapped marks admin RPCs that require an
+	// encryption bootstrap entry before they can safely mutate later
+	// envelope state. EnableRaftEnvelope uses this Stage 6C-4 typed
+	// refusal when Active.Raft is still 0.
+	ErrEncryptionNotBootstrapped = errors.New("encryption: cluster is not bootstrapped")
+
+	// ErrLocalEpochOutOfRange marks wire-format local_epoch values
+	// above the §4.1 16-bit nonce field. Proto3 carries the value as
+	// uint32, so every decode boundary must reject > 0xFFFF before
+	// narrowing to uint16.
+	ErrLocalEpochOutOfRange = errors.New("encryption: local_epoch exceeds 16-bit nonce field")
 )

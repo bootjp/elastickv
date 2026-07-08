@@ -3143,6 +3143,7 @@ type luaCommitPlan struct {
 // luaKeyPlan carries the data elements and TTL metadata for a single key commit.
 type luaKeyPlan struct {
 	elems            []*kv.Elem[kv.OP]
+	readKeys         [][]byte
 	finalType        redisValueType
 	preserveExisting bool
 }
@@ -3164,12 +3165,14 @@ func (c *luaScriptContext) commit() error {
 	}
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
+	readKeys := make([][]byte, 0, len(keys))
 	for _, key := range keys {
 		plan, err := c.commitPlanForKey(ctx, key, commitTS)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, plan.elems...)
+		readKeys = append(readKeys, plan.readKeys...)
 		// For non-string keys with dirty TTL: include !redis|ttl| in the same txn.
 		// String keys already have TTL embedded in the value via stringCommitElems.
 		if isNonStringCollectionType(plan.finalType) {
@@ -3189,6 +3192,7 @@ func (c *luaScriptContext) commit() error {
 		IsTxn:    true,
 		StartTS:  luaCommitFloor(c.startTS),
 		CommitTS: commitTS,
+		ReadKeys: readKeys,
 		Elems:    elems,
 	}); err != nil {
 		return errors.WithStack(err)
@@ -3232,12 +3236,18 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		return luaKeyPlan{}, err
 	}
 
+	startType, err := c.server.keyTypeAt(context.Background(), []byte(key), c.startTS)
+	if err != nil {
+		return luaKeyPlan{}, err
+	}
 	var deleteElems []*kv.Elem[kv.OP]
+	readKeys := luaWideFenceReadKeysForPlan([]byte(key), finalType, startType, valuePlan.preserveExisting)
 	if !valuePlan.preserveExisting {
 		deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
 		if err != nil {
 			return luaKeyPlan{}, err
 		}
+		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems([]byte(key))...)
 	}
 
 	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems))
@@ -3245,9 +3255,29 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	dataElems = append(dataElems, valuePlan.elems...)
 	return luaKeyPlan{
 		elems:            dataElems,
+		readKeys:         readKeys,
 		finalType:        finalType,
 		preserveExisting: valuePlan.preserveExisting,
 	}, nil
+}
+
+func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {
+	if !preserveExisting || startType == redisTypeNone {
+		return redisTxnWideCollectionFenceKeys(key)
+	}
+	switch finalType {
+	case redisTypeHash:
+		return [][]byte{redisTxnWideHashFenceKey(key)}
+	case redisTypeSet:
+		return [][]byte{redisTxnWideSetFenceKey(key)}
+	case redisTypeList:
+		return [][]byte{redisTxnWideListFenceKey(key)}
+	case redisTypeZSet:
+		return [][]byte{redisTxnWideZSetFenceKey(key)}
+	case redisTypeNone, redisTypeString, redisTypeStream:
+		return nil
+	}
+	return nil
 }
 
 func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
@@ -3378,6 +3408,9 @@ func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, co
 			Value: leftDelta,
 		})
 	}
+	if len(elems) != 0 {
+		elems = append(elems, redisTxnWideListFenceElem([]byte(key)))
+	}
 	return elems, nil
 }
 
@@ -3426,7 +3459,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	}
 	// Wide-column: write per-field keys and a base meta key with the final count.
 	// deleteLogicalKeyElems (called by the Lua commit flow) clears any old keys.
-	elems := make([]*kv.Elem[kv.OP], 0, len(st.value)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.value)+setWideColOverhead)
 	for field, val := range st.value {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -3434,6 +3467,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 			Value: []byte(val),
 		})
 	}
+	elems = append(elems, redisTxnWideHashFenceElem([]byte(key)))
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey([]byte(key)),
@@ -3452,7 +3486,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 		return nil, nil
 	}
 	// Wide-column: write per-member keys and a base meta key with the final count.
-	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+setWideColOverhead)
 	for member := range st.members {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -3460,6 +3494,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 			Value: []byte{},
 		})
 	}
+	elems = append(elems, redisTxnWideSetFenceElem([]byte(key)))
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.SetMetaKey([]byte(key)),
@@ -3541,6 +3576,7 @@ func (c *luaScriptContext) zsetFullCommitElems(key string) []*kv.Elem[kv.OP] {
 		Key:   store.ZSetMetaKey([]byte(key)),
 		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(st.members))}),
 	})
+	elems = append(elems, redisTxnWideZSetFenceElem([]byte(key)))
 	return elems
 }
 
@@ -3587,6 +3623,9 @@ func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, co
 		)
 	}
 	elems = append(elems, c.zsetDeltaMetaElems([]byte(key), st, commitTS)...)
+	if len(elems) != 0 {
+		elems = append(elems, redisTxnWideZSetFenceElem([]byte(key)))
+	}
 	return elems
 }
 

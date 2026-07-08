@@ -2,7 +2,7 @@
 
 Machine-checkable safety models for the four cross-cutting subsystems
 (HLC, OCC, MVCC, route catalog) per
-[`docs/design/2026_05_28_partial_tla_safety_spec.md`](../docs/design/2026_05_28_partial_tla_safety_spec.md).
+[`docs/design/2026_05_28_implemented_tla_safety_spec.md`](../docs/design/2026_05_28_implemented_tla_safety_spec.md).
 
 This directory is **independent of the Go module**; you can navigate and
 run it without touching anything under the Go source tree.
@@ -355,7 +355,7 @@ For reviewers new to TLA+:
 
 For the elastickv-specific design:
 
-- [`docs/design/2026_05_28_partial_tla_safety_spec.md`](../docs/design/2026_05_28_partial_tla_safety_spec.md)
+- [`docs/design/2026_05_28_implemented_tla_safety_spec.md`](../docs/design/2026_05_28_implemented_tla_safety_spec.md)
   — the proposal that this directory implements.
 - [`docs/architecture_overview.md`](../docs/architecture_overview.md)
   — high-level subsystem diagrams that the modules abstract.

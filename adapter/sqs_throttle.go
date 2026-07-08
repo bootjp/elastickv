@@ -5,13 +5,14 @@ import (
 	"math"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
 )
 
 // Per-queue throttling — token-bucket store that hangs off *SQSServer.
-// See docs/design/2026_04_26_proposed_sqs_per_queue_throttling.md for
+// See docs/design/2026_04_26_implemented_sqs_per_queue_throttling.md for
 // the full design and rollout context. This file implements §3.1 (bucket
 // store + token bucket), §3.3 (charging model), §3.4 (Throttling
 // envelope helpers) and the cache-invalidation primitives §3.1 calls
@@ -122,6 +123,11 @@ type tokenBucket struct {
 	evicted    bool
 }
 
+type bucketQueueEpoch struct {
+	epoch           atomic.Uint64
+	updatedUnixNano atomic.Int64
+}
+
 // bucketStore holds every active bucket for an SQS server process.
 // sync.Map matches the read-mostly access pattern: lookups are nearly
 // always Load hits; LoadOrStore pays the write cost only on first use.
@@ -131,6 +137,8 @@ type tokenBucket struct {
 // caller of sweep() is the sole goroutine the ticker drives.
 type bucketStore struct {
 	buckets      sync.Map // map[bucketKey]*tokenBucket
+	queueEpochMu sync.RWMutex
+	queueEpochs  sync.Map // map[string]*bucketQueueEpoch
 	clock        func() time.Time
 	evictedAfter time.Duration
 	sweepEvery   time.Duration
@@ -159,6 +167,61 @@ func newBucketStoreDefault() *bucketStore {
 	return newBucketStore(time.Now, throttleIdleEvictAfter)
 }
 
+func (b *bucketStore) queueEpoch(queue string) uint64 {
+	if b == nil || queue == "" {
+		return 0
+	}
+	b.queueEpochMu.RLock()
+	defer b.queueEpochMu.RUnlock()
+	v, ok := b.queueEpochs.Load(queue)
+	if !ok {
+		return 0
+	}
+	epoch, _ := v.(*bucketQueueEpoch)
+	if epoch == nil {
+		return 0
+	}
+	return epoch.epoch.Load()
+}
+
+func (b *bucketStore) bumpQueueEpoch(queue string) {
+	if b == nil || queue == "" {
+		return
+	}
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	cell := b.queueEpochCellLocked(queue)
+	cell.epoch.Add(1)
+	cell.updatedUnixNano.Store(b.clock().UnixNano())
+}
+
+func (b *bucketStore) beginQueueReset(queue string, cutoff func() uint64) uint64 {
+	if b == nil || queue == "" {
+		if cutoff == nil {
+			return 0
+		}
+		return cutoff()
+	}
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	var resetCutoff uint64
+	if cutoff != nil {
+		resetCutoff = cutoff()
+	}
+	cell := b.queueEpochCellLocked(queue)
+	cell.epoch.Add(1)
+	cell.updatedUnixNano.Store(b.clock().UnixNano())
+	return resetCutoff
+}
+
+func (b *bucketStore) queueEpochCellLocked(queue string) *bucketQueueEpoch {
+	fresh := &bucketQueueEpoch{}
+	fresh.updatedUnixNano.Store(b.clock().UnixNano())
+	actual, _ := b.queueEpochs.LoadOrStore(queue, fresh)
+	epoch, _ := actual.(*bucketQueueEpoch)
+	return epoch
+}
+
 // chargeOutcome is returned from charge so the caller can build the
 // Throttling envelope (Retry-After computed from refillRate +
 // requestedCount, see §3.4) without re-loading the bucket.
@@ -167,6 +230,7 @@ type chargeOutcome struct {
 	retryAfter    time.Duration
 	tokensAfter   float64
 	bucketPresent bool
+	action        string
 }
 
 // charge takes count tokens from the bucket identified by (queue,
@@ -212,6 +276,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 		bucket := b.loadOrInit(queue, resolvedAction, incarnation, capacity, refill)
 		outcome, retry := chargeBucket(bucket, b.clock(), count)
 		if !retry {
+			outcome.action = resolvedAction
 			return outcome
 		}
 	}
@@ -230,6 +295,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 		allowed:       false,
 		retryAfter:    time.Second,
 		bucketPresent: false,
+		action:        resolvedAction,
 	}
 }
 
@@ -384,6 +450,14 @@ func (b *bucketStore) invalidateQueue(queue string) {
 	if b == nil {
 		return
 	}
+	b.bumpQueueEpoch(queue)
+	b.invalidateQueueBuckets(queue)
+}
+
+func (b *bucketStore) invalidateQueueBuckets(queue string) {
+	if b == nil {
+		return
+	}
 	// Incarnation participates in the key: we do
 	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes
@@ -462,15 +536,44 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 // bucket.mu, so there is no AB-BA cycle with charge().
 func (b *bucketStore) sweep() {
 	cutoff := b.clock().Add(-b.evictedAfter)
+	queuesWithBuckets := map[string]struct{}{}
 	b.buckets.Range(func(k, v any) bool {
+		key, _ := k.(bucketKey)
 		bucket, _ := v.(*tokenBucket)
 		bucket.mu.Lock()
 		if bucket.lastRefill.Before(cutoff) {
 			if b.buckets.CompareAndDelete(k, v) {
 				bucket.evicted = true
 			}
+		} else {
+			queuesWithBuckets[key.queue] = struct{}{}
 		}
 		bucket.mu.Unlock()
+		return true
+	})
+	b.sweepQueueEpochs(cutoff, queuesWithBuckets)
+}
+
+func (b *bucketStore) sweepQueueEpochs(cutoff time.Time, queuesWithBuckets map[string]struct{}) {
+	if b == nil || b.evictedAfter <= 0 {
+		return
+	}
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	b.queueEpochs.Range(func(k, v any) bool {
+		queue, _ := k.(string)
+		if _, ok := queuesWithBuckets[queue]; ok {
+			return true
+		}
+		cell, _ := v.(*bucketQueueEpoch)
+		if cell == nil {
+			b.queueEpochs.Delete(k)
+			return true
+		}
+		updated := time.Unix(0, cell.updatedUnixNano.Load())
+		if updated.Before(cutoff) || updated.Equal(cutoff) {
+			b.queueEpochs.Delete(k)
+		}
 		return true
 	})
 }
@@ -496,6 +599,19 @@ func resolveActionConfig(cfg *sqsQueueThrottle, action string) (string, float64,
 		return bucketActionAny, cfg.DefaultCapacity, cfg.DefaultRefillPerSecond
 	}
 	return action, 0, 0
+}
+
+func sqsThrottleMetricAction(action string) string {
+	switch action {
+	case bucketActionSend:
+		return "send"
+	case bucketActionReceive:
+		return "receive"
+	case bucketActionAny:
+		return "default"
+	default:
+		return "default"
+	}
 }
 
 // throttleRetryAfterCap bounds the Retry-After value the client sees.
@@ -582,46 +698,80 @@ func throttleChargeCount(entries int) int {
 // sendMessageWithRetry et al. would otherwise busy-loop on a
 // permanent rate-limit reject, burning leader CPU.
 func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueName, action string, count int) bool {
-	if s.throttle == nil {
-		return true
-	}
-	throttle, incarnation, err := s.queueThrottleConfig(r, queueName)
-	if err != nil {
-		// Fail closed on a transient storage error. Earlier code
-		// converted the error to (nil, 0)
-		// which made the throttle check short-circuit to "allowed";
-		// if the same storage hiccup did not also break the OCC
-		// commit a few lines later, the request would be processed
-		// unthrottled — a silent rate-limit bypass under storage
-		// instability. 500 here matches what the OCC layer would
-		// also surface for a meta read failure.
+	if err := s.chargeQueueErr(r.Context(), queueName, action, count); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return false
 	}
-	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation)
+	return true
 }
 
-// chargeQueueWithThrottle is the variant for handlers that already
-// have the throttle config in hand from their own meta load. Drops
-// the per-request meta load chargeQueue does, avoiding redundant
-// storage reads on the hot path. incarnation is
-// sqsQueueMeta.Incarnation: it must come from the same meta snapshot
-// the throttle config was read from so a recreate committed
-// mid-request lands in a fresh bucket on the next call rather than
-// mixing tokens with the prior incarnation. NOTE: meta.Incarnation,
-// NOT meta.Generation — PurgeQueue bumps Generation but preserves
-// Incarnation, so keying the bucket by Generation would let a caller
+// chargeQueueWithThrottle is the variant for handlers that already have the
+// throttle config in hand from their own meta load. Drops the per-request meta
+// load chargeQueue does, avoiding redundant storage reads on the hot path.
+// incarnation is sqsQueueMeta.Incarnation: it must come from the same meta
+// snapshot the throttle config was read from so a recreate committed mid-request
+// lands in a fresh bucket on the next call rather than mixing tokens with the
+// prior incarnation. throttleEpoch must be captured before the same meta read;
+// if SetQueueAttributes/Delete/Create invalidates the queue after that snapshot,
+// the request result is still honoured but the stale token-balance metric is not
+// allowed to recreate a gauge the config path already reset. NOTE:
+// meta.Incarnation, NOT meta.Generation — PurgeQueue bumps Generation but
+// preserves Incarnation, so keying the bucket by Generation would let a caller
 // bypass the rate limit by repeatedly purging.
-func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) bool {
+func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64, throttleEpoch uint64) bool {
+	if err := s.chargeQueueWithThrottleErr(queueName, action, count, throttle, incarnation, throttleEpoch); err != nil {
+		writeSQSErrorFromErr(w, err)
+		return false
+	}
+	return true
+}
+
+func (s *SQSServer) chargeQueueErr(ctx context.Context, queueName, action string, count int) error {
 	if s.throttle == nil {
-		return true
+		return nil
+	}
+	throttleEpoch := s.throttle.queueEpoch(queueName)
+	throttle, incarnation, err := s.queueThrottleConfigContext(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	return s.chargeQueueWithThrottleErr(queueName, action, count, throttle, incarnation, throttleEpoch)
+}
+
+func (s *SQSServer) chargeQueueWithThrottleErr(queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64, throttleEpoch uint64) error {
+	if s.throttle == nil {
+		return nil
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
+	s.observeThrottleDecision(queueName, outcome, s.throttle.queueEpoch(queueName) == throttleEpoch)
 	if outcome.allowed {
-		return true
+		return nil
 	}
-	writeSQSThrottlingError(w, queueName, action, outcome.retryAfter)
-	return false
+	return &sqsThrottlingError{queue: queueName, action: action, retryAfter: outcome.retryAfter}
+}
+
+type sqsThrottlingError struct {
+	queue      string
+	action     string
+	retryAfter time.Duration
+}
+
+func (e *sqsThrottlingError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return "Rate exceeded for queue '" + e.queue + "' action '" + e.action + "'"
+}
+
+func (e *sqsThrottlingError) retryAfterSeconds() int {
+	if e == nil {
+		return 0
+	}
+	retryAfter := e.retryAfter
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	return int(retryAfter / time.Second)
 }
 
 // queueThrottleConfig loads the Throttle config and Incarnation off a
@@ -638,15 +788,12 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 //     the request closed; converting an error to (nil, 0) silently
 //     would let traffic bypass the throttle check during a transient
 //     storage outage if the OCC commit later succeeded.
-//
-// Held as a method on *SQSServer so a test can swap the meta loader
-// via the existing nextTxnReadTS / loadQueueMetaAt seam.
-func (s *SQSServer) queueThrottleConfig(r *http.Request, queueName string) (*sqsQueueThrottle, uint64, error) {
+func (s *SQSServer) queueThrottleConfigContext(ctx context.Context, queueName string) (*sqsQueueThrottle, uint64, error) {
 	if s.store == nil {
 		return nil, 0, nil
 	}
-	readTS := s.nextTxnReadTS(r.Context())
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), queueName, readTS)
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}

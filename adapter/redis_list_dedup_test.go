@@ -124,6 +124,18 @@ func minElemKey(elems []*kv.Elem[kv.OP]) []byte {
 	return primary
 }
 
+func TestListPushBoundaryReadKeysIncludeWideFence(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("list:fence")
+	require.Equal(t,
+		[][]byte{redisTxnWideListFenceKey(key)},
+		listPushBoundaryReadKeys(key, store.ListMeta{}))
+	require.Equal(t,
+		[][]byte{redisTxnWideListFenceKey(key), listItemKey(key, 7)},
+		listPushBoundaryReadKeys(key, store.ListMeta{Head: 7, Len: 1, Tail: 8}))
+}
+
 // TestListPushDedup_LandedPriorAttempt_NoDuplicate is the option-2 headline:
 // attempt 1 commits the RPUSH but returns an ambiguous error; the retry
 // reuses the same write set with prev_commit_ts, the probe finds the landed

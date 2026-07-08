@@ -413,6 +413,7 @@ export interface KeyVizHotKey {
 
 export interface KeyVizHotKeysResponse {
   route_id: number;
+  label?: string;
   // Omitted by the server when the route was registered with K=1
   // (no sub-bucket axis); the SPA treats absence as "whole route".
   sub_bucket?: number;
@@ -433,6 +434,7 @@ export interface KeyVizHotKeysResponse {
 
 export interface KeyVizHotKeysParams {
   route_id: number;
+  label?: string;
   // Sub-key-range bucket WITHIN the route (parallel to the matrix
   // row's `#<n>` suffix). Omit for K=1 routes; the server validates
   // the range and returns 400 invalid_query on out-of-range.
@@ -597,6 +599,7 @@ export const api = {
     apiFetch<KeyVizHotKeysResponse>("/keyviz/hotkeys", {
       query: {
         route_id: params.route_id,
+        label: params.label,
         sub_bucket: params.sub_bucket,
         series: params.series,
         top: params.top,

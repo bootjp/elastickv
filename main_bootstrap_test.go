@@ -69,6 +69,52 @@ func TestResolveBootstrapServers(t *testing.T) {
 	})
 }
 
+func TestResolveBootstrapConfigGroupPeers(t *testing.T) {
+	groups := []groupSpec{
+		{id: 1, address: "10.0.0.11:50051"},
+		{id: 2, address: "10.0.0.11:50052"},
+	}
+	raw := "1=n1@10.0.0.11:50051,n2@10.0.0.12:50051;2=n1@10.0.0.11:50052,n2@10.0.0.12:50052"
+
+	t.Run("resolves per group peers", func(t *testing.T) {
+		cfg, err := resolveBootstrapConfig("n1", groups, "", raw)
+		require.NoError(t, err)
+		require.Nil(t, cfg.legacyServers)
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+			{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
+		}, cfg.serversForGroup(1))
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50052"},
+			{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50052"},
+		}, cfg.serversForGroup(2))
+		require.Equal(t, cfg.serversForGroup(1), cfg.adminSeed(1))
+		require.Equal(t, cfg.serversForGroup(2), cfg.bootstrapSeedForGroup(2))
+	})
+
+	t.Run("mutually exclusive with bootstrap members", func(t *testing.T) {
+		_, err := resolveBootstrapConfig("n1", groups, "n1=10.0.0.11:50051,n2=10.0.0.12:50051", raw)
+		require.ErrorIs(t, err, ErrRaftGroupPeersMutuallyExclusive)
+	})
+
+	t.Run("missing group is rejected", func(t *testing.T) {
+		_, err := resolveBootstrapConfig("n1", groups, "", "1=n1@10.0.0.11:50051,n2@10.0.0.12:50051")
+		require.ErrorIs(t, err, ErrRaftGroupPeersMissingGroup)
+	})
+
+	t.Run("local address mismatch is rejected", func(t *testing.T) {
+		_, err := resolveBootstrapConfig("n1", groups, "",
+			"1=n1@10.0.0.99:50051,n2@10.0.0.12:50051;2=n1@10.0.0.11:50052,n2@10.0.0.12:50052")
+		require.ErrorIs(t, err, ErrRaftGroupPeersLocalAddrMismatch)
+	})
+
+	t.Run("heterogeneous membership is rejected", func(t *testing.T) {
+		_, err := resolveBootstrapConfig("n1", groups, "",
+			"1=n1@10.0.0.11:50051,n2@10.0.0.12:50051;2=n1@10.0.0.11:50052,n3@10.0.0.13:50052")
+		require.ErrorIs(t, err, ErrRaftGroupPeersHeterogeneous)
+	})
+}
+
 func TestDurationToTicks(t *testing.T) {
 	t.Parallel()
 

@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,6 +137,35 @@ func TestCoordinate_ProposeHLCLease_NoLeaseProviderNoPanic(t *testing.T) {
 
 	require.NoError(t, c.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs))
 	require.False(t, c.lease.valid(monoclock.Now()))
+}
+
+func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) {
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+	var blocked atomic.Bool
+	blocked.Store(true)
+	c.SetHLCLeaseRenewalBlocker(blocked.Load)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.RunHLCLeaseRenewal(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	time.Sleep(hlcRenewalInterval + 100*time.Millisecond)
+	require.Equal(t, int32(0), eng.proposeCalls.Load(),
+		"blocked HLC renewal must not propose while startup rotation is active")
+
+	blocked.Store(false)
+	require.Eventually(t, func() bool {
+		return eng.proposeCalls.Load() > 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"HLC renewal should resume after startup rotation blocker clears")
 }
 
 // TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the

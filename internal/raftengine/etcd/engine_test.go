@@ -338,17 +338,8 @@ func TestOpenSingleNodeRestartsFromPersistedLog(t *testing.T) {
 func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	state := persistedState{
-		HardState: raftpb.HardState{
-			Term:   1,
-			Commit: 5,
-		},
-		Snapshot: raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     5,
-				Term:      1,
-			},
-		},
+		HardState: testHardState(1, 5),
+		Snapshot:  raftTestSnapshot(5, 1, []uint64{1}, nil),
 	}
 	require.NoError(t, saveMetadataFile(metadataFilePath(dir), state.HardState, state.Snapshot))
 	require.NoError(t, writeAndSyncFile(snapshotDataFilePath(dir), mustEncodeSnapshotData(t, nil)))
@@ -421,13 +412,7 @@ func TestOpenRestoresPlaceholderPersistedPeerMetadata(t *testing.T) {
 		{NodeID: 1, ID: "1"},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
 	}))
-	require.NoError(t, saveMetadataFile(metadataFilePath(dir), raftpb.HardState{Term: 2, Commit: 7}, raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
-			Index:     7,
-			Term:      2,
-		},
-	}))
+	require.NoError(t, saveMetadataFile(metadataFilePath(dir), testHardState(2, 7), raftTestSnapshot(7, 2, []uint64{1, 2}, nil)))
 
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
@@ -498,7 +483,7 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: raftpb.MsgHeartbeat})
+		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)})
 	}()
 
 	select {
@@ -511,7 +496,7 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 
 	select {
 	case msg := <-engine.stepCh:
-		require.Equal(t, raftpb.MsgHeartbeat, msg.Type)
+		require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
 	case <-time.After(time.Second):
 		t.Fatal("transport message was not delivered after startup")
 	}
@@ -524,11 +509,11 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
 	}
-	engine.stepCh <- raftpb.Message{Type: raftpb.MsgHeartbeat}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
 
 	require.Equal(t, uint64(0), engine.StepQueueFullCount())
 
-	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
 
@@ -537,7 +522,7 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 	// equals the true drop rate, not a multiple of it.
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 
-	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: raftpb.MsgApp})
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
 	require.Error(t, err)
 	require.Equal(t, uint64(2), engine.StepQueueFullCount())
 }
@@ -547,9 +532,9 @@ func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
 		rawNode: mustRawNode(t, etcdraft.NewMemoryStorage(), 1),
 	}
 	msg := raftpb.Message{
-		Type: raftpb.MsgAppResp,
-		From: 2,
-		To:   1,
+		Type: messageTypePtr(raftpb.MsgAppResp),
+		From: uint64Ptr(2),
+		To:   uint64Ptr(1),
 	}
 
 	engine.handleStep(msg)
@@ -559,13 +544,8 @@ func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
 
 func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     10,
-			Term:      1,
-		},
-	}))
+	snap := raftTestSnapshot(10, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
 	engine := &Engine{
 		rawNode: mustRawNode(t, storage, 1),
 		protectedReceivedFSMSnaps: map[uint64]int{
@@ -575,16 +555,12 @@ func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testin
 	require.False(t, engine.rawNode.HasReady())
 
 	engine.handleStep(raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 2,
-		To:   1,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(2),
+		To:   uint64Ptr(1),
 		Snapshot: &raftpb.Snapshot{
-			Data: encodeSnapshotToken(9, 0),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     9,
-				Term:      1,
-			},
+			Data:     encodeSnapshotToken(9, 0),
+			Metadata: testSnapshotMetadata(9, 1, []uint64{1}),
 		},
 	})
 
@@ -594,13 +570,8 @@ func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testin
 
 func TestHandleStepKeepsAcceptedSnapshotTokenProtectedUntilReady(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     10,
-			Term:      1,
-		},
-	}))
+	snap := raftTestSnapshot(10, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
 	engine := &Engine{
 		rawNode: mustRawNode(t, storage, 1),
 		protectedReceivedFSMSnaps: map[uint64]int{
@@ -610,16 +581,12 @@ func TestHandleStepKeepsAcceptedSnapshotTokenProtectedUntilReady(t *testing.T) {
 	require.False(t, engine.rawNode.HasReady())
 
 	engine.handleStep(raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 2,
-		To:   1,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(2),
+		To:   uint64Ptr(1),
 		Snapshot: &raftpb.Snapshot{
-			Data: encodeSnapshotToken(11, 0),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     11,
-				Term:      2,
-			},
+			Data:     encodeSnapshotToken(11, 0),
+			Metadata: testSnapshotMetadata(11, 2, []uint64{1}),
 		},
 	})
 
@@ -635,14 +602,8 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	}
 
 	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})
-	err := engine.applyReadySnapshot(raftpb.Snapshot{
-		Data: payload,
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     7,
-			Term:      2,
-		},
-	})
+	snap := raftTestSnapshot(7, 2, []uint64{1}, payload)
+	err := engine.applyReadySnapshot(&snap)
 	require.NoError(t, err)
 	require.Equal(t, uint64(7), engine.applied)
 	fsm, ok := engine.fsm.(*testStateMachine)
@@ -655,7 +616,7 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	hbCh := make(chan dispatchRequest, 1)
-	hbCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+	hbCh <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}}
 	engine := &Engine{
 		nodeID:    1,
 		transport: &GRPCTransport{},
@@ -667,8 +628,8 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		require.NoError(t, engine.sendMessages([]raftpb.Message{{
-			Type: raftpb.MsgHeartbeat,
-			To:   2,
+			Type: messageTypePtr(raftpb.MsgHeartbeat),
+			To:   uint64Ptr(2),
 		}}))
 		close(done)
 	}()
@@ -701,7 +662,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 		return ctx.Err()
 	}
 	engine.startDispatchWorkers()
-	engine.peerDispatchers[2].heartbeat <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}}
+	engine.peerDispatchers[2].heartbeat <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}}
 
 	select {
 	case <-started:
@@ -746,11 +707,11 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 	require.Equal(t, defaultHeartbeatBufPerPeer, cap(pd.heartbeat))
 	require.Equal(t, 4, cap(pd.normal))
 
-	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
 
 	select {
 	case msg := <-dispatched:
-		require.Equal(t, uint64(2), msg.To)
+		require.Equal(t, uint64(2), msg.GetTo())
 	case <-time.After(time.Second):
 		t.Fatal("message was not dispatched to peer 2")
 	}
@@ -795,18 +756,13 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 	}
 
 	// Subsequent messages to the removed peer must be dropped without panic.
-	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgHeartbeat, To: 2}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
 }
 
 func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
 
 	persist := mockstorage.NewStorageRecorder("")
 	engine := &Engine{
@@ -822,25 +778,16 @@ func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
 
 func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
 
 	entries := make([]raftpb.Entry, defaultSnapshotEvery)
 	for i := range entries {
 		index, err := uint32Len(i + 2)
 		require.NoError(t, err)
-		entries[i] = raftpb.Entry{
-			Type:  raftpb.EntryNormal,
-			Term:  1,
-			Index: uint64(index),
-		}
+		entries[i] = testEntry(uint64(index), 1, nil)
 	}
-	require.NoError(t, storage.Append(entries))
+	require.NoError(t, storage.Append(entryPointers(entries)))
 
 	persist := mockstorage.NewStorageRecorder("")
 	fsm := &blockingSnapshotStateMachine{
@@ -901,25 +848,16 @@ func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 
 func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
 
 	entries := make([]raftpb.Entry, defaultSnapshotEvery)
 	for i := range entries {
 		index, err := uint32Len(i + 2)
 		require.NoError(t, err)
-		entries[i] = raftpb.Entry{
-			Type:  raftpb.EntryNormal,
-			Term:  1,
-			Index: uint64(index),
-		}
+		entries[i] = testEntry(uint64(index), 1, nil)
 	}
-	require.NoError(t, storage.Append(entries))
+	require.NoError(t, storage.Append(entryPointers(entries)))
 
 	engine := &Engine{
 		storage:        storage,
@@ -948,14 +886,8 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 
 func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Data: []byte("newer"),
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
-			Index:     9,
-			Term:      2,
-		},
-	}))
+	snap := raftTestSnapshot(9, 2, []uint64{1, 2}, []byte("newer"))
+	require.NoError(t, storage.ApplySnapshot(&snap))
 
 	fsm := &countingSnapshotStateMachine{}
 	engine := &Engine{
@@ -969,18 +901,13 @@ func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testi
 
 func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
-	require.NoError(t, storage.Append([]raftpb.Entry{
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+	require.NoError(t, storage.Append(entryPointers([]raftpb.Entry{
+		testEntry(2, 1, nil),
+		testEntry(3, 1, nil),
+		testEntry(4, 1, nil),
+	})))
 
 	engine := &Engine{
 		storage: storage,
@@ -997,18 +924,13 @@ func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 
 func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
-	require.NoError(t, storage.Append([]raftpb.Entry{
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+	require.NoError(t, storage.Append(entryPointers([]raftpb.Entry{
+		testEntry(2, 1, nil),
+		testEntry(3, 1, nil),
+		testEntry(4, 1, nil),
+	})))
 
 	persist := mockstorage.NewStorageRecorder("")
 	fsm := &blockingSnapshotStateMachine{
@@ -1061,8 +983,8 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 
 	snapshot, err := storage.Snapshot()
 	require.NoError(t, err)
-	require.Equal(t, uint64(4), snapshot.Metadata.Index)
-	require.Equal(t, []uint64{1, 2}, snapshot.Metadata.ConfState.Voters)
+	require.Equal(t, uint64(4), snapshot.GetMetadata().GetIndex())
+	require.Equal(t, []uint64{1, 2}, snapshot.GetMetadata().GetConfState().GetVoters())
 }
 
 func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
@@ -1076,18 +998,13 @@ func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
 
 func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
-	require.NoError(t, storage.Append([]raftpb.Entry{
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+	require.NoError(t, storage.Append(entryPointers([]raftpb.Entry{
+		testEntry(2, 1, nil),
+		testEntry(3, 1, nil),
+		testEntry(4, 1, nil),
+	})))
 
 	engine := &Engine{
 		storage: storage,
@@ -1105,18 +1022,13 @@ func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
 
 func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     1,
-			Term:      1,
-		},
-	}))
-	require.NoError(t, storage.Append([]raftpb.Entry{
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-	}))
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+	require.NoError(t, storage.Append(entryPointers([]raftpb.Entry{
+		testEntry(2, 1, nil),
+		testEntry(3, 1, nil),
+		testEntry(4, 1, nil),
+	})))
 
 	fsm := &blockingSnapshotStateMachine{
 		started: make(chan struct{}),
@@ -1149,14 +1061,8 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 
 	restoreDone := make(chan error, 1)
 	go func() {
-		restoreDone <- engine.applyReadySnapshot(raftpb.Snapshot{
-			Data: mustEncodeSnapshotData(t, nil),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
-				Index:     5,
-				Term:      1,
-			},
-		})
+		restoreSnap := raftTestSnapshot(5, 1, []uint64{1, 2}, mustEncodeSnapshotData(t, nil))
+		restoreDone <- engine.applyReadySnapshot(&restoreSnap)
 	}()
 
 	select {
@@ -1225,9 +1131,9 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 
 	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
 		Context: context,
-		Changes: []raftpb.ConfChangeSingle{
-			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
-			{Type: raftpb.ConfChangeAddNode, NodeID: 3},
+		Changes: []*raftpb.ConfChangeSingle{
+			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(2)},
+			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(3)},
 		},
 	}, raftpb.ConfState{Voters: []uint64{1, 2, 3}})
 
@@ -1247,8 +1153,8 @@ func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *test
 	}
 
 	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
-		Changes: []raftpb.ConfChangeSingle{
-			{Type: raftpb.ConfChangeAddNode, NodeID: 2},
+		Changes: []*raftpb.ConfChangeSingle{
+			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(2)},
 		},
 	}, raftpb.ConfState{Voters: []uint64{1, 2}})
 
@@ -1284,29 +1190,18 @@ func TestApplyAddedPeerWithoutContextPreservesExistingMetadata(t *testing.T) {
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original := raftpb.Message{
-		Type:    raftpb.MsgApp,
-		To:      2,
+		Type:    messageTypePtr(raftpb.MsgApp),
+		To:      uint64Ptr(2),
 		Context: []byte("ctx"),
-		Entries: []raftpb.Entry{{
-			Type:  raftpb.EntryNormal,
-			Term:  3,
-			Index: 4,
-			Data:  []byte("entry"),
-		}},
+		Entries: entryPointers([]raftpb.Entry{testEntry(4, 3, []byte("entry"))}),
 		Snapshot: &raftpb.Snapshot{
-			Data: []byte("snapshot"),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{
-					Voters: []uint64{1, 2},
-				},
-				Index: 7,
-				Term:  3,
-			},
+			Data:     []byte("snapshot"),
+			Metadata: testSnapshotMetadata(7, 3, []uint64{1, 2}),
 		},
-		Responses: []raftpb.Message{{
-			Type:    raftpb.MsgHeartbeatResp,
+		Responses: testMessagePointers([]raftpb.Message{{
+			Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
 			Context: []byte("resp"),
-		}},
+		}}),
 	}
 
 	cloned := cloneDispatchMessage(original)
@@ -1314,27 +1209,23 @@ func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 	original.Context[0] = 'X'
 	original.Entries[0].Data[0] = 'X'
 	original.Snapshot.Data[0] = 'X'
-	original.Snapshot.Metadata.ConfState.Voters[0] = 99
+	original.Snapshot.GetMetadata().GetConfState().Voters[0] = 99
 	original.Responses[0].Context[0] = 'X'
 
 	require.Equal(t, []byte("ctx"), cloned.Context)
 	require.Equal(t, []byte("entry"), cloned.Entries[0].Data)
 	require.Equal(t, []byte("snapshot"), cloned.Snapshot.Data)
-	require.Equal(t, []uint64{1, 2}, cloned.Snapshot.Metadata.ConfState.Voters)
+	require.Equal(t, []uint64{1, 2}, cloned.Snapshot.GetMetadata().GetConfState().GetVoters())
 	require.Equal(t, []byte("resp"), cloned.Responses[0].Context)
 }
 
 func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Data: []byte("snapshot"),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
-				Index:     7,
-				Term:      3,
-			},
+			Data:     []byte("snapshot"),
+			Metadata: testSnapshotMetadata(7, 3, []uint64{1, 2}),
 		},
 	}
 
@@ -1345,50 +1236,31 @@ func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
 	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
 
 	msg.Snapshot.Data[0] = 'X'
-	msg.Snapshot.Metadata.ConfState.Voters[0] = 99
+	msg.Snapshot.GetMetadata().GetConfState().Voters[0] = 99
 
 	require.Equal(t, []byte("snapshot"), req.msg.Snapshot.Data)
-	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.Metadata.ConfState.Voters)
+	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.GetMetadata().GetConfState().GetVoters())
 }
 
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     5,
-			Term:      2,
-		},
-	}))
-	require.NoError(t, storage.SetHardState(raftpb.HardState{
-		Term:   2,
-		Commit: 9,
-	}))
+	snap := raftTestSnapshot(5, 2, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+	hs := testHardState(2, 9)
+	require.NoError(t, storage.SetHardState(&hs))
 
-	require.Equal(t, uint64(5), maxAppliedIndex(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{Index: 5},
-	}))
+	require.Equal(t, uint64(5), maxAppliedIndex(raftTestSnapshot(5, 0, nil, nil)))
 }
 
 func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
-		HardState: raftpb.HardState{
-			Term:   2,
-			Commit: 6,
-		},
-		Snapshot: raftpb.Snapshot{
-			Data: mustEncodeSnapshotData(t, [][]byte{[]byte("snap")}),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     5,
-				Term:      2,
-			},
-		},
+		HardState: testHardState(2, 6),
+		Snapshot:  raftTestSnapshot(5, 2, []uint64{1}, mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})),
 		Entries: []raftpb.Entry{{
-			Type:  raftpb.EntryNormal,
-			Term:  2,
-			Index: 6,
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Term:  uint64Ptr(2),
+			Index: uint64Ptr(6),
 			Data:  encodeProposalEnvelope(1, []byte("tail")),
 		}},
 	}))
@@ -1589,6 +1461,66 @@ func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
 	require.True(t, errors.Is(err, errTooManyPendingConfigs))
 }
 
+func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
+	engine := &Engine{}
+	engine.appliedIndex.Store(10)
+
+	engine.markPendingConfChange(12)
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(11)
+	require.True(t, engine.hasPendingConfChange(), "entry below the pending config index must not clear the fence")
+
+	engine.clearPendingConfChange(12)
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(129)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(130)
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorageUsesReplayAppliedFloor(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(150)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(129))
+	require.True(t, engine.hasPendingConfChange(),
+		"RawNode replay can start before the FSM applied index after restart; the transfer fence must cover that replay window")
+}
+
+func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: entryTypePtr(raftpb.EntryConfChange),
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(130)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
+	require.False(t, engine.hasPendingConfChange())
+}
+
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
 	t.Helper()
 
@@ -1785,35 +1717,23 @@ func committedTailStorage(t *testing.T, snapIndex, commit uint64) *etcdraft.Memo
 func committedTailStorageWithEntries(t *testing.T, snapIndex, commit uint64, overrides map[uint64]raftpb.Entry) *etcdraft.MemoryStorage {
 	t.Helper()
 	storage := etcdraft.NewMemoryStorage()
-	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			ConfState: raftpb.ConfState{Voters: []uint64{1}},
-			Index:     snapIndex,
-			Term:      1,
-		},
-	}))
-	entries := make([]raftpb.Entry, 0, commit-snapIndex)
+	snapshot := raftTestSnapshot(snapIndex, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snapshot))
+	entries := make([]*raftpb.Entry, 0, commit-snapIndex)
 	for index := snapIndex + 1; index <= commit; index++ {
-		entry := raftpb.Entry{
-			Index: index,
-			Term:  1,
-			Type:  raftpb.EntryNormal,
-			Data:  []byte("already-applied"),
-		}
+		entry := testEntry(index, 1, []byte("already-applied"))
 		if override, ok := overrides[index]; ok {
 			entry = override
-			entry.Index = index
-			if entry.Term == 0 {
-				entry.Term = 1
+			entry.Index = uint64Ptr(index)
+			if entry.GetTerm() == 0 {
+				entry.Term = uint64Ptr(1)
 			}
 		}
-		entries = append(entries, entry)
+		entries = append(entries, &entry)
 	}
 	require.NoError(t, storage.Append(entries))
-	require.NoError(t, storage.SetHardState(raftpb.HardState{
-		Term:   1,
-		Commit: commit,
-	}))
+	hardState := testHardState(1, commit)
+	require.NoError(t, storage.SetHardState(&hardState))
 	return storage
 }
 
@@ -1837,8 +1757,8 @@ func TestNewRawNodeWithoutAppliedRedeliversCommittedTail(t *testing.T) {
 	require.True(t, rawNode.HasReady())
 	ready := rawNode.Ready()
 	require.Len(t, ready.CommittedEntries, 50)
-	require.Equal(t, uint64(101), ready.CommittedEntries[0].Index)
-	require.Equal(t, uint64(150), ready.CommittedEntries[len(ready.CommittedEntries)-1].Index)
+	require.Equal(t, uint64(101), ready.CommittedEntries[0].GetIndex())
+	require.Equal(t, uint64(150), ready.CommittedEntries[len(ready.CommittedEntries)-1].GetIndex())
 }
 
 func TestRawNodeAppliedForOpenClipsToCommitted(t *testing.T) {
@@ -1853,7 +1773,7 @@ func TestRawNodeAppliedForOpenClipsToCommitted(t *testing.T) {
 func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		125: {
-			Type: raftpb.EntryNormal,
+			Type: entryTypePtr(raftpb.EntryNormal),
 			Data: encodeProposalEnvelope(1, []byte{0x02, 0xaa}),
 		},
 	})
@@ -1870,13 +1790,13 @@ func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
 	require.True(t, rawNode.HasReady())
 	ready := rawNode.Ready()
 	require.NotEmpty(t, ready.CommittedEntries)
-	require.Equal(t, uint64(125), ready.CommittedEntries[0].Index)
+	require.Equal(t, uint64(125), ready.CommittedEntries[0].GetIndex())
 }
 
 func TestRawNodeAppliedForOpenPreservesConfChangeReplay(t *testing.T) {
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {
-			Type: raftpb.EntryConfChange,
+			Type: entryTypePtr(raftpb.EntryConfChange),
 			Data: []byte("conf"),
 		},
 	})
@@ -1899,6 +1819,9 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNotLeader), raftengine.ErrNotLeader))
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferInProgress), raftengine.ErrLeadershipTransferInProgress))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferNoHealthyTarget), raftengine.ErrLeadershipTransferNoHealthyTarget))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferTargetNotCaughtUp), raftengine.ErrLeadershipTransferTargetNotCaughtUp))
+	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferConfChangePending), raftengine.ErrLeadershipTransferConfChangePending))
 }
 
 // TestSelectDispatchLane_LegacyTwoLane verifies that, when the 4-lane
@@ -2005,7 +1928,7 @@ func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 		dispatchCancel:         cancel,
 	}
 	engine.dispatchFn = func(dctx context.Context, req dispatchRequest) error {
-		switch req.msg.Type { //nolint:exhaustive // test only exercises MsgSnap and MsgApp; other types are irrelevant here
+		switch req.msg.GetType() { //nolint:exhaustive // test only exercises MsgSnap and MsgApp; other types are irrelevant here
 		case raftpb.MsgSnap:
 			// Block the snapshot lane until the test releases it. The
 			// replication lane should keep flowing in the meantime.
@@ -2027,8 +1950,8 @@ func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 	require.NotNil(t, pd.replication)
 	require.NotNil(t, pd.snapshot)
 
-	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgSnap, To: 2}))
-	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}))
 
 	select {
 	case <-replicationDone:
@@ -2083,7 +2006,7 @@ func TestFourLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
 	}
 
 	// Subsequent sends to the removed peer must be dropped without panic.
-	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}))
 }
 
 // TestDispatcherLanesEnabledFromEnv pins env-var parsing so a regression in

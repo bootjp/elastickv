@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"maps"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,11 +38,12 @@ var (
 	ErrInvalidRaftSQSMapEntry           = errors.New("invalid raftSqsMap entry")
 	ErrInvalidSQSFifoPartitionMapEntry  = errors.New("invalid sqsFifoPartitionMap entry")
 	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
+	ErrInvalidRaftGroupPeersEntry       = errors.New("invalid raftGroupPeers entry")
 )
 
 // sqsFifoPartitionMaxPartitions caps the per-queue partition count so
 // the partitionFor mask + bucket-store sizing arguments in
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md §3.1 stay
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md §3.1 stay
 // honest: 32 partitions × ~1k RPS per shard ≈ 30k aggregate RPS per
 // queue, which matches the design's stated ceiling. Operators who
 // need more should split the workload across queues rather than
@@ -381,6 +383,97 @@ func parseRaftBootstrapMembers(raw string) ([]raftengine.Server, error) {
 		})
 	}
 	return servers, nil
+}
+
+func parseRaftGroupPeers(raw string) (map[uint64][]raftengine.Server, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := make(map[uint64][]raftengine.Server)
+	for entry := range strings.SplitSeq(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		groupID, servers, err := parseRaftGroupPeersEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := out[groupID]; exists {
+			return nil, errors.Wrapf(ErrInvalidRaftGroupPeersEntry, "duplicate group id %d", groupID)
+		}
+		out[groupID] = servers
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func parseRaftGroupPeersEntry(entry string) (uint64, []raftengine.Server, error) {
+	kv := strings.SplitN(entry, "=", splitParts)
+	if len(kv) != splitParts {
+		return 0, nil, errors.Wrapf(ErrInvalidRaftGroupPeersEntry,
+			"%q: expected groupID=raftID@host:port,...", entry)
+	}
+	groupRaw := strings.TrimSpace(kv[0])
+	groupID, err := strconv.ParseUint(groupRaw, 10, 64)
+	if err != nil {
+		return 0, nil, errors.Wrapf(ErrInvalidRaftGroupPeersEntry,
+			"%q: invalid group id %q", entry, groupRaw)
+	}
+	servers, err := parseRaftGroupPeerList(entry, kv[1])
+	if err != nil {
+		return 0, nil, err
+	}
+	return groupID, servers, nil
+}
+
+func parseRaftGroupPeerList(entry, raw string) ([]raftengine.Server, error) {
+	servers := make([]raftengine.Server, 0)
+	seen := make(map[string]struct{})
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		server, err := parseRaftGroupPeer(entry, part)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[server.ID]; exists {
+			return nil, errors.Wrapf(ErrInvalidRaftGroupPeersEntry,
+				"%q: duplicate raft id %q", entry, server.ID)
+		}
+		seen[server.ID] = struct{}{}
+		servers = append(servers, server)
+	}
+	if len(servers) == 0 {
+		return nil, errors.Wrapf(ErrInvalidRaftGroupPeersEntry, "%q: empty member list", entry)
+	}
+	slices.SortFunc(servers, func(a, b raftengine.Server) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return servers, nil
+}
+
+func parseRaftGroupPeer(entry, part string) (raftengine.Server, error) {
+	id, addr, ok := strings.Cut(part, "@")
+	id = strings.TrimSpace(id)
+	addr = strings.TrimSpace(addr)
+	if !ok || id == "" || addr == "" {
+		return raftengine.Server{}, errors.Wrapf(ErrInvalidRaftGroupPeersEntry,
+			"%q: invalid member %q (expected raftID@host:port)", entry, part)
+	}
+	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
+		return raftengine.Server{}, errors.Wrapf(ErrInvalidRaftGroupPeersEntry,
+			"%q: invalid member address %q", entry, addr)
+	}
+	return raftengine.Server{
+		Suffrage: "voter",
+		ID:       id,
+		Address:  addr,
+	}, nil
 }
 
 func defaultGroupID(groups []groupSpec) uint64 {
