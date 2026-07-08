@@ -18,7 +18,7 @@ COPY web/admin/ ./
 # emptyOutDir=true, so only --outDir is forwarded here.
 RUN npm run build -- --outDir /spa/dist
 
-FROM golang:1.25 AS build
+FROM golang:1.26 AS build
 WORKDIR $GOPATH/src/app
 COPY . .
 # Replace the placeholder dist/ with the real Vite bundle BEFORE the

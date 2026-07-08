@@ -1231,7 +1231,7 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 // was captured at — flows into pb.Request.ObservedRouteVersion so the M3
 // Composed-1 FSM apply-time gate can re-validate ownership against the
 // route catalog snapshot at txn-begin (M1 plumbing, see
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md).
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md).
 // Zero is the legacy "unpinned" sentinel.
 func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)

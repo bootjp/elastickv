@@ -325,14 +325,19 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 // the HLC-4 (iii) ceiling fence added a NextFenced error branch
 // (PR #867 Phase 2b).
 func (r *RedisServer) requireKeyTypeOrEmpty(ctx context.Context, key []byte, readTS uint64, expected redisValueType) error {
+	_, err := r.keyTypeOrEmptyAt(ctx, key, readTS, expected)
+	return err
+}
+
+func (r *RedisServer) keyTypeOrEmptyAt(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
 	typ, err := r.keyTypeAtExpect(ctx, key, readTS, expected)
 	if err != nil {
-		return err
+		return redisTypeNone, err
 	}
 	if typ != redisTypeNone && typ != expected {
-		return wrongTypeError()
+		return typ, wrongTypeError()
 	}
-	return nil
+	return typ, nil
 }
 
 // keyTypeAtExpect is a fast-path replacement for keyTypeAt callers that

@@ -1,6 +1,6 @@
 # Lease Read Design
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-04-20
 
