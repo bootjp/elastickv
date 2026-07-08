@@ -223,12 +223,13 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID       uint64
-	LocalID      string
-	LocalAddress string
-	DataDir      string
-	Peers        []Peer
-	Bootstrap    bool
+	NodeID        uint64
+	LocalID       string
+	LocalAddress  string
+	DataDir       string
+	Peers         []Peer
+	BootstrapSeed []Peer
+	Bootstrap     bool
 	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
 	// engine watches every post-apply ConfState and emits an
 	// ERROR-level alarm whenever the local node is in Voters while
@@ -736,7 +737,12 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 	// a peers file that contradicts the snapshot's ConfState.Learners
 	// and validateConfState would reject the cluster on next open.
 	annotatePeerSuffrageInSlice(peers, confStateValue(disk.LocalSnap.GetMetadata().GetConfState()))
-	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
+	if err := savePersistedPeersWithBootstrapSeed(
+		cfg.DataDir,
+		maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index),
+		peers,
+		cfg.BootstrapSeed,
+	); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
 	}
@@ -3870,6 +3876,9 @@ func normalizeOpenConfig(cfg OpenConfig) (OpenConfig, persistedPeers, bool, erro
 	if err != nil {
 		return OpenConfig{}, persistedPeers{}, false, err
 	}
+	if err := validateBootstrapSeed(peers, ok, cfg.BootstrapSeed); err != nil {
+		return OpenConfig{}, persistedPeers{}, false, err
+	}
 	if ok {
 		cfg.Peers = peers.Peers
 	}
@@ -3877,6 +3886,34 @@ func normalizeOpenConfig(cfg OpenConfig) (OpenConfig, persistedPeers, bool, erro
 	cfg = normalizeTimingConfig(cfg)
 	cfg = normalizeLimitConfig(cfg)
 	return cfg, peers, ok, nil
+}
+
+func validateBootstrapSeed(persisted persistedPeers, persistedOK bool, configured []Peer) error {
+	if !persistedOK || !persisted.BootstrapSeedActive || len(configured) == 0 {
+		return nil
+	}
+	normalizedConfigured, err := normalizePersistedPeers(configured)
+	if err != nil {
+		return err
+	}
+	if samePeerList(normalizedConfigured, persisted.BootstrapSeed) {
+		return nil
+	}
+	return errors.Wrapf(errClusterMismatch,
+		"bootstrap seed differs from persisted seed: configured=%v persisted=%v",
+		normalizedConfigured, persisted.BootstrapSeed)
+}
+
+func samePeerList(a, b []Peer) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOpenPeers(snapshot raftpb.Snapshot, peers []Peer, persisted persistedPeers, persistedOK bool) error {

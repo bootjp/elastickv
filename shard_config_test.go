@@ -332,6 +332,39 @@ func TestParseRaftBootstrapMembers(t *testing.T) {
 	})
 }
 
+func TestParseRaftGroupPeers(t *testing.T) {
+	t.Run("parses groups and sorted members", func(t *testing.T) {
+		peers, err := parseRaftGroupPeers("2=n2@10.0.0.12:50052,n1@10.0.0.11:50052;1=n2@10.0.0.12:50051,n1@10.0.0.11:50051")
+		require.NoError(t, err)
+		require.Equal(t, map[uint64][]raftengine.Server{
+			1: {
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
+			},
+			2: {
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50052"},
+				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50052"},
+			},
+		}, peers)
+	})
+
+	t.Run("empty returns nil", func(t *testing.T) {
+		peers, err := parseRaftGroupPeers(" ; ")
+		require.NoError(t, err)
+		require.Nil(t, peers)
+	})
+
+	t.Run("duplicate raft id errors", func(t *testing.T) {
+		_, err := parseRaftGroupPeers("1=n1@10.0.0.11:50051,n1@10.0.0.12:50051")
+		require.ErrorIs(t, err, ErrInvalidRaftGroupPeersEntry)
+	})
+
+	t.Run("invalid address errors", func(t *testing.T) {
+		_, err := parseRaftGroupPeers("1=n1@not-a-hostport,n2@10.0.0.12:50051")
+		require.ErrorIs(t, err, ErrInvalidRaftGroupPeersEntry)
+	})
+}
+
 func TestDefaultGroupID(t *testing.T) {
 	require.Equal(t, uint64(1), defaultGroupID(nil))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))

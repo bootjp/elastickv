@@ -213,6 +213,9 @@ func normalizePersistedPeer(peer Peer) (Peer, error) {
 			peer.ID = strconv.FormatUint(peer.NodeID, 10)
 		}
 	}
+	if peer.Suffrage == "" {
+		peer.Suffrage = SuffrageVoter
+	}
 	return peer, nil
 }
 

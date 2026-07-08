@@ -179,7 +179,7 @@ type Admin interface {
 
     AddVoter(ctx context.Context, id, address string, prevIndex uint64) (uint64, error)
     AddLearner(ctx context.Context, id, address string, prevIndex uint64) (uint64, error)
-    PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error)
+    PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
     RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 
     TransferLeadership(ctx context.Context) error
@@ -209,12 +209,11 @@ Notes on the new methods:
      proposing. The `Progress` map is read directly from `rawNode.Status()`
      inside the admin handler — same goroutine that owns the rawNode —
      so no lock or clone is required.
-  3. `minAppliedIndex == 0` is **discouraged**: it skips the
-     precondition. We accept the convention to stay consistent with the
-     existing `prevIndex` ("0 means don't check the config index") on
-     the same RPC family, but the runbook calls it out as a footgun and
-     §8 lists "should we use a separate `skip_min_applied_check` boolean
-     instead" as an open question.
+  3. `minAppliedIndex == 0` is rejected unless
+     `skipMinAppliedCheck == true`. The explicit skip flag prevents
+     scripts that omit the catch-up bound from silently disabling the
+     promotion safety check; callers that intentionally bypass the
+     guard must name that choice in the request.
 - `RemoveServer` is unchanged. etcd/raft handles `ConfChangeRemoveNode` for
   a learner correctly, and the existing path already calls `peerForID` /
   `removePeer`.
@@ -487,7 +486,8 @@ message RaftAdminAddLearnerRequest {
 message RaftAdminPromoteLearnerRequest {
   string id = 1;
   uint64 previous_index = 2;
-  uint64 min_applied_index = 3; // 0 = skip precondition
+  uint64 min_applied_index = 3; // must be >0 unless skip_min_applied_check is true
+  bool skip_min_applied_check = 4;
 }
 ```
 
@@ -499,7 +499,7 @@ existing wiring helpers (`adminError`, the `Unimplemented` guard for
 
 ```text
 raftadmin <addr> add_learner <id> <address> [previous_index]
-raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index]
+raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]
 ```
 
 The existing `configuration` subcommand already prints the per-server
@@ -892,9 +892,10 @@ follower-served read routing remains a separate proposal.
    policy in `multiraft_runtime.go`.
 3. **Operator promotes a not-yet-caught-up learner.** Mitigation:
    `min_applied_index` precondition checked against
-   `Progress[nodeID].Match` on the leader. Default `0` skips the check
-   for compatibility with scripts that don't set it; the runbook
-   strongly recommends a non-zero value.
+   `Progress[nodeID].Match` on the leader. Default `0` is rejected
+   unless `skip_min_applied_check=true`, so scripts that omit the
+   catch-up bound get a clean `FailedPrecondition` instead of silently
+   disabling the safety check.
 4. **Learner cannot become leader by accident.** etcd/raft already
    enforces this; we inherit the property. The rejection path in
    `handleTransferLeadership` already documents it (rejects transfer to

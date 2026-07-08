@@ -156,20 +156,12 @@ memory each group's private cache/memtable pins.
   write-proposal load is not pinned to one node. Count-based v1 (TiKV
   balance-leader equivalent), embedded in the default-group leader, default
   OFF behind `--leaderBalance`.
-- **Multi-node multi-group bootstrap — GAP.** Leader balance is *blocked on a
-  topology that does not exist*: PR #953 §1.1a ("PR0") documents that no
-  startup wiring produces a group whose voters span more than one node — the
-  `len(groups) != 1` guard at `main.go:746` and the single-member bootstrap in
-  `multiraft_runtime.go:246-254` mean every group in a multi-group process is
-  single-voter, so there is nothing to transfer a leader *to*. Closing this is
-  a prerequisite for write-throughput scaling beyond one node, and a companion
-  proposal is in review as **PR #955**
-  (`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
-  `design/multinode-multigroup-bootstrap`): extend `--raftGroups` / a per-group
-  members flag to accept a multi-node voter set per group, lifting the
-  `len(groups)==1` guard. Once PR #955 lands it is the authoritative spec for
-  this gap; this roadmap treats it as the unblocking dependency for (b), (e),
-  and the region-balance gap in §3.
+- **Multi-node multi-group bootstrap — done.** The implemented
+  `docs/design/2026_06_14_implemented_multinode_multigroup_bootstrap.md`
+  adds `--raftGroupPeers`, per-group bootstrap peer wiring, persisted
+  bootstrap-seed validation, and a 3-node × 2-group integration smoke with
+  leader transfer. This unblocks the topology prerequisite for leader balance,
+  write-throughput scaling beyond one node, and the region-balance gap in §3.
 
 ### (c) Read throughput
 
@@ -302,25 +294,15 @@ memory each group's private cache/memtable pins.
 Each gap is a design doc that should be written (`*_proposed_*.md`). Ranked by
 how much further scaling it unlocks. "Depends-on" lists hard prerequisites.
 
-### Gap 1 — Multi-node multi-group bootstrap (highest leverage)
-**Problem.** Startup wiring can already bootstrap a *single* Raft group with
-multiple voters via `--raftBootstrapMembers`, but it cannot express a
-*multi-group* topology where each group has its own multi-node voter set
-(`main.go:746` rejects `--raftBootstrapMembers` when `len(groups) != 1`, and
-the multi-group path still falls back to single-member group bootstraps). That
-multi-group limitation blocks write-throughput scaling beyond one group, leader
-balance across groups, follower reads for every group, and every cluster-size
-dimension that needs multiple replicated ranges. **Rough milestones:** (M1)
-extend `--raftGroups` / add a per-group members flag to accept per-group
-multi-node voter sets; lift the guard only for the explicitly modeled
-multi-group form. (M2) integration harness that stands up multi-voter groups
-across processes. (M3) Jepsen multi-group multi-node workload. **Depends-on:**
-none for writing the design; rollout must land the HLC per-group ceiling
-renewal fix first, as sequenced in §4, before enabling the topology that
-exposes stale ceilings. *A companion proposal is in review as **PR #955**
-(`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
-`design/multinode-multigroup-bootstrap`); once it lands it is the authoritative
-spec for this gap and this roadmap defers to it.*
+### Gap 1 — Multi-node multi-group bootstrap (closed)
+**Status.** Closed by
+`docs/design/2026_06_14_implemented_multinode_multigroup_bootstrap.md`.
+Startup wiring can now express a *multi-group* topology where each group has a
+multi-node voter set via `--raftGroupPeers`, and the in-process 3-node × 2-group
+smoke verifies per-group voters, leader transfer, and restart rejoin. The
+remaining work from the original roadmap item is the broader Jepsen runner for
+true multi-node multi-group workloads, tracked as a follow-on rather than a
+bootstrap design blocker.
 
 ### Gap 2 — Shared Pebble cache / resource pools
 **Problem.** Each group's store allocates a private 256 MiB block cache
@@ -410,10 +392,10 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
    replicas move across nodes, but do not enable cross-group transactions whose
    timestamps can be allocated by more than one coordinator node until step 11
    (or its single-oracle bridge) lands.
-2. **Multi-node multi-group bootstrap** (Gap 1 / **PR #955**,
-   `2026_06_12_proposed_multinode_multigroup_bootstrap.md`). The root
-   unblocker for (b), (c), (e), Gap 3, Gap 4. Nothing else multi-node-shaped
-   can land until a group can have voters on more than one node.
+2. **Multi-node multi-group bootstrap** (Gap 1, implemented in
+   `2026_06_14_implemented_multinode_multigroup_bootstrap.md`). The root
+   topology unblocker for (b), (c), (e), Gap 3, Gap 4 is now in-tree; downstream
+   work can build on groups whose voters span more than one node.
 3. **Leader balance scheduler** (PR #953). Its PR0 is exactly Gap 1; PR1
    (observe-only) can land against today's single-voter topology, but the
    transfer-issuing PR2–PR3 are blocked on step 2. So: PR #953 PR1 in
