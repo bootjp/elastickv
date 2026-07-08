@@ -88,10 +88,12 @@ enum SampleRole {
 }
 
 message KeyVizRow {
-  // bucket_id is either "route:<routeID>" or "virtual:<lineageID-or-hash>".
+  // bucket_id is "route:<routeID>", "route:<routeID>:<label>", or
+  // "virtual:<lineageID-or-hash>".
   string bucket_id = 1;
   bytes start = 2;
   bytes end = 3;
+  // label is the per-adapter KeyViz label; empty for legacy and virtual rows.
   string label = 4;
   bool aggregate = 5;
   repeated uint64 route_ids = 6;

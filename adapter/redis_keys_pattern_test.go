@@ -157,12 +157,19 @@ func TestCollectUserKeys_FiltersByPattern(t *testing.T) {
 		{Key: []byte("toast:key"), Value: []byte("v")},
 		{Key: store.ListMetaKey([]byte("test:list")), Value: []byte("m")},
 		{Key: store.ListItemKey([]byte("test:list"), 1), Value: []byte("i")},
+		{Key: redisTxnWideHashFenceKey([]byte("test:hash")), Value: []byte("1")},
+		{Key: redisTxnWideSetFenceKey([]byte("test:set")), Value: []byte("1")},
+		{Key: redisTxnWideListFenceKey([]byte("test:list")), Value: []byte("1")},
+		{Key: redisTxnWideZSetFenceKey([]byte("test:zset")), Value: []byte("1")},
 	}
 
 	keys := r.collectUserKeys(kvs, []byte("test*"))
 	require.Len(t, keys, 2)
 	require.Contains(t, keys, "test:key")
 	require.Contains(t, keys, "test:list")
+	require.NotContains(t, keys, "test:hash")
+	require.NotContains(t, keys, "test:set")
+	require.NotContains(t, keys, "test:zset")
 }
 
 func TestLocalKeysPattern_FindsListKeysForUserPrefix(t *testing.T) {

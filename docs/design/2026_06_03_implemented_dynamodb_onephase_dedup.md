@@ -12,9 +12,9 @@ Date: 2026-06-03
 > (`UpdateItem` / `PutItem` / `DeleteItem`). The FSM-side probe
 > (`dedupProbeOnePhase`, `kv/fsm.go`) and the request plumbing
 > (`OperationGroup.PrevCommitTS` → `onePhaseTxnRequestWithPrevCommit`) already
-> exist and are shared across adapters; only the DynamoDB adapter retry loop
-> and a default-off gate are new. Follows the parent design
-> [`2026_05_21_proposed_txn_secondary_idempotency.md`](2026_05_21_proposed_txn_secondary_idempotency.md);
+> exist and are shared across adapters; this implementation wires the DynamoDB
+> adapter retry loop and keeps an explicit rollback switch. Follows the parent design
+> [`2026_05_21_implemented_txn_secondary_idempotency.md`](2026_05_21_implemented_txn_secondary_idempotency.md);
 > read that first — this doc reuses its correctness argument verbatim and only
 > develops the DynamoDB-specific differences.
 >
@@ -131,7 +131,10 @@ gated **emission** behind the Redis adapter only:
   doc's M4 "Workflow scope rationale" stated this explicitly: *"DynamoDB / S3
   / SQS do not route through the dedup loop."*
 
-So the FSM is ready; the DynamoDB adapter is the only missing piece.
+Before this implementation the FSM probe was ready while the DynamoDB adapter
+still emitted no `PrevCommitTS`. The adapter now emits the probe metadata from
+the one-phase item-write retry loop, so DynamoDB participates in the same
+option-2 dedup mechanism as Redis.
 
 ## Why DynamoDB is simpler than the Redis list-push case
 
@@ -171,8 +174,8 @@ Mirror `listPushCoreWithDedup` / `dispatchListPushReuse` at the
 
 ### Prerequisite: allocate `commit_ts` in the adapter
 
-Today the DynamoDB item-write path leaves `OperationGroup.CommitTS = 0` and
-lets the coordinator assign the commit timestamp internally. Option 2 requires
+Before M1 the DynamoDB item-write path left `OperationGroup.CommitTS = 0` and
+let the coordinator assign the commit timestamp internally. Option 2 requires
 the adapter to **know** the `commit_ts` it dispatched, so it can pass it as
 `PrevCommitTS` on the next attempt. The Redis adapter already does this:
 `commitTS = r.coordinator.Clock().NextFenced()`, dispatched as
@@ -487,7 +490,7 @@ probe already existed.
 - (2026-06-03) Initial proposal, triggered by Jepsen run 26856696842
   (`:duplicate-elements` on the DynamoDB list-append workload). Open for
   review. Diagnosis confirmed: same anomaly class as the parent design
-  (`2026_05_21_proposed_txn_secondary_idempotency.md`); the DynamoDB
+  (`2026_05_21_implemented_txn_secondary_idempotency.md`); the DynamoDB
   single-item write recomputes its write set on a self-inflicted
   `WriteConflict` under leadership churn and double-applies. Fix: extend
   option-2 reuse-dedup to `retryItemWriteWithGeneration`.

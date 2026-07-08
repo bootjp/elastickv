@@ -1,12 +1,12 @@
 // elastickv-split is a single-shot CLI that invokes the
 // Distribution.SplitRange RPC on a running elastickv cluster.  Per
 // the Composed-1 M5 design doc
-// (docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md
+// (docs/design/2026_06_02_implemented_composed1_m5_jepsen_route_shuffle.md
 // §3.1), the Jepsen route-shuffle nemesis shells out to this tool
 // rather than re-implementing the gRPC client in Clojure: keeping
 // the request construction and the SplitRangeRequest field
-// encoding in Go avoids the silent-mis-routing trap codex P1 #1
-// flagged on PR #905 (base64 RawURLEncoding for table-route keys).
+// encoding in Go avoids the silent-mis-routing trap flagged on PR #905
+// (base64 RawURLEncoding for table-route keys).
 //
 // Usage:
 //
@@ -63,7 +63,7 @@ func run() error {
 	}
 	defer func() {
 		// Surface gRPC close errors on stderr so a resource-leak
-		// or half-closed-stream condition is visible (gemini medium
+		// or half-closed-stream condition is visible (review feedback
 		// on PR #911).  Don't promote to a process-level error
 		// since the SplitRange result is already in hand by this
 		// point; a noisy close shouldn't mask a successful RPC.
