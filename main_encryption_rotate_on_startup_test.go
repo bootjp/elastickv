@@ -133,6 +133,33 @@ func (b *blockingRunRotateStartupRunner) Run(context.Context) error {
 
 func (b *blockingRunRotateStartupRunner) Done() bool { return b.done.Load() }
 
+type raceFireRotateStartupController struct {
+	fakeRotateStartupController
+	stateCalls atomic.Int32
+	runner     *blockingRunRotateStartupRunner
+}
+
+func (r *raceFireRotateStartupController) State() raftengine.State {
+	r.mu.Lock()
+	state := r.state
+	callbacks := append([]func(){}, r.callbacks...)
+	r.mu.Unlock()
+	if r.stateCalls.Add(1) == 2 {
+		go func() {
+			for _, cb := range callbacks {
+				if cb != nil {
+					cb()
+				}
+			}
+		}()
+		select {
+		case <-r.runner.started:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return state
+}
+
 type stubStartupCoordinator struct {
 	dispatches atomic.Int32
 	clock      *kv.HLC
@@ -293,6 +320,44 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("startup wait did not finish after rotation completed")
+	}
+}
+
+func TestInstallEncryptionRotateOnStartupRequest_WaitContinuesAfterConcurrentFire(t *testing.T) {
+	runner := &blockingRunRotateStartupRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	controller := &raceFireRotateStartupController{
+		fakeRotateStartupController: fakeRotateStartupController{state: raftengine.StateLeader},
+		runner:                      runner,
+	}
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
+	defer deregister()
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- waitStartup.Wait(context.Background())
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent startup rotation did not start")
+	}
+	select {
+	case err := <-waitDone:
+		t.Fatalf("startup wait returned before concurrent rotation finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(runner.release)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("startup wait returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup wait did not finish after concurrent rotation completed")
 	}
 }
 
@@ -834,6 +899,41 @@ func TestEncryptionRotateOnStartupTask_KeyIDExhaustionDoesNotMarkDone(t *testing
 	}
 	if task.Done() {
 		t.Fatal("key-id exhaustion must not mark rotation done")
+	}
+}
+
+func TestEncryptionRotateOnStartupTask_PreflightsKeyIDCapacity(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 1,
+		Active:           encryption.ActiveKeys{Storage: 7, Raft: 8},
+		Keys: map[string]encryption.SidecarKey{
+			"7":          {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage")},
+			"8":          {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft")},
+			"4294967294": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("near-max")},
+		},
+	}
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	rec := &recordingRotateProposer{}
+	task := &encryptionRotateOnStartupTask{
+		server:      adapterServerForRotateStartup(t, sidecarPath, rec),
+		sidecarPath: sidecarPath,
+		kekWrapper:  fakeStartupKEK{},
+		fullNodeID:  0xCAFE,
+	}
+	if err := task.Run(context.Background()); err == nil {
+		t.Fatal("Run returned nil, want preflight key-id exhaustion error")
+	}
+	if len(rec.proposals) != 0 {
+		t.Fatalf("proposals=%d, want 0 before capacity preflight passes", len(rec.proposals))
+	}
+	if task.Done() {
+		t.Fatal("key-id preflight exhaustion must not mark rotation done")
 	}
 }
 

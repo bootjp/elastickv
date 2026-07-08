@@ -97,6 +97,7 @@ var dynamoOperationTargets = map[string]string{
 const (
 	dynamoErrValidation          = "ValidationException"
 	dynamoErrInternal            = "InternalServerError"
+	dynamoErrServiceUnavailable  = "ServiceUnavailable"
 	dynamoErrConditionalFailed   = "ConditionalCheckFailedException"
 	dynamoErrTransactionCanceled = "TransactionCanceledException"
 	dynamoErrResourceNotFound    = "ResourceNotFoundException"

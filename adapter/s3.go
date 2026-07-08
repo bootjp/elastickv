@@ -28,6 +28,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -2969,6 +2971,10 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 	}
 	if isRetryableS3MutationErr(err) {
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
+		return
+	}
+	if status.Code(errors.Cause(err)) == codes.Unavailable {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)

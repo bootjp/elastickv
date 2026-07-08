@@ -18,6 +18,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // AWS SQS defaults, reproduced from the public API reference so clients that
@@ -241,6 +243,10 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 	var rateLimit *purgeRateLimitedError
 	if errors.As(err, &rateLimit) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrPurgeInProgress, rateLimit.Error())
+		return
+	}
+	if status.Code(errors.Cause(err)) == codes.Unavailable {
+		writeSQSError(w, http.StatusServiceUnavailable, sqsErrServiceUnavailable, "service unavailable")
 		return
 	}
 	// Internal errors can wrap Pebble file names, Raft peer ids, stack

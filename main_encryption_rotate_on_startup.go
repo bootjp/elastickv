@@ -293,7 +293,7 @@ func waitEncryptionRotateOnStartupIdle(
 		}
 		done := fireEncryptionRotateOnStartup(ctx, controller, task, logger, flight, true)
 		if done == nil {
-			return nil
+			continue
 		}
 	}
 }
@@ -396,8 +396,24 @@ func (t *encryptionRotateOnStartupTask) prepareNextKeyIDLocked(sc *encryption.Si
 	if err != nil {
 		return err
 	}
+	pending := t.pendingRotatePurposeCountLocked(sc)
+	remaining := uint64(math.MaxUint32) - uint64(next) + 1
+	if pending > remaining {
+		return errors.New("encryption rotate-on-startup: key_id space exhausted")
+	}
 	t.nextKeyID = next
 	return nil
+}
+
+func (t *encryptionRotateOnStartupTask) pendingRotatePurposeCountLocked(sc *encryption.Sidecar) uint64 {
+	var pending uint64
+	if sc.Active.Storage != encryption.ReservedKeyID && !t.storageDone {
+		pending++
+	}
+	if sc.Active.Raft != encryption.ReservedKeyID && !t.raftDone {
+		pending++
+	}
+	return pending
 }
 
 func (t *encryptionRotateOnStartupTask) rotatePurposeIfActive(
