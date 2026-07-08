@@ -1047,50 +1047,88 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 	var seqInTxn uint32
 	for _, k := range listKeys {
 		st := t.listStates[k]
-		userKey := []byte(k)
-
-		if st.deleted {
-			if meta, ok := listDeleteMeta(st); ok {
-				elems = appendListDeleteOps(elems, userKey, meta)
-			}
-			// Delete existing delta keys so they don't survive the logical delete.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
-			continue
+		built, usedDelta := t.buildListElemsForState(k, st, commitTS, seqInTxn)
+		elems = append(elems, built...)
+		if usedDelta {
+			seqInTxn++
 		}
-		if len(st.appends) == 0 {
-			continue
-		}
-		if st.purge {
-			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
-			// Delete existing delta keys so they don't accumulate after DEL+RPUSH.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
-		}
-
-		startSeq := st.meta.Head + st.meta.Len
-		for i, v := range st.appends {
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   listItemKey(userKey, startSeq+int64(i)),
-				Value: v,
-			})
-		}
-
-		// Emit a Delta key instead of updating the base metadata key.
-		// Each list key in this transaction gets a unique seqInTxn.
-		n := int64(len(st.appends))
-		deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: n})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
-			Value: deltaVal,
-		})
-		seqInTxn++
 	}
 	return elems
+}
+
+func (t *txnContext) buildListElemsForState(k string, st *listTxnState, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], bool) {
+	userKey := []byte(k)
+	if st.deleted {
+		return listDeletionElems(userKey, st), false
+	}
+	if len(st.appends) == 0 {
+		return nil, false
+	}
+	elems := listPurgeElems(userKey, st)
+	elems = append(elems, listAppendItemElems(userKey, st)...)
+	if inline, ok := t.listInlineTTLCreateElems(k, userKey, st); ok {
+		return append(elems, inline...), false
+	}
+	return append(elems, listAppendDeltaElem(userKey, st, commitTS, seqInTxn)), true
+}
+
+func listDeletionElems(userKey []byte, st *listTxnState) []*kv.Elem[kv.OP] {
+	var elems []*kv.Elem[kv.OP]
+	if meta, ok := listDeleteMeta(st); ok {
+		elems = appendListDeleteOps(elems, userKey, meta)
+	}
+	return appendListDeltaKeyDeletes(elems, st.existingDeltas)
+}
+
+func listPurgeElems(userKey []byte, st *listTxnState) []*kv.Elem[kv.OP] {
+	if !st.purge {
+		return nil
+	}
+	elems := appendListDeleteOps(nil, userKey, st.purgeMeta)
+	return appendListDeltaKeyDeletes(elems, st.existingDeltas)
+}
+
+func appendListDeltaKeyDeletes(elems []*kv.Elem[kv.OP], deltaKeys [][]byte) []*kv.Elem[kv.OP] {
+	for _, dk := range deltaKeys {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+	}
+	return elems
+}
+
+func listAppendItemElems(userKey []byte, st *listTxnState) []*kv.Elem[kv.OP] {
+	startSeq := st.meta.Head + st.meta.Len
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.appends))
+	for i, v := range st.appends {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   listItemKey(userKey, startSeq+int64(i)),
+			Value: v,
+		})
+	}
+	return elems
+}
+
+func (t *txnContext) listInlineTTLCreateElems(k string, userKey []byte, st *listTxnState) ([]*kv.Elem[kv.OP], bool) {
+	ttlMs, ok := t.collectionTTLMillis(k)
+	if !ok || st.metaExists || (len(st.existingDeltas) != 0 && !st.purge) {
+		return nil, false
+	}
+	meta := store.ListMeta{Head: st.meta.Head, Len: st.meta.Len + int64(len(st.appends)), ExpireAt: ttlMs}
+	metaBytes, err := store.MarshalListMeta(meta)
+	if err != nil {
+		return nil, false
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: store.ListMetaKey(userKey), Value: metaBytes}}, true
+}
+
+func listAppendDeltaElem(userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) *kv.Elem[kv.OP] {
+	n := int64(len(st.appends))
+	deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: n})
+	return &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
+		Value: deltaVal,
+	}
 }
 
 func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) {
@@ -1122,6 +1160,10 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 			}
 			continue
 		}
+		if ttlMs, ok := t.collectionTTLMillis(k); ok && !st.exists {
+			elems = append(elems, zsetWideCreateElemsWithTTL(key, st, ttlMs)...)
+			continue
+		}
 		// Legacy blob path.
 		if len(st.members) == 0 {
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
@@ -1134,6 +1176,36 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload})
 	}
 	return elems, nil
+}
+
+func (t *txnContext) collectionTTLMillis(key string) (uint64, bool) {
+	st := t.ttlStates[key]
+	if st == nil || !st.dirty || st.value == nil {
+		return 0, false
+	}
+	return redisExpireAtMillis(*st.value), true
+}
+
+func zsetWideCreateElemsWithTTL(key []byte, st *zsetTxnState, ttlMs uint64) []*kv.Elem[kv.OP] {
+	if len(st.members) == 0 {
+		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisZSetKey(key)}}
+	}
+	entries := zsetMapToEntries(st.members)
+	elems := make([]*kv.Elem[kv.OP], 0, len(entries)*2+1)
+	for _, entry := range entries {
+		member := []byte(entry.Member)
+		score := store.MarshalZSetScore(entry.Score)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetMemberKey(key, member), Value: score},
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, entry.Score, member), Value: []byte{}},
+		)
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaKey(key),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(entries)), ExpireAt: ttlMs}),
+	})
+	return elems
 }
 
 // buildZSetWideElems computes the minimal set of ops to transition from st.origMembers to

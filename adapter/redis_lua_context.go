@@ -72,16 +72,17 @@ type luaStringState struct {
 }
 
 type luaListState struct {
-	loaded       bool
-	exists       bool
-	dirty        bool
-	materialized bool
-	meta         store.ListMeta
-	leftTrim     int64
-	rightTrim    int64
-	leftValues   []string
-	rightValues  []string
-	values       []string
+	loaded        bool
+	exists        bool
+	existsAtStart bool
+	dirty         bool
+	materialized  bool
+	meta          store.ListMeta
+	leftTrim      int64
+	rightTrim     int64
+	leftValues    []string
+	rightValues   []string
+	values        []string
 }
 
 type luaHashState struct {
@@ -101,6 +102,7 @@ type luaSetState struct {
 type luaZSetState struct {
 	loaded         bool
 	exists         bool
+	existsAtStart  bool
 	dirty          bool
 	membersLoaded  bool // all members loaded into st.members
 	legacyBlobBase bool // existing data is in legacy blob format
@@ -573,6 +575,7 @@ func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
 	}
 	st.loaded = true
 	st.exists = exists
+	st.existsAtStart = exists
 	st.meta = meta
 	return st, nil
 }
@@ -750,6 +753,7 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	// Key is a live ZSet.
 	st.loaded = true
 	st.exists = true
+	st.existsAtStart = true
 	if h.memberFound {
 		// Member keys present → wide-column format (not legacy blob).
 		return st, nil
@@ -3367,6 +3371,10 @@ func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
+	if !st.existsAtStart {
+		elems, err := c.listCommitElems(key, commitTS)
+		return luaCommitPlan{elems: elems}, err
+	}
 	if st.materialized {
 		elems, err := c.listCommitElems(key, commitTS)
 		return luaCommitPlan{elems: elems}, err
@@ -3567,7 +3575,7 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	// storage at script start but was TTL-expired (logically absent). Force a
 	// full commit so deleteLogicalKeyElems removes stale wide-column rows
 	// (members, score-index, meta, TTL) that were left by the expired ZSet.
-	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
+	if !st.existsAtStart || st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
 		return c.zsetFullCommitWithMerge(key, st)
 	}
 	if st.legacyBlobBase {

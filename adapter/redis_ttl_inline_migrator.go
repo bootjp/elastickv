@@ -98,9 +98,6 @@ func trimKnownPrefix(prefix []byte) func([]byte) []byte {
 }
 
 func extractListMetaMigrationUserKey(key []byte) []byte {
-	if store.IsListMetaDeltaKey(key) {
-		return nil
-	}
 	return store.ExtractListUserKey(key)
 }
 
@@ -268,6 +265,9 @@ func (c *DeltaCompactor) migrateHLLTTLInlineElems(ctx context.Context, pair *sto
 }
 
 func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	if isListMetaMigrationDelta(pair) {
+		return nil, nil
+	}
 	userKey := extractListMetaMigrationUserKey(pair.Key)
 	if len(userKey) == 0 {
 		return nil, nil
@@ -289,6 +289,13 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 	}
 	elems := putIfChanged(pair.Key, pair.Value, desired)
 	return appendTTLIndexSyncElem(ctx, c.st, elems, userKey, meta.ExpireAt, readTS)
+}
+
+func isListMetaMigrationDelta(pair *store.KVPair) bool {
+	if pair == nil || !store.IsListMetaDeltaKey(pair.Key) {
+		return false
+	}
+	return len(pair.Value) != redisWideMetaLegacySizeBytes && len(pair.Value) != redisWideMetaInlineSizeBytes
 }
 
 func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

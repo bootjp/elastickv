@@ -139,3 +139,333 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		}
 	}
 }
+
+func TestRedisCollectionExpireHandlesLegacyBlobs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name      string
+		typ       redisValueType
+		legacyKey func([]byte) []byte
+		payload   func(t *testing.T) []byte
+	}{
+		{
+			name:      "hash",
+			typ:       redisTypeHash,
+			legacyKey: redisHashKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalHashValue(redisHashValue{"field": "value"})
+				require.NoError(t, err)
+				return raw
+			},
+		},
+		{
+			name:      "set",
+			typ:       redisTypeSet,
+			legacyKey: redisSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalSetValue(redisSetValue{Members: []string{"member"}})
+				require.NoError(t, err)
+				return raw
+			},
+		},
+		{
+			name:      "zset",
+			typ:       redisTypeZSet,
+			legacyKey: redisZSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalZSetValue(redisZSetValue{Entries: []redisZSetEntry{{Member: "member", Score: 1}}})
+				require.NoError(t, err)
+				return raw
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+			key := []byte("ttl:legacy:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.legacyKey(key), tc.payload(t), 1, 0))
+
+			typ, err := server.rawKeyTypeAt(ctx, key, 1)
+			require.NoError(t, err)
+			require.Equal(t, tc.typ, typ)
+			applied, err := server.dispatchExpireForType(ctx, key, 1, typ, expireAt)
+			require.NoError(t, err)
+			require.True(t, applied)
+
+			readTS := st.LastCommitTS()
+			rawTTL, err := st.GetAt(ctx, redisTTLKey(key), readTS)
+			require.NoError(t, err)
+			ttl, err := decodeRedisTTL(rawTTL)
+			require.NoError(t, err)
+			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
+			got, err := server.ttlAt(ctx, key, readTS)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*got))
+		})
+	}
+}
+
+func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name         string
+		typ          redisValueType
+		metaKey      func([]byte) []byte
+		baseValue    func(t *testing.T) []byte
+		deltaKey     func([]byte, uint64) []byte
+		deltaValue   []byte
+		metaExpireAt func([]byte) (uint64, error)
+	}{
+		{
+			name:    "list",
+			typ:     redisTypeList,
+			metaKey: store.ListMetaKey,
+			baseValue: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := store.MarshalListMeta(store.ListMeta{Head: 0, Len: 1})
+				require.NoError(t, err)
+				return raw
+			},
+			deltaKey: func(key []byte, ts uint64) []byte {
+				return store.ListMetaDeltaKey(key, ts, 0)
+			},
+			deltaValue: store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1}),
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalListMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:    "hash",
+			typ:     redisTypeHash,
+			metaKey: store.HashMetaKey,
+			baseValue: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalHashMeta(store.HashMeta{Len: 1})
+			},
+			deltaKey: func(key []byte, ts uint64) []byte {
+				return store.HashMetaDeltaKey(key, ts, 0)
+			},
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalHashMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+			key := []byte("ttl:delta-heavy:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.baseValue(t), 1, 0))
+			const firstDeltaTS uint64 = 2
+			const lastDeltaTS uint64 = store.MaxDeltaScanLimit + firstDeltaTS
+			for ts := firstDeltaTS; ts <= lastDeltaTS; ts++ {
+				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
+			}
+
+			readTS := st.LastCommitTS()
+			applied, err := server.dispatchCollectionExpire(ctx, key, readTS, tc.typ, expireAt)
+			require.NoError(t, err)
+			require.True(t, applied)
+
+			readTS = st.LastCommitTS()
+			raw, err := st.GetAt(ctx, tc.metaKey(key), readTS)
+			require.NoError(t, err)
+			expireAtMs, err := tc.metaExpireAt(raw)
+			require.NoError(t, err)
+			require.Equal(t, redisExpireAtMillis(expireAt), expireAtMs)
+			rawTTL, err := st.GetAt(ctx, redisTTLKey(key), readTS)
+			require.NoError(t, err)
+			ttl, err := decodeRedisTTL(rawTTL)
+			require.NoError(t, err)
+			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
+		})
+	}
+}
+
+func TestRedisMultiExecStagedCollectionCreateWritesInlineTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	server := nodes[0].redisServer
+	ttl := 50 * time.Second
+	cases := []struct {
+		name         string
+		key          string
+		commands     [][]any
+		metaKey      func([]byte) []byte
+		metaExpireAt func([]byte) (uint64, error)
+	}{
+		{
+			name:     "list",
+			key:      "ttl:multi-create:list",
+			commands: [][]any{{"RPUSH", "ttl:multi-create:list", "value"}},
+			metaKey:  store.ListMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalListMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:     "zset",
+			key:      "ttl:multi-create:zset",
+			commands: [][]any{{"ZINCRBY", "ttl:multi-create:zset", "1", "member"}},
+			metaKey:  store.ZSetMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+			for _, cmd := range tc.commands {
+				require.Equal(t, "QUEUED", rdb.Do(ctx, cmd...).Val())
+			}
+			require.Equal(t, "QUEUED", rdb.Do(ctx, "PEXPIRE", tc.key, int(ttl/time.Millisecond)).Val())
+			_, err := rdb.Do(ctx, "EXEC").Result()
+			require.NoError(t, err)
+
+			key := []byte(tc.key)
+			var expireAtMs uint64
+			require.Eventually(t, func() bool {
+				readTS := server.readTS()
+				raw, err := server.store.GetAt(ctx, tc.metaKey(key), readTS)
+				if err != nil {
+					return false
+				}
+				got, err := tc.metaExpireAt(raw)
+				if err != nil {
+					return false
+				}
+				expireAtMs = got
+				return got > redisExpireAtMillis(time.Now().Add(ttl/2))
+			}, 5*time.Second, 20*time.Millisecond)
+
+			commitTS, err := server.coordinator.Clock().NextFenced()
+			require.NoError(t, err)
+			require.NoError(t, server.store.DeleteAt(ctx, redisTTLKey(key), commitTS))
+			got, err := server.ttlAt(ctx, key, commitTS)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, expireAtMs, redisExpireAtMillis(*got))
+		})
+	}
+}
+
+func TestRedisLuaStagedCollectionCreateWritesInlineTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	server := nodes[0].redisServer
+	ttl := 50 * time.Second
+	cases := []struct {
+		name         string
+		key          string
+		script       string
+		metaKey      func([]byte) []byte
+		metaExpireAt func([]byte) (uint64, error)
+	}{
+		{
+			name:    "list",
+			key:     "ttl:lua-create:list",
+			script:  `redis.call("rpush", KEYS[1], "value"); return redis.call("pexpire", KEYS[1], ARGV[1])`,
+			metaKey: store.ListMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalListMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:    "hash",
+			key:     "ttl:lua-create:hash",
+			script:  `redis.call("hset", KEYS[1], "field", "value"); return redis.call("pexpire", KEYS[1], ARGV[1])`,
+			metaKey: store.HashMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalHashMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:    "set",
+			key:     "ttl:lua-create:set",
+			script:  `redis.call("sadd", KEYS[1], "member"); return redis.call("pexpire", KEYS[1], ARGV[1])`,
+			metaKey: store.SetMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:    "zset",
+			key:     "ttl:lua-create:zset",
+			script:  `redis.call("zadd", KEYS[1], "1", "member"); return redis.call("pexpire", KEYS[1], ARGV[1])`,
+			metaKey: store.ZSetMetaKey,
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rdb.Eval(ctx, tc.script, []string{tc.key}, int(ttl/time.Millisecond)).Result()
+			require.NoError(t, err)
+			require.Equal(t, int64(1), got)
+
+			key := []byte(tc.key)
+			var expireAtMs uint64
+			require.Eventually(t, func() bool {
+				readTS := server.readTS()
+				raw, err := server.store.GetAt(ctx, tc.metaKey(key), readTS)
+				if err != nil {
+					return false
+				}
+				got, err := tc.metaExpireAt(raw)
+				if err != nil {
+					return false
+				}
+				expireAtMs = got
+				return got > redisExpireAtMillis(time.Now().Add(ttl/2))
+			}, 5*time.Second, 20*time.Millisecond)
+
+			commitTS, err := server.coordinator.Clock().NextFenced()
+			require.NoError(t, err)
+			require.NoError(t, server.store.DeleteAt(ctx, redisTTLKey(key), commitTS))
+			ttlValue, err := server.ttlAt(ctx, key, commitTS)
+			require.NoError(t, err)
+			require.NotNil(t, ttlValue)
+			require.Equal(t, expireAtMs, redisExpireAtMillis(*ttlValue))
+		})
+	}
+}

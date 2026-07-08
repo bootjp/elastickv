@@ -94,6 +94,40 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyHashMeta(t *testing.T) {
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
 }
 
+func TestDeltaCompactor_TTLInlineMigratesListUserKeyStartingWithDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	key := []byte("d|ttl:migrate:list")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisWideMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta[0:8], 0)
+	binary.BigEndian.PutUint64(legacyMeta[8:16], 1)
+	binary.BigEndian.PutUint64(legacyMeta[16:24], 1)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	deltaKey := store.ListMetaDeltaKey(key, 3, 0)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, deltaKey, delta, 3, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.ListMetaKey(key), readTS)
+	require.NoError(t, err)
+	require.Len(t, raw, redisWideMetaInlineSizeBytes)
+	meta, err := store.UnmarshalListMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+
+	rawDelta, err := st.GetAt(ctx, deltaKey, readTS)
+	require.NoError(t, err)
+	require.Equal(t, delta, rawDelta)
+}
+
 func TestRedisTTLAt_LegacyFallbackCanBeDisabled(t *testing.T) {
 	t.Parallel()
 
