@@ -227,11 +227,11 @@ config-order winner: during routing-catalog divergence, different
 serving nodes can expose their own local metadata while the counters
 still merge by `BucketID`. If two nodes disagree on `Start`/`End`
 for the same `BucketID`, that indicates a routing-catalog
-divergence the operator should investigate. Phase 2-C does not ship
-a structured warning field for this case; the aggregator keeps the
-local-first metadata winner and still serves the merged response.
-Surfacing catalog-divergence warnings in the per-node status payload
-is a future wire extension.
+divergence, but Phase 2-C does not surface that condition on the
+wire. It is not reported in `FanoutNodeStatus`, row metadata, or a
+warning array; the aggregator keeps the local-first metadata winner
+and still serves the merged response. Surfacing catalog-divergence
+warnings is a future wire extension.
 
 ### 4.5 Time alignment
 
@@ -290,8 +290,9 @@ no breaking changes — old SPA versions keep working):
 
 `FanoutNodeStatus` currently serializes only `node`, `ok`, and
 `error`; `error` is omitted for successful nodes. Structured per-node
-warnings such as catalog-divergence are not shipped in Phase 2-C. A
-future warning array would be an additive wire extension.
+warnings such as catalog-divergence are not shipped in Phase 2-C, and
+catalog divergence is not encoded anywhere else in the response today.
+A future warning array would be an additive wire extension.
 
 `conflicts[]` is parallel to `values[]` and marks only the columns
 where the fan-out merge saw disagreement inside the same
