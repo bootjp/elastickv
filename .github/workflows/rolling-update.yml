@@ -59,6 +59,12 @@ jobs:
       S3_REGION: ${{ vars.S3_REGION || 'us-east-1' }}
       S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
       S3_PATH_STYLE_ONLY: ${{ vars.S3_PATH_STYLE_ONLY || 'true' }}
+      ENABLE_SQS: ${{ vars.ENABLE_SQS || 'false' }}
+      SQS_PORT: ${{ vars.SQS_PORT || '9324' }}
+      SQS_REGION: ${{ vars.SQS_REGION || 'us-east-1' }}
+      SQS_CREDENTIALS_FILE: ${{ vars.SQS_CREDENTIALS_FILE }}
+      SQS_FIFO_PARTITION_MAP: ${{ vars.SQS_FIFO_PARTITION_MAP }}
+      RAFT_TO_SQS_MAP: ${{ vars.RAFT_TO_SQS_MAP }}
       DEFAULT_EXTRA_ENV: ${{ vars.DEFAULT_EXTRA_ENV || 'GOMEMLIMIT=1800MiB' }}
       EXTRA_ENV: ${{ vars.EXTRA_ENV }}
       CONTAINER_MEMORY_LIMIT: ${{ vars.CONTAINER_MEMORY_LIMIT || '2500m' }}
@@ -369,6 +375,32 @@ jobs:
             exit 1
           fi
 
+      - name: Remote SQS credentials preflight
+        if: ${{ env.ENABLE_SQS == 'true' && env.SQS_CREDENTIALS_FILE != '' }}
+        env:
+          SSH_TARGETS: ${{ steps.render.outputs.ROLLING_SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+          printf -v remote_path '%q' "$SQS_CREDENTIALS_FILE"
+          IFS=',' read -r -a entries <<< "$SSH_TARGETS"
+          failed=0
+          for e in "${entries[@]}"; do
+            target="${e##*=}"
+            if [[ "$target" != *@* ]]; then
+              target="${SSH_USER:-$(id -un)}@$target"
+            fi
+            if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" "test -r $remote_path"; then
+              echo "  ok   $target:$SQS_CREDENTIALS_FILE"
+            else
+              echo "::error::$target cannot read SQS_CREDENTIALS_FILE=$SQS_CREDENTIALS_FILE"
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
       - name: Log rollout configuration
         env:
           NODES: ${{ steps.render.outputs.NODES }}
@@ -381,7 +413,9 @@ jobs:
           for name in \
             IMAGE CONTAINER_NAME DATA_DIR SERVER_ENTRYPOINT RAFT_ENGINE \
             RAFT_PORT REDIS_PORT DYNAMO_PORT S3_PORT ENABLE_S3 S3_REGION \
-            S3_CREDENTIALS_FILE S3_PATH_STYLE_ONLY DEFAULT_EXTRA_ENV EXTRA_ENV \
+            S3_CREDENTIALS_FILE S3_PATH_STYLE_ONLY ENABLE_SQS SQS_PORT \
+            SQS_REGION SQS_CREDENTIALS_FILE SQS_FIFO_PARTITION_MAP \
+            RAFT_TO_SQS_MAP DEFAULT_EXTRA_ENV EXTRA_ENV \
             CONTAINER_MEMORY_LIMIT NODES SSH_TARGETS ROLLING_ORDER; do
             printf '%s=%s\n' "$name" "${!name-}"
           done
@@ -406,6 +440,12 @@ jobs:
           ./scripts/rolling-update.sh --dry-run
           echo "ref: $REF"
           echo "Re-run with dry_run=false to apply."
+
+      - name: Set up Go for raftadmin helper
+        if: ${{ !inputs.dry_run }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
 
       - name: Roll cluster
         if: ${{ !inputs.dry_run }}

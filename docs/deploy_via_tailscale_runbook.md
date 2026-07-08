@@ -54,6 +54,7 @@ In the Tailscale admin console, add the deploy rule to the tailnet ACL:
       "tag:elastickv-node:6379",  // Redis adapter, if enabled
       "tag:elastickv-node:8000",  // DynamoDB adapter, if enabled
       "tag:elastickv-node:9000",  // S3 adapter, if enabled
+      "tag:elastickv-node:9324",  // SQS adapter, if enabled
     ],
   },
 ],
@@ -134,6 +135,11 @@ Regenerate on operator rotation.
 | `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 | `ENABLE_S3`       | `true` to start the S3 adapter, `false` to keep it disabled. The workflow defaults missing values to `false` rather than the script's local default. | `true` |
 | `S3_CREDENTIALS_FILE` | Node-local path to the SigV4 credentials file. Required when `ENABLE_S3=true`; the workflow fails before rollout if it is missing. | `/etc/elastickv/s3-credentials.json` |
+| `ENABLE_SQS`      | `true` to start the SQS adapter, `false` to keep it disabled. The workflow defaults missing values to `false`. | `true` |
+| `SQS_PORT`        | SQS-compatible listener port on each node. The workflow forwards this into `rolling-update.sh`, which derives `RAFT_TO_SQS_MAP` from `NODES_RAFT_MAP` unless overridden. | `9324` |
+| `SQS_REGION`      | SigV4 region for the SQS adapter. | `us-east-1` |
+| `SQS_CREDENTIALS_FILE` | Optional node-local SQS credentials file. If set, it must exist on each target host before rollout. | `/etc/elastickv/sqs-credentials.json` |
+| `SQS_FIFO_PARTITION_MAP` | Optional HT-FIFO partition routing map. Empty keeps partitioned FIFO routing on the default Raft group. | `queue.fifo:2=group_0,group_1` |
 
 For private GHCR packages, log every node in to `ghcr.io` with a
 deploy-scoped read token before the first rollout. The workflow's manifest check
@@ -199,7 +205,9 @@ hazard that needs manual cleanup.
    the actual `IMAGE`, `CONTAINER_NAME`, `DATA_DIR`, `SERVER_ENTRYPOINT`,
    `RAFT_ENGINE`, `RAFT_PORT`, `REDIS_PORT`, `DYNAMO_PORT`, `S3_PORT`,
    `ENABLE_S3`, `S3_REGION`, `S3_CREDENTIALS_FILE`,
-   `S3_PATH_STYLE_ONLY`, `DEFAULT_EXTRA_ENV`, `EXTRA_ENV`,
+   `S3_PATH_STYLE_ONLY`, `ENABLE_SQS`, `SQS_PORT`, `SQS_REGION`,
+   `SQS_CREDENTIALS_FILE`, `SQS_FIFO_PARTITION_MAP`, `RAFT_TO_SQS_MAP`,
+   `DEFAULT_EXTRA_ENV`, `EXTRA_ENV`,
    `CONTAINER_MEMORY_LIMIT`, `NODES`, `SSH_TARGETS`, and
    `ROLLING_ORDER` values used by the following `Roll cluster` step.
    The workflow sets the same defaults as `scripts/rolling-update.sh`

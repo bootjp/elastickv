@@ -1523,14 +1523,6 @@ if [[ "${ENABLE_SQS}" == "true" && -z "$RAFT_TO_SQS_MAP" ]]; then
   RAFT_TO_SQS_MAP="$(derive_raft_to_sqs_map)"
 fi
 
-if [[ "$DRY_RUN" == "true" ]]; then
-  print_dry_run_plan
-  exit 0
-fi
-
-ensure_local_raftadmin
-ensure_remote_raftadmin_binaries
-
 # ssh joins remaining arguments into a single command string which the remote
 # login shell re-parses before `bash -s` is exec'd, so values containing
 # whitespace or shell metacharacters must be escaped before transport.
@@ -1582,8 +1574,15 @@ merge_extra_env() {
   fi
   for pair in "${user_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
-    [[ "$pair" == *=* ]] || continue
+    if [[ "$pair" != *=* || "$pair" == =* ]]; then
+      echo "rolling-update: malformed EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+      return 1
+    fi
     key="${pair%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "rolling-update: malformed EXTRA_ENV key '$key' in entry '$pair' (key must match [A-Za-z_][A-Za-z0-9_]*)" >&2
+      return 1
+    fi
     seen+="${key} "
   done
 
@@ -1608,6 +1607,11 @@ merge_extra_env() {
         echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (empty key)" >&2
         return 1
       fi
+      key="${pair%%=*}"
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV key '$key' in entry '$pair' (key must match [A-Za-z_][A-Za-z0-9_]*)" >&2
+        return 1
+      fi
     done
   fi
   for pair in "${default_pairs[@]}"; do
@@ -1626,6 +1630,16 @@ merge_extra_env() {
 }
 
 EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
+EXTRA_ENV="$EXTRA_ENV_NORMALISED"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  print_dry_run_plan
+  exit 0
+fi
+
+ensure_local_raftadmin
+ensure_remote_raftadmin_binaries
+
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
 CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
