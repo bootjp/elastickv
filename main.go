@@ -888,7 +888,7 @@ func buildShardGroups(
 		// verifyComposed1 apply-time gate can resolve the
 		// observed-version owner-of-key without further plumbing
 		// work. At M2 the FSM stores both but does not consult them;
-		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
+		// see docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 		// §M2.
 		sm := kv.NewKvFSMWithHLC(st, clock,
 			kv.WithEncryption(applier),
