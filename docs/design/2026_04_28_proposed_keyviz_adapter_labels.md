@@ -587,12 +587,15 @@ The fan-out aggregator's per-cell merge key gains the label:
   encoded into `bucketID` so the aggregator already separates
   same-route different-label rows correctly.
 
-Reads still sum, writes still max-with-conflict; nothing about
-the merge **rules** changes other than the wire shape of
-`bucketID`. The merge **key** logic is unchanged: composite
-`bucketID` already separates same-route different-label rows
-correctly, so the aggregator's bucketing/grouping path needs no
-edits.
+The merge **rules** do not change. Phase 2-C+ already uses the
+canonical per-cell identity `(bucketID, raftGroupID, leaderTerm,
+column)`: read samples sum across nodes, write samples are deduped
+within the same `(bucketID, raftGroupID, leaderTerm, column)` and
+summed across distinct terms, and conflicts are marked only for
+same-identity disagreements. Adapter labels only change the
+`bucketID` dimension by embedding the label into the composite ID, so
+same-route different-label rows are already separated by the existing
+bucketing/grouping path.
 
 The merge **value** path, however, still needs one explicit
 field copy: `mergeRowInto` (`internal/admin/keyviz_fanout.go:509`)

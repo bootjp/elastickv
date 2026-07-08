@@ -282,11 +282,9 @@ no breaking changes — old SPA versions keep working):
   // NEW fan-out metadata; absent when fan-out is disabled.
   "fanout": {
     "nodes": [
-      {"node": "10.0.0.1:8080", "ok": true,  "error": "", "warnings": []},
-      {"node": "10.0.0.2:8080", "ok": true,  "error": "",
-        "warnings": [{"code": "catalog_divergence", "bucket_id": "route:42",
-                      "detail": "start/end disagree with prior node"}]},
-      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded", "warnings": []}
+      {"node": "10.0.0.1:8080", "ok": true},
+      {"node": "10.0.0.2:8080", "ok": true},
+      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded"}
     ],
     "responded": 2,
     "expected": 3
@@ -294,12 +292,10 @@ no breaking changes — old SPA versions keep working):
 }
 ```
 
-`warnings` is a per-node array of structured non-fatal signals.
-Today the only emitter is `catalog_divergence` (§4.4 — `Start`/`End`
-disagree across nodes for the same `BucketID`). Adding a new
-warning code is a wire-format extension, not a breaking change:
-old SPAs render the entry as a generic warning until they teach
-themselves the new code. (Round-1 review finding on PR #685.)
+`FanoutNodeStatus` currently serializes only `node`, `ok`, and
+`error`; `error` is omitted for successful nodes. Structured per-node
+warnings such as catalog-divergence are not shipped in Phase 2-C. A
+future warning array would be an additive wire extension.
 
 `conflicts[]` is parallel to `values[]` and marks only the columns
 where the fan-out merge saw disagreement inside the same
@@ -307,14 +303,10 @@ where the fan-out merge saw disagreement inside the same
 is the row-level OR of `conflicts[]` and remains on the wire for
 older SPAs that only know how to hatch a whole row.
 
-The field is **always present** on every row in the response — even
-when fan-out is disabled (single-node mode), `conflict` defaults to
-`false` and is emitted on the wire. This is wire-stable: an SPA
-that pattern-matches `"conflict" in row` rather than checking the
-value will not regress when the operator toggles
-`--keyvizFanoutNodes`. Only the fan-out aggregator ever sets
-`conflict = true` or allocates `conflicts[]`; in local-only mode
-the field's value is identically false and `conflicts` is omitted.
+`KeyVizRow.Conflict` is tagged `json:"conflict,omitempty"`, so
+absence means `false`. Only the fan-out aggregator sets
+`conflict = true` or allocates `conflicts[]`; in local-only mode and
+cleanly merged rows, both `conflict` and `conflicts` are omitted.
 `raft_group_ids[]` and `leader_terms[]` are omitted only for legacy
 peers or rows whose identity is unknown.
 
