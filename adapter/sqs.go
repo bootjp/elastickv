@@ -363,6 +363,13 @@ func (s *SQSServer) throttleGaugeSnapshotCutoff() uint64 {
 	return observer.ThrottleGaugeSnapshotCutoff()
 }
 
+func (s *SQSServer) beginThrottleReset(queue string) uint64 {
+	if s == nil || s.throttle == nil {
+		return s.throttleGaugeSnapshotCutoff()
+	}
+	return s.throttle.beginQueueReset(queue, s.throttleGaugeSnapshotCutoff)
+}
+
 func enabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {
 	if throttle == nil || throttle.IsEmpty() {
 		return nil

@@ -33,9 +33,16 @@ type recordingSQSThrottleObserver struct {
 	rejections []throttleForgetReport
 	forgotten  []throttleForgetReport
 	syncs      []throttleSyncReport
+	seq        uint64
+	actionSeq  map[throttleForgetReport]uint64
 }
 
 func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
+	r.seq++
+	if r.actionSeq == nil {
+		r.actionSeq = map[throttleForgetReport]uint64{}
+	}
+	r.actionSeq[throttleForgetReport{queue: queue, action: action}] = r.seq
 	r.reports = append(r.reports, throttleObserveReport{
 		queue:           queue,
 		action:          action,
@@ -49,14 +56,32 @@ func (r *recordingSQSThrottleObserver) ObserveThrottleRejection(queue string, ac
 }
 
 func (r *recordingSQSThrottleObserver) ForgetThrottleAction(queue string, action string) {
+	if r.actionSeq != nil {
+		delete(r.actionSeq, throttleForgetReport{queue: queue, action: action})
+	}
 	r.forgotten = append(r.forgotten, throttleForgetReport{queue: queue, action: action})
+}
+
+func (r *recordingSQSThrottleObserver) ForgetThrottleActionBefore(queue string, action string, cutoff uint64) {
+	key := throttleForgetReport{queue: queue, action: action}
+	if r.actionSeq != nil {
+		if seq := r.actionSeq[key]; seq > cutoff {
+			return
+		}
+		delete(r.actionSeq, key)
+	}
+	r.forgotten = append(r.forgotten, key)
+}
+
+func (r *recordingSQSThrottleObserver) ThrottleGaugeSnapshotCutoff() uint64 {
+	return r.seq
 }
 
 func (r *recordingSQSThrottleObserver) SyncThrottleActions(queue string, enabledActions []string) {
 	enabled := append([]string(nil), enabledActions...)
 	r.syncs = append(r.syncs, throttleSyncReport{queue: queue, enabled: enabled})
 	for _, action := range disabledThrottleMetricActionsFromEnabled(enabled) {
-		r.forgotten = append(r.forgotten, throttleForgetReport{queue: queue, action: action})
+		r.ForgetThrottleAction(queue, action)
 	}
 }
 
@@ -153,6 +178,31 @@ func TestSQSServer_ChargeQueueWithThrottleSkipsStaleMetricAfterInvalidate(t *tes
 	require.Len(t, observer.reports, 1, "fresh post-invalidation snapshot may publish the new token gauge")
 	require.Equal(t, "orders.fifo", observer.reports[0].queue)
 	require.Equal(t, SQSThrottleActionSend, observer.reports[0].action)
+}
+
+func TestSQSServer_BeginThrottleResetSuppressesStaleMetricBeforeCleanup(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	srv.throttle = newBucketStore(func() time.Time { return now }, throttleIdleEvictAfter)
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+
+	staleEpoch := srv.throttle.queueEpoch("orders.fifo")
+	resetCutoff := srv.beginThrottleReset("orders.fifo")
+	rec := httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, staleEpoch))
+	require.Empty(t, observer.reports, "pre-reset epoch request must not publish a token gauge after the reset gate starts")
+
+	srv.throttle.invalidateQueueBuckets("orders.fifo")
+	freshEpoch := srv.throttle.queueEpoch("orders.fifo")
+	rec = httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, freshEpoch))
+	require.Len(t, observer.reports, 1, "fresh post-reset request may publish a token gauge")
+
+	srv.observeThrottleConfigChange("orders.fifo", cfg, []string{SQSThrottleActionSend}, resetCutoff)
+	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionSend},
+		"reset cleanup must preserve token gauges observed after the reset gate")
 }
 
 func TestSQSServer_ChargeQueueWithThrottleCountsStaleRejectionAfterInvalidate(t *testing.T) {

@@ -137,7 +137,7 @@ type bucketQueueEpoch struct {
 // caller of sweep() is the sole goroutine the ticker drives.
 type bucketStore struct {
 	buckets      sync.Map // map[bucketKey]*tokenBucket
-	queueEpochMu sync.Mutex
+	queueEpochMu sync.RWMutex
 	queueEpochs  sync.Map // map[string]*bucketQueueEpoch
 	clock        func() time.Time
 	evictedAfter time.Duration
@@ -171,6 +171,8 @@ func (b *bucketStore) queueEpoch(queue string) uint64 {
 	if b == nil || queue == "" {
 		return 0
 	}
+	b.queueEpochMu.RLock()
+	defer b.queueEpochMu.RUnlock()
 	v, ok := b.queueEpochs.Load(queue)
 	if !ok {
 		return 0
@@ -191,6 +193,25 @@ func (b *bucketStore) bumpQueueEpoch(queue string) {
 	cell := b.queueEpochCellLocked(queue)
 	cell.epoch.Add(1)
 	cell.updatedUnixNano.Store(b.clock().UnixNano())
+}
+
+func (b *bucketStore) beginQueueReset(queue string, cutoff func() uint64) uint64 {
+	if b == nil || queue == "" {
+		if cutoff == nil {
+			return 0
+		}
+		return cutoff()
+	}
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	var resetCutoff uint64
+	if cutoff != nil {
+		resetCutoff = cutoff()
+	}
+	cell := b.queueEpochCellLocked(queue)
+	cell.epoch.Add(1)
+	cell.updatedUnixNano.Store(b.clock().UnixNano())
+	return resetCutoff
 }
 
 func (b *bucketStore) queueEpochCellLocked(queue string) *bucketQueueEpoch {
@@ -430,6 +451,13 @@ func (b *bucketStore) invalidateQueue(queue string) {
 		return
 	}
 	b.bumpQueueEpoch(queue)
+	b.invalidateQueueBuckets(queue)
+}
+
+func (b *bucketStore) invalidateQueueBuckets(queue string) {
+	if b == nil {
+		return
+	}
 	// Incarnation participates in the key: we do
 	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes

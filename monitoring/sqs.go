@@ -70,12 +70,16 @@ type SQSThrottleObserver interface {
 //
 // Two distinct empty-snapshot states, signalled by ok:
 //
-//   - ok=true with an empty/nil slice — "this source legitimately
-//     has no queues this tick". Triggers when the node is a
-//     follower (leader-only emission) or the leader genuinely has
-//     zero queues configured. The observer diffs against the
-//     previous tick and ForgetQueue's any queue that disappeared
-//     so a former leader's gauges are cleared on step-down.
+//   - ok=true with a nil slice — "this source is not emitting this tick".
+//     The adapter returns this when the node is a follower (leader-only
+//     emission). The observer clears both depth and token gauges so a former
+//     leader does not keep exporting stale SQS series after step-down.
+//
+//   - ok=true with a non-nil slice, possibly empty — leader, scrape OK.
+//     The observer writes the returned queue gauges and diffs against the
+//     previous tick. A queue omitted from a non-nil snapshot can be a
+//     per-queue scan miss, so throttle token gauges for depth-seen queues are
+//     preserved until a config/delete path explicitly removes them.
 //
 //   - ok=false (regardless of the slice contents) — "the source
 //     could not produce a snapshot this tick" (transient catalog-
@@ -918,8 +922,9 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	// at least one interval even when capacity opens up the same
 	// tick. Reclaiming first lets phase 2's admissions reuse the
 	// freed slots immediately.
+	sourceInactive := snaps == nil
 	o.mu.Lock()
-	o.forgetMissingQueuesLocked(current, throttleCutoff)
+	o.forgetMissingQueuesLocked(current, throttleCutoff, sourceInactive)
 	o.lastSeen = current
 	o.mu.Unlock()
 	// Phase 2: emit gauges for the current tick. Slots freed in
@@ -932,10 +937,17 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	}
 }
 
-func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}, throttleCutoff uint64) {
+func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}, throttleCutoff uint64, sourceInactive bool) {
+	if sourceInactive {
+		throttleQueues, _ := o.snapshotThrottleQueues(^uint64(0))
+		o.forgetDepthQueuesMissingFrom(current, false)
+		o.forgetInactiveSourceThrottleQueues(current, throttleQueues)
+		clear(o.depthSeenThrottleQueues)
+		return
+	}
 	throttleQueues, activeThrottleQueues := o.snapshotThrottleQueues(throttleCutoff)
 	o.forgetDepthSeenThrottleQueuesWithoutGauge(activeThrottleQueues)
-	o.forgetDepthQueuesMissingFrom(current, activeThrottleQueues)
+	o.forgetDepthQueuesMissingFrom(current, true)
 	o.forgetThrottleOnlyQueues(current, throttleQueues)
 }
 
@@ -956,14 +968,23 @@ func (o *SQSObserver) forgetDepthSeenThrottleQueuesWithoutGauge(activeThrottleQu
 	}
 }
 
-func (o *SQSObserver) forgetDepthQueuesMissingFrom(current map[string]struct{}, activeThrottleQueues map[string]struct{}) {
+func (o *SQSObserver) forgetDepthQueuesMissingFrom(current map[string]struct{}, preserveThrottle bool) {
 	for prev := range o.lastSeen {
 		if _, ok := current[prev]; !ok {
-			if _, hasThrottleGauge := activeThrottleQueues[prev]; hasThrottleGauge {
+			if preserveThrottle {
 				o.depthSeenThrottleQueues[prev] = struct{}{}
 			}
 			o.metrics.ForgetQueue(prev)
 		}
+	}
+}
+
+func (o *SQSObserver) forgetInactiveSourceThrottleQueues(current map[string]struct{}, throttleQueues []string) {
+	for _, prev := range throttleQueues {
+		if _, ok := current[prev]; ok {
+			continue
+		}
+		o.metrics.ForgetThrottleQueue(prev)
 	}
 }
 

@@ -956,11 +956,15 @@ func TestSQSObserver_ObserveOnce_LeaderStepDownClearsAll(t *testing.T) {
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 6, count, "tick 1: 2 queues × 3 states = 6 series")
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 4, false)
 
 	obs.ObserveOnce(source)
 	count, err = testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "tick 2 (leader step-down): all gauges cleared")
+	throttleCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, throttleCount, "tick 2 (leader step-down): throttle gauges cleared with depth gauges")
 }
 
 func TestSQSObserver_ObserveOnce_ForgetsThrottleOnlyQueues(t *testing.T) {
@@ -975,7 +979,7 @@ func TestSQSObserver_ObserveOnce_ForgetsThrottleOnlyQueues(t *testing.T) {
 	require.Equal(t, 1, count, "sanity: throttle-only queue emitted a token gauge before the depth tick")
 
 	obs.ObserveOnce(&fakeDepthSource{
-		ticks: []fakeDepthTick{{snaps: nil, ok: true}},
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{}, ok: true}},
 	})
 
 	count, err = testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
@@ -992,7 +996,7 @@ func TestSQSObserver_ObserveOnce_PreservesThrottleGaugeNewerThanDepthSnapshot(t 
 
 	obs.ObserveOnce(callbackDepthSource{fn: func() ([]SQSQueueDepth, bool) {
 		m.ObserveThrottleDecision("newer.fifo", SQSThrottleActionSend, 4, false)
-		return nil, true
+		return []SQSQueueDepth{}, true
 	}})
 
 	value, found := gatheredThrottleTokenValue(t, reg, map[string]string{
@@ -1003,7 +1007,7 @@ func TestSQSObserver_ObserveOnce_PreservesThrottleGaugeNewerThanDepthSnapshot(t 
 	require.InDelta(t, 4.0, value, 0.001)
 
 	obs.ObserveOnce(&fakeDepthSource{
-		ticks: []fakeDepthTick{{snaps: nil, ok: true}},
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{}, ok: true}},
 	})
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
 	require.NoError(t, err)
@@ -1020,8 +1024,8 @@ func TestSQSObserver_ObserveOnce_DepthMissPreservesThrottleGauge(t *testing.T) {
 	source := &fakeDepthSource{
 		ticks: []fakeDepthTick{
 			{snaps: []SQSQueueDepth{{Queue: "orders.fifo", Visible: 1}}, ok: true},
-			{snaps: nil, ok: true},
-			{snaps: nil, ok: true},
+			{snaps: []SQSQueueDepth{}, ok: true},
+			{snaps: []SQSQueueDepth{}, ok: true},
 		},
 	}
 
@@ -1039,6 +1043,31 @@ func TestSQSObserver_ObserveOnce_DepthMissPreservesThrottleGauge(t *testing.T) {
 	require.True(t, found, "depth-only miss must not delete throttle-token gauges")
 	require.InDelta(t, 4.0, value, 0.001)
 	require.Len(t, m.trackedThrottleGaugeQueues, 1, "depth-only miss must not reclaim the throttle-gauge budget slot")
+}
+
+func TestSQSObserver_ObserveOnce_DepthSeenFreshGaugeAfterCutoffSurvivesMiss(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{{Queue: "orders.fifo", Visible: 1}}, ok: true}},
+	})
+	obs.ObserveOnce(callbackDepthSource{fn: func() ([]SQSQueueDepth, bool) {
+		m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 6, false)
+		return []SQSQueueDepth{}, true
+	}})
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: []SQSQueueDepth{}, ok: true}},
+	})
+
+	value, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "fresh token gauge for a previously depth-seen queue must survive repeated depth misses")
+	require.InDelta(t, 6.0, value, 0.001)
 }
 
 // TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges
