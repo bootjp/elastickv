@@ -11,6 +11,8 @@ import (
 
 const migrationTempSuffix = ".migrating"
 
+var errMigrationDestinationExists = errors.New("etcd migration: destination already exists")
+
 type MigrationStats struct {
 	SnapshotBytes int64
 	Peers         int
@@ -101,15 +103,18 @@ func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {
 	// common case during migration, where --raftBootstrapMembers is not
 	// repeated).  Without this file the engine falls back to a single-node
 	// configuration and every node elects itself leader independently.
-	if err := savePersistedPeers(tempDir, state.Snapshot.Metadata.Index, peers); err != nil {
+	if err := savePersistedPeers(tempDir, state.Snapshot.GetMetadata().GetIndex(), peers); err != nil {
 		return err
 	}
 	return nil
 }
 
 func finalizeMigrationDir(tempDir string, destDataDir string) error {
-	if err := os.Rename(tempDir, destDataDir); err != nil {
+	if err := renameDirNoReplace(tempDir, destDataDir); err != nil {
 		_ = os.RemoveAll(tempDir)
+		if isRenameNoReplaceExists(err) {
+			return errors.Wrapf(errMigrationDestinationExists, "%s", destDataDir)
+		}
 		return errors.WithStack(err)
 	}
 	if err := syncDir(filepath.Dir(destDataDir)); err != nil {

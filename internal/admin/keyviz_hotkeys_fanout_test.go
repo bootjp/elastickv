@@ -260,6 +260,12 @@ func TestBuildKeyVizHotKeysPeerURL(t *testing.T) {
 			want:   "https://node-b.internal:9443/admin/api/v1/keyviz/hotkeys?route_id=7&series=writes&top=256",
 		},
 		{
+			name:   "label forwarded",
+			peer:   "10.0.0.2:8080",
+			params: hotKeysParams{routeID: 7, label: keyviz.LabelRedis, series: "writes", top: 20},
+			want:   "http://10.0.0.2:8080/admin/api/v1/keyviz/hotkeys?label=redis&route_id=7&series=writes&top=256",
+		},
+		{
 			name: "sub_bucket + from/to forwarded",
 			peer: "10.0.0.2:8080",
 			params: hotKeysParams{

@@ -30,10 +30,10 @@ func TestRestoreSnapshotStateEmptySnapshot(t *testing.T) {
 func TestRestoreSnapshotStateNilData(t *testing.T) {
 	// Snapshot with non-zero metadata but empty Data must be a no-op.
 	snap := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{Index: 5, Term: 1},
+		Metadata: testSnapshotMetadata(5, 1, nil),
 	}
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, "", nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), "", nil, nil)
 	require.NoError(t, err)
 	require.Nil(t, fsm.restored)
 }
@@ -42,9 +42,9 @@ func TestRestoreSnapshotStateNilFSM(t *testing.T) {
 	// Non-empty snapshot with a nil FSM must be a no-op (not a panic).
 	snap := raftpb.Snapshot{
 		Data:     []byte("some payload"),
-		Metadata: raftpb.SnapshotMetadata{Index: 1, Term: 1},
+		Metadata: testSnapshotMetadata(1, 1, nil),
 	}
-	_, err := restoreSnapshotState(nil, snap, snap.Metadata.Index, "", nil, nil)
+	_, err := restoreSnapshotState(nil, snap, snap.GetMetadata().GetIndex(), "", nil, nil)
 	require.NoError(t, err)
 }
 
@@ -54,11 +54,11 @@ func TestRestoreSnapshotStateLegacyFormat(t *testing.T) {
 	payload := []byte("legacy raw fsm state payload data here")
 	snap := raftpb.Snapshot{
 		Data:     payload,
-		Metadata: raftpb.SnapshotMetadata{Index: 1, Term: 1},
+		Metadata: testSnapshotMetadata(1, 1, nil),
 	}
 
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, "", nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), "", nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, payload, fsm.restored)
 }
@@ -72,11 +72,11 @@ func TestRestoreSnapshotStateTokenFormat(t *testing.T) {
 
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(7, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: 7, Term: 1},
+		Metadata: testSnapshotMetadata(7, 1, nil),
 	}
 
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, payload, fsm.restored)
 }
@@ -89,11 +89,11 @@ func TestRestoreSnapshotStateTokenEmptyPayload(t *testing.T) {
 
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(11, crc),
-		Metadata: raftpb.SnapshotMetadata{Index: 11, Term: 1},
+		Metadata: testSnapshotMetadata(11, 1, nil),
 	}
 
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []byte{}, fsm.restored)
 }
@@ -108,11 +108,11 @@ func TestRestoreSnapshotStateTokenCRCMismatch(t *testing.T) {
 
 	snap := raftpb.Snapshot{
 		Data:     encodeSnapshotToken(8, wrongCRC),
-		Metadata: raftpb.SnapshotMetadata{Index: 8, Term: 1},
+		Metadata: testSnapshotMetadata(8, 1, nil),
 	}
 
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, nil, nil)
 	require.ErrorIs(t, err, ErrFSMSnapshotTokenCRC)
 	require.Nil(t, fsm.restored, "FSM must not be restored after CRC mismatch")
 }
@@ -125,11 +125,11 @@ func TestRestoreSnapshotStateTokenFileNotFound(t *testing.T) {
 
 	snap := raftpb.Snapshot{
 		Data:     token,
-		Metadata: raftpb.SnapshotMetadata{Index: 999, Term: 1},
+		Metadata: testSnapshotMetadata(999, 1, nil),
 	}
 
 	fsm := &dummyFSM{}
-	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	_, err := restoreSnapshotState(fsm, snap, snap.GetMetadata().GetIndex(), dir, nil, nil)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 	require.Nil(t, fsm.restored)
 }

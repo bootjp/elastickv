@@ -47,11 +47,16 @@ func (s *SQSServer) purgeQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if _, _, err := s.purgeQueueWithRetry(r.Context(), name); err != nil {
+	if err := s.purgeQueueCore(r.Context(), name); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) purgeQueueCore(ctx context.Context, name string) error {
+	_, _, err := s.purgeQueueWithRetry(ctx, name)
+	return err
 }
 
 // purgeQueueWithRetry runs tryPurgeQueueOnce under the standard OCC

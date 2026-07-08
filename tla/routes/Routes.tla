@@ -1,7 +1,7 @@
 -------------------------------- MODULE Routes -------------------------------
 (***************************************************************************)
 (* TLA+ specification of the elastickv route catalog and CatalogWatcher.   *)
-(* Per docs/design/2026_05_28_partial_tla_safety_spec.md §5.4.             *)
+(* Per docs/design/2026_05_28_implemented_tla_safety_spec.md §5.4.             *)
 (*                                                                         *)
 (* Models the durable route catalog as a versioned snapshot and a set of   *)
 (* per-node engine views that re-sync via a CatalogWatcher action.  M4     *)

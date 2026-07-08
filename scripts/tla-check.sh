@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tla-check.sh — run TLC on every module in the elastickv TLA+ suite.
 #
-# Per docs/design/2026_05_28_partial_tla_safety_spec.md §7.2.  Each
+# Per docs/design/2026_05_28_implemented_tla_safety_spec.md §7.2.  Each
 # module under tla/<module>/ ships:
 #   MC<MODULE>.tla       — the TLC model module
 #   MC<MODULE>.cfg       — the correct-design config (expected PASS)
@@ -59,7 +59,7 @@ gap_configs_for() {
 # Per-module OPTIONAL liveness (M6) configurations.  Returns one
 # "<cfg-stem>" line per liveness config; empty output means the module
 # has no liveness configuration yet (the M6 milestone is optional per
-# docs/design/2026_05_28_partial_tla_safety_spec.md §5.6).  Each
+# docs/design/2026_05_28_implemented_tla_safety_spec.md §5.6).  Each
 # returned config is expected to PASS — the .cfg file points at the
 # module's SpecLive definition (which adds fairness assumptions) and
 # its PROPERTY list includes the leads-to obligation.

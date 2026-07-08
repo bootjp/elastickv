@@ -1,11 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	pkgerrors "github.com/cockroachdb/errors"
 )
 
@@ -24,6 +32,10 @@ import (
 type encryptionGapEngine interface {
 	AppliedIndex() uint64
 	EncryptionScanner() encryption.EncryptionRelevantScanner
+}
+
+type restoredCutoverReader interface {
+	RestoredCutover() uint64
 }
 
 // checkSidecarBehindRaftLog implements the §9.1 ErrSidecarBehindRaftLog
@@ -199,7 +211,449 @@ func chainEncryptionStartupGuard(
 	if prevErr != nil {
 		return prevErr
 	}
-	return checkSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
+	if err := checkSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled); err != nil {
+		return err
+	}
+	return checkEnvelopeCutoverDivergenceStartupGuard(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
+}
+
+func checkEnvelopeCutoverDivergenceStartupGuard(
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil || sc == nil {
+		return err
+	}
+	return checkEnvelopeCutoverDivergenceForRuntime(runtimes, defaultGroup, sc)
+}
+
+func checkEnvelopeCutoverDivergenceBeforeNonceBump(
+	raftID string,
+	raftDir string,
+	groups []groupSpec,
+	defaultGroup uint64,
+	multi bool,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil {
+		return err
+	}
+	sidecarCutover := uint64(0)
+	if sc != nil {
+		sidecarCutover = sc.RaftEnvelopeCutoverIndex
+	}
+	dir := groupDataDir(raftDir, raftID, defaultGroup, multi)
+	if !hasGroup(defaultGroup, groups) {
+		return nil
+	}
+	payload, ok, err := etcdraftengine.OpenNewestFSMSnapshotPayload(dir)
+	if err != nil || !ok {
+		return pkgerrors.Wrap(err, "encryption startup guard: open newest FSM snapshot payload")
+	}
+	defer payload.Close()
+	return checkEnvelopeCutoverDivergenceSnapshotPayload(payload, sidecarCutover, defaultGroup)
+}
+
+func checkEnvelopeCutoverDivergenceSnapshotPayload(payload io.Reader, sidecarCutover, defaultGroup uint64) error {
+	_, snapshotCutover, err := kv.ReadSnapshotHeader(bufio.NewReader(payload))
+	if err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: read restored snapshot header")
+	}
+	if snapshotCutover == 0 || snapshotCutover == sidecarCutover {
+		return nil
+	}
+	return pkgerrors.Wrapf(encryption.ErrEnvelopeCutoverDivergence,
+		"encryption startup guard: restored_snapshot_cutover=%d sidecar_raft_envelope_cutover=%d default_group=%d",
+		snapshotCutover, sidecarCutover, defaultGroup)
+}
+
+func hasGroup(groupID uint64, groups []groupSpec) bool {
+	for _, g := range groups {
+		if g.id == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+func readExistingSidecarForStartupGuard(sidecarPath string) (*encryption.Sidecar, error) {
+	if _, err := os.Stat(sidecarPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, pkgerrors.Wrapf(err, "encryption startup guard: stat sidecar %q", sidecarPath)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		return nil, pkgerrors.Wrapf(err, "encryption startup guard: read sidecar %q", sidecarPath)
+	}
+	return sc, nil
+}
+
+func checkEnvelopeCutoverDivergenceForRuntime(
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sc *encryption.Sidecar,
+) error {
+	rt := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if rt == nil {
+		return nil
+	}
+	if rt.stateMachine == nil {
+		if sc.RaftEnvelopeCutoverIndex == 0 {
+			return nil
+		}
+		return pkgerrors.Errorf(
+			"encryption startup guard: state machine for default group %d is nil (cannot compare restored raft envelope cutover)",
+			defaultGroup)
+	}
+	source, ok := rt.stateMachine.(restoredCutoverReader)
+	if !ok {
+		if sc.RaftEnvelopeCutoverIndex == 0 {
+			return nil
+		}
+		return pkgerrors.Errorf(
+			"encryption startup guard: state machine for default group %d cannot expose restored raft envelope cutover",
+			defaultGroup)
+	}
+	snapshotCutover := source.RestoredCutover()
+	if snapshotCutover == 0 {
+		return nil
+	}
+	if snapshotCutover != sc.RaftEnvelopeCutoverIndex {
+		return pkgerrors.Wrapf(encryption.ErrEnvelopeCutoverDivergence,
+			"encryption startup guard: restored_snapshot_cutover=%d sidecar_raft_envelope_cutover=%d default_group=%d",
+			snapshotCutover, sc.RaftEnvelopeCutoverIndex, defaultGroup)
+	}
+	return nil
+}
+
+type encryptionMembershipStartupGuardInput struct {
+	raftID            string
+	raftDir           string
+	groups            []groupSpec
+	multi             bool
+	defaultGroup      uint64
+	sidecarPath       string
+	encryptionEnabled bool
+	bootstrapServers  []raftengine.Server
+}
+
+// checkEncryptionMembershipStartupGuardsBeforeEngine implements the
+// Stage 6C-3 startup-refusal phase before buildEncryptionWriteWiring
+// bumps local_epoch and before buildShardGroups opens Raft engines:
+//
+//   - ErrNodeIDCollision: every voter/learner ID observed from the
+//     persisted etcd-raft peers files (or bootstrap peer list on a
+//     brand-new cluster) is narrowed with the same DeriveNodeID →
+//     NodeID16 path used by the nonce factory.
+//   - ErrLocalEpochRollback: the local sidecar's active storage DEK
+//     local_epoch must not be behind this node's writer-registry
+//     LastSeenLocalEpoch. Equality is allowed at this pre-bump phase:
+//     a healthy restart has sidecar == registry from the previous
+//     process load, and prepareStorageNonceEpoch will bump the sidecar
+//     before any encrypted write path opens.
+func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipStartupGuardInput) error {
+	if !in.encryptionEnabled || in.sidecarPath == "" {
+		return nil
+	}
+	sc, err := readExistingSidecarForStartupGuard(in.sidecarPath)
+	if err != nil || sc == nil {
+		return err
+	}
+	if sc.Active.Storage == 0 {
+		return nil
+	}
+	if err := checkNodeIDCollisionFromDisk(in.raftID, in.raftDir, in.groups, in.multi, in.bootstrapServers); err != nil {
+		return err
+	}
+	return checkLocalEpochRollbackFromDisk(in.raftID, in.raftDir, in.defaultGroup, in.multi, sc)
+}
+
+func checkNodeIDCollisionFromDisk(
+	raftID string,
+	raftDir string,
+	groups []groupSpec,
+	multi bool,
+	bootstrapServers []raftengine.Server,
+) error {
+	fullNodeIDs, err := memberFullNodeIDsFromDisk(raftID, raftDir, groups, multi, bootstrapServers)
+	if err != nil {
+		return err
+	}
+	if err := encryption.CheckNodeIDCollision(fullNodeIDs); err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: node_id collision")
+	}
+	return nil
+}
+
+func memberFullNodeIDsFromDisk(
+	raftID string,
+	raftDir string,
+	groups []groupSpec,
+	multi bool,
+	bootstrapServers []raftengine.Server,
+) ([]uint64, error) {
+	seen := map[uint64]struct{}{}
+	var out []uint64
+	add := func(fullNodeID uint64) {
+		if fullNodeID == 0 {
+			return
+		}
+		if _, ok := seen[fullNodeID]; ok {
+			return
+		}
+		seen[fullNodeID] = struct{}{}
+		out = append(out, fullNodeID)
+	}
+	for _, g := range groups {
+		dir := groupDataDir(raftDir, raftID, g.id, multi)
+		peers, ok, err := etcdraftengine.LoadPersistedPeers(dir)
+		if err != nil {
+			return nil, pkgerrors.Wrapf(err,
+				"encryption startup guard: read persisted peers for group %d",
+				g.id)
+		}
+		if ok {
+			for _, peer := range peers {
+				add(fullNodeIDForPersistedPeer(peer))
+			}
+			continue
+		}
+		for _, srv := range bootstrapServers {
+			add(etcdraftengine.DeriveNodeID(srv.ID))
+		}
+	}
+	return out, nil
+}
+
+func fullNodeIDForPersistedPeer(peer etcdraftengine.Peer) uint64 {
+	if peer.ID != "" {
+		return etcdraftengine.DeriveNodeID(peer.ID)
+	}
+	return peer.NodeID
+}
+
+func checkLocalEpochRollbackFromDisk(
+	raftID string,
+	raftDir string,
+	defaultGroup uint64,
+	multi bool,
+	sc *encryption.Sidecar,
+) error {
+	key, ok := sc.Keys[strconv.FormatUint(uint64(sc.Active.Storage), 10)]
+	if !ok {
+		return pkgerrors.Wrapf(encryption.ErrSidecarActiveKeyMissing,
+			"encryption startup guard: active storage DEK %d missing from sidecar keys",
+			sc.Active.Storage)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	storePath := filepath.Join(groupDataDir(raftDir, raftID, defaultGroup, multi), "fsm.db")
+	if _, err := os.Stat(storePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if err := checkLocalEpochRollbackBeforeBump(
+				missingWriterRegistry{},
+				fullNodeID,
+				sc.Active.Storage,
+				key.LocalEpoch,
+				sc.StorageEnvelopeActive,
+			); err != nil {
+				return pkgerrors.Wrap(err, "encryption startup guard: local_epoch rollback")
+			}
+			return nil
+		}
+		return pkgerrors.Wrapf(err, "encryption startup guard: stat writer registry store %q", storePath)
+	}
+	st, err := store.NewPebbleStore(storePath)
+	if err != nil {
+		return pkgerrors.Wrapf(err, "encryption startup guard: open writer registry store %q", storePath)
+	}
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			slog.Warn("encryption startup guard: failed to close writer registry store",
+				slog.String("store_path", storePath),
+				slog.Any("err", closeErr))
+		}
+	}()
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: writer registry")
+	}
+	if err := checkLocalEpochRollbackBeforeBump(
+		reg,
+		fullNodeID,
+		sc.Active.Storage,
+		key.LocalEpoch,
+		sc.StorageEnvelopeActive,
+	); err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: local_epoch rollback")
+	}
+	return nil
+}
+
+func checkLocalEpochRollbackBeforeBump(
+	registry encryption.WriterRegistryStore,
+	fullNodeID uint64,
+	activeStorageDEKID uint32,
+	sidecarLocalEpoch uint16,
+	storageEnvelopeActive bool,
+) error {
+	key := encryption.RegistryKey(activeStorageDEKID, encryption.NodeID16(fullNodeID))
+	rawVal, ok, err := registry.GetRegistryRow(key)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: read writer-registry row for full_node_id=%#x dek_id=%d",
+			fullNodeID, activeStorageDEKID)
+	}
+	if !ok {
+		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+	}
+	registryRow, err := encryption.DecodeRegistryValue(rawVal)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: decode writer-registry row for full_node_id=%#x dek_id=%d",
+			fullNodeID, activeStorageDEKID)
+	}
+	if registryRow.FullNodeID != fullNodeID {
+		return foreignRegistryRowBeforeBump(registryRow.FullNodeID, fullNodeID, activeStorageDEKID)
+	}
+	if sidecarLocalEpoch < registryRow.LastSeenLocalEpoch {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"sidecar local_epoch=%d < registry last_seen_local_epoch=%d (full_node_id=%#x dek_id=%d) before startup bump; sidecar must be at least registry before BumpLocalEpoch advances it",
+			sidecarLocalEpoch, registryRow.LastSeenLocalEpoch, fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
+func checkLocalEpochRollbackAfterReplay(
+	raftID string,
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, key, ok, err := activeStorageKeyForStartupGuard(sidecarPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	reg, err := writerRegistryAfterReplay(runtimes, defaultGroup)
+	if err != nil {
+		return err
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	if err := checkLocalEpochRollbackAfterBump(
+		reg,
+		fullNodeID,
+		sc.Active.Storage,
+		key.LocalEpoch,
+		sc.StorageEnvelopeActive,
+	); err != nil {
+		return pkgerrors.Wrap(err, "encryption startup guard: local_epoch rollback after raft replay")
+	}
+	return nil
+}
+
+func activeStorageKeyForStartupGuard(sidecarPath string) (*encryption.Sidecar, encryption.SidecarKey, bool, error) {
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil || sc == nil {
+		return nil, encryption.SidecarKey{}, false, err
+	}
+	if sc.Active.Storage == 0 {
+		return sc, encryption.SidecarKey{}, false, nil
+	}
+	key, ok := sc.Keys[strconv.FormatUint(uint64(sc.Active.Storage), 10)]
+	if !ok {
+		return sc, encryption.SidecarKey{}, false, pkgerrors.Wrapf(encryption.ErrSidecarActiveKeyMissing,
+			"encryption startup guard: active storage DEK %d missing from sidecar keys after raft replay",
+			sc.Active.Storage)
+	}
+	return sc, key, true, nil
+}
+
+func writerRegistryAfterReplay(runtimes []*raftGroupRuntime, defaultGroup uint64) (encryption.WriterRegistryStore, error) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil || defaultRuntime.store == nil {
+		return nil, pkgerrors.Errorf("encryption startup guard: default group %d runtime unavailable after raft replay", defaultGroup)
+	}
+	reg, err := store.WriterRegistryFor(defaultRuntime.store)
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "encryption startup guard: writer registry after raft replay")
+	}
+	return reg, nil
+}
+
+func checkLocalEpochRollbackAfterBump(
+	registry encryption.WriterRegistryStore,
+	fullNodeID uint64,
+	activeStorageDEKID uint32,
+	sidecarLocalEpoch uint16,
+	storageEnvelopeActive bool,
+) error {
+	key := encryption.RegistryKey(activeStorageDEKID, encryption.NodeID16(fullNodeID))
+	rawVal, ok, err := registry.GetRegistryRow(key)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: read writer-registry row for full_node_id=%#x dek_id=%d after startup bump",
+			fullNodeID, activeStorageDEKID)
+	}
+	if !ok {
+		return missingRegistryRowBeforeBump(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
+	}
+	registryRow, err := encryption.DecodeRegistryValue(rawVal)
+	if err != nil {
+		return pkgerrors.Wrapf(err,
+			"local_epoch rollback guard: decode writer-registry row for full_node_id=%#x dek_id=%d after startup bump",
+			fullNodeID, activeStorageDEKID)
+	}
+	if registryRow.FullNodeID != fullNodeID {
+		return foreignRegistryRowBeforeBump(registryRow.FullNodeID, fullNodeID, activeStorageDEKID)
+	}
+	if sidecarLocalEpoch <= registryRow.LastSeenLocalEpoch {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"sidecar local_epoch=%d <= registry last_seen_local_epoch=%d (full_node_id=%#x dek_id=%d) after raft replay; startup bump must advance beyond every replayed registration",
+			sidecarLocalEpoch, registryRow.LastSeenLocalEpoch, fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
+func missingRegistryRowBeforeBump(storageEnvelopeActive bool, fullNodeID uint64, activeStorageDEKID uint32) error {
+	if storageEnvelopeActive {
+		return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+			"writer-registry has no row for full_node_id=%#x dek_id=%d but storage_envelope_active=true; cannot prove nonce monotonicity for the active DEK before startup bump",
+			fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
+func foreignRegistryRowBeforeBump(registryFullNodeID, fullNodeID uint64, activeStorageDEKID uint32) error {
+	return pkgerrors.Wrapf(encryption.ErrLocalEpochRollback,
+		"writer-registry row for node_id16=%#x dek_id=%d belongs to full_node_id=%#x, not this full_node_id=%#x; refusing startup to avoid nonce-prefix collision",
+		encryption.NodeID16(fullNodeID), activeStorageDEKID, registryFullNodeID, fullNodeID)
+}
+
+type missingWriterRegistry struct{}
+
+func (missingWriterRegistry) GetRegistryRow([]byte) ([]byte, bool, error) { return nil, false, nil }
+
+func (missingWriterRegistry) SetRegistryRow(_, _ []byte) error {
+	return pkgerrors.New("missing writer registry is read-only")
 }
 
 // findDefaultGroupRuntime returns the runtime whose spec.id

@@ -212,42 +212,23 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	// Option-2 dedup for standalone SET: route through runTransactionWithDedup
-	// as a single-mop EXEC body when the gate is on. SET inside MULTI/EXEC
-	// already has full dedup coverage via applySet (§M3 in the design doc),
-	// so we just reuse that machinery instead of building a per-handler
-	// reusableSetTxn + dispatchSetReuse shape. The fast-path optimization is
-	// intentionally bypassed under the gate — dedup is opt-in, and a
-	// non-dedup'd fast path under a dedup-on cluster would split the
-	// idempotency contract.
-	//
-	// Result translation: runTransactionWithDedup returns []redisResult; for
-	// SET there is exactly one element with the same redisResult shape as
-	// the standalone reply (resultString OK / resultNil for NX/XX miss /
-	// resultBulk for GET).
-	// Both gates must be on to route standalone SET through the dedup path.
-	// onePhaseTxnDedup covers the MULTI/EXEC and list-push retries that the
-	// parent design's M4 validated; standaloneSetDedup is a separate sub-gate
-	// (default off) because applySet diverges from executeSet on SET-over-
-	// collection — flipping onePhaseTxnDedup default-on without this guard
-	// would change normal Redis overwrite behaviour (PR #943 round-1 codex P1).
-	if r.onePhaseTxnDedup && r.standaloneSetDedup {
-		// Call runTransactionWithDedup directly instead of going through
-		// runTransaction. runTransaction re-checks the same
-		// r.onePhaseTxnDedup gate and routes here anyway; the indirection
-		// would make the call chain misleading ("dispatches via
-		// runTransactionWithDedup" being true only by indirection).
-		// Direct call makes the intent explicit and removes the double
-		// gate check.
-		results, err := r.runTransactionWithDedup([]redcon.Command{cmd})
-		if err != nil {
-			writeRedisError(conn, err)
-			return
-		}
-		writeRedisStandaloneResult(conn, results)
+	if r.runStandaloneDedup(conn, cmd) {
 		return
 	}
 	r.setLegacy(conn, cmd)
+}
+
+func (r *RedisServer) runStandaloneDedup(conn redcon.Conn, cmd redcon.Command) bool {
+	if !r.onePhaseTxnDedup {
+		return false
+	}
+	results, err := r.runTransactionWithDedup([]redcon.Command{cmd})
+	if err != nil {
+		writeRedisError(conn, err)
+		return true
+	}
+	writeRedisStandaloneResult(conn, results)
+	return true
 }
 
 // setLegacy is the pre-dedup standalone SET path. Extracted from set() so
