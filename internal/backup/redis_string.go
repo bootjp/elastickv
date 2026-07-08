@@ -43,6 +43,15 @@ const (
 	redisStrBaseHeader      = 3
 	redisUint64Bytes        = 8
 
+	// redisHLLMagic / redisHLLVersion / redisHLLHasTTL /
+	// redisHLLBaseHeader mirror adapter/redis_compat_types.go. HLLs use
+	// a distinct version byte because the payload is a stored set sketch,
+	// not a Redis string body.
+	redisHLLMagic      byte = 0xFF
+	redisHLLVersion    byte = 0x02
+	redisHLLHasTTL     byte = 0x01
+	redisHLLBaseHeader      = 3
+
 	// wideColumnUserKeyLenSize is the fixed BE-uint32 width of the
 	// per-key length prefix used by every wide-column key shape
 	// (!hs|, !st|, !zs|, !stream|, and any future families that
@@ -67,6 +76,11 @@ const (
 // new magic-prefix format but its declared TTL section is truncated. Legacy
 // (no-magic) values are accepted as opaque raw bytes.
 var ErrRedisInvalidStringValue = cockroachdberr.New("backup: invalid !redis|str| value")
+
+// ErrRedisInvalidHLLValue is returned when a !redis|hll| value uses the
+// new magic-prefix format but its declared TTL section is truncated. Legacy
+// (no-magic) values are accepted as opaque raw bytes.
+var ErrRedisInvalidHLLValue = cockroachdberr.New("backup: invalid !redis|hll| value")
 
 // ErrRedisInvalidTTLValue is returned when a !redis|ttl| value is not the
 // expected 8-byte big-endian uint64 millisecond expiry.
@@ -170,16 +184,14 @@ type RedisDB struct {
 	// stat+mkdir(EEXIST) round-trips.
 	dirsCreated map[string]struct{}
 
-	// inlineTTLEmitted tracks string keys whose TTL was already
-	// extracted from the inline magic-prefix header by HandleString and
-	// written to strings_ttl.jsonl. The live Redis encoder emits BOTH
-	// `!redis|str|<k>` (with inline TTL) and `!redis|ttl|<k>` (the
-	// scan-index entry the sweeper consumes) for an expiring string
-	// (see adapter/redis_lua_context.go stringCommitElems). Without
-	// this set, HandleTTL would route the redundant `!redis|ttl|`
-	// record back into the same sidecar, duplicating the entry and
-	// violating the one-record-per-key contract sidecar consumers
-	// rely on. Codex P1 round 5.
+	// inlineTTLEmitted tracks simple keys whose TTL was already extracted
+	// from the inline magic-prefix header by HandleString or HandleHLL and
+	// written to the matching TTL sidecar. The live Redis encoder emits both
+	// the typed record with inline TTL and `!redis|ttl|<k>` scan-index entry
+	// the sweeper consumes. Without this set, HandleTTL would route the
+	// redundant scan-index record back into the same sidecar, duplicating the
+	// entry and violating the one-record-per-key contract sidecar consumers
+	// rely on.
 	inlineTTLEmitted map[string]struct{}
 
 	// warn is the structured-warning sink. Non-nil in production
@@ -385,13 +397,24 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 	return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 }
 
-// HandleHLL processes one !redis|hll|<userKey> record. The value is the
-// raw HLL sketch bytes, written byte-for-byte to hll/<encoded>.bin. TTL
-// for HLL keys lives in !redis|ttl|<userKey> and is consumed by
-// HandleTTL.
+// HandleHLL processes one !redis|hll|<userKey> record. Legacy values are raw
+// HLL sketch bytes. New values may carry a magic-prefix TTL envelope; the
+// decoded dump remains the user-facing raw sketch in hll/<encoded>.bin, with
+// any embedded TTL written to hll_ttl.jsonl.
 func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	r.kindByKey[string(userKey)] = redisKindHLL
-	return r.writeBlob("hll", userKey, value)
+	sketch, expireAtMs, err := decodeRedisHLLValue(value)
+	if err != nil {
+		return err
+	}
+	if err := r.writeBlob("hll", userKey, sketch); err != nil {
+		return err
+	}
+	if expireAtMs == 0 {
+		return nil
+	}
+	r.inlineTTLEmitted[string(userKey)] = struct{}{}
+	return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
 }
 
 // HandleTTL processes one !redis|ttl|<userKey> record. Routing
@@ -427,6 +450,9 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	}
 	switch r.kindByKey[string(userKey)] {
 	case redisKindHLL:
+		if _, ok := r.inlineTTLEmitted[string(userKey)]; ok {
+			return nil
+		}
 		return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
 	case redisKindString:
 		// New-format strings carry TTL inline in the magic-prefix
@@ -921,6 +947,38 @@ func decodeRedisStringValue(value []byte) ([]byte, uint64, error) {
 func isNewRedisStrFormat(raw []byte) bool {
 	return len(raw) >= 2 && //nolint:mnd // 2 == magic + version length
 		raw[0] == redisStrMagic && raw[1] == redisStrVersion
+}
+
+// decodeRedisHLLValue strips the redis-HLL magic-prefix TTL header (if
+// present) from a !redis|hll| value and returns (sketch, expireAtMs).
+// expireAtMs == 0 means "no inline TTL"; legacy values always return 0 here
+// because their TTL lives in !redis|ttl|.
+func decodeRedisHLLValue(value []byte) ([]byte, uint64, error) {
+	if !isNewRedisHLLFormat(value) {
+		return value, 0, nil
+	}
+	if len(value) < redisHLLBaseHeader {
+		return nil, 0, cockroachdberr.Wrap(ErrRedisInvalidHLLValue, "header truncated")
+	}
+	flags := value[2]
+	rest := value[redisHLLBaseHeader:]
+	if flags&redisHLLHasTTL == 0 {
+		return rest, 0, nil
+	}
+	if len(rest) < redisUint64Bytes {
+		return nil, 0, cockroachdberr.Wrap(ErrRedisInvalidHLLValue, "ttl section truncated")
+	}
+	rawMs := binary.BigEndian.Uint64(rest[:redisUint64Bytes])
+	expireAtMs := rawMs
+	if expireAtMs > math.MaxInt64 {
+		expireAtMs = math.MaxInt64
+	}
+	return rest[redisUint64Bytes:], expireAtMs, nil
+}
+
+func isNewRedisHLLFormat(raw []byte) bool {
+	return len(raw) >= 2 && //nolint:mnd // 2 == magic + version length
+		raw[0] == redisHLLMagic && raw[1] == redisHLLVersion
 }
 
 func decodeRedisTTLValue(raw []byte) (uint64, error) {

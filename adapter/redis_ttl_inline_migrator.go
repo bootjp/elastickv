@@ -47,6 +47,12 @@ func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandle
 			buildElems:     c.migrateHLLTTLInlineElems,
 		},
 		{
+			typeName:       "ttl-inline-indexed-collection",
+			prefix:         []byte(redisTTLPrefix),
+			extractUserKey: trimKnownPrefix([]byte(redisTTLPrefix)),
+			buildElems:     c.migrateTTLIndexedCollectionElems,
+		},
+		{
 			typeName:       "ttl-inline-list",
 			prefix:         []byte(store.ListMetaPrefix),
 			extractUserKey: extractListMetaMigrationUserKey,
@@ -135,7 +141,7 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 		extractUserKey: extractUserKey,
 		buildElems: func(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 			userKey := extractUserKey(pair.Key)
-			if len(userKey) == 0 {
+			if userKey == nil {
 				return nil, nil
 			}
 			n, ttlMs, err := unmarshal(pair.Value)
@@ -177,7 +183,7 @@ func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlin
 	)
 	for _, pair := range kvs {
 		userKey := h.extractUserKey(pair.Key)
-		if len(userKey) == 0 || !c.coord.IsLeaderForKey(userKey) {
+		if userKey == nil || !c.coord.IsLeaderForKey(userKey) {
 			continue
 		}
 		built, buildErr := h.buildElems(ctx, pair, readTS)
@@ -264,12 +270,184 @@ func (c *DeltaCompactor) migrateHLLTTLInlineElems(ctx context.Context, pair *sto
 	return appendTTLIndexSyncElem(ctx, c.st, elems, userKey, ttlMs, readTS)
 }
 
+func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	userKey := bytes.TrimPrefix(pair.Key, []byte(redisTTLPrefix))
+	ttl, err := decodeRedisTTL(pair.Value)
+	if err != nil {
+		return nil, err
+	}
+	ttlMs := redisExpireAtMillis(ttl)
+	if ttlMs == 0 {
+		return nil, nil
+	}
+
+	server := &RedisServer{store: c.st, compactor: c}
+	typ, err := server.rawKeyTypeAt(ctx, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	switch typ {
+	case redisTypeNone, redisTypeString:
+		return nil, nil
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+	}
+	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
+	if err != nil || baseExists {
+		return nil, err
+	}
+	elems, ok, err := server.collectionMetaExpireElems(ctx, userKey, readTS, typ, ttlMs)
+	if err != nil || ok {
+		return elems, err
+	}
+	return c.legacyCollectionTTLInlineElems(ctx, userKey, typ, ttlMs, readTS)
+}
+
+func (c *DeltaCompactor) collectionBaseMetaExistsAt(ctx context.Context, userKey []byte, typ redisValueType, readTS uint64) (bool, error) {
+	var metaKey []byte
+	switch typ {
+	case redisTypeNone, redisTypeString:
+		return false, nil
+	case redisTypeList:
+		metaKey = store.ListMetaKey(userKey)
+	case redisTypeHash:
+		metaKey = store.HashMetaKey(userKey)
+	case redisTypeSet:
+		metaKey = store.SetMetaKey(userKey)
+	case redisTypeZSet:
+		metaKey = store.ZSetMetaKey(userKey)
+	case redisTypeStream:
+		metaKey = store.StreamMetaKey(userKey)
+	}
+	exists, err := c.st.ExistsAt(ctx, metaKey, readTS)
+	return exists, errors.WithStack(err)
+}
+
+func (c *DeltaCompactor) legacyCollectionTTLInlineElems(
+	ctx context.Context,
+	userKey []byte,
+	typ redisValueType,
+	ttlMs uint64,
+	readTS uint64,
+) ([]*kv.Elem[kv.OP], error) {
+	switch typ {
+	case redisTypeNone, redisTypeString, redisTypeList, redisTypeStream:
+		return nil, nil
+	case redisTypeHash:
+		return c.legacyHashTTLInlineElems(ctx, userKey, ttlMs, readTS)
+	case redisTypeSet:
+		return c.legacySetTTLInlineElems(ctx, userKey, ttlMs, readTS)
+	case redisTypeZSet:
+		return c.legacyZSetTTLInlineElems(ctx, userKey, ttlMs, readTS)
+	}
+	return nil, nil
+}
+
+func (c *DeltaCompactor) legacyHashTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := c.st.GetAt(ctx, redisHashKey(userKey), readTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	value, err := unmarshalHashValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value)+setWideColOverhead)
+	for field, val := range value {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(userKey, []byte(field)),
+			Value: []byte(val),
+		})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(userKey)},
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaKey(userKey),
+			Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
+		},
+	)
+	return elems, nil
+}
+
+func (c *DeltaCompactor) legacySetTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := c.st.GetAt(ctx, redisSetKey(userKey), readTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	value, err := unmarshalSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Members)+setWideColOverhead)
+	for _, member := range value.Members {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.SetMemberKey(userKey, []byte(member)),
+			Value: []byte{},
+		})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(userKey)},
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.SetMetaKey(userKey),
+			Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members)), ExpireAt: ttlMs}),
+		},
+	)
+	return elems, nil
+}
+
+func (c *DeltaCompactor) legacyZSetTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := c.st.GetAt(ctx, redisZSetKey(userKey), readTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)*zsetOpsPerEntry+setWideColOverhead)
+	for _, entry := range value.Entries {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey(userKey, []byte(entry.Member)),
+				Value: store.MarshalZSetScore(entry.Score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey(userKey, entry.Score, []byte(entry.Member)),
+				Value: []byte{},
+			},
+		)
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(userKey)},
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaKey(userKey),
+			Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries)), ExpireAt: ttlMs}),
+		},
+	)
+	return elems, nil
+}
+
 func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	if isListMetaMigrationDelta(pair) {
 		return nil, nil
 	}
 	userKey := extractListMetaMigrationUserKey(pair.Key)
-	if len(userKey) == 0 {
+	if userKey == nil {
 		return nil, nil
 	}
 	meta, err := store.UnmarshalListMeta(pair.Value)
@@ -300,7 +478,7 @@ func isListMetaMigrationDelta(pair *store.KVPair) bool {
 
 func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	userKey := store.ExtractStreamUserKeyFromMeta(pair.Key)
-	if len(userKey) == 0 {
+	if userKey == nil {
 		return nil, nil
 	}
 	meta, err := store.UnmarshalStreamMeta(pair.Value)

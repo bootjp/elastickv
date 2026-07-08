@@ -260,46 +260,56 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 // SyncOnce runs one compaction pass. The IsLeader() guard avoids the
 // full-prefix delta scan on followers, which would proxy cross-node on
 // ShardStore backends. For sharded deployments where this node is the
-// leader for a non-default shard group, the regular tick is skipped; those
-// keys are still handled by the urgent compaction path (compactUrgentKey)
-// which uses IsLeaderForKey for per-key routing. buildBatchElems adds an
-// additional per-key IsLeaderForKey filter so a default-group leader never
-// dispatches mutations for shards it does not own.
+// leader for a non-default shard group, the regular delta-compaction tick is
+// skipped; those keys are still handled by the urgent compaction path
+// (compactUrgentKey) which uses IsLeaderForKey for per-key routing.
+//
+// The TTL-inline migrator is intentionally outside the default-group leader
+// guard. It is a migration path, not just a hot-key repair path, and each
+// candidate is still filtered by IsLeaderForKey before dispatch. Without this
+// pass, keys whose shard is led by this node but whose default group is led
+// elsewhere would never get their inline TTL anchor before legacy fallback is
+// disabled.
+//
+// buildBatchElems adds an additional per-key IsLeaderForKey filter so a
+// default-group leader never dispatches mutations for shards it does not own.
 // Each collection-type handler runs in its own goroutine so that a slow
 // handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
 // compaction. All goroutines share the same per-tick timeout context.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
-	if c.coord == nil || !c.coord.IsLeader() {
+	if c.coord == nil {
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	handlers := c.allHandlers()
-	errs := make([]error, len(handlers))
-	var wg sync.WaitGroup
-	for i, h := range handlers {
-		wg.Add(1)
-		go func(idx int, handler collectionDeltaHandler) {
-			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					c.logger.Error("DeltaCompactor: panic in handler",
-						slog.String("type", handler.typeName),
-						slog.Any("panic", rec))
-					errs[idx] = errors.Errorf("panic in %s compactor: %v", handler.typeName, rec)
-				}
-			}()
-			errs[idx] = c.compactHandler(tickCtx, handler, readTS)
-		}(i, h)
-	}
-	wg.Wait()
-
 	var combined error
-	for _, err := range errs {
-		if err != nil && !errors.Is(err, context.Canceled) {
-			combined = errors.CombineErrors(combined, err)
+	if c.coord.IsLeader() {
+		handlers := c.allHandlers()
+		errs := make([]error, len(handlers))
+		var wg sync.WaitGroup
+		for i, h := range handlers {
+			wg.Add(1)
+			go func(idx int, handler collectionDeltaHandler) {
+				defer wg.Done()
+				defer func() {
+					if rec := recover(); rec != nil {
+						c.logger.Error("DeltaCompactor: panic in handler",
+							slog.String("type", handler.typeName),
+							slog.Any("panic", rec))
+						errs[idx] = errors.Errorf("panic in %s compactor: %v", handler.typeName, rec)
+					}
+				}()
+				errs[idx] = c.compactHandler(tickCtx, handler, readTS)
+			}(i, h)
+		}
+		wg.Wait()
+
+		for _, err := range errs {
+			if err != nil && !errors.Is(err, context.Canceled) {
+				combined = errors.CombineErrors(combined, err)
+			}
 		}
 	}
 	if err := c.migrateTTLInlineOnce(tickCtx, readTS); err != nil && !errors.Is(err, context.Canceled) {
