@@ -1210,7 +1210,14 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		if r.bzpopminTryAllKeys(conn, keys, fast) {
+		var done bool
+		if ok := r.runWithHeavyCommandSlot(func() {
+			done = r.bzpopminTryAllKeys(conn, keys, fast)
+		}); !ok {
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return
+		}
+		if done {
 			return
 		}
 		if !fast {

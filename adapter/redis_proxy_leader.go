@@ -15,6 +15,8 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+const defaultRedisLeaderClientPoolSize = 4
+
 func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
@@ -239,9 +241,20 @@ func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
 	if cli, ok = r.leaderClients[addr]; ok {
 		return cli
 	}
-	cli = redis.NewClient(&redis.Options{Addr: addr})
+	cli = redis.NewClient(&redis.Options{Addr: addr, PoolSize: r.leaderClientPoolSize()})
 	r.leaderClients[addr] = cli
 	return cli
+}
+
+func (r *RedisServer) leaderClientPoolSize() int {
+	n := defaultRedisLeaderClientPoolSize
+	if r != nil && r.peerLimiter != nil && r.peerLimiter.limit > 0 && r.peerLimiter.limit < n {
+		n = r.peerLimiter.limit
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 // leaderClientForKey returns a cached go-redis client connected to the leader

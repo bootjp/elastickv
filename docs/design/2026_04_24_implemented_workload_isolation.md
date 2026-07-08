@@ -15,6 +15,10 @@ Implementation status:
   It gates the static heavy-command set, returns `BUSY server overloaded` when
   full, defaults to `2 * GOMAXPROCS`, and is configurable via
   `ELASTICKV_REDIS_HEAVY_COMMAND_SLOTS` / `WithRedisHeavyCommandSlots`.
+  Blocking commands (`XREAD`, `BZPOPMIN`) do not hold a slot while waiting;
+  their resolve/poll iterations take a slot and release it before the waiter
+  parks. `MULTI`/`EXEC` also takes a slot when the queued body contains a
+  heavy command such as `LRANGE`.
 - Shipped: Lua execution derives its timeout from `RedisServer.handlerContext`
   instead of `context.Background`, preserving request cancellation for the
   gated `EVAL`/`EVALSHA` path.
@@ -22,7 +26,9 @@ Implementation status:
   `adapter/redis_peer_limiter.go`, wired through `RedisServer.Run` accept and
   close hooks. Default cap is 8 per peer IP and is configurable via
   `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
-  `WithRedisPerPeerConnectionLimit`.
+  `WithRedisPerPeerConnectionLimit`. Redis leader-proxy clients use a small
+  explicit go-redis pool below that default cap, and Pub/Sub detached sockets
+  stay counted until their Pub/Sub cleanup path closes.
 - Shipped: Layer 4 stream entry-per-key layout in `store/stream_helpers.go`,
   `adapter/redis_stream_cmds.go`, and `adapter/redis_compat_helpers.go`.
   XREAD now range-scans `!stream|entry|...` after the requested ID instead of
@@ -140,30 +146,18 @@ command byte" simplicity, and a bounded `ZRANGE 0 10` contributes at
 most one unmarshal per request (cheap). Dynamic (observed-cost)
 classification is a follow-up; v1 bias is a boring, reviewable list.
 
-**Blocking variants are NOT I/O-bound in the current implementation.**
-`XREAD BLOCK ms`, `BLPOP`, `BRPOP`, `BZPOPMIN`/`MAX` look idle from
-the outside but the adapter (`adapter/redis_compat_commands.go:xread`,
-`:bzpopmin` around line 3432) implements them as a **busy-poll loop**:
-on a miss it calls `time.Sleep(redisBusyPollBackoff)` and re-issues
-the underlying KV+leader lookup. Every wake-up does CPU work and a
-Raft leadership round-trip, then sleeps again. A pool-bypass for
-"blocking" variants under this implementation would hand them
-unbounded CPU on the fast path, the opposite of what we want.
+**Blocking variants are split into poll work and idle wait.**
+`XREAD BLOCK` and `BZPOPMIN` now register key waiters fed by the write path,
+with a bounded fallback timer for writes that bypass the local signal. Their
+poll/resolve iterations still do CPU and storage work, so those iterations
+take a heavy-command slot. The wait phase releases the slot before parking,
+so long-lived blocked consumers do not starve unrelated heavy commands such
+as `HGETALL`, `KEYS`, `DBSIZE`, or `EVAL`.
 
-**v1 resolution: keep the blocking variants gated** alongside the
-other heavy commands. Reject with `-BUSY` when the pool is full,
-same as XREAD. The behaviour is strictly worse than a true
-condition-variable wake-up (which would be slot-free), but correct
-under the existing busy-poll, and consistent with the rest of the
-heavy-command accounting.
-
-**Stacked follow-up to unblock a real bypass:** replace the
-busy-poll with a condvar/notification hook fed by the write path.
-Only after that lands can blocking variants honestly be called
-I/O-bound; at that point carve them out of the pool with the
-simplest form of arg inspection (`XREAD …BLOCK…`, `B*POP`) and
-re-evaluate pool sizing. Tracked as a separate item in the stream
-and list/zset adapters; not required by Layer 1 v1.
+**v1 resolution: gate work, not idle.** Blocking commands reject with
+`-BUSY` only when the next poll/resolve iteration cannot acquire a slot.
+They do not hold the slot while waiting for a producer signal or fallback
+tick.
 
 ### Tradeoffs
 

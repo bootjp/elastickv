@@ -1,16 +1,21 @@
 package adapter
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/tidwall/redcon"
 )
 
 const (
 	redisHeavyCommandSlotsEnv     = "ELASTICKV_REDIS_HEAVY_COMMAND_SLOTS"
 	defaultRedisHeavySlotCPUScale = 2
 )
+
+var errRedisHeavyCommandPoolFull = errors.New("BUSY server overloaded")
 
 type redisHeavyCommandLimiter struct {
 	slots chan struct{}
@@ -51,8 +56,9 @@ func (l *redisHeavyCommandLimiter) submit(fn func()) bool {
 }
 
 func isRedisHeavyCommand(name string) bool {
-	switch strings.ToUpper(name) {
+	switch name {
 	case cmdEval, cmdEvalSHA,
+		cmdDBSize,
 		cmdKeys, cmdScan,
 		cmdHGetAll,
 		cmdLRange,
@@ -64,4 +70,16 @@ func isRedisHeavyCommand(name string) bool {
 	default:
 		return false
 	}
+}
+
+func transactionHasHeavyCommand(queue []redcon.Command) bool {
+	for _, cmd := range queue {
+		if len(cmd.Args) == 0 {
+			continue
+		}
+		if isRedisHeavyCommand(strings.ToUpper(string(cmd.Args[0]))) {
+			return true
+		}
+	}
+	return false
 }

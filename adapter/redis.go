@@ -468,9 +468,10 @@ type connState struct {
 	// clientName is the name set via HELLO SETNAME or CLIENT SETNAME,
 	// returned by CLIENT GETNAME. Empty string means no name set, which
 	// CLIENT GETNAME must report as a null bulk string.
-	clientName  string
-	peerKey     string
-	peerCounted bool
+	clientName     string
+	peerKey        string
+	peerCounted    bool
+	pubsubDetached bool
 }
 
 type resultType int
@@ -544,6 +545,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 			opt(r)
 		}
 	}
+	r.pubsub.detach = r.detachPubSubConn
+	r.pubsub.onClose = r.releaseDetachedPubSubConn
 	// Materialize the Lua VM pool after option processing so
 	// WithLuaPoolMaxIdle can choose the cap. newLuaStatePoolWithMaxIdle
 	// clamps non-positive values to DefaultLuaPoolMaxIdle, so callers
@@ -586,11 +589,23 @@ func (r *RedisServer) closeConn(conn redcon.Conn) {
 		return
 	}
 	st, ok := conn.Context().(*connState)
-	if !ok || !st.peerCounted {
+	if !ok || !st.peerCounted || st.pubsubDetached {
 		return
 	}
 	r.peerLimiter.release(st.peerKey)
 	st.peerCounted = false
+}
+
+func (r *RedisServer) detachPubSubConn(conn redcon.Conn) redcon.DetachedConn {
+	st := getConnState(conn)
+	st.pubsubDetached = true
+	return conn.Detach()
+}
+
+func (r *RedisServer) releaseDetachedPubSubConn(conn redcon.Conn) {
+	st := getConnState(conn)
+	st.pubsubDetached = false
+	r.closeConn(conn)
 }
 
 // ensureConnID assigns and returns a per-connection numeric ID for the
@@ -673,12 +688,29 @@ func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handl
 }
 
 func (r *RedisServer) shouldLimitHeavyCommand(name string) bool {
-	return r != nil && r.heavyCommandLimiter != nil && isRedisHeavyCommand(name)
+	return r != nil && r.heavyCommandLimiter != nil && isRedisHeavyCommand(name) && !isRedisIdleWaitCommand(name)
+}
+
+func (r *RedisServer) runWithHeavyCommandSlot(fn func()) bool {
+	if r == nil || r.heavyCommandLimiter == nil {
+		fn()
+		return true
+	}
+	return r.heavyCommandLimiter.submit(fn)
+}
+
+func isRedisIdleWaitCommand(name string) bool {
+	switch name {
+	case cmdXRead, cmdBZPopMin:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *RedisServer) rejectHeavyCommand(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) {
 	r.traceCommandError(conn, name, cmd.Args[1:], "heavy command pool full")
-	conn.WriteError("BUSY server overloaded")
+	conn.WriteError(errRedisHeavyCommandPoolFull.Error())
 	r.observeRedisError(name, time.Since(start))
 }
 

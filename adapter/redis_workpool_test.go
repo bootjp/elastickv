@@ -22,8 +22,8 @@ func TestRedisHeavyCommandLimiterRejectsWhenFull(t *testing.T) {
 	require.True(t, server.heavyCommandLimiter.submit(func() {
 		var called atomic.Bool
 		conn := &commandRecorder{}
-		cmd := redcon.Command{Args: [][]byte{[]byte(cmdXRead), []byte("STREAMS"), []byte("s"), []byte("0")}}
-		server.dispatchCommand(conn, cmdXRead, func(redcon.Conn, redcon.Command) {
+		cmd := redcon.Command{Args: [][]byte{[]byte(cmdHGetAll), []byte("hash")}}
+		server.dispatchCommand(conn, cmdHGetAll, func(redcon.Conn, redcon.Command) {
 			called.Store(true)
 		}, cmd, time.Now())
 
@@ -38,10 +38,10 @@ func TestRedisHeavyCommandLimiterRejectsWhenFull(t *testing.T) {
 		strings.NewReader(`
 # HELP elastickv_redis_requests_total Total number of Redis API requests by command and outcome.
 # TYPE elastickv_redis_requests_total counter
-elastickv_redis_requests_total{command="XREAD",node_address="10.0.0.1:50051",node_id="n1",outcome="error"} 1
+elastickv_redis_requests_total{command="HGETALL",node_address="10.0.0.1:50051",node_id="n1",outcome="error"} 1
 # HELP elastickv_redis_errors_total Total number of Redis API errors by command.
 # TYPE elastickv_redis_errors_total counter
-elastickv_redis_errors_total{command="XREAD",node_address="10.0.0.1:50051",node_id="n1"} 1
+elastickv_redis_errors_total{command="HGETALL",node_address="10.0.0.1:50051",node_id="n1"} 1
 `),
 		"elastickv_redis_requests_total",
 		"elastickv_redis_errors_total",
@@ -52,7 +52,7 @@ elastickv_redis_errors_total{command="XREAD",node_address="10.0.0.1:50051",node_
 func TestRedisHeavyCommandLimiterReleasesSlot(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	conn := &commandRecorder{}
-	cmd := redcon.Command{Args: [][]byte{[]byte(cmdXRead), []byte("STREAMS"), []byte("s"), []byte("0")}}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdHGetAll), []byte("hash")}}
 
 	var calls atomic.Int64
 	handler := func(c redcon.Conn, _ redcon.Command) {
@@ -60,8 +60,8 @@ func TestRedisHeavyCommandLimiterReleasesSlot(t *testing.T) {
 		c.WriteString("OK")
 	}
 
-	server.dispatchCommand(conn, cmdXRead, handler, cmd, time.Now())
-	server.dispatchCommand(conn, cmdXRead, handler, cmd, time.Now())
+	server.dispatchCommand(conn, cmdHGetAll, handler, cmd, time.Now())
+	server.dispatchCommand(conn, cmdHGetAll, handler, cmd, time.Now())
 
 	require.Equal(t, int64(2), calls.Load())
 	require.Len(t, conn.writes, 2)
@@ -91,10 +91,68 @@ func TestRedisHeavyCommandClassification(t *testing.T) {
 		cmdEval, cmdEvalSHA, cmdKeys, cmdScan, cmdHGetAll, cmdLRange,
 		cmdSMembers, cmdXRead, cmdXRange, cmdXRevRange, cmdZRange,
 		cmdZRangeByScore, cmdZRevRange, cmdZRevRangeByScore, cmdBZPopMin,
+		cmdDBSize,
 	} {
-		require.True(t, isRedisHeavyCommand(strings.ToLower(cmd)), cmd)
+		require.True(t, isRedisHeavyCommand(cmd), cmd)
+		require.False(t, isRedisHeavyCommand(strings.ToLower(cmd)), cmd)
 	}
 	for _, cmd := range []string{cmdGet, cmdSet, cmdHGet, cmdLPush, cmdXAdd, cmdTTL} {
 		require.False(t, isRedisHeavyCommand(cmd), cmd)
 	}
+}
+
+func TestRedisHeavyCommandLimiterRejectsQueuedExecWhenFull(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
+	require.True(t, server.heavyCommandLimiter.submit(func() {
+		_, err := server.runTransaction([]redcon.Command{{
+			Args: [][]byte{[]byte(cmdLRange), []byte("list"), []byte("0"), []byte("-1")},
+		}})
+		require.ErrorIs(t, err, errRedisHeavyCommandPoolFull)
+	}))
+}
+
+func TestRedisHeavyCommandLimiterClassifiesQueuedExecCaseInsensitively(t *testing.T) {
+	require.True(t, transactionHasHeavyCommand([]redcon.Command{{
+		Args: [][]byte{[]byte(strings.ToLower(cmdLRange)), []byte("list"), []byte("0"), []byte("-1")},
+	}}))
+	require.False(t, transactionHasHeavyCommand([]redcon.Command{{
+		Args: [][]byte{[]byte(strings.ToLower(cmdGet)), []byte("k")},
+	}}))
+}
+
+func TestRedisIdleWaitCommandsUseIterationGate(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
+	require.False(t, server.shouldLimitHeavyCommand(cmdXRead))
+	require.False(t, server.shouldLimitHeavyCommand(cmdBZPopMin))
+	require.True(t, server.shouldLimitHeavyCommand(cmdDBSize))
+}
+
+func TestRedisXReadPollIterationRejectsWhenHeavyPoolFull(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
+	conn := &commandRecorder{}
+	req := xreadRequest{
+		keys:     [][]byte{[]byte("stream")},
+		afterIDs: []string{"0-0"},
+	}
+
+	require.True(t, server.heavyCommandLimiter.submit(func() {
+		server.xreadBusyPoll(conn, req, time.Now().Add(time.Second))
+	}))
+
+	require.Len(t, conn.writes, 1)
+	require.Equal(t, "error", conn.writes[0].op)
+	require.Equal(t, errRedisHeavyCommandPoolFull.Error(), conn.writes[0].s)
+}
+
+func TestRedisBZPopMinPollIterationRejectsWhenHeavyPoolFull(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
+	conn := &commandRecorder{}
+
+	require.True(t, server.heavyCommandLimiter.submit(func() {
+		server.bzpopminWaitLoop(conn, [][]byte{[]byte("zset")}, time.Now().Add(time.Second))
+	}))
+
+	require.Len(t, conn.writes, 1)
+	require.Equal(t, "error", conn.writes[0].op)
+	require.Equal(t, errRedisHeavyCommandPoolFull.Error(), conn.writes[0].s)
 }

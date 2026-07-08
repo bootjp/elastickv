@@ -1185,6 +1185,20 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
+	if transactionHasHeavyCommand(queue) {
+		var results []redisResult
+		var err error
+		if ok := r.runWithHeavyCommandSlot(func() {
+			results, err = r.runTransactionDirect(queue)
+		}); !ok {
+			return nil, errRedisHeavyCommandPoolFull
+		}
+		return results, err
+	}
+	return r.runTransactionDirect(queue)
+}
+
+func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResult, error) {
 	if r.onePhaseTxnDedup {
 		return r.runTransactionWithDedup(queue)
 	}

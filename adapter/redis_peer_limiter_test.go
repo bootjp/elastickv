@@ -30,6 +30,39 @@ func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
 	require.Empty(t, server.peerLimiter.active)
 }
 
+func TestRedisPeerLimiterKeepsDetachedPubSubCountUntilCleanup(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(1))
+	conn := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
+	next := &remoteCommandRecorder{remote: "192.168.0.64:10002"}
+
+	require.True(t, server.acceptConn(conn))
+	_ = server.detachPubSubConn(conn)
+	server.closeConn(conn)
+	require.False(t, server.acceptConn(next))
+
+	server.releaseDetachedPubSubConn(conn)
+	require.True(t, server.acceptConn(next))
+	server.closeConn(next)
+	require.Empty(t, server.peerLimiter.active)
+}
+
+func TestRedisLeaderClientPoolStaysBelowPeerLimit(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(2))
+	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
+	defer client.Close()
+
+	require.Equal(t, 2, client.Options().PoolSize)
+}
+
+func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(8))
+	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
+	defer client.Close()
+
+	require.Equal(t, defaultRedisLeaderClientPoolSize, client.Options().PoolSize)
+	require.Less(t, client.Options().PoolSize, server.peerLimiter.limit)
+}
+
 func TestRedisPeerLimiterCanBeDisabled(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(0))
 	for _, remote := range []string{"192.168.0.64:10001", "192.168.0.64:10002", "192.168.0.64:10003"} {
