@@ -93,6 +93,15 @@ func WithLeaseReadObserver(observer LeaseReadObserver) CoordinatorOption {
 	}
 }
 
+// SetHLCLeaseRenewalBlocker installs a predicate that suppresses background
+// HLC lease-renewal proposals while it returns true.
+func (c *Coordinate) SetHLCLeaseRenewalBlocker(blocked func() bool) {
+	if c == nil {
+		return
+	}
+	c.hlcRenewalBlocked = blocked
+}
+
 // normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
 // untyped nil interface so downstream `observer != nil` checks behave
 // as expected.
@@ -187,6 +196,9 @@ type Coordinate struct {
 	connCache GRPCConnCache
 	log       *slog.Logger
 	lease     leaseState
+	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
+	// lease proposals while another startup-only Raft mutation must run first.
+	hlcRenewalBlocked func() bool
 	// deregisterLeaseCb removes the leader-loss callback registered
 	// against engine at construction. Long-lived Coordinates don't
 	// need to call it (the engine will be closed after them), but
@@ -790,6 +802,10 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
+			if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+				timer.Reset(hlcRenewalInterval)
+				continue
+			}
 			if c.IsLeaderAcceptingWrites() {
 				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
@@ -1258,7 +1274,7 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 // key. Adapters that implement option-2 one-phase dedup must probe this exact
 // key (it becomes the FSM's meta.PrimaryKey) so the adapter-side
 // self-inflicted-conflict guard agrees with dedupProbeOnePhase. See
-// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md (R4).
+// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md (R4).
 func PrimaryKeyForElems(reqs []*Elem[OP]) []byte {
 	return primaryKeyForElems(reqs)
 }

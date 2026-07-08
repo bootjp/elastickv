@@ -160,6 +160,12 @@ type RedisServer struct {
 	// WithLuaFastPathObserver so the hot path does not pay for
 	// CounterVec.WithLabelValues on every redis.call().
 	luaFastPathZRange monitoring.LuaFastPathCmd
+	// heavyCommandLimiter bounds CPU-heavy Redis command families so one
+	// expensive path cannot occupy every scheduler P and starve Raft.
+	// nil preserves the historical unbounded path for narrow test fixtures.
+	heavyCommandLimiter *redisHeavyCommandLimiter
+	// peerLimiter bounds concurrent Redis connections per remote peer IP.
+	peerLimiter *redisPeerLimiter
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -174,8 +180,9 @@ type RedisServer struct {
 
 	// leaderClients caches go-redis clients per leader address to avoid
 	// creating a new connection pool for every proxied request.
-	leaderClientsMu sync.RWMutex
-	leaderClients   map[string]*redis.Client
+	leaderClientsMu       sync.RWMutex
+	leaderClients         map[string]*redis.Client
+	blockingLeaderClients map[string]*redis.Client
 
 	// compactor is the background DeltaCompactor for this node. When set,
 	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
@@ -301,6 +308,23 @@ func WithLuaPoolMaxIdle(n int) RedisServerOption {
 	}
 }
 
+// WithRedisHeavyCommandSlots overrides the heavy-command limiter size.
+// n <= 0 disables the limiter. Omit the option to use the environment/default
+// selected by newDefaultRedisHeavyCommandLimiter.
+func WithRedisHeavyCommandSlots(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.heavyCommandLimiter = newRedisHeavyCommandLimiter(n)
+	}
+}
+
+// WithRedisPerPeerConnectionLimit overrides the per-peer Redis connection cap.
+// n <= 0 disables the cap.
+func WithRedisPerPeerConnectionLimit(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.peerLimiter = newRedisPeerLimiter(n)
+	}
+}
+
 // luaFastPathCmdZRangeByScore is the shared label for ZRANGEBYSCORE
 // and ZREVRANGEBYSCORE fast-path outcomes. Both directions take the
 // same branch through zsetRangeByScoreFast so sharing one label
@@ -423,6 +447,7 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 }
 
 type connState struct {
+	mu    sync.Mutex
 	inTxn bool
 	queue []redcon.Command
 	// connID is a monotonically increasing per-server connection
@@ -434,7 +459,10 @@ type connState struct {
 	// clientName is the name set via HELLO SETNAME or CLIENT SETNAME,
 	// returned by CLIENT GETNAME. Empty string means no name set, which
 	// CLIENT GETNAME must report as a null bulk string.
-	clientName string
+	clientName     string
+	peerKey        string
+	peerCounted    bool
+	pubsubDetached bool
 }
 
 type resultType int
@@ -463,22 +491,25 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	}
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	r := &RedisServer{
-		listen:          listen,
-		store:           store,
-		coordinator:     kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
-		redisTranscoder: newRedisTranscoder(),
-		redisAddr:       redisAddr,
-		relay:           relay,
-		leaderRedis:     leaderRedis,
-		leaderClients:   make(map[string]*redis.Client),
-		pubsub:          newRedisPubSub(),
-		scriptCache:     map[string]string{},
+		listen:                listen,
+		store:                 store,
+		coordinator:           kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
+		redisTranscoder:       newRedisTranscoder(),
+		redisAddr:             redisAddr,
+		relay:                 relay,
+		leaderRedis:           leaderRedis,
+		leaderClients:         make(map[string]*redis.Client),
+		blockingLeaderClients: make(map[string]*redis.Client),
+		pubsub:                newRedisPubSub(),
+		scriptCache:           map[string]string{},
 		// luaPool is materialized after the option loop so
 		// WithLuaPoolMaxIdle can influence its sizing. Test fixtures
 		// that bypass NewRedisServer construct the pool lazily via
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
-		luaPool:       nil,
-		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		luaPool:             nil,
+		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
+		peerLimiter:         newDefaultRedisPeerLimiter(),
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
@@ -505,6 +536,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 			opt(r)
 		}
 	}
+	r.pubsub.detach = r.detachPubSubConn
+	r.pubsub.onClose = r.releaseDetachedPubSubConn
 	// Materialize the Lua VM pool after option processing so
 	// WithLuaPoolMaxIdle can choose the cap. newLuaStatePoolWithMaxIdle
 	// clamps non-positive values to DefaultLuaPoolMaxIdle, so callers
@@ -526,6 +559,63 @@ func getConnState(conn redcon.Conn) *connState {
 	st := &connState{}
 	conn.SetContext(st)
 	return st
+}
+
+func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
+	if r == nil || r.peerLimiter == nil {
+		return true
+	}
+	peer, ok := r.peerLimiter.accept(conn.RemoteAddr())
+	st := getConnState(conn)
+	st.mu.Lock()
+	st.peerKey = peer
+	st.peerCounted = ok
+	st.pubsubDetached = false
+	st.mu.Unlock()
+	if !ok {
+		conn.WriteError(redisPeerLimitError)
+	}
+	return ok
+}
+
+func (r *RedisServer) closeConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
+	st, ok := conn.Context().(*connState)
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	r.releaseConnStateLocked(st)
+}
+
+func (r *RedisServer) detachPubSubConn(conn redcon.Conn) redcon.DetachedConn {
+	st := getConnState(conn)
+	st.mu.Lock()
+	st.pubsubDetached = true
+	st.mu.Unlock()
+	return conn.Detach()
+}
+
+func (r *RedisServer) releaseDetachedPubSubConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
+	st := getConnState(conn)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.pubsubDetached = false
+	r.releaseConnStateLocked(st)
+}
+
+func (r *RedisServer) releaseConnStateLocked(st *connState) {
+	if r == nil || r.peerLimiter == nil || !st.peerCounted || st.pubsubDetached {
+		return
+	}
+	r.peerLimiter.release(st.peerKey)
+	st.peerCounted = false
 }
 
 // ensureConnID assigns and returns a per-connection numeric ID for the
@@ -565,6 +655,18 @@ func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	if r.shouldLimitHeavyCommand(name) {
+		if ok := r.heavyCommandLimiter.submit(func() {
+			r.dispatchCommandDirect(conn, name, handler, cmd, start)
+		}); !ok {
+			r.rejectHeavyCommand(conn, name, cmd, start)
+		}
+		return
+	}
+	r.dispatchCommandDirect(conn, name, handler, cmd, start)
+}
+
+func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	switch {
 	case r.requestObserver != nil:
 		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)
@@ -593,6 +695,33 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 	default:
 		handler(conn, cmd)
 	}
+}
+
+func (r *RedisServer) shouldLimitHeavyCommand(name string) bool {
+	return r != nil && r.heavyCommandLimiter != nil && isRedisHeavyCommand(name) && !isRedisIdleWaitCommand(name)
+}
+
+func (r *RedisServer) runWithHeavyCommandSlot(fn func()) bool {
+	if r == nil || r.heavyCommandLimiter == nil {
+		fn()
+		return true
+	}
+	return r.heavyCommandLimiter.submit(fn)
+}
+
+func isRedisIdleWaitCommand(name string) bool {
+	switch name {
+	case cmdXRead, cmdBZPopMin:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *RedisServer) rejectHeavyCommand(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) {
+	r.traceCommandError(conn, name, cmd.Args[1:], "heavy command pool full")
+	conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+	r.observeRedisError(name, time.Since(start))
 }
 
 // handlerContext returns the base context for a request handler.
@@ -688,13 +817,12 @@ func (r *RedisServer) Run() error {
 			r.dispatchCommand(conn, name, handler, cmd, start)
 		},
 		func(conn redcon.Conn) bool {
-			// Use this function to accept or deny the connection.
-			// log.Printf("accept: %s", conn.RemoteAddr())
-			return true
+			return r.acceptConn(conn)
 		},
 		func(conn redcon.Conn, err error) {
 			// This is called when the connection has been closed.
 			// PubSub connections clean up their own subscriptions via bgrunner.
+			r.closeConn(conn)
 		})
 
 	return errors.WithStack(err)

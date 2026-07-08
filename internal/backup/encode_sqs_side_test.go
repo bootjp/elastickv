@@ -59,7 +59,7 @@ func splitSQSEntries(entries []RoundTripEntry) (data, vis, byage, dedup, group [
 // by manual code review of encode_sqs_side.go against the cited adapter
 // locations (the adapter functions are unexported and not callable from
 // this package, so a runtime cross-check cannot be expressed here).
-// Partitioned variant deferred to M5-3.
+// The partitioned variant is covered by M5-3 tests.
 func TestSQSEncodeSideRecordsCrossCheckClassic(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()

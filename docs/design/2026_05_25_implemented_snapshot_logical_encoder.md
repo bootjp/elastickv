@@ -342,15 +342,14 @@ and the value envelopes from the same codecs
 A shared `encode.go` orchestrates: read+validate `MANIFEST.json`,
 fan out to enabled adapters, collect all `(encKey, encVal)` pairs,
 **sort**, then stream-write the EKVPBBL1 file. Memory: the sort
-requires materializing the encoded-key set; for very large dumps the
-encoder spills to an on-disk external sort keyed by encoded key (a
-later milestone — Phase 0b v1 sorts in memory and documents the
-bound, mirroring how Phase 0a bounded per-entry allocations first and
-optimized later). Worst-case in-memory bound for v1 is roughly
+requires materializing the encoded-key set. Phase 0b v1 is
+in-memory-only: it uses the in-package sort path and does not spill to
+an on-disk external sort. Worst-case in-memory bound for v1 is roughly
 `N × (avg_encoded_key_size + small_slice_header)` for the key index
 plus the value bytes if held — e.g. a 10M-key snapshot at a 256-byte
 average key is ~2.5 GiB just for the keys. The external-sort
-follow-up milestone uses this as its baseline target.
+follow-up milestone uses this implemented v1 bound as its baseline
+target.
 
 ## Version coupling and the format gate
 
@@ -421,9 +420,11 @@ round-trip coverage for the adapter slice):
 6. **CLI** — `cmd/elastickv-snapshot-encode` flag parsing
    (`--input`, `--output`, optional `--last-commit-ts` override with
    the fail-closed `T ≥ manifest.last_commit_ts` semantics from
-   §"MVCC re-encoding"), `ENCODE_INFO.json` provenance, end-to-end
-   test that loads the output into a fresh single-node cluster and
-   reads back every adapter's data.
+   §"MVCC re-encoding"), `ENCODE_INFO.json` provenance, and
+   round-trip self-test coverage through `backup.EncodeSnapshot` and
+   `cmd/elastickv-snapshot-encode --self-test`. The fresh single-node
+   cluster boot test remains a P1 follow-up rather than shipped M6
+   evidence.
 
 Each milestone follows the project convention: a review-found defect
 gets a failing test first, then the fix, in the same PR.
@@ -448,7 +449,7 @@ P1:
 
 | Test | Verifies |
 |---|---|
-| `TestEncoderProducesLoadableSnapshot` | Output placed under a fresh node's `fsm-snap/` + `snap/` loads on `Open`; every adapter serves the original data |
+| Follow-up `TestEncoderProducesLoadableSnapshot` | Output placed under a fresh node's `fsm-snap/` + `snap/` loads on `Open`; every adapter serves the original data. Not part of the current implemented evidence; M6 is covered by library/CLI round-trip self-tests. |
 | `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; `elastickv-snapshot-prepare-restore` detects mismatch before creating the raft data dir |
 
 P2:
