@@ -16,7 +16,7 @@ import (
 // exact-ts dedup probe on kv.PrimaryKeyForElems, a passing dedup test proves the
 // probe is load-bearing: without it a reuse would conflict against attempt 1's
 // own version, recompute the list, and duplicate.
-// See docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+// See docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md.
 
 const dedupTestKey = "k"
 
@@ -222,8 +222,8 @@ func TestItemWriteDedup_TxnLockedOnReuseAdvancesProbe(t *testing.T) {
 	require.Equal(t, 0, coord.probeNoOps, "no attempt landed before the final apply; the probe must miss")
 }
 
-// TestItemWriteDedup_NonLeaderFallsBackToLegacy pins the leader-only guard
-// (codex P1, PR #920): with the gate ON but this node NOT the leader, the dedup
+// TestItemWriteDedup_NonLeaderFallsBackToLegacy pins the leader-only guard:
+// with the gate ON but this node NOT the leader, the dedup
 // path is skipped so a non-leader never mints the commit_ts used as the dedup
 // identity (which could collide across frontends and lose an update). The legacy
 // recompute path runs instead — identical to gate-off — so no prev_commit_ts is

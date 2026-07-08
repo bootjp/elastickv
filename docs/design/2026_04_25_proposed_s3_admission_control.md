@@ -6,7 +6,7 @@
 >
 > Companion to PR #636 (`s3ChunkBatchOps = 4`, Raft entry size aligned
 > with `MaxSizePerMsg = 4 MiB` per PR #593) and to the workload-class
-> isolation proposal (`docs/design/2026_04_24_proposed_workload_isolation.md`).
+> isolation proposal (`docs/design/2026_04_24_implemented_workload_isolation.md`).
 > Where PR #636 fixes the *per-entry* memory accounting and the
 > isolation doc keeps Raft's CPU budget separate from heavy command
 > paths, this doc bounds the *aggregate* in-flight memory that S3
