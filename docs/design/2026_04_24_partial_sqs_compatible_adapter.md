@@ -1,6 +1,9 @@
 # SQS-Compatible Adapter Design for Elastickv
 
-Status: Proposed
+Status: Partial — core JSON SQS APIs, FIFO/batch/DLQ/tag APIs, admin UI,
+per-queue throttling, HT-FIFO partitioning, and query-protocol XML coverage
+for the supported public verbs have shipped. Split-queue FIFO completion and
+broader scaling roadmap items remain open.
 Author: bootjp
 Date: 2026-04-24
 
@@ -15,7 +18,7 @@ Elastickv exposes four protocol surfaces as of 2026-04-24:
 3. DynamoDB-compatible HTTP APIs (`adapter/dynamodb.go`)
 4. S3-compatible HTTP APIs (`adapter/s3.go`)
 
-There is no message-queue surface. This document proposes an HTTP adapter that exposes an Amazon SQS-compatible API while reusing the existing Raft, MVCC, HLC, shard-routing, leader-proxy, and SigV4 patterns that the DynamoDB and S3 adapters already established.
+Before this work there was no message-queue surface. This document tracks the HTTP adapter that exposes an Amazon SQS-compatible API while reusing the existing Raft, MVCC, HLC, shard-routing, leader-proxy, and SigV4 patterns that the DynamoDB and S3 adapters already established.
 
 The goal is SQS compatibility for standard AWS SDK/CLI workflows against a self-hosted Elastickv cluster, not AWS feature parity. The adapter should transparently support `aws sqs`, the AWS SDK for Go v2, the JVM SDK, and boto3 against the same endpoint.
 
@@ -685,7 +688,7 @@ Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_pre
 
 ### Phase 3
 
-1. Query-protocol full XML fidelity for older SDKs.
+1. Query-protocol XML support for older SDKs is wired for the supported public verbs; see [`2026_04_26_implemented_sqs_query_protocol.md`](2026_04_26_implemented_sqs_query_protocol.md).
 2. `ApproximateNumberOfMessagesDelayed` / `NotVisible` accuracy.
 3. Per-queue throttling and fairness across tenants.
 4. Split-queue FIFO for very hot queues.

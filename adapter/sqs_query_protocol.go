@@ -3,6 +3,7 @@ package adapter
 import (
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -15,7 +16,7 @@ import (
 )
 
 // SQS query-protocol (form-encoded request, XML response) support per
-// docs/design/2026_04_26_proposed_sqs_query_protocol.md. Detection
+// docs/design/2026_04_26_implemented_sqs_query_protocol.md. Detection
 // runs on every inbound SQS request alongside the existing JSON path
 // — no separate listener, no flag. The implementation deliberately
 // touches as little of the JSON path as possible: the SQS handlers
@@ -67,6 +68,28 @@ const (
 	sqsProtocolUnknown
 )
 
+type sqsQueryHandler func(*SQSServer, http.ResponseWriter, *http.Request, url.Values)
+
+var sqsQueryHandlers = map[string]sqsQueryHandler{
+	"CreateQueue":                  (*SQSServer).handleQueryCreateQueue,
+	"DeleteQueue":                  (*SQSServer).handleQueryDeleteQueue,
+	"ListQueues":                   (*SQSServer).handleQueryListQueues,
+	"GetQueueUrl":                  (*SQSServer).handleQueryGetQueueUrl,
+	"GetQueueAttributes":           (*SQSServer).handleQueryGetQueueAttributes,
+	"SetQueueAttributes":           (*SQSServer).handleQuerySetQueueAttributes,
+	"PurgeQueue":                   (*SQSServer).handleQueryPurgeQueue,
+	"SendMessage":                  (*SQSServer).handleQuerySendMessage,
+	"SendMessageBatch":             (*SQSServer).handleQuerySendMessageBatch,
+	"ReceiveMessage":               (*SQSServer).handleQueryReceiveMessage,
+	"DeleteMessage":                (*SQSServer).handleQueryDeleteMessage,
+	"DeleteMessageBatch":           (*SQSServer).handleQueryDeleteMessageBatch,
+	"ChangeMessageVisibility":      (*SQSServer).handleQueryChangeMessageVisibility,
+	"ChangeMessageVisibilityBatch": (*SQSServer).handleQueryChangeMessageVisibilityBatch,
+	"TagQueue":                     (*SQSServer).handleQueryTagQueue,
+	"UntagQueue":                   (*SQSServer).handleQueryUntagQueue,
+	"ListQueueTags":                (*SQSServer).handleQueryListQueueTags,
+}
+
 // pickSqsProtocol decides which wire format a request is using. The
 // rules are documented in §3 of the design doc:
 //
@@ -117,24 +140,43 @@ func (s *SQSServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Action is required")
 		return
 	}
-	switch action {
-	case "CreateQueue":
-		s.handleQueryCreateQueue(w, r, form)
-	case "ListQueues":
-		s.handleQueryListQueues(w, r, form)
-	case "GetQueueUrl":
-		s.handleQueryGetQueueUrl(w, r, form)
-	default:
-		// Per design §4.1: every wired verb appears here; everything
-		// else returns 501 NotImplementedYet so operators see the
-		// gap explicitly rather than the request silently failing
-		// against the JSON dispatch table.
-		writeSQSQueryError(w, newSQSAPIError(
-			http.StatusNotImplemented,
-			"NotImplementedYet",
-			"query-protocol Action "+action+" is not yet wired in elastickv (Phase 3.B follow-up)",
-		))
+	s.fillQueryQueueURLFromPath(r, form)
+	if h := sqsQueryHandlers[action]; h != nil {
+		h(s, w, r, form)
+		return
 	}
+	// Per design §4.1: every wired verb appears in sqsQueryHandlers;
+	// everything else returns 501 NotImplementedYet so operators see
+	// the gap explicitly rather than the request silently failing
+	// against the JSON dispatch table.
+	writeSQSQueryError(w, newSQSAPIError(
+		http.StatusNotImplemented,
+		"NotImplementedYet",
+		"query-protocol Action "+action+" is not yet wired in elastickv (Phase 3.B follow-up)",
+	))
+}
+
+func (s *SQSServer) fillQueryQueueURLFromPath(r *http.Request, form url.Values) {
+	if strings.TrimSpace(form.Get("QueueUrl")) != "" {
+		return
+	}
+	queueName := queryQueueNameFromRequestPath(r)
+	if queueName == "" {
+		return
+	}
+	form.Set("QueueUrl", s.queueURL(r, queueName))
+}
+
+func queryQueueNameFromRequestPath(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	path := strings.Trim(r.URL.Path, "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
 // readQueryForm extracts the form values from either the request
@@ -189,6 +231,20 @@ func (s *SQSServer) handleQueryCreateQueue(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *SQSServer) handleQueryDeleteQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryDeleteQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.deleteQueueCore(r.Context(), queueName); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "DeleteQueue", queryEmptyResult{XMLName: xml.Name{Local: "DeleteQueueResult"}})
+}
+
 func (s *SQSServer) handleQueryListQueues(w http.ResponseWriter, r *http.Request, form url.Values) {
 	in := parseQueryListQueues(form)
 	page, nextToken, err := s.listQueuesCore(r.Context(), in)
@@ -218,6 +274,219 @@ func (s *SQSServer) handleQueryGetQueueUrl(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *SQSServer) handleQueryGetQueueAttributes(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryGetQueueAttributes(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	attrs, err := s.getQueueAttributesCore(r.Context(), queueName, in.AttributeNames)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "GetQueueAttributes", queryGetQueueAttributesResult{
+		Attributes: queryAttributePairs(attrs),
+	})
+}
+
+func (s *SQSServer) handleQuerySetQueueAttributes(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQuerySetQueueAttributes(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.setQueueAttributesCore(r.Context(), queueName, in.Attributes); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "SetQueueAttributes", queryEmptyResult{XMLName: xml.Name{Local: "SetQueueAttributesResult"}})
+}
+
+func (s *SQSServer) handleQueryPurgeQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryPurgeQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.purgeQueueCore(r.Context(), queueName); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "PurgeQueue", queryEmptyResult{XMLName: xml.Name{Local: "PurgeQueueResult"}})
+}
+
+func (s *SQSServer) handleQuerySendMessage(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in, err := parseQuerySendMessage(form)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	out, err := s.sendMessageCore(r.Context(), queueName, *in)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "SendMessage", querySendMessageResultFromMap(out))
+}
+
+func (s *SQSServer) handleQueryReceiveMessage(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in, err := parseQueryReceiveMessage(form)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	messages, err := s.receiveMessageCore(r.Context(), queueName, *in)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "ReceiveMessage", queryReceiveMessageResultFromMaps(messages))
+}
+
+func (s *SQSServer) handleQueryDeleteMessage(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryDeleteMessage(form)
+	queueName, handle, err := s.parseQueueAndReceipt(in.QueueUrl, in.ReceiptHandle)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.deleteMessageCore(r.Context(), queueName, handle); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "DeleteMessage", queryEmptyResult{XMLName: xml.Name{Local: "DeleteMessageResult"}})
+}
+
+func (s *SQSServer) handleQueryChangeMessageVisibility(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in, err := parseQueryChangeMessageVisibility(form)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	queueName, handle, err := s.parseQueueAndReceipt(in.QueueUrl, in.ReceiptHandle)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.changeMessageVisibilityCore(r.Context(), queueName, handle, *in.VisibilityTimeout); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "ChangeMessageVisibility", queryEmptyResult{XMLName: xml.Name{Local: "ChangeMessageVisibilityResult"}})
+}
+
+func (s *SQSServer) handleQuerySendMessageBatch(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in, err := parseQuerySendMessageBatch(form)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	successful, failed, err := s.sendMessageBatchCore(r.Context(), queueName, in.Entries)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "SendMessageBatch", querySendMessageBatchResultFromEntries(successful, failed))
+}
+
+func (s *SQSServer) handleQueryDeleteMessageBatch(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryDeleteMessageBatch(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	successful, failed, err := s.deleteMessageBatchCore(r.Context(), queueName, in.Entries)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "DeleteMessageBatch", queryDeleteMessageBatchResultFromEntries(successful, failed))
+}
+
+func (s *SQSServer) handleQueryChangeMessageVisibilityBatch(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in, err := parseQueryChangeMessageVisibilityBatch(form)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	successful, failed, err := s.changeMessageVisibilityBatchCore(r.Context(), queueName, in.Entries)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "ChangeMessageVisibilityBatch", queryChangeMessageVisibilityBatchResultFromEntries(successful, failed))
+}
+
+func (s *SQSServer) handleQueryTagQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryTagQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.tagQueueCore(r.Context(), queueName, in.Tags); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "TagQueue", queryEmptyResult{XMLName: xml.Name{Local: "TagQueueResult"}})
+}
+
+func (s *SQSServer) handleQueryUntagQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryUntagQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.untagQueueCore(r.Context(), queueName, in.TagKeys); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "UntagQueue", queryEmptyResult{XMLName: xml.Name{Local: "UntagQueueResult"}})
+}
+
+func (s *SQSServer) handleQueryListQueueTags(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryListQueueTags(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	tags, err := s.listQueueTagsCore(r.Context(), queueName)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "ListQueueTags", queryListQueueTagsResult{
+		Tags: queryTagPairs(tags),
+	})
+}
+
 // ----------- form parsers -----------
 
 func parseQueryCreateQueue(form url.Values) (*sqsCreateQueueInput, error) {
@@ -235,6 +504,12 @@ func parseQueryCreateQueue(form url.Values) (*sqsCreateQueueInput, error) {
 	// vocabulary for that resource.
 	in.Tags = collectIndexedKVPairs(form, "Tag", "Key")
 	return in, nil
+}
+
+func parseQueryDeleteQueue(form url.Values) *sqsDeleteQueueInput {
+	return &sqsDeleteQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
 }
 
 func parseQueryListQueues(form url.Values) *sqsListQueuesInput {
@@ -258,6 +533,332 @@ func parseQueryGetQueueUrl(form url.Values) *sqsGetQueueUrlInput {
 	return &sqsGetQueueUrlInput{
 		QueueName: strings.TrimSpace(form.Get("QueueName")),
 	}
+}
+
+func parseQueryGetQueueAttributes(form url.Values) *sqsGetQueueAttributesInput {
+	return &sqsGetQueueAttributesInput{
+		QueueUrl:       strings.TrimSpace(form.Get("QueueUrl")),
+		AttributeNames: collectIndexedValues(form, "AttributeName"),
+	}
+}
+
+func parseQuerySetQueueAttributes(form url.Values) *sqsSetQueueAttributesInput {
+	return &sqsSetQueueAttributesInput{
+		QueueUrl:   strings.TrimSpace(form.Get("QueueUrl")),
+		Attributes: collectIndexedKVPairs(form, "Attribute", "Name"),
+	}
+}
+
+func parseQueryPurgeQueue(form url.Values) *sqsPurgeQueueInput {
+	return &sqsPurgeQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
+}
+
+func parseQueryTagQueue(form url.Values) *sqsTagQueueInput {
+	return &sqsTagQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		Tags:     collectIndexedKVPairs(form, "Tag", "Key"),
+	}
+}
+
+func parseQueryUntagQueue(form url.Values) *sqsUntagQueueInput {
+	return &sqsUntagQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		TagKeys:  collectIndexedValues(form, "TagKey"),
+	}
+}
+
+func parseQueryListQueueTags(form url.Values) *sqsListQueueTagsInput {
+	return &sqsListQueueTagsInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
+}
+
+func parseQuerySendMessage(form url.Values) (*sqsSendMessageInput, error) {
+	delay, err := parseOptionalQueryInt64(form, "DelaySeconds")
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := parseQueryMessageAttributes(form, "MessageAttribute")
+	if err != nil {
+		return nil, err
+	}
+	return &sqsSendMessageInput{
+		QueueUrl:               strings.TrimSpace(form.Get("QueueUrl")),
+		MessageBody:            form.Get("MessageBody"),
+		DelaySeconds:           delay,
+		MessageAttributes:      attrs,
+		MessageGroupId:         form.Get("MessageGroupId"),
+		MessageDeduplicationId: form.Get("MessageDeduplicationId"),
+	}, nil
+}
+
+func parseQueryReceiveMessage(form url.Values) (*sqsReceiveMessageInput, error) {
+	max, err := parseOptionalQueryInt(form, "MaxNumberOfMessages")
+	if err != nil {
+		return nil, err
+	}
+	visibility, err := parseOptionalQueryInt64(form, "VisibilityTimeout")
+	if err != nil {
+		return nil, err
+	}
+	wait, err := parseOptionalQueryInt64(form, "WaitTimeSeconds")
+	if err != nil {
+		return nil, err
+	}
+	return &sqsReceiveMessageInput{
+		QueueUrl:              strings.TrimSpace(form.Get("QueueUrl")),
+		MaxNumberOfMessages:   max,
+		VisibilityTimeout:     visibility,
+		WaitTimeSeconds:       wait,
+		MessageAttributeNames: collectIndexedValues(form, "MessageAttributeName"),
+	}, nil
+}
+
+func parseQueryDeleteMessage(form url.Values) *sqsDeleteMessageInput {
+	return &sqsDeleteMessageInput{
+		QueueUrl:      strings.TrimSpace(form.Get("QueueUrl")),
+		ReceiptHandle: form.Get("ReceiptHandle"),
+	}
+}
+
+func parseQueryChangeMessageVisibility(form url.Values) (*sqsChangeVisibilityInput, error) {
+	timeout, err := parseRequiredQueryInt64(form, "VisibilityTimeout")
+	if err != nil {
+		return nil, err
+	}
+	return &sqsChangeVisibilityInput{
+		QueueUrl:          strings.TrimSpace(form.Get("QueueUrl")),
+		ReceiptHandle:     form.Get("ReceiptHandle"),
+		VisibilityTimeout: timeout,
+	}, nil
+}
+
+func parseQuerySendMessageBatch(form url.Values) (*sqsSendMessageBatchInput, error) {
+	entries := make([]sqsSendMessageBatchEntryInput, 0)
+	for _, idx := range collectQueryEntryIndices(form, "SendMessageBatchRequestEntry") {
+		prefix := "SendMessageBatchRequestEntry." + strconv.Itoa(idx)
+		delay, err := parseOptionalQueryInt64At(form, prefix+".DelaySeconds")
+		if err != nil {
+			return nil, err
+		}
+		attrs, err := parseQueryMessageAttributes(form, prefix+".MessageAttribute")
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, sqsSendMessageBatchEntryInput{
+			Id:                     form.Get(prefix + ".Id"),
+			MessageBody:            form.Get(prefix + ".MessageBody"),
+			DelaySeconds:           delay,
+			MessageAttributes:      attrs,
+			MessageGroupId:         form.Get(prefix + ".MessageGroupId"),
+			MessageDeduplicationId: form.Get(prefix + ".MessageDeduplicationId"),
+		})
+	}
+	return &sqsSendMessageBatchInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		Entries:  entries,
+	}, nil
+}
+
+func parseQueryDeleteMessageBatch(form url.Values) *sqsDeleteMessageBatchInput {
+	entries := make([]sqsDeleteMessageBatchEntryInput, 0)
+	for _, idx := range collectQueryEntryIndices(form, "DeleteMessageBatchRequestEntry") {
+		prefix := "DeleteMessageBatchRequestEntry." + strconv.Itoa(idx)
+		entries = append(entries, sqsDeleteMessageBatchEntryInput{
+			Id:            form.Get(prefix + ".Id"),
+			ReceiptHandle: form.Get(prefix + ".ReceiptHandle"),
+		})
+	}
+	return &sqsDeleteMessageBatchInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		Entries:  entries,
+	}
+}
+
+func parseQueryChangeMessageVisibilityBatch(form url.Values) (*sqsChangeVisBatchInput, error) {
+	entries := make([]sqsChangeVisBatchEntryInput, 0)
+	for _, idx := range collectQueryEntryIndices(form, "ChangeMessageVisibilityBatchRequestEntry") {
+		prefix := "ChangeMessageVisibilityBatchRequestEntry." + strconv.Itoa(idx)
+		timeout, err := parseOptionalQueryInt64At(form, prefix+".VisibilityTimeout")
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, sqsChangeVisBatchEntryInput{
+			Id:                form.Get(prefix + ".Id"),
+			ReceiptHandle:     form.Get(prefix + ".ReceiptHandle"),
+			VisibilityTimeout: timeout,
+		})
+	}
+	return &sqsChangeVisBatchInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		Entries:  entries,
+	}, nil
+}
+
+func parseOptionalQueryInt(form url.Values, name string) (*int, error) {
+	raw := strings.TrimSpace(form.Get(name))
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.ParseInt(raw, 10, strconv.IntSize)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && errors.Is(numErr.Err, strconv.ErrRange) {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" is out of range")
+		}
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" must be an integer")
+	}
+	n := int(parsed)
+	if int64(n) != parsed {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" is out of range")
+	}
+	return &n, nil
+}
+
+func parseOptionalQueryInt64(form url.Values, name string) (*int64, error) {
+	return parseOptionalQueryInt64At(form, name)
+}
+
+func parseOptionalQueryInt64At(form url.Values, key string) (*int64, error) {
+	raw := strings.TrimSpace(form.Get(key))
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, key+" must be an integer")
+	}
+	return &n, nil
+}
+
+func parseRequiredQueryInt64(form url.Values, name string) (*int64, error) {
+	return parseRequiredQueryInt64At(form, name)
+}
+
+func parseRequiredQueryInt64At(form url.Values, key string) (*int64, error) {
+	v, err := parseOptionalQueryInt64At(form, key)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, key+" is required")
+	}
+	return v, nil
+}
+
+func parseQueryMessageAttributes(form url.Values, prefix string) (map[string]sqsMessageAttributeValue, error) {
+	indices := collectQueryEntryIndices(form, prefix)
+	if len(indices) == 0 {
+		return nil, nil
+	}
+	attrs := make(map[string]sqsMessageAttributeValue, len(indices))
+	for _, idx := range indices {
+		itemPrefix := prefix + "." + strconv.Itoa(idx)
+		name := form.Get(itemPrefix + ".Name")
+		if name == "" {
+			continue
+		}
+		valuePrefix := itemPrefix + ".Value"
+		attr := sqsMessageAttributeValue{
+			DataType:    form.Get(valuePrefix + ".DataType"),
+			StringValue: form.Get(valuePrefix + ".StringValue"),
+		}
+		if raw := form.Get(valuePrefix + ".BinaryValue"); raw != "" {
+			decoded, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+					itemPrefix+".Value.BinaryValue must be base64 encoded")
+			}
+			attr.BinaryValue = decoded
+		}
+		if _, exists := attrs[name]; !exists {
+			attrs[name] = attr
+		}
+	}
+	if len(attrs) == 0 {
+		return nil, nil
+	}
+	return attrs, nil
+}
+
+func collectQueryEntryIndices(form url.Values, prefix string) []int {
+	if len(form) == 0 {
+		return nil
+	}
+	wantPrefix := prefix + "."
+	seen := map[int]bool{}
+	for key := range form {
+		if !strings.HasPrefix(key, wantPrefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(key, wantPrefix)
+		dot := strings.IndexByte(rest, '.')
+		if dot < 0 {
+			continue
+		}
+		idx, err := strconv.Atoi(rest[:dot])
+		if err != nil || idx <= 0 {
+			continue
+		}
+		seen[idx] = true
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(seen))
+	for idx := range seen {
+		out = append(out, idx)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// collectIndexedValues reads AWS-style indexed values of the form
+// "<prefix>.1=value1&<prefix>.2=value2". A repeated unindexed
+// "<prefix>=value" is accepted first as a compatibility courtesy for
+// hand-rolled clients; SDK-generated query requests use indexed keys.
+func collectIndexedValues(form url.Values, prefix string) []string {
+	if len(form) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(form[prefix]))
+	for _, v := range form[prefix] {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	indexed := gatherIndexedValues(form, prefix)
+	for _, item := range indexed {
+		out = append(out, item.val)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type indexedValue struct {
+	idx int
+	val string
+}
+
+func gatherIndexedValues(form url.Values, prefix string) []indexedValue {
+	var indexed []indexedValue
+	wantPrefix := prefix + "."
+	for k, vs := range form {
+		if !strings.HasPrefix(k, wantPrefix) {
+			continue
+		}
+		idx, err := strconv.Atoi(strings.TrimPrefix(k, wantPrefix))
+		if err != nil || len(vs) == 0 || vs[0] == "" {
+			continue
+		}
+		indexed = append(indexed, indexedValue{idx: idx, val: vs[0]})
+	}
+	sort.Slice(indexed, func(i, j int) bool { return indexed[i].idx < indexed[j].idx })
+	return indexed
 }
 
 // collectIndexedKVPairs reads AWS-style indexed pairs of the form
@@ -287,6 +888,7 @@ func collectIndexedKVPairs(form url.Values, prefix, keyField string) map[string]
 		return nil
 	}
 	pairs := gatherIndexedKVPairs(form, prefix+".", "."+keyField)
+	pairs = append(pairs, gatherUnindexedKVPair(form, prefix, keyField)...)
 	if len(pairs) == 0 {
 		return nil
 	}
@@ -304,6 +906,15 @@ func collectIndexedKVPairs(form url.Values, prefix, keyField string) map[string]
 		return nil
 	}
 	return out
+}
+
+func gatherUnindexedKVPair(form url.Values, prefix, keyField string) []indexedKVPair {
+	key := form.Get(prefix + "." + keyField)
+	value := form.Get(prefix + ".Value")
+	if key == "" || value == "" {
+		return nil
+	}
+	return []indexedKVPair{{idx: 0, mapKey: key, mapVal: value}}
 }
 
 // indexedKVPair is an intermediate (idx, key, value) triple used to
@@ -368,6 +979,10 @@ type queryCreateQueueResult struct {
 	QueueUrl string   `xml:"QueueUrl"`
 }
 
+type queryEmptyResult struct {
+	XMLName xml.Name
+}
+
 type queryListQueuesResult struct {
 	XMLName   xml.Name `xml:"ListQueuesResult"`
 	QueueUrl  []string `xml:"QueueUrl"`
@@ -377,6 +992,266 @@ type queryListQueuesResult struct {
 type queryGetQueueUrlResult struct {
 	XMLName  xml.Name `xml:"GetQueueUrlResult"`
 	QueueUrl string   `xml:"QueueUrl"`
+}
+
+type queryGetQueueAttributesResult struct {
+	XMLName    xml.Name             `xml:"GetQueueAttributesResult"`
+	Attributes []queryAttributePair `xml:"Attribute,omitempty"`
+}
+
+type queryAttributePair struct {
+	Name  string `xml:"Name"`
+	Value string `xml:"Value"`
+}
+
+func queryAttributePairs(attrs map[string]string) []queryAttributePair {
+	if len(attrs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(attrs))
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]queryAttributePair, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, queryAttributePair{Name: k, Value: attrs[k]})
+	}
+	return out
+}
+
+type queryListQueueTagsResult struct {
+	XMLName xml.Name       `xml:"ListQueueTagsResult"`
+	Tags    []queryTagPair `xml:"Tag,omitempty"`
+}
+
+type queryTagPair struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
+}
+
+func queryTagPairs(tags map[string]string) []queryTagPair {
+	if len(tags) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]queryTagPair, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, queryTagPair{Key: k, Value: tags[k]})
+	}
+	return out
+}
+
+type querySendMessageResult struct {
+	XMLName                xml.Name `xml:"SendMessageResult"`
+	MessageId              string   `xml:"MessageId"`
+	MD5OfMessageBody       string   `xml:"MD5OfMessageBody"`
+	MD5OfMessageAttributes string   `xml:"MD5OfMessageAttributes,omitempty"`
+	SequenceNumber         string   `xml:"SequenceNumber,omitempty"`
+}
+
+func querySendMessageResultFromMap(out map[string]string) querySendMessageResult {
+	return querySendMessageResult{
+		MessageId:              out["MessageId"],
+		MD5OfMessageBody:       out["MD5OfMessageBody"],
+		MD5OfMessageAttributes: out["MD5OfMessageAttributes"],
+		SequenceNumber:         out["SequenceNumber"],
+	}
+}
+
+type queryReceiveMessageResult struct {
+	XMLName  xml.Name       `xml:"ReceiveMessageResult"`
+	Messages []queryMessage `xml:"Message,omitempty"`
+}
+
+type queryMessage struct {
+	MessageId              string                      `xml:"MessageId"`
+	ReceiptHandle          string                      `xml:"ReceiptHandle"`
+	MD5OfBody              string                      `xml:"MD5OfBody"`
+	Body                   string                      `xml:"Body"`
+	Attributes             []queryAttributePair        `xml:"Attribute,omitempty"`
+	MD5OfMessageAttributes string                      `xml:"MD5OfMessageAttributes,omitempty"`
+	MessageAttributes      []queryMessageAttributePair `xml:"MessageAttribute,omitempty"`
+}
+
+type queryMessageAttributePair struct {
+	Name  string                     `xml:"Name"`
+	Value queryMessageAttributeValue `xml:"Value"`
+}
+
+type queryMessageAttributeValue struct {
+	DataType    string `xml:"DataType"`
+	StringValue string `xml:"StringValue,omitempty"`
+	BinaryValue string `xml:"BinaryValue,omitempty"`
+}
+
+func queryReceiveMessageResultFromMaps(messages []map[string]any) queryReceiveMessageResult {
+	out := queryReceiveMessageResult{Messages: make([]queryMessage, 0, len(messages))}
+	for _, m := range messages {
+		qm := queryMessage{
+			MessageId:              stringValueFromAny(m["MessageId"]),
+			ReceiptHandle:          stringValueFromAny(m["ReceiptHandle"]),
+			MD5OfBody:              stringValueFromAny(m["MD5OfBody"]),
+			Body:                   stringValueFromAny(m["Body"]),
+			MD5OfMessageAttributes: stringValueFromAny(m["MD5OfMessageAttributes"]),
+			Attributes:             queryAttributePairs(stringMapFromAny(m["Attributes"])),
+			MessageAttributes:      queryMessageAttributePairs(messageAttributesFromAny(m["MessageAttributes"])),
+		}
+		out.Messages = append(out.Messages, qm)
+	}
+	return out
+}
+
+func queryMessageAttributePairs(attrs map[string]sqsMessageAttributeValue) []queryMessageAttributePair {
+	if len(attrs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(attrs))
+	for name := range attrs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]queryMessageAttributePair, 0, len(names))
+	for _, name := range names {
+		attr := attrs[name]
+		value := queryMessageAttributeValue{
+			DataType:    attr.DataType,
+			StringValue: attr.StringValue,
+		}
+		if len(attr.BinaryValue) > 0 {
+			value.BinaryValue = base64.StdEncoding.EncodeToString(attr.BinaryValue)
+		}
+		out = append(out, queryMessageAttributePair{Name: name, Value: value})
+	}
+	return out
+}
+
+type querySendMessageBatchResult struct {
+	XMLName    xml.Name                           `xml:"SendMessageBatchResult"`
+	Successful []querySendMessageBatchResultEntry `xml:"SendMessageBatchResultEntry,omitempty"`
+	Failed     []queryBatchResultErrorEntry       `xml:"BatchResultErrorEntry,omitempty"`
+}
+
+type querySendMessageBatchResultEntry struct {
+	Id                     string `xml:"Id"`
+	MessageId              string `xml:"MessageId"`
+	MD5OfMessageBody       string `xml:"MD5OfMessageBody"`
+	MD5OfMessageAttributes string `xml:"MD5OfMessageAttributes,omitempty"`
+	SequenceNumber         string `xml:"SequenceNumber,omitempty"`
+}
+
+func querySendMessageBatchResultFromEntries(successful []sqsSendMessageBatchResultEntry, failed []sqsBatchResultErrorEntry) querySendMessageBatchResult {
+	out := querySendMessageBatchResult{
+		Successful: make([]querySendMessageBatchResultEntry, 0, len(successful)),
+		Failed:     queryBatchErrorEntries(failed),
+	}
+	for _, e := range successful {
+		out.Successful = append(out.Successful, querySendMessageBatchResultEntry(e))
+	}
+	return out
+}
+
+type queryDeleteMessageBatchResult struct {
+	XMLName    xml.Name                     `xml:"DeleteMessageBatchResult"`
+	Successful []queryBatchResultEntry      `xml:"DeleteMessageBatchResultEntry,omitempty"`
+	Failed     []queryBatchResultErrorEntry `xml:"BatchResultErrorEntry,omitempty"`
+}
+
+type queryChangeMessageVisibilityBatchResult struct {
+	XMLName    xml.Name                     `xml:"ChangeMessageVisibilityBatchResult"`
+	Successful []queryBatchResultEntry      `xml:"ChangeMessageVisibilityBatchResultEntry,omitempty"`
+	Failed     []queryBatchResultErrorEntry `xml:"BatchResultErrorEntry,omitempty"`
+}
+
+type queryBatchResultEntry struct {
+	Id string `xml:"Id"`
+}
+
+type queryBatchResultErrorEntry struct {
+	Id          string `xml:"Id"`
+	SenderFault bool   `xml:"SenderFault"`
+	Code        string `xml:"Code"`
+	Message     string `xml:"Message"`
+}
+
+func queryDeleteMessageBatchResultFromEntries(successful []sqsBatchResultEntry, failed []sqsBatchResultErrorEntry) queryDeleteMessageBatchResult {
+	return queryDeleteMessageBatchResult{
+		Successful: queryBatchResultEntries(successful),
+		Failed:     queryBatchErrorEntries(failed),
+	}
+}
+
+func queryChangeMessageVisibilityBatchResultFromEntries(successful []sqsBatchResultEntry, failed []sqsBatchResultErrorEntry) queryChangeMessageVisibilityBatchResult {
+	return queryChangeMessageVisibilityBatchResult{
+		Successful: queryBatchResultEntries(successful),
+		Failed:     queryBatchErrorEntries(failed),
+	}
+}
+
+func queryBatchResultEntries(entries []sqsBatchResultEntry) []queryBatchResultEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]queryBatchResultEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, queryBatchResultEntry(e))
+	}
+	return out
+}
+
+func queryBatchErrorEntries(entries []sqsBatchResultErrorEntry) []queryBatchResultErrorEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]queryBatchResultErrorEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, queryBatchResultErrorEntry{
+			Id:          e.Id,
+			SenderFault: e.SenderFault,
+			Code:        e.Code,
+			Message:     e.Message,
+		})
+	}
+	return out
+}
+
+func stringValueFromAny(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return ""
+	}
+}
+
+func stringMapFromAny(v any) map[string]string {
+	switch t := v.(type) {
+	case map[string]string:
+		return t
+	case map[string]any:
+		out := make(map[string]string, len(t))
+		for k, val := range t {
+			if s, ok := val.(string); ok {
+				out[k] = s
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func messageAttributesFromAny(v any) map[string]sqsMessageAttributeValue {
+	switch t := v.(type) {
+	case map[string]sqsMessageAttributeValue:
+		return t
+	default:
+		return nil
+	}
 }
 
 // queryResponseEnvelope wraps the per-verb result in the AWS
@@ -442,12 +1317,26 @@ func writeSQSQueryResponse(w http.ResponseWriter, action string, result any) {
 // HTTP status, so keeping them aligned across protocols means a
 // retry policy that works for the JSON client also works for the
 // query client.
-func writeSQSQueryError(w http.ResponseWriter, err error) {
+func sqsQueryErrorDetails(err error) (int, string, string, int) {
 	status := http.StatusInternalServerError
 	code := sqsErrInternalFailure
 	message := "internal error"
+	retryAfter := 0
+	var throttled *sqsThrottlingError
+	if errors.As(err, &throttled) {
+		status = http.StatusBadRequest
+		code = sqsErrThrottling
+		message = throttled.Error()
+		retryAfter = throttled.retryAfterSeconds()
+	}
+	var rateLimit *purgeRateLimitedError
+	if retryAfter == 0 && errors.As(err, &rateLimit) {
+		status = http.StatusBadRequest
+		code = sqsErrPurgeInProgress
+		message = rateLimit.Error()
+	}
 	var apiErr *sqsAPIError
-	if errors.As(err, &apiErr) {
+	if retryAfter == 0 && errors.As(err, &apiErr) {
 		status = apiErr.status
 		if apiErr.errorType != "" {
 			code = apiErr.errorType
@@ -456,6 +1345,11 @@ func writeSQSQueryError(w http.ResponseWriter, err error) {
 			message = apiErr.message
 		}
 	}
+	return status, code, message, retryAfter
+}
+
+func writeSQSQueryError(w http.ResponseWriter, err error) {
+	status, code, message, retryAfter := sqsQueryErrorDetails(err)
 	env := queryErrorEnvelope{
 		XMLName:   xml.Name{Local: "ErrorResponse"},
 		XMLNS:     sqsQueryNamespace,
@@ -473,6 +1367,9 @@ func writeSQSQueryError(w http.ResponseWriter, err error) {
 	w.Header().Set("x-amzn-RequestId", env.RequestId)
 	if code != "" {
 		w.Header().Set("x-amzn-ErrorType", code)
+	}
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(xml.Header))
