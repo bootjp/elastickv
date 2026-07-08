@@ -119,11 +119,12 @@
   land as on-disk §4.1 envelopes (a cipher-less reopen refuses them)
   while every version reads back as correct plaintext.
 
-## Open milestones
+## Closed deferrals
 
-_None — Stage 6D is complete. The §7.1 rollout's remaining
-multi-node-churn nonce safety (registration-before-first-write gate)
-is a Stage 7 item, tracked in the 6D-6c-2 partial doc._
+_None — Stage 6D is complete. The §7.1 rollout's former
+multi-node-churn nonce-safety deferral (registration-before-first-write
+gate) was tracked in the 6D-6c-2 partial doc and is now closed by
+Stage 7._
 
 ## 0. Why this doc exists
 

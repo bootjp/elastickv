@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented — filename kept stable for existing links |
 | Date | 2026-05-28 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md) (cutover case + §6 deferred-rotation analysis) |
 | Builds on | 7a (process-start propose path), 7a-2 (storage-layer `Registered()` gate), 7b (runtime watcher for the cutover case) |

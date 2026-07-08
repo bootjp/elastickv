@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented — filename kept stable for existing links |
 | Date | 2026-05-26 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 process-start path) |
 | Builds on | 6A (`ApplyRegistration` §4.1 case 1–4 dispatch), 5B (`RegisterEncryptionWriter` RPC + leader Proposer wiring), 6C-3 (`ErrLocalEpochRollback`), 6D-6c-2 (`BumpLocalEpoch`, `DeterministicNonceFactory`, keystore hydration) |
@@ -18,8 +18,8 @@ record that makes the 16-bit `node_id` uniqueness invariant
 unconditional (§4.1) — is not updated on restart. The deferred gap,
 called out in the 6D-6c-2 partial doc and the Stage-6D parent doc:
 
-> the multi-node-churn registration-before-first-write nonce gate is a
-> Stage 7 item.
+> the multi-node-churn registration-before-first-write nonce gate was a
+> Stage 7 item and is now closed.
 
 7a closes the **process-start** half of that gap (§4.1 "Process start
 under an existing DEK"): a node that restarts under an already-active

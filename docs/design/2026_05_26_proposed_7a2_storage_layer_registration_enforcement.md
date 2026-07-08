@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented — filename kept stable for existing links |
 | Date | 2026-05-26 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md) (7a coordinator-layer gate) |
 | Builds on | 7a (coordinator-layer first-write barrier), 6D-6c-1 (`encryption.StateCache`) |
