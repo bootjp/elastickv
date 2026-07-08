@@ -13,7 +13,7 @@ import (
 
 // encode_dynamodb.go is the Phase 0b DynamoDB reverse encoder — the
 // inverse of the DDBEncoder decoder in dynamodb.go (design:
-// docs/design/2026_05_25_proposed_snapshot_logical_encoder.md
+// docs/design/2026_05_25_implemented_snapshot_logical_encoder.md
 // §"DynamoDB").
 //
 // This commit covers TABLE SCHEMAS: it reconstructs the

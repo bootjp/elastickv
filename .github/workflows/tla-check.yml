@@ -54,7 +54,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up JDK 21 (Temurin)
         uses: actions/setup-java@v5
@@ -74,7 +74,7 @@ jobs:
       # whole point of the pin (codex P2 on PR #856 round 4).  A full
       # miss-and-redownload is correct here.
       - name: Cache tla2tools.jar
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .cache/tla
           key: ${{ runner.os }}-tla-tools-${{ hashFiles('Makefile') }}

@@ -218,6 +218,11 @@ type HealthReader interface {
 	CheckServing(ctx context.Context) error
 }
 
+type Lifecycle interface {
+	Done() <-chan struct{}
+	Err() error
+}
+
 type Admin interface {
 	LeaderView
 	StatusReader

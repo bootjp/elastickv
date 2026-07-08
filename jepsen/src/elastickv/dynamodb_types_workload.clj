@@ -188,6 +188,42 @@
                          :resp     resp})))
       resp)))
 
+(def ^:private setup-retry-delays-ms [100 250 500 1000 2000])
+
+(def ^:private setup-retryable-error-types
+  #{"InternalServerError"
+    "ServiceUnavailableException"
+    "ThrottlingException"
+    "ProvisionedThroughputExceededException"})
+
+(defn- setup-retryable?
+  [e]
+  (let [{:keys [type category]} (ex-data e)
+        msg (or (.getMessage e) "")]
+    (or (contains? setup-retryable-error-types type)
+        (contains? #{:cognitect.anomalies/fault
+                     :cognitect.anomalies/unavailable}
+                   category)
+        (str/includes? msg "no raft leader currently available"))))
+
+(defn- with-setup-retry!
+  [f]
+  (loop [delays setup-retry-delays-ms]
+    (let [[ok result] (try
+                        [true (f)]
+                        (catch clojure.lang.ExceptionInfo e
+                          [false e]))]
+      (cond
+        ok result
+
+        (and (seq delays) (setup-retryable? result))
+        (do
+          (Thread/sleep (first delays))
+          (recur (rest delays)))
+
+        :else
+        (throw result)))))
+
 ;; Default provisioned throughput for test tables.  elastickv does not
 ;; enforce these numbers today, but we pick something high enough that a
 ;; real DynamoDB endpoint would not throttle a stress run (which would
@@ -201,12 +237,14 @@
   "Create a table for the type under test; ignore ResourceInUseException."
   [ddb table read-capacity write-capacity]
   (try
-    (ddb-invoke! ddb :CreateTable
-                 {:TableName             table
-                  :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
-                  :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
-                  :ProvisionedThroughput {:ReadCapacityUnits  read-capacity
-                                          :WriteCapacityUnits write-capacity}})
+    (with-setup-retry!
+      #(ddb-invoke! ddb :CreateTable
+                    {:TableName             table
+                     :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
+                     :AttributeDefinitions  [{:AttributeName pk-attr
+                                               :AttributeType "S"}]
+                     :ProvisionedThroughput {:ReadCapacityUnits  read-capacity
+                                             :WriteCapacityUnits write-capacity}}))
     (catch clojure.lang.ExceptionInfo e
       (when-not (= "ResourceInUseException" (:type (ex-data e)))
         (throw e)))))
@@ -221,9 +259,10 @@
    is safe on first run too."
   [ddb table key-count]
   (doseq [k (range key-count)]
-    (ddb-invoke! ddb :DeleteItem
-                 {:TableName table
-                  :Key       {pk-attr {:S (str k)}}})))
+    (with-setup-retry!
+      #(ddb-invoke! ddb :DeleteItem
+                    {:TableName table
+                     :Key       {pk-attr {:S (str k)}}}))))
 
 (defn- dynamo-put!
   "PutItem with the encoded value.  Replaces the entire item."

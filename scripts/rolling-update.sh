@@ -16,11 +16,10 @@ Required environment:
 Optional environment:
   ROLLING_UPDATE_ENV_FILE
     Shell env file to source before evaluating the rest of the settings.
-
   DRY_RUN
-    Set to true, or pass --dry-run, to validate and print the rollout plan
-    without building helpers, copying files, SSHing to nodes, or touching
-    containers.
+    Set to true, or pass --dry-run, to validate rollout inputs and print the
+    computed plan without building helpers, copying files, SSHing, or touching
+    remote containers.
 
   SSH_TARGETS
     Comma-separated SSH target map when SSH hosts differ from advertised hosts:
@@ -159,15 +158,15 @@ EOF
 }
 
 DRY_RUN_ARG=false
-while [[ $# -gt 0 ]]; do
+while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --help|-h)
-      usage
-      exit 0
-      ;;
     --dry-run)
       DRY_RUN_ARG=true
       shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -184,6 +183,11 @@ if [[ -n "${ROLLING_UPDATE_ENV_FILE:-}" ]]; then
   fi
   # shellcheck disable=SC1090
   source "$ROLLING_UPDATE_ENV_FILE"
+fi
+
+DRY_RUN="${DRY_RUN:-false}"
+if [[ "$DRY_RUN_ARG" == "true" ]]; then
+  DRY_RUN=true
 fi
 
 IMAGE="${IMAGE:-ghcr.io/bootjp/elastickv:latest}"
@@ -297,6 +301,12 @@ ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 # state); it just produces no callers without --adminEnabled.
 KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
 KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
+KEYVIZ_LABELS_ENABLED="${KEYVIZ_LABELS_ENABLED:-false}"
+# Sub-range (hot-key) buckets per route. Empty omits the flag (binary
+# default 1 = route-level). A positive integer (e.g. 64) divides each
+# route into that many order-preserving sub-ranges so the heatmap shows
+# hot sub-ranges, including for the unbounded single-route / tail case.
+KEYVIZ_KEY_BUCKETS_PER_ROUTE="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
 
 # KeyViz hot-key Top-K drill-down (Phase 2-A++). Master switch +
 # four tuning knobs. When KEYVIZ_HOT_KEYS_ENABLED != "true" the
@@ -324,7 +334,7 @@ fi
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
+for _bool_var in DRY_RUN ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_LABELS_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -334,6 +344,17 @@ for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_IN
   esac
 done
 unset _bool_var
+
+# KeyViz sub-range buckets: empty (omit the flag) or 1..256. Validate
+# only when KeyViz is enabled, matching build_keyviz_flags: stale or
+# placeholder bucket values remain inert when the sampler is disabled.
+# When enabled, fail before the value reaches the SSH heredoc / the
+# binary's flag parser so an operator typo gets a clear script-level
+# error instead of a container crash-loop.
+if [[ "$KEYVIZ_ENABLED" == "true" && -n "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" && ! "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" =~ ^([1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-6])$ ]]; then
+  echo "rolling-update: KEYVIZ_KEY_BUCKETS_PER_ROUTE must be empty or an integer between 1 and 256, got '$KEYVIZ_KEY_BUCKETS_PER_ROUTE'" >&2
+  exit 1
+fi
 
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
@@ -541,22 +562,40 @@ derive_raft_to_sqs_map() {
 print_dry_run_plan() {
   local node_id node_host ssh_target
 
-  echo "[rolling-update] dry run: no remote commands will be executed"
+  echo "[rolling-update] dry run: no local builds, scp, ssh, or remote docker commands will be executed"
   echo "[rolling-update] target image: $IMAGE"
   echo "[rolling-update] container: $CONTAINER_NAME"
   echo "[rolling-update] raft engine: $RAFT_ENGINE"
-  echo "[rolling-update] nodes:"
+  echo "[rolling-update] rolling order:"
   for node_id in "${ROLLING_NODE_IDS[@]}"; do
     node_host="$(node_host_by_id "$node_id")"
     ssh_target="$(ssh_target_by_id "$node_id")"
     echo "  - raft_id=$node_id host=$node_host ssh_target=$ssh_target"
   done
   echo "[rolling-update] RAFT_TO_REDIS_MAP=$RAFT_TO_REDIS_MAP"
-  if [[ "${ENABLE_S3}" == "true" ]]; then
+  if [[ "$ENABLE_S3" == "true" ]]; then
     echo "[rolling-update] RAFT_TO_S3_MAP=$RAFT_TO_S3_MAP"
   fi
-  if [[ "${ENABLE_SQS}" == "true" ]]; then
+  if [[ "$ENABLE_SQS" == "true" ]]; then
     echo "[rolling-update] RAFT_TO_SQS_MAP=$RAFT_TO_SQS_MAP"
+  fi
+  if [[ -n "${EXTRA_ENV_NORMALISED:-}" ]]; then
+    echo "[rolling-update] EXTRA_ENV=$EXTRA_ENV_NORMALISED"
+  fi
+  if [[ -n "${CONTAINER_MEMORY_LIMIT:-}" ]]; then
+    echo "[rolling-update] CONTAINER_MEMORY_LIMIT=$CONTAINER_MEMORY_LIMIT"
+  fi
+  if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
+    echo "[rolling-update] KEYVIZ_FANOUT_NODES=$KEYVIZ_FANOUT_NODES"
+    echo "[rolling-update] KEYVIZ_LABELS_ENABLED=$KEYVIZ_LABELS_ENABLED"
+    echo "[rolling-update] KEYVIZ_KEY_BUCKETS_PER_ROUTE=$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
+    echo "[rolling-update] KEYVIZ_HOT_KEYS_ENABLED=$KEYVIZ_HOT_KEYS_ENABLED"
+    if [[ "$KEYVIZ_HOT_KEYS_ENABLED" == "true" ]]; then
+      echo "[rolling-update] KEYVIZ_HOT_KEYS_PER_ROUTE=$KEYVIZ_HOT_KEYS_PER_ROUTE"
+      echo "[rolling-update] KEYVIZ_HOT_KEYS_SAMPLE_RATE=$KEYVIZ_HOT_KEYS_SAMPLE_RATE"
+      echo "[rolling-update] KEYVIZ_HOT_KEYS_QUEUE_SIZE=$KEYVIZ_HOT_KEYS_QUEUE_SIZE"
+      echo "[rolling-update] KEYVIZ_HOT_KEYS_MAX_KEY_LEN=$KEYVIZ_HOT_KEYS_MAX_KEY_LEN"
+    fi
   fi
 }
 
@@ -716,6 +755,8 @@ update_one_node() {
       ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
       KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
+      KEYVIZ_LABELS_ENABLED="$KEYVIZ_LABELS_ENABLED" \
+      KEYVIZ_KEY_BUCKETS_PER_ROUTE="$KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q" \
       KEYVIZ_HOT_KEYS_ENABLED="$KEYVIZ_HOT_KEYS_ENABLED" \
       KEYVIZ_HOT_KEYS_PER_ROUTE="$KEYVIZ_HOT_KEYS_PER_ROUTE_Q" \
       KEYVIZ_HOT_KEYS_SAMPLE_RATE="$KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q" \
@@ -1212,6 +1253,14 @@ build_keyviz_flags() {
   if [[ -n "$fanout_nodes" ]]; then
     _flags+=(--keyvizFanoutNodes "$fanout_nodes")
   fi
+  if [[ "${KEYVIZ_LABELS_ENABLED:-false}" == "true" ]]; then
+    _flags+=(--keyvizLabelsEnabled)
+  fi
+
+  local key_buckets="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
+  if [[ -n "$key_buckets" ]]; then
+    _flags+=(--keyvizKeyBucketsPerRoute "$key_buckets")
+  fi
 
   # Hot-key Top-K drill-down. Only emit the master flag (and its
   # tuning knobs) when KEYVIZ_HOT_KEYS_ENABLED=true; the four tuning
@@ -1428,6 +1477,27 @@ running_status="$(docker inspect --format "{{.State.Status}}" "$CONTAINER_NAME" 
 # spoof the boundary). All inputs are always-present env vars so an
 # unset deploy knob hashes as the empty string consistently.
 config_fp() {
+  local keyviz_fanout_nodes_fp=""
+  local keyviz_labels_enabled_fp=""
+  local keyviz_key_buckets_per_route_fp=""
+  local keyviz_hot_keys_enabled_fp=""
+  local keyviz_hot_keys_per_route_fp=""
+  local keyviz_hot_keys_sample_rate_fp=""
+  local keyviz_hot_keys_queue_size_fp=""
+  local keyviz_hot_keys_max_key_len_fp=""
+  if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
+    keyviz_fanout_nodes_fp="$KEYVIZ_FANOUT_NODES"
+    keyviz_labels_enabled_fp="$KEYVIZ_LABELS_ENABLED"
+    keyviz_key_buckets_per_route_fp="$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
+    keyviz_hot_keys_enabled_fp="$KEYVIZ_HOT_KEYS_ENABLED"
+    if [[ "$KEYVIZ_HOT_KEYS_ENABLED" == "true" ]]; then
+      keyviz_hot_keys_per_route_fp="$KEYVIZ_HOT_KEYS_PER_ROUTE"
+      keyviz_hot_keys_sample_rate_fp="$KEYVIZ_HOT_KEYS_SAMPLE_RATE"
+      keyviz_hot_keys_queue_size_fp="$KEYVIZ_HOT_KEYS_QUEUE_SIZE"
+      keyviz_hot_keys_max_key_len_fp="$KEYVIZ_HOT_KEYS_MAX_KEY_LEN"
+    fi
+  fi
+
   printf '%s\0' \
     "$IMAGE" \
     "$SERVER_ENTRYPOINT" \
@@ -1447,10 +1517,10 @@ config_fp() {
     "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
-    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
-    "$KEYVIZ_HOT_KEYS_ENABLED" "$KEYVIZ_HOT_KEYS_PER_ROUTE" \
-    "$KEYVIZ_HOT_KEYS_SAMPLE_RATE" "$KEYVIZ_HOT_KEYS_QUEUE_SIZE" \
-    "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN" \
+    "$KEYVIZ_ENABLED" "$keyviz_fanout_nodes_fp" "$keyviz_labels_enabled_fp" "$keyviz_key_buckets_per_route_fp" \
+    "$keyviz_hot_keys_enabled_fp" "$keyviz_hot_keys_per_route_fp" \
+    "$keyviz_hot_keys_sample_rate_fp" "$keyviz_hot_keys_queue_size_fp" \
+    "$keyviz_hot_keys_max_key_len_fp" \
     | sha256sum | cut -d' ' -f1
 }
 DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
@@ -1629,7 +1699,32 @@ merge_extra_env() {
   printf '%s' "$merged"
 }
 
+validate_extra_env_pairs() {
+  local value="$1"
+  local -a pairs=()
+  local pair key
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  IFS=$' \t\n' read -r -a pairs <<< "$value"
+  for pair in "${pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    if [[ "$pair" != *=* || "$pair" == =* ]]; then
+      echo "rolling-update: invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
+      return 1
+    fi
+    key="${pair%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "rolling-update: invalid EXTRA_ENV key '$key' in entry '$pair'; key must match [A-Za-z_][A-Za-z0-9_]*" >&2
+      return 1
+    fi
+  done
+}
+
 EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
+validate_extra_env_pairs "$EXTRA_ENV_NORMALISED"
 EXTRA_ENV="$EXTRA_ENV_NORMALISED"
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -1670,7 +1765,7 @@ RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
 # the login shell once, so every value the operator might set has to
 # survive that pass intact. printf %q is the same hardening every
 # other forwarded path-like variable above gets.
-# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_ENABLED)
+# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_*)
 # are validated at the top of the local script to be the literal
 # "true" or "false", so they need no extra escaping — kept unquoted
 # at the env site for readability.
@@ -1686,6 +1781,7 @@ ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 # survive an unquoted env pass but pre-quoting keeps the pattern
 # uniform with the ADMIN_* set above.
 KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
+KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_KEY_BUCKETS_PER_ROUTE")"
 
 # Hot-key tuning knobs are integers (or empty for sampler default);
 # integers carry no shell metacharacters, but pre-quoting matches the
@@ -1697,6 +1793,14 @@ KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
 KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  print_dry_run_plan
+  exit 0
+fi
+
+ensure_local_raftadmin
+ensure_remote_raftadmin_binaries
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

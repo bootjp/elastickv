@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -310,7 +311,9 @@ type Engine struct {
 
 	// Restore swaps the underlying store state and must not race with the short
 	// critical section that publishes a newly persisted local snapshot.
-	snapshotMu sync.Mutex
+	snapshotMu                     sync.Mutex
+	protectedReceivedFSMSnaps      map[uint64]int
+	pendingReceivedFSMSnapshotStep map[uint64]int
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -503,7 +506,14 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		return nil, err
 	}
 
-	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage)
+	initialApplied := coldStartApplied(prepared.disk)
+	rawNodeApplied, err := rawNodeAppliedForOpen(prepared.disk.Storage, initialApplied, prepared.cfg)
+	if err != nil {
+		_ = closePersist(prepared.disk.Persist)
+		return nil, err
+	}
+
+	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage, rawNodeApplied)
 	if err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
@@ -555,7 +565,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
 		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
 		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          coldStartApplied(prepared.disk),
+		applied:          initialApplied,
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -570,7 +580,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
+	engine.appliedIndex.Store(initialApplied)
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -666,6 +676,8 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
+	e.transport.SetFSMSnapshotPrepare(e.prepareFSMSnapshotWriteLocked)
+	e.transport.SetFSMSnapshotProtection(e.protectReceivedFSMSnapshot, e.unprotectReceivedFSMSnapshot)
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
@@ -685,12 +697,95 @@ func (e *Engine) initSnapshotWorker() {
 	e.startSnapshotWorker()
 }
 
-func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawNode, error) {
+func rawNodeAppliedForOpen(storage *etcdraft.MemoryStorage, applied uint64, cfg OpenConfig) (uint64, error) {
+	if applied == 0 {
+		return 0, nil
+	}
+	baseApplied, applied, err := rawNodeAppliedBounds(storage, applied)
+	if err != nil {
+		return 0, err
+	}
+	if applied <= baseApplied {
+		return applied, nil
+	}
+	return trimRawNodeAppliedForReplay(storage, baseApplied, applied, cfg), nil
+}
+
+func rawNodeAppliedBounds(storage *etcdraft.MemoryStorage, applied uint64) (uint64, uint64, error) {
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	baseApplied := uint64(0)
+	if firstIndex > 0 {
+		baseApplied = firstIndex - 1
+	}
+	committed := baseApplied
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	if !etcdraft.IsEmptyHardState(hardState) && hardState.Commit > committed {
+		committed = hardState.Commit
+	}
+	if applied > committed {
+		applied = committed
+	}
+	return baseApplied, applied, nil
+}
+
+func trimRawNodeAppliedForReplay(storage *etcdraft.MemoryStorage, baseApplied, applied uint64, cfg OpenConfig) uint64 {
+	entries, entriesErr := storage.Entries(baseApplied+1, applied+1, math.MaxUint64)
+	if entriesErr != nil {
+		return applied
+	}
+	for _, entry := range entries {
+		if coldStartEntryRequiresReplay(entry, cfg) {
+			return entry.Index - 1
+		}
+	}
+	return applied
+}
+
+func coldStartEntryRequiresReplay(entry raftpb.Entry, cfg OpenConfig) bool {
+	switch entry.Type {
+	case raftpb.EntryConfChange, raftpb.EntryConfChangeV2:
+		return true
+	case raftpb.EntryNormal:
+	default:
+		return false
+	}
+	if len(entry.Data) == 0 {
+		return false
+	}
+	_, payload, ok := decodeProposalEnvelope(entry.Data)
+	if !ok {
+		return false
+	}
+	if entry.Index > orInertCutover(cfg.RaftCutoverIndex)() {
+		if cfg.RaftCipher == nil {
+			return true
+		}
+		plain, err := unwrapRaftPayload(cfg.RaftCipher, payload)
+		if err != nil {
+			return true
+		}
+		payload = plain
+	}
+	classifier, ok := cfg.StateMachine.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
+}
+
+func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64) (*etcdraft.RawNode, error) {
 	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
 		ID:                        cfg.NodeID,
 		ElectionTick:              cfg.ElectionTick,
 		HeartbeatTick:             cfg.HeartbeatTick,
 		Storage:                   storage,
+		Applied:                   applied,
 		MaxSizePerMsg:             cfg.MaxSizePerMsg,
 		MaxCommittedSizePerReady:  cfg.MaxSizePerMsg,
 		MaxInflightMsgs:           cfg.MaxInflightMsg,
@@ -732,6 +827,22 @@ func (e *Engine) Close() error {
 		return err
 	}
 	return nil
+}
+
+func (e *Engine) Done() <-chan struct{} {
+	if e == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return e.doneCh
+}
+
+func (e *Engine) Err() error {
+	if e == nil {
+		return nil
+	}
+	return e.currentError()
 }
 
 func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
@@ -1778,12 +1889,14 @@ func (e *Engine) drainReady() error {
 		if err := e.persistReady(rd); err != nil {
 			return err
 		}
+		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
 		if err := e.sendMessages(rd.Messages); err != nil {
 			return err
 		}
 		if err := e.applyCommitted(rd.CommittedEntries); err != nil {
 			return err
 		}
+		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
 		e.handleReadStates(rd.ReadStates)
 		e.rawNode.Advance(rd)
 		if err := e.maybePersistLocalSnapshot(); err != nil {
@@ -1800,6 +1913,9 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 	if !readyNeedsPersistence(rd) {
 		return nil
 	}
+	if !etcdraft.IsEmptySnap(rd.Snapshot) {
+		return e.persistReadyWithSnapshotLocked(rd)
+	}
 	if err := e.applyReady(rd); err != nil {
 		return err
 	}
@@ -1809,8 +1925,36 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 	return persistReadyToWAL(e.persist, rd)
 }
 
+func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if err := e.applyReadyLocked(rd); err != nil {
+		return err
+	}
+	if e.persist == nil {
+		e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
+		return nil
+	}
+	if err := persistReadyToWAL(e.persist, rd); err != nil {
+		return err
+	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
+	return nil
+}
+
 func (e *Engine) applyReady(rd etcdraft.Ready) error {
 	if err := e.applyReadySnapshot(rd.Snapshot); err != nil {
+		return err
+	}
+	if err := e.applyReadyEntries(rd.Entries); err != nil {
+		return err
+	}
+	return e.applyReadyHardState(rd.HardState)
+}
+
+func (e *Engine) applyReadyLocked(rd etcdraft.Ready) error {
+	if err := e.applyReadySnapshotLocked(rd.Snapshot); err != nil {
 		return err
 	}
 	if err := e.applyReadyEntries(rd.Entries); err != nil {
@@ -1825,12 +1969,24 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	}
 	e.recordLeaderContact(msg)
 	e.recordQuorumAck(msg)
+	commitBeforeStep := e.rawNode.Status().Commit
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
+			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
 		}
 		e.fail(errors.WithStack(err))
+		return
 	}
+	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg, commitBeforeStep) {
+		return
+	}
+	if !e.rawNode.HasReady() {
+		e.unprotectReceivedFSMSnapshotToken(msg)
+		return
+	}
+	e.trackReceivedFSMSnapshotStep(msg)
+	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
 }
 
 // recordQuorumAck updates the per-peer last-response time when msg is
@@ -2017,6 +2173,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return e.applyReadySnapshotLocked(snapshot)
+}
+
+func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snapshot) {
+		return nil
+	}
 	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
 	// requires FSM payload bytes so it can restore local state before applying
 	// the metadata snapshot to MemoryStorage.
@@ -2026,9 +2191,6 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
 	if isSnapshotToken(snapshot.Data) {
 		tok, err := decodeSnapshotToken(snapshot.Data)
 		if err != nil {
@@ -2661,7 +2823,7 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
-	payload, err := e.snapshotPayload(index)
+	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
 		return err
 	}
@@ -2697,7 +2859,7 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 		return nil
 	}
 
-	payload, err := e.snapshotPayload(index)
+	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
 		return err
 	}
@@ -2722,6 +2884,7 @@ func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raft
 	if err := e.persistCreatedSnapshot(snap); err != nil {
 		return err
 	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
 	return nil
 }
 
@@ -2749,11 +2912,158 @@ func (e *Engine) openFSMPayloadLocked(index uint64) (io.ReadCloser, error) {
 	return openFSMPayloadFromFD(f)
 }
 
-// snapshotPayload takes a FSM snapshot for the given index, writes it to the
+func (e *Engine) prepareFSMSnapshotWriteLocked(index uint64) error {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return e.prepareFSMSnapshotWrite(index)
+}
+
+func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	return prepareFSMSnapshotWriteProtected(snapDir, e.fsmSnapDir, index, e.protectedReceivedFSMSnapshotIndexesLocked())
+}
+
+func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
+	if index == 0 {
+		return false
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	if index <= e.appliedIndex.Load() {
+		return false
+	}
+	if e.protectedReceivedFSMSnaps == nil {
+		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
+	}
+	e.protectedReceivedFSMSnaps[index]++
+	return true
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshot(index uint64) {
+	if index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	e.unprotectReceivedFSMSnapshotLocked(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotLocked(index uint64) {
+	if e.protectedReceivedFSMSnaps == nil {
+		return
+	}
+	count := e.protectedReceivedFSMSnaps[index]
+	if count <= 1 {
+		delete(e.protectedReceivedFSMSnaps, index)
+		return
+	}
+	e.protectedReceivedFSMSnaps[index] = count - 1
+}
+
+func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpToLocked(index uint64) {
+	if e.protectedReceivedFSMSnaps == nil {
+		return
+	}
+	for protectedIndex := range e.protectedReceivedFSMSnaps {
+		if protectedIndex <= index {
+			delete(e.protectedReceivedFSMSnaps, protectedIndex)
+		}
+	}
+}
+
+func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
+	if index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || index > e.appliedIndex.Load() {
+		return
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotTokenIfCommitted(msg raftpb.Message, committedIndex uint64) bool {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || index > committedIndex {
+		return false
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+	return true
+}
+
+func (e *Engine) trackReceivedFSMSnapshotStep(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || index <= e.appliedIndex.Load() {
+		return
+	}
+	if e.pendingReceivedFSMSnapshotStep == nil {
+		e.pendingReceivedFSMSnapshotStep = make(map[uint64]int, 1)
+	}
+	e.pendingReceivedFSMSnapshotStep[index]++
+}
+
+func (e *Engine) releaseIgnoredReceivedFSMSnapshotSteps(rd etcdraft.Ready) {
+	if len(e.pendingReceivedFSMSnapshotStep) == 0 {
+		return
+	}
+	snapshotIndex := uint64(0)
+	if !etcdraft.IsEmptySnap(rd.Snapshot) {
+		snapshotIndex = rd.Snapshot.Metadata.Index
+	}
+	for index, count := range e.pendingReceivedFSMSnapshotStep {
+		delete(e.pendingReceivedFSMSnapshotStep, index)
+		if index == snapshotIndex {
+			continue
+		}
+		for i := 0; i < count; i++ {
+			e.unprotectReceivedFSMSnapshot(index)
+		}
+	}
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok {
+		return
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func receivedFSMSnapshotTokenIndex(msg raftpb.Message) (uint64, bool) {
+	if msg.Type != raftpb.MsgSnap || msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+		return 0, false
+	}
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	if err != nil || tok.Index == 0 {
+		return 0, false
+	}
+	return tok.Index, true
+}
+
+func (e *Engine) protectedReceivedFSMSnapshotIndexesLocked() map[uint64]bool {
+	if len(e.protectedReceivedFSMSnaps) == 0 {
+		return nil
+	}
+	indexes := make(map[uint64]bool, len(e.protectedReceivedFSMSnaps))
+	for index := range e.protectedReceivedFSMSnaps {
+		indexes[index] = true
+	}
+	return indexes
+}
+
+// snapshotPayloadLocked takes a FSM snapshot for the given index, writes it to the
 // .fsm file on disk, and returns the 17-byte token for raftpb.Snapshot.Data.
+// Caller must hold snapshotMu when fsmSnapDir is set: prewrite cleanup may
+// delete orphaned .fsm files below index.
 // If fsmSnapDir is not set (e.g., engines created directly in unit tests),
 // falls back to the legacy in-memory []byte path.
-func (e *Engine) snapshotPayload(index uint64) ([]byte, error) {
+func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
 	if e.fsmSnapDir == "" {
 		snapshot, err := e.fsm.Snapshot()
 		if err != nil {
@@ -2764,6 +3074,12 @@ func (e *Engine) snapshotPayload(index uint64) ([]byte, error) {
 	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if err := e.prepareFSMSnapshotWrite(index); err != nil {
+		slog.Warn("failed to prepare fsm snapshot write",
+			"index", index,
+			"error", err,
+		)
 	}
 	crc32c, writeErr := writeFSMSnapshotFile(snapshot, e.fsmSnapDir, index)
 	closeErr := snapshot.Close()
@@ -4187,6 +4503,15 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		}
 		return e.persistLocalSnapshotPayload(req.index, payload)
 	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if err := e.prepareFSMSnapshotWrite(req.index); err != nil {
+		slog.Warn("failed to prepare fsm snapshot write",
+			"index", req.index,
+			"error", err,
+		)
+	}
 	crc32c, writeErr := writeFSMSnapshotFile(req.snapshot, e.fsmSnapDir, req.index)
 	closeErr := req.snapshot.Close()
 	if writeErr != nil {
@@ -4196,7 +4521,7 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		return errors.WithStack(closeErr)
 	}
 	token := encodeSnapshotToken(req.index, crc32c)
-	return e.persistLocalSnapshotPayload(req.index, token)
+	return e.persistLocalSnapshotPayloadLocked(req.index, token)
 }
 
 func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
@@ -4206,6 +4531,10 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	return e.persistLocalSnapshotPayloadLocked(index, payload)
+}
+
+func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte) error {
 	current, err := e.storage.Snapshot()
 	if err != nil {
 		return errors.WithStack(err)
@@ -4219,7 +4548,11 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	}
 
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
-	return e.handleLocalSnapshotPersistResult(err)
+	if err := e.handleLocalSnapshotPersistResult(err); err != nil {
+		return err
+	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+	return nil
 }
 
 // handleLocalSnapshotPersistResult collapses the post-SaveSnap error

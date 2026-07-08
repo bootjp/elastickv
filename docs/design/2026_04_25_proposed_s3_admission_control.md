@@ -462,7 +462,7 @@ Acceptance criteria:
 - Per-bucket admission classes (e.g. system buckets get their own
   budget). Punted to the workload-isolation rollout.
 - Coordinated admission across the multi-region read replica path
-  proposed in `docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md`.
+  implemented in `docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md`.
 - Token-bucket rate-shaping (e.g. bytes-per-second). The current
   proposal only bounds *concurrent* bytes; rate-shaping is a separate
   policy choice.

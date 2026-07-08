@@ -452,11 +452,9 @@
             (assoc op :type :info :error :network-error)
 
             (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"} err-type)
+                         "InternalServerError"
+                         "TransactionCanceledException"} err-type)
             (assoc op :type :info :error (str err-type))
-
-            (= "TransactionCanceledException" err-type)
-            (assoc op :type :fail :error (str err-type))
 
             (= "ValidationException" err-type)
             (assoc op :type :fail
