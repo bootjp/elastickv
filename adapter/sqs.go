@@ -318,6 +318,16 @@ func (s *SQSServer) observeThrottleConfig(queue string, throttle *sqsQueueThrott
 	s.throttleObserver.SyncThrottleActions(queue, enabledThrottleMetricActions(throttle))
 }
 
+func (s *SQSServer) observeThrottleConfigChange(queue string, throttle *sqsQueueThrottle, resetActions []string) {
+	if s == nil || s.throttleObserver == nil {
+		return
+	}
+	s.throttleObserver.SyncThrottleActions(queue, enabledThrottleMetricActions(throttle))
+	for _, action := range resetActions {
+		s.throttleObserver.ForgetThrottleAction(queue, action)
+	}
+}
+
 func enabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {
 	if throttle == nil || throttle.IsEmpty() {
 		return nil

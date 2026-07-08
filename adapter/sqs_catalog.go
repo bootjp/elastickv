@@ -817,6 +817,42 @@ func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
 		a.DefaultRefillPerSecond == b.DefaultRefillPerSecond
 }
 
+func changedThrottleMetricActions(before, after *sqsQueueThrottle) []string {
+	changed := make([]string, 0, len(sqsThrottleMetricActions))
+	for _, action := range sqsThrottleMetricActions {
+		if !throttleMetricActionEnabled(after, action) {
+			continue
+		}
+		beforeCapacity, beforeRefill := throttleMetricActionConfig(before, action)
+		afterCapacity, afterRefill := throttleMetricActionConfig(after, action)
+		if beforeCapacity != afterCapacity || beforeRefill != afterRefill {
+			changed = append(changed, action)
+		}
+	}
+	return changed
+}
+
+func throttleMetricActionEnabled(throttle *sqsQueueThrottle, action string) bool {
+	capacity, _ := throttleMetricActionConfig(throttle, action)
+	return capacity > 0
+}
+
+func throttleMetricActionConfig(throttle *sqsQueueThrottle, action string) (float64, float64) {
+	if throttle == nil {
+		return 0, 0
+	}
+	switch action {
+	case SQSThrottleActionSend:
+		return throttle.SendCapacity, throttle.SendRefillPerSecond
+	case SQSThrottleActionReceive:
+		return throttle.RecvCapacity, throttle.RecvRefillPerSecond
+	case SQSThrottleActionDefault:
+		return throttle.DefaultCapacity, throttle.DefaultRefillPerSecond
+	default:
+		return 0, 0
+	}
+}
+
 // htfifoAttributesEqual compares the Phase 3.D HT-FIFO fields.
 //
 // PartitionCount normalisation: validatePartitionConfig documents 0
@@ -1050,6 +1086,7 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// the new queue starts with a fresh full-capacity bucket
 	// regardless of in-flight traffic to the prior incarnation.
 	s.throttle.invalidateQueue(requested.Name)
+	s.observeThrottleConfigChange(requested.Name, requested.Throttle, enabledThrottleMetricActions(requested.Throttle))
 	// Mirror the throttle invalidate for the per-queue fanout-rotation
 	// counter. A delete-then-create race could otherwise leave the
 	// new queue starting partitioned receives at the previous
@@ -1082,6 +1119,7 @@ func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
 	// surprising operators who use DeleteQueue+CreateQueue to reset
 	// queue state.
 	s.throttle.invalidateQueue(name)
+	s.observeThrottleConfig(name, nil)
 	// Drop the per-queue fanout-rotation counter as well. Without
 	// this, repeated DeleteQueue of unique queue names retains one
 	// receiveFanoutCounters entry per name for the process lifetime
@@ -1509,7 +1547,7 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Attributes is required")
 		return
 	}
-	throttleChanged, throttle, err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes)
+	throttleChanged, throttle, resetActions, err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -1528,36 +1566,37 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	// full capacity. trySetQueueAttributesOnce therefore
 	// compares the old and new throttle configs under the same Raft
 	// read snapshot used for the commit and reports whether the values
-	// actually moved, plus the committed throttle config so the metrics
-	// layer can clear disabled token gauges even if the queue goes quiet.
-	// The bucket reconciliation in loadOrInit also
+	// actually moved, plus the committed throttle config and still-enabled
+	// actions whose capacity/refill changed so the metrics layer can clear
+	// disabled token gauges and reset stale token gauges even if the queue
+	// goes quiet. The bucket reconciliation in loadOrInit also
 	// catches a stale bucket if a throttle change slips past this gate
 	// (e.g. via a future admin path), so the gating here is purely a
 	// hot-path optimisation plus a no-op-bypass guard.
 	if throttleChanged {
 		s.throttle.invalidateQueue(name)
-		s.observeThrottleConfig(name, throttle)
+		s.observeThrottleConfigChange(name, throttle, resetActions)
 	}
 	writeSQSJSON(w, map[string]any{})
 }
 
-func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, error) {
+func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, []string, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		throttleChanged, throttle, done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
+		throttleChanged, throttle, resetActions, done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
 		if err == nil && done {
-			return throttleChanged, throttle, nil
+			return throttleChanged, throttle, resetActions, nil
 		}
 		if err != nil && !isRetryableTransactWriteError(err) {
-			return false, nil, err
+			return false, nil, nil, err
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			return false, nil, errors.WithStack(err)
+			return false, nil, nil, errors.WithStack(err)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}
-	return false, nil, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
+	return false, nil, nil, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
 }
 
 // applyAndValidateSetAttributes runs the apply + cross-validator
@@ -1596,22 +1635,23 @@ func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) 
 }
 
 // trySetQueueAttributesOnce is one read-validate-commit pass. The returns are
-// (throttleChanged, postThrottle, done, err). done reports whether the caller
-// should stop retrying (the attrs are now committed); an error means either a
-// non-retryable failure (propagate) or a retryable write conflict (retry after
-// backoff). throttleChanged is true iff the post-apply meta's Throttle config
-// differs from the pre-apply snapshot — the caller uses it to gate the cache
-// invalidation and metrics reconciliation so that a no-op same-value
-// SetQueueAttributes does not reset the bucket to full capacity or churn token
-// gauges.
-func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, bool, error) {
+// (throttleChanged, postThrottle, resetActions, done, err). done reports
+// whether the caller should stop retrying (the attrs are now committed); an
+// error means either a non-retryable failure (propagate) or a retryable write
+// conflict (retry after backoff). throttleChanged is true iff the post-apply
+// meta's Throttle config differs from the pre-apply snapshot — the caller uses
+// it to gate the cache invalidation and metrics reconciliation so that a no-op
+// same-value SetQueueAttributes does not reset the bucket to full capacity or
+// churn token gauges. resetActions is the still-enabled metric-action subset
+// whose capacity/refill changed and whose stale token gauge must be removed.
+func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, []string, bool, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return false, nil, false, errors.WithStack(err)
+		return false, nil, nil, false, errors.WithStack(err)
 	}
 	if !exists {
-		return false, nil, false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return false, nil, nil, false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	// Snapshot the throttle config under the same read TS used for the
 	// commit so the comparison sees the value the writer is racing
@@ -1619,17 +1659,18 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	// floats wrapped in a struct).
 	preThrottle := snapshotThrottle(meta.Throttle)
 	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
-		return false, nil, false, err
+		return false, nil, nil, false, err
 	}
 	if err := s.validateRedrivePolicyTarget(ctx, meta, readTS); err != nil {
-		return false, nil, false, err
+		return false, nil, nil, false, err
 	}
 	throttleChanged := !throttleConfigEqual(preThrottle, meta.Throttle)
 	postThrottle := snapshotThrottle(meta.Throttle)
+	resetActions := changedThrottleMetricActions(preThrottle, postThrottle)
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)
 	if err != nil {
-		return false, nil, false, errors.WithStack(err)
+		return false, nil, nil, false, errors.WithStack(err)
 	}
 	metaKey := sqsQueueMetaKey(queueName)
 	// StartTS + ReadKeys prevent two concurrent SetQueueAttributes from
@@ -1644,9 +1685,9 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		return false, nil, false, errors.WithStack(err)
+		return false, nil, nil, false, errors.WithStack(err)
 	}
-	return throttleChanged, postThrottle, true, nil
+	return throttleChanged, postThrottle, resetActions, true, nil
 }
 
 // snapshotThrottle returns a value-copy of the Throttle config so a
