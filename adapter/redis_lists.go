@@ -100,7 +100,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		meta, metaExists, err := r.resolveListMeta(ctx, key, readTS)
+		meta, metaExists, typ, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -124,7 +124,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
-			ReadKeys: listPushReadKeys(key, meta, metaExists),
+			ReadKeys: listPushReadKeys(key, meta, typ, metaExists),
 			Elems:    ops,
 		})
 		if dispErr != nil {
@@ -134,6 +134,18 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		return nil
 	})
 	return newLen, err
+}
+
+func (r *RedisServer) listPushSnapshot(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, redisValueType, error) {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeList)
+	if err != nil {
+		return store.ListMeta{}, false, redisTypeNone, err
+	}
+	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
+	if err != nil {
+		return store.ListMeta{}, false, redisTypeNone, err
+	}
+	return meta, exists, typ, nil
 }
 
 // reusableListPush captures a dispatched list-push attempt so a subsequent
@@ -334,8 +346,8 @@ func listPushBoundaryReadKeys(key []byte, meta store.ListMeta) [][]byte {
 	}
 }
 
-func listPushReadKeys(key []byte, meta store.ListMeta, metaExists bool) [][]byte {
-	if !metaExists {
+func listPushReadKeys(key []byte, meta store.ListMeta, typ redisValueType, metaExists bool) [][]byte {
+	if typ == redisTypeNone || !metaExists {
 		return redisTxnWideCollectionFenceKeys(key)
 	}
 	return listPushBoundaryReadKeys(key, meta)
@@ -364,7 +376,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		readTS := r.readTS()
-		meta, metaExists, err := r.resolveListMeta(ctx, key, readTS)
+		meta, metaExists, typ, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -385,7 +397,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		startTS := normalizeStartTS(readTS)
-		boundaryReads := listPushReadKeys(key, meta, metaExists)
+		boundaryReads := listPushReadKeys(key, meta, typ, metaExists)
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,

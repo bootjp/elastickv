@@ -360,6 +360,15 @@ func TestRedisTxnMissingKeyCreatorsReadAllWideFences(t *testing.T) {
 				require.Equal(t, int64(1), res.integer)
 			},
 		},
+		{
+			name: "zincrby",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				res, err := txn.applyZIncrBy(redcon.Command{Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), []byte("member")}})
+				require.NoError(t, err)
+				require.Equal(t, resultBulk, res.typ)
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -498,15 +507,56 @@ func TestRedisTxnBuildZSetWideElemsWritesFence(t *testing.T) {
 		"wide zset writers must update the replacement/delete fence")
 }
 
+func TestRedisTxnBuildZSetLegacyElemsWritesFence(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("zset:legacy-fence")
+	txn := &txnContext{
+		zsetStates: map[string]*zsetTxnState{
+			string(key): {
+				members: map[string]float64{"member": 1},
+				dirty:   true,
+			},
+		},
+		replacers: map[string]*stringReplacement{},
+	}
+
+	elems, err := txn.buildZSetElems(20)
+	require.NoError(t, err)
+	require.True(t, elemKeysContain(elems, redisTxnWideZSetFenceKey(key)),
+		"legacy zset writers must update the replacement/delete fence")
+}
+
+func TestRedisTxnMissingIncrWritesWideFences(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, _ := newRedisStorageMigrationTestServer(t)
+	txn := newRedisTxnTestContext(server)
+	key := []byte("missing-incr:fence")
+
+	res, err := txn.applyIncr(redcon.Command{Args: [][]byte{[]byte(cmdIncr), key}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.integer)
+
+	elems, err := txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {
+		require.True(t, elemKeysContain(elems, fenceKey))
+	}
+}
+
 func TestLuaWideFenceReadKeysForPlan(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("lua:fence")
 	require.Equal(t, redisTxnWideCollectionFenceKeys(key),
-		luaWideFenceReadKeysForPlan(key, redisTypeString, false))
+		luaWideFenceReadKeysForPlan(key, redisTypeString, redisTypeNone, false))
+	require.Equal(t, redisTxnWideCollectionFenceKeys(key),
+		luaWideFenceReadKeysForPlan(key, redisTypeList, redisTypeNone, true))
 	require.Equal(t, [][]byte{redisTxnWideZSetFenceKey(key)},
-		luaWideFenceReadKeysForPlan(key, redisTypeZSet, true))
-	require.Nil(t, luaWideFenceReadKeysForPlan(key, redisTypeString, true))
+		luaWideFenceReadKeysForPlan(key, redisTypeZSet, redisTypeZSet, true))
+	require.Nil(t, luaWideFenceReadKeysForPlan(key, redisTypeString, redisTypeString, true))
 }
 
 func TestRedisTxnSetReplacementConflictsWithConcurrentWideHashWrite(t *testing.T) {
@@ -626,6 +676,23 @@ func TestRedisStandaloneMissingCreatorsReadAllWideFences(t *testing.T) {
 		require.Equal(t, int64(1), n)
 		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
 	})
+}
+
+func TestRedisListPushRechecksTypeAtDispatchSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("list-push:type-recheck")
+	raw, err := marshalHashValue(redisHashValue{"field": "value"})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, redisTxnTestStartTS, 0))
+	coord.Clock().Observe(redisTxnTestStartTS)
+
+	_, err = server.listRPush(ctx, key, [][]byte{[]byte("value")})
+	require.ErrorContains(t, err, wrongTypeMessage)
 }
 
 func TestRedisTxnSetThenExpireUpdatesReplacementTTL(t *testing.T) {

@@ -3233,8 +3233,12 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		return luaKeyPlan{}, err
 	}
 
+	startType, err := c.server.keyTypeAt(context.Background(), []byte(key), c.startTS)
+	if err != nil {
+		return luaKeyPlan{}, err
+	}
 	var deleteElems []*kv.Elem[kv.OP]
-	readKeys := luaWideFenceReadKeysForPlan([]byte(key), finalType, valuePlan.preserveExisting)
+	readKeys := luaWideFenceReadKeysForPlan([]byte(key), finalType, startType, valuePlan.preserveExisting)
 	if !valuePlan.preserveExisting {
 		deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
 		if err != nil {
@@ -3254,8 +3258,8 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	}, nil
 }
 
-func luaWideFenceReadKeysForPlan(key []byte, finalType redisValueType, preserveExisting bool) [][]byte {
-	if !preserveExisting {
+func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {
+	if !preserveExisting || startType == redisTypeNone {
 		return redisTxnWideCollectionFenceKeys(key)
 	}
 	switch finalType {

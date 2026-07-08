@@ -854,12 +854,15 @@ func (t *txnContext) applyIncr(cmd redcon.Command) (redisResult, error) {
 		return incrOverflowResult(), nil
 	}
 	current++
+	next := []byte(strconv.FormatInt(current, 10))
 	if typ == redisTypeNone {
 		if _, err := t.stageExpiredKeyCleanupForRecreate(cmd.Args[1]); err != nil {
 			return redisResult{}, err
 		}
+		t.stageStringReplacement(cmd.Args[1], next, ttl)
+		return redisResult{typ: resultInt, integer: current}, nil
 	}
-	if err := t.stageStringValue(cmd.Args[1], []byte(strconv.FormatInt(current, 10)), ttl); err != nil {
+	if err := t.stageStringValue(cmd.Args[1], next, ttl); err != nil {
 		return redisResult{}, err
 	}
 	return redisResult{typ: resultInt, integer: current}, nil
@@ -1101,6 +1104,7 @@ func (t *txnContext) applyZIncrBy(cmd redcon.Command) (redisResult, error) {
 	if typ != redisTypeNone && typ != redisTypeZSet {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
+	t.trackMissingKeyCreatorFenceReads(cmd.Args[1], typ)
 
 	inc, err := strconv.ParseFloat(string(cmd.Args[2]), 64)
 	if err != nil {
@@ -1820,7 +1824,10 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload})
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+			redisTxnWideZSetFenceElem(key),
+		)
 	}
 	return elems, nil
 }
