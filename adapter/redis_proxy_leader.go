@@ -17,7 +17,8 @@ import (
 
 const (
 	defaultRedisLeaderClientPoolSize         = 4
-	defaultRedisBlockingLeaderClientPoolSize = 1
+	defaultRedisBlockingLeaderClientPoolSize = 4
+	redisLeaderProxyPoolSplitDivisor         = 2
 )
 
 func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
@@ -275,21 +276,47 @@ func (r *RedisServer) getOrCreateBlockingLeaderClient(addr string) *redis.Client
 	}
 	cli = redis.NewClient(&redis.Options{
 		Addr:     addr,
-		PoolSize: defaultRedisBlockingLeaderClientPoolSize,
+		PoolSize: r.blockingLeaderClientPoolSize(),
 	})
 	r.blockingLeaderClients[addr] = cli
 	return cli
 }
 
 func (r *RedisServer) leaderClientPoolSize() int {
-	n := defaultRedisLeaderClientPoolSize
-	if r != nil && r.peerLimiter != nil && r.peerLimiter.limit > 0 && r.peerLimiter.limit < n {
-		n = r.peerLimiter.limit
+	normal, _ := r.leaderProxyPoolSizes()
+	return normal
+}
+
+func (r *RedisServer) blockingLeaderClientPoolSize() int {
+	_, blocking := r.leaderProxyPoolSizes()
+	return blocking
+}
+
+func (r *RedisServer) leaderProxyPoolSizes() (normal, blocking int) {
+	normal = defaultRedisLeaderClientPoolSize
+	blocking = defaultRedisBlockingLeaderClientPoolSize
+	if r == nil || r.peerLimiter == nil || r.peerLimiter.limit <= 0 {
+		return normal, blocking
 	}
-	if n < 1 {
-		return 1
+	limit := r.peerLimiter.limit
+	if limit <= 1 {
+		return 1, 1
 	}
-	return n
+	blocking = limit / redisLeaderProxyPoolSplitDivisor
+	if blocking < 1 {
+		blocking = 1
+	}
+	if blocking > defaultRedisBlockingLeaderClientPoolSize {
+		blocking = defaultRedisBlockingLeaderClientPoolSize
+	}
+	normal = limit - blocking
+	if normal > defaultRedisLeaderClientPoolSize {
+		normal = defaultRedisLeaderClientPoolSize
+	}
+	if normal < 1 {
+		normal = 1
+	}
+	return normal, blocking
 }
 
 // leaderClientForKey returns a cached go-redis client connected to the leader

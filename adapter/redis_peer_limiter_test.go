@@ -74,7 +74,7 @@ func TestRedisLeaderClientPoolStaysBelowPeerLimit(t *testing.T) {
 	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
 	defer client.Close()
 
-	require.Equal(t, 2, client.Options().PoolSize)
+	require.Equal(t, 1, client.Options().PoolSize)
 }
 
 func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
@@ -86,7 +86,27 @@ func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
 	require.Less(t, client.Options().PoolSize, server.peerLimiter.limit)
 }
 
-func TestRedisBlockingLeaderClientUsesDedicatedPool(t *testing.T) {
+func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		limit        int
+		wantNormal   int
+		wantBlocking int
+	}{
+		{name: "low cap", limit: 2, wantNormal: 1, wantBlocking: 1},
+		{name: "four cap", limit: 4, wantNormal: 2, wantBlocking: 2},
+		{name: "default cap", limit: 8, wantNormal: 4, wantBlocking: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(tc.limit))
+			require.Equal(t, tc.wantNormal, server.leaderClientPoolSize())
+			require.Equal(t, tc.wantBlocking, server.blockingLeaderClientPoolSize())
+			require.LessOrEqual(t, server.leaderClientPoolSize()+server.blockingLeaderClientPoolSize(), tc.limit)
+		})
+	}
+}
+
+func TestRedisBlockingLeaderClientUsesDedicatedBudgetedPool(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(8))
 	shared := server.getOrCreateLeaderClient("127.0.0.1:6379")
 	defer shared.Close()
