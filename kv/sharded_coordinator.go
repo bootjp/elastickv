@@ -358,6 +358,9 @@ type ShardedCoordinator struct {
 	// allowed to reach the sampler. When false, observations keep the
 	// legacy unlabeled route-only shape.
 	keyvizLabelsEnabled bool
+	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
+	// lease proposals while another startup-only Raft mutation must run first.
+	hlcRenewalBlocked func() bool
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -520,6 +523,15 @@ func hasMutatingElems(reqs *OperationGroup[OP]) bool {
 func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *ShardedCoordinator {
 	c.leaseObserver = normalizeLeaseObserver(observer)
 	return c
+}
+
+// SetHLCLeaseRenewalBlocker installs a predicate that suppresses background
+// HLC lease-renewal proposals while it returns true.
+func (c *ShardedCoordinator) SetHLCLeaseRenewalBlocker(blocked func() bool) {
+	if c == nil {
+		return
+	}
+	c.hlcRenewalBlocked = blocked
 }
 
 // WithSampler wires a keyviz.Sampler onto a ShardedCoordinator. The
@@ -1990,6 +2002,10 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
+			if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+				timer.Reset(hlcRenewalInterval)
+				continue
+			}
 			if group.Engine.State() == raftengine.StateLeader {
 				c.renewHLCLease(ctx, group)
 			}

@@ -102,6 +102,60 @@ func TestRaftEnvelopeRuntime_InstallFromApplyPublishesWrap(t *testing.T) {
 	}
 }
 
+func TestRaftEnvelopeRuntime_InstallRotatedRaftDEKRepublishesWrap(t *testing.T) {
+	t.Parallel()
+	const (
+		oldKeyID  uint32 = 4
+		newKeyID  uint32 = 9
+		raftEpoch uint16 = 7
+	)
+	ks := encryption.NewKeystore()
+	for _, keyID := range []uint32{oldKeyID, newKeyID} {
+		key := bytes.Repeat([]byte{byte(keyID)}, encryption.KeySize)
+		if err := ks.Set(keyID, key); err != nil {
+			t.Fatalf("keystore Set(%d): %v", keyID, err)
+		}
+	}
+	cipher, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	var cutover atomic.Uint64
+	runtime, err := newRaftEnvelopeRuntime(
+		cipher,
+		encryption.NewDeterministicNonceFactory(0xCAFE, 7),
+		1234,
+		oldKeyID,
+		&cutover,
+		raftEpoch,
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
+	}
+	sg := &kv.ShardGroup{}
+	runtime.attachGroup(7, sg)
+	if err := runtime.installRotatedRaftDEK(newKeyID); err != nil {
+		t.Fatalf("installRotatedRaftDEK: %v", err)
+	}
+	wrap := sg.RaftPayloadWrap()
+	if wrap == nil {
+		t.Fatal("installRotatedRaftDEK did not publish wrap to attached group")
+	}
+	wrapped, err := wrap([]byte("raft payload"))
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	env, err := encryption.DecodeEnvelope(wrapped)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope: %v", err)
+	}
+	if env.KeyID != newKeyID {
+		t.Fatalf("wrapped key_id=%d, want rotated key_id=%d", env.KeyID, newKeyID)
+	}
+}
+
 func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	t.Parallel()
 	const keyID uint32 = 4

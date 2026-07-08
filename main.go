@@ -34,7 +34,9 @@ import (
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -174,6 +176,13 @@ var (
 	// Default off; pre-Stage-6 clusters and operators who have
 	// not yet committed to encryption are unaffected.
 	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires --kekFile to be set; without that, mutators still refuse with FailedPrecondition. Default off.")
+
+	// Stage 6F: operator-requested DEK rotation at boot. The flag is
+	// intentionally a request, not a guarantee: only the leader of the
+	// default encryption Raft group proposes the rotation; followers
+	// keep the request in memory and fire it only if they acquire
+	// leadership during this process uptime.
+	encryptionRotateOnStartup = flag.Bool("encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
 
 	// Stage 6B-2: KEK source. The KEK never appears in elastickv's
 	// data dir; it is held externally and exercised only at process
@@ -485,10 +494,6 @@ func run() error {
 	eg.Go(func() error {
 		return compactor.Run(runCtx)
 	})
-	eg.Go(func() error {
-		coordinate.RunHLCLeaseRenewal(runCtx)
-		return nil
-	})
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -497,7 +502,22 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	if err := startServers(serversInput{
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
+	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
+		runCtx,
+		*encryptionRotateOnStartup,
+		defaultRuntime,
+		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+		*encryptionSidecarPath,
+		kekWrapper,
+		encWiring.raftEnvelope,
+		etcdraftengine.DeriveNodeID(*raftId),
+		encWiring.epoch,
+		encWiring.raftEpoch,
+		slog.Default(),
+	)
+	cleanup.Add(rotateOnStartupDeregister)
+	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
 		shardStore: shardStore, coordinate: coordinate,
@@ -960,6 +980,13 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 	return rt.engine
 }
 
+func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if rt == nil {
+		return nil
+	}
+	return proposerForGroup(rt, shardGroups)
+}
+
 func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
 	applied, ok := engine.(interface{ AppliedIndex() uint64 })
 	if !ok {
@@ -1197,10 +1224,10 @@ type serversInput struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
-// startServers wires up the AdminServer, builds the runtime runner, and
-// kicks off both the per-group raft listeners and the admin HTTP listener.
-// Extracted from run() to keep cyclomatic complexity within budget.
-func startServers(in serversInput) error {
+// startServersAfterStartupRotation wires up the AdminServer, starts the
+// per-group Raft listeners needed for quorum traffic, waits for any requested
+// startup rotation, then opens the public service listeners.
+func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
 		return err
@@ -1211,9 +1238,9 @@ func startServers(in serversInput) error {
 	// otherwise still flip forwardDeps.readyForRegistration() to
 	// true, registering the leader-side gRPC AdminForward service
 	// and re-exposing the table-write surface a follower-direct
-	// admin call could reach (Codex P1, CodeRabbit Major on #648).
+	// admin call could reach (P1/Major review on #648).
 	// The HTTP admin listener already short-circuits in
-	// startAdminFromFlags when *adminEnabled is false; the gRPC path
+	// prepareAdminFromFlags when *adminEnabled is false; the gRPC path
 	// must do the same.
 	var (
 		roleStore admin.RoleStore
@@ -1222,7 +1249,7 @@ func startServers(in serversInput) error {
 	if *adminEnabled {
 		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
 		// connCache is shared between the follower-side LeaderForwarder
-		// (built inside startAdminFromFlags) and any future bridge that
+		// (built inside prepareAdminFromFlags) and any future bridge that
 		// dials the leader's gRPC ports. Keeping a single instance per
 		// process means the two paths re-use TLS / HTTP/2 connections
 		// rather than each maintaining a parallel pool. The shutdown
@@ -1239,6 +1266,12 @@ func startServers(in serversInput) error {
 			return nil
 		})
 	}
+	publicKVGate := &startupPublicKVGate{}
+	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
+	adapterCoordinate := startupGatedCoordinator{
+		inner: in.coordinate,
+		gate:  publicKVGate,
+	}
 	runner := runtimeServerRunner{
 		ctx:             in.ctx,
 		lc:              in.lc,
@@ -1247,7 +1280,7 @@ func startServers(in serversInput) error {
 		runtimes:        in.runtimes,
 		shardGroups:     in.shardGroups,
 		shardStore:      in.shardStore,
-		coordinate:      in.coordinate,
+		coordinate:      adapterCoordinate,
 		distServer:      in.distServer,
 		adminServer:     adminServer,
 		adminGRPCOpts:   adminGRPCOpts,
@@ -1287,17 +1320,21 @@ func startServers(in serversInput) error {
 		metricsRegistry:                 in.metricsRegistry,
 		roleStore:                       roleStore,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
+		publicKVGate:                    publicKVGate,
 	}
-	if err := runner.start(); err != nil {
+	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	// runner.start() populates runner.dynamoServer for the admin
-	// listener's SigV4-bypass entrypoints (see adapter/dynamodb_admin.go).
+	if err := runner.preparePublicServices(); err != nil {
+		return runner.startupFailure(err)
+	}
+	// runner.startRaftTransport() has populated runner.dynamoServer for the
+	// admin listener's SigV4-bypass entrypoints (see adapter/dynamodb_admin.go).
 	// Passing nil here would leave the admin dashboard with no
 	// access to table metadata; the admin handler answers
 	// /admin/api/v1/dynamo/* with 404 in that case.
 	//
-	// in.coordinate + connCache are forwarded so the admin HTTP
+	// runner.coordinate + connCache are forwarded so the admin HTTP
 	// dynamo handler can construct its production LeaderForwarder
 	// (Phase 3 of design 3.3): when the local node is a follower,
 	// the handler hands ErrTablesNotLeader writes to the forwarder
@@ -1307,10 +1344,53 @@ func startServers(in serversInput) error {
 		Nodes:   parseCSV(*keyvizFanoutNodes),
 		Timeout: *keyvizFanoutTimeout,
 	}
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler, fanoutCfg); err != nil {
-		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
+	if err != nil {
+		return runner.startupFailure(err)
 	}
+	runner.adminHTTP = adminHTTP
+	publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
+	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
+		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
+	}
+	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
+	publicKVGate.markReady()
+	if err := runner.startPublicServices(); err != nil {
+		return err
+	}
+	runner.startAdminHTTP()
 	return nil
+}
+
+type hlcLeaseRenewalBlocker interface {
+	SetHLCLeaseRenewalBlocker(func() bool)
+}
+
+type hlcLeaseRenewalRunner interface {
+	RunHLCLeaseRenewal(context.Context)
+}
+
+func installHLCLeaseRenewalBlocker(coordinate kv.Coordinator, blocked func() bool) {
+	if coordinate == nil || blocked == nil {
+		return
+	}
+	if installer, ok := coordinate.(hlcLeaseRenewalBlocker); ok {
+		installer.SetHLCLeaseRenewalBlocker(blocked)
+	}
+}
+
+func startHLCLeaseRenewal(ctx context.Context, eg *errgroup.Group, coordinate kv.Coordinator) {
+	if eg == nil || coordinate == nil {
+		return
+	}
+	runner, ok := coordinate.(hlcLeaseRenewalRunner)
+	if !ok {
+		return
+	}
+	eg.Go(func() error {
+		runner.RunHLCLeaseRenewal(ctx)
+		return nil
+	})
 }
 
 func setupAdminService(
@@ -1414,6 +1494,132 @@ type adminGRPCInterceptors struct {
 
 func (a adminGRPCInterceptors) empty() bool {
 	return len(a.unary) == 0 && len(a.stream) == 0
+}
+
+type startupGatedCoordinator struct {
+	inner kv.Coordinator
+	gate  *startupPublicKVGate
+}
+
+var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
+var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+
+func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if c.gate != nil && c.gate.blocked() {
+		return nil, status.Error(codes.Unavailable, "startup rotation has not completed") //nolint:wrapcheck // Preserve the gRPC status for adapters.
+	}
+	return c.inner.Dispatch(ctx, reqs) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) IsLeader() bool {
+	return c.inner.IsLeader()
+}
+
+func (c startupGatedCoordinator) VerifyLeader(ctx context.Context) error {
+	return c.inner.VerifyLeader(ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) RaftLeader() string {
+	return c.inner.RaftLeader()
+}
+
+func (c startupGatedCoordinator) IsLeaderForKey(key []byte) bool {
+	return c.inner.IsLeaderForKey(key)
+}
+
+func (c startupGatedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
+	return c.inner.VerifyLeaderForKey(ctx, key) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) RaftLeaderForKey(key []byte) string {
+	return c.inner.RaftLeaderForKey(key)
+}
+
+func (c startupGatedCoordinator) Clock() *kv.HLC {
+	return c.inner.Clock()
+}
+
+func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
+	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	return kv.LeaseReadForKeyThrough(c.inner, ctx, key) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	if router, ok := c.inner.(kv.GroupRoutableCoordinator); ok {
+		return router.EngineGroupIDForKey(key)
+	}
+	return 0
+}
+
+type startupPublicKVGate struct {
+	ready        atomic.Bool
+	blockMutator func() bool
+}
+
+func (g *startupPublicKVGate) markReady() {
+	if g != nil {
+		g.ready.Store(true)
+	}
+}
+
+func (g *startupPublicKVGate) unaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
+		// Return a raw gRPC status so clients and retry policy see Unavailable.
+		//nolint:wrapcheck
+		return nil, status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return handler(ctx, req)
+}
+
+func (g *startupPublicKVGate) blocked() bool {
+	if g == nil {
+		return false
+	}
+	if !g.ready.Load() {
+		return true
+	}
+	return g.blockMutator != nil && g.blockMutator()
+}
+
+func startupRotationGatedMethod(fullMethod string) bool {
+	switch fullMethod {
+	case pb.Internal_Forward_FullMethodName,
+		pb.AdminForward_Forward_FullMethodName,
+		pb.Distribution_SplitRange_FullMethodName,
+		pb.RaftAdmin_AddVoter_FullMethodName,
+		pb.RaftAdmin_AddLearner_FullMethodName,
+		pb.RaftAdmin_PromoteLearner_FullMethodName,
+		pb.RaftAdmin_RemoveServer_FullMethodName,
+		pb.RaftAdmin_TransferLeadership_FullMethodName,
+		pb.EncryptionAdmin_BootstrapEncryption_FullMethodName,
+		pb.EncryptionAdmin_RotateDEK_FullMethodName,
+		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
+		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
+		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName:
+		return true
+	default:
+		return strings.HasPrefix(fullMethod, "/RawKV/") ||
+			strings.HasPrefix(fullMethod, "/TransactionalKV/")
+	}
 }
 
 // configureAdminService builds the node-side AdminServer plus the interceptor
@@ -1728,13 +1934,12 @@ func startRaftServers(
 	return nil
 }
 
-func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) error {
+func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", redisAddr)
+		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
 	deltaCompactor := adapter.NewDeltaCompactor(shardStore, coordinate)
-	eg.Go(func() error { return deltaCompactor.Run(ctx) })
 	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
@@ -1753,6 +1958,16 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 	if err := redisServer.RegisterLuaPoolMetrics(metricsRegistry.Registerer()); err != nil {
 		slog.Warn("failed to register lua pool metrics; pool counters will be invisible in Prometheus", "err", err)
 	}
+	return redisServer, deltaCompactor, redisL, nil
+}
+
+func runRedisServer(ctx context.Context, eg *errgroup.Group, redisServer *adapter.RedisServer, deltaCompactor *adapter.DeltaCompactor) {
+	if redisServer == nil {
+		return
+	}
+	if deltaCompactor != nil {
+		eg.Go(func() error { return deltaCompactor.Run(ctx) })
+	}
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})
@@ -1770,22 +1985,32 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		}
 		return errors.WithStack(err)
 	})
-	return nil
 }
 
-func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, dynamoAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.DynamoDBServer, error) {
-	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
-	}
-	dynamoServer := adapter.NewDynamoDBServer(
-		dynamoL,
+func newDynamoDBServer(shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderDynamo map[string]string, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) *adapter.DynamoDBServer {
+	return adapter.NewDynamoDBServer(
+		nil,
 		shardStore,
 		coordinate,
 		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 		adapter.WithDynamoDBLeaderMap(leaderDynamo),
 	)
+}
+
+func bindDynamoDBServer(ctx context.Context, lc *net.ListenConfig, dynamoAddr string, dynamoServer *adapter.DynamoDBServer) (net.Listener, error) {
+	if dynamoServer == nil {
+		return nil, errors.New("dynamodb server is not prepared")
+	}
+	dynamoL, err := lc.Listen(ctx, "tcp", dynamoAddr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to listen on %s", dynamoAddr)
+	}
+	dynamoServer.SetListener(dynamoL)
+	return dynamoL, nil
+}
+
+func runDynamoDBServer(ctx context.Context, eg *errgroup.Group, dynamoServer *adapter.DynamoDBServer) {
 	eg.Go(func() error {
 		defer dynamoServer.Stop()
 		stop := make(chan struct{})
@@ -1803,49 +2028,78 @@ func startDynamoDBServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		}
 		return errors.WithStack(err)
 	})
-	return dynamoServer, nil
 }
 
 func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
-	pprofAddr = strings.TrimSpace(pprofAddr)
-	if pprofAddr == "" {
-		return nil
-	}
-	if _, _, err := net.SplitHostPort(pprofAddr); err != nil {
-		return errors.Wrapf(err, "invalid pprofAddress %q; expected host:port", pprofAddr)
-	}
-	if monitoring.AddressRequiresToken(pprofAddr) && strings.TrimSpace(pprofToken) == "" {
-		return errors.New("pprofToken is required when pprofAddress is not loopback")
-	}
-	pprofL, err := lc.Listen(ctx, "tcp", pprofAddr)
+	pprofServer, pprofL, bindAddr, err := preparePprofServer(ctx, lc, pprofAddr, pprofToken)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", pprofAddr)
+		return err
 	}
-	pprofServer := monitoring.NewPprofServer(pprofToken)
-	eg.Go(monitoring.PprofShutdownTask(ctx, pprofServer, pprofAddr))
-	eg.Go(monitoring.PprofServeTask(pprofServer, pprofL, pprofAddr))
+	runPreparedPprofServer(ctx, eg, pprofServer, pprofL, bindAddr)
 	return nil
 }
 
+func preparePprofServer(ctx context.Context, lc *net.ListenConfig, pprofAddr string, pprofToken string) (*http.Server, net.Listener, string, error) {
+	pprofAddr = strings.TrimSpace(pprofAddr)
+	if pprofAddr == "" {
+		return nil, nil, "", nil
+	}
+	if _, _, err := net.SplitHostPort(pprofAddr); err != nil {
+		return nil, nil, "", errors.Wrapf(err, "invalid pprofAddress %q; expected host:port", pprofAddr)
+	}
+	if monitoring.AddressRequiresToken(pprofAddr) && strings.TrimSpace(pprofToken) == "" {
+		return nil, nil, "", errors.New("pprofToken is required when pprofAddress is not loopback")
+	}
+	pprofL, err := lc.Listen(ctx, "tcp", pprofAddr)
+	if err != nil {
+		return nil, nil, "", errors.Wrapf(err, "failed to listen on %s", pprofAddr)
+	}
+	pprofServer := monitoring.NewPprofServer(pprofToken)
+	return pprofServer, pprofL, pprofAddr, nil
+}
+
+func runPreparedPprofServer(ctx context.Context, eg *errgroup.Group, pprofServer *http.Server, pprofL net.Listener, pprofAddr string) {
+	if pprofServer == nil || pprofL == nil {
+		return
+	}
+	eg.Go(monitoring.PprofShutdownTask(ctx, pprofServer, pprofAddr))
+	eg.Go(monitoring.PprofServeTask(pprofServer, pprofL, pprofAddr))
+}
+
 func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
+	metricsServer, metricsL, bindAddr, err := prepareMetricsServer(ctx, lc, metricsAddr, metricsToken, handler)
+	if err != nil {
+		return err
+	}
+	runPreparedMetricsServer(ctx, eg, metricsServer, metricsL, bindAddr)
+	return nil
+}
+
+func prepareMetricsServer(ctx context.Context, lc *net.ListenConfig, metricsAddr string, metricsToken string, handler http.Handler) (*http.Server, net.Listener, string, error) {
 	metricsAddr = strings.TrimSpace(metricsAddr)
 	if metricsAddr == "" || handler == nil {
-		return nil
+		return nil, nil, "", nil
 	}
 	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
-		return errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
+		return nil, nil, "", errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
 	}
 	if monitoring.AddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
-		return errors.New("metricsToken is required when metricsAddress is not loopback")
+		return nil, nil, "", errors.New("metricsToken is required when metricsAddress is not loopback")
 	}
 	metricsL, err := lc.Listen(ctx, "tcp", metricsAddr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", metricsAddr)
+		return nil, nil, "", errors.Wrapf(err, "failed to listen on %s", metricsAddr)
 	}
 	metricsServer := monitoring.NewMetricsServer(handler, metricsToken)
+	return metricsServer, metricsL, metricsAddr, nil
+}
+
+func runPreparedMetricsServer(ctx context.Context, eg *errgroup.Group, metricsServer *http.Server, metricsL net.Listener, metricsAddr string) {
+	if metricsServer == nil || metricsL == nil {
+		return
+	}
 	eg.Go(monitoring.MetricsShutdownTask(ctx, metricsServer, metricsAddr))
 	eg.Go(monitoring.MetricsServeTask(metricsServer, metricsL, metricsAddr))
-	return nil
 }
 
 func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint64) *distribution.CatalogStore {
@@ -1965,33 +2219,47 @@ type runtimeServerRunner struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 
 	// dynamoServer is populated by start() and made available to
-	// startAdminFromFlags in this package so the admin listener can
+	// prepareAdminFromFlags in this package so the admin listener can
 	// call SigV4-bypass admin entrypoints (see
 	// adapter/dynamodb_admin.go) without going through HTTP. The
 	// field is unexported on purpose — it is package-private state,
 	// not a public API. Nil until start() reaches the dynamo step.
-	dynamoServer *adapter.DynamoDBServer
+	dynamoServer   *adapter.DynamoDBServer
+	dynamoListener net.Listener
+	redisServer    *adapter.RedisServer
+	redisCompactor *adapter.DeltaCompactor
+	redisListener  net.Listener
 
 	// s3Server is the parallel field for the S3 admin endpoints
 	// (read-only in this slice). Nil when --s3Address is empty,
 	// in which case the admin handler answers /s3/buckets* with
 	// 404, mirroring the dynamoServer == nil contract.
-	s3Server *adapter.S3Server
+	s3Server   *adapter.S3Server
+	s3Listener net.Listener
 
 	// sqsServer plays the same role for the SQS admin entrypoints
 	// (adapter/sqs_admin.go). Always non-nil after startup —
-	// startSQSServer constructs a listenless SQSServer when
+	// prepareSQSServer constructs a listenless SQSServer when
 	// --sqsAddress is empty (the public SigV4 listener is
 	// suppressed but the admin bridge stays wired since the admin
 	// handlers only need the coordinator/store, not the listener).
-	sqsServer *adapter.SQSServer
+	sqsServer   *adapter.SQSServer
+	sqsListener net.Listener
+
+	metricsServer   *http.Server
+	metricsListener net.Listener
+	metricsBindAddr string
+	pprofServer     *http.Server
+	pprofListener   net.Listener
+	pprofBindAddr   string
+	adminHTTP       *preparedAdminServer
 
 	// sqsPartitionResolver is the concrete pointer to the same
-	// resolver installed on the coordinator (line ~322). startSQSServer
+	// resolver installed on the coordinator (line ~322). prepareSQSServer
 	// hands this through WithSQSPartitionResolver so the CreateQueue
 	// capability gate can verify routing coverage on partitioned
-	// creates without re-parsing --sqsFifoPartitionMap (Codex P1
-	// review on PR #734, round 2). Nil on single-shard / no-flag
+	// creates without re-parsing --sqsFifoPartitionMap (P1 review on
+	// PR #734, round 2). Nil on single-shard / no-flag
 	// deployments — the gate's resolver==nil branch then skips
 	// the coverage check.
 	sqsPartitionResolver *adapter.SQSPartitionResolver
@@ -2006,35 +2274,23 @@ type runtimeServerRunner struct {
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
-	// produces inside startAdminFromFlags; built up-front in
+	// produces inside prepareAdminFromFlags; built up-front in
 	// startServers so registerAdminForwardServer in startRaftServers
 	// does not need to wait for the (later) admin-config parse.
 	// Nil when no admin access keys are configured.
 	roleStore admin.RoleStore
+
+	publicKVGate *startupPublicKVGate
 }
 
-func (r *runtimeServerRunner) start() error {
-	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+func (r *runtimeServerRunner) startRaftTransport() error {
+	if err := r.prepareAdminForwardServers(); err != nil {
+		return r.startupFailure(err)
 	}
-	// startDynamoDBServer + startS3Server must run BEFORE
-	// startRaftServers so the resulting *DynamoDBServer / *S3Server
-	// are available to the leader-side gRPC AdminForward registration
-	// in startRaftServers (design 3.3, P2 slice 2b). Each server
-	// listens on its own address; them accepting traffic before the
-	// raft TCP listeners are up is no different from the existing
-	// startup-race semantics — a hit in that window already returned
-	// 503 before this reorder.
-	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	adminGRPCOpts := r.adminGRPCOpts
+	if r.publicKVGate != nil {
+		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
 	}
-	r.dynamoServer = dynamoServer
-	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
-	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	r.s3Server = s3Server
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
 		buckets: newBucketsSource(r.s3Server),
@@ -2054,18 +2310,134 @@ func (r *runtimeServerRunner) start() error {
 			return r.metricsRegistry.RaftProposalObserver(groupID)
 		},
 		r.adminServer,
-		r.adminGRPCOpts,
+		adminGRPCOpts,
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 	); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return r.startupFailure(err)
 	}
-	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver, r.sqsPartitionObserver)
+	return nil
+}
+
+func (r *runtimeServerRunner) prepareAdminForwardServers() error {
+	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	s3Server, err := newS3Server(r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
 	if err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+		return err
+	}
+	r.s3Server = s3Server
+	return nil
+}
+
+func (r *runtimeServerRunner) preparePublicServices() error {
+	redisServer, redisCompactor, redisListener, err := prepareRedisServer(
+		r.ctx, r.lc, r.redisAddress, r.shardStore, r.coordinate,
+		r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker,
+	)
+	if err != nil {
+		return err
+	}
+	r.redisServer = redisServer
+	r.redisCompactor = redisCompactor
+	r.redisListener = redisListener
+
+	dynamoListener, err := bindDynamoDBServer(r.ctx, r.lc, r.dynamoAddress, r.dynamoServer)
+	if err != nil {
+		return err
+	}
+	r.dynamoListener = dynamoListener
+
+	s3Listener, err := bindS3Server(r.ctx, r.lc, r.s3Address, r.s3Server)
+	if err != nil {
+		return err
+	}
+	r.s3Listener = s3Listener
+
+	sqsServer, sqsListener, err := prepareSQSServer(
+		r.ctx, r.lc, r.sqsAddress, r.shardStore, r.coordinate,
+		r.leaderSQS, r.sqsRegion, r.sqsCredsFile,
+		r.sqsPartitionResolver, r.sqsPartitionObserver,
+	)
+	if err != nil {
+		return err
 	}
 	r.sqsServer = sqsServer
+	r.sqsListener = sqsListener
+
+	metricsServer, metricsListener, metricsAddr, err := prepareMetricsServer(
+		r.ctx, r.lc, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler(),
+	)
+	if err != nil {
+		return err
+	}
+	r.metricsServer = metricsServer
+	r.metricsListener = metricsListener
+	r.metricsBindAddr = metricsAddr
+
+	pprofServer, pprofListener, pprofAddr, err := preparePprofServer(r.ctx, r.lc, r.pprofAddress, r.pprofToken)
+	if err != nil {
+		return err
+	}
+	r.pprofServer = pprofServer
+	r.pprofListener = pprofListener
+	r.pprofBindAddr = pprofAddr
+	return nil
+}
+
+func (r *runtimeServerRunner) closePreparedExternalListeners() {
+	if r.redisListener != nil {
+		_ = r.redisListener.Close()
+		r.redisListener = nil
+	}
+	if r.dynamoListener != nil {
+		_ = r.dynamoListener.Close()
+		r.dynamoListener = nil
+	}
+	if r.s3Listener != nil {
+		_ = r.s3Listener.Close()
+		r.s3Listener = nil
+	}
+	if r.sqsListener != nil {
+		_ = r.sqsListener.Close()
+		r.sqsListener = nil
+	}
+	if r.metricsListener != nil {
+		_ = r.metricsListener.Close()
+		r.metricsListener = nil
+	}
+	if r.pprofListener != nil {
+		_ = r.pprofListener.Close()
+		r.pprofListener = nil
+	}
+	if r.adminHTTP != nil {
+		r.adminHTTP.close()
+	}
+}
+
+func (r *runtimeServerRunner) startupFailure(err error) error {
+	r.closePreparedExternalListeners()
+	return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+}
+
+func (r *runtimeServerRunner) startPublicServices() error {
+	if r.redisServer == nil || r.redisListener == nil {
+		return r.startupFailure(errors.New("redis server is not prepared"))
+	}
+	if r.dynamoServer == nil || r.dynamoListener == nil {
+		return r.startupFailure(errors.New("dynamodb server is not prepared"))
+	}
+	if r.sqsServer == nil {
+		return r.startupFailure(errors.New("sqs server is not prepared"))
+	}
+	runRedisServer(r.ctx, r.eg, r.redisServer, r.redisCompactor)
+	r.redisListener = nil
+	runDynamoDBServer(r.ctx, r.eg, r.dynamoServer)
+	r.dynamoListener = nil
+	runS3Server(r.ctx, r.eg, r.s3Server)
+	r.s3Listener = nil
+	runSQSServer(r.ctx, r.eg, r.sqsServer)
+	r.sqsListener = nil
 	// Plug the SQS adapter into the monitoring registry's depth
 	// observer (see startSQSDepthObserver). nil sqsServer (e.g.
 	// --sqsAddress empty on this node) is a no-op so single-binary
@@ -2073,13 +2445,18 @@ func (r *runtimeServerRunner) start() error {
 	if r.sqsServer != nil {
 		startSQSDepthObserver(r.ctx, r.metricsRegistry, r.sqsServer)
 	}
-	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
-	if err := startPprofServer(r.ctx, r.lc, r.eg, r.pprofAddress, r.pprofToken); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
+	runPreparedMetricsServer(r.ctx, r.eg, r.metricsServer, r.metricsListener, r.metricsBindAddr)
+	r.metricsListener = nil
+	runPreparedPprofServer(r.ctx, r.eg, r.pprofServer, r.pprofListener, r.pprofBindAddr)
+	r.pprofListener = nil
 	return nil
+}
+
+func (r *runtimeServerRunner) startAdminHTTP() {
+	if r.adminHTTP == nil {
+		return
+	}
+	r.adminHTTP.start(r.ctx, r.eg)
 }
 
 // buildKeyVizSampler constructs the in-memory keyviz sampler from
