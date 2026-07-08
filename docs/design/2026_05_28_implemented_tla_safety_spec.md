@@ -1,16 +1,17 @@
 # TLA+ Safety Specification for elastickv
 
-Status: Partial
+Status: Implemented
 Author: bootjp
 Date: 2026-05-28
 
-> **Implementation status.** M1 landed in PR #TBD (the PR opening this
-> document's rename to `partial`). The HLC TLA+ module + `make tla-check`
-> + the gap-config counterexample evidence are now part of the build.
-> M2–M5 (OCC, MVCC, Routes, Composed) remain open per §8. The follow-up
-> Go code changes that strategy (c) and the ceiling fence require (per
-> §5.1 HLC-4 (ii) and (iii)) are tracked as separate issues against
-> `kv/hlc.go`, `kv/sharded_coordinator.go`, and `kv/fsm.go`.
+> **Implementation status.** M1-M5 are landed and guarded by
+> `make tla-check`: HLC, OCC, MVCC, Routes, and Composed all have
+> runnable TLC configs plus gap configs that fail on the expected
+> invariants. On 2026-07-07 the suite was re-run with
+> `tla2tools.jar` v1.8.0 and completed with
+> `tla-check: all model-check outcomes match the design contract.`
+> M6 remains an optional deep/liveness extension and is outside the
+> initial proposal's implemented scope.
 
 ---
 
@@ -621,21 +622,19 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes precondition (i) as a TLA+ `ASSUME` (constant predicate `MaxClockSkewMs < HlcPhysicalWindowMs`), and encodes (ii) and (iii) as **action guards** — strategy (c) lives in the `BecomeLeader` action (`LET maxAppliedHLC == MaxAppliedHLC(fsm[n]) IN hlcLast[n]' = max(hlcLast[n], maxAppliedHLC)`, where `MaxAppliedHLC` is the new FSM operator described in §5.1), and the ceiling-fencing gate lives in the `IssueTimestamp` action (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`). A companion `HLC_gap.tla` + `MCHLC_gap.cfg` pair that removes the `ASSUME` and relaxes those action guards is expected to surface counterexamples; that pair is committed alongside M1 as the motivating evidence that the preconditions are necessary. (TLA+ `ASSUME` is only valid for constant-level predicates, so describing behavioural requirements as `ASSUME`s would produce invalid TLA+; the distinction matters for M1 implementers.) | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
-| **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
-| **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
-| **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
-| **M5** | `composed/Composed.tla` with safety invariants Composed-1..Composed-3. CI integration. | Cross-subsystem spec; TLC at default bounds in <10 min. | Where interaction bugs surface. Safety only; liveness is M6. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Implemented and passing via `tla/hlc/MCHLC.cfg`; `MCHLC_gap.cfg` fails on `HLC4_NoRegressionAcrossTerms` as designed. | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
+| **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | Implemented and passing via `tla/occ/MCOCC.cfg`; `MCOCC_gap.cfg` fails on `OCC1_CommitTsAboveStart` as designed. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. |
+| **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | Implemented and passing via `tla/mvcc/MCMVCC.cfg`; `MCMVCC_gap.cfg` fails on `MVCC4_NoLostCommitOnSnapshotInstall` as designed. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
+| **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Implemented and passing via `tla/routes/MCRoutes.cfg`; `MCRoutes_gap.cfg` fails on `Routes4_NoEngineRegression` as designed. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. |
+| **M5** | `composed/Composed.tla` with safety invariants Composed-1..Composed-3. CI integration. | Implemented and passing via `tla/composed/MCComposed.cfg`; both composed gap configs fail on the expected Composed-1 / Composed-1a invariants. | Where interaction bugs surface. Safety only; deeper liveness remains M6. |
 | **M6** *(optional)* | `tla-check-deep` configuration: larger bounds for `Composed`, plus liveness checking for OCC-L1 and Routes-L1 with their fairness assumptions. | Deeper coverage runnable on a beefier machine / off-CI. | Out of scope of the initial proposal — included only as a placeholder for the follow-up decision. Liveness checking is significantly more expensive than safety checking, hence the deferral. |
 
 ### 8.2 Doc lifecycle
 
-This doc is `proposed` at M1 kickoff. It is renamed to `partial` when M1
-lands (per CLAUDE.md's `*_partial_*.md` convention, since the proposal
-spans multiple milestones). It is renamed to `implemented` when M5's TLC
-run passes in CI on `main` — i.e. when the composed spec is not only
-written but actively guarded by the build, since the protective value of
-the spec depends on it running, not just existing.
+This doc is now `implemented`: M5's composed TLC run passes through
+`make tla-check`, and the workflow guards the spec on PRs / main pushes
+that touch the anchored implementation paths. M6 remains optional and
+does not keep this document in `partial`.
 
 ---
 

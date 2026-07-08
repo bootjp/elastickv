@@ -19,7 +19,7 @@ import (
 // greater than every commit it has previously applied.
 //
 // See:
-//   - docs/design/2026_05_28_partial_tla_safety_spec.md §5.1 HLC-4 (ii)
+//   - docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1 HLC-4 (ii)
 //   - tla/hlc/HLC.tla BecomeLeader_HLC (strategy (c))
 func TestApplyObservesCommitTSIntoHLC(t *testing.T) {
 	st := store.NewMVCCStore()
