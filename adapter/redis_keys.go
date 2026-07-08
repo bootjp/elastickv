@@ -309,6 +309,9 @@ func redisVisibleUserKey(key []byte) []byte {
 	if bytes.HasPrefix(key, redisTxnKeyPrefix) || isRedisTTLKey(key) {
 		return nil
 	}
+	if redisTxnWideFenceUserKey(key) != nil {
+		return nil
+	}
 	// List item keys are visible; meta, delta, and claim keys are internal-only.
 	if store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)

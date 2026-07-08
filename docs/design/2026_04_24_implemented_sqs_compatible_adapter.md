@@ -18,7 +18,7 @@ Elastickv exposes four protocol surfaces as of 2026-04-24:
 3. DynamoDB-compatible HTTP APIs (`adapter/dynamodb.go`)
 4. S3-compatible HTTP APIs (`adapter/s3.go`)
 
-There is no message-queue surface. This document proposes an HTTP adapter that exposes an Amazon SQS-compatible API while reusing the existing Raft, MVCC, HLC, shard-routing, leader-proxy, and SigV4 patterns that the DynamoDB and S3 adapters already established.
+Before this work there was no message-queue surface. This document tracks the HTTP adapter that exposes an Amazon SQS-compatible API while reusing the existing Raft, MVCC, HLC, shard-routing, leader-proxy, and SigV4 patterns that the DynamoDB and S3 adapters already established.
 
 The goal is SQS compatibility for standard AWS SDK/CLI workflows against a self-hosted Elastickv cluster, not AWS feature parity. The adapter should transparently support `aws sqs`, the AWS SDK for Go v2, the JVM SDK, and boto3 against the same endpoint.
 
@@ -463,10 +463,12 @@ New metrics (prefixed `sqs_`):
 5. `sqs_messages_received_total{queue, is_fifo}`
 6. `sqs_messages_deleted_total{queue}`
 7. `sqs_messages_in_flight{queue}`
-8. `sqs_longpoll_waiters{queue}`
-9. `sqs_longpoll_wake_latency_seconds`
-10. `sqs_dlq_redrive_total{queue}`
-11. `sqs_proxy_to_leader_total{op}`
+8. `sqs_throttled_requests_total{queue, action}`
+9. `sqs_throttle_tokens_remaining{queue, action}`
+10. `sqs_longpoll_waiters{queue}`
+11. `sqs_longpoll_wake_latency_seconds`
+12. `sqs_dlq_redrive_total{queue}`
+13. `sqs_proxy_to_leader_total{op}`
 
 Structured log fields match the rest of the project: `queue`, `message_id`, `receipt_token_prefix`, `group_id`, `dedup_id`, `commit_ts`, `leader`.
 
@@ -688,9 +690,9 @@ Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_pre
 
 ### Phase 3
 
-1. Query-protocol full XML fidelity for older SDKs.
+1. Query-protocol XML support for older SDKs is wired for the supported public verbs; see [`2026_04_26_implemented_sqs_query_protocol.md`](2026_04_26_implemented_sqs_query_protocol.md).
 2. `ApproximateNumberOfMessagesDelayed` / `NotVisible` accuracy.
-3. Per-queue throttling and fairness across tenants.
+3. Per-queue throttling has landed; see [`2026_04_26_implemented_sqs_per_queue_throttling.md`](2026_04_26_implemented_sqs_per_queue_throttling.md).
 4. Split-queue FIFO for very hot queues.
 5. Console UI polish: in-flight tab with per-message countdown, filtering, dark mode.
 

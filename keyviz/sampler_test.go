@@ -36,7 +36,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 func TestNilSamplerObserveSafe(t *testing.T) {
 	t.Parallel()
 	var s *MemSampler // nil
-	s.Observe(1, make([]byte, 10), OpRead, 20)
+	s.Observe(1, make([]byte, 10), OpRead, 20, LabelLegacy)
 	if s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("nil RegisterRoute should return false")
 	}
@@ -53,9 +53,9 @@ func TestObserveAndFlushBasic(t *testing.T) {
 	if !s.RegisterRoute(1, []byte("a"), []byte("c"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
-	s.Observe(1, make([]byte, 5), OpRead, 10)
-	s.Observe(1, make([]byte, 5), OpRead, 10)
-	s.Observe(1, make([]byte, 5), OpWrite, 100)
+	s.Observe(1, make([]byte, 5), OpRead, 10, LabelLegacy)
+	s.Observe(1, make([]byte, 5), OpRead, 10, LabelLegacy)
+	s.Observe(1, make([]byte, 5), OpWrite, 100, LabelLegacy)
 
 	s.Flush()
 	clk.Advance(time.Second)
@@ -106,7 +106,7 @@ func TestNoCountsLostAcrossFlush(t *testing.T) {
 					return
 				default:
 				}
-				s.Observe(1, make([]byte, 1), OpRead, 0)
+				s.Observe(1, make([]byte, 1), OpRead, 0, LabelLegacy)
 			}
 		}()
 	}
@@ -141,9 +141,9 @@ func TestNoCountsLostAcrossFlush(t *testing.T) {
 func TestRouteBudgetCoarsensIntoVirtualBucket(t *testing.T) {
 	t.Parallel()
 	s := budgetSetup(t)
-	s.Observe(1, make([]byte, 1), OpRead, 0)
-	s.Observe(2, make([]byte, 1), OpRead, 0)
-	s.Observe(3, make([]byte, 1), OpRead, 0)
+	s.Observe(1, make([]byte, 1), OpRead, 0, LabelLegacy)
+	s.Observe(2, make([]byte, 1), OpRead, 0, LabelLegacy)
+	s.Observe(3, make([]byte, 1), OpRead, 0, LabelLegacy)
 	s.Flush()
 	rows := budgetSingleColumnRows(t, s)
 	agg := findAggregateRow(t, rows)
@@ -200,7 +200,7 @@ func TestSnapshotRangeFilters(t *testing.T) {
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
 	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 5; i++ {
-		s.Observe(1, make([]byte, 0), OpRead, 0)
+		s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 		s.Flush()
 		clk.Advance(time.Second)
 	}
@@ -224,7 +224,7 @@ func TestRingBufferDropsOldest(t *testing.T) {
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 3})
 	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 5; i++ {
-		s.Observe(1, make([]byte, 0), OpRead, 0)
+		s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 		s.Flush()
 		clk.Advance(time.Second)
 	}
@@ -244,9 +244,9 @@ func TestRemoveRouteSilencesObserve(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
 	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
-	s.Observe(1, make([]byte, 0), OpRead, 0)
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.RemoveRoute(1)
-	s.Observe(1, make([]byte, 0), OpRead, 0) // silently dropped
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy) // silently dropped
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	for _, c := range cols {
@@ -266,7 +266,7 @@ func TestRemoveRouteHarvestsPendingCounts(t *testing.T) {
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
 	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 7; i++ {
-		s.Observe(1, make([]byte, 1), OpRead, 0)
+		s.Observe(1, make([]byte, 1), OpRead, 0, LabelLegacy)
 	}
 	// Remove BEFORE flushing — pending 7 reads must surface.
 	s.RemoveRoute(1)
@@ -296,12 +296,12 @@ func TestRemoveVirtualMemberPrunesMemberRoutes(t *testing.T) {
 	// Drain at least once within grace, then advance past grace so the
 	// next Flush actually executes the prune. One more Flush captures
 	// the post-prune MemberRoutes state in a row.
-	s.Observe(3, make([]byte, 1), OpRead, 0)
+	s.Observe(3, make([]byte, 1), OpRead, 0, LabelLegacy)
 	s.Flush()
 	clk.Advance(s.graceWindow() + time.Second)
-	s.Observe(3, make([]byte, 1), OpRead, 0)
+	s.Observe(3, make([]byte, 1), OpRead, 0, LabelLegacy)
 	s.Flush()
-	s.Observe(3, make([]byte, 1), OpRead, 0)
+	s.Observe(3, make([]byte, 1), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	agg := findAggregateRow(t, lastSnapshotColumn(t, s).Rows)
@@ -325,7 +325,7 @@ func TestRemoveVirtualMemberPruneDeferred(t *testing.T) {
 	// so each Flush sees now-retiredAt == 0 < grace and keeps the
 	// prune entry.
 	for i := 0; i < 2; i++ {
-		s.Observe(3, make([]byte, 1), OpRead, 0)
+		s.Observe(3, make([]byte, 1), OpRead, 0, LabelLegacy)
 		s.Flush()
 		col := lastSnapshotColumn(t, s)
 		agg := findAggregateRow(t, col.Rows)
@@ -427,7 +427,7 @@ func TestRegisterDoesNotRaceFlushOnVirtualBucket(t *testing.T) {
 func TestObserveOnUnknownRouteIsNoop(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	s.Observe(42, make([]byte, 0), OpRead, 0)
+	s.Observe(42, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	for _, c := range cols {
@@ -467,7 +467,7 @@ func TestConcurrentRegisterAndObserveRace(t *testing.T) {
 				default:
 				}
 				for i := uint64(1); i <= routes; i++ {
-					s.Observe(i, make([]byte, 0), OpRead, 0)
+					s.Observe(i, make([]byte, 0), OpRead, 0, LabelLegacy)
 					observed.Add(1)
 				}
 			}
@@ -507,7 +507,7 @@ func TestRemoveLastVirtualMemberHarvestsBucket(t *testing.T) {
 	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 over budget should fold into virtual bucket")
 	}
-	s.Observe(2, make([]byte, 5), OpRead, 7)
+	s.Observe(2, make([]byte, 5), OpRead, 7, LabelLegacy)
 	s.RemoveRoute(2)
 	s.Flush()
 
@@ -530,10 +530,10 @@ func TestFlushSortsMixedLiveAndRetiredRows(t *testing.T) {
 	mustRegister(t, s, 1, "a", "b")
 	mustRegister(t, s, 2, "m", "n")
 	mustRegister(t, s, 3, "z", "{")
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.RemoveRoute(2)
-	s.Observe(1, make([]byte, 0), OpRead, 0)
-	s.Observe(3, make([]byte, 0), OpRead, 0)
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
+	s.Observe(3, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 	flushedRowsSorted(t, s)
 }
@@ -551,7 +551,7 @@ func TestRetiredSlotGracePeriod(t *testing.T) {
 	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
-	s.Observe(1, make([]byte, 1), OpRead, 2)
+	s.Observe(1, make([]byte, 1), OpRead, 2, LabelLegacy)
 	s.RemoveRoute(1)
 
 	lateSlot := graceQueueSingleSlot(t, s)
@@ -619,10 +619,10 @@ func TestRegisterFoldLowerStartReorders(t *testing.T) {
 	if s.RegisterRoute(4, []byte("a"), []byte("b"), 0) {
 		t.Fatal("route 4 over budget should fold into virtual bucket")
 	}
-	s.Observe(1, make([]byte, 0), OpRead, 0)
-	s.Observe(2, make([]byte, 0), OpRead, 0)
-	s.Observe(3, make([]byte, 0), OpRead, 0)
-	s.Observe(4, make([]byte, 0), OpRead, 0)
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
+	s.Observe(3, make([]byte, 0), OpRead, 0, LabelLegacy)
+	s.Observe(4, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	rows := flushedRowsSorted(t, s)
@@ -665,7 +665,7 @@ func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	if !s.RegisterRoute(1, []byte("aaaa"), []byte("bbbb"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
-	s.Observe(1, make([]byte, 1), OpRead, 2)
+	s.Observe(1, make([]byte, 1), OpRead, 2, LabelLegacy)
 	s.Flush()
 
 	first := s.Snapshot(time.Time{}, time.Time{})
@@ -702,7 +702,7 @@ func TestVirtualBucketRouteIDIsSynthetic(t *testing.T) {
 	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold into a fresh virtual bucket")
 	}
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	rows := lastSnapshotColumn(t, s).Rows
@@ -739,8 +739,8 @@ func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
 	if s.RegisterRoute(3, []byte("y"), []byte("z"), 0) {
 		t.Fatal("route 3 should fold (same bucket)")
 	}
-	s.Observe(2, make([]byte, 0), OpRead, 0)
-	s.Observe(3, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
+	s.Observe(3, make([]byte, 0), OpRead, 0, LabelLegacy)
 	// Free capacity (route 1) and remove the virtual member (route 3),
 	// which queues a prune against the bucket. Route 2 still keeps the
 	// bucket alive in virtualForRoute.
@@ -753,9 +753,9 @@ func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
 	// Two flushes after grace: the first executes the prune, the
 	// second emits a row with the post-prune MemberRoutes.
 	clk.Advance(s.graceWindow() + time.Second)
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	rows := lastSnapshotColumn(t, s).Rows
@@ -779,10 +779,10 @@ func TestReRegisterIndividualReusesRetiredSlot(t *testing.T) {
 		HistoryColumns: 4,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	s.Observe(1, make([]byte, 0), OpRead, 0)
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.RemoveRoute(1)
 	mustRegister(t, s, 1, "a", "b")
-	s.Observe(1, make([]byte, 0), OpRead, 0)
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	rows := lastSnapshotColumn(t, s).Rows
@@ -824,7 +824,7 @@ func TestReRegisterDuringPruneGraceCancelsPrune(t *testing.T) {
 	}
 
 	clk.Advance(s.graceWindow() + time.Second)
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 
 	rows := lastSnapshotColumn(t, s).Rows
@@ -855,7 +855,7 @@ func TestRegisterRouteCarriesGroupID(t *testing.T) {
 	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 42) {
 		t.Fatal("RegisterRoute returned false")
 	}
-	s.Observe(1, make([]byte, 16), OpWrite, 64)
+	s.Observe(1, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	if len(cols) != 1 || len(cols[0].Rows) != 1 {
@@ -878,12 +878,12 @@ func TestSetLeaderTermStampsRows(t *testing.T) {
 		t.Fatal("RegisterRoute returned false")
 	}
 	s.SetLeaderTerm(7, 100)
-	s.Observe(1, make([]byte, 16), OpWrite, 64)
+	s.Observe(1, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 	clk.Advance(time.Second)
 
 	s.SetLeaderTerm(7, 101)
-	s.Observe(1, make([]byte, 16), OpWrite, 64)
+	s.Observe(1, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 
 	cols := s.Snapshot(time.Time{}, time.Time{})
@@ -919,7 +919,7 @@ func TestSetLeaderTermZeroGroupIDDoesNotPolluteVirtualBucket(t *testing.T) {
 	t.Parallel()
 	s, _ := setupOneIndividualPlusVirtualBucket(t)
 	s.SetLeaderTerm(0, 999) // bug case: caller passes the reserved groupID
-	s.Observe(2, make([]byte, 16), OpWrite, 64)
+	s.Observe(2, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	if len(cols) == 0 {
@@ -963,7 +963,7 @@ func TestVirtualBucketRaftGroupIDIsZero(t *testing.T) {
 	if s.RegisterRoute(2, []byte("c"), []byte("d"), 42) {
 		t.Fatal("route 2 should fold into virtual bucket (group 42, over budget)")
 	}
-	s.Observe(2, make([]byte, 16), OpWrite, 64)
+	s.Observe(2, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	if len(cols) == 0 {
@@ -999,7 +999,7 @@ func TestRegisterRouteSecondCallIgnoresGroupID(t *testing.T) {
 	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 99) {
 		t.Fatal("second RegisterRoute should be a no-op returning true")
 	}
-	s.Observe(1, make([]byte, 16), OpWrite, 64)
+	s.Observe(1, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	if len(cols) != 1 || len(cols[0].Rows) != 1 {
@@ -1094,7 +1094,7 @@ func TestMemberRoutesCappedAtConfiguredCap(t *testing.T) {
 		if s.RegisterRoute(i, key, append(key, 'z'), 0) {
 			t.Fatalf("route %d should fold (over budget)", i)
 		}
-		s.Observe(i, make([]byte, 1), OpRead, 0)
+		s.Observe(i, make([]byte, 1), OpRead, 0, LabelLegacy)
 	}
 	s.Flush()
 	rows := lastSnapshotColumn(t, s).Rows
@@ -1136,7 +1136,7 @@ func TestPastCapMemberRejoinDoesNotInflateTotal(t *testing.T) {
 	if s.RegisterRoute(4, []byte("g"), []byte("h"), 0) {
 		t.Fatal("route 4 should fold (hidden — past cap)")
 	}
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 	beforeTotal := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
 	if beforeTotal != 3 {
@@ -1149,7 +1149,7 @@ func TestPastCapMemberRejoinDoesNotInflateTotal(t *testing.T) {
 	if s.RegisterRoute(3, []byte("e"), []byte("f"), 0) {
 		t.Fatal("route 3 should fold again")
 	}
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 	afterTotal := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
 	if afterTotal != 3 {
@@ -1176,11 +1176,11 @@ func TestPastCapMemberPruneDecrementsTotal(t *testing.T) {
 	if s.RegisterRoute(3, []byte("e"), []byte("f"), 0) {
 		t.Fatal("route 3 should fold (hidden — past cap)")
 	}
-	s.Observe(2, make([]byte, 0), OpRead, 0)
+	s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 	s.Flush()
 	require := func(want uint64, ctx string) {
 		t.Helper()
-		s.Observe(2, make([]byte, 0), OpRead, 0)
+		s.Observe(2, make([]byte, 0), OpRead, 0, LabelLegacy)
 		s.Flush()
 		got := findAggregateRow(t, lastSnapshotColumn(t, s).Rows).MemberRoutesTotal
 		if got != want {
@@ -1206,7 +1206,7 @@ func TestRetiredTailClearedAfterDrop(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
 	mustRegister(t, s, 1, "a", "b")
-	s.Observe(1, make([]byte, 1), OpRead, 1)
+	s.Observe(1, make([]byte, 1), OpRead, 1, LabelLegacy)
 	s.RemoveRoute(1)
 
 	s.retiredMu.Lock()
@@ -1244,7 +1244,7 @@ func BenchmarkObserveHit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		s.Observe(1, make([]byte, 16), OpRead, 64)
+		s.Observe(1, make([]byte, 16), OpRead, 64, LabelLegacy)
 	}
 }
 
@@ -1256,7 +1256,7 @@ func BenchmarkObserveMiss(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		s.Observe(99, make([]byte, 16), OpRead, 64)
+		s.Observe(99, make([]byte, 16), OpRead, 64, LabelLegacy)
 	}
 }
 
@@ -1294,7 +1294,7 @@ func BenchmarkObserveParallel(b *testing.B) {
 		shardBase := (shardIndex * routesPerShard) % numRoutes
 		var i uint64
 		for pb.Next() {
-			s.Observe(shardBase+(i%routesPerShard)+1, make([]byte, 16), OpWrite, 64)
+			s.Observe(shardBase+(i%routesPerShard)+1, make([]byte, 16), OpWrite, 64, LabelLegacy)
 			i++
 		}
 	})
@@ -1361,7 +1361,7 @@ func BenchmarkFlush(b *testing.B) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 		// Pre-seed every slot with traffic so the first Flush has work to swap.
-		s.Observe(r, make([]byte, 16), OpWrite, 64)
+		s.Observe(r, make([]byte, 16), OpWrite, 64, LabelLegacy)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -1371,7 +1371,7 @@ func BenchmarkFlush(b *testing.B) {
 		clk.Advance(time.Second)
 		// Reseed so the next Flush still has counters to drain.
 		for r := uint64(1); r <= numRoutes; r++ {
-			s.Observe(r, make([]byte, 16), OpWrite, 64)
+			s.Observe(r, make([]byte, 16), OpWrite, 64, LabelLegacy)
 		}
 		b.StartTimer()
 	}
@@ -1401,7 +1401,7 @@ func BenchmarkSnapshot(b *testing.B) {
 	}
 	for c := 0; c < numColumns; c++ {
 		for r := uint64(1); r <= numRoutes; r++ {
-			s.Observe(r, make([]byte, 16), OpWrite, 64)
+			s.Observe(r, make([]byte, 16), OpWrite, 64, LabelLegacy)
 		}
 		s.Flush()
 		clk.Advance(time.Second)
@@ -1500,7 +1500,7 @@ func runConcurrentBurst(s *MemSampler, numRoutes uint64, writersPerRoute, opsPer
 				ready.Done()
 				start.Wait()
 				for op := 0; op < opsPerWriter; op++ {
-					s.Observe(routeID, make([]byte, keyLen), OpWrite, valueLen)
+					s.Observe(routeID, make([]byte, keyLen), OpWrite, valueLen, LabelLegacy)
 				}
 			}()
 		}

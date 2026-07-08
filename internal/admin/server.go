@@ -68,7 +68,7 @@ type ServerDeps struct {
 	KeyVizFanout *KeyVizFanout
 
 	// KeyVizHotKeys backs the per-cell Top-K drill-down handler at
-	// /admin/api/v1/keyviz/hotkeys (design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// /admin/api/v1/keyviz/hotkeys (design 2026_05_28_implemented_keyviz_hot_key_topk).
 	// Optional: nil makes the route 503 keyviz_disabled, the same shape
 	// as the matrix route's disabled response. A non-nil source whose
 	// HotKeysOptions() reports enabled=false serves 503 hotkeys_disabled

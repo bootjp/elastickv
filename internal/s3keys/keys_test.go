@@ -278,7 +278,7 @@ func TestBlobPrefixForUpload_IsPrefixOfBlobKeys(t *testing.T) {
 // TestPerBucketPrefixes_IsolateByBucketAndGeneration covers the
 // new *PrefixForBucket helpers used by AdminDeleteBucket's
 // DEL_PREFIX safety net (design doc
-// 2026_04_28_proposed_admin_delete_bucket_safety_net.md). For each
+// 2026_04_28_implemented_admin_delete_bucket_safety_net.md). For each
 // of the six per-bucket key families, the test pins three
 // invariants:
 //
