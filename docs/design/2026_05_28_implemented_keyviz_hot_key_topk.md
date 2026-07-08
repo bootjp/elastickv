@@ -1,8 +1,8 @@
 ---
-status: proposed
+status: implemented
 phase: 2-A++
 parent_design: docs/admin_ui_key_visualizer_design.md
-related_design: docs/design/2026_05_25_proposed_keyviz_subrange_sampling.md
+related_design: docs/design/2026_05_25_implemented_keyviz_subrange_sampling.md
 author: bootjp
 date: 2026-05-28
 ---
@@ -13,7 +13,7 @@ date: 2026-05-28
 
 Phase 2-A+ sub-range sampling (#836 + #841) shows hot **sub-ranges**:
 the heatmap tells you *which region of the key space* is busy. The
-sub-range design (`2026_05_25_proposed_keyviz_subrange_sampling.md` §2.2
+sub-range design (`2026_05_25_implemented_keyviz_subrange_sampling.md` §2.2
 / §8) explicitly deferred naming the actual hottest **keys** —
 "`Top-K can layer on later as a drill-down`." This is that follow-up.
 
