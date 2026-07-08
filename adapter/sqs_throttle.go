@@ -123,6 +123,11 @@ type tokenBucket struct {
 	evicted    bool
 }
 
+type bucketQueueEpoch struct {
+	epoch           atomic.Uint64
+	updatedUnixNano atomic.Int64
+}
+
 // bucketStore holds every active bucket for an SQS server process.
 // sync.Map matches the read-mostly access pattern: lookups are nearly
 // always Load hits; LoadOrStore pays the write cost only on first use.
@@ -132,7 +137,8 @@ type tokenBucket struct {
 // caller of sweep() is the sole goroutine the ticker drives.
 type bucketStore struct {
 	buckets      sync.Map // map[bucketKey]*tokenBucket
-	queueEpochs  sync.Map // map[string]*atomic.Uint64
+	queueEpochMu sync.Mutex
+	queueEpochs  sync.Map // map[string]*bucketQueueEpoch
 	clock        func() time.Time
 	evictedAfter time.Duration
 	sweepEvery   time.Duration
@@ -169,24 +175,29 @@ func (b *bucketStore) queueEpoch(queue string) uint64 {
 	if !ok {
 		return 0
 	}
-	epoch, _ := v.(*atomic.Uint64)
+	epoch, _ := v.(*bucketQueueEpoch)
 	if epoch == nil {
 		return 0
 	}
-	return epoch.Load()
+	return epoch.epoch.Load()
 }
 
 func (b *bucketStore) bumpQueueEpoch(queue string) {
 	if b == nil || queue == "" {
 		return
 	}
-	b.queueEpochCell(queue).Add(1)
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	cell := b.queueEpochCellLocked(queue)
+	cell.epoch.Add(1)
+	cell.updatedUnixNano.Store(b.clock().UnixNano())
 }
 
-func (b *bucketStore) queueEpochCell(queue string) *atomic.Uint64 {
-	fresh := &atomic.Uint64{}
+func (b *bucketStore) queueEpochCellLocked(queue string) *bucketQueueEpoch {
+	fresh := &bucketQueueEpoch{}
+	fresh.updatedUnixNano.Store(b.clock().UnixNano())
 	actual, _ := b.queueEpochs.LoadOrStore(queue, fresh)
-	epoch, _ := actual.(*atomic.Uint64)
+	epoch, _ := actual.(*bucketQueueEpoch)
 	return epoch
 }
 
@@ -497,15 +508,44 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 // bucket.mu, so there is no AB-BA cycle with charge().
 func (b *bucketStore) sweep() {
 	cutoff := b.clock().Add(-b.evictedAfter)
+	queuesWithBuckets := map[string]struct{}{}
 	b.buckets.Range(func(k, v any) bool {
+		key, _ := k.(bucketKey)
 		bucket, _ := v.(*tokenBucket)
 		bucket.mu.Lock()
 		if bucket.lastRefill.Before(cutoff) {
 			if b.buckets.CompareAndDelete(k, v) {
 				bucket.evicted = true
 			}
+		} else {
+			queuesWithBuckets[key.queue] = struct{}{}
 		}
 		bucket.mu.Unlock()
+		return true
+	})
+	b.sweepQueueEpochs(cutoff, queuesWithBuckets)
+}
+
+func (b *bucketStore) sweepQueueEpochs(cutoff time.Time, queuesWithBuckets map[string]struct{}) {
+	if b == nil || b.evictedAfter <= 0 {
+		return
+	}
+	b.queueEpochMu.Lock()
+	defer b.queueEpochMu.Unlock()
+	b.queueEpochs.Range(func(k, v any) bool {
+		queue, _ := k.(string)
+		if _, ok := queuesWithBuckets[queue]; ok {
+			return true
+		}
+		cell, _ := v.(*bucketQueueEpoch)
+		if cell == nil {
+			b.queueEpochs.Delete(k)
+			return true
+		}
+		updated := time.Unix(0, cell.updatedUnixNano.Load())
+		if updated.Before(cutoff) || updated.Equal(cutoff) {
+			b.queueEpochs.Delete(k)
+		}
 		return true
 	})
 }
@@ -668,9 +708,7 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 		return true
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
-	if s.throttle.queueEpoch(queueName) == throttleEpoch {
-		s.observeThrottleDecision(queueName, outcome)
-	}
+	s.observeThrottleDecision(queueName, outcome, s.throttle.queueEpoch(queueName) == throttleEpoch)
 	if outcome.allowed {
 		return true
 	}

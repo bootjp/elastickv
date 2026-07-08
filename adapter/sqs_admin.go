@@ -364,8 +364,9 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 		return errors.Wrap(err, "admin set queue attributes")
 	}
 	if throttleChanged {
+		throttleResetCutoff := s.throttleGaugeSnapshotCutoff()
 		s.throttle.invalidateQueue(name)
-		s.observeThrottleConfigChange(name, throttle, resetActions)
+		s.observeThrottleConfigChange(name, throttle, resetActions, throttleResetCutoff)
 	}
 	return nil
 }

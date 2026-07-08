@@ -232,6 +232,18 @@ type SQSThrottleObserver interface {
 	SyncThrottleActions(queue string, enabledActions []string)
 }
 
+type sqsThrottleRejectionObserver interface {
+	ObserveThrottleRejection(queue string, action string)
+}
+
+type sqsThrottleGaugeCutoffObserver interface {
+	ThrottleGaugeSnapshotCutoff() uint64
+}
+
+type sqsThrottleGaugeResetObserver interface {
+	ForgetThrottleActionBefore(queue string, action string, cutoff uint64)
+}
+
 // SQS metric action labels mirror the values from monitoring/sqs.go.
 // Re-declared so adapter call sites do not need a monitoring import; the
 // observer interface validates the value at runtime so a drift between these
@@ -295,16 +307,25 @@ func (s *SQSServer) observePartitionMessage(queue string, partition uint32, acti
 	s.partitionObserver.ObservePartitionMessage(queue, partition, action)
 }
 
-func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome) {
+func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome, observeTokens bool) {
 	if s == nil || s.throttleObserver == nil {
 		return
 	}
 	if !outcome.bucketPresent && outcome.allowed {
 		return
 	}
+	action := sqsThrottleMetricAction(outcome.action)
+	if !observeTokens {
+		if !outcome.allowed {
+			if observer, ok := s.throttleObserver.(sqsThrottleRejectionObserver); ok {
+				observer.ObserveThrottleRejection(queue, action)
+			}
+		}
+		return
+	}
 	s.throttleObserver.ObserveThrottleDecision(
 		queue,
-		sqsThrottleMetricAction(outcome.action),
+		action,
 		outcome.tokensAfter,
 		!outcome.allowed,
 	)
@@ -317,14 +338,29 @@ func (s *SQSServer) observeThrottleConfig(queue string, throttle *sqsQueueThrott
 	s.throttleObserver.SyncThrottleActions(queue, enabledThrottleMetricActions(throttle))
 }
 
-func (s *SQSServer) observeThrottleConfigChange(queue string, throttle *sqsQueueThrottle, resetActions []string) {
+func (s *SQSServer) observeThrottleConfigChange(queue string, throttle *sqsQueueThrottle, resetActions []string, resetCutoff uint64) {
 	if s == nil || s.throttleObserver == nil {
 		return
 	}
 	s.throttleObserver.SyncThrottleActions(queue, enabledThrottleMetricActions(throttle))
 	for _, action := range resetActions {
+		if observer, ok := s.throttleObserver.(sqsThrottleGaugeResetObserver); ok {
+			observer.ForgetThrottleActionBefore(queue, action, resetCutoff)
+			continue
+		}
 		s.throttleObserver.ForgetThrottleAction(queue, action)
 	}
+}
+
+func (s *SQSServer) throttleGaugeSnapshotCutoff() uint64 {
+	if s == nil || s.throttleObserver == nil {
+		return 0
+	}
+	observer, ok := s.throttleObserver.(sqsThrottleGaugeCutoffObserver)
+	if !ok {
+		return 0
+	}
+	return observer.ThrottleGaugeSnapshotCutoff()
 }
 
 func enabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {

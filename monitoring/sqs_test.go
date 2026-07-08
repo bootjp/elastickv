@@ -213,6 +213,19 @@ func TestSQSMetrics_ObserveThrottleDecision_EmitsCounterAndGauge(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
 }
 
+func TestSQSMetrics_ObserveThrottleRejection_EmitsCounterOnly(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleRejection("orders.fifo", SQSThrottleActionSend)
+
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "stale rejection accounting must not recreate a token gauge")
+}
+
 func TestSQSMetrics_ObserveThrottleDecision_AllowedDoesNotConsumeCounterBudget(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -318,6 +331,32 @@ func TestSQSMetrics_ForgetThrottleAction_DropsGaugeAndFreesSlot(t *testing.T) {
 	require.Empty(t, m.trackedThrottleGaugeQueues, "last disabled action frees the throttle gauge queue slot")
 }
 
+func TestSQSMetrics_ForgetThrottleActionBefore_PreservesFreshActionGauge(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 5, false)
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionReceive, 7, false)
+	cutoff := m.ThrottleGaugeSnapshotCutoff()
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 3, false)
+
+	m.ForgetThrottleActionBefore("orders.fifo", SQSThrottleActionSend, cutoff)
+	m.ForgetThrottleActionBefore("orders.fifo", SQSThrottleActionReceive, cutoff)
+
+	send, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "post-cutoff send gauge must survive reset cleanup")
+	require.InDelta(t, 3.0, send, 0.001)
+	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionReceive,
+	})
+	require.False(t, found, "pre-cutoff receive gauge should still be reset")
+}
+
 func TestSQSMetrics_SyncThrottleActions_DropsDisabledWithoutTraffic(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -392,6 +431,39 @@ func TestSQSMetrics_ForgetThrottleQueue_OverflowThrottleGaugeClearsPerAction(t *
 		"action": SQSThrottleActionReceive,
 	})
 	require.False(t, found, "last overflow receive queue disappearing must drop _other/receive")
+}
+
+func TestSQSMetrics_ThrottleOverflowPromotionPreservesOtherActionGauge(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveThrottleDecision("real-"+strconv.Itoa(i)+".fifo", SQSThrottleActionSend, 1, false)
+	}
+	m.ObserveThrottleDecision("overflow.fifo", SQSThrottleActionSend, 10, false)
+	m.ObserveThrottleDecision("overflow.fifo", SQSThrottleActionReceive, 20, false)
+
+	m.ForgetThrottleQueue("real-0.fifo")
+	m.ObserveThrottleDecision("overflow.fifo", SQSThrottleActionSend, 8, false)
+
+	send, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "overflow.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found, "promoted action should move to the real queue label")
+	require.InDelta(t, 8.0, send, 0.001)
+	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionSend,
+	})
+	require.False(t, found, "the promoted send overflow gauge should be removed")
+	receive, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionReceive,
+	})
+	require.True(t, found, "unrelated receive overflow gauge must survive until receive traffic is promoted")
+	require.InDelta(t, 20.0, receive, 0.001)
 }
 
 // TestSQSMetrics_ObserveQueueDepth_EmitsThreeStates pins that one
@@ -949,9 +1021,11 @@ func TestSQSObserver_ObserveOnce_DepthMissPreservesThrottleGauge(t *testing.T) {
 		ticks: []fakeDepthTick{
 			{snaps: []SQSQueueDepth{{Queue: "orders.fifo", Visible: 1}}, ok: true},
 			{snaps: nil, ok: true},
+			{snaps: nil, ok: true},
 		},
 	}
 
+	obs.ObserveOnce(source)
 	obs.ObserveOnce(source)
 	obs.ObserveOnce(source)
 

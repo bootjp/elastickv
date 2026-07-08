@@ -29,9 +29,10 @@ type throttleSyncReport struct {
 }
 
 type recordingSQSThrottleObserver struct {
-	reports   []throttleObserveReport
-	forgotten []throttleForgetReport
-	syncs     []throttleSyncReport
+	reports    []throttleObserveReport
+	rejections []throttleForgetReport
+	forgotten  []throttleForgetReport
+	syncs      []throttleSyncReport
 }
 
 func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
@@ -41,6 +42,10 @@ func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, act
 		tokensRemaining: tokensRemaining,
 		throttled:       throttled,
 	})
+}
+
+func (r *recordingSQSThrottleObserver) ObserveThrottleRejection(queue string, action string) {
+	r.rejections = append(r.rejections, throttleForgetReport{queue: queue, action: action})
 }
 
 func (r *recordingSQSThrottleObserver) ForgetThrottleAction(queue string, action string) {
@@ -148,6 +153,23 @@ func TestSQSServer_ChargeQueueWithThrottleSkipsStaleMetricAfterInvalidate(t *tes
 	require.Len(t, observer.reports, 1, "fresh post-invalidation snapshot may publish the new token gauge")
 	require.Equal(t, "orders.fifo", observer.reports[0].queue)
 	require.Equal(t, SQSThrottleActionSend, observer.reports[0].action)
+}
+
+func TestSQSServer_ChargeQueueWithThrottleCountsStaleRejectionAfterInvalidate(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	srv.throttle = newBucketStore(func() time.Time { return now }, throttleIdleEvictAfter)
+	cfg := &sqsQueueThrottle{SendCapacity: 1, SendRefillPerSecond: 1}
+
+	staleEpoch := srv.throttle.queueEpoch("orders.fifo")
+	srv.throttle.invalidateQueue("orders.fifo")
+
+	rec := httptest.NewRecorder()
+	require.False(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 2, cfg, 1, staleEpoch))
+	require.Empty(t, observer.reports, "stale pre-invalidation snapshot must not recreate a reset token gauge")
+	require.Equal(t, []throttleForgetReport{{queue: "orders.fifo", action: SQSThrottleActionSend}}, observer.rejections)
 }
 
 // TestBucketStore_Empty_ShortCircuit covers the post-validator
@@ -767,6 +789,22 @@ func TestBucketStore_InvalidateQueueClearsAllIncarnations(t *testing.T) {
 	require.True(t, hasEvents, "unrelated queue must not be evicted")
 }
 
+func TestBucketStore_SweepEvictsIdleQueueEpochs(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Minute)
+
+	store.invalidateQueue("orders")
+	require.Equal(t, uint64(1), store.queueEpoch("orders"))
+	require.Equal(t, 1, countQueueEpochs(store))
+
+	now = now.Add(2 * time.Minute)
+	store.sweep()
+
+	require.Equal(t, uint64(0), store.queueEpoch("orders"))
+	require.Equal(t, 0, countQueueEpochs(store), "idle epoch cells must not grow without bound under queue churn")
+}
+
 // TestBucketStore_PurgeQueueDoesNotResetBucket pins the
 // PurgeQueue-bypass guard: PurgeQueue bumps sqsQueueMeta.Generation
 // but preserves Incarnation, and the throttle bucket keys by Incarnation.
@@ -803,6 +841,15 @@ func TestBucketStore_PurgeQueueDoesNotResetBucket(t *testing.T) {
 func countBuckets(b *bucketStore) int {
 	n := 0
 	b.buckets.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func countQueueEpochs(b *bucketStore) int {
+	n := 0
+	b.queueEpochs.Range(func(_, _ any) bool {
 		n++
 		return true
 	})

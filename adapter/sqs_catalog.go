@@ -1049,8 +1049,9 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// return path above, which exits before this point) guarantees
 	// the new queue starts with a fresh full-capacity bucket
 	// regardless of in-flight traffic to the prior incarnation.
+	throttleResetCutoff := s.throttleGaugeSnapshotCutoff()
 	s.throttle.invalidateQueue(requested.Name)
-	s.observeThrottleConfigChange(requested.Name, requested.Throttle, enabledThrottleMetricActions(requested.Throttle))
+	s.observeThrottleConfigChange(requested.Name, requested.Throttle, enabledThrottleMetricActions(requested.Throttle), throttleResetCutoff)
 	// Mirror the throttle invalidate for the per-queue fanout-rotation
 	// counter. A delete-then-create race could otherwise leave the
 	// new queue starting partitioned receives at the previous
@@ -1539,8 +1540,9 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	// (e.g. via a future admin path), so the gating here is purely a
 	// hot-path optimisation plus a no-op-bypass guard.
 	if throttleChanged {
+		throttleResetCutoff := s.throttleGaugeSnapshotCutoff()
 		s.throttle.invalidateQueue(name)
-		s.observeThrottleConfigChange(name, throttle, resetActions)
+		s.observeThrottleConfigChange(name, throttle, resetActions, throttleResetCutoff)
 	}
 	writeSQSJSON(w, map[string]any{})
 }
