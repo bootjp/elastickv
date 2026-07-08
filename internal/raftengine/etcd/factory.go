@@ -64,6 +64,7 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 		LocalAddress:      cfg.LocalAddress,
 		DataDir:           cfg.DataDir,
 		Peers:             peers,
+		BootstrapSeed:     peersFromServers(cfg.BootstrapSeed),
 		Bootstrap:         cfg.Bootstrap,
 		JoinAsLearner:     cfg.JoinAsLearner,
 		Transport:         transport,

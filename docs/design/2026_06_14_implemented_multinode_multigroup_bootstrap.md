@@ -1,6 +1,6 @@
 # Multi-node multi-group bootstrap — standing up N nodes × M Raft groups at startup
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-06-14
 Date source: first add commit introducing this proposal in PR #955's review cycle, aligned with the filename propose date.
@@ -9,9 +9,16 @@ Sibling / prerequisite-for:
 - [Leader-balance scheduler design PR #953](https://github.com/bootjp/elastickv/pull/953) §1.1a (PR0) + OQ-9 — this doc **is** that PR0. The leader-balance scheduler's transfer-issuing milestones (PR2/PR3) are blocked on a Raft group whose voter set spans more than one node; that topology cannot be declared at startup today, and OQ-9 resolved "option (a): extend the bootstrap/flag surface." This document is the design for option (a).
 - [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md) Milestone 2 — cross-group range migration testing also needs ≥2 nodes hosting the same group to be meaningful (see §7).
 
+Implementation status (2026-07-07):
+- PR-A/B/C are implemented in-tree. The server accepts `--raftGroupPeers`, validates the per-group `raftID@host:port` grammar, enforces homogeneous v1 voter membership, and rejects mixed `--raftBootstrapMembers` + `--raftGroupPeers` configs.
+- `buildShardGroups` / `buildRuntimeForGroup` now pass group-specific bootstrap peers into each raft engine while preserving the legacy `--raftBootstrapMembers` single-group path.
+- etcd raft peer metadata is v3: it persists the original `--raftGroupPeers` bootstrap seed plus a `BootstrapSeedActive` marker, rejects divergent active seeds on restart, and flips the marker inactive after committed membership changes.
+- `TestRaftGroupPeers_E2E_MultiNodeMultiGroupBootstrap` stands up 3 nodes × 2 groups, verifies 3 voters per group, transfers leadership between nodes within a group, restarts a node, and verifies it rejoins both groups.
+- The true multi-node multi-group Jepsen runner remains a follow-on milestone (§6.3 / PR-D), not part of this v1 implementation.
+
 ## 1. Background
 
-### 1.1 The gap: a real multi-node deployment can only run single-group today
+### 1.1 The pre-implementation gap: a real multi-node deployment could only run single-group
 
 elastickv runs multiple Raft groups in one process (`--raftGroups id=addr,id=addr,…`, parsed by `parseRaftGroups`, `shard_config.go:61-99`; default group is the lowest ID, `defaultGroupID`, `shard_config.go:386-397`). Each group gets its own `raftGroupRuntime` with its own engine and its own gRPC listener at `rt.spec.address` (`startRaftServers`, `main.go:1610-1620`). This is a genuine multi-Raft-group runtime — **within one process**. What does **not** exist is the ability to spread any single group's voters across more than one node. Verified at file:line on `main`:
 
@@ -35,7 +42,7 @@ The single-group multi-node path is fully built and is the template this design 
 - **`cmd/server/demo.go` already stands up 3 nodes that bootstrap one shared group.** All three node configs set `raftBootstrap=true` and receive the **same** `raftPeers` list (all three `{Suffrage:"voter", ID, Address}`), `cmd/server/demo.go:180-219`. The comment at `:215-219` records the key etcd requirement: *"every member of a fresh cluster must bootstrap with the same peer list."* This is exactly the per-group bootstrap discipline §3 generalizes to M groups.
 - **Per-group data dir + `raft-engine` marker is already per-group.** `groupDataDir(baseDir, raftID, groupID, multi)` returns `…/raftID/group-N` in multi mode (`multiraft_runtime.go:110-115`); `ensureRaftEngineDataDir` writes/reads the `raft-engine` marker and refuses an engine mismatch *per dir* (`multiraft_runtime.go:117-151`). So idempotent-restart detection is already per group.
 
-The only missing piece is a **flag/parse/wiring path that gives each group its own multi-node voter set at bootstrap** instead of a single shared list rejected for multi-group.
+The missing piece this implementation adds is a **flag/parse/wiring path that gives each group its own multi-node voter set at bootstrap** instead of a single shared list rejected for multi-group.
 
 ## 2. Goals and Non-Goals
 
@@ -205,15 +212,15 @@ Extend the multi-node story to Jepsen as a **later milestone** (noted, not v1): 
 
 | PR | Scope | Tests | Shippable alone? |
 |---|---|---|---|
-| **PR-A** | Flag + parse + validation: `--raftGroupPeers`, the §3.1 grammar and all validation rules, mutual-exclusion with `--raftBootstrapMembers`. No wiring change yet (parsed result unused). | Unit (§6.1) flag-parse table tests. | Yes — pure parsing, zero behavior change (result unconsumed). |
-| **PR-B** | Wiring: add the `--raftGroupPeers` resolver alongside the existing `resolveBootstrapServers` path, preserving the `--raftBootstrapMembers` single-group guard; thread the static per-group peer map through `buildShardGroups`/`buildRuntimeForGroup`; replace the process-wide `bootstrap bool` decision with per-group bootstrap derived from whether that group has a resolved peer list; seed Admin discovery from the canonical group in that peer map; extend persisted-peers metadata with the stored bootstrap seed plus bootstrap-era marker; validate the flag-supplied bootstrap seed against that stored seed before adopting persisted state while the marker is active, but preserve live-expanded persisted peers after conf changes by flipping the marker inactive. Each group now opens multi-voter. | Unit (§6.1) per-group resolution + Admin discovery seed + restart idempotency; smoke that a 2-group config opens 2 transports and `GetClusterOverview` lists remote members. | After PR-A — the core capability. |
-| **PR-C** | In-process 3-node × 2-group integration harness (§6.2) + the leader-transfer-between-nodes smoke. | Integration (§6.2). | After PR-B — the deliverable #953 PR0 / hotspot-M2 need. |
+| **PR-A** | Flag + parse + validation: `--raftGroupPeers`, the §3.1 grammar and all validation rules, mutual-exclusion with `--raftBootstrapMembers`. | Implemented: `TestParseRaftGroupPeers`, `TestResolveBootstrapConfigGroupPeers`. | Shipped. |
+| **PR-B** | Wiring: add the `--raftGroupPeers` resolver alongside the existing `resolveBootstrapServers` path, preserving the `--raftBootstrapMembers` single-group guard; thread the static per-group peer map through `buildShardGroups`/`buildRuntimeForGroup`; replace the process-wide `bootstrap bool` decision with per-group bootstrap derived from whether that group has a resolved peer list; seed Admin discovery from the canonical group in that peer map; extend persisted-peers metadata with the stored bootstrap seed plus bootstrap-era marker; validate the flag-supplied bootstrap seed against that stored seed before adopting persisted state while the marker is active, but preserve live-expanded persisted peers after conf changes by flipping the marker inactive. Each group now opens multi-voter. | Implemented: per-group resolver tests, `TestPersistedPeersBootstrapSeedRoundTripAndDeactivate`, `TestValidateBootstrapSeedActiveMismatchRejected`. | Shipped. |
+| **PR-C** | In-process 3-node × 2-group integration harness (§6.2) + the leader-transfer-between-nodes smoke. | Implemented: `TestRaftGroupPeers_E2E_MultiNodeMultiGroupBootstrap`. | Shipped. |
 | **PR-D (later)** | Jepsen: true multi-node multi-group runner (§6.3). | Existing workloads, no-new-anomalies bar. | After PR-C; the "M6+" item. |
 
 Each PR carries the five-lens self-review (CLAUDE.md). Lens highlights for this change: **data loss** — restart must never re-bootstrap over committed data (existing-WAL path bypasses bootstrap, and PR-B validates the bootstrap seed before adopting bootstrap-era persisted peers, §3.2); **concurrency/distributed** — any node-start order must form each group (all-same-list model, §3.2), partial-quorum bootstrap recovers; **data consistency** — a divergent `--raftGroupPeers` before live membership changes fails fast, while committed RaftAdmin membership changes remain authoritative on restart.
 
 ### 6.5 Doc lifecycle
-`*_proposed_*` → `*_partial_*` after PR-B (the topology is deployable) → `*_implemented_*` after PR-C (integration harness lands). `git mv`, propose date fixed.
+`*_implemented_*` as of 2026-07-07. PR-A/B/C are in-tree; PR-D remains a follow-on Jepsen runner rather than part of this v1 lifecycle.
 
 ## 7. Cross-doc impact (explicit)
 
@@ -221,19 +228,15 @@ Each PR carries the five-lens self-review (CLAUDE.md). Lens highlights for this 
 - **Unblocks hotspot-split Milestone 2 cross-group migration testing (#945).** Cross-group range migration is only meaningfully testable when the source and destination groups each have voters on ≥2 nodes (so migration races real replication, not a single in-process voter). The §6.2 harness provides that; M2's migration tests can build on it.
 - **No change to leader-balance's own design.** This doc resolves #953 OQ-9 with option (a) as #953 recommended; it does not alter the scheduler's policy, transfer mechanism, or proto extension.
 
-## 8. Open Questions
+## 8. Resolved Decisions and Follow-ons
 
-1. **OQ-1 — Flag spelling: `--raftGroupPeers` companion flag vs. extending `--raftGroups` entries.** §3.1 recommends the companion flag (clean separation of "my listener" vs. "the voter set"; mirrors single-group `--raftBootstrapMembers`). Confirm before PR-A, since it fixes the operator-facing surface.
-2. **OQ-2 — Should `--raftBootstrap` be *required* alongside `--raftGroupPeers`, or implied?** §3.2 recommends implied (non-empty `--raftGroupPeers` ⇒ bootstrap=true per group, matching `bootstrap = *raftBootstrap || len(bootstrapServers) > 0`, `main.go:534`). Alternative: require `--raftBootstrap` explicitly for symmetry with single-group. Confirm before PR-B.
-3. **OQ-3 — Per-group bootstrap-server carrier: `map[uint64][]Server`.** Resolved here: use a static map built during startup validation and thread that through `buildShardGroups`/`buildRuntimeForGroup` (`main.go:777`, `multiraft_runtime.go:234`). The group set is fixed at startup, so a function provider adds no value until a runtime update path exists.
-4. **OQ-4 — Heterogeneous group membership (groups on a subset of nodes).** v1 enforces homogeneity (§3.1 rule 4) to match #953 §2.2. The `raftID@host:port` member syntax already expresses arbitrary per-group sets, so relaxing rule 4 later needs no grammar change — but #953's observation/forward paths assume homogeneity, so we keep the guard until a consumer needs otherwise. Should the validator's homogeneity check be a hard error (v1) or a warning that allows heterogeneous sets for advanced operators? (Recommendation: hard error in v1.)
-5. **OQ-5 — Mixed bootstrap + learner start.** `--raftJoinAsLearner` (`buildRuntimeForGroup`'s `joinAsLearner`, `multiraft_runtime.go:238`) lets a node join an existing cluster as a learner. Should `--raftGroupPeers` interoperate with a per-group learner bootstrap (some members start as learners, promoted later), or is learner-join strictly a live-expansion concern (§5)? (Recommendation: learners are live-expansion only in v1; `--raftGroupPeers` declares voters.)
-6. **OQ-6 — Single shared raft listener multiplexing all groups.** §3.4 keeps one listener per group (the `5005{1..6}` convention). Is the per-group-port model acceptable at the target scale, or is a single multiplexed raft listener (demux by group ID) worth the transport change for very high M? (Recommendation: per-group ports for v1; revisit only if port count becomes an operational problem.)
+1. **OQ-1 — Flag spelling:** resolved as the companion `--raftGroupPeers` flag.
+2. **OQ-2 — Bootstrap flag interaction:** resolved as implied bootstrap; non-empty `--raftGroupPeers` makes the configured groups bootstrap with their full peer list.
+3. **OQ-3 — Per-group bootstrap-server carrier:** resolved as a static `map[uint64][]Server` carried through startup validation and runtime construction.
+4. **OQ-4 — Heterogeneous group membership:** v1 hard-errors on heterogeneous voter sets. The grammar can express heterogeneity later, but the current leader-balance consumer assumes homogeneity.
+5. **OQ-5 — Mixed bootstrap + learner start:** learners remain live-expansion only in v1; `--raftGroupPeers` declares voters.
+6. **OQ-6 — Shared raft listener:** v1 keeps one listener per group. A shared multiplexed raft listener remains a future operational optimization if port count becomes a real problem.
 
 ## 9. Lifecycle
 
-This document begins as `*_proposed_*`. Per CLAUDE.md / `docs/design/README.md`:
-- Rename to `*_partial_*` after PR-B (multi-voter groups deployable at startup), recording which PRs shipped.
-- Rename to `*_implemented_*` after PR-C (in-process integration harness landed), with the Jepsen runner (PR-D) tracked as a follow-on.
-
-Use `git mv` so history follows the rename. The propose date (2026-06-14) and slug stay fixed.
+This document is now `*_implemented_*`. The propose date (2026-06-14) and slug stay fixed. The Jepsen runner (PR-D) is tracked as a follow-on, not a blocker for implemented status.

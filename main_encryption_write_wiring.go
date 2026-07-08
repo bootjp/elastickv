@@ -28,7 +28,7 @@ func buildShardGroupsWithEncryptionWiring(
 	defaultGroup uint64,
 	multi bool,
 	bootstrap bool,
-	bootstrapServers []raftengine.Server,
+	bootstrapCfg raftBootstrapConfig,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -47,7 +47,7 @@ func buildShardGroupsWithEncryptionWiring(
 		defaultGroup:      defaultGroup,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: encryptionEnabled,
-		bootstrapServers:  bootstrapServers,
+		bootstrapServers:  bootstrapCfg.adminSeed(defaultGroup),
 	}); guardErr != nil {
 		return nil, nil, encryptionWriteWiring{}, guardErr
 	}
@@ -56,7 +56,7 @@ func buildShardGroupsWithEncryptionWiring(
 		return nil, nil, encryptionWriteWiring{}, err
 	}
 	configureRaftEnvelopeFactory(factory, encWiring)
-	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
+	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapCfg,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine, applyObserver)
 	if err != nil {
 		return runtimes, shardGroups, encWiring, err
