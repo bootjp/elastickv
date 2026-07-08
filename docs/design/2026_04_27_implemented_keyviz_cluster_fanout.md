@@ -270,7 +270,7 @@ no breaking changes — old SPA versions keep working):
       "bucket_id": "route:42",
       ...,
       "values": [...],
-      "conflict": false,     // OR of conflicts[]
+      "conflict": true,      // OR of conflicts[]
       "conflicts": [false, true, false],
       "raft_group_ids": [7, 7, 7],
       "leader_terms": [42, 43, 43]
@@ -308,7 +308,10 @@ absence means `false`. Only the fan-out aggregator sets
 `conflict = true` or allocates `conflicts[]`; in local-only mode and
 cleanly merged rows, both `conflict` and `conflicts` are omitted.
 `raft_group_ids[]` and `leader_terms[]` are omitted only for legacy
-peers or rows whose identity is unknown.
+peers that do not emit per-column identity. Current JSON responses
+still allocate arrays parallel to `values[]`; unknown identity is
+represented by zero entries, matching `proto/admin.proto`'s
+"term not tracked" sentinel.
 
 ## 6. SPA changes
 
