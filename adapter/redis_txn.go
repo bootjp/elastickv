@@ -142,11 +142,12 @@ type listTxnState struct {
 }
 
 type hashTxnState struct {
-	fields     map[string][]byte
-	origFields map[string][]byte
-	legacy     bool
-	deleted    bool
-	dirty      bool
+	fields      map[string][]byte
+	origFields  map[string][]byte
+	dirtyFields map[string]struct{}
+	legacy      bool
+	deleted     bool
+	dirty       bool
 }
 
 type zsetTxnState struct {
@@ -389,13 +390,14 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	return st, nil
 }
 
-func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
+func (t *txnContext) loadHashStateForFields(key []byte, fields [][]byte) (*hashTxnState, error) {
 	k := string(key)
 	if t.hashStates == nil {
 		t.hashStates = map[string]*hashTxnState{}
 	}
 	if st, ok := t.hashStates[k]; ok {
-		return reviveDeletedHashState(st), nil
+		st = reviveDeletedHashState(st)
+		return st, t.loadHashFieldsIntoState(key, fields, st)
 	}
 	if _, deleted := t.deletedKeys[k]; deleted {
 		return t.storeEmptyHashState(k), nil
@@ -403,13 +405,17 @@ func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
 	if st, err := t.loadExpiredHashAsEmpty(key, k); err != nil || st != nil {
 		return st, err
 	}
-	return t.loadExistingHashState(key, k)
+	if len(fields) == 0 {
+		return t.loadExistingHashState(key, k)
+	}
+	return t.loadExistingHashFieldState(key, k, fields)
 }
 
 func reviveDeletedHashState(st *hashTxnState) *hashTxnState {
 	if st.deleted {
 		st.fields = map[string][]byte{}
 		st.origFields = map[string][]byte{}
+		st.dirtyFields = map[string]struct{}{}
 		st.legacy = false
 		st.deleted = false
 		st.dirty = true
@@ -419,9 +425,10 @@ func reviveDeletedHashState(st *hashTxnState) *hashTxnState {
 
 func (t *txnContext) storeEmptyHashState(key string) *hashTxnState {
 	st := &hashTxnState{
-		fields:     map[string][]byte{},
-		origFields: map[string][]byte{},
-		dirty:      true,
+		fields:      map[string][]byte{},
+		origFields:  map[string][]byte{},
+		dirtyFields: map[string]struct{}{},
+		dirty:       true,
 	}
 	t.hashStates[key] = st
 	return st
@@ -454,12 +461,67 @@ func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashT
 		return nil, errors.WithStack(err)
 	}
 	st := &hashTxnState{
-		fields:     fields,
-		origFields: origFields,
-		legacy:     legacy,
+		fields:      fields,
+		origFields:  origFields,
+		dirtyFields: map[string]struct{}{},
+		legacy:      legacy,
 	}
 	t.hashStates[keyString] = st
 	return st, nil
+}
+
+func (t *txnContext) loadExistingHashFieldState(key []byte, keyString string, fields [][]byte) (*hashTxnState, error) {
+	ctx := t.ctxOrBackground()
+	t.trackReadKey(redisTxnWideHashFenceKey(key))
+	wide, err := t.server.prefixExistsAt(ctx, store.HashFieldScanPrefix(key), t.startTS)
+	if err != nil {
+		return nil, err
+	}
+	if !wide {
+		legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if legacy {
+			return t.loadExistingHashState(key, keyString)
+		}
+	}
+	st := &hashTxnState{
+		fields:      map[string][]byte{},
+		origFields:  map[string][]byte{},
+		dirtyFields: map[string]struct{}{},
+	}
+	t.hashStates[keyString] = st
+	if err := t.loadHashFieldsIntoState(key, fields, st); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func (t *txnContext) loadHashFieldsIntoState(key []byte, fields [][]byte, st *hashTxnState) error {
+	if st.legacy {
+		return nil
+	}
+	ctx := t.ctxOrBackground()
+	for _, field := range fields {
+		fieldName := string(field)
+		if _, loaded := st.origFields[fieldName]; loaded {
+			continue
+		}
+		if _, staged := st.fields[fieldName]; staged {
+			continue
+		}
+		raw, err := t.server.store.GetAt(ctx, store.HashFieldKey(key, field), t.startTS)
+		if err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				continue
+			}
+			return errors.WithStack(err)
+		}
+		st.fields[fieldName] = bytes.Clone(raw)
+		st.origFields[fieldName] = bytes.Clone(raw)
+	}
+	return nil
 }
 
 func (t *txnContext) listLength(st *listTxnState) int64 {
@@ -868,7 +930,8 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 	t.trackMissingKeyCreatorFenceReads(cmd.Args[1], typ)
-	st, err := t.loadHashState(cmd.Args[1])
+	fields := hashCommandFields(cmd.Args[2:])
+	st, err := t.loadHashStateForFields(cmd.Args[1], fields)
 	if err != nil {
 		return redisResult{}, err
 	}
@@ -879,6 +942,7 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 			added++
 		}
 		st.fields[field] = bytes.Clone(cmd.Args[i+1])
+		st.dirtyFields[field] = struct{}{}
 	}
 	st.deleted = false
 	st.dirty = true
@@ -887,6 +951,14 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 		return redisResult{typ: resultString, str: "OK"}, nil
 	}
 	return redisResult{typ: resultInt, integer: added}, nil
+}
+
+func hashCommandFields(args [][]byte) [][]byte {
+	fields := make([][]byte, 0, len(args)/redisPairWidth)
+	for i := 0; i < len(args); i += redisPairWidth {
+		fields = append(fields, args[i])
+	}
+	return fields
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
@@ -1827,12 +1899,9 @@ func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, s
 
 func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTxnState) ([]*kv.Elem[kv.OP], int64) {
 	var newFields int64
-	for _, field := range sortedHashFieldNames(st.fields) {
+	for _, field := range sortedHashDirtyFieldNames(st.dirtyFields) {
 		value := st.fields[field]
-		old, existed := st.origFields[field]
-		if existed && bytes.Equal(old, value) {
-			continue
-		}
+		_, existed := st.origFields[field]
 		if !existed {
 			newFields++
 		}
@@ -1882,6 +1951,15 @@ func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Ele
 }
 
 func sortedHashFieldNames(fields map[string][]byte) []string {
+	names := make([]string, 0, len(fields))
+	for field := range fields {
+		names = append(names, field)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedHashDirtyFieldNames(fields map[string]struct{}) []string {
 	names := make([]string, 0, len(fields))
 	for field := range fields {
 		names = append(names, field)

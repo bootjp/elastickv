@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -369,6 +370,37 @@ func TestRedisTxnMissingKeyCreatorsReadAllWideFences(t *testing.T) {
 			requireTxnReadKeysContainWideFences(t, txn, key)
 		})
 	}
+}
+
+func TestRedisStandaloneHSetDedupAvoidsWideHashMaterializationLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("hash:oversized-wide")
+
+	for i := 0; i <= maxWideColumnItems; i++ {
+		field := []byte(fmt.Sprintf("field:%06d", i))
+		require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, field), []byte("v"), redisTxnTestStartTS, 0))
+	}
+	coord.Clock().Observe(redisTxnTestStartTS)
+
+	_, err := server.loadHashAt(ctx, key, redisTxnTestStartTS)
+	require.ErrorIs(t, err, ErrCollectionTooLarge)
+
+	results, err := server.runTransactionWithDedup([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdHSet), key, []byte("new-field"), []byte("new-value")},
+	}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, resultInt, results[0].typ)
+	require.Equal(t, int64(1), results[0].integer)
+
+	raw, err := st.GetAt(ctx, store.HashFieldKey(key, []byte("new-field")), server.readTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("new-value"), raw)
 }
 
 func requireTxnReadKeysContainWideFences(t *testing.T, txn *txnContext, key []byte) {
