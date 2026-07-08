@@ -217,7 +217,7 @@ hydrate+bump is gated on an active DEK:
   `ErrKeyConflict` only if the KEK-unwrap produced different bytes for
   the same id — a halt condition surfaced as a startup failure.
 
-## 4. Self-review checklist (to satisfy on the implementation PR)
+## 4. Self-review checklist
 
 - **Data loss** — hydration/bump never delete a DEK or a committed
   write; bump consumes epochs monotonically.

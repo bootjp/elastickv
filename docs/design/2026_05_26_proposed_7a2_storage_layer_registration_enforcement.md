@@ -244,9 +244,9 @@ direct path is `pebbleStore.ApplyMutations`. It is reached by:
     **MVCCStore-interface forwarders** (`kv/shard_store.go`,
     `kv/leader_routed_store.go`) which simply delegate to the
     underlying `pebbleStore.ApplyMutations` — no production hot-path
-    caller of these forwarders was found (grep of `adapter/`, `kv/`,
-    `main*.go`), but they are live entry points the implementation's
-    §5 verification must re-confirm.
+    caller of these forwarders was found in `adapter/`, `kv/`, or
+    `main*.go`; §5 records the final `encryptForKey` call-site
+    inventory used for the implementation audit.
 "admin snapshot" and "migration" are *anticipated future* direct-path
 callers named by the `lsm_store.go` doc comment as the design-time
 category, not code that exists yet. So the implementation wires the
@@ -275,7 +275,7 @@ forwarder callers before merge.
   (it is, incidentally, when the envelope is active; changing that is a
   separate question).
 
-## 4. Self-review checklist (for the implementation PR)
+## 4. Self-review checklist
 - **Data loss** — gating only refuses to *emit* an encrypted write
   before registration (caller sees a typed error and retries); never
   drops a committed write. FSM-apply path untouched → no apply halt.
@@ -305,5 +305,10 @@ forwarder callers before merge.
    `PutAt`, and tombstone-only delete paths do not call `encryptForKey`.
 3. **Per-DEK state resolved.** §2.1 adopts
    `registeredStorageDEKID atomic.Uint32`, lock-free and composing with
-   the 7b cutover watcher. The 7b' rotation case remains a separate
-   follow-up.
+   the 7b cutover watcher and the 7b' rotation watcher.
+4. **Test coverage landed.** `store/lsm_store_registration_gate_test.go`
+   covers direct-path fail-closed behavior, FSM-apply exemption,
+   inactive-envelope ungating, and legacy unwired behavior;
+   `main_encryption_write_wiring_test.go` covers production wiring of
+   `WithStorageRegistrationGate`; `main_encryption_registration_test.go`
+   covers barrier release and already-registered restart seeding.
