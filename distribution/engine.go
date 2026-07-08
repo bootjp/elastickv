@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
 )
@@ -33,7 +34,7 @@ type Engine struct {
 	mu             sync.RWMutex
 	routes         []Route
 	catalogVersion uint64
-	ts             uint64
+	ts             atomic.Uint64
 	// history is the M2 versioned-snapshot ring for Composed-1
 	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 	// §M2).  Keyed by catalogVersion; populated on every successful
@@ -330,10 +331,7 @@ func (e *Engine) GetRoute(key []byte) (Route, bool) {
 
 // NextTimestamp returns a monotonic increasing timestamp.
 func (e *Engine) NextTimestamp() uint64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.ts++
-	return e.ts
+	return e.ts.Add(1)
 }
 
 // Stats returns a snapshot of current ranges and their load counters.
