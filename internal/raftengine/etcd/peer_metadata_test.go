@@ -135,6 +135,39 @@ func TestPersistedPeersBootstrapSeedRoundTripAndDeactivate(t *testing.T) {
 	require.Equal(t, changed, state.Peers)
 }
 
+func TestPersistedPeersSnapshotSaveDeactivatesChangedBootstrapSeed(t *testing.T) {
+	dir := t.TempDir()
+	seed := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+	}
+
+	require.NoError(t, savePersistedPeersWithBootstrapSeed(dir, 1, seed, seed))
+
+	reorderedSeed := []Peer{
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+	}
+	require.NoError(t, savePersistedPeers(dir, 2, reorderedSeed))
+	state, ok, err := loadPersistedPeersState(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, state.BootstrapSeedActive)
+	require.Equal(t, seed, state.BootstrapSeed)
+
+	changed := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:7003", Suffrage: SuffrageVoter},
+	}
+	require.NoError(t, savePersistedPeers(dir, 3, changed))
+	state, ok, err = loadPersistedPeersState(dir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, state.BootstrapSeedActive)
+	require.Equal(t, seed, state.BootstrapSeed)
+	require.Equal(t, changed, state.Peers)
+}
+
 func TestValidateBootstrapSeedActiveMismatchRejected(t *testing.T) {
 	seed := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},

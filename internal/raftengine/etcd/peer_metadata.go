@@ -82,6 +82,9 @@ func savePersistedPeersWithBootstrapSeed(dataDir string, index uint64, peers []P
 	if ok {
 		state.BootstrapSeed = current.BootstrapSeed
 		state.BootstrapSeedActive = current.BootstrapSeedActive
+		if state.BootstrapSeedActive && !samePeerList(state.Peers, state.BootstrapSeed) {
+			state.BootstrapSeedActive = false
+		}
 	} else if len(bootstrapSeed) > 0 {
 		normalizedSeed, err := normalizePersistedPeers(bootstrapSeed)
 		if err != nil {
