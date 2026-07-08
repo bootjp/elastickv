@@ -1060,6 +1060,10 @@ type sqsMsgCandidate struct {
 	partition uint32
 }
 
+type sqsGroupScanner interface {
+	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
 // sqsVisScanWallClockBudget caps how long the scan + deliver loop may
 // spend paging the visibility index. The receive path filters
 // candidates after each scan page (FIFO group lock, retention expiry,
@@ -1076,7 +1080,7 @@ const sqsVisScanWallClockBudget = 100 * time.Millisecond
 // helpers route to the same partition the vis-index entry was found
 // under (legacy queues always pass 0).
 func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64, partition uint32) ([]sqsMsgCandidate, []byte, bool, error) {
-	kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+	kvs, err := s.scanVisibleIndexAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
 		return nil, start, true, errors.WithStack(err)
 	}
@@ -1095,6 +1099,23 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 		return out, next, true, nil
 	}
 	return out, next, false, nil
+}
+
+func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, error) {
+	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(start) {
+		kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+		return kvs, errors.WithStack(err)
+	}
+	groupID, ok := s.partitionResolver.ResolveGroup(start)
+	if !ok {
+		return nil, errors.Errorf("sqs receive partition scan: no route for partitioned visibility key %q", start)
+	}
+	groupScanner, ok := s.store.(sqsGroupScanner)
+	if !ok {
+		return nil, errors.New("sqs receive partition scan requires a group-aware shard store")
+	}
+	kvs, err := groupScanner.ScanGroupAt(ctx, groupID, start, end, pageSize, readTS)
+	return kvs, errors.WithStack(err)
 }
 
 // rotateMessagesForDelivery runs an OCC transaction per candidate to

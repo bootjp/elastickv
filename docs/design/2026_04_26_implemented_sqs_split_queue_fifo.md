@@ -225,8 +225,14 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
         `sqsMsgVisScanBoundsDispatch(meta, queueName, partitionIndex, ...)`.
      c. Call `scanAndDeliverPartition` for that partition with the
         per-pass scanDeadline and the remaining `MaxNumberOfMessages`
-        allowance. The scan and rotation stay in-process; no public or
-        internal request header selects a partition.
+        allowance. When `--sqsFifoPartitionMap` is configured, the
+        visibility-index scan resolves the partition key through the
+        same partition resolver used by SendMessage and asks `ShardStore`
+        to scan that Raft group directly; if this node is not that
+        group's linearizable leader, the existing raw-scan leader proxy
+        path forwards to the group leader. The fanout remains internal
+        to the handler; no public or internal request header selects a
+        partition.
 5. Aggregate the per-partition results, cap at MaxNumberOfMessages.
 ```
 
@@ -267,7 +273,7 @@ These take a `ReceiptHandle` which already encodes the partition index. The rece
 
 Reads as: queue `orders.fifo` has `8` partitions, mapped to Raft groups `group-7` through `group-14` in partition order. The existing `--raftSqsMap` keeps doing what it does today — endpoint mapping for `proxyToLeader` — and is unchanged by this design.
 
-Backward compatibility: deployments that do not configure `--sqsFifoPartitionMap` run with no partition resolver, so the routing-coverage gate is skipped and `PartitionCount > 1` queues are admitted on the single SQS shard. That shape is correct for single-shard/no-map installs but does not provide per-partition Raft-group placement. When a partition resolver is configured, a queue whose `PartitionCount` in meta does not match the partition-map's entry count is a configuration error: the CreateQueue handler resolves the count from the `Attributes` first, then verifies the partition map agrees; mismatch returns 400 `InvalidParameterValue`. With a resolver installed, a queue with `PartitionCount > 1` and no entry in `--sqsFifoPartitionMap` is rejected because the routing layer has no Raft-group mapping to use.
+Backward compatibility: deployments that do not configure `--sqsFifoPartitionMap` run with no partition resolver, so the routing-coverage gate is skipped and `PartitionCount > 1` queues are admitted on the single SQS shard. That shape is correct for single-shard/no-map installs but does not provide per-partition Raft-group placement. When a partition resolver is configured, the map must cover every partition the queue declares: a queue whose configured route count is lower than `PartitionCount`, or that has no entry in `--sqsFifoPartitionMap`, is rejected with 400 `InvalidParameterValue` because at least one partition would have no Raft-group mapping. Extra preconfigured routes are accepted so operators can over-provision the map before creating or recreating a queue with a larger partition count; the CreateQueue gate only requires `RoutedPartitionCount >= PartitionCount`.
 
 ---
 

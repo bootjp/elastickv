@@ -186,6 +186,18 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	return out, nil
 }
 
+// ScanGroupAt scans a range on the explicitly selected Raft group.
+// It is for keyspaces whose owner is resolved outside the byte-range
+// engine (for example SQS HT-FIFO's (queue, partition) resolver).
+// Normal callers should use ScanAt so range scans keep following the
+// distribution engine's route table.
+func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false)
+}
+
 func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
