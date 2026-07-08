@@ -217,19 +217,19 @@ unknown-identity max fallback).
 ### 4.4 Row identity
 
 Two rows from different nodes belong to the same logical row when
-their `BucketID` matches. After the aggregator has collected **all**
-per-node responses (i.e. waited for every peer's deadline to
-resolve), `Start` / `End` / `Aggregate` / `RouteCount` / `RouteIDs`
-are taken from the **lowest-indexed node in `--keyvizFanoutNodes`
-whose response is non-empty for the row**. Selection by config-list
-position rather than wall-clock arrival order is the load-bearing
-property: peers respond in non-deterministic order, so picking on
-first arrival would let `Start`/`End` flap between polls for the
-same bucket. If two nodes disagree on `Start`/`End`
+their `BucketID` matches. The serving node merges its local matrix
+first, then appends peer matrices, so `Start` / `End` / `Aggregate` /
+`RouteCount` / `RouteIDs` are taken from the **serving node's local row
+when present**. If the serving node has no row for that `BucketID`, the
+first peer row in the fan-out merge order supplies the metadata. This
+is intentionally a local-first contract, not a cluster-wide
+config-order winner: during routing-catalog divergence, different
+serving nodes can expose their own local metadata while the counters
+still merge by `BucketID`. If two nodes disagree on `Start`/`End`
 for the same `BucketID`, that indicates a routing-catalog
 divergence the operator should investigate. Phase 2-C does not ship
 a structured warning field for this case; the aggregator keeps the
-deterministic metadata winner and still serves the merged response.
+local-first metadata winner and still serves the merged response.
 Surfacing catalog-divergence warnings in the per-node status payload
 is a future wire extension.
 
