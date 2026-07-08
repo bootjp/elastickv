@@ -677,6 +677,9 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	if typ != redisTypeString {
 		return redisResult{typ: resultInt, integer: 1}, nil
 	}
+	if t.hasStagedPlainString(key) {
+		return t.markStringDirty(key)
+	}
 	plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
 	if err != nil {
 		return redisResult{}, err
@@ -688,6 +691,11 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 		return redisResult{}, err
 	}
 	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
+func (t *txnContext) hasStagedPlainString(key []byte) bool {
+	tv, ok := t.working[string(redisStrKey(key))]
+	return ok && !tv.deleted && tv.raw != nil
 }
 
 func (t *txnContext) markHLLDirty(key []byte, ttl *time.Time) error {

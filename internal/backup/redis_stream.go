@@ -99,13 +99,14 @@ type redisStreamEntry struct {
 // state in memory; a single stream is bounded by maxWideColumnItems
 // on the live side, so this remains tractable.
 type redisStreamState struct {
-	metaSeen   bool
-	length     int64
-	lastMs     uint64
-	lastSeq    uint64
-	entries    []redisStreamEntry
-	expireAtMs uint64
-	hasTTL     bool
+	metaSeen       bool
+	length         int64
+	lastMs         uint64
+	lastSeq        uint64
+	entries        []redisStreamEntry
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleStreamMeta processes one !stream|meta|<userKey> record.
@@ -134,10 +135,10 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	st.lastSeq = binary.BigEndian.Uint64(value[16:24])
 	st.metaSeen = true
 	if len(value) == redisStreamMetaInlineTTLSize {
-		if expireAtMs := binary.BigEndian.Uint64(value[24:32]); expireAtMs != 0 {
-			st.expireAtMs = expireAtMs
-			st.hasTTL = true
-		}
+		expireAtMs := binary.BigEndian.Uint64(value[24:32])
+		st.expireAtMs = expireAtMs
+		st.hasTTL = expireAtMs != 0
+		st.inlineTTLOwned = true
 	}
 	return nil
 }

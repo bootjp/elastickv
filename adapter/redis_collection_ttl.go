@@ -67,7 +67,7 @@ func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readT
 		return nil, false, errors.WithStack(err)
 	}
 	ttl := redisTimeFromMillis(meta.ExpireAt)
-	return ttl, ttl != nil, nil
+	return ttl, true, nil
 }
 
 func (r *RedisServer) simpleInlineTTLAt(
@@ -91,7 +91,7 @@ func (r *RedisServer) simpleInlineTTLAt(
 		return nil, false, errors.WithStack(err)
 	}
 	ttl := redisTimeFromMillis(expireAt)
-	return ttl, ttl != nil, nil
+	return ttl, true, nil
 }
 
 func hashMetaExpireAt(raw []byte) (uint64, error) {
@@ -125,7 +125,7 @@ func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, rea
 		return nil, false, errors.WithStack(err)
 	}
 	ttl := redisTimeFromMillis(meta.ExpireAt)
-	return ttl, ttl != nil, nil
+	return ttl, true, nil
 }
 
 func (r *RedisServer) dispatchCollectionExpire(
@@ -171,7 +171,7 @@ func (r *RedisServer) collectionMetaExpireElems(
 	case redisTypeList:
 		return r.listMetaExpireElems(ctx, key, readTS, expireAtMs)
 	case redisTypeHash:
-		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key),
+		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, "hash", store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key),
 			func(raw []byte) (int64, uint64, error) {
 				m, err := store.UnmarshalHashMeta(raw)
 				return m.Len, m.ExpireAt, errors.WithStack(err)
@@ -183,7 +183,7 @@ func (r *RedisServer) collectionMetaExpireElems(
 			},
 		)
 	case redisTypeSet:
-		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key),
+		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, "set", store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key),
 			func(raw []byte) (int64, uint64, error) {
 				m, err := store.UnmarshalSetMeta(raw)
 				return m.Len, m.ExpireAt, errors.WithStack(err)
@@ -195,7 +195,7 @@ func (r *RedisServer) collectionMetaExpireElems(
 			},
 		)
 	case redisTypeZSet:
-		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, store.ZSetMetaKey(key), store.ZSetMetaDeltaScanPrefix(key),
+		return r.simpleMetaExpireElems(ctx, key, readTS, expireAtMs, "zset", store.ZSetMetaKey(key), store.ZSetMetaDeltaScanPrefix(key),
 			func(raw []byte) (int64, uint64, error) {
 				m, err := store.UnmarshalZSetMeta(raw)
 				return m.Len, m.ExpireAt, errors.WithStack(err)
@@ -313,9 +313,10 @@ func listMetaTTLUpdateElem(key []byte, meta store.ListMeta, expireAtMs uint64) (
 
 func (r *RedisServer) simpleMetaExpireElems(
 	ctx context.Context,
-	_ []byte,
+	key []byte,
 	readTS uint64,
 	expireAtMs uint64,
+	typeName string,
 	metaKey []byte,
 	deltaPrefix []byte,
 	unmarshalBase func([]byte) (int64, uint64, error),
@@ -339,7 +340,7 @@ func (r *RedisServer) simpleMetaExpireElems(
 	}
 	deltas, err := r.scanDeltaKVs(ctx, deltaPrefix, readTS)
 	if err != nil {
-		return simpleMetaExpireScanErr(metaKey, baseLen, exists, expireAtMs, marshalBase, err)
+		return r.simpleMetaExpireScanErr(key, typeName, metaKey, baseLen, exists, expireAtMs, marshalBase, err)
 	}
 	if !exists && len(deltas) == 0 {
 		return nil, false, nil
@@ -355,7 +356,9 @@ func (r *RedisServer) simpleMetaExpireElems(
 	return appendDeltaDeletes(elems, deltas), true, nil
 }
 
-func simpleMetaExpireScanErr(
+func (r *RedisServer) simpleMetaExpireScanErr(
+	key []byte,
+	typeName string,
 	metaKey []byte,
 	baseLen int64,
 	exists bool,
@@ -369,6 +372,7 @@ func simpleMetaExpireScanErr(
 	if exists {
 		return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(baseLen, expireAtMs)}}, true, nil
 	}
+	r.triggerUrgentCompaction(typeName, key)
 	return nil, true, nil
 }
 

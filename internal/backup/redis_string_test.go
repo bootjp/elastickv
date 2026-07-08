@@ -201,6 +201,28 @@ func TestRedisDB_HandleHLL_NewFormatStripsEnvelopeAndDeduplicatesTTL(t *testing.
 	}
 }
 
+func TestRedisDB_HandleHLL_NewFormatNoTTLIgnoresScanIndex(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	sketch := []byte{0xca, 0xfe}
+	if err := db.HandleHLL([]byte("fresh"), encodeNewHLLValue(t, sketch, 0)); err != nil {
+		t.Fatalf("HandleHLL: %v", err)
+	}
+	if err := db.HandleTTL([]byte("fresh"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatalf("HandleTTL: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	body := readBlob(t, filepath.Join(root, "redis", "db_0", "hll", "fresh.bin"))
+	if !bytes.Equal(body, sketch) {
+		t.Fatalf("hll blob = %x want %x", body, sketch)
+	}
+	if _, err := os.Stat(filepath.Join(root, "redis", "db_0", "hll_ttl.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("expected no hll_ttl.jsonl for no-TTL HLL envelope, stat err=%v", err)
+	}
+}
+
 func assertTTLSidecar(t *testing.T, path string, wantKey string, wantMs uint64) {
 	t.Helper()
 	recs := readTTLJSONL(t, path)

@@ -184,15 +184,12 @@ type RedisDB struct {
 	// stat+mkdir(EEXIST) round-trips.
 	dirsCreated map[string]struct{}
 
-	// inlineTTLEmitted tracks simple keys whose TTL was already extracted
-	// from the inline magic-prefix header by HandleString or HandleHLL and
-	// written to the matching TTL sidecar. The live Redis encoder emits both
-	// the typed record with inline TTL and `!redis|ttl|<k>` scan-index entry
-	// the sweeper consumes. Without this set, HandleTTL would route the
-	// redundant scan-index record back into the same sidecar, duplicating the
-	// entry and violating the one-record-per-key contract sidecar consumers
-	// rely on.
-	inlineTTLEmitted map[string]struct{}
+	// inlineTTLOwned tracks simple keys whose current-format magic-prefix
+	// header is authoritative for TTL, including explicit no-TTL anchors.
+	// The live Redis encoder may also emit `!redis|ttl|<k>` as a scan index
+	// for the sweeper. Without this set, HandleTTL would route stale or
+	// redundant scan-index records back into the sidecar.
+	inlineTTLOwned map[string]struct{}
 
 	// warn is the structured-warning sink. Non-nil in production
 	// (fed by the decoder driver); nil in tests if the test does not
@@ -336,7 +333,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		dbIndex:            dbIndex,
 		kindByKey:          make(map[string]redisKeyKind),
 		dirsCreated:        make(map[string]struct{}),
-		inlineTTLEmitted:   make(map[string]struct{}),
+		inlineTTLOwned:     make(map[string]struct{}),
 		hashes:             make(map[string]*redisHashState),
 		lists:              make(map[string]*redisListState),
 		sets:               make(map[string]*redisSetState),
@@ -380,6 +377,7 @@ func (r *RedisDB) WithWarnSink(fn func(event string, fields ...any)) *RedisDB {
 // the TTL — if any — to strings_ttl.jsonl.
 func (r *RedisDB) HandleString(userKey, value []byte) error {
 	r.kindByKey[string(userKey)] = redisKindString
+	newFormat := isNewRedisStrFormat(value)
 	userValue, expireAtMs, err := decodeRedisStringValue(value)
 	if err != nil {
 		return err
@@ -387,13 +385,12 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 	if err := r.writeBlob("strings", userKey, userValue); err != nil {
 		return err
 	}
+	if newFormat {
+		r.inlineTTLOwned[string(userKey)] = struct{}{}
+	}
 	if expireAtMs == 0 {
 		return nil
 	}
-	// Mark the key as already emitted inline so HandleTTL can drop the
-	// redundant !redis|ttl| scan-index record; otherwise the same
-	// expiring string would be written to strings_ttl.jsonl twice.
-	r.inlineTTLEmitted[string(userKey)] = struct{}{}
 	return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 }
 
@@ -403,6 +400,7 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 // any embedded TTL written to hll_ttl.jsonl.
 func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	r.kindByKey[string(userKey)] = redisKindHLL
+	newFormat := isNewRedisHLLFormat(value)
 	sketch, expireAtMs, err := decodeRedisHLLValue(value)
 	if err != nil {
 		return err
@@ -410,10 +408,12 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	if err := r.writeBlob("hll", userKey, sketch); err != nil {
 		return err
 	}
+	if newFormat {
+		r.inlineTTLOwned[string(userKey)] = struct{}{}
+	}
 	if expireAtMs == 0 {
 		return nil
 	}
-	r.inlineTTLEmitted[string(userKey)] = struct{}{}
 	return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
 }
 
@@ -450,7 +450,7 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	}
 	switch r.kindByKey[string(userKey)] {
 	case redisKindHLL:
-		if _, ok := r.inlineTTLEmitted[string(userKey)]; ok {
+		if _, ok := r.inlineTTLOwned[string(userKey)]; ok {
 			return nil
 		}
 		return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
@@ -461,7 +461,7 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		// the sweeper consumes is redundant for backup output. Only
 		// legacy strings (no inline TTL) reach the appendTTL call.
 		// Codex P1 round 5.
-		if _, ok := r.inlineTTLEmitted[string(userKey)]; ok {
+		if _, ok := r.inlineTTLOwned[string(userKey)]; ok {
 			return nil
 		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
@@ -485,30 +485,65 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 func (r *RedisDB) inlineWideColumnTTL(kind redisKeyKind, userKey []byte, expireAtMs uint64) {
 	switch kind {
 	case redisKindHash:
-		st := r.hashState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		r.inlineHashTTL(userKey, expireAtMs)
 	case redisKindList:
-		st := r.listState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		r.inlineListTTL(userKey, expireAtMs)
 	case redisKindSet:
-		st := r.setState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		r.inlineSetTTL(userKey, expireAtMs)
 	case redisKindZSet:
-		st := r.zsetState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		r.inlineZSetTTL(userKey, expireAtMs)
 	case redisKindStream:
-		st := r.streamState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		r.inlineStreamTTL(userKey, expireAtMs)
 	case redisKindUnknown, redisKindString, redisKindHLL:
 		// Unreachable: HandleTTL filters to wide-column kinds
 		// before calling this helper. Listed explicitly to satisfy
 		// the exhaustive linter.
 	}
+}
+
+func (r *RedisDB) inlineHashTTL(userKey []byte, expireAtMs uint64) {
+	st := r.hashState(userKey)
+	if st.inlineTTLOwned {
+		return
+	}
+	st.expireAtMs = expireAtMs
+	st.hasTTL = true
+}
+
+func (r *RedisDB) inlineListTTL(userKey []byte, expireAtMs uint64) {
+	st := r.listState(userKey)
+	if st.inlineTTLOwned {
+		return
+	}
+	st.expireAtMs = expireAtMs
+	st.hasTTL = true
+}
+
+func (r *RedisDB) inlineSetTTL(userKey []byte, expireAtMs uint64) {
+	st := r.setState(userKey)
+	if st.inlineTTLOwned {
+		return
+	}
+	st.expireAtMs = expireAtMs
+	st.hasTTL = true
+}
+
+func (r *RedisDB) inlineZSetTTL(userKey []byte, expireAtMs uint64) {
+	st := r.zsetState(userKey)
+	if st.inlineTTLOwned {
+		return
+	}
+	st.expireAtMs = expireAtMs
+	st.hasTTL = true
+}
+
+func (r *RedisDB) inlineStreamTTL(userKey []byte, expireAtMs uint64) {
+	st := r.streamState(userKey)
+	if st.inlineTTLOwned {
+		return
+	}
+	st.expireAtMs = expireAtMs
+	st.hasTTL = true
 }
 
 // parkUnknownTTL buffers a redisKindUnknown TTL into pendingTTL, or

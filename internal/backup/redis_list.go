@@ -72,11 +72,12 @@ var ErrRedisInvalidListKey = cockroachdberr.New("backup: malformed !lst| key")
 // flush time matches the live store's left-to-right order regardless
 // of the order in which !lst|itm| records arrive at the dispatcher.
 type redisListState struct {
-	metaSeen    bool
-	declaredLen int64
-	items       map[int64][]byte
-	expireAtMs  uint64
-	hasTTL      bool
+	metaSeen       bool
+	declaredLen    int64
+	items          map[int64][]byte
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleListMeta processes one !lst|meta|<userKey> record. The value is
@@ -117,10 +118,10 @@ func (r *RedisDB) HandleListMeta(key, value []byte) error {
 	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
 	if len(value) == listMetaInlineTTLSize {
-		if expireAtMs := binary.BigEndian.Uint64(value[24:32]); expireAtMs != 0 {
-			st.expireAtMs = expireAtMs
-			st.hasTTL = true
-		}
+		expireAtMs := binary.BigEndian.Uint64(value[24:32])
+		st.expireAtMs = expireAtMs
+		st.hasTTL = expireAtMs != 0
+		st.inlineTTLOwned = true
 	}
 	return nil
 }

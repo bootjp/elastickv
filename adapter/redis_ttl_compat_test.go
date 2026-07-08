@@ -173,6 +173,29 @@ func TestRedis_MultiExec_SetEXStoresTTL(t *testing.T) {
 	require.Greater(t, ttl, time.Duration(0))
 }
 
+func TestRedis_MultiExec_SetThenExpireNewString(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "multi:set-expire", "hello").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "EXPIRE", "multi:set-expire", "30").Val())
+	_, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+
+	val, err := rdb.Get(ctx, "multi:set-expire").Result()
+	require.NoError(t, err)
+	require.Equal(t, "hello", val)
+	ttl, err := rdb.TTL(ctx, "multi:set-expire").Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+}
+
 // ────────────────────────────────────────────────────────────────
 // Key expiration — expired keys must become invisible
 // ────────────────────────────────────────────────────────────────

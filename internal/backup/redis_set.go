@@ -42,11 +42,12 @@ var ErrRedisInvalidSetKey = cockroachdberr.New("backup: malformed !st| key")
 // that re-emits a member is harmless — Redis sets are mathematical
 // sets, not multisets).
 type redisSetState struct {
-	metaSeen    bool
-	declaredLen int64
-	members     map[string]struct{}
-	expireAtMs  uint64
-	hasTTL      bool
+	metaSeen       bool
+	declaredLen    int64
+	members        map[string]struct{}
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleSetMeta processes one !st|meta|<len><userKey> record. The
@@ -74,16 +75,17 @@ func (r *RedisDB) HandleSetMeta(key, value []byte) error {
 	// would wrap to a negative declaredLen and fire spurious
 	// redis_set_length_mismatch warnings on every flush. Mirrors
 	// the hash + list encoders' symmetric guard.
-	declaredLen, expireAtMs, hasTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidSetMeta)
+	declaredLen, expireAtMs, hasTTL, inlineTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidSetMeta)
 	if err != nil {
 		return err
 	}
 	st := r.setState(userKey)
 	st.declaredLen = declaredLen
 	st.metaSeen = true
-	if hasTTL {
+	if inlineTTL {
 		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		st.hasTTL = hasTTL
+		st.inlineTTLOwned = true
 	}
 	return nil
 }

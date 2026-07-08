@@ -108,12 +108,13 @@ var ErrRedisInvalidZSetKey = cockroachdberr.New("backup: malformed !zs| key")
 // wide-column source-of-truth, surfacing deleted or outdated
 // entries in the restored zset. Codex P1 round 3 (PR #790).
 type redisZSetState struct {
-	metaSeen    bool
-	declaredLen int64
-	members     map[string]float64
-	sawWide     bool
-	expireAtMs  uint64
-	hasTTL      bool
+	metaSeen       bool
+	declaredLen    int64
+	members        map[string]float64
+	sawWide        bool
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleZSetMeta processes one !zs|meta|<len><userKey> record. The
@@ -141,16 +142,17 @@ func (r *RedisDB) HandleZSetMeta(key, value []byte) error {
 	// would wrap to a negative declaredLen and fire spurious
 	// redis_zset_length_mismatch warnings on every flush. Mirrors
 	// the hash/list/set encoders' symmetric guard.
-	declaredLen, expireAtMs, hasTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidZSetMeta)
+	declaredLen, expireAtMs, hasTTL, inlineTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidZSetMeta)
 	if err != nil {
 		return err
 	}
 	st := r.zsetState(userKey)
 	st.declaredLen = declaredLen
 	st.metaSeen = true
-	if hasTTL {
+	if inlineTTL {
 		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		st.hasTTL = hasTTL
+		st.inlineTTLOwned = true
 	}
 	// Codex P2 (PR #790 r9): do NOT call markZSetWide here. The
 	// live read path (adapter/redis_compat_helpers.go:610-621)

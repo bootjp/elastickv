@@ -216,6 +216,82 @@ func TestRedisCollectionExpireHandlesLegacyBlobs(t *testing.T) {
 	}
 }
 
+func TestRedisTTLAtInlineNoTTLCollectionMetaSkipsLegacyFallback(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expiredAt := time.Now().Add(-time.Hour)
+	cases := []struct {
+		name    string
+		metaKey func([]byte) []byte
+		value   func(t *testing.T) []byte
+	}{
+		{
+			name:    "list",
+			metaKey: store.ListMetaKey,
+			value: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := store.MarshalListMeta(store.ListMeta{Len: 1})
+				require.NoError(t, err)
+				return raw
+			},
+		},
+		{
+			name:    "hash",
+			metaKey: store.HashMetaKey,
+			value: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalHashMeta(store.HashMeta{Len: 1})
+			},
+		},
+		{
+			name:    "set",
+			metaKey: store.SetMetaKey,
+			value: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalSetMeta(store.SetMeta{Len: 1})
+			},
+		},
+		{
+			name:    "zset",
+			metaKey: store.ZSetMetaKey,
+			value: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalZSetMeta(store.ZSetMeta{Len: 1})
+			},
+		},
+		{
+			name:    "stream",
+			metaKey: store.StreamMetaKey,
+			value: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := store.MarshalStreamMeta(store.StreamMeta{Length: 1})
+				require.NoError(t, err)
+				return raw
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			server := &RedisServer{store: st}
+			key := []byte("ttl:no-ttl-inline:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.value(t), 1, 0))
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expiredAt), 2, 0))
+
+			got, err := server.ttlAt(ctx, key, 2)
+			require.NoError(t, err)
+			require.Nil(t, got)
+			expired, err := server.hasExpired(ctx, key, 2, true)
+			require.NoError(t, err)
+			require.False(t, expired)
+		})
+	}
+}
+
 func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 	t.Parallel()
 
@@ -298,6 +374,65 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 			ttl, err := decodeRedisTTL(rawTTL)
 			require.NoError(t, err)
 			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
+		})
+	}
+}
+
+func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name       string
+		typ        redisValueType
+		deltaKey   func([]byte, uint64) []byte
+		deltaValue []byte
+	}{
+		{
+			name:       "hash",
+			typ:        redisTypeHash,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "set",
+			typ:        redisTypeSet,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "zset",
+			typ:        redisTypeZSet,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			coord := newLocalAdapterCoordinator(st)
+			compactor := NewDeltaCompactor(st, coord)
+			server := &RedisServer{store: st, coordinator: coord, compactor: compactor}
+			key := []byte("ttl:delta-only-truncated:" + tc.name)
+			for ts := uint64(1); ts <= store.MaxDeltaScanLimit+1; ts++ {
+				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
+			}
+
+			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
+			require.NoError(t, err)
+			require.True(t, applied)
+
+			select {
+			case req := <-compactor.urgentCh:
+				require.Equal(t, tc.name, req.typeName)
+				require.Equal(t, key, req.userKey)
+			default:
+				t.Fatalf("expected urgent compaction request for %s", tc.name)
+			}
 		})
 	}
 }

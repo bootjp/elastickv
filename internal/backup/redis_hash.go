@@ -35,11 +35,12 @@ var ErrRedisInvalidHashKey = cockroachdberr.New("backup: malformed !hs| key")
 // stream) because the design's per-hash JSON shape requires the full
 // field map up-front and Redis hashes are typically small.
 type redisHashState struct {
-	declaredLen int64
-	metaSeen    bool
-	fields      map[string][]byte // field-name → field-value bytes
-	expireAtMs  uint64
-	hasTTL      bool
+	declaredLen    int64
+	metaSeen       bool
+	fields         map[string][]byte // field-name → field-value bytes
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleHashMeta processes one !hs|meta|<userKey> record. The value is
@@ -70,16 +71,17 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 	// wide-column encoders fail closed on the same shape of
 	// corruption. Round-2 review on PR #755 — backported from list
 	// encoder for cross-encoder consistency.
-	declaredLen, expireAtMs, hasTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidHashMeta)
+	declaredLen, expireAtMs, hasTTL, inlineTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidHashMeta)
 	if err != nil {
 		return err
 	}
 	st := r.hashState(userKey)
 	st.declaredLen = declaredLen
 	st.metaSeen = true
-	if hasTTL {
+	if inlineTTL {
 		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+		st.hasTTL = hasTTL
+		st.inlineTTLOwned = true
 	}
 	return nil
 }
