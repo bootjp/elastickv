@@ -1794,14 +1794,6 @@ KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
 
-if [[ "$DRY_RUN" == "true" ]]; then
-  print_dry_run_plan
-  exit 0
-fi
-
-ensure_local_raftadmin
-ensure_remote_raftadmin_binaries
-
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
   update_one_node "$node_id" "$(node_host_by_id "$node_id")" "$(ssh_target_by_id "$node_id")"
