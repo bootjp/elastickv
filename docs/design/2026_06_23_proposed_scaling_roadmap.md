@@ -180,7 +180,8 @@ memory each group's private cache/memtable pins.
   all reads on the leader.
 - **Learner reads → follower/learner reads.** The learner *primitive* is
   implemented in
-  `2026_04_26_implemented_raft_learner.md`: `AddLearner` / `PromoteLearner` are
+  `2026_04_26_implemented_raft_learner.md` (promoted to implemented status):
+  `AddLearner` / `PromoteLearner` are
   on the engine `Admin` interface (`internal/raftengine/engine.go:233`, `:245`)
   and implemented in the etcd backend (`internal/raftengine/etcd/engine.go:1268`,
   `:1289`, `ConfChangeAddLearnerNode` handling at `:2550`), the raftadmin CLI
