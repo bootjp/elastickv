@@ -454,5 +454,6 @@ that bypass the standard workflow) must rely on the
 `ErrNodeIDCollision` startup membership pre-check before issuing the
 ConfChange.
 
-This closes Stage 7. Stage 8 (snapshot header v2) and Stage 9 (KMS +
-compress + rotation/retire/rewrite + Jepsen) follow.
+This closes the new-member registration-before-first-write path. Stage
+7b' rotation re-registration, Stage 8 (snapshot header v2), and Stage 9
+(KMS + compress + rotation/retire/rewrite + Jepsen) follow.

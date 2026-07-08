@@ -4,9 +4,9 @@
 |---|---|
 | Status | implemented |
 | Date | 2026-05-25 |
-| Implemented | 2026-07-07 status audit; Stage 7 gate is now shipped |
+| Implemented | 2026-07-07 status audit; Stage 7a/7a-2/7c registration gate is now shipped |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 nonce, §5.1 sidecar, §7.1 rollout), [`2026_05_18_implemented_6d_enable_storage_envelope.md`](2026_05_18_implemented_6d_enable_storage_envelope.md) (6D-6c milestone breakdown) |
-| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The full Raft-replicated writer-registry **registration-before-first-write** gate is now shipped by the Stage 7 docs. |
+| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The Raft-replicated writer-registry **registration-before-first-write** gate is now shipped by the Stage 7a/7a-2/7c docs. |
 
 ## Lifecycle status
 
@@ -16,7 +16,7 @@ sidecar, the `local_epoch` bump-and-fsync lifecycle, the production
 `StateCache` wiring. A single-node cluster can now Bootstrap →
 EnableStorageEnvelope → Put (encrypted at rest) → read back.
 
-**Stage 7 follow-up now shipped:** the Raft-replicated
+**Stage 7 registration follow-up now shipped:** the Raft-replicated
 registration-before-first-write coordinator gate (the §5.2
 process-start and §4.1 ConfChange-time paths) now makes multi-node
 membership churn nonce-safe beyond the startup guards
@@ -103,7 +103,7 @@ the Stage 7 work that later closed the original multi-node-churn gap.
   registry-apply-time collision check shipped in 6A; the
   propose-before-write *gate* (block the coordinator's first encrypted
   write until registration commits) is implemented by the existing
-  Stage 7 docs:
+  Stage 7a/7a-2/7c docs:
   [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md),
   [`2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md`](2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md),
   and [`2026_05_29_proposed_7c_confchange_time_registration.md`](2026_05_29_proposed_7c_confchange_time_registration.md).
@@ -120,7 +120,7 @@ today. The single-node e2e (6D-6c-3) exercises the full
 Bootstrap → cutover → Put → read-back loop on one process load where
 the registration gate is moot (the node is the only writer and is
 registered by the §5.6 bootstrap batch). Multi-node deployments that
-add a writer after bootstrap are now covered by the Stage 7
+add a writer after bootstrap are now covered by the Stage 7a/7a-2/7c
 registration-before-first-write gate in addition to the startup guards;
 this is why the former 6D-6c-2 partial-status caveat is closed.
 

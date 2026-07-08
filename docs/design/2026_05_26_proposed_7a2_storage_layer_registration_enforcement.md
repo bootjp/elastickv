@@ -290,20 +290,20 @@ forwarder callers before merge.
 - **Test coverage** — direct vs FSM-apply path, pre/post registration,
   envelope/DEK off, catalog-bootstrap ordering.
 
-## 5. Verification action items (design decisions are settled)
-1. **Sequencing is decided** (§2.3: arm the gate first, then
-   `EnsureCatalogSnapshot`, with bounded `retryUntilRegistered` for the
-   empty-catalog + active-envelope edge). Remaining **verification**
-   before implementation: confirm the `OpRegistration` apply path in
-   `kv/fsm.go` makes no route-catalog / `distribution.Engine` call, so
-   arm-before-bootstrap has no hidden cycle.
-2. **Call-site inventory is settled** (§2.2's 4-row table: `PutAt`
-   (1031) and `ExpireAt` (1076) are *separate* direct `encryptForKey`
-   callers — `ExpireAt` does **not** delegate to `PutAt`;
-   `PutWithTTLAt` does; `applyMutationsBatch` (1177) is reached from
-   both the direct and FSM paths; `DeletePrefixAt` writes tombstones
-   only and is out of scope). Remaining **verification**: grep-confirm
-   no *other* `encryptForKey` caller exists.
-(Open question 3 — per-DEK vs single bool — is resolved: §2.1 adopts
-the per-DEK `registeredStorageDEKID atomic.Uint32`, lock-free and
-composing with 7b.)
+## 5. Verification record
+1. **Sequencing check completed.** `kv/fsm.go` dispatches
+   `OpRegistration` through `applyEncryption` to
+   `EncryptionApplier.ApplyRegistration`; it does not call the route
+   catalog or `distribution.Engine`, so arming the direct-write gate
+   before `EnsureCatalogSnapshot` has no hidden route-catalog cycle.
+2. **Call-site inventory completed.** The implemented code has exactly
+   three `encryptForKey` call sites: `PutAt`, `ExpireAt`, and the shared
+   `applyMutationsBatch` path. `PutAt` and `ExpireAt` pass
+   `gateRegistration=true`; `applyMutationsBatch` receives the threaded
+   direct-vs-FSM flag, so `ApplyMutations` gates and
+   `ApplyMutationsRaft` remains exempt. `PutWithTTLAt` delegates to
+   `PutAt`, and tombstone-only delete paths do not call `encryptForKey`.
+3. **Per-DEK state resolved.** §2.1 adopts
+   `registeredStorageDEKID atomic.Uint32`, lock-free and composing with
+   the 7b cutover watcher. The 7b' rotation case remains a separate
+   follow-up.

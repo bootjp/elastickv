@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | implemented — all milestones shipped: 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors), 6D-6c-2 (main.go cipher + gate wiring), 6D-6c-3a (capability fan-out closure wiring), 6D-6c-3b (end-to-end Bootstrap→cutover→Put→read-back test). Note: the multi-node-churn registration-before-first-write nonce gate was tracked separately as a Stage 7 deferral in [`2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md) and is now shipped by Stage 7 — not a 6D milestone. |
+| Status | implemented — all milestones shipped: 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors), 6D-6c-2 (main.go cipher + gate wiring), 6D-6c-3a (capability fan-out closure wiring), 6D-6c-3b (end-to-end Bootstrap→cutover→Put→read-back test). Note: the multi-node-churn registration-before-first-write nonce gate was tracked separately as a Stage 7 deferral in [`2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md) and is now shipped by the Stage 7a/7a-2/7c registration path — not a 6D milestone. |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -123,8 +123,9 @@
 
 _None — Stage 6D is complete. The §7.1 rollout's former
 multi-node-churn nonce-safety deferral (registration-before-first-write
-gate) was tracked in the 6D-6c-2 partial doc and is now closed by
-Stage 7._
+gate) was tracked in the 6D-6c-2 partial doc and is now closed by the
+Stage 7a/7a-2/7c registration path. Stage 7b' rotation re-registration
+remains a separate Stage 7 follow-up, not a 6D blocker._
 
 ## 0. Why this doc exists
 
