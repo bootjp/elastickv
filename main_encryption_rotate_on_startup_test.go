@@ -141,7 +141,7 @@ func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderWaitRuns(t *test
 	if got := runner.runs.Load(); got != 0 {
 		t.Fatalf("install must defer immediate-leader rotation until startup wait; runs=%d", got)
 	}
-	if err := waitStartup(context.Background()); err != nil {
+	if err := waitStartup.Wait(context.Background()); err != nil {
 		t.Fatalf("waitStartup: %v", err)
 	}
 	if got := runner.runs.Load(); got != 1 {
@@ -163,7 +163,7 @@ func TestInstallEncryptionRotateOnStartupRequest_FollowerDefersUntilStartupWait(
 	if got := runner.runs.Load(); got != 0 {
 		t.Fatalf("leader callback before startup wait must not run rotation; runs=%d", got)
 	}
-	if err := waitStartup(context.Background()); err != nil {
+	if err := waitStartup.Wait(context.Background()); err != nil {
 		t.Fatalf("waitStartup: %v", err)
 	}
 	if got := runner.runs.Load(); got != 1 {
@@ -183,7 +183,7 @@ func TestInstallEncryptionRotateOnStartupRequest_RetriesTransientWhileLeader(t *
 	if got := runner.runs.Load(); got != 0 {
 		t.Fatalf("install must defer immediate-leader retry loop until startup wait; runs=%d", got)
 	}
-	if err := waitStartup(context.Background()); err != nil {
+	if err := waitStartup.Wait(context.Background()); err != nil {
 		t.Fatalf("waitStartup: %v", err)
 	}
 	if got := runner.runs.Load(); got != 2 {
@@ -203,7 +203,7 @@ func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *t
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := waitStartup(waitCtx); err != nil {
+	if err := waitStartup.Wait(waitCtx); err != nil {
 		t.Fatalf("startup wait while follower: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
 	defer deregister()
 
-	if err := waitStartup(context.Background()); err != nil {
+	if err := waitStartup.Wait(context.Background()); err != nil {
 		t.Fatalf("initial follower wait: %v", err)
 	}
 	controller.becomeLeader()
@@ -245,7 +245,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 
 	waitDone := make(chan error, 1)
 	go func() {
-		waitDone <- waitStartup(context.Background())
+		waitDone <- waitStartup.Wait(context.Background())
 	}()
 	select {
 	case err := <-waitDone:
@@ -264,6 +264,39 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 	}
 }
 
+func TestInstallEncryptionRotateOnStartupRequest_BlocksMutatorsDuringAsyncStartupFlight(t *testing.T) {
+	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
+	runner := &blockingRunRotateStartupRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	deregister, waitStartup := installEncryptionRotateOnStartupRequestWithWait(context.Background(), controller, runner, nil)
+	defer deregister()
+
+	if err := waitStartup.Wait(context.Background()); err != nil {
+		t.Fatalf("initial follower wait: %v", err)
+	}
+	controller.becomeLeader()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async startup rotation did not start")
+	}
+	if !waitStartup.BlockMutators() {
+		t.Fatal("startup mutator gate must remain closed while async rotation is in flight")
+	}
+
+	close(runner.release)
+	deadline := time.After(2 * time.Second)
+	for waitStartup.BlockMutators() {
+		select {
+		case <-deadline:
+			t.Fatal("startup mutator gate did not open after async rotation finished")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestInstallEncryptionRotateOnStartupRequest_WaitReturnsPermanentError(t *testing.T) {
 	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
@@ -272,7 +305,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitReturnsPermanentError(t *te
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := waitStartup(waitCtx)
+	err := waitStartup.Wait(waitCtx)
 	if err == nil || !strings.Contains(err.Error(), "bad sidecar") {
 		t.Fatalf("startup wait err=%v, want bad sidecar", err)
 	}
@@ -291,6 +324,11 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.Internal_Forward_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
+		pb.RaftAdmin_AddVoter_FullMethodName,
+		pb.RaftAdmin_AddLearner_FullMethodName,
+		pb.RaftAdmin_PromoteLearner_FullMethodName,
+		pb.RaftAdmin_RemoveServer_FullMethodName,
+		pb.RaftAdmin_TransferLeadership_FullMethodName,
 		pb.EncryptionAdmin_BootstrapEncryption_FullMethodName,
 		pb.EncryptionAdmin_RotateDEK_FullMethodName,
 		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
@@ -321,6 +359,8 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 
 	allowedMethods := []string{
 		pb.Internal_RelayPublish_FullMethodName,
+		pb.RaftAdmin_Status_FullMethodName,
+		pb.RaftAdmin_Configuration_FullMethodName,
 		pb.EncryptionAdmin_GetCapability_FullMethodName,
 		pb.EncryptionAdmin_GetSidecarState_FullMethodName,
 	}
@@ -363,6 +403,41 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 				t.Fatalf("%s handler did not run after startup gate opened", method)
 			}
 		})
+	}
+}
+
+func TestStartupPublicKVGate_BlocksAfterReadyWhenStartupRotationPending(t *testing.T) {
+	t.Parallel()
+	blocked := true
+	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
+	gate.markReady()
+
+	handlerCalled := false
+	handler := func(context.Context, interface{}) (interface{}, error) {
+		handlerCalled = true
+		return "ok", nil
+	}
+	if _, err := gate.unaryInterceptor(
+		context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: pb.RaftAdmin_AddVoter_FullMethodName},
+		handler,
+	); status.Code(err) != codes.Unavailable {
+		t.Fatalf("ready gate with pending startup rotation err=%v, want Unavailable", err)
+	}
+	if handlerCalled {
+		t.Fatal("gated handler ran while startup rotation blocker was active")
+	}
+
+	blocked = false
+	if _, err := gate.unaryInterceptor(
+		context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: pb.RaftAdmin_AddVoter_FullMethodName},
+		handler,
+	); err != nil {
+		t.Fatalf("gate after blocker cleared: %v", err)
+	}
+	if !handlerCalled {
+		t.Fatal("gated handler did not run after blocker cleared")
 	}
 }
 

@@ -70,25 +70,25 @@ func installEncryptionRotateOnStartup(
 	storageEpoch uint16,
 	raftEpoch uint16,
 	logger *slog.Logger,
-) (func(), func(context.Context) error) {
+) (func(), startupRotationWaiter) {
 	if !requested {
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if rt == nil || rt.engine == nil {
 		logger.Warn("encryption rotate-on-startup skipped: default raft group is not available")
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	controller, ok := rt.engine.(encryptionRotateOnStartupController)
 	if !ok {
 		logger.Warn("encryption rotate-on-startup skipped: engine does not implement leader-acquired observer")
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	if sidecarPath == "" || kekWrapper == nil {
 		logger.Warn("encryption rotate-on-startup skipped: encryption sidecar or KEK is not configured")
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(sidecarPath),
@@ -99,7 +99,7 @@ func installEncryptionRotateOnStartup(
 	)
 	if err := server.Validate(); err != nil {
 		logger.Warn("encryption rotate-on-startup skipped: admin server wiring invalid", "err", err)
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	task := &encryptionRotateOnStartupTask{
 		server:       server,
@@ -114,14 +114,30 @@ func installEncryptionRotateOnStartup(
 	return installEncryptionRotateOnStartupRequestWithWait(ctx, controller, task, logger)
 }
 
+type startupRotationWaiter struct {
+	wait         func(context.Context) error
+	blockMutator func() bool
+}
+
+func (w startupRotationWaiter) Wait(ctx context.Context) error {
+	if w.wait == nil {
+		return nil
+	}
+	return w.wait(ctx)
+}
+
+func (w startupRotationWaiter) BlockMutators() bool {
+	return w.blockMutator != nil && w.blockMutator()
+}
+
 func installEncryptionRotateOnStartupRequestWithWait(
 	ctx context.Context,
 	controller encryptionRotateOnStartupController,
 	task encryptionRotateOnStartupRunner,
 	logger *slog.Logger,
-) (func(), func(context.Context) error) {
+) (func(), startupRotationWaiter) {
 	if controller == nil || task == nil {
-		return func() {}, encryptionRotateOnStartupNoopWait
+		return func() {}, startupRotationWaiter{}
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -141,7 +157,13 @@ func installEncryptionRotateOnStartupRequestWithWait(
 		callbacksEnabled.Store(true)
 		return waitEncryptionRotateOnStartupIdle(waitCtx, controller, task, logger, &flight)
 	}
-	return deregister, waitStartup
+	blockMutators := func() bool {
+		if flight.terminalError() != nil {
+			return true
+		}
+		return controller.State() == raftengine.StateLeader && !task.Done()
+	}
+	return deregister, startupRotationWaiter{wait: waitStartup, blockMutator: blockMutators}
 }
 
 func (s *encryptionRotateOnStartupFlightState) publishDone(done <-chan struct{}) {
@@ -300,8 +322,6 @@ func waitEncryptionRotateOnStartupFlightPublish(ctx context.Context) error {
 		return nil
 	}
 }
-
-func encryptionRotateOnStartupNoopWait(context.Context) error { return nil }
 
 func logEncryptionRotateOnStartupError(logger *slog.Logger, err error) {
 	if retryableEncryptionRotateOnStartupError(err) {

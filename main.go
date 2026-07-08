@@ -1228,7 +1228,7 @@ type serversInput struct {
 // startServersAfterStartupRotation wires up the AdminServer, starts the
 // per-group Raft listeners needed for quorum traffic, waits for any requested
 // startup rotation, then opens the public service listeners.
-func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) error, in serversInput) error {
+func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
 		return err
@@ -1321,12 +1321,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup func(context.Context) 
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	if waitRotateOnStartup != nil {
-		if err := waitRotateOnStartup(in.ctx); err != nil {
-			runner.closePreparedExternalListeners()
-			in.cancel()
-			return errors.Wrap(err, "encryption rotate-on-startup: wait before serving")
-		}
+	publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
+	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
+		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
 	publicKVGate.markReady()
 	if err := runner.startPublicServices(); err != nil {
@@ -1458,7 +1455,8 @@ func (a adminGRPCInterceptors) empty() bool {
 }
 
 type startupPublicKVGate struct {
-	ready atomic.Bool
+	ready        atomic.Bool
+	blockMutator func() bool
 }
 
 func (g *startupPublicKVGate) markReady() {
@@ -1473,7 +1471,7 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	if g != nil && info != nil && !g.ready.Load() && startupRotationGatedMethod(info.FullMethod) {
+	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
 		// Return a raw gRPC status so clients and retry policy see Unavailable.
 		//nolint:wrapcheck
 		return nil, status.Error(codes.Unavailable, "startup rotation has not completed")
@@ -1481,11 +1479,26 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	return handler(ctx, req)
 }
 
+func (g *startupPublicKVGate) blocked() bool {
+	if g == nil {
+		return false
+	}
+	if !g.ready.Load() {
+		return true
+	}
+	return g.blockMutator != nil && g.blockMutator()
+}
+
 func startupRotationGatedMethod(fullMethod string) bool {
 	switch fullMethod {
 	case pb.Internal_Forward_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
+		pb.RaftAdmin_AddVoter_FullMethodName,
+		pb.RaftAdmin_AddLearner_FullMethodName,
+		pb.RaftAdmin_PromoteLearner_FullMethodName,
+		pb.RaftAdmin_RemoveServer_FullMethodName,
+		pb.RaftAdmin_TransferLeadership_FullMethodName,
 		pb.EncryptionAdmin_BootstrapEncryption_FullMethodName,
 		pb.EncryptionAdmin_RotateDEK_FullMethodName,
 		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
