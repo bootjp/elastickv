@@ -396,7 +396,9 @@ func (t *txnContext) loadHashStateForFields(key []byte, fields [][]byte) (*hashT
 		t.hashStates = map[string]*hashTxnState{}
 	}
 	if st, ok := t.hashStates[k]; ok {
-		st = reviveDeletedHashState(st)
+		if st.deleted {
+			return reviveDeletedHashState(st), nil
+		}
 		return st, t.loadHashFieldsIntoState(key, fields, st)
 	}
 	if _, deleted := t.deletedKeys[k]; deleted {

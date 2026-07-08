@@ -412,6 +412,42 @@ func TestRedisStandaloneHSetDedupAvoidsWideHashMaterializationLimit(t *testing.T
 	require.Equal(t, []byte("new-value"), raw)
 }
 
+func TestRedisTxnHSetAfterDelDoesNotReloadDeletedHash(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("txn:hash-del-recreate")
+	field := []byte("field")
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, field), []byte("old"), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	first, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, field, []byte("updated")}})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), first.integer)
+
+	delRes, err := txn.applyDel(redcon.Command{Args: [][]byte{[]byte(cmdDel), key}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), delRes.integer)
+
+	recreated, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, field, []byte("recreated")}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), recreated.integer)
+
+	hashState := txn.hashStates[string(key)]
+	require.NotNil(t, hashState)
+	require.False(t, hashState.deleted)
+	require.Empty(t, hashState.origFields)
+
+	elems := txn.buildHashElems(20)
+	deltaElem := requireElemByKey(t, elems, store.HashMetaDeltaKey(key, 20, 0))
+	delta, err := store.UnmarshalHashMetaDelta(deltaElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), delta.LenDelta)
+}
+
 func requireTxnReadKeysContainWideFences(t *testing.T, txn *txnContext, key []byte) {
 	t.Helper()
 	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {
