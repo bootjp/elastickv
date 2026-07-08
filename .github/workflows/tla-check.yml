@@ -2,7 +2,7 @@ name: TLA+ model check
 
 # Runs `make tla-check` on PRs (and pushes to main) that touch the
 # subsystems modelled by the spec or the spec / tooling themselves.
-# Per docs/design/2026_05_28_partial_tla_safety_spec.md §7.3.
+# Per docs/design/2026_05_28_implemented_tla_safety_spec.md §7.3.
 #
 # The job runs both MCHLC.cfg (correct design — expected PASS) and
 # MCHLC_gap.cfg (preconditions disabled — expected FAIL with the HLC-4
@@ -74,7 +74,7 @@ jobs:
       # whole point of the pin (codex P2 on PR #856 round 4).  A full
       # miss-and-redownload is correct here.
       - name: Cache tla2tools.jar
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .cache/tla
           key: ${{ runner.os }}-tla-tools-${{ hashFiles('Makefile') }}

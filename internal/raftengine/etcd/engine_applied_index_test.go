@@ -74,7 +74,7 @@ type recordingPersistStorage struct {
 	saveRelease     <-chan struct{}
 }
 
-func (p *recordingPersistStorage) SaveSnap(snap raftpb.Snapshot) error {
+func (p *recordingPersistStorage) SaveSnap(snap *raftpb.Snapshot) error {
 	if p.saveStarted != nil {
 		p.saveStartedOnce.Do(func() { close(p.saveStarted) })
 	}
@@ -82,16 +82,27 @@ func (p *recordingPersistStorage) SaveSnap(snap raftpb.Snapshot) error {
 		<-p.saveRelease
 	}
 	if p.rec != nil {
-		p.rec.record("save", snap.Metadata.Index)
+		p.rec.record("save", snap.GetMetadata().GetIndex())
 	}
 	return nil
 }
 
-func (p *recordingPersistStorage) Save(_ raftpb.HardState, _ []raftpb.Entry) error { return nil }
-func (p *recordingPersistStorage) Release(_ raftpb.Snapshot) error                 { return nil }
-func (p *recordingPersistStorage) Sync() error                                     { return nil }
-func (p *recordingPersistStorage) Close() error                                    { return nil }
-func (p *recordingPersistStorage) MinimalEtcdVersion() *semver.Version             { return nil }
+func (p *recordingPersistStorage) Save(_ *raftpb.HardState, _ []*raftpb.Entry) error { return nil }
+func (p *recordingPersistStorage) Release(_ *raftpb.Snapshot) error                  { return nil }
+func (p *recordingPersistStorage) Sync() error                                       { return nil }
+func (p *recordingPersistStorage) Close() error                                      { return nil }
+func (p *recordingPersistStorage) MinimalEtcdVersion() *semver.Version               { return nil }
+
+func appliedIndexTestSnapshot(index uint64, data []byte) raftpb.Snapshot {
+	return raftpb.Snapshot{
+		Data: data,
+		Metadata: &raftpb.SnapshotMetadata{
+			ConfState: &raftpb.ConfState{Voters: []uint64{1}},
+			Index:     uint64Ptr(index),
+			Term:      uint64Ptr(1),
+		},
+	}
+}
 
 func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 	saveStarted := make(chan struct{})
@@ -104,15 +115,9 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 		fsmSnapDir: t.TempDir(),
 	}
 	e.protectReceivedFSMSnapshot(7)
+	readySnapshot := appliedIndexTestSnapshot(7, []byte("payload"))
 	rd := etcdraft.Ready{
-		Snapshot: raftpb.Snapshot{
-			Data: []byte("payload"),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     7,
-				Term:      1,
-			},
-		},
+		Snapshot: &readySnapshot,
 	}
 
 	persistDone := make(chan error, 1)
@@ -207,7 +212,7 @@ func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
 	}
 	e.appliedIndex.Store(9)
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
+		Type: messageTypePtr(raftpb.MsgSnap),
 		Snapshot: &raftpb.Snapshot{
 			Data: encodeSnapshotToken(9, 0),
 		},
@@ -224,7 +229,7 @@ func TestUnprotectReceivedFSMSnapshotTokenIfAppliedKeepsFutureSnapshot(t *testin
 	}
 	e.appliedIndex.Store(9)
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
+		Type: messageTypePtr(raftpb.MsgSnap),
 		Snapshot: &raftpb.Snapshot{
 			Data: encodeSnapshotToken(10, 0),
 		},
@@ -257,8 +262,9 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 		},
 	}
 
+	readySnapshot := appliedIndexTestSnapshot(10, nil)
 	e.releaseIgnoredReceivedFSMSnapshotSteps(etcdraft.Ready{
-		Snapshot: raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 10, Term: 1}},
+		Snapshot: &readySnapshot,
 	})
 
 	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
@@ -285,7 +291,7 @@ func TestPersistCreatedSnapshot_BumpsAppliedIndex(t *testing.T) {
 	persist := &recordingPersistStorage{rec: rec}
 	e := &Engine{fsm: fsm, persist: persist}
 
-	snap := raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 42, Term: 1}}
+	snap := appliedIndexTestSnapshot(42, nil)
 	require.NoError(t, e.persistCreatedSnapshot(snap))
 
 	require.Equal(t, []orderEvent{
@@ -305,7 +311,7 @@ func TestPersistCreatedSnapshot_NilFSMNoOp(t *testing.T) {
 	// non-AppliedIndexWriter FSM used by other tests in this package.
 	e := &Engine{fsm: &testStateMachine{}, persist: persist}
 
-	snap := raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 17, Term: 1}}
+	snap := appliedIndexTestSnapshot(17, nil)
 	require.NoError(t, e.persistCreatedSnapshot(snap))
 
 	require.Equal(t, []orderEvent{
@@ -325,7 +331,7 @@ func TestPersistCreatedSnapshot_BumpErrorAborts(t *testing.T) {
 	persist := &recordingPersistStorage{rec: rec}
 	e := &Engine{fsm: fsm, persist: persist}
 
-	snap := raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 99, Term: 1}}
+	snap := appliedIndexTestSnapshot(99, nil)
 	err := e.persistCreatedSnapshot(snap)
 	require.Error(t, err, "bump failure MUST be surfaced to caller")
 	require.Empty(t, rec.snapshot(),
@@ -358,9 +364,9 @@ func localSnapshotEngine(t *testing.T, rec *applyIndexOrderRecorder, fsm *record
 	// reaching persist.SaveSnap, and the test cannot observe the save.
 	entries := make([]raftpb.Entry, applied)
 	for i := uint64(0); i < applied; i++ {
-		entries[i] = raftpb.Entry{Index: i + 1, Term: 1, Data: []byte{}}
+		entries[i] = raftpb.Entry{Index: uint64Ptr(i + 1), Term: uint64Ptr(1), Data: []byte{}}
 	}
-	require.NoError(t, storage.Append(entries))
+	require.NoError(t, storage.Append(entryPointers(entries)))
 	persist := &recordingPersistStorage{rec: rec}
 	return &Engine{
 		fsm:        fsm,

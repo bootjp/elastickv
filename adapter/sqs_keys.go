@@ -10,7 +10,7 @@ import (
 )
 
 // SQS keyspace prefixes. Kept in sync with the naming in
-// docs/design/2026_04_24_proposed_sqs_compatible_adapter.md.
+// docs/design/2026_04_24_partial_sqs_compatible_adapter.md.
 const (
 	// SqsQueueMetaPrefix prefixes queue-metadata records.
 	SqsQueueMetaPrefix = "!sqs|queue|meta|"
@@ -50,7 +50,7 @@ const (
 )
 
 // HT-FIFO partitioned-keyspace discriminator. Per the §3.1 design in
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md, partitioned
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md, partitioned
 // FIFO queues live in a separate keyspace so the legacy single-
 // partition layout can stay byte-identical on disk:
 //

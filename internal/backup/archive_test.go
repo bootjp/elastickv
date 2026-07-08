@@ -1,0 +1,253 @@
+package backup
+
+import (
+	"archive/tar"
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestPackUnpackDumpTreeZstdRoundTrip(t *testing.T) {
+	root := writeArchiveFixture(t)
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionZstd))
+
+	out := filepath.Join(t.TempDir(), "unpacked")
+	require.NoError(t, UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionZstd))
+	require.NoError(t, VerifyChecksums(out))
+	require.FileExists(t, filepath.Join(out, "MANIFEST.json"))
+	require.FileExists(t, filepath.Join(out, CHECKSUMSFilename))
+	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
+}
+
+func TestPackDumpTreeFollowsSymlinkedRoot(t *testing.T) {
+	root := writeArchiveFixture(t)
+	link := filepath.Join(t.TempDir(), "current")
+	require.NoError(t, os.Symlink(root, link))
+
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(link, &buf, ArchiveCompressionNone))
+
+	out := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone))
+	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
+}
+
+func TestUnpackDumpTreeRestoresReadOnlyDirectoryModesAfterChildren(t *testing.T) {
+	root := writeArchiveFixture(t)
+	require.NoError(t, os.Chmod(filepath.Join(root, "redis"), 0o555))
+	t.Cleanup(func() { makeArchiveTreeWritable(root) })
+
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionNone))
+
+	out := filepath.Join(t.TempDir(), "out")
+	t.Cleanup(func() { makeArchiveTreeWritable(out) })
+	require.NoError(t, UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone))
+	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
+	info, err := os.Stat(filepath.Join(out, "redis"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o555), info.Mode().Perm())
+}
+
+func TestUnpackDumpTreeCleansReadOnlyTreeOnVerifyFailure(t *testing.T) {
+	var manifest bytes.Buffer
+	m := NewPhase0SnapshotManifest(time.Unix(0, 0))
+	m.ElastickvVersion = "test"
+	m.ClusterID = "cluster-a"
+	m.LastCommitTS = 1
+	m.Source = &Source{FSMPath: "source.fsm"}
+	require.NoError(t, WriteManifest(&manifest, m))
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "readonly",
+		Typeflag: tar.TypeDir,
+		Mode:     0o555,
+	}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "readonly/file.bin",
+		Mode: 0o600,
+		Size: 1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "MANIFEST.json",
+		Mode: 0o600,
+		Size: int64(manifest.Len()),
+	}))
+	_, err = tw.Write(manifest.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	out := filepath.Join(t.TempDir(), "out")
+	err = UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.Error(t, err)
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr))
+}
+
+func TestUnpackDumpTreeRejectsSymlinkOutputRoot(t *testing.T) {
+	root := writeArchiveFixture(t)
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionNone))
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.Mkdir(target, 0o755))
+	out := filepath.Join(dir, "out")
+	if err := os.Symlink(target, out); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	err := UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveDestinationExists)
+	require.NoFileExists(t, filepath.Join(target, "MANIFEST.json"))
+}
+
+func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "../escape",
+		Mode: 0o600,
+		Size: 1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	out := filepath.Join(t.TempDir(), "out")
+	err = UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchivePathUnsafe)
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr))
+}
+
+func TestUnpackDumpTreeRejectsNonDirectoryRootEntry(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     ".",
+		Typeflag: tar.TypeReg,
+		Mode:     0o600,
+		Size:     1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	out := filepath.Join(t.TempDir(), "out")
+	err = UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveNonRegular)
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr))
+}
+
+func TestReadTarTreeRejectsEntryBudgetExceeded(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "dir",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+	}))
+	require.NoError(t, tw.Close())
+
+	err := readTarTree(tar.NewReader(bytes.NewReader(buf.Bytes())), t.TempDir(), &archiveUnpackBudget{
+		entriesLeft: 0,
+		bytesLeft:   archiveMaxUnpackBytes,
+	})
+	require.ErrorIs(t, err, ErrArchiveBudgetExceeded)
+}
+
+func TestExtractRegularTarEntryRejectsByteBudgetExceeded(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "file.bin",
+		Mode: 0o600,
+		Size: 1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	err = readTarTree(tar.NewReader(bytes.NewReader(buf.Bytes())), t.TempDir(), &archiveUnpackBudget{
+		entriesLeft: 1,
+		bytesLeft:   0,
+	})
+	require.ErrorIs(t, err, ErrArchiveBudgetExceeded)
+}
+
+func TestPackDumpTreeRejectsSymlink(t *testing.T) {
+	root := writeArchiveFixture(t)
+	require.NoError(t, os.Symlink("MANIFEST.json", filepath.Join(root, "link")))
+	var buf bytes.Buffer
+	err := PackDumpTree(root, &buf, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveNonRegular)
+}
+
+func TestOpenArchiveRegularForReadRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	require.NoError(t, os.WriteFile(target, []byte("payload"), 0o600))
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	f, _, err := openArchiveRegularForRead(link)
+	if f != nil {
+		_ = f.Close()
+	}
+	require.ErrorIs(t, err, ErrArchiveNonRegular)
+}
+
+func TestPackDumpTreeRejectsUnchecksummedFile(t *testing.T) {
+	root := writeArchiveFixture(t)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "extra.bin"), []byte("extra"), 0o600))
+	var buf bytes.Buffer
+	err := PackDumpTree(root, &buf, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveUnchecksummedFile)
+}
+
+func TestCleanArchiveRelPathAllowsRootDotSlash(t *testing.T) {
+	rel, err := cleanArchiveRelPath("./")
+	require.NoError(t, err)
+	require.Equal(t, ".", rel)
+}
+
+func writeArchiveFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "redis", "db_0", "strings"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "redis", "db_0", "strings", "key.bin"), []byte("value"), 0o600))
+	m := NewPhase0SnapshotManifest(time.Unix(0, 0))
+	m.ElastickvVersion = "test"
+	m.ClusterID = "cluster-a"
+	m.LastCommitTS = 1
+	m.Source = &Source{FSMPath: "source.fsm"}
+	m.Adapters = &Adapters{Redis: &Adapter{}}
+	f, err := os.Create(filepath.Join(root, "MANIFEST.json"))
+	require.NoError(t, err)
+	require.NoError(t, WriteManifest(f, m))
+	require.NoError(t, f.Close())
+	require.NoError(t, WriteChecksums(root))
+	return root
+}
+
+func makeArchiveTreeWritable(root string) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, 0o755)
+		}
+		return nil
+	})
+}

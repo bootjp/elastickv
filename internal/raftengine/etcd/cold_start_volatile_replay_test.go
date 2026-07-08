@@ -66,8 +66,8 @@ func TestApplyNormalCommitted_VolatileEntryReplayedOnDuplicate(t *testing.T) {
 
 			payload := []byte{c.tag, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
 			entry := raftpb.Entry{
-				Type:  raftpb.EntryNormal,
-				Index: 150, // <= e.applied → duplicate path
+				Type:  entryTypePtr(raftpb.EntryNormal),
+				Index: uint64Ptr(150), // <= e.applied → duplicate path
 				Data:  encodeProposalEnvelope(42, payload),
 			}
 
@@ -108,8 +108,8 @@ func TestApplyNormalCommitted_FreshEntryAlwaysAppliesAndAdvances(t *testing.T) {
 			e.applied = 100
 
 			entry := raftpb.Entry{
-				Type:  raftpb.EntryNormal,
-				Index: 150,
+				Type:  entryTypePtr(raftpb.EntryNormal),
+				Index: uint64Ptr(150),
 				Data:  encodeProposalEnvelope(7, []byte{tag, 0x99}),
 			}
 
@@ -182,8 +182,8 @@ func TestApplyNormalCommitted_DuplicateWithoutClassifier_DropsAll(t *testing.T) 
 	e.applied = 200
 
 	entry := raftpb.Entry{
-		Type:  raftpb.EntryNormal,
-		Index: 150,
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(150),
 		Data:  encodeProposalEnvelope(13, []byte{0x02, 0xff}), // would-be volatile
 	}
 

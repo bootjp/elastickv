@@ -151,25 +151,17 @@ memory each group's private cache/memtable pins.
   pipelines and independent serial apply loops (§1.7). Already in-tree
   structurally.
 - **Leader balance — PR #953**
-  (`docs/design/2026_06_11_proposed_leader_balance_scheduler.md`, branch
+  (`docs/design/2026_06_11_implemented_leader_balance_scheduler.md`, branch
   `design/leader-balance-scheduler`) spreads group leaderships across nodes so
   write-proposal load is not pinned to one node. Count-based v1 (TiKV
   balance-leader equivalent), embedded in the default-group leader, default
   OFF behind `--leaderBalance`.
-- **Multi-node multi-group bootstrap — GAP.** Leader balance is *blocked on a
-  topology that does not exist*: PR #953 §1.1a ("PR0") documents that no
-  startup wiring produces a group whose voters span more than one node — the
-  `len(groups) != 1` guard at `main.go:746` and the single-member bootstrap in
-  `multiraft_runtime.go:246-254` mean every group in a multi-group process is
-  single-voter, so there is nothing to transfer a leader *to*. Closing this is
-  a prerequisite for write-throughput scaling beyond one node, and a companion
-  proposal is in review as **PR #955**
-  (`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
-  `design/multinode-multigroup-bootstrap`): extend `--raftGroups` / a per-group
-  members flag to accept a multi-node voter set per group, lifting the
-  `len(groups)==1` guard. Once PR #955 lands it is the authoritative spec for
-  this gap; this roadmap treats it as the unblocking dependency for (b), (e),
-  and the region-balance gap in §3.
+- **Multi-node multi-group bootstrap — done.** The implemented
+  `docs/design/2026_06_14_implemented_multinode_multigroup_bootstrap.md`
+  adds `--raftGroupPeers`, per-group bootstrap peer wiring, persisted
+  bootstrap-seed validation, and a 3-node × 2-group integration smoke with
+  leader transfer. This unblocks the topology prerequisite for leader balance,
+  write-throughput scaling beyond one node, and the region-balance gap in §3.
 
 ### (c) Read throughput
 
@@ -270,8 +262,8 @@ memory each group's private cache/memtable pins.
   write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
   with proposed extensions for cluster fan-out
   (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
-  subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
-  hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
+  subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
+  hot-key top-K (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell
   conflict (implemented). It is the detection signal M3 reuses. Current
   adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
   coordinator sampler, so read-heavy hotspots remain invisible until read-path
@@ -285,11 +277,11 @@ memory each group's private cache/memtable pins.
   top-N sketch, keyviz `MaxTrackedRoutes` coarsening). Any new per-route /
   per-queue / per-peer metric must carry a cardinality bound; this is a
   cross-cutting operational-scaling rule, not a single design.
-- **workload isolation** — `2026_04_24_proposed_workload_isolation.md` (heavy
+- **workload isolation** — `2026_04_24_implemented_workload_isolation.md` (heavy
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
   (`2026_04_25_implemented_s3_admission_control.md`), SQS per-queue throttling
-  (`2026_04_26_proposed_sqs_per_queue_throttling.md`). These bound *one
+  (`2026_04_26_implemented_sqs_per_queue_throttling.md`). These bound *one
   workload's* impact so it cannot starve the shared runtime / Raft control
   plane; they scale a deployment by making it predictable under adversarial or
   unbalanced load rather than by raising raw capacity.
@@ -301,25 +293,15 @@ memory each group's private cache/memtable pins.
 Each gap is a design doc that should be written (`*_proposed_*.md`). Ranked by
 how much further scaling it unlocks. "Depends-on" lists hard prerequisites.
 
-### Gap 1 — Multi-node multi-group bootstrap (highest leverage)
-**Problem.** Startup wiring can already bootstrap a *single* Raft group with
-multiple voters via `--raftBootstrapMembers`, but it cannot express a
-*multi-group* topology where each group has its own multi-node voter set
-(`main.go:746` rejects `--raftBootstrapMembers` when `len(groups) != 1`, and
-the multi-group path still falls back to single-member group bootstraps). That
-multi-group limitation blocks write-throughput scaling beyond one group, leader
-balance across groups, follower reads for every group, and every cluster-size
-dimension that needs multiple replicated ranges. **Rough milestones:** (M1)
-extend `--raftGroups` / add a per-group members flag to accept per-group
-multi-node voter sets; lift the guard only for the explicitly modeled
-multi-group form. (M2) integration harness that stands up multi-voter groups
-across processes. (M3) Jepsen multi-group multi-node workload. **Depends-on:**
-none for writing the design; rollout must land the HLC per-group ceiling
-renewal fix first, as sequenced in §4, before enabling the topology that
-exposes stale ceilings. *A companion proposal is in review as **PR #955**
-(`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
-`design/multinode-multigroup-bootstrap`); once it lands it is the authoritative
-spec for this gap and this roadmap defers to it.*
+### Gap 1 — Multi-node multi-group bootstrap (closed)
+**Status.** Closed by
+`docs/design/2026_06_14_implemented_multinode_multigroup_bootstrap.md`.
+Startup wiring can now express a *multi-group* topology where each group has a
+multi-node voter set via `--raftGroupPeers`, and the in-process 3-node × 2-group
+smoke verifies per-group voters, leader transfer, and restart rejoin. The
+remaining work from the original roadmap item is the broader Jepsen runner for
+true multi-node multi-group workloads, tracked as a follow-on rather than a
+bootstrap design blocker.
 
 ### Gap 2 — Shared Pebble cache / resource pools
 **Problem.** Each group's store allocates a private 256 MiB block cache
@@ -377,17 +359,17 @@ reverse). (M3) auto-merge in the M3 detector (cold-route hysteresis).
 **Depends-on:** M2 migration plane for cross-group merge; the Composed-1 guard
 for cutover coherence.
 
-### Gap 6 — Connection / transport scaling (streaming transport revival)
-**Problem.** Raft inter-node messages use unary gRPC per message
-(`docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md` §1): each
-send pays a full RTT, capping per-peer throughput at ~RTT⁻¹ regardless of
-bandwidth. This bites exactly when multi-node multi-group (Gap 1) puts real
-inter-node Raft traffic on the wire. **Rough milestones:** revive the existing
-streaming-transport proposal (client-streaming `SendStream` per peer, biased
-heartbeat select, backward-compat fallback). The blob-fetch RPC in the S3
-offload doc (§3.6) already wants to reuse the same chunked-streaming
-abstraction, so landing both behind one transport layer is the leverage.
-**Depends-on:** nothing hard; value scales with Gap 1.
+### Gap 6 — Connection / transport scaling (streaming transport soak)
+**Problem.** Raft inter-node messages previously used unary gRPC per message
+(`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md` §1),
+which paid a full RTT per send. The implemented `SendStream` transport removes
+that bottleneck, but multi-node multi-group (Gap 1) still needs transport soak
+coverage under real cross-node traffic. **Rough milestones:** (M1) run transport
+soak with multi-node multi-group traffic. (M2) decide whether the optional
+biased-select multiplexing worker from the implemented transport doc is needed.
+The blob-fetch RPC in the S3 offload doc (§3.6) can reuse the same
+chunked-streaming abstraction. **Depends-on:** Gap 1 for realistic traffic;
+value scales with Gap 1.
 
 ### Gap 7 — Auto group lifecycle (longest-term)
 **Problem.** Groups are static (`--raftGroups`). Elastic scale-out (add node →
@@ -409,10 +391,10 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
    replicas move across nodes, but do not enable cross-group transactions whose
    timestamps can be allocated by more than one coordinator node until step 11
    (or its single-oracle bridge) lands.
-2. **Multi-node multi-group bootstrap** (Gap 1 / **PR #955**,
-   `2026_06_12_proposed_multinode_multigroup_bootstrap.md`). The root
-   unblocker for (b), (c), (e), Gap 3, Gap 4. Nothing else multi-node-shaped
-   can land until a group can have voters on more than one node.
+2. **Multi-node multi-group bootstrap** (Gap 1, implemented in
+   `2026_06_14_implemented_multinode_multigroup_bootstrap.md`). The root
+   topology unblocker for (b), (c), (e), Gap 3, Gap 4 is now in-tree; downstream
+   work can build on groups whose voters span more than one node.
 3. **Leader balance scheduler** (PR #953). Its PR0 is exactly Gap 1; PR1
    (observe-only) can land against today's single-voter topology, but the
    transfer-issuing PR2–PR3 are blocked on step 2. So: PR #953 PR1 in
@@ -512,7 +494,7 @@ design if needed. The near-term mitigation is layered:
 
    Both calls go through the same `c.clock`. The apply-time OCC/ownership check
    then compares these timestamps against stored `CommitTS` values (the
-   Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
+   Composed-1 guard, `docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md`
    §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
    serializability depends on those `commitTS` values being **mutually
    comparable** across all participating groups, and read-only participant shards

@@ -353,7 +353,7 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 	if strings.TrimSpace(name) == "" || len(attrs) == 0 {
 		return ErrAdminSQSValidation
 	}
-	throttleChanged, err := s.setQueueAttributesWithRetry(ctx, name, attrs)
+	throttleChanged, throttle, resetActions, throttleResetCutoff, err := s.setQueueAttributesWithRetry(ctx, name, attrs)
 	if err != nil {
 		if isSQSAdminQueueDoesNotExist(err) {
 			return ErrAdminSQSNotFound
@@ -364,7 +364,8 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 		return errors.Wrap(err, "admin set queue attributes")
 	}
 	if throttleChanged {
-		s.throttle.invalidateQueue(name)
+		s.throttle.invalidateQueueBuckets(name)
+		s.observeThrottleConfigChange(name, throttle, resetActions, throttleResetCutoff)
 	}
 	return nil
 }
@@ -383,7 +384,8 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 	if strings.TrimSpace(name) == "" {
 		return ErrAdminSQSValidation
 	}
-	if err := s.deleteQueueWithRetry(ctx, name); err != nil {
+	throttleResetCutoff, err := s.deleteQueueWithRetry(ctx, name)
+	if err != nil {
 		// deleteQueueWithRetry returns sqsAPIError with
 		// sqsErrQueueDoesNotExist when the queue is missing; map
 		// to the structured ErrAdminSQSNotFound so the admin
@@ -393,6 +395,9 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 		}
 		return errors.Wrap(err, "admin delete queue")
 	}
+	s.throttle.invalidateQueueBuckets(name)
+	s.observeThrottleDelete(name, throttleResetCutoff)
+	s.dropReceiveFanoutCounter(name)
 	return nil
 }
 

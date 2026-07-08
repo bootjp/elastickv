@@ -24,8 +24,8 @@ import (
 // aggregate, or the index is out of range; nil hi means unbounded tail.
 type KeyVizHotKeysSource interface {
 	HotKeysOptions() (enabled bool, capacity, sampleRate, maxKeyLen int)
-	HotKeysSnapshot(routeID uint64) *keyviz.KeyvizHotKeysSnapshot
-	SubBucketBoundsFor(routeID uint64, subBucket int) (lo, hi []byte, ok bool)
+	HotKeysSnapshot(routeID uint64, label keyviz.Label) *keyviz.KeyvizHotKeysSnapshot
+	SubBucketBoundsFor(routeID uint64, label keyviz.Label, subBucket int) (lo, hi []byte, ok bool)
 }
 
 // KeyVizHotKeysHandler serves GET /admin/api/v1/keyviz/hotkeys.
@@ -114,6 +114,7 @@ const (
 // scaled units (`sample_rate × sampled_n / m`).
 type hotKeyResponse struct {
 	RouteID         uint64                `json:"route_id"`
+	Label           string                `json:"label,omitempty"`
 	SubBucket       *int                  `json:"sub_bucket,omitempty"`
 	Series          string                `json:"series"`
 	Keys            []hotKeyResponseEntry `json:"keys"`
@@ -152,7 +153,7 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// makes the !enabled+fanout intent visible at the call site.
 	var snap *keyviz.KeyvizHotKeysSnapshot
 	if enabled {
-		snap = h.source.HotKeysSnapshot(params.routeID)
+		snap = h.source.HotKeysSnapshot(params.routeID, params.label)
 	}
 	out, errStatus, errCode, errMsg := h.buildLocalResponse(r, params, snap)
 	if errCode != "" {
@@ -222,7 +223,7 @@ func (h *KeyVizHotKeysHandler) checkSnapshotWindow(p hotKeysParams, snap *keyviz
 func (h *KeyVizHotKeysHandler) collectEntries(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot) ([]keyviz.KeyvizHotKeyEntry, string, string) {
 	entries := snap.Entries
 	if p.subBucketSet {
-		lo, hi, ok := h.source.SubBucketBoundsFor(p.routeID, p.subBucket)
+		lo, hi, ok := h.source.SubBucketBoundsFor(p.routeID, p.label, p.subBucket)
 		if !ok {
 			return nil, "invalid_query", "sub_bucket is out of range for this route"
 		}
@@ -257,6 +258,7 @@ func (h *KeyVizHotKeysHandler) collectEntries(p hotKeysParams, snap *keyviz.Keyv
 func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, entries []keyviz.KeyvizHotKeyEntry) hotKeyResponse {
 	out := hotKeyResponse{
 		RouteID:         p.routeID,
+		Label:           string(p.label),
 		Series:          p.series,
 		Keys:            make([]hotKeyResponseEntry, len(entries)),
 		Approximate:     true,
@@ -393,6 +395,7 @@ func (h *KeyVizHotKeysHandler) buildLocalResponse(r *http.Request, params hotKey
 func emptyHotKeyResponse(params hotKeysParams) hotKeyResponse {
 	out := hotKeyResponse{
 		RouteID:     params.routeID,
+		Label:       string(params.label),
 		Series:      params.series,
 		Approximate: true,
 		Keys:        []hotKeyResponseEntry{},
@@ -448,6 +451,7 @@ func (h *KeyVizHotKeysHandler) audit(r *http.Request, p hotKeysParams, returned 
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
 		slog.Uint64("route_id", p.routeID),
+		slog.String("label", string(p.label)),
 		slog.Int("top", p.top),
 		slog.String("series", p.series),
 		slog.Int("returned", returned),
@@ -464,6 +468,7 @@ func (h *KeyVizHotKeysHandler) audit(r *http.Request, p hotKeysParams, returned 
 
 type hotKeysParams struct {
 	routeID      uint64
+	label        keyviz.Label
 	subBucket    int
 	subBucketSet bool
 	series       string
@@ -479,6 +484,9 @@ func parseHotKeysParams(r *http.Request, capacity int) (hotKeysParams, error) {
 		return hotKeysParams{}, err
 	}
 	p := hotKeysParams{routeID: routeID, series: "writes", top: hotKeysDefaultTop}
+	if err := parseHotKeysLabelParam(q.Get("label"), &p); err != nil {
+		return hotKeysParams{}, err
+	}
 	if err := parseSubBucketParam(q.Get("sub_bucket"), &p); err != nil {
 		return hotKeysParams{}, err
 	}
@@ -503,6 +511,21 @@ func parseRouteIDParam(raw string) (uint64, error) {
 		return 0, errors.New("route_id must be an unsigned 64-bit integer")
 	}
 	return v, nil
+}
+
+func parseHotKeysLabelParam(raw string, p *hotKeysParams) error {
+	if raw == "" {
+		p.label = keyviz.LabelLegacy
+		return nil
+	}
+	label := keyviz.Label(raw)
+	for _, known := range keyviz.AllLabels {
+		if label == known {
+			p.label = label
+			return nil
+		}
+	}
+	return errors.New("label must be a known KeyViz adapter label")
 }
 
 func parseSubBucketParam(raw string, p *hotKeysParams) error {

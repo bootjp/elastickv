@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strconv"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // === SQS throttle test refill-rate guardrail ============================
@@ -272,6 +274,91 @@ func TestSQSServer_Throttle_SetQueueAttributesInvalidatesBucket(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("post-SetQueueAttributes send: status %d (expected 200; bucket invalidation broken)", status)
 	}
+}
+
+func TestSQSServer_Throttle_SetQueueAttributesSyncsDisabledMetrics(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	observer := &recordingSQSThrottleObserver{}
+	node.sqsServer.throttleObserver = observer
+
+	url := mustCreateQueue(t, node, "throttle-metric-sync")
+	mustSetQueueAttributes(t, node, url, map[string]string{
+		"ThrottleSendCapacity":        drainBucketCapacity,
+		"ThrottleSendRefillPerSecond": slowRefillRate,
+		"ThrottleRecvCapacity":        drainBucketCapacity,
+		"ThrottleRecvRefillPerSecond": slowRefillRate,
+	})
+	require.Contains(t, observer.syncs, throttleSyncReport{
+		queue:   "throttle-metric-sync",
+		enabled: []string{SQSThrottleActionSend, SQSThrottleActionReceive},
+	})
+
+	observer.syncs = nil
+	observer.forgotten = nil
+	mustSetQueueAttributes(t, node, url, map[string]string{
+		"ThrottleSendCapacity":        "20",
+		"ThrottleSendRefillPerSecond": slowRefillRate,
+	})
+	require.Contains(t, observer.syncs, throttleSyncReport{
+		queue:   "throttle-metric-sync",
+		enabled: []string{SQSThrottleActionSend, SQSThrottleActionReceive},
+	})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionSend})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionReceive})
+
+	observer.syncs = nil
+	observer.forgotten = nil
+	mustSetQueueAttributes(t, node, url, map[string]string{
+		"ThrottleRecvCapacity":        "0",
+		"ThrottleRecvRefillPerSecond": "0",
+	})
+
+	require.Contains(t, observer.syncs, throttleSyncReport{
+		queue:   "throttle-metric-sync",
+		enabled: []string{SQSThrottleActionSend},
+	})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionSend})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionReceive})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionDefault})
+}
+
+func TestSQSServer_Throttle_DeleteCreateQueueSyncsMetrics(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	observer := &recordingSQSThrottleObserver{}
+	node.sqsServer.throttleObserver = observer
+
+	queue := "throttle-metric-recreate"
+	url := mustCreateQueue(t, node, queue)
+	mustSetQueueAttributes(t, node, url, newSendThrottleAttrs())
+
+	observer.syncs = nil
+	observer.forgotten = nil
+	if status, _ := callSQS(t, node, sqsDeleteQueueTarget, map[string]any{"QueueUrl": url}); status != http.StatusOK {
+		t.Fatalf("delete: %d", status)
+	}
+	require.Empty(t, observer.syncs,
+		"DeleteQueue cleanup must use cutoff-scoped forgets instead of unconditional action sync")
+	require.ElementsMatch(t, []throttleForgetReport{
+		{queue: queue, action: SQSThrottleActionSend},
+		{queue: queue, action: SQSThrottleActionReceive},
+		{queue: queue, action: SQSThrottleActionDefault},
+	}, observer.forgotten)
+
+	observer.syncs = nil
+	observer.forgotten = nil
+	_ = mustCreateQueue(t, node, queue)
+	require.Contains(t, observer.syncs, throttleSyncReport{queue: queue})
+	require.ElementsMatch(t, []throttleForgetReport{
+		{queue: queue, action: SQSThrottleActionSend},
+		{queue: queue, action: SQSThrottleActionReceive},
+		{queue: queue, action: SQSThrottleActionDefault},
+	}, observer.forgotten)
 }
 
 // TestSQSServer_Throttle_DeleteQueueInvalidatesBucket pins the §3.1

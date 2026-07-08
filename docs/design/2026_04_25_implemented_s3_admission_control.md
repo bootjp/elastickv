@@ -6,7 +6,7 @@
 >
 > Companion to PR #636 (`s3ChunkBatchOps = 4`, Raft entry size aligned
 > with `MaxSizePerMsg = 4 MiB` per PR #593) and to the workload-class
-> isolation proposal (`docs/design/2026_04_24_proposed_workload_isolation.md`).
+> isolation proposal (`docs/design/2026_04_24_implemented_workload_isolation.md`).
 > Where PR #636 fixes the *per-entry* memory accounting and the
 > isolation doc keeps Raft's CPU budget separate from heavy command
 > paths, this doc bounds the *aggregate* in-flight memory that S3
@@ -493,7 +493,7 @@ Acceptance criteria:
 - Per-bucket admission classes (e.g. system buckets get their own
   budget). Punted to the workload-isolation rollout.
 - Coordinated admission across the multi-region read replica path
-  proposed in `docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md`.
+  implemented in `docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md`.
 - Token-bucket rate-shaping (e.g. bytes-per-second). The current
   proposal only bounds *concurrent* bytes; rate-shaping is a separate
   policy choice.

@@ -220,7 +220,10 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 // has elapsed since the last full check, restoring the #666 ceiling.
 func TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad(t *testing.T) {
 	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
+	// This test drives the in-process waiter registry directly, so a
+	// single-node cluster keeps the synthetic Signal calls on the same
+	// RedisServer that owns the blocking wait loop.
+	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 
 	rdbReader := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})

@@ -1,5 +1,7 @@
 package kv
 
+import "github.com/bootjp/elastickv/keyviz"
+
 // OP is an operation type.
 type OP int
 
@@ -23,6 +25,9 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// KeyVizLabel tags this operation group for KeyViz attribution.
+	// The zero value is the legacy unlabeled route-only view.
+	KeyVizLabel keyviz.Label
 	// StartTS is a logical timestamp captured at transaction begin.
 	// It is ignored for non-transactional groups.
 	StartTS uint64
@@ -46,7 +51,7 @@ type OperationGroup[T OP] struct {
 	// "unpinned" — every existing caller leaves it at zero so this
 	// is behaviour-neutral on the M1 plumbing PR.  M3 of the
 	// Composed-1 design
-	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md)
+	// (docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md)
 	// will gate the FSM apply path on this version so a route shift
 	// between BeginTxn and Commit is caught before it can produce a
 	// G1c anomaly across a cross-group MoveRange / SplitRange.
