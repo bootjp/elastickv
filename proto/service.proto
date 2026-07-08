@@ -248,6 +248,9 @@ message RaftAdminConfigurationChangeResponse {
 }
 
 message RaftAdminTransferLeadershipRequest {
+  reserved 3, 4, 5;
+  reserved "gated", "max_lag", "target_candidates";
+
   string target_id = 1;
   string target_address = 2;
 }
