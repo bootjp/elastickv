@@ -156,11 +156,15 @@ func (s *Server) TransferLeadership(ctx context.Context, req *pb.RaftAdminTransf
 	if s == nil || s.admin == nil {
 		return nil, grpcStatus(codes.Unimplemented, "leadership transfer is not supported by this raft engine")
 	}
-	if req != nil && (req.TargetId != "" || req.TargetAddress != "") {
-		if req.TargetId == "" || req.TargetAddress == "" {
-			return nil, grpcStatus(codes.InvalidArgument, "target_id and target_address must be provided together")
-		}
-		if err := s.admin.TransferLeadershipToServer(ctx, req.TargetId, req.TargetAddress); err != nil {
+	if req != nil && usesUnsupportedGatedTransfer(req) {
+		return nil, grpcStatus(codes.FailedPrecondition, "gated leadership transfer is not supported by this raft engine")
+	}
+	targetID, targetAddress, hasTarget, err := transferLeadershipTarget(req)
+	if err != nil {
+		return nil, err
+	}
+	if hasTarget {
+		if err := s.admin.TransferLeadershipToServer(ctx, targetID, targetAddress); err != nil {
 			return nil, adminError(err)
 		}
 		return &pb.RaftAdminTransferLeadershipResponse{}, nil
@@ -169,6 +173,20 @@ func (s *Server) TransferLeadership(ctx context.Context, req *pb.RaftAdminTransf
 		return nil, adminError(err)
 	}
 	return &pb.RaftAdminTransferLeadershipResponse{}, nil
+}
+
+func transferLeadershipTarget(req *pb.RaftAdminTransferLeadershipRequest) (string, string, bool, error) {
+	if req == nil || (req.GetTargetId() == "" && req.GetTargetAddress() == "") {
+		return "", "", false, nil
+	}
+	if req.GetTargetId() == "" || req.GetTargetAddress() == "" {
+		return "", "", false, grpcStatus(codes.InvalidArgument, "target_id and target_address must be provided together")
+	}
+	return req.GetTargetId(), req.GetTargetAddress(), true, nil
+}
+
+func usesUnsupportedGatedTransfer(req *pb.RaftAdminTransferLeadershipRequest) bool {
+	return req.GetGated() || req.GetMaxLag() != 0 || len(req.GetTargetCandidates()) != 0
 }
 
 func stateToProto(state raftengine.State) pb.RaftAdminState {

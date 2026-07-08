@@ -11,8 +11,10 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -260,6 +262,28 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.Equal(t, []fakeRemoveServerCall{{id: "node-2", prevIndex: 5}}, engine.removeServerCalls)
 	require.Equal(t, 1, engine.transferCalls)
 	require.Equal(t, []fakeTransferCall{{id: "node-2", address: "127.0.0.1:50052"}}, engine.targetTransferCalls)
+}
+
+func TestTransferLeadershipRejectsUnsupportedGatedRequest(t *testing.T) {
+	t.Parallel()
+
+	engine := &fakeEngine{}
+	server := NewServer(engine)
+
+	_, err := server.TransferLeadership(context.Background(), &pb.RaftAdminTransferLeadershipRequest{
+		Gated: true,
+		TargetCandidates: []*pb.TransferTarget{{
+			TargetId:      "node-2",
+			TargetAddress: "127.0.0.1:50052",
+		}},
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	require.Zero(t, engine.transferCalls)
+	require.Empty(t, engine.targetTransferCalls)
 }
 
 func TestRegisterOperationalServicesPublishesLeaderHealth(t *testing.T) {
