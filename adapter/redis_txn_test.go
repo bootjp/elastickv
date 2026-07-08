@@ -676,6 +676,48 @@ func TestRedisStandaloneMissingCreatorsReadAllWideFences(t *testing.T) {
 		require.Equal(t, int64(1), n)
 		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
 	})
+
+	t.Run("hincrby-legacy-migration-expired", func(t *testing.T) {
+		t.Parallel()
+		st := store.NewMVCCStore()
+		coord := newReadKeyRecordingCoordinator(st)
+		server := NewRedisServer(nil, "", st, coord, nil, nil)
+		key := []byte("missing-create:hincrby-legacy")
+
+		raw, err := marshalHashValue(redisHashValue{"field": "1"})
+		require.NoError(t, err)
+		require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, redisTxnTestStartTS, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), redisTxnTestStartTS, 0))
+		coord.Clock().Observe(redisTxnTestStartTS)
+
+		n, err := server.hincrbyTxn(ctx, key, []byte("field"), 2)
+		require.NoError(t, err)
+		require.NotZero(t, n)
+		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
+	})
+}
+
+func TestRedisTxnMissingLRangeConflictsWithConcurrentRPush(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, _ := newRedisStorageMigrationTestServer(t)
+	key := []byte("missing-lrange:concurrent-rpush")
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applyLRange(redcon.Command{Args: [][]byte{[]byte(cmdLRange), key, []byte("0"), []byte("-1")}})
+	require.NoError(t, err)
+	require.Equal(t, resultArray, res.typ)
+	require.Empty(t, res.arr)
+	require.Contains(t, txn.readKeys, string(redisTxnWideListFenceKey(key)))
+
+	newLen, err := server.listRPush(ctx, key, [][]byte{[]byte("value")})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), newLen)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"missing-key LRANGE in MULTI must conflict with a concurrent RPUSH on the same key")
 }
 
 func TestRedisListPushRechecksTypeAtDispatchSnapshot(t *testing.T) {

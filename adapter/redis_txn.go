@@ -1070,6 +1070,7 @@ func (t *txnContext) applyLRange(cmd redcon.Command) (redisResult, error) {
 		return redisResult{}, err
 	}
 	if typ == redisTypeNone {
+		t.trackReadKey(redisTxnWideListFenceKey(cmd.Args[1]))
 		return redisResult{typ: resultArray, arr: []string{}}, nil
 	}
 	if typ != redisTypeList {

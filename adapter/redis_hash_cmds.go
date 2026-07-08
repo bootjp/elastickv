@@ -682,7 +682,7 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
-func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64) (int64, error) {
 	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
@@ -707,6 +707,7 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideHashFenceKey),
 		Elems:    elems,
 	})
 	return current, cockerrors.WithStack(dispatchErr)
@@ -732,7 +733,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 
 	// If a legacy blob exists, migrate it atomically with the increment.
 	if len(legacyValue) > 0 {
-		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, increment)
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, typ, increment)
 	}
 
 	current += increment
