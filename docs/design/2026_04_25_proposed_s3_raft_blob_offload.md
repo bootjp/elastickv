@@ -500,9 +500,8 @@ message PushChunkBlobResponse {
 Streamed because a chunkblob is up to `s3ChunkSize = 1 MiB`. The
 existing gRPC `MaxRecvMsgSize = 64 MiB` (PR #593 → `internal.GRPCCallOptions`)
 already covers this in a single RPC, but streaming keeps the
-implementation symmetric with how the future Raft streaming
-transport (proposed under
-`docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md`)
+implementation symmetric with how the Raft streaming transport, implemented in
+`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md`,
 handles large payloads.
 
 ### 3.7 Backwards compatibility & rollout
@@ -586,9 +585,9 @@ capability-advertising peers exists.
 - **PR #589 (snapshot tuning) and PR #614 (etcd-snapshot-disk-offload).**
   Already implemented. The offload path makes those tunables more
   effective by reducing the per-snapshot byte count.
-- **`docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md`.**
+- **`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md`.**
   The blob-fetch RPC reuses the same chunked-streaming approach
-  proposed for Raft transport. We can land both behind the same
+  implemented for Raft transport. We can land both behind the same
   abstraction.
 - **Lease read & MVCC snapshot reads.** No change. Manifests remain
   the linearisation point; chunk bytes are immutable once committed
