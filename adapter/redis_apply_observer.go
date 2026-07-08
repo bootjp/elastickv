@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"bytes"
-	"sync"
 
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -12,7 +11,6 @@ import (
 // RedisApplyObserver wakes blocking Redis waiters from the FSM apply path.
 // It is safe to share one instance between the FSM wiring and RedisServer.
 type RedisApplyObserver struct {
-	initOnce      sync.Once
 	streamWaiters *keyWaiterRegistry
 	zsetWaiters   *keyWaiterRegistry
 }
@@ -33,36 +31,22 @@ func WithRedisApplyObserver(observer *RedisApplyObserver) RedisServerOption {
 		if observer == nil {
 			return
 		}
-		streamWaiters, zsetWaiters := observer.registries()
-		r.streamWaiters = streamWaiters
-		r.zsetWaiters = zsetWaiters
+		r.streamWaiters = observer.streamWaiters
+		r.zsetWaiters = observer.zsetWaiters
 	}
 }
 
 func (o *RedisApplyObserver) OnApply(op pb.Op, key []byte) {
-	if o == nil || op != pb.Op_PUT {
+	if op != pb.Op_PUT {
 		return
 	}
-	streamWaiters, zsetWaiters := o.registries()
 	if userKey := streamApplyUserKey(key); userKey != nil {
-		streamWaiters.Signal(userKey)
+		o.streamWaiters.Signal(userKey)
 		return
 	}
 	if userKey := zsetApplyUserKey(key); userKey != nil {
-		zsetWaiters.SignalFull(userKey)
+		o.zsetWaiters.SignalFull(userKey)
 	}
-}
-
-func (o *RedisApplyObserver) registries() (*keyWaiterRegistry, *keyWaiterRegistry) {
-	o.initOnce.Do(func() {
-		if o.streamWaiters == nil {
-			o.streamWaiters = newKeyWaiterRegistry()
-		}
-		if o.zsetWaiters == nil {
-			o.zsetWaiters = newKeyWaiterRegistry()
-		}
-	})
-	return o.streamWaiters, o.zsetWaiters
 }
 
 func streamApplyUserKey(key []byte) []byte {
