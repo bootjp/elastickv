@@ -441,6 +441,28 @@ func TestSQSEncodeRejectsPartitionedStandardQueue(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO pins the
+// restore-side mirror of validatePartitionConfig's HT-FIFO dedup
+// rule. Queue-scoped dedup cannot be represented by partitioned dedup
+// rows, which are keyed by (partition, group, dedupID), so a
+// hand-authored dump with this live-impossible shape must fail before
+// addQueueMeta persists it.
+func TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "bad.fifo",
+		[]byte(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perMessageGroupId",`+
+			`"deduplication_scope":"queue"}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
 // TestSQSEncodeAcceptsPowerOfTwoPartitionCount confirms the
 // power-of-two guard does not reject legitimate values.
 func TestSQSEncodeAcceptsPowerOfTwoPartitionCount(t *testing.T) {

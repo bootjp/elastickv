@@ -45,9 +45,13 @@ import (
 // meta, gen counter, and every message key (Option B; see file header).
 const sqsRestoreGeneration uint64 = 1
 
-// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go:htfifoMaxPartitions.
-// Keep this local to avoid importing adapter from internal/backup.
-const sqsMaxHTFIFOPartitions uint32 = 32
+const (
+	// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go:htfifoMaxPartitions.
+	// Keep this local to avoid importing adapter from internal/backup.
+	sqsMaxHTFIFOPartitions uint32 = 32
+	// sqsFifoDedupScopeQueue mirrors adapter/sqs_partitioning.go:htfifoDedupeScopeQueue.
+	sqsFifoDedupScopeQueue = "queue"
+)
 
 var (
 	// ErrSQSEncodeInvalidQueue is returned when a _queue.json cannot be
@@ -623,8 +627,15 @@ func (e *SQSRecordEncoder) readQueueMeta(root *os.Root, queueDir string) (sqsQue
 	if err := decodeOneJSON(f, &pub); err != nil {
 		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue, "%s: %v", rel, err)
 	}
+	if err := validateSQSQueueMetaPublic(pub, rel); err != nil {
+		return sqsQueueMetaPublic{}, err
+	}
+	return pub, nil
+}
+
+func validateSQSQueueMetaPublic(pub sqsQueueMetaPublic, rel string) error {
 	if pub.FormatVersion != 1 {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
 	// PartitionCount must be a power of two when > 1. The live
@@ -633,18 +644,22 @@ func (e *SQSRecordEncoder) readQueueMeta(root *os.Root, queueDir string) (sqsQue
 	// (h % n). A malformed dump with e.g. partition_count=3 would
 	// hash inconsistently and route messages to wrong partitions.
 	if pub.PartitionCount != 0 && pub.PartitionCount&(pub.PartitionCount-1) != 0 {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d must be a power of two", rel, pub.PartitionCount)
 	}
 	if pub.PartitionCount > sqsMaxHTFIFOPartitions {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d exceeds max %d", rel, pub.PartitionCount, sqsMaxHTFIFOPartitions)
 	}
 	if !pub.FIFO && pub.PartitionCount > 1 {
-		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d is only valid on FIFO queues", rel, pub.PartitionCount)
 	}
-	return pub, nil
+	if pub.PartitionCount > 1 && pub.DeduplicationScope == sqsFifoDedupScopeQueue {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: deduplication_scope=%q is incompatible with partition_count %d", rel, pub.DeduplicationScope, pub.PartitionCount)
+	}
+	return nil
 }
 
 // readMessages reads <queue>/messages.jsonl (one sqsMessageRecord per
