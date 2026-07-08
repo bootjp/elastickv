@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -589,6 +590,27 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyCollectionBlobsFromTTLIndex(t *te
 			require.ErrorIs(t, err, store.ErrKeyNotFound)
 		})
 	}
+}
+
+type recordingCompactorCoordinator struct {
+	stubAdapterCoordinator
+	labels []keyviz.Label
+}
+
+func (c *recordingCompactorCoordinator) Dispatch(_ context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if reqs != nil {
+		c.labels = append(c.labels, reqs.KeyVizLabel)
+	}
+	return &kv.CoordinateResponse{}, nil
+}
+
+func TestDeltaCompactorStampsRedisKeyVizLabel(t *testing.T) {
+	t.Parallel()
+	rec := &recordingCompactorCoordinator{}
+	c := NewDeltaCompactor(store.NewMVCCStore(), rec)
+	_, err := c.coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{})
+	require.NoError(t, err)
+	require.Equal(t, []keyviz.Label{keyviz.LabelRedis}, rec.labels)
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {

@@ -301,6 +301,7 @@ ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 # state); it just produces no callers without --adminEnabled.
 KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
 KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
+KEYVIZ_LABELS_ENABLED="${KEYVIZ_LABELS_ENABLED:-false}"
 # Sub-range (hot-key) buckets per route. Empty omits the flag (binary
 # default 1 = route-level). A positive integer (e.g. 64) divides each
 # route into that many order-preserving sub-ranges so the heatmap shows
@@ -328,7 +329,7 @@ KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in DRY_RUN ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
+for _bool_var in DRY_RUN ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_LABELS_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -576,6 +577,7 @@ print_dry_run_plan() {
   fi
   if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
     echo "[rolling-update] KEYVIZ_FANOUT_NODES=$KEYVIZ_FANOUT_NODES"
+    echo "[rolling-update] KEYVIZ_LABELS_ENABLED=$KEYVIZ_LABELS_ENABLED"
     echo "[rolling-update] KEYVIZ_KEY_BUCKETS_PER_ROUTE=$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
     echo "[rolling-update] KEYVIZ_HOT_KEYS_ENABLED=$KEYVIZ_HOT_KEYS_ENABLED"
     if [[ "$KEYVIZ_HOT_KEYS_ENABLED" == "true" ]]; then
@@ -743,6 +745,7 @@ update_one_node() {
       ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
       KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
+      KEYVIZ_LABELS_ENABLED="$KEYVIZ_LABELS_ENABLED" \
       KEYVIZ_KEY_BUCKETS_PER_ROUTE="$KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q" \
       KEYVIZ_HOT_KEYS_ENABLED="$KEYVIZ_HOT_KEYS_ENABLED" \
       KEYVIZ_HOT_KEYS_PER_ROUTE="$KEYVIZ_HOT_KEYS_PER_ROUTE_Q" \
@@ -1240,6 +1243,9 @@ build_keyviz_flags() {
   if [[ -n "$fanout_nodes" ]]; then
     _flags+=(--keyvizFanoutNodes "$fanout_nodes")
   fi
+  if [[ "${KEYVIZ_LABELS_ENABLED:-false}" == "true" ]]; then
+    _flags+=(--keyvizLabelsEnabled)
+  fi
 
   local key_buckets="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
   if [[ -n "$key_buckets" ]]; then
@@ -1462,6 +1468,7 @@ running_status="$(docker inspect --format "{{.State.Status}}" "$CONTAINER_NAME" 
 # unset deploy knob hashes as the empty string consistently.
 config_fp() {
   local keyviz_fanout_nodes_fp=""
+  local keyviz_labels_enabled_fp=""
   local keyviz_key_buckets_per_route_fp=""
   local keyviz_hot_keys_enabled_fp=""
   local keyviz_hot_keys_per_route_fp=""
@@ -1470,6 +1477,7 @@ config_fp() {
   local keyviz_hot_keys_max_key_len_fp=""
   if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
     keyviz_fanout_nodes_fp="$KEYVIZ_FANOUT_NODES"
+    keyviz_labels_enabled_fp="$KEYVIZ_LABELS_ENABLED"
     keyviz_key_buckets_per_route_fp="$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
     keyviz_hot_keys_enabled_fp="$KEYVIZ_HOT_KEYS_ENABLED"
     if [[ "$KEYVIZ_HOT_KEYS_ENABLED" == "true" ]]; then
@@ -1499,7 +1507,7 @@ config_fp() {
     "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
-    "$KEYVIZ_ENABLED" "$keyviz_fanout_nodes_fp" "$keyviz_key_buckets_per_route_fp" \
+    "$KEYVIZ_ENABLED" "$keyviz_fanout_nodes_fp" "$keyviz_labels_enabled_fp" "$keyviz_key_buckets_per_route_fp" \
     "$keyviz_hot_keys_enabled_fp" "$keyviz_hot_keys_per_route_fp" \
     "$keyviz_hot_keys_sample_rate_fp" "$keyviz_hot_keys_queue_size_fp" \
     "$keyviz_hot_keys_max_key_len_fp" \
@@ -1725,7 +1733,7 @@ RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
 # the login shell once, so every value the operator might set has to
 # survive that pass intact. printf %q is the same hardening every
 # other forwarded path-like variable above gets.
-# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_ENABLED)
+# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_*)
 # are validated at the top of the local script to be the literal
 # "true" or "false", so they need no extra escaping — kept unquoted
 # at the env site for readability.
