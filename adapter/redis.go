@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -476,7 +477,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	r := &RedisServer{
 		listen:          listen,
 		store:           store,
-		coordinator:     coordinate,
+		coordinator:     kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
 		redisTranscoder: newRedisTranscoder(),
 		redisAddr:       redisAddr,
 		relay:           relay,

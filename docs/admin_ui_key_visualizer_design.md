@@ -135,7 +135,7 @@ Response matrix format: `matrix[i][j]` is the value for bucket `i` at time colum
 A single call site is added at the dispatch entry of `kv.ShardedCoordinator` (see `kv/sharded_coordinator.go`), immediately after the request is resolved to a `RouteID`:
 
 ```go
-sampler.Observe(routeID, op, keyLen, valueLen)
+sampler.Observe(routeID, key, op, valueLen, label)
 ```
 
 `sampler` is an interface; the default implementation is nil-safe (a nil sampler compiles to one branch and no allocation). The hook runs *before* Raft proposal so it measures offered load, not applied load.
