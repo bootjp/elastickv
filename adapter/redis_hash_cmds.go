@@ -122,7 +122,8 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 			return err
 		}
 
-		commitTS, err := r.nextCommitTS(ctx, "applyHashFieldPairs: allocate commitTS")
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "applyHashFieldPairs: allocate commitTS")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
@@ -169,7 +170,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
@@ -374,7 +375,8 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	if removed == 0 {
 		return 0, nil
 	}
-	commitTS, err := r.nextCommitTS(ctx, "hdelWideColumn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hdelWideColumn: allocate commitTS")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -387,7 +389,7 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	})
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -706,7 +708,8 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 		return 0, err
 	}
 
-	commitTS, err := r.nextCommitTS(ctx, "hincrbyTxn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hincrbyTxn: allocate commitTS")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -736,7 +739,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})

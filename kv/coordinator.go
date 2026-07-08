@@ -972,15 +972,24 @@ func (c *Coordinate) EngineGroupIDForKey(_ []byte) uint64 {
 }
 
 func (c *Coordinate) allocateTimestamp(ctx context.Context, label string) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, label, 0)
+}
+
+func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
+	}
 	if c.tsAllocator != nil {
-		ts, err := c.tsAllocator.Next(ctx)
-		if err != nil {
-			return 0, errors.Wrap(err, label)
+		if min > 0 {
+			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
 		}
-		return ts, nil
+		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
 	}
 	if c.clock == nil {
 		return 0, errors.Wrap(ErrTSOClockNil, label)
+	}
+	if min > 0 {
+		c.clock.Observe(min)
 	}
 	ts, err := c.clock.NextFenced()
 	if err != nil {
@@ -992,6 +1001,10 @@ func (c *Coordinate) allocateTimestamp(ctx context.Context, label string) (uint6
 // Next makes Coordinate usable as a TimestampAllocator for adapter helpers.
 func (c *Coordinate) Next(ctx context.Context) (uint64, error) {
 	return c.allocateTimestamp(ctx, "allocate coordinator timestamp")
+}
+
+func (c *Coordinate) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, "allocate coordinator timestamp after observed ts", min)
 }
 
 func (c *Coordinate) nextStartTS(ctx context.Context) (uint64, error) {
@@ -1015,7 +1028,7 @@ func (c *Coordinate) resolveDispatchCommitTS(ctx context.Context, commitTS, star
 		}
 		return commitTS, nil
 	}
-	next, err := c.allocateTimestamp(ctx, "allocate commitTS")
+	next, err := c.allocateTimestampAfter(ctx, "allocate commitTS", startTS)
 	if err != nil {
 		return 0, err
 	}
@@ -1025,7 +1038,7 @@ func (c *Coordinate) resolveDispatchCommitTS(ctx context.Context, commitTS, star
 	if c.clock != nil {
 		c.clock.Observe(startTS)
 	}
-	retry, err := c.allocateTimestamp(ctx, "re-allocate commitTS after Observe")
+	retry, err := c.allocateTimestampAfter(ctx, "re-allocate commitTS after Observe", startTS)
 	if err != nil {
 		return 0, err
 	}

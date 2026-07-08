@@ -246,6 +246,9 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if err := t.coord.awaitRegistrationBarrier(ctx); err != nil {
 		return nil, err
 	}
+	if err := t.stampRawTimestampsForLocalCommit(ctx, reqs); err != nil {
+		return nil, err
+	}
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(ctx, reqs)
@@ -266,6 +269,34 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	}
 	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
+}
+
+func (t *leaseRefreshingTxn) stampRawTimestampsForLocalCommit(ctx context.Context, reqs []*pb.Request) error {
+	if t == nil || t.coord == nil || !hasUnstampedRawRequests(reqs) {
+		return nil
+	}
+	if t.g != nil && t.g.Engine != nil {
+		if !isLeaderEngine(t.g.Engine) {
+			return nil
+		}
+		if !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
+			return nil
+		}
+	}
+	return t.coord.stampRawRequestTimestamps(ctx, reqs)
+}
+
+func canStampRawTimestampsOnEngine(ctx context.Context, engine raftengine.Engine) bool {
+	return verifyLeaderEngineCtx(ctx, engine) == nil
+}
+
+func hasUnstampedRawRequests(reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r != nil && !r.IsTxn && r.Ts == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *leaseRefreshingTxn) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -1390,15 +1421,24 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 }
 
 func (c *ShardedCoordinator) allocateTimestamp(ctx context.Context, label string) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, label, 0)
+}
+
+func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
+	}
 	if c.tsAllocator != nil {
-		ts, err := c.tsAllocator.Next(ctx)
-		if err != nil {
-			return 0, errors.Wrap(err, label)
+		if min > 0 {
+			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
 		}
-		return ts, nil
+		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
 	}
 	if c.clock == nil {
 		return 0, errors.Wrap(ErrTSOClockNil, label)
+	}
+	if min > 0 {
+		c.clock.Observe(min)
 	}
 	ts, err := c.clock.NextFenced()
 	if err != nil {
@@ -1413,6 +1453,10 @@ func (c *ShardedCoordinator) Next(ctx context.Context) (uint64, error) {
 	return c.allocateTimestamp(ctx, "allocate sharded timestamp")
 }
 
+func (c *ShardedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, "allocate sharded timestamp after observed ts", min)
+}
+
 func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64) (uint64, error) {
 	if c.clock == nil && c.tsAllocator == nil {
 		nextTS := startTS + 1
@@ -1421,7 +1465,7 @@ func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64)
 		}
 		return nextTS, nil
 	}
-	ts, err := c.allocateTimestamp(ctx, "allocate txn commit ts")
+	ts, err := c.allocateTimestampAfter(ctx, "allocate txn commit ts", startTS)
 	if err != nil {
 		return 0, err
 	}
@@ -1429,7 +1473,7 @@ func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64)
 		if c.clock != nil {
 			c.clock.Observe(startTS)
 		}
-		ts, err = c.allocateTimestamp(ctx, "re-allocate txn commit ts after Observe")
+		ts, err = c.allocateTimestampAfter(ctx, "re-allocate txn commit ts after Observe", startTS)
 		if err != nil {
 			return 0, err
 		}
@@ -1479,7 +1523,7 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock == nil && c.tsAllocator == nil {
 		return maxTS + 1, nil
 	}
-	ts, err := c.allocateTimestamp(ctx, "allocate sharded startTS")
+	ts, err := c.allocateTimestampAfter(ctx, "allocate sharded startTS", maxTS)
 	if err != nil {
 		return 0, err
 	}
@@ -1862,7 +1906,7 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
-		ts, err := c.allocateTimestamp(ctx, "allocate sharded raw log ts")
+		ts, err := c.rawLogTimestamp(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1874,6 +1918,27 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 		})
 	}
 	return logs, nil
+}
+
+func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
+	if c.tsAllocator != nil {
+		return 0, nil
+	}
+	return c.allocateTimestamp(ctx, "allocate sharded raw log ts")
+}
+
+func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs []*pb.Request) error {
+	for _, r := range reqs {
+		if r == nil || r.IsTxn || r.Ts != 0 {
+			continue
+		}
+		ts, err := c.allocateTimestamp(ctx, "stamp sharded raw log ts")
+		if err != nil {
+			return err
+		}
+		r.Ts = ts
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {

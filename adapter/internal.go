@@ -114,6 +114,47 @@ func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, err
 	return ts, nil
 }
 
+func (i *Internal) nextTimestampAfter(ctx context.Context, min uint64, label string) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	if i.tsAllocator != nil {
+		return i.nextTimestampAfterFromAllocator(ctx, min, label)
+	}
+	if i.clock == nil {
+		return min + 1, nil
+	}
+	if i.clock != nil {
+		i.clock.Observe(min)
+	}
+	ts, err := i.nextTimestamp(ctx, label)
+	if err != nil {
+		return 0, err
+	}
+	if ts <= min {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	return ts, nil
+}
+
+func (i *Internal) nextTimestampAfterFromAllocator(ctx context.Context, min uint64, label string) (uint64, error) {
+	if after, ok := i.tsAllocator.(kv.TimestampAfterAllocator); ok {
+		ts, err := after.NextAfter(ctx, min)
+		if err != nil {
+			return 0, errors.Wrap(err, label)
+		}
+		return ts, nil
+	}
+	ts, err := i.tsAllocator.Next(ctx)
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if ts <= min {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	return ts, nil
+}
+
 func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) error {
 	for _, r := range reqs {
 		if r == nil {
@@ -230,7 +271,7 @@ func (i *Internal) forwardedTxnCommitTS(ctx context.Context, startTS uint64) (ui
 		i.clock.Observe(startTS)
 	}
 	if i.tsAllocator != nil || i.clock != nil {
-		ts, err := i.nextTimestamp(ctx, "fillForwardedTxnCommitTS")
+		ts, err := i.nextTimestampAfter(ctx, startTS, "fillForwardedTxnCommitTS")
 		if err != nil {
 			return 0, err
 		}

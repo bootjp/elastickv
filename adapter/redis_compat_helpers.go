@@ -1175,7 +1175,8 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	for _, value := range values {
 		rawValues = append(rawValues, []byte(value))
 	}
-	commitTS, err := r.nextCommitTS(ctx, "rewriteListTxn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "rewriteListTxn: allocate commitTS")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1184,12 +1185,9 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 		return err
 	}
 	elems = append(elems, ops...)
-	if readTS == ^uint64(0) {
-		readTS = 0
-	}
 	_, err = r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  readTS,
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})

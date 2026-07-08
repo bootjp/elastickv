@@ -494,7 +494,7 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 	if len(elems) == 0 {
 		return nil
 	}
-	commitTS, err := kv.NextTimestampThrough(ctx, c.coord, "dispatchCompaction: allocate commitTS")
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, c.coord, normalizeStartTS(readTS), "dispatchCompaction: allocate commitTS")
 	if err != nil {
 		return errors.WithStack(err)
 	}

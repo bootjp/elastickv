@@ -264,7 +264,8 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return err
 		}
 
-		commitTS, err := r.nextCommitTS(ctx, "mutateExactSetWide: allocate commitTS")
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "mutateExactSetWide: allocate commitTS")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
@@ -306,7 +307,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})

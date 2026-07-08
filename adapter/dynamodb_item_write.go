@@ -277,7 +277,7 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	// Allocate through the coordinator so TSO-enabled deployments use the
 	// same timestamp source as Dispatch. The fallback still honors the HLC
 	// physical-ceiling fence.
-	commitTS, err := kv.NextTimestampThrough(ctx, d.coordinator, "dynamodb item-write first attempt: allocate commitTS")
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, readTS, "dynamodb item-write first attempt: allocate commitTS")
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
@@ -305,7 +305,7 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 	tableName string,
 	pending *reusableItemWrite,
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	commitTS, err := kv.NextTimestampThrough(ctx, d.coordinator, "dynamodb item-write reuse: allocate commitTS")
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, pending.plan.req.StartTS, "dynamodb item-write reuse: allocate commitTS")
 	if err != nil {
 		return nil, pending, errors.WithStack(err)
 	}

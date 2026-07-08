@@ -3154,10 +3154,11 @@ func (c *luaScriptContext) commit() error {
 	}
 	sort.Strings(keys)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(c.scriptCtx(), redisDispatchTimeout)
+	defer cancel()
 
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
-	commitTS, err := c.server.nextCommitTS(ctx, "luaScriptContext.commit: allocate commitTS")
+	commitTS, err := c.server.nextCommitTSAfter(ctx, luaCommitFloor(c.startTS), "luaScriptContext.commit: allocate commitTS")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -3184,21 +3185,22 @@ func (c *luaScriptContext) commit() error {
 		return nil
 	}
 
-	dispatchCtx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
-	defer cancel()
-	startTS := c.startTS
-	if startTS == ^uint64(0) {
-		startTS = 0
-	}
-	if _, err := c.server.coordinator.Dispatch(dispatchCtx, &kv.OperationGroup[kv.OP]{
+	if _, err := c.server.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  startTS,
+		StartTS:  luaCommitFloor(c.startTS),
 		CommitTS: commitTS,
 		Elems:    elems,
 	}); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func luaCommitFloor(startTS uint64) uint64 {
+	if startTS == ^uint64(0) {
+		return 0
+	}
+	return startTS
 }
 
 // nonStringTTLElems returns !redis|ttl| elements for a non-string key if the TTL

@@ -81,6 +81,38 @@ func TestBatchAllocatorInvalidateDropsCachedWindow(t *testing.T) {
 	require.EqualValues(t, 2, tso.calls.Load())
 }
 
+func TestBatchAllocatorNextAfterSkipsCachedSlotsBelowFloor(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+
+	got, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, got)
+
+	got, err = alloc.NextAfter(context.Background(), testTSOInitialBase+5)
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+6, got)
+	require.EqualValues(t, 3, tso.calls.Load())
+}
+
+func TestBatchAllocatorRejectsInvalidatedWindowSnapshot(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+
+	alloc.win.Store(&windowSnapshot{
+		base:  testTSOInitialBase,
+		size:  positiveIntToUint64(testTSOBatchSize),
+		epoch: alloc.epoch.Load(),
+	})
+	alloc.Invalidate()
+
+	got, ok := alloc.tryWindowAfter(0)
+	require.False(t, ok)
+	require.Zero(t, got)
+}
+
 func TestCoordinateLeaderLossInvalidatesTimestampWindow(t *testing.T) {
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
@@ -176,7 +208,11 @@ func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
 }
 
 func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) {
-	got, err := NextTimestampAfterThrough(context.Background(), nil, testTSOInitialBase, "test")
+	got, err := NextTimestampThrough(context.Background(), &Coordinate{}, "test")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, got)
+
+	got, err = NextTimestampAfterThrough(context.Background(), nil, testTSOInitialBase, "test")
 	require.NoError(t, err)
 	require.EqualValues(t, testTSOInitialBase+1, got)
 
@@ -186,6 +222,21 @@ func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) 
 
 	_, err = NextTimestampAfterThrough(context.Background(), nil, ^uint64(0), "test")
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
+}
+
+func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
+	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
+	require.NoError(t, err)
+	coord := &Coordinate{tsAllocator: alloc}
+
+	got, err := NextTimestampThrough(context.Background(), coord, "test")
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, got)
+
+	got, err = NextTimestampAfterThrough(context.Background(), coord, testTSOInitialBase+5, "test")
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+6, got)
 }
 
 func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
@@ -205,6 +256,32 @@ func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
 	commitTS, err := coord.resolveDispatchCommitTS(context.Background(), 0, startTS)
 	require.NoError(t, err)
 	require.EqualValues(t, testTSOInitialBase+1, commitTS)
+}
+
+func TestShardedCoordinatorRawFollowerDefersTSOAllocationToLeaderPath(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	txn := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 3}},
+	}
+	alloc := &blockingTimestampAllocator{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {
+			Engine: &stubFollowerEngine{},
+			Txn:    txn,
+		},
+	}, 1, NewHLC(), nil).WithTSOAllocator(alloc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTSOWaitTimeout)
+	defer cancel()
+	_, err := coord.Dispatch(ctx, &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("raw")}},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, alloc.calls.Load())
+	require.EqualValues(t, 0, txn.requests[0].Ts)
 }
 
 func TestShardedCoordinatorUsesTSOAllocatorForRawTxnAndDelPrefix(t *testing.T) {
@@ -281,6 +358,16 @@ func (f *fakeTSOAllocator) IsLeader() bool { return f.leader }
 
 func (f *fakeTSOAllocator) RunLeaseRenewal(ctx context.Context) {
 	<-ctx.Done()
+}
+
+type blockingTimestampAllocator struct {
+	calls atomic.Uint64
+}
+
+func (b *blockingTimestampAllocator) Next(ctx context.Context) (uint64, error) {
+	b.calls.Add(1)
+	<-ctx.Done()
+	return 0, ctx.Err()
 }
 
 type fakeTSOCoordinator struct {

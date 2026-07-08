@@ -837,37 +837,43 @@ type preparedTxnDispatch struct {
 func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	elems := t.buildKeyElems()
 
-	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
-	// the coordinator assigns it during Dispatch.
-	commitTS, err := t.server.nextCommitTS(context.Background(), "redis txn commit: allocate commitTS")
-	if err != nil {
-		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
-	}
-	listElems := t.buildListElems(commitTS)
-	zsetElems, err := t.buildZSetElems(commitTS)
-	if err != nil {
-		return preparedTxnDispatch{cancel: func() {}}, err
-	}
-	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
-	// non-string keys get a !redis|ttl| element written in the same transaction.
-	ttlElems := t.buildTTLElems()
-
 	// Derive a single redisDispatchTimeout-bounded context covering both
-	// the stream-deletion scans (paginated ScanAt/ExistsAt over
-	// StreamEntryScanPrefix) and the final Dispatch. The parent is the
-	// txnContext's own ctx (the caller's dispatchCtx), not the server-
-	// lifetime handlerContext, so an outer cancellation (client
-	// disconnect, retryRedisWrite timeout) interrupts the prepare+dispatch
-	// promptly instead of waiting the full redisDispatchTimeout. Symmetric
-	// with the reuseCtx threading in runTransactionWithDedup. The nil-guard
-	// falls back to handlerContext for callers that construct a txnContext
-	// without setting ctx (test fixtures).
+	// the commitTS allocation, the delta-key stream-deletion scans, and
+	// the final Dispatch. The parent is the txnContext's own ctx (the
+	// caller's dispatchCtx), not the server-lifetime handlerContext, so
+	// an outer cancellation (client disconnect, retryRedisWrite timeout)
+	// interrupts the prepare+dispatch promptly instead of waiting the
+	// full redisDispatchTimeout. Symmetric with the reuseCtx threading in
+	// runTransactionWithDedup. The nil-guard falls back to handlerContext
+	// for callers that construct a txnContext without setting ctx (test
+	// fixtures).
 	parentCtx := t.ctx
 	if parentCtx == nil {
 		parentCtx = t.server.handlerContext()
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, redisDispatchTimeout)
 
+	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
+	// the coordinator assigns it during Dispatch. The allocation is bounded by
+	// ctx and must floor above the transaction's read snapshot.
+	commitTS, err := t.server.nextCommitTSAfter(ctx, t.startTS, "redis txn commit: allocate commitTS")
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
+	}
+	listElems := t.buildListElems(commitTS)
+	zsetElems, err := t.buildZSetElems(commitTS)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
+	// non-string keys get a !redis|ttl| element written in the same transaction.
+	ttlElems := t.buildTTLElems()
+
+	// Continue using the same redisDispatchTimeout-bounded context for
+	// the stream-deletion scans (paginated ScanAt/ExistsAt over
+	// StreamEntryScanPrefix) and the final Dispatch.
 	streamElems, err := t.buildStreamDeletionElems(ctx)
 	if err != nil {
 		cancel()
@@ -1281,7 +1287,7 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// could issue a timestamp that collides with a subsequent leader's
 	// window after renewal — the very class of bug option-2 is meant to
 	// rule out.
-	commitTS, allocErr := r.nextCommitTS(ctx, "redis exec reuse: allocate commitTS")
+	commitTS, allocErr := r.nextCommitTSAfter(ctx, pending.startTS, "redis exec reuse: allocate commitTS")
 	if allocErr != nil {
 		return nil, false, errors.WithStack(allocErr)
 	}

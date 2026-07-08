@@ -561,24 +561,13 @@ func (r *RedisServer) readTS() uint64 {
 	return snapshotTS(r.coordinator.Clock(), r.store)
 }
 
-func (r *RedisServer) nextCommitTS(ctx context.Context, label string) (uint64, error) {
+func (r *RedisServer) nextCommitTSAfter(ctx context.Context, startTS uint64, label string) (uint64, error) {
 	if r == nil || r.coordinator == nil {
 		return 0, errors.Wrap(kv.ErrTSOCoordinatorNil, label)
 	}
-	if alloc, ok := r.coordinator.(kv.TimestampAllocator); ok {
-		ts, err := alloc.Next(ctx)
-		if err != nil {
-			return 0, errors.Wrap(err, label)
-		}
-		return ts, nil
-	}
-	clock := r.coordinator.Clock()
-	if clock == nil {
-		return 0, errors.Wrap(kv.ErrTSOClockNil, label)
-	}
-	ts, err := clock.NextFenced()
+	ts, err := kv.NextTimestampAfterThrough(ctx, r.coordinator, startTS, label)
 	if err != nil {
-		return 0, errors.Wrap(err, label)
+		return 0, errors.WithStack(err)
 	}
 	return ts, nil
 }

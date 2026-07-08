@@ -595,7 +595,8 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		return 0, err
 	}
 
-	commitTS, err := r.nextCommitTS(ctx, "zaddTxn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zaddTxn: allocate commitTS")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -647,7 +648,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key)
+	return added, r.dispatchAndSignalZSet(ctx, startTS, commitTS, elems, key)
 }
 
 // dispatchAndSignalZSet dispatches the elems through the coordinator
@@ -686,7 +687,8 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	}
 
 	memberKey := store.ZSetMemberKey(key, []byte(member))
-	commitTS, err := r.nextCommitTS(ctx, "zincrbyTxn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zincrbyTxn: allocate commitTS")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -833,7 +835,8 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 		}
 		elems, lenDelta := buildZSetWideElems(key, st)
 		if lenDelta != 0 {
-			commitTS, err := r.nextCommitTS(ctx, "persistZSetEntriesTxn: allocate commitTS")
+			startTS := normalizeStartTS(readTS)
+			commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetEntriesTxn: allocate commitTS")
 			if err != nil {
 				return cockerrors.WithStack(err)
 			}
@@ -845,7 +848,7 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 			})
 			_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 				IsTxn:    true,
-				StartTS:  normalizeStartTS(readTS),
+				StartTS:  startTS,
 				CommitTS: commitTS,
 				Elems:    elems,
 			})
@@ -880,7 +883,8 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	if len(probeKVs) == 0 {
 		return r.persistZSetEntriesTxn(ctx, key, readTS, remaining)
 	}
-	commitTS, err := r.nextCommitTS(ctx, "persistZSetRemovalsTxn: allocate commitTS")
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetRemovalsTxn: allocate commitTS")
 	if err != nil {
 		return cockerrors.WithStack(err)
 	}
@@ -900,7 +904,7 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	})
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -1123,7 +1127,8 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 	}
 	if isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
-		commitTS, err := r.nextCommitTS(ctx, "persistBZPopMinResult: allocate commitTS")
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistBZPopMinResult: allocate commitTS")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
@@ -1135,7 +1140,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
