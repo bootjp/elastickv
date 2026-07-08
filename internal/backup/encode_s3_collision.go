@@ -16,7 +16,7 @@ import (
 // turns that file back into a map[encoded-rel-path]KeymapRecord the
 // object walk consults to recover original S3 keys.
 //
-// Design: docs/design/2026_06_03_proposed_s3_collision_reversal.md.
+// Design: docs/design/2026_06_03_implemented_s3_collision_reversal.md.
 //
 // File-system safety: loadBucketKeymap re-runs the read-side
 // Lstat → refuseHardLink → Open sequence rather than reusing

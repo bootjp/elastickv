@@ -10,7 +10,7 @@
 
 ## Implementation audit
 
-Implemented by `internal/encryption.Applier.WithLocalEpoch`,
+Implemented by `internal/encryption.WithLocalEpoch`,
 `writeRotationSidecar`, `main_encryption_registration.go`'s runtime
 registration watcher, and the per-DEK `StateCache.Registered` gate.
 Tests cover rotation-local-epoch sidecar writes and runtime rotation

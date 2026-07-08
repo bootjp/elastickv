@@ -46,7 +46,7 @@ const (
 	// applyMutationsRaftAt / deletePrefixAtRaftAt) and pinned to
 	// snap.Metadata.Index by SetDurableAppliedIndex at every snapshot
 	// persist site. See
-	// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+	// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3.
 	metaAppliedIndex = "_meta_applied_index"
 	spoolBufSize     = 32 * 1024 // buffer size for streaming I/O during restore
 
@@ -578,7 +578,7 @@ func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 // fsm.db that has not yet bumped through a raft-Apply, or a freshly
 // restored store. Callers MUST treat this as "missing" and fall back
 // to the full restore path; see
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §4 fallback
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §4 fallback
 // policy. Any other error propagates.
 //
 // dbMu.RLock matches the rest of the read path

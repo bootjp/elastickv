@@ -101,7 +101,10 @@ type encryptionAdminEngine interface {
 // short-circuit at the gRPC boundary with FailedPrecondition —
 // identical to the Stage 5D posture. When enableMutators is
 // true, both options are wired and the mutators reach the §6.3
-// applier through the supplied engine's Propose path.
+// applier through the supplied engine. Callers may append a
+// wrap-aware post-cutover proposer option so non-cutover admin
+// entries wrap after EnableRaftEnvelope while the cutover marker
+// itself remains on the raw engine path.
 //
 // The double gate exists because both conditions are
 // independently necessary:
@@ -128,7 +131,7 @@ type encryptionAdminEngine interface {
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn) {
+func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, extraOpts ...adapter.EncryptionAdminServerOption) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
@@ -147,6 +150,7 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 		if capabilityFanout != nil {
 			opts = append(opts, adapter.WithEncryptionAdminCapabilityFanout(capabilityFanout))
 		}
+		opts = append(opts, extraOpts...)
 	}
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {
