@@ -275,7 +275,7 @@ func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport 
 	return s, gs
 }
 
-func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker, deltaCompactor *adapter.DeltaCompactor) (*adapter.RedisServer, error) {
+func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, coordinator *kv.Coordinate, addr, redisAddr, raftRedisMapStr string, relay *adapter.RedisPubSubRelay, readTracker *kv.ActiveTimestampTracker, deltaCompactor *adapter.DeltaCompactor, applyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, error) {
 	leaderRedis := make(map[string]string)
 	if raftRedisMapStr != "" {
 		parts := strings.SplitSeq(raftRedisMapStr, ",")
@@ -297,6 +297,7 @@ func setupRedis(ctx context.Context, lc net.ListenConfig, st store.MVCCStore, co
 	return adapter.NewRedisServer(l, redisAddr, routedStore, coordinator, leaderRedis, relay,
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisCompactor(deltaCompactor),
+		adapter.WithRedisApplyObserver(applyObserver),
 	), nil
 }
 
@@ -450,7 +451,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 	cleanup.Add(func() { st.Close() })
 	hlc := kv.NewHLC()
-	fsm := kv.NewKvFSMWithHLC(st, hlc)
+	redisApplyObserver := adapter.NewRedisApplyObserver()
+	fsm := kv.NewKvFSMWithHLC(st, hlc, kv.WithApplyObserver(redisApplyObserver))
 	readTracker := kv.NewActiveTimestampTracker()
 
 	result, err := openRaftEngine(cfg, fsm, &cleanup)
@@ -508,7 +510,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	deltaCompactor := adapter.NewDeltaCompactor(st, coordinator)
 
-	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay, readTracker, deltaCompactor)
+	rd, err := setupRedis(ctx, lc, st, coordinator, cfg.address, cfg.redisAddress, cfg.raftRedisMap, relay, readTracker, deltaCompactor, redisApplyObserver)
 	if err != nil {
 		return err
 	}

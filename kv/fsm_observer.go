@@ -1,6 +1,9 @@
 package kv
 
-import pb "github.com/bootjp/elastickv/proto"
+import (
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
+)
 
 // ApplyObserver receives a notification after a logical mutation is
 // successfully applied by kvFSM. Implementations run inline on the Raft apply
@@ -27,6 +30,21 @@ func (f *kvFSM) notifyApplyObservers(commitTS uint64, muts []*pb.Mutation) {
 			continue
 		}
 		f.notifyApplyObserverAfterObserve(mut.Op, mut.Key)
+	}
+}
+
+func (f *kvFSM) notifyApplyObserversForStoreMutations(commitTS uint64, muts []*store.KVPairMutation) {
+	f.observeAppliedCommitTS(commitTS)
+	for _, mut := range muts {
+		if mut == nil || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		switch mut.Op {
+		case store.OpTypePut:
+			f.notifyApplyObserverAfterObserve(pb.Op_PUT, mut.Key)
+		case store.OpTypeDelete:
+			f.notifyApplyObserverAfterObserve(pb.Op_DEL, mut.Key)
+		}
 	}
 }
 

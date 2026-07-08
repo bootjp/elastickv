@@ -115,7 +115,17 @@ func TestFSMApplyObserverTxnVisibleMutationsOnly(t *testing.T) {
 
 	primary := []byte("primary")
 	secondary := []byte("secondary")
-	prepareTxn(t, fsm, primary, 10, [][]byte{primary, secondary}, [][]byte{[]byte("p"), []byte("s")})
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: primary, Value: []byte("p")},
+			{Op: pb.Op_DEL, Key: secondary},
+		},
+	}
+	require.NoError(t, applyObserverTestRequest(t, fsm, prepare))
 	require.Empty(t, observer.calls, "PREPARE must not notify user-visible mutations")
 
 	commit := &pb.Request{
@@ -131,7 +141,7 @@ func TestFSMApplyObserverTxnVisibleMutationsOnly(t *testing.T) {
 	require.NoError(t, applyObserverTestRequest(t, fsm, commit))
 	require.Equal(t, []recordedApply{
 		{op: pb.Op_PUT, key: "primary"},
-		{op: pb.Op_PUT, key: "secondary"},
+		{op: pb.Op_DEL, key: "secondary"},
 	}, observer.calls)
 }
 

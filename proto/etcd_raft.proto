@@ -4,6 +4,7 @@ option go_package = "github.com/bootjp/elastickv/proto";
 
 service EtcdRaft {
   rpc Send(EtcdRaftMessage) returns (EtcdRaftAck) {}
+  rpc SendStream(stream EtcdRaftMessage) returns (EtcdRaftAck) {}
   rpc SendSnapshot(stream EtcdRaftSnapshotChunk) returns (EtcdRaftAck) {}
 }
 

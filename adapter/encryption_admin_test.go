@@ -358,6 +358,60 @@ func TestEncryptionAdmin_Validate_OKWithBothWired(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_NonCutoverAdminEntriesUsePostCutoverProposer(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		call       func(context.Context, *EncryptionAdminServer) (uint64, error)
+		wantOpcode byte
+	}{
+		{
+			name: "RotateDEK",
+			call: func(ctx context.Context, srv *EncryptionAdminServer) (uint64, error) {
+				resp, err := srv.RotateDEK(ctx, validRotateDEKRequest())
+				if resp == nil {
+					return 0, err
+				}
+				return resp.AppliedIndex, err
+			},
+			wantOpcode: fsmwire.OpRotation,
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(ctx context.Context, srv *EncryptionAdminServer) (uint64, error) {
+				resp, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				if resp == nil {
+					return 0, err
+				}
+				return resp.AppliedIndex, err
+			},
+			wantOpcode: fsmwire.OpRegistration,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := &recordingProposer{commitIndex: 17}
+			postCutover := &recordingProposer{commitIndex: 99}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(raw),
+				WithEncryptionAdminPostCutoverProposer(postCutover),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+			)
+			gotIdx, err := tc.call(context.Background(), srv)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if gotIdx != 99 {
+				t.Errorf("AppliedIndex=%d, want 99 from post-cutover proposer", gotIdx)
+			}
+			if len(raw.calls) != 0 {
+				t.Fatalf("raw proposer calls=%d, want 0 for non-cutover admin entry", len(raw.calls))
+			}
+			assertSingleProposalOpcode(t, postCutover.calls, tc.wantOpcode)
+		})
+	}
+}
+
 // TestEncryptionAdmin_BootstrapEncryption_HappyPath verifies the
 // byte layout of the proposed §5.6 0x04 Raft entry by
 // round-tripping through fsmwire.DecodeBootstrap. Each writer in
@@ -464,6 +518,20 @@ func TestEncryptionAdmin_BootstrapEncryption_RejectsBadInputs(t *testing.T) {
 				t.Errorf("%s: status=%v, want InvalidArgument", c.name, status.Code(err))
 			}
 		})
+	}
+}
+
+func TestEncryptionAdmin_BootstrapWriter_LocalEpochOutOfRangeSentinel(t *testing.T) {
+	t.Parallel()
+	_, err := validateBootstrapWriter(0, &pb.WriterRegistryEntry{
+		FullNodeId: 1,
+		LocalEpoch: math.MaxUint16 + 1,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("validateBootstrapWriter status=%v, want InvalidArgument", status.Code(err))
+	}
+	if !errors.Is(err, encryption.ErrLocalEpochOutOfRange) {
+		t.Fatalf("validateBootstrapWriter must mark ErrLocalEpochOutOfRange, got %v", err)
 	}
 }
 
@@ -1672,6 +1740,57 @@ func TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator
 	}
 }
 
+func TestEncryptionAdmin_AdminMutatorsHonorCtxDeadlineWaitingOnCutover(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		call func(*EncryptionAdminServer, context.Context) error
+	}{
+		{
+			name: "BootstrapEncryption",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.BootstrapEncryption(ctx, validBootstrapEncryptionRequest())
+				return err
+			},
+		},
+		{
+			name: "RotateDEK",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.RotateDEK(ctx, validRotateDEKRequest())
+				return err
+			},
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proposer := &recordingProposer{commitIndex: 42}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(proposer),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+			)
+			srv.cutoverSem <- struct{}{}
+			t.Cleanup(func() { <-srv.cutoverSem })
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+			defer cancel()
+			err := tc.call(srv, ctx)
+			if status.Code(err) != codes.DeadlineExceeded {
+				t.Fatalf("%s status=%v, want DeadlineExceeded", tc.name, status.Code(err))
+			}
+			if len(proposer.calls) != 0 {
+				t.Fatalf("%s proposed %d entries while cutover semaphore was held, want 0", tc.name, len(proposer.calls))
+			}
+		})
+	}
+}
+
 // TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK
 // pins codex P2 round-2 on PR812: the production fan-out helper
 // can synthesize Reachable=false verdicts and return (result, nil)
@@ -1978,6 +2097,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch(t *testin
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
 	}
+	if !errors.Is(err, encryption.ErrLocalEpochOutOfRange) {
+		t.Errorf("EnableRaftEnvelope must mark ErrLocalEpochOutOfRange, got %v", err)
+	}
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped pins
@@ -1998,6 +2120,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T)
 	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if !errors.Is(err, encryption.ErrEncryptionNotBootstrapped) {
+		t.Errorf("EnableRaftEnvelope must mark ErrEncryptionNotBootstrapped, got %v", err)
 	}
 	if err == nil || !strings.Contains(err.Error(), "BootstrapEncryption") {
 		t.Errorf("error %q does not hint at BootstrapEncryption", err)
@@ -2044,59 +2169,6 @@ func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
 	}
 }
 
-// TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2 pins the
-// fail-closed gate: while raftEnvelopeWrapEnabled is false (i.e.
-// before Stage 6E-2 ships wrap-on-propose / unwrap-on-apply /
-// §7.1 barrier), the RPC MUST refuse fresh cutover proposals
-// with FailedPrecondition rather than recording
-// RaftEnvelopeCutoverIndex=N. Recording N now would let cleartext
-// entries land at indexes > N and the 6E-2 engine apply-hook
-// would treat them as envelopes on upgrade, halting apply
-// cluster-wide.
-//
-// The test wires an `applyingProposer` exactly as a future
-// happy-path test would, then verifies the gate refuses BEFORE
-// any proposal is composed (proposer.calls is empty) and BEFORE
-// any sidecar mutation lands (RaftEnvelopeCutoverIndex stays 0).
-// When 6E-2 lands and flips raftEnvelopeWrapEnabled to true, this
-// test becomes the regression pin for the gate-flip and a
-// HappyPath sibling is added.
-func TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2(t *testing.T) {
-	t.Parallel()
-	path := cutoverReadySidecarFixture(t)
-	proposer := &applyingProposer{
-		recordingProposer: recordingProposer{commitIndex: 4242},
-		sidecarPath:       path,
-		applyFn:           applyRaftCutover,
-	}
-	srv := NewEncryptionAdminServer(
-		WithEncryptionAdminProposer(proposer),
-		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
-		WithEncryptionAdminSidecarPath(path),
-		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
-	)
-	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (gated until 6E-2)", status.Code(err))
-	}
-	if err == nil || !strings.Contains(err.Error(), "6E-2") {
-		t.Errorf("error %q does not hint at the 6E-2 gate", err)
-	}
-	if len(proposer.calls) != 0 {
-		t.Errorf("proposer.calls len=%d, want 0 (gate must refuse before propose)", len(proposer.calls))
-	}
-	// Sidecar must remain untouched: RaftEnvelopeCutoverIndex
-	// still 0 means the cluster has not entered Phase 2 and a
-	// future 6E-2 upgrade is still safe.
-	sc, readErr := encryption.ReadSidecar(path)
-	if readErr != nil {
-		t.Fatalf("ReadSidecar: %v", readErr)
-	}
-	if sc.RaftEnvelopeCutoverIndex != 0 {
-		t.Errorf("RaftEnvelopeCutoverIndex=%d, want 0 (gate must refuse before sidecar mutation)", sc.RaftEnvelopeCutoverIndex)
-	}
-}
-
 // recordingCutoverBarrier is a CutoverBarrierController stub that
 // records the call order so the §7.1 6-step state-machine tests can
 // assert Begin → WaitDrained → (propose) → InstallWrap → End. It
@@ -2130,18 +2202,14 @@ func (b *recordingCutoverBarrier) End() {
 	b.order = append(b.order, "End")
 }
 
-// withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
-// the duration of t and restores the original value via t.Cleanup.
-// Tests that exercise the §7.1 state machine MUST call this — the
-// production value is still false in 6E-2d so the gated short-
-// circuit would otherwise eat the test before the barrier path
-// runs. Returns no value; t.Cleanup handles teardown so callers
-// don't need to defer.
+// withWrapEnabledForTest keeps raftEnvelopeWrapEnabled open for the
+// duration of t and restores the original value via t.Cleanup. The gate
+// remains mutable as an emergency/test kill switch. Returns no value;
+// t.Cleanup handles teardown so callers don't need to defer.
 //
 // Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
 // an atomic.Bool, so concurrent reads from sibling parallel tests
-// (e.g. GatedUntil6E2) observe a coherent value rather than
-// tripping -race detection (claude finding 3 round-1).
+// observe a coherent value rather than tripping -race detection.
 func withWrapEnabledForTest(t *testing.T) {
 	t.Helper()
 	prev := raftEnvelopeWrapEnabled.Load()
@@ -2151,8 +2219,7 @@ func withWrapEnabledForTest(t *testing.T) {
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier
 // pins the §7.1 wiring gate: even with raftEnvelopeWrapEnabled
-// flipped true (the future 6E-2f production state), the handler
-// MUST refuse with FailedPrecondition when the cutoverBarrier
+// open, the handler MUST refuse with FailedPrecondition when the cutoverBarrier
 // controller is not wired. Silently skipping the barrier would
 // let a fresh USER proposal land at index > proposedIdx mid-
 // cutover and halt apply cluster-wide on the §6.3 strict-`>` hook.
@@ -2232,12 +2299,14 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 		sidecarPath:       path,
 		applyFn:           applyRaftCutover,
 	}
+	postCutover := &recordingProposer{commitIndex: 9999}
 	barrier := &recordingCutoverBarrier{}
 	// latestAppliedIndex returns the proposer's commitIndex so the
 	// step-4 wait completes immediately on the first poll. A
 	// production wiring would have the FSM apply path update this.
 	srv := NewEncryptionAdminServer(
 		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminPostCutoverProposer(postCutover),
 		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
 		WithEncryptionAdminSidecarPath(path),
 		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
@@ -2257,6 +2326,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 	}
 	if len(proposer.calls) != 1 {
 		t.Errorf("proposer.calls len=%d, want 1 (one ProposeAdmin between WaitDrained and InstallWrap)", len(proposer.calls))
+	}
+	if len(postCutover.calls) != 0 {
+		t.Errorf("post-cutover proposer calls=%d, want 0 for the cutover marker itself", len(postCutover.calls))
 	}
 }
 
@@ -2307,6 +2379,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *te
 	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
 		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
 	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout
@@ -2410,6 +2485,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *te
 	if len(proposer.calls) != 1 {
 		t.Errorf("proposer.calls len=%d, want 1 (cutover entry MUST have been proposed before the apply-wait timeout)", len(proposer.calls))
 	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace
@@ -2562,6 +2640,52 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t
 	wantPrefix := []string{"Begin", "WaitDrained"}
 	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
 		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
+}
+
+func assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t *testing.T, srv *EncryptionAdminServer, proposalCalls func() int) {
+	t.Helper()
+	cases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "BootstrapEncryption",
+			call: func(ctx context.Context) error {
+				_, err := srv.BootstrapEncryption(ctx, validBootstrapEncryptionRequest())
+				return err
+			},
+		},
+		{
+			name: "RotateDEK",
+			call: func(ctx context.Context) error {
+				_, err := srv.RotateDEK(ctx, validRotateDEKRequest())
+				return err
+			},
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(ctx context.Context) error {
+				_, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		before := proposalCalls()
+		err := tc.call(context.Background())
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("%s status=%v, want FailedPrecondition after unsafe raft cutover", tc.name, status.Code(err))
+		}
+		if err == nil || !strings.Contains(err.Error(), "cutover outcome is unsafe") {
+			t.Fatalf("%s error %q does not explain the unsafe cutover latch", tc.name, err)
+		}
+		if after := proposalCalls(); after != before {
+			t.Fatalf("%s proposed after unsafe raft cutover: calls before=%d after=%d", tc.name, before, after)
+		}
 	}
 }
 

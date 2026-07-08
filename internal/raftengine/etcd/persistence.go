@@ -13,6 +13,7 @@ import (
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -59,10 +60,10 @@ type fileFormat struct {
 func bootstrapState(nodeID uint64) persistedState {
 	return persistedState{
 		Snapshot: raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{nodeID}},
-				Index:     1,
-				Term:      1,
+			Metadata: &raftpb.SnapshotMetadata{
+				ConfState: &raftpb.ConfState{Voters: []uint64{nodeID}},
+				Index:     proto.Uint64(1),
+				Term:      proto.Uint64(1),
 			},
 		},
 	}
@@ -201,10 +202,10 @@ func saveMetadataFile(path string, hardState raftpb.HardState, snapshot raftpb.S
 		if err := writeVersionedHeader(writer, fileFormat{magic: metadataFileMagic, version: metadataFileVersion}); err != nil {
 			return err
 		}
-		if err := writeMessage(writer, hardState.Marshal); err != nil {
+		if err := writeMessage(writer, &hardState); err != nil {
 			return err
 		}
-		if err := writeMessage(writer, snapshot.Marshal); err != nil {
+		if err := writeMessage(writer, &snapshot); err != nil {
 			return err
 		}
 		if err := writer.Flush(); err != nil {
@@ -250,7 +251,7 @@ func rewriteEntriesFile(path string, entries []raftpb.Entry) error {
 			return err
 		}
 		for _, entry := range entries {
-			if err := writeMessage(writer, entry.Marshal); err != nil {
+			if err := writeMessage(writer, &entry); err != nil {
 				return err
 			}
 		}
@@ -325,10 +326,10 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 	if err := writeVersionedHeader(writer, fileFormat{magic: stateFileMagic, version: stateFileVersion}); err != nil {
 		return nil, err
 	}
-	if err := writeMessage(writer, state.HardState.Marshal); err != nil {
+	if err := writeMessage(writer, &state.HardState); err != nil {
 		return nil, err
 	}
-	if err := writeMessage(writer, state.Snapshot.Marshal); err != nil {
+	if err := writeMessage(writer, &state.Snapshot); err != nil {
 		return nil, err
 	}
 	entryCount, err := uint32Len(len(state.Entries))
@@ -339,7 +340,7 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 		return nil, err
 	}
 	for _, entry := range state.Entries {
-		if err := writeMessage(writer, entry.Marshal); err != nil {
+		if err := writeMessage(writer, &entry); err != nil {
 			return nil, err
 		}
 	}
@@ -351,22 +352,34 @@ func encodeStateFile(state persistedState) ([]byte, error) {
 
 func newMemoryStorage(state persistedState) (*etcdraft.MemoryStorage, error) {
 	storage := etcdraft.NewMemoryStorage()
-	if !etcdraft.IsEmptySnap(state.Snapshot) {
-		if err := storage.ApplySnapshot(state.Snapshot); err != nil {
+	if !etcdraft.IsEmptySnap(&state.Snapshot) {
+		if err := storage.ApplySnapshot(&state.Snapshot); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
-	if !etcdraft.IsEmptyHardState(state.HardState) {
-		if err := storage.SetHardState(state.HardState); err != nil {
+	if !etcdraft.IsEmptyHardState(&state.HardState) {
+		if err := storage.SetHardState(&state.HardState); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
 	if len(state.Entries) > 0 {
-		if err := storage.Append(append([]raftpb.Entry(nil), state.Entries...)); err != nil {
+		if err := storage.Append(entryPointers(state.Entries)); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
 	return storage, nil
+}
+
+func entryPointers(entries []raftpb.Entry) []*raftpb.Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]*raftpb.Entry, 0, len(entries))
+	for _, entry := range entries {
+		entryCopy := entry
+		out = append(out, &entryCopy)
+	}
+	return out
 }
 
 func writeU32(w io.Writer, v uint32) error {
@@ -405,8 +418,8 @@ func readU64(r io.Reader) (uint64, error) {
 	return v, nil
 }
 
-func writeMessage(w io.Writer, marshal func() ([]byte, error)) error {
-	raw, err := marshal()
+func writeMessage(w io.Writer, msg proto.Message) error {
+	raw, err := proto.Marshal(msg)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -530,11 +543,7 @@ func syncDir(path string) error {
 	return errors.WithStack(dir.Sync())
 }
 
-type protoMessage interface {
-	Unmarshal([]byte) error
-}
-
-func readMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) error {
+func readMessage(r io.Reader, msg proto.Message, maxSize uint32, kind string) error {
 	ok, err := readOptionalMessage(r, msg, maxSize, kind)
 	if err != nil {
 		return err
@@ -545,7 +554,7 @@ func readMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) err
 	return nil
 }
 
-func readOptionalMessage(r io.Reader, msg protoMessage, maxSize uint32, kind string) (bool, error) {
+func readOptionalMessage(r io.Reader, msg proto.Message, maxSize uint32, kind string) (bool, error) {
 	size, err := readU32(r)
 	if err != nil {
 		if errors.Is(errors.UnwrapAll(err), io.EOF) {
@@ -563,7 +572,7 @@ func readOptionalMessage(r io.Reader, msg protoMessage, maxSize uint32, kind str
 	if _, err := io.ReadFull(r, raw); err != nil {
 		return false, errors.WithStack(err)
 	}
-	if err := msg.Unmarshal(raw); err != nil {
+	if err := proto.Unmarshal(raw, msg); err != nil {
 		return false, errors.WithStack(err)
 	}
 	return true, nil

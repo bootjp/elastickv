@@ -70,6 +70,15 @@ var ErrEncodeUnsupportedS3Orphans = errors.New("backup: S3 include_orphans not s
 // visible/reset" without this guard (codex P2 v21 #904).
 var ErrEncodeUnsupportedSQSPreserveVisibility = errors.New("backup: preserve_sqs_visibility not supported by encoder")
 
+// ErrEncodeUnsupportedSQSSideRecords is returned when the manifest
+// requests the producer's internal SQS side-record dump
+// (`include_sqs_side_records=true`), but the reverse encoder only
+// reconstructs the derived live key families it owns. The encoder does
+// not read `_internals/side_records.jsonl` and intentionally omits
+// group-lock/tombstone side records, so accepting this mode would drop
+// operator-requested internal state.
+var ErrEncodeUnsupportedSQSSideRecords = errors.New("backup: include_sqs_side_records not supported by encoder")
+
 // ErrRedisEncodeMultiDBUnsupported is returned when the input tree
 // contains a Redis db_<N>/ for any N != 0, or contains multiple
 // db_<N> directories. The current Redis MVCC key prefixes
@@ -160,6 +169,15 @@ type EncodeOptions struct {
 	// message; fail-closed via ErrEncodeUnsupportedSQSPreserveVisibility
 	// when true AND Adapters.SQS is enabled (codex P2 v21 #904).
 	PreserveSQSVisibility bool
+
+	// IncludeSQSSideRecords is true when the input dump's MANIFEST.json
+	// has `exclusions.include_sqs_side_records=true`. The reverse
+	// encoder derives vis/byage/dedup rows from messages.jsonl but
+	// does not round-trip producer-dumped internal side records such
+	// as group locks or tombstones; fail-closed via
+	// ErrEncodeUnsupportedSQSSideRecords when true AND Adapters.SQS is
+	// enabled.
+	IncludeSQSSideRecords bool
 
 	// ManifestLastCommitTS is the floor LastCommitTS must not fall
 	// below. When > 0, EncodeSnapshot fails-closed with
@@ -319,9 +337,8 @@ func checkInputRoot(opts EncodeOptions) error {
 
 // validateEncodeOptionsData covers the data-correctness pre-conditions:
 // HLC ceiling floor, DynamoDB JSONL guard, and (via
-// validateEncodeOptionsUnsupportedFeatures) the three manifest
-// exclusion guards added by codex P2 v21 #904 (S3 incomplete uploads,
-// S3 orphans, SQS preserve-visibility). Kept separate from the
+// validateEncodeOptionsUnsupportedFeatures) the manifest exclusion
+// guards for unsupported producer modes. Kept separate from the
 // nil/empty-args checks so each function stays cyclop-clean.
 func validateEncodeOptionsData(opts EncodeOptions) error {
 	if opts.ManifestLastCommitTS > 0 && opts.LastCommitTS < opts.ManifestLastCommitTS {
@@ -344,7 +361,6 @@ func validateEncodeOptionsData(opts EncodeOptions) error {
 // encoding only Redis + SQS with `include_incomplete_uploads=true`
 // inherited from the manifest is unaffected (no S3 → no concern).
 // Split out from validateEncodeOptionsData to stay under cyclop;
-// codex P2 v21 #904 added the three S3/SQS exclusion guards.
 func validateEncodeOptionsUnsupportedFeatures(opts EncodeOptions) error {
 	if opts.S3IncludeIncompleteUploads && opts.Adapters.S3 {
 		// The S3 reverse encoder skips _incomplete_uploads/ payload
@@ -362,6 +378,9 @@ func validateEncodeOptionsUnsupportedFeatures(opts EncodeOptions) error {
 		// visibility fields; a dump that preserved them would lose
 		// the state on restore (codex P2 v21 #904 L473).
 		return errors.WithStack(ErrEncodeUnsupportedSQSPreserveVisibility)
+	}
+	if opts.IncludeSQSSideRecords && opts.Adapters.SQS {
+		return errors.WithStack(ErrEncodeUnsupportedSQSSideRecords)
 	}
 	return nil
 }

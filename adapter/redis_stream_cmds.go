@@ -1050,7 +1050,13 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	// down — otherwise the per-resolve ScanAt could survive past
 	// graceful-shutdown's drain window.
 	resolveCtx, resolveCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
-	err = r.resolveXReadAfterIDs(resolveCtx, &req)
+	if ok := r.runWithHeavyCommandSlot(func() {
+		err = r.resolveXReadAfterIDs(resolveCtx, &req)
+	}); !ok {
+		resolveCancel()
+		conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+		return
+	}
 	resolveCancel()
 	if err != nil {
 		writeRedisError(conn, err)
@@ -1106,7 +1112,15 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// top of each iteration prevents the loop from spinning once
 		// the parent ctx is cancelled.
 		iterCtx, iterCancel := context.WithTimeout(handlerCtx, iterTimeout)
-		results, err := r.xreadOnce(iterCtx, req)
+		var results []xreadResult
+		var err error
+		if ok := r.runWithHeavyCommandSlot(func() {
+			results, err = r.xreadOnce(iterCtx, req)
+		}); !ok {
+			iterCancel()
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return
+		}
 		iterCancel()
 		// Per-iteration ctx hitting its deadline (or being cancelled by
 		// the upstream BLOCK timeout) is not a client-facing error — it

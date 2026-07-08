@@ -151,7 +151,7 @@ memory each group's private cache/memtable pins.
   pipelines and independent serial apply loops (§1.7). Already in-tree
   structurally.
 - **Leader balance — PR #953**
-  (`docs/design/2026_06_11_proposed_leader_balance_scheduler.md`, branch
+  (`docs/design/2026_06_11_implemented_leader_balance_scheduler.md`, branch
   `design/leader-balance-scheduler`) spreads group leaderships across nodes so
   write-proposal load is not pinned to one node. Count-based v1 (TiKV
   balance-leader equivalent), embedded in the default-group leader, default
@@ -270,8 +270,8 @@ memory each group's private cache/memtable pins.
   write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
   with proposed extensions for cluster fan-out
   (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
-  subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
-  hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
+  subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
+  hot-key top-K (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell
   conflict (implemented). It is the detection signal M3 reuses. Current
   adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
   coordinator sampler, so read-heavy hotspots remain invisible until read-path
@@ -285,11 +285,11 @@ memory each group's private cache/memtable pins.
   top-N sketch, keyviz `MaxTrackedRoutes` coarsening). Any new per-route /
   per-queue / per-peer metric must carry a cardinality bound; this is a
   cross-cutting operational-scaling rule, not a single design.
-- **workload isolation** — `2026_04_24_proposed_workload_isolation.md` (heavy
+- **workload isolation** — `2026_04_24_implemented_workload_isolation.md` (heavy
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
   (`2026_04_25_proposed_s3_admission_control.md`), SQS per-queue throttling
-  (`2026_04_26_proposed_sqs_per_queue_throttling.md`). These bound *one
+  (`2026_04_26_implemented_sqs_per_queue_throttling.md`). These bound *one
   workload's* impact so it cannot starve the shared runtime / Raft control
   plane; they scale a deployment by making it predictable under adversarial or
   unbalanced load rather than by raising raw capacity.
@@ -377,17 +377,17 @@ reverse). (M3) auto-merge in the M3 detector (cold-route hysteresis).
 **Depends-on:** M2 migration plane for cross-group merge; the Composed-1 guard
 for cutover coherence.
 
-### Gap 6 — Connection / transport scaling (streaming transport revival)
-**Problem.** Raft inter-node messages use unary gRPC per message
-(`docs/design/2026_04_18_proposed_raft_grpc_streaming_transport.md` §1): each
-send pays a full RTT, capping per-peer throughput at ~RTT⁻¹ regardless of
-bandwidth. This bites exactly when multi-node multi-group (Gap 1) puts real
-inter-node Raft traffic on the wire. **Rough milestones:** revive the existing
-streaming-transport proposal (client-streaming `SendStream` per peer, biased
-heartbeat select, backward-compat fallback). The blob-fetch RPC in the S3
-offload doc (§3.6) already wants to reuse the same chunked-streaming
-abstraction, so landing both behind one transport layer is the leverage.
-**Depends-on:** nothing hard; value scales with Gap 1.
+### Gap 6 — Connection / transport scaling (streaming transport soak)
+**Problem.** Raft inter-node messages previously used unary gRPC per message
+(`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md` §1),
+which paid a full RTT per send. The implemented `SendStream` transport removes
+that bottleneck, but multi-node multi-group (Gap 1) still needs transport soak
+coverage under real cross-node traffic. **Rough milestones:** (M1) run transport
+soak with multi-node multi-group traffic. (M2) decide whether the optional
+biased-select multiplexing worker from the implemented transport doc is needed.
+The blob-fetch RPC in the S3 offload doc (§3.6) can reuse the same
+chunked-streaming abstraction. **Depends-on:** Gap 1 for realistic traffic;
+value scales with Gap 1.
 
 ### Gap 7 — Auto group lifecycle (longest-term)
 **Problem.** Groups are static (`--raftGroups`). Elastic scale-out (add node →
@@ -512,7 +512,7 @@ design if needed. The near-term mitigation is layered:
 
    Both calls go through the same `c.clock`. The apply-time OCC/ownership check
    then compares these timestamps against stored `CommitTS` values (the
-   Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
+   Composed-1 guard, `docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md`
    §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
    serializability depends on those `commitTS` values being **mutually
    comparable** across all participating groups, and read-only participant shards

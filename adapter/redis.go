@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -159,6 +160,12 @@ type RedisServer struct {
 	// WithLuaFastPathObserver so the hot path does not pay for
 	// CounterVec.WithLabelValues on every redis.call().
 	luaFastPathZRange monitoring.LuaFastPathCmd
+	// heavyCommandLimiter bounds CPU-heavy Redis command families so one
+	// expensive path cannot occupy every scheduler P and starve Raft.
+	// nil preserves the historical unbounded path for narrow test fixtures.
+	heavyCommandLimiter *redisHeavyCommandLimiter
+	// peerLimiter bounds concurrent Redis connections per remote peer IP.
+	peerLimiter *redisPeerLimiter
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -173,8 +180,9 @@ type RedisServer struct {
 
 	// leaderClients caches go-redis clients per leader address to avoid
 	// creating a new connection pool for every proxied request.
-	leaderClientsMu sync.RWMutex
-	leaderClients   map[string]*redis.Client
+	leaderClientsMu       sync.RWMutex
+	leaderClients         map[string]*redis.Client
+	blockingLeaderClients map[string]*redis.Client
 
 	// compactor is the background DeltaCompactor for this node. When set,
 	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
@@ -197,30 +205,28 @@ type RedisServer struct {
 	// redis_key_waiters.go.
 	zsetWaiters *keyWaiterRegistry
 
+	// applyObserver is the shared FSM observer when this RedisServer is wired
+	// through WithRedisApplyObserver. Local zset writes use it to keep their
+	// FSM-originated wake fast-safe.
+	applyObserver *RedisApplyObserver
+
 	// onePhaseTxnDedup enables option-2 one-phase idempotency: on a
 	// retryable write error, list-push retries reuse the failed attempt's
 	// write set and carry prev_commit_ts so the FSM can dedup a commit that
 	// landed under leadership churn (see
-	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). The
+	// docs/design/2026_05_21_implemented_txn_secondary_idempotency.md). The
 	// FSM probe ships on every node in production, satisfying R5 (FSM
 	// determinism across a rolling upgrade), so the gate now defaults on
-	// per docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+	// per docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md.
 	// Set ELASTICKV_REDIS_ONEPHASE_DEDUP=0 (or WithOnePhaseTxnDedup(false))
 	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
 
-	// standaloneSetDedup gates whether the *standalone* SET command (not SET
-	// inside MULTI/EXEC) routes through runTransactionWithDedup. Default off
-	// because the dedup path's applySet does not match the legacy
-	// executeSet/replaceWithStringTxn semantics for SET-over-collection: a
-	// `SET k v` after `RPUSH k x` returns WRONGTYPE on the dedup path but
-	// overwrites correctly on the legacy path (PR #943 round-1 codex P1).
-	// Bringing applySet to parity (collection-deletion + string write inside
-	// the dedup txn) is tracked as a follow-up; until that lands, the
-	// standalone SET path stays on the legacy default-on-flip code path
-	// regardless of onePhaseTxnDedup's value. Enable explicitly via
-	// WithStandaloneSetDedup(true) or ELASTICKV_REDIS_ONEPHASE_DEDUP_SET=1
-	// only when applySet's parity is verified for the workload at hand.
+	// standaloneSetDedup is kept for compatibility with older tests and
+	// deployments that toggled the former standalone SET sub-gate. SET now
+	// has the same collection-overwrite semantics on the dedup path as the
+	// legacy path, so onePhaseTxnDedup alone controls standalone SET/INCR/HSET
+	// routing.
 	standaloneSetDedup bool
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
@@ -231,23 +237,18 @@ type RedisServerOption func(*RedisServer)
 // WithOnePhaseTxnDedup enables (or disables) the option-2 one-phase
 // idempotency dedup on list-push and MULTI/EXEC retries
 // (see RedisServer.onePhaseTxnDedup). On by default since the rollout
-// recorded in docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md;
+// recorded in docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md;
 // pass false to opt out from code, or set ELASTICKV_REDIS_ONEPHASE_DEDUP=0
 // to opt out from the environment. The constructor option trumps the env var.
-// Standalone SET requires the separate WithStandaloneSetDedup gate; see
-// RedisServer.standaloneSetDedup.
 func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
 	return func(r *RedisServer) {
 		r.onePhaseTxnDedup = enabled
 	}
 }
 
-// WithStandaloneSetDedup enables the option-2 dedup path on the *standalone*
-// SET command (not SET inside MULTI/EXEC). Off by default because the dedup
-// path's applySet does not yet match the legacy executeSet semantics for
-// SET-over-collection — see RedisServer.standaloneSetDedup. Enable only
-// after verifying applySet parity for the workload (no SET-over-list /
-// SET-over-hash / SET-over-set / SET-over-zset / SET-over-stream issued).
+// WithStandaloneSetDedup is a compatibility no-op. Standalone SET follows
+// onePhaseTxnDedup now that SET-over-collection parity is implemented in
+// txnContext.applySet.
 func WithStandaloneSetDedup(enabled bool) RedisServerOption {
 	return func(r *RedisServer) {
 		r.standaloneSetDedup = enabled
@@ -309,6 +310,23 @@ func WithLuaFastPathObserver(observer monitoring.LuaFastPathObserver) RedisServe
 func WithLuaPoolMaxIdle(n int) RedisServerOption {
 	return func(r *RedisServer) {
 		r.luaPoolMaxIdle = n
+	}
+}
+
+// WithRedisHeavyCommandSlots overrides the heavy-command limiter size.
+// n <= 0 disables the limiter. Omit the option to use the environment/default
+// selected by newDefaultRedisHeavyCommandLimiter.
+func WithRedisHeavyCommandSlots(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.heavyCommandLimiter = newRedisHeavyCommandLimiter(n)
+	}
+}
+
+// WithRedisPerPeerConnectionLimit overrides the per-peer Redis connection cap.
+// n <= 0 disables the cap.
+func WithRedisPerPeerConnectionLimit(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.peerLimiter = newRedisPeerLimiter(n)
 	}
 }
 
@@ -434,6 +452,7 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 }
 
 type connState struct {
+	mu    sync.Mutex
 	inTxn bool
 	queue []redcon.Command
 	// connID is a monotonically increasing per-server connection
@@ -445,7 +464,10 @@ type connState struct {
 	// clientName is the name set via HELLO SETNAME or CLIENT SETNAME,
 	// returned by CLIENT GETNAME. Empty string means no name set, which
 	// CLIENT GETNAME must report as a null bulk string.
-	clientName string
+	clientName     string
+	peerKey        string
+	peerCounted    bool
+	pubsubDetached bool
 }
 
 type resultType int
@@ -474,31 +496,33 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 	}
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	r := &RedisServer{
-		listen:          listen,
-		store:           store,
-		coordinator:     coordinate,
-		redisTranscoder: newRedisTranscoder(),
-		redisAddr:       redisAddr,
-		relay:           relay,
-		leaderRedis:     leaderRedis,
-		leaderClients:   make(map[string]*redis.Client),
-		pubsub:          newRedisPubSub(),
-		scriptCache:     map[string]string{},
+		listen:                listen,
+		store:                 store,
+		coordinator:           kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
+		redisTranscoder:       newRedisTranscoder(),
+		redisAddr:             redisAddr,
+		relay:                 relay,
+		leaderRedis:           leaderRedis,
+		leaderClients:         make(map[string]*redis.Client),
+		blockingLeaderClients: make(map[string]*redis.Client),
+		pubsub:                newRedisPubSub(),
+		scriptCache:           map[string]string{},
 		// luaPool is materialized after the option loop so
 		// WithLuaPoolMaxIdle can influence its sizing. Test fixtures
 		// that bypass NewRedisServer construct the pool lazily via
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
-		luaPool:       nil,
-		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		luaPool:             nil,
+		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
+		peerLimiter:         newDefaultRedisPeerLimiter(),
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
-		// See docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+		// See docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md.
 		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
 		// constructor option still trumps the env var.
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
-		// standaloneSetDedup defaults off; see field comment for the
-		// applySet-vs-executeSet parity gap that gates this separately.
+		// Compatibility field for the removed standalone SET sub-gate.
 		standaloneSetDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP_SET") == "1",
 		baseCtx:            baseCtx,
 		baseCancel:         baseCancel,
@@ -517,6 +541,8 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 			opt(r)
 		}
 	}
+	r.pubsub.detach = r.detachPubSubConn
+	r.pubsub.onClose = r.releaseDetachedPubSubConn
 	// Materialize the Lua VM pool after option processing so
 	// WithLuaPoolMaxIdle can choose the cap. newLuaStatePoolWithMaxIdle
 	// clamps non-positive values to DefaultLuaPoolMaxIdle, so callers
@@ -538,6 +564,63 @@ func getConnState(conn redcon.Conn) *connState {
 	st := &connState{}
 	conn.SetContext(st)
 	return st
+}
+
+func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
+	if r == nil || r.peerLimiter == nil {
+		return true
+	}
+	peer, ok := r.peerLimiter.accept(conn.RemoteAddr())
+	st := getConnState(conn)
+	st.mu.Lock()
+	st.peerKey = peer
+	st.peerCounted = ok
+	st.pubsubDetached = false
+	st.mu.Unlock()
+	if !ok {
+		conn.WriteError(redisPeerLimitError)
+	}
+	return ok
+}
+
+func (r *RedisServer) closeConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
+	st, ok := conn.Context().(*connState)
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	r.releaseConnStateLocked(st)
+}
+
+func (r *RedisServer) detachPubSubConn(conn redcon.Conn) redcon.DetachedConn {
+	st := getConnState(conn)
+	st.mu.Lock()
+	st.pubsubDetached = true
+	st.mu.Unlock()
+	return conn.Detach()
+}
+
+func (r *RedisServer) releaseDetachedPubSubConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
+	st := getConnState(conn)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.pubsubDetached = false
+	r.releaseConnStateLocked(st)
+}
+
+func (r *RedisServer) releaseConnStateLocked(st *connState) {
+	if r == nil || r.peerLimiter == nil || !st.peerCounted || st.pubsubDetached {
+		return
+	}
+	r.peerLimiter.release(st.peerKey)
+	st.peerCounted = false
 }
 
 // ensureConnID assigns and returns a per-connection numeric ID for the
@@ -577,6 +660,18 @@ func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	if r.shouldLimitHeavyCommand(name) {
+		if ok := r.heavyCommandLimiter.submit(func() {
+			r.dispatchCommandDirect(conn, name, handler, cmd, start)
+		}); !ok {
+			r.rejectHeavyCommand(conn, name, cmd, start)
+		}
+		return
+	}
+	r.dispatchCommandDirect(conn, name, handler, cmd, start)
+}
+
+func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	switch {
 	case r.requestObserver != nil:
 		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)
@@ -605,6 +700,33 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 	default:
 		handler(conn, cmd)
 	}
+}
+
+func (r *RedisServer) shouldLimitHeavyCommand(name string) bool {
+	return r != nil && r.heavyCommandLimiter != nil && isRedisHeavyCommand(name) && !isRedisIdleWaitCommand(name)
+}
+
+func (r *RedisServer) runWithHeavyCommandSlot(fn func()) bool {
+	if r == nil || r.heavyCommandLimiter == nil {
+		fn()
+		return true
+	}
+	return r.heavyCommandLimiter.submit(fn)
+}
+
+func isRedisIdleWaitCommand(name string) bool {
+	switch name {
+	case cmdXRead, cmdBZPopMin:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *RedisServer) rejectHeavyCommand(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) {
+	r.traceCommandError(conn, name, cmd.Args[1:], "heavy command pool full")
+	conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+	r.observeRedisError(name, time.Since(start))
 }
 
 // handlerContext returns the base context for a request handler.
@@ -700,13 +822,12 @@ func (r *RedisServer) Run() error {
 			r.dispatchCommand(conn, name, handler, cmd, start)
 		},
 		func(conn redcon.Conn) bool {
-			// Use this function to accept or deny the connection.
-			// log.Printf("accept: %s", conn.RemoteAddr())
-			return true
+			return r.acceptConn(conn)
 		},
 		func(conn redcon.Conn, err error) {
 			// This is called when the connection has been closed.
 			// PubSub connections clean up their own subscriptions via bgrunner.
+			r.closeConn(conn)
 		})
 
 	return errors.WithStack(err)

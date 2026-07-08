@@ -652,6 +652,55 @@ func TestDynamicWrappedProposer_BarrierDrainsInflight(t *testing.T) {
 	}
 }
 
+func TestDynamicWrappedProposer_EndReleasesPendingDrain(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+	entered := make(chan struct{})
+	inner := &blockingFakeProposer{enter: entered, release: release}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+
+	proposeDone := make(chan error, 1)
+	go func() {
+		_, err := wp.Propose(context.Background(), []byte("inflight-write"))
+		proposeDone <- err
+	}()
+	<-entered
+
+	wp.BeginCutoverBarrier()
+	drained := make(chan error, 1)
+	go func() {
+		drained <- wp.WaitInflightDrained(context.Background())
+	}()
+
+	select {
+	case err := <-drained:
+		t.Fatalf("WaitInflightDrained returned (%v) before EndCutoverBarrier while Propose is still in flight", err)
+	case <-makeShortTimer():
+	}
+
+	wp.EndCutoverBarrier()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("WaitInflightDrained after EndCutoverBarrier: %v", err)
+		}
+	case <-makeLongTimer():
+		t.Fatal("EndCutoverBarrier did not release a waiter blocked on the old drain channel")
+	}
+
+	closeRelease()
+	if err := <-proposeDone; err != nil {
+		t.Fatalf("inflight Propose: %v", err)
+	}
+}
+
 // blockingFakeProposer signals on enter when Propose is invoked
 // and blocks until release is closed. Used by the
 // barrier-drains-inflight test to deterministically hold a

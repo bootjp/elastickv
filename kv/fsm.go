@@ -72,7 +72,7 @@ type kvFSM struct {
 	// short-circuit as "unpinned" (no Composed-1 enforcement) —
 	// matching the pre-feature behaviour byte-for-byte.  Concrete
 	// production type is *distribution.Engine.  See
-	// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+	// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 	// §4.2 prerequisite block + §M2.
 	routes RouteHistory
 	// shardGroupID is the Raft group ID this FSM serves.  Used by
@@ -151,7 +151,7 @@ func (f *kvFSM) SetApplyIndex(idx uint64) {
 // (0, false, nil) propagates the strictly-additive fallback when
 // the store does not expose the seam — the future skip gate treats
 // "missing" as "fall back to full restore." See
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §3 / §4.
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3 / §4.
 func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
 	r, ok := f.store.(raftengine.AppliedIndexReader)
 	if !ok {
@@ -225,7 +225,7 @@ func WithCutoverSource(src CutoverSource) FSMOption {
 // historical owner-of-key resolution.  Zero is reserved for the
 // not-wired case.
 //
-// See docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// See docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M2 + §4.2 prerequisite block.
 func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
 	return func(f *kvFSM) {
@@ -663,7 +663,7 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 }
 
 // verifyComposed1 is the M3 apply-time Composed-1 gate per
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §4.2(a) + §4.4.  Runs two checks before the txn's writes land:
 //
 //	(a) Observed-version owner — the txn's read-set was captured
@@ -971,7 +971,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err := f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS); err != nil {
 		return err
 	}
-	f.notifyApplyObservers(commitTS, uniq)
+	f.notifyApplyObserversForStoreMutations(commitTS, storeMuts)
 	return nil
 }
 

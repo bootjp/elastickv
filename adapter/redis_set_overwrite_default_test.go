@@ -8,24 +8,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestRedis_SET_OverwritesList_UnderDefaultGate locks in the legacy
-// SET-over-collection overwrite semantics under the new default-on dedup
-// gate landed in PR #943. The dedup path's applySet returns WRONGTYPE on
-// a SET that hits a key already holding a list/hash/set/zset/stream,
-// while the legacy setLegacy / executeSet / replaceWithStringTxn path
-// deletes the collection's logical elements and writes the string.
-// Codex flagged this as a P1 regression on PR #943 round-1: flipping
-// onePhaseTxnDedup default-on without a separate gate on the standalone
-// SET path would have changed normal Redis overwrite behaviour. The fix
-// is the standaloneSetDedup sub-gate, which defaults off — so
-// `SET k v` after `RPUSH k x` must still return OK and let the next
-// GET observe the string value, not WRONGTYPE.
+// TestRedis_SET_OverwritesList_UnderDefaultGate locks in Redis
+// SET-over-collection overwrite semantics under the default-on dedup gate.
+// `SET k v` after `RPUSH k x` must return OK and let the next GET observe
+// the string value, not WRONGTYPE.
 //
 // This is a regression test (CLAUDE.md self-review §5 + the
 // "when code review surfaces a defect, first add a failing test"
-// convention). If a future change re-enables standaloneSetDedup as
-// default-on without bringing applySet to parity with executeSet, this
-// test must fail.
+// convention). If a future change regresses applySet parity with executeSet,
+// this test must fail.
 func TestRedis_SET_OverwritesList_UnderDefaultGate(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
@@ -41,9 +32,7 @@ func TestRedis_SET_OverwritesList_UnderDefaultGate(t *testing.T) {
 
 	// Real Redis behaviour: SET unconditionally replaces the value,
 	// dropping the previous type. The legacy path implements this; the
-	// dedup path returns WRONGTYPE. With the default config
-	// (onePhaseTxnDedup on, standaloneSetDedup off) we must take the
-	// legacy path and observe OK + string value.
+	// default-on dedup path must preserve the legacy OK + string value shape.
 	res, err := rdb.Do(ctx, "SET", "setover:list", "replaced").Result()
 	require.NoError(t, err, "SET must overwrite an existing list under default config")
 	require.Equal(t, "OK", res)
