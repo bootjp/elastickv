@@ -293,6 +293,29 @@ func TestRedis_MultiExec_HSetRecreatesExpiredListAsHash(t *testing.T) {
 	require.ErrorContains(t, rdb.LRange(ctx, "multi:expired-list-hset", 0, -1).Err(), "WRONGTYPE")
 }
 
+func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Do(ctx, "PFADD", "set:expired-hll", "a").Err())
+	require.NoError(t, rdb.PExpire(ctx, "set:expired-hll", time.Millisecond).Err())
+	require.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, "set:expired-hll").Result()
+		return err == nil && exists == 0
+	}, time.Second, 10*time.Millisecond)
+
+	err := rdb.SAdd(ctx, "set:expired-hll", "member").Err()
+	require.ErrorContains(t, err, "WRONGTYPE")
+	count, err := rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+}
+
 func TestRedis_MultiExec_IncrRecreatesExpiredStringWithoutTTLIndex(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

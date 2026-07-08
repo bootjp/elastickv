@@ -265,6 +265,9 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		if err != nil {
 			return err
 		}
+		if err := r.rejectHLLPayloadForSetCreate(key, readTS, typ); err != nil {
+			return err
+		}
 
 		commitTS, err := r.coordinator.Clock().NextFenced()
 		if err != nil {
@@ -312,6 +315,20 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+func (r *RedisServer) rejectHLLPayloadForSetCreate(key []byte, readTS uint64, typ redisValueType) error {
+	if typ != redisTypeNone {
+		return nil
+	}
+	hllExists, err := r.hllExistsAt(key, readTS)
+	if err != nil {
+		return err
+	}
+	if hllExists {
+		return wrongTypeError()
+	}
+	return nil
 }
 
 func appendSetDeltaElems(elems []*kv.Elem[kv.OP], key []byte, lenDelta int64, commitTS uint64) []*kv.Elem[kv.OP] {

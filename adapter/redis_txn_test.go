@@ -448,6 +448,40 @@ func TestRedisTxnHSetAfterDelDoesNotReloadDeletedHash(t *testing.T) {
 	require.Equal(t, int64(1), delta.LenDelta)
 }
 
+func TestRedisTxnZIncrByAfterDelDoesNotDiffAgainstDeletedZSet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("txn:zset-del-recreate")
+	member := []byte("member")
+	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, member), store.MarshalZSetScore(10), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey(key, 10, member), []byte{}, redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 1}), redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	delRes, err := txn.applyDel(redcon.Command{Args: [][]byte{[]byte(cmdDel), key}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), delRes.integer)
+
+	recreated, err := txn.applyZIncrBy(redcon.Command{Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), member}})
+	require.NoError(t, err)
+	require.Equal(t, resultBulk, recreated.typ)
+	require.Equal(t, []byte("1"), recreated.bulk)
+
+	zsetState := txn.zsetStates[string(key)]
+	require.NotNil(t, zsetState)
+	require.True(t, zsetState.isWide)
+	require.Empty(t, zsetState.origMembers)
+
+	elems, err := txn.buildZSetElems(20)
+	require.NoError(t, err)
+	deltaElem := requireElemByKey(t, elems, store.ZSetMetaDeltaKey(key, 20, 0))
+	delta, err := store.UnmarshalZSetMetaDelta(deltaElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), delta.LenDelta)
+}
+
 func requireTxnReadKeysContainWideFences(t *testing.T, txn *txnContext, key []byte) {
 	t.Helper()
 	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {

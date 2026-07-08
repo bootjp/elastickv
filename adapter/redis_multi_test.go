@@ -248,6 +248,34 @@ func TestRedis_MultiExec_IncrCreatedStringCanBeIncrementedAgain(t *testing.T) {
 	require.Equal(t, "2", rdb.Get(ctx, "txn:double-incr").Val())
 }
 
+func TestRedis_MultiExec_HSetArityErrorDoesNotAbortExec(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:hset-arity-a", "1").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", "txn:hset-arity-h", "f", "v", "dangling").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:hset-arity-b", "2").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 3)
+	require.Equal(t, "OK", vals[0])
+	arityErr, ok := vals[1].(error)
+	require.True(t, ok, "HSET odd field/value count should be an EXEC item error, got %T", vals[1])
+	require.Contains(t, arityErr.Error(), "wrong number of arguments")
+	require.Equal(t, "OK", vals[2])
+	require.Equal(t, "1", rdb.Get(ctx, "txn:hset-arity-a").Val())
+	require.Equal(t, "2", rdb.Get(ctx, "txn:hset-arity-b").Val())
+	require.Equal(t, int64(0), rdb.Exists(ctx, "txn:hset-arity-h").Val())
+}
+
 func TestRedis_MultiExec_ListOpsRejectStagedHashAndString(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

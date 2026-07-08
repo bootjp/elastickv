@@ -925,7 +925,7 @@ func incrOverflowResult() redisResult {
 
 func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 	if len(cmd.Args[2:]) == 0 || len(cmd.Args[2:])%redisPairWidth != 0 {
-		return redisResult{}, errors.New("ERR wrong number of arguments for hash command")
+		return redisResult{typ: resultError, err: errors.New("ERR wrong number of arguments for hash command")}, nil
 	}
 	typ, err := t.stagedKeyType(cmd.Args[1])
 	if err != nil {
@@ -1276,6 +1276,7 @@ func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
 		return err
 	}
 	zs.members = map[string]float64{}
+	zs.origMembers = map[string]float64{}
 	zs.exists = false
 	zs.dirty = true
 	return nil
