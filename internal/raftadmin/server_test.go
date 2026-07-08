@@ -11,8 +11,10 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -29,6 +31,7 @@ type fakeEngine struct {
 	removeServerCalls   []fakeRemoveServerCall
 	transferCalls       int
 	targetTransferCalls []fakeTransferCall
+	gatedTransferCalls  []fakeGatedTransferCall
 
 	// addVoterHook is invoked synchronously inside AddVoter, before
 	// recording the call. Tests use this to observe the ordering of
@@ -60,6 +63,11 @@ type fakeRemoveServerCall struct {
 type fakeTransferCall struct {
 	id      string
 	address string
+}
+
+type fakeGatedTransferCall struct {
+	candidates []raftengine.TransferTarget
+	maxLag     uint64
 }
 
 func (f *fakeEngine) Close() error { return nil }
@@ -174,6 +182,16 @@ func (f *fakeEngine) TransferLeadershipToServer(_ context.Context, id string, ad
 	return nil
 }
 
+func (f *fakeEngine) TransferLeadershipToServerIfEligible(_ context.Context, candidates []raftengine.TransferTarget, maxLag uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gatedTransferCalls = append(f.gatedTransferCalls, fakeGatedTransferCall{
+		candidates: append([]raftengine.TransferTarget(nil), candidates...),
+		maxLag:     maxLag,
+	})
+	return nil
+}
+
 func TestServerMapsEngineAdminMethods(t *testing.T) {
 	t.Parallel()
 
@@ -251,6 +269,17 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 		TargetAddress: "127.0.0.1:50052",
 	})
 	require.NoError(t, err)
+	_, err = server.TransferLeadership(context.Background(), &pb.RaftAdminTransferLeadershipRequest{
+		TargetId:      "node-2",
+		TargetAddress: "127.0.0.1:50052",
+		Gated:         true,
+		MaxLag:        0,
+		TargetCandidates: []*pb.TransferTarget{
+			{TargetId: "node-2", TargetAddress: "127.0.0.1:50052"},
+			{TargetId: "node-3", TargetAddress: "127.0.0.1:50053"},
+		},
+	})
+	require.NoError(t, err)
 
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
@@ -260,6 +289,31 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.Equal(t, []fakeRemoveServerCall{{id: "node-2", prevIndex: 5}}, engine.removeServerCalls)
 	require.Equal(t, 1, engine.transferCalls)
 	require.Equal(t, []fakeTransferCall{{id: "node-2", address: "127.0.0.1:50052"}}, engine.targetTransferCalls)
+	require.Equal(t, []fakeGatedTransferCall{{
+		candidates: []raftengine.TransferTarget{
+			{ID: "node-2", Address: "127.0.0.1:50052"},
+			{ID: "node-3", Address: "127.0.0.1:50053"},
+		},
+		maxLag: 0,
+	}}, engine.gatedTransferCalls)
+}
+
+func TestTransferLeadershipPartialLegacyTargetRejected(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{status: raftengine.Status{State: raftengine.StateLeader}}
+	server := NewServer(engine)
+
+	_, err := server.TransferLeadership(context.Background(), &pb.RaftAdminTransferLeadershipRequest{
+		TargetAddress: "127.0.0.1:50052",
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	require.Zero(t, engine.transferCalls)
+	require.Empty(t, engine.targetTransferCalls)
+	require.Empty(t, engine.gatedTransferCalls)
 }
 
 func TestRegisterOperationalServicesPublishesLeaderHealth(t *testing.T) {

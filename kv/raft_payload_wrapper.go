@@ -285,42 +285,24 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 // runs. ProposeAdmin is unaffected (the cutover marker proposes
 // through it).
 //
-// HAZARDS — per-leader scope of the barrier (codex P1 round-2 and
-// round-3 on PR933): the barrier is an in-memory data structure
-// owned by THIS leader's dynamicWrappedProposer. It does not
-// coordinate across the cluster, and it does not survive leadership
-// transfer. Two related future-state failure modes follow from
-// that scope and MUST be closed by 6E-2e before 6E-2f flips the
-// gate; 6E-2d ships them inert by leaving raftEnvelopeWrapEnabled
-// false so production never opens the cutover window.
+// HISTORICAL HAZARDS — per-leader scope of the barrier: the barrier
+// is an in-memory data structure owned by THIS leader's
+// dynamicWrappedProposer. It does not coordinate across the cluster,
+// and it does not survive leadership transfer. The two failure modes
+// below are the ones 6E-2e had to close before 6E-2f opened the
+// production gate.
 //
-//	(a) Wrap-gap admin RPCs (codex P1 #1 round-2):
+//	(a) Wrap-gap admin RPCs:
 //	    Other admin RPCs that route through ProposeAdmin (RotateDEK,
-//	    RegisterEncryptionWriter) are barrier-exempt and currently
-//	    reach the engine via the raw-engine s.proposer in
-//	    adapter/encryption_admin.go. Between the cutover marker's
-//	    commit and the handler's InstallWrap call, an admin RPC
-//	    that lands at `index > raftEnvelopeCutoverIndex` would be
-//	    cleartext, and the §6.3 strict-`>` apply hook on every
-//	    follower would treat it as a wrapped envelope and halt
-//	    apply cluster-wide.
+//	    RegisterEncryptionWriter) are barrier-exempt but must not
+//	    bypass the wrap layer after the cutover. Production wiring
+//	    closes this by passing ShardGroup.Proposer() into
+//	    WithEncryptionAdminPostCutoverProposer: the cutover marker
+//	    itself still uses the raw engine reference, while every
+//	    non-cutover admin entry uses the same dynamic wrapper as
+//	    user proposals.
 //
-//	    Remediation options for 6E-2e:
-//	      Option A (preferred): route RotateDEK /
-//	                            RegisterEncryptionWriter through the
-//	                            wrap-aware proposer so post-cutover
-//	                            admin entries are wrapped. The
-//	                            cutover marker itself remains on a
-//	                            separate raw-engine reference held
-//	                            by the EnableRaftEnvelope handler.
-//	      Option B: extend cutoverSem to serialize RotateDEK and
-//	                RegisterEncryptionWriter against the
-//	                EnableRaftEnvelope handler so no admin RPC can
-//	                race the barrier window.
-//	    See main_encryption_registration.go's call-site comment for
-//	    the 7c §3.1 wiring that Option A would extend.
-//
-//	(b) Leader failover mid-cutover (codex P1 round-3):
+//	(b) Leader failover mid-cutover:
 //	    If leadership transfers from L1 to L2 between the cutover
 //	    marker's commit and L1's InstallWrap call, L2 has its own
 //	    barrierOpen=false and a nil wrap pointer. L2 admits a fresh
@@ -329,28 +311,12 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 //	    L2 (or any follower) applies the cutover marker the §6.3
 //	    strict-`>` hook treats every subsequent cleartext proposal
 //	    as a wrapped envelope and halts.
-//
-//	    Remediation options for 6E-2e:
-//	      Option A (preferred): auto-install the wrap on every
-//	                            replica's FSM-apply of the cutover
-//	                            marker so L2's
-//	                            dynamicWrappedProposer publishes the
-//	                            same wrap closure independently of
-//	                            leadership state. The handler's
-//	                            InstallWrap call then becomes a
-//	                            redundant convenience (matches the
-//	                            state every follower will reach via
-//	                            the apply path).
-//	      Option B: make dynamicWrappedProposer.Propose consult the
-//	                sidecar's RaftEnvelopeCutoverIndex on every call
-//	                and refuse when the wrap pointer is nil but the
-//	                sidecar already reflects a cutover. Trades a
-//	                sidecar load per propose for a closed gap.
-//
-// Both hazards (a) and (b) share a single shape: post-cutover
-// cleartext entries land in Raft at indexes that the §6.3 apply
-// hook treats as wrapped. The gate (`raftEnvelopeWrapEnabled =
-// false`) is the only thing keeping either from triggering today.
+//	    Production wiring closes this by invoking
+//	    WithRaftCutoverWrapInstaller from every replica's FSM apply
+//	    of the cutover marker and by installing the wrap at startup
+//	    whenever the sidecar already carries a non-zero cutover
+//	    index. The handler's InstallWrap call is therefore a
+//	    redundant convergence step, not the only publication path.
 //
 // Idempotent against double-Begin: a second call freshens drainSig
 // and leaves barrierOpen true. CALLER SAFETY: a goroutine that was
@@ -412,15 +378,18 @@ func (p *dynamicWrappedProposer) EndCutoverBarrier() {
 	p.barrierMu.Lock()
 	defer p.barrierMu.Unlock()
 	p.barrierOpen = false
-	// Drop the drainSig reference so a stale WaitInflightDrained
-	// caller that reads the channel after EndCutoverBarrier sees
-	// nil (immediate-success degraded path) rather than blocking
-	// on a closed channel from a previous cycle. Whether the
-	// channel was closed or not at this point depends on whether
-	// in-flight drained; both shapes are acceptable transient
-	// states because no new BeginCutoverBarrier has run yet to
-	// allocate a fresh channel.
-	p.drainSig = nil
+	if p.drainSig != nil {
+		select {
+		case <-p.drainSig:
+		default:
+			close(p.drainSig)
+		}
+		// Drop the drainSig reference so a WaitInflightDrained caller
+		// that starts after EndCutoverBarrier sees nil (the
+		// immediate-success degraded path), while callers already
+		// blocked on the old channel are released above.
+		p.drainSig = nil
+	}
 }
 
 // ProposeAdmin mirrors Propose's wrap-applies semantics. See

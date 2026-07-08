@@ -358,6 +358,9 @@ type ShardedCoordinator struct {
 	// allowed to reach the sampler. When false, observations keep the
 	// legacy unlabeled route-only shape.
 	keyvizLabelsEnabled bool
+	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
+	// lease proposals while another startup-only Raft mutation must run first.
+	hlcRenewalBlocked func() bool
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -522,6 +525,15 @@ func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *
 	return c
 }
 
+// SetHLCLeaseRenewalBlocker installs a predicate that suppresses background
+// HLC lease-renewal proposals while it returns true.
+func (c *ShardedCoordinator) SetHLCLeaseRenewalBlocker(blocked func() bool) {
+	if c == nil {
+		return
+	}
+	c.hlcRenewalBlocked = blocked
+}
+
 // WithSampler wires a keyviz.Sampler onto a ShardedCoordinator. The
 // coordinator calls sampler.Observe at dispatch entry — once per
 // resolved (RouteID, mutation key) pair — to feed the key visualizer
@@ -683,7 +695,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 
 // dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
 // (design doc
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M4).  Pins reqs.ObservedRouteVersion to the engine's current
 // catalog version on the FIRST attempt when the caller left it at the
 // zero sentinel — every txn that flows through ShardedCoordinator
@@ -1990,6 +2002,10 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
+			if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+				timer.Reset(hlcRenewalInterval)
+				continue
+			}
 			if group.Engine.State() == raftengine.StateLeader {
 				c.renewHLCLease(ctx, group)
 			}

@@ -784,11 +784,11 @@ func TestApplyRotateDEK_LocalEpochAppliedToStorageKey(t *testing.T) {
 
 // TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero pins 7b' §3.1.1:
 // the WithLocalEpoch value is the STORAGE write-path's pinned
-// `w.epoch`. Raft DEK rotations have their own (future) per-purpose
-// epoch counter; cross-applying the storage epoch to a raft DEK's
-// LocalEpoch would corrupt the raft counter before raft envelope
-// support consumes it. PurposeRaft rotations MUST continue to write
-// LocalEpoch: 0 even with WithLocalEpoch installed.
+// `w.epoch`. Raft DEK rotations have their own per-purpose epoch
+// counter; cross-applying the storage epoch to a raft DEK's
+// LocalEpoch would corrupt the raft counter. PurposeRaft rotations
+// keep LocalEpoch: 0 when WithRaftLocalEpoch is not installed, even
+// with WithLocalEpoch installed.
 func TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero(t *testing.T) {
 	t.Parallel()
 	reg := newMapRegistryStore()
@@ -828,6 +828,48 @@ func TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero(t *testing.T) {
 	}
 	if got.LocalEpoch != 0 {
 		t.Errorf("Keys[6].LocalEpoch = %d, want 0 (raft rotation MUST NOT inherit storage write-path epoch — 7b' §3.1.1)", got.LocalEpoch)
+	}
+}
+
+func TestApplyRotateDEK_RaftLocalEpochAppliedToRaftKey(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	const raftEpoch uint16 = 13
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+		encryption.WithLocalEpoch(7),
+		encryption.WithRaftLocalEpoch(raftEpoch),
+	)
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	if err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                6,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("raft-v2-wrapped"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 6, FullNodeID: 0xBEEF, LocalEpoch: raftEpoch},
+	}); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	got, ok := sc.Keys["6"]
+	if !ok {
+		t.Fatal("sidecar keys missing rotated raft DEK 6")
+	}
+	if got.LocalEpoch != raftEpoch {
+		t.Errorf("Keys[6].LocalEpoch = %d, want %d (WithRaftLocalEpoch's pinned value)", got.LocalEpoch, raftEpoch)
 	}
 }
 
@@ -2596,6 +2638,44 @@ func TestApplyRotation_EnableRaftEnvelope_FreshSuccess_InvokesInstaller(t *testi
 	}
 }
 
+func TestApplyRotation_RaftRotateDEK_CutoverActiveRepublishesInstaller(t *testing.T) {
+	t.Parallel()
+	_, sidecarPath := bootstrappedDir(t)
+	app, rec := newCutoverApplierWithInstaller(t, sidecarPath)
+	const raftCutoverIdx uint64 = 600
+	if err := app.ApplyRotation(raftCutoverIdx, fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:   cutoverBootstrapRaftDEKID,
+		Purpose: fsmwire.PurposeRaft,
+		Wrapped: []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1,
+		},
+	}); err != nil {
+		t.Fatalf("ApplyRotation raft-cutover: %v", err)
+	}
+	const newRaftDEKID uint32 = 99
+	if err := app.ApplyRotation(raftCutoverIdx+1, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                newRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("new-raft-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: newRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("ApplyRotation raft RotateDEK: %v", err)
+	}
+	if got, want := len(rec.calls), 2; got != want {
+		t.Fatalf("installer called %d times, want %d (cutover + raft RotateDEK republish)", got, want)
+	}
+	last := rec.calls[len(rec.calls)-1]
+	if last.cutoverIdx != raftCutoverIdx {
+		t.Errorf("installer cutoverIdx after RotateDEK = %d, want %d", last.cutoverIdx, raftCutoverIdx)
+	}
+	if last.activeRaftDEKID != newRaftDEKID {
+		t.Errorf("installer activeRaftDEKID after RotateDEK = %d, want %d", last.activeRaftDEKID, newRaftDEKID)
+	}
+}
+
 // TestApplyRotation_EnableRaftEnvelope_AlreadyActive_InvokesInstaller
 // pins the FSM-replay safety contract: a duplicate cutover apply
 // (sidecar.RaftEnvelopeCutoverIndex already non-zero) MUST still
@@ -2719,6 +2799,42 @@ func TestApplyRotation_EnableRaftEnvelope_AlreadyActive_StaleDEKReplay_InvokesIn
 	}
 	if sc.Active.Raft != newRaftDEKID {
 		t.Errorf("Active.Raft = %d after replay, want %d", sc.Active.Raft, newRaftDEKID)
+	}
+}
+
+func TestApplyRotation_RaftDEKRotationAfterCutover_ReinstallsWrapper(t *testing.T) {
+	t.Parallel()
+	_, sidecarPath := bootstrappedDir(t)
+	app, rec := newCutoverApplierWithInstaller(t, sidecarPath)
+	const cutoverIdx uint64 = 500
+	if err := app.ApplyRotation(cutoverIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	const newRaftDEKID uint32 = 99
+	if err := app.ApplyRotation(600, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                newRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("new-raft-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: newRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("RotateDEK: %v", err)
+	}
+	if got, want := len(rec.calls), 2; got != want {
+		t.Fatalf("installer calls = %d, want %d (cutover + raft DEK rotation)", got, want)
+	}
+	last := rec.calls[len(rec.calls)-1]
+	if last.cutoverIdx != cutoverIdx {
+		t.Errorf("rotation reinstall cutoverIdx = %d, want %d", last.cutoverIdx, cutoverIdx)
+	}
+	if last.activeRaftDEKID != newRaftDEKID {
+		t.Errorf("rotation reinstall activeRaftDEKID = %d, want %d", last.activeRaftDEKID, newRaftDEKID)
 	}
 }
 

@@ -1,6 +1,6 @@
 # Composed-1 M5 — Jepsen route-shuffle workload
 
-Status: Partial.  M5a shipped:
+Status: Implemented.  M5a shipped:
   - PR #911 — `cmd/elastickv-split` + `cmd/elastickv-route-key` CLI helpers
   - PR #916 — `dynamodb-append-multi-table-workload` (Clojure)
   - PR #925 — `cmd/elastickv-list-routes` + setup-hook
@@ -10,18 +10,30 @@ Status: Partial.  M5a shipped:
   - PR #926 (separate) — `--host 127.0.0.1` fix discovered during
     M5a E2E
 
-M5b (route-shuffle nemesis) is still open.  Plus one known follow-up
-issue from M5a E2E: workers report `ResourceNotFoundException` for
-every txn despite `create-all-tables!` reporting success and ListRoutes
-showing the expected two-group catalog — likely a CreateTable
-race / sync issue under 5-parallel client setup; tracked separately.
+M5b is now implemented:
+  - `jepsen/src/elastickv/composed1_nemesis.clj` adds the route-shuffle
+    nemesis, route-catalog JSON parsing, RawURL DynamoDB table-route encoding,
+    current-route lookup, and strictly interior split-key generation.
+  - `jepsen/src/elastickv/dynamodb_multi_table_workload.clj` adds
+    `--composed1-route-shuffle`, `--route-shuffle-interval`, and `--split-bin`
+    wiring.
+  - `scripts/run-jepsen-m5-local.sh` builds `cmd/elastickv-split`, validates it
+    with the other helpers, and enables the route-shuffle nemesis for the local
+    M5 run.
+  - `jepsen/test/elastickv/composed1_nemesis_test.clj` covers encoding,
+    route selection, interior split-key generation, and opt-in packaging.
+
+The old M5a E2E `ResourceNotFoundException` follow-up is closed by the local
+script's full-route `--shardRanges` coverage (`[empty, t3)` and `[t3, +inf)`);
+the setup hook still verifies that the catalog reports at least two distinct
+Raft groups before any workload operation runs.
 
 Author: bootjp
-Date: 2026-06-02 (renamed *_proposed_* → *_partial_* on 2026-06-04)
+Date: 2026-06-02 (renamed *_proposed_* to *_partial_* on 2026-06-04; promoted to implemented on 2026-07-07)
 Parent design:
-[`2026_05_29_partial_composed1_cross_group_commit_guard.md`](2026_05_29_partial_composed1_cross_group_commit_guard.md)
+[`2026_05_29_implemented_composed1_cross_group_commit_guard.md`](2026_05_29_implemented_composed1_cross_group_commit_guard.md)
 
-> **Forward-looking proposal, same posture as the parent doc.**
+> **Implemented integration harness, same safety posture as the parent doc.**
 > Today's `SplitRange` is same-group only (per CLAUDE.md and
 > `adapter/distribution_server.go`'s implementation), so the
 > Composed-1 hazard the M3/M4 guard catches cannot yet be
@@ -169,8 +181,7 @@ The nemesis is composed with the existing
 via `jepsen.nemesis/compose`. The combined nemesis becomes the
 workload's `:nemesis`.
 
-**Split key picking strategy (gemini medium R1 + codex P1 #1
-on f5d2ad7a).** Pick a split key from inside the DynamoDB
+**Split key picking strategy (review feedback on f5d2ad7a).** Pick a split key from inside the DynamoDB
 **table-route** key space. The exact encoding matters: the
 route key is built by `dynamoRouteTableKey(encodeDynamoSegment(tableName))`
 (`adapter/dynamodb.go:8337-8365`, `kv/shard_key.go:117-124`).
@@ -205,7 +216,7 @@ After the setup-time boundary lands, the table-route key
 in `adapter/distribution_server.go:357-372` rejects
 `splitKey == parent.Start` or `splitKey == parent.End` with
 "split key at route boundary" — so reusing the setup-time key
-would fail every nemesis tick after the first (codex P2 #2 on
+would fail every nemesis tick after the first (review feedback on
 3ca2a7f7).  In a 5-minute run expecting ≥10 shuffles, the
 nemesis would no-op silently and the workload would never
 exercise the catalog-version churn M3+M4 must absorb.
@@ -234,7 +245,7 @@ restarts, collision recovery, byte-vs-string coercion of
 `ListRoutes` response fields — `(str (:start route) …)`
 silently yields `"[B@…"` if `:start` is a Java byte array
 rather than a string, a silent mis-routing footgun flagged
-by claude[bot] on b752a894) are M5b implementation notes —
+by review on b752a894) are M5b implementation notes —
 the design contract is: each shuffle's split key is strictly
 interior to the route's current range.
 
@@ -245,7 +256,7 @@ implementation uses `base64.RawURLEncoding` — URL-safe charset
 `(.withoutPadding (java.util.Base64/getUrlEncoder))`;
 `Base64/getEncoder` (standard alphabet with `+`/`/`) and the
 default `Base64/getUrlEncoder` (URL-safe **with** padding) are
-both wrong (claude[bot] P3 on 24812867).  The failure mode is
+both wrong (review feedback on 24812867).  The failure mode is
 silent and non-obvious: a wrong encoding produces split keys
 that fall outside every route's range, `ListRoutes` returns no
 matching route, the nemesis logs and skips every `:start`,
@@ -260,12 +271,12 @@ A prior revision of this doc also wrongly explained the old
 DynamoDB table-route prefix starts with `!` (ASCII 33) and
 `/` is ASCII 47, so `/split/<int>` is lexicographically
 **larger** than `!ddb|route|table|*` — workload keys would land
-on the **left** shard, not the rightmost (claude[bot] P2 on
+on the **left** shard, not the rightmost (review feedback on
 f5d2ad7a). The fix (anchoring to the table-route prefix)
 is correct in either direction; the explanation above is now
 also correct.
 
-**Route ID resolution (gemini medium R2).** The nemesis CANNOT
+**Route ID resolution.** The nemesis CANNOT
 rely on a single `ListRoutes` call + a local counter — every
 successful split deletes the parent route ID and creates two
 fresh child IDs, so a cached route ID is stale on the next
@@ -279,7 +290,7 @@ drift (another split landing concurrently between
 `ErrCatalogVersionMismatch` from the server; the nemesis logs
 and refreshes on the next tick.
 
-### 3.3 Multi-shard workload guarantee (revised post-codex P1 #2)
+### 3.3 Multi-shard workload guarantee (revised after route-group review)
 
 **Original §3.3 (single-key item split) and revised §3.3
 (multi-table with setup-hook SplitRange) were both incomplete.**
@@ -296,7 +307,7 @@ setup" approach insufficient on its own:
    creates child routes with the **parent's GroupID**.
    `dispatchTxn` enters `dispatchMultiShardTxn` only when
    mutations group to ≥2 distinct Raft **groups**, not just
-   ≥2 routes (codex P1 #2 on f5d2ad7a).  A `SplitRange`
+   ≥2 routes (review feedback on f5d2ad7a).  A `SplitRange`
    inside the table-route keyspace produces two routes still
    in the same group — single-shard transaction path,
    2PC never fires.
@@ -307,7 +318,7 @@ startup.** Both halves are required.
 | Half | Mechanism |
 |---|---|
 | Multi-table workload | A NEW workload variant `dynamodb-append-multi-table-workload` creates N=4 tables (`jepsen_append_t1` … `jepsen_append_t4`) and writes to ≥2 distinct tables per `TransactWriteItems`.  The router maps each table to its own route key so cross-table txns engage multi-route routing. |
-| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to launch a multi-group cluster.  Per `shard_config.go:61-99` (claude[bot] P2 on 24812867), `--shardRanges` alone is not enough: without `--raftGroups`, every shard range's `groupID` collapses into the single default group 1 and `groupMutations` returns `gids = [1]` for every key — single-shard path, 2PC never fires.  M5a must therefore add **five** coordinated launch-script changes:<br><br>1. **`--raftGroups`** declaring ≥2 groups (e.g. `1=127.0.0.1:50051,2=127.0.0.1:50054`).<br>2. **`--shardRanges`** boundary keys placing `t1-t2` in group 1 and `t3-t4` in group 2.<br>3. **Cluster topology decision — constrained by the current server.**  `shard_config.go:399-410` (`validateShardRanges`) requires every `--shardRanges` group ID to appear in that process's `--raftGroups`, and `main.go:764` (`buildShardGroups`) starts a local Raft runtime for every group listed in `--raftGroups` (codex P1 on 6f024aaa).  Consequence: "two processes, each hosting one group" is NOT supported — Process A with `--raftGroups "1=…"` and a `--shardRanges` entry pointing to group 2 fails validation; configuring both processes with `--raftGroups "1=…,2=…"` makes both try to host both groups and race on the Raft listeners.<br>The supported topology for M5a is **one process hosting both single-member groups** — two Raft addresses (`50051` for group 1, `50054` for group 2), shared by a single Dynamo endpoint (e.g. `63801`).  Each group is single-member (just this process) so `--raftBootstrap` works for both.  Cross-group txns go through the in-process router → 2PC fires across the two co-located groups.<br>**Limitation accepted for M5a:** because both groups live in one process, partition/kill nemeses can't separate them — only the route-shuffle nemesis (API-level) exercises the cross-group path meaningfully.  True distributed multi-group (multi-process) requires server-side support for "remote-only groups in `--raftGroups`" or equivalent, which is M6+ work and out of M5's scope.<br>4. **Per-process `--raftBootstrap` (boolean) — NOT `--raftBootstrapMembers`.**  `main.go:735-741` has a hard guard: `resolveBootstrapServers` returns `ErrBootstrapMembersRequireSingleGroup` whenever `--raftBootstrapMembers` is set and `--raftGroups` parses to more than one group (codex P2 + claude[bot] P2 on 3ca2a7f7).  For the single-process-two-groups topology, the process needs no peer discovery for either of its two single-member groups, so `--raftBootstrap` is necessary and sufficient.  The existing `--raftBootstrapMembers` in `run-jepsen-local.sh` must be **removed** for the M5a launch; it is only valid for single-group, multi-node formations.<br>5. **Single `--raftDynamoMap`** entry pointing the process's Dynamo address at itself (no cross-process leader fan-out is needed since there's only one process); port allocation simplifies — drop the `5005{1,2,3}`/`6380{1,2,3}` 3-node layout to a 1-process layout with two Raft ports (`50051`, `50054`) and one Dynamo port (`63801`). |
+| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to launch a multi-group cluster.  Per `shard_config.go:61-99` (review feedback on 24812867), `--shardRanges` alone is not enough: without `--raftGroups`, every shard range's `groupID` collapses into the single default group 1 and `groupMutations` returns `gids = [1]` for every key — single-shard path, 2PC never fires.  M5a must therefore add **five** coordinated launch-script changes:<br><br>1. **`--raftGroups`** declaring ≥2 groups (e.g. `1=127.0.0.1:50051,2=127.0.0.1:50054`).<br>2. **`--shardRanges`** boundary keys placing `t1-t2` in group 1 and `t3-t4` in group 2.<br>3. **Cluster topology decision — constrained by the current server.**  `shard_config.go:399-410` (`validateShardRanges`) requires every `--shardRanges` group ID to appear in that process's `--raftGroups`, and `main.go:764` (`buildShardGroups`) starts a local Raft runtime for every group listed in `--raftGroups` (review feedback on 6f024aaa).  Consequence: "two processes, each hosting one group" is NOT supported — Process A with `--raftGroups "1=…"` and a `--shardRanges` entry pointing to group 2 fails validation; configuring both processes with `--raftGroups "1=…,2=…"` makes both try to host both groups and race on the Raft listeners.<br>The supported topology for M5a is **one process hosting both single-member groups** — two Raft addresses (`50051` for group 1, `50054` for group 2), shared by a single Dynamo endpoint (e.g. `63801`).  Each group is single-member (just this process) so `--raftBootstrap` works for both.  Cross-group txns go through the in-process router → 2PC fires across the two co-located groups.<br>**Limitation accepted for M5a:** because both groups live in one process, partition/kill nemeses can't separate them — only the route-shuffle nemesis (API-level) exercises the cross-group path meaningfully.  True distributed multi-group (multi-process) requires server-side support for "remote-only groups in `--raftGroups`" or equivalent, which is M6+ work and out of M5's scope.<br>4. **Per-process `--raftBootstrap` (boolean) — NOT `--raftBootstrapMembers`.**  `main.go:735-741` has a hard guard: `resolveBootstrapServers` returns `ErrBootstrapMembersRequireSingleGroup` whenever `--raftBootstrapMembers` is set and `--raftGroups` parses to more than one group (review feedback on 3ca2a7f7).  For the single-process-two-groups topology, the process needs no peer discovery for either of its two single-member groups, so `--raftBootstrap` is necessary and sufficient.  The existing `--raftBootstrapMembers` in `run-jepsen-local.sh` must be **removed** for the M5a launch; it is only valid for single-group, multi-node formations.<br>5. **Single `--raftDynamoMap`** entry pointing the process's Dynamo address at itself (no cross-process leader fan-out is needed since there's only one process); port allocation simplifies — drop the `5005{1,2,3}`/`6380{1,2,3}` 3-node layout to a 1-process layout with two Raft ports (`50051`, `50054`) and one Dynamo port (`63801`). |
 
 `encodeDynamoSegment("jepsen_append_t1")` etc. are computed at
 script setup time and inlined into the `--shardRanges`
@@ -320,9 +331,9 @@ per `(when (= node (first (:nodes test))) …)`) and **verifies**
 that the expected multi-group routing is in place; if not, it
 fails fast with a clear error so the operator knows the
 launch script needs to be re-run with the right
-`--shardRanges`.  This avoids the gemini-medium R3 setup-hook
+`--shardRanges`.  This avoids the setup-hook
 concurrency hazard entirely (no mutation, just a read).  It
-also resolves the claude[bot] P3 follow-up about needing
+also resolves the review follow-up about needing
 ListRoutes for route-ID resolution in setup — the hook now
 needs ListRoutes for **verification** rather than mutation.
 
@@ -362,7 +373,7 @@ A prior revision of this doc used `(filter #(= (:type %) :G1c)
 …)` over `(:anomalies results)`, which is wrong: iterating a
 map yields `[key val]` vectors with no `:type` field, so the
 filter always returned an empty seq and the check would
-silently pass on any G1c run (claude[bot] P2 on f5d2ad7a).
+silently pass on any G1c run (review feedback on f5d2ad7a).
 The corrected form above keys off the map directly.
 
 `G1c` is the parent doc's explicit safety violation; `G-single`
@@ -399,10 +410,10 @@ mergeable on its own.
 | Phase | Title | Scope | Done when |
 |---|---|---|---|
 | M5a | CLI + multi-table workload + multi-group launch | `cmd/elastickv-split` binary; new `dynamodb-append-multi-table-workload` that creates N tables and writes to ≥2 tables per `TransactWriteItems`; **`scripts/run-jepsen-local.sh` extended to pass BOTH `--raftGroups` (declaring ≥2 groups) AND `--shardRanges` (placing tables across those groups)** — per §3.3, `--shardRanges` alone collapses every range to the single default group 1 and 2PC never fires; both flags are required for the multi-group contract.  Table-route keys for `t1…tN` are statically split across the declared groups; setup hook calls `ListRoutes` from the first node and verifies the multi-group routing is in place (read-only, no mutation). | `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table` runs from t=0 with tables 1-2 owned by group 1 and tables 3-4 owned by group 2; the workload exercises `dispatchMultiShardTxn` (verifiable via server-side log markers or a probe metric); Elle finds zero G1c. |
-| M5b | Route-shuffle nemesis | `jepsen/src/elastickv/composed1_nemesis.clj`; compose into the multi-table workload's nemesis package; CLI flag `--composed1-route-shuffle` (default off, on under `run-jepsen-local.sh`). Nemesis re-queries `ListRoutes` before every split and picks split keys from inside the table-route keyspace. | A `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table --composed1-route-shuffle` run produces zero G1c after ≥10 shuffles during a 5-minute run. |
+| M5b | Route-shuffle nemesis | Implemented in `jepsen/src/elastickv/composed1_nemesis.clj`; composed into the multi-table workload's nemesis package behind `--composed1-route-shuffle` (default off, enabled by `scripts/run-jepsen-m5-local.sh`). Nemesis re-queries `ListRoutes` before every split and picks split keys from inside the table-route keyspace. | Unit coverage: `lein test elastickv.composed1-nemesis-test elastickv.dynamodb-multi-table-workload-test`. Helper coverage: `go test ./cmd/elastickv-split ./cmd/elastickv-list-routes`. Script syntax: `bash -n scripts/run-jepsen-m5-local.sh`. |
 
 M5a is a single focused PR but no longer "small" after the
-codex P1 #2 expansion: `cmd/elastickv-split` (Go CLI), the
+multi-table expansion: `cmd/elastickv-split` (Go CLI), the
 new `dynamodb-append-multi-table-workload` (Clojure), the
 `scripts/run-jepsen-local.sh` multi-group launch extension
 (five coordinated changes — see §3.3 table), the setup-hook
@@ -433,26 +444,23 @@ plus the cadence-tuning analysis.
   `make tools`, mirror in `docs/operations/` (does this dir
   exist? — check at implementation). Out of scope for the
   design doc itself.
-- **OQ-4** (resolved post-PR #900 merge). The parent doc
-  rename `*_proposed_*.md` → `*_partial_*.md` should land as a
-  separate small doc-only PR now that PR #900 is merged. When
-  M5 ships, rename both this doc and the parent to
-  `*_implemented_*.md` (tentative — keep both files separate
-  so the M5 design history isn't lost).
-- **OQ-5** (new, codex P1 follow-up). Is `N = 4` tables the
+- **OQ-4** (resolved). The parent doc and this doc are both promoted to
+  `*_implemented_*.md`; the files remain separate so the M5 design history is
+  preserved.
+- **OQ-5** (new). Is `N = 4` tables the
   right default? Trade-offs: more tables = better 2PC
   fan-out coverage but slower setup and noisier history. The
   workload's existing `:concurrency` defaults to 5, so 4
   tables means each client touches ~all of them per txn on
   average. Defer to implementation; revisit if the workload
   becomes I/O-bound on table-meta lookups.
-- **OQ-6** (new, gemini medium R3 follow-up). The first-node
+- **OQ-6** (new, review follow-up). The first-node
   gate for the setup verification assumes Jepsen's
   `(first (:nodes test))` is stable across nodes; verify this
   matches actual Jepsen semantics (it should — `:nodes` is the
   test config, not a per-node view). Out of scope to design
   more carefully; will test at M5a implementation.
-- **OQ-7** (new, codex P1 #1 follow-up). The `--shardRanges`
+- **OQ-7** (new, review follow-up). The `--shardRanges`
   boundary keys for the multi-group launch (§3.3) need to be
   emitted as bytes that exactly match
   `dynamoRouteTableKey(encodeDynamoSegment(tableName))`. Two

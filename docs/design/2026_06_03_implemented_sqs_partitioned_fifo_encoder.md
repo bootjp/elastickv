@@ -167,7 +167,7 @@ The slice landed as a single PR because the decoder format change and encoder pa
 ## References
 
 - Parent: `2026_05_25_implemented_snapshot_logical_encoder.md` §"SQS"
-- M5-2 doc (decision gate template, classic side records): `2026_05_30_proposed_sqs_side_record_derivation.md`
+- M5-2 doc (decision gate template, classic side records): `2026_05_30_implemented_sqs_side_record_derivation.md`
 - M5-1 PR: #849
 - M5-2 PR: #892
 - Live partitioned constructors: `adapter/sqs_keys.go:337+` (`sqsPartitionedMsgDataKey` and siblings)

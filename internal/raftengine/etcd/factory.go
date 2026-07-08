@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -24,6 +25,8 @@ type FactoryConfig struct {
 	// monitoring.Registry.ColdStartObserver(). See PR #934 round-1
 	// codex P2 for the plumbing rationale.
 	ColdStartObserver raftengine.ColdStartObserver
+	RaftCipher        *encryption.Cipher
+	RaftCutoverIndex  RaftCutoverIndex
 }
 
 // Factory creates etcd raft engine instances.
@@ -37,6 +40,11 @@ func NewFactory(cfg FactoryConfig) *Factory {
 }
 
 func (f *Factory) EngineType() string { return "etcd" }
+
+func (f *Factory) SetRaftEnvelope(cipher *encryption.Cipher, cutover RaftCutoverIndex) {
+	f.cfg.RaftCipher = cipher
+	f.cfg.RaftCutoverIndex = cutover
+}
 
 func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResult, error) {
 	peers := peersFromServers(cfg.Peers)
@@ -66,6 +74,8 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 		ElectionTick:      f.cfg.ElectionTick,
 		MaxSizePerMsg:     f.cfg.MaxSizePerMsg,
 		MaxInflightMsg:    f.cfg.MaxInflightMsg,
+		RaftCipher:        f.cfg.RaftCipher,
+		RaftCutoverIndex:  f.cfg.RaftCutoverIndex,
 		ColdStartObserver: f.cfg.ColdStartObserver,
 	})
 	if err != nil {

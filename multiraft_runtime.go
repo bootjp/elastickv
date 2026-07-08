@@ -27,7 +27,8 @@ type raftGroupRuntime struct {
 	engineMu sync.RWMutex
 	engine   raftengine.Engine
 
-	store store.MVCCStore
+	store        store.MVCCStore
+	stateMachine raftengine.StateMachine
 
 	registerTransport func(grpc.ServiceRegistrar)
 	closeFactory      func() error // releases factory-created resources (transport, stores)
@@ -262,6 +263,7 @@ func buildRuntimeForGroup(
 		spec:              group,
 		engine:            result.Engine,
 		store:             st,
+		stateMachine:      sm,
 		registerTransport: result.RegisterTransport,
 		closeFactory:      result.Close,
 	}, nil

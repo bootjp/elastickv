@@ -151,7 +151,7 @@ memory each group's private cache/memtable pins.
   pipelines and independent serial apply loops (§1.7). Already in-tree
   structurally.
 - **Leader balance — PR #953**
-  (`docs/design/2026_06_11_proposed_leader_balance_scheduler.md`, branch
+  (`docs/design/2026_06_11_implemented_leader_balance_scheduler.md`, branch
   `design/leader-balance-scheduler`) spreads group leaderships across nodes so
   write-proposal load is not pinned to one node. Count-based v1 (TiKV
   balance-leader equivalent), embedded in the default-group leader, default
@@ -281,7 +281,7 @@ memory each group's private cache/memtable pins.
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
   (`2026_04_25_proposed_s3_admission_control.md`), SQS per-queue throttling
-  (`2026_04_26_proposed_sqs_per_queue_throttling.md`). These bound *one
+  (`2026_04_26_implemented_sqs_per_queue_throttling.md`). These bound *one
   workload's* impact so it cannot starve the shared runtime / Raft control
   plane; they scale a deployment by making it predictable under adversarial or
   unbalanced load rather than by raising raw capacity.
@@ -494,7 +494,7 @@ design if needed. The near-term mitigation is layered:
 
    Both calls go through the same `c.clock`. The apply-time OCC/ownership check
    then compares these timestamps against stored `CommitTS` values (the
-   Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
+   Composed-1 guard, `docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md`
    §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
    serializability depends on those `commitTS` values being **mutually
    comparable** across all participating groups, and read-only participant shards
