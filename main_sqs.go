@@ -12,21 +12,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// startSQSServer constructs the SQS adapter and returns the running
-// *adapter.SQSServer. The admin listener calls SigV4-bypass admin
-// entrypoints against this server (see adapter/sqs_admin.go); those
-// admin methods only need the coordinator/store, NOT the public SQS
-// HTTP listener. So when sqsAddr is empty the function still
-// constructs the server (with a nil net.Listener) — Run() then skips
-// httpServer.Serve while the reaper and throttle-sweep goroutines
-// still run, keeping retention math behind the admin counters
-// correct. The admin bridge in main_admin.go therefore wires
-// /admin/api/v1/sqs/* on the wire even on builds that disabled the
-// public SigV4 endpoint.
-func startSQSServer(
+// prepareSQSServer constructs the SQS adapter. The admin listener calls
+// SigV4-bypass admin entrypoints against this server (see adapter/sqs_admin.go);
+// those admin methods only need the coordinator/store, NOT the public SQS HTTP
+// listener. So when sqsAddr is empty the function still constructs the server
+// with a nil net.Listener.
+func prepareSQSServer(
 	ctx context.Context,
 	lc *net.ListenConfig,
-	eg *errgroup.Group,
 	sqsAddr string,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
@@ -35,16 +28,16 @@ func startSQSServer(
 	credentialsFile string,
 	partitionResolver *adapter.SQSPartitionResolver,
 	partitionObserver adapter.SQSPartitionObserver,
-) (*adapter.SQSServer, error) {
+) (*adapter.SQSServer, net.Listener, error) {
 	sqsAddr = strings.TrimSpace(sqsAddr)
 	sqsL, err := openSQSListener(ctx, lc, sqsAddr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	staticCreds, err := loadSQSStaticCredentials(credentialsFile, sqsAddr)
 	if err != nil {
 		closeSQSListenerOnError(sqsL, sqsAddr)
-		return nil, err
+		return nil, nil, err
 	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
@@ -56,6 +49,13 @@ func startSQSServer(
 		adapter.WithSQSPartitionResolver(partitionResolver),
 		adapter.WithSQSPartitionObserver(partitionObserver),
 	)
+	return sqsServer, sqsL, nil
+}
+
+func runSQSServer(ctx context.Context, eg *errgroup.Group, sqsServer *adapter.SQSServer) {
+	if sqsServer == nil {
+		return
+	}
 	// Two-goroutine shutdown pattern mirrors startS3Server: one goroutine waits
 	// on either ctx.Done() or Run completion to call Stop, the other runs the
 	// server and cancels the waiter once it has returned.
@@ -76,12 +76,11 @@ func startSQSServer(
 		}
 		return errors.WithStack(err)
 	})
-	return sqsServer, nil
 }
 
 // openSQSListener returns the bound listener for sqsAddr, or
 // (nil, nil) when sqsAddr is empty (listenless / admin-only mode).
-// Pulled out of startSQSServer so the constructor stays under the
+// Pulled out of prepareSQSServer so the constructor stays under the
 // cyclop budget; the listenless branch is otherwise the same one
 // the function-level docstring describes.
 func openSQSListener(ctx context.Context, lc *net.ListenConfig, sqsAddr string) (net.Listener, error) {

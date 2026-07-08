@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
 	crdberrors "github.com/cockroachdb/errors"
@@ -131,6 +132,37 @@ func (b *blockingRunRotateStartupRunner) Run(context.Context) error {
 }
 
 func (b *blockingRunRotateStartupRunner) Done() bool { return b.done.Load() }
+
+type stubStartupCoordinator struct {
+	dispatches atomic.Int32
+	clock      *kv.HLC
+}
+
+func (s *stubStartupCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	s.dispatches.Add(1)
+	return &kv.CoordinateResponse{}, nil
+}
+
+func (s *stubStartupCoordinator) IsLeader() bool { return true }
+
+func (s *stubStartupCoordinator) VerifyLeader(context.Context) error { return nil }
+
+func (s *stubStartupCoordinator) LinearizableRead(context.Context) (uint64, error) { return 1, nil }
+
+func (s *stubStartupCoordinator) RaftLeader() string { return "n1" }
+
+func (s *stubStartupCoordinator) IsLeaderForKey([]byte) bool { return true }
+
+func (s *stubStartupCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
+
+func (s *stubStartupCoordinator) RaftLeaderForKey([]byte) string { return "n1" }
+
+func (s *stubStartupCoordinator) Clock() *kv.HLC {
+	if s.clock == nil {
+		s.clock = kv.NewHLC()
+	}
+	return s.clock
+}
 
 func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderWaitRuns(t *testing.T) {
 	t.Parallel()
@@ -441,6 +473,33 @@ func TestStartupPublicKVGate_BlocksAfterReadyWhenStartupRotationPending(t *testi
 	}
 }
 
+func TestStartupGatedCoordinator_BlocksAdapterDispatchDuringAsyncRotation(t *testing.T) {
+	t.Parallel()
+	inner := &stubStartupCoordinator{clock: kv.NewHLC()}
+	blocked := true
+	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
+	gate.markReady()
+	coord := startupGatedCoordinator{inner: inner, gate: gate}
+
+	if _, err := coord.Dispatch(context.Background(), nil); status.Code(err) != codes.Unavailable {
+		t.Fatalf("blocked Dispatch err=%v, want Unavailable", err)
+	}
+	if got := inner.dispatches.Load(); got != 0 {
+		t.Fatalf("inner Dispatch calls while blocked=%d, want 0", got)
+	}
+	if _, err := coord.LinearizableRead(context.Background()); err != nil {
+		t.Fatalf("LinearizableRead should pass through while Dispatch is blocked: %v", err)
+	}
+
+	blocked = false
+	if _, err := coord.Dispatch(context.Background(), nil); err != nil {
+		t.Fatalf("Dispatch after blocker cleared: %v", err)
+	}
+	if got := inner.dispatches.Load(); got != 1 {
+		t.Fatalf("inner Dispatch calls after unblock=%d, want 1", got)
+	}
+}
+
 func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListeners(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -478,6 +537,38 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 	}
 }
 
+func TestRuntimeServerRunner_PreparePublicServicesBindsBeforeRotation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	lc := &net.ListenConfig{}
+	heldDynamo, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen held dynamo: %v", err)
+	}
+	defer heldDynamo.Close()
+
+	runner := runtimeServerRunner{
+		ctx:             ctx,
+		lc:              lc,
+		redisAddress:    "127.0.0.1:0",
+		dynamoAddress:   heldDynamo.Addr().String(),
+		s3PathStyleOnly: true,
+		metricsAddress:  "",
+		pprofAddress:    "",
+		pubsubRelay:     adapter.NewRedisPubSubRelay(),
+		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
+		coordinate:      &stubStartupCoordinator{clock: kv.NewHLC()},
+	}
+	if err := runner.prepareAdminForwardServers(); err != nil {
+		t.Fatalf("prepareAdminForwardServers: %v", err)
+	}
+	err = runner.preparePublicServices()
+	if err == nil || !strings.Contains(err.Error(), "failed to listen") {
+		t.Fatalf("preparePublicServices err=%v, want occupied listener error before rotation", err)
+	}
+	runner.closePreparedExternalListeners()
+}
+
 type fakeStartupKEK struct{}
 
 func (fakeStartupKEK) Wrap(dek []byte) ([]byte, error) {
@@ -510,8 +601,24 @@ func (r *recordingRotateProposer) ProposeAdmin(_ context.Context, data []byte) (
 	return &raftengine.ProposalResult{CommitIndex: uint64(len(r.proposals))}, nil
 }
 
+type blockingRotateProposer struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRotateProposer) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, errors.New("unexpected Propose")
+}
+
+func (b *blockingRotateProposer) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return &raftengine.ProposalResult{CommitIndex: 1}, nil
+}
+
 type rotateStartupLeader struct {
-	*recordingRotateProposer
+	raftengine.Proposer
 }
 
 func (rotateStartupLeader) State() raftengine.State            { return raftengine.StateLeader }
@@ -558,6 +665,63 @@ func TestEncryptionRotateOnStartupTask_RunRotatesStorageAndRaft(t *testing.T) {
 	}
 	assertRotateProposal(t, rec.proposals[0], pb.RotateDEKRequest_PURPOSE_STORAGE, 9, 11)
 	assertRotateProposal(t, rec.proposals[1], pb.RotateDEKRequest_PURPOSE_RAFT, 10, 12)
+}
+
+func TestEncryptionRotateOnStartupTask_DoneDoesNotWaitForRotateDEK(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 1,
+		Active:           encryption.ActiveKeys{Storage: 7},
+		Keys: map[string]encryption.SidecarKey{
+			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage"), Created: "2026-07-07T00:00:00Z"},
+		},
+	}
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	blocking := &blockingRotateProposer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	task := &encryptionRotateOnStartupTask{
+		server:      adapterServerForRotateStartupProposer(t, sidecarPath, blocking),
+		sidecarPath: sidecarPath,
+		kekWrapper:  fakeStartupKEK{},
+		fullNodeID:  0xCAFE,
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- task.Run(context.Background())
+	}()
+	select {
+	case <-blocking.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RotateDEK proposal did not start")
+	}
+
+	doneReturned := make(chan bool, 1)
+	go func() { doneReturned <- task.Done() }()
+	select {
+	case got := <-doneReturned:
+		if got {
+			t.Fatal("task must not be done while RotateDEK is still in flight")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Done blocked behind in-flight RotateDEK")
+	}
+
+	close(blocking.release)
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run after release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not finish after RotateDEK release")
+	}
 }
 
 func TestEncryptionRotateOnStartupTask_RunFencesBeforeSidecarRead(t *testing.T) {
@@ -683,7 +847,12 @@ func TestRetryableEncryptionRotateOnStartupError_UnwrapsStatus(t *testing.T) {
 
 func adapterServerForRotateStartup(t *testing.T, sidecarPath string, rec *recordingRotateProposer) *adapter.EncryptionAdminServer {
 	t.Helper()
-	leader := rotateStartupLeader{recordingRotateProposer: rec}
+	return adapterServerForRotateStartupProposer(t, sidecarPath, rec)
+}
+
+func adapterServerForRotateStartupProposer(t *testing.T, sidecarPath string, proposer raftengine.Proposer) *adapter.EncryptionAdminServer {
+	t.Helper()
+	leader := rotateStartupLeader{Proposer: proposer}
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(sidecarPath),
 		adapter.WithEncryptionAdminFullNodeID(0xCAFE),

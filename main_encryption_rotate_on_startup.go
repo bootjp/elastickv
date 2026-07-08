@@ -350,19 +350,17 @@ func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
 		return errors.Wrap(err, "encryption rotate-on-startup: read sidecar")
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err := t.prepareNextKeyIDLocked(sc); err != nil {
+	if err := t.prepareNextKeyID(sc); err != nil {
 		return err
 	}
-	if err := t.rotatePurposeIfActiveLocked(
-		ctx, &t.storageDone, sc.Active.Storage,
+	if err := t.rotatePurposeIfActive(
+		ctx, sc.Active.Storage,
 		pb.RotateDEKRequest_PURPOSE_STORAGE, t.storageEpoch,
 	); err != nil {
 		return err
 	}
-	if err := t.rotatePurposeIfActiveLocked(
-		ctx, &t.raftDone, sc.Active.Raft,
+	if err := t.rotatePurposeIfActive(
+		ctx, sc.Active.Raft,
 		pb.RotateDEKRequest_PURPOSE_RAFT, t.raftEpoch,
 	); err != nil {
 		return err
@@ -387,6 +385,12 @@ func (t *encryptionRotateOnStartupTask) markAllDone() {
 	t.raftDone = true
 }
 
+func (t *encryptionRotateOnStartupTask) prepareNextKeyID(sc *encryption.Sidecar) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.prepareNextKeyIDLocked(sc)
+}
+
 func (t *encryptionRotateOnStartupTask) prepareNextKeyIDLocked(sc *encryption.Sidecar) error {
 	next, err := nextEncryptionRotateOnStartupKeyID(sc)
 	if err != nil {
@@ -396,32 +400,76 @@ func (t *encryptionRotateOnStartupTask) prepareNextKeyIDLocked(sc *encryption.Si
 	return nil
 }
 
-func (t *encryptionRotateOnStartupTask) rotatePurposeIfActiveLocked(
+func (t *encryptionRotateOnStartupTask) rotatePurposeIfActive(
 	ctx context.Context,
-	done *bool,
 	activeID uint32,
 	purpose pb.RotateDEKRequest_Purpose,
 	localEpoch uint16,
 ) error {
-	if activeID == encryption.ReservedKeyID {
-		*done = true
-		return nil
-	}
-	if *done {
-		return nil
-	}
-	if err := t.rotateLocked(ctx, purpose, localEpoch); err != nil {
+	keyID, rotate, err := t.reserveRotateKey(activeID, purpose)
+	if err != nil || !rotate {
 		return err
 	}
-	*done = true
+	if err := t.rotateWithKeyID(ctx, purpose, localEpoch, keyID); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.advanceNextKeyIDLocked(keyID)
+	t.mu.Unlock()
+	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT && t.raftEnvelope != nil {
+		if err := t.raftEnvelope.installRotatedRaftDEK(keyID); err != nil {
+			return errors.Wrap(err, "encryption rotate-on-startup: install rotated raft envelope wrapper")
+		}
+	}
+	t.markPurposeDone(purpose)
 	return nil
 }
 
-func (t *encryptionRotateOnStartupTask) rotateLocked(ctx context.Context, purpose pb.RotateDEKRequest_Purpose, localEpoch uint16) error {
+func (t *encryptionRotateOnStartupTask) reserveRotateKey(
+	activeID uint32,
+	purpose pb.RotateDEKRequest_Purpose,
+) (uint32, bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	done := t.purposeDoneLocked(purpose)
+	if activeID == encryption.ReservedKeyID {
+		t.markPurposeDoneLocked(purpose)
+		return 0, false, nil
+	}
+	if done {
+		return 0, false, nil
+	}
 	if t.nextKeyID == encryption.ReservedKeyID {
+		return 0, false, errors.New("encryption rotate-on-startup: key_id space exhausted")
+	}
+	return t.nextKeyID, true, nil
+}
+
+func (t *encryptionRotateOnStartupTask) purposeDoneLocked(purpose pb.RotateDEKRequest_Purpose) bool {
+	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+		return t.raftDone
+	}
+	return t.storageDone
+}
+
+func (t *encryptionRotateOnStartupTask) markPurposeDone(purpose pb.RotateDEKRequest_Purpose) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.markPurposeDoneLocked(purpose)
+}
+
+func (t *encryptionRotateOnStartupTask) markPurposeDoneLocked(purpose pb.RotateDEKRequest_Purpose) {
+	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+		t.raftDone = true
+		return
+	}
+	t.storageDone = true
+}
+
+func (t *encryptionRotateOnStartupTask) rotateWithKeyID(ctx context.Context, purpose pb.RotateDEKRequest_Purpose, localEpoch uint16, keyID uint32) error {
+	if keyID == encryption.ReservedKeyID {
 		return errors.New("encryption rotate-on-startup: key_id space exhausted")
 	}
-	keyID := t.nextKeyID
 	wrapped, err := wrapFreshStartupDEK(t.kekWrapper)
 	if err != nil {
 		return err
@@ -435,12 +483,6 @@ func (t *encryptionRotateOnStartupTask) rotateLocked(ctx context.Context, purpos
 	})
 	if err != nil {
 		return errors.Wrap(err, "encryption rotate-on-startup: RotateDEK")
-	}
-	t.advanceNextKeyIDLocked(keyID)
-	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT && t.raftEnvelope != nil {
-		if err := t.raftEnvelope.installRotatedRaftDEK(keyID); err != nil {
-			return errors.Wrap(err, "encryption rotate-on-startup: install rotated raft envelope wrapper")
-		}
 	}
 	return nil
 }
