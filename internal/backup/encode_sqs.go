@@ -393,7 +393,7 @@ func pickDedupWinners(meta *sqsQueueMetaPublic, records []sqsMessageRecord, isPa
 	return winners
 }
 
-// validatePartitioning runs the fail-closed gates from the M5-3
+// validatePartitioning runs the message-level fail-closed gates from the M5-3
 // design doc §"Validation invariants" before any message is staged.
 // All gates use raw meta.PartitionCount > 1 as the partitioned-queue
 // predicate, never effectivePartitionCount.

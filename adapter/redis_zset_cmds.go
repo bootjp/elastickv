@@ -1165,7 +1165,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+	if r.proxyBlockingToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	timeoutSeconds, err := strconv.ParseFloat(string(cmd.Args[len(cmd.Args)-1]), 64)
@@ -1223,7 +1223,14 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		if r.bzpopminTryAllKeys(conn, keys, fast) {
+		var done bool
+		if ok := r.runWithHeavyCommandSlot(func() {
+			done = r.bzpopminTryAllKeys(conn, keys, fast)
+		}); !ok {
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return
+		}
+		if done {
 			return
 		}
 		if !fast {

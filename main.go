@@ -5,11 +5,13 @@ import (
 	"flag"
 	"log"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +105,7 @@ var (
 	redisLuaMaxIdleStates           = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
 	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
+	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
 	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
@@ -332,7 +335,7 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 }
 
 func run() error {
-	cfg, engineType, bootstrapServers, bootstrap, err := resolveRuntimeInputs()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
 		return err
 	}
@@ -395,7 +398,7 @@ func run() error {
 		cfg.defaultGroup,
 		cfg.multi,
 		bootstrap,
-		bootstrapServers,
+		bootstrapCfg,
 		factory,
 		func(groupID uint64) kv.ProposalObserver {
 			return metricsRegistry.RaftProposalObserver(groupID)
@@ -528,7 +531,7 @@ func run() error {
 	cleanup.Add(rotateOnStartupDeregister)
 	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
-		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
+		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
@@ -585,27 +588,64 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 	}
 }
 
-func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server, bool, error) {
+func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if *raftId == "" {
-		return runtimeConfig{}, "", nil, false, errors.New("flag --raftId is required")
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.New("flag --raftId is required")
 	}
 
 	engineType, err := parseRaftEngineType(*raftEngineName)
 	if err != nil {
-		return runtimeConfig{}, "", nil, false, err
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
 	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *sqsAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap, *sqsFifoPartitionMap)
 	if err != nil {
-		return runtimeConfig{}, "", nil, false, err
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
-	bootstrapServers, err := resolveBootstrapServers(*raftId, cfg.groups, *raftBootstrapMembers)
+	bootstrapCfg, err := resolveBootstrapConfig(*raftId, cfg.groups, *raftBootstrapMembers, *raftGroupPeers)
 	if err != nil {
-		return runtimeConfig{}, "", nil, false, err
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
-	return cfg, engineType, bootstrapServers, *raftBootstrap || len(bootstrapServers) > 0, nil
+	return cfg, engineType, bootstrapCfg, *raftBootstrap || bootstrapCfg.anyBootstrapServers(), nil
+}
+
+type raftBootstrapConfig struct {
+	legacyServers []raftengine.Server
+	groupServers  map[uint64][]raftengine.Server
+}
+
+func (c raftBootstrapConfig) anyBootstrapServers() bool {
+	return len(c.legacyServers) > 0 || len(c.groupServers) > 0
+}
+
+func (c raftBootstrapConfig) serversForGroup(groupID uint64) []raftengine.Server {
+	if len(c.groupServers) != 0 {
+		return cloneRaftServers(c.groupServers[groupID])
+	}
+	return cloneRaftServers(c.legacyServers)
+}
+
+func (c raftBootstrapConfig) bootstrapSeedForGroup(groupID uint64) []raftengine.Server {
+	if len(c.groupServers) == 0 {
+		return nil
+	}
+	return cloneRaftServers(c.groupServers[groupID])
+}
+
+func (c raftBootstrapConfig) adminSeed(defaultGroup uint64) []raftengine.Server {
+	if len(c.groupServers) != 0 {
+		return cloneRaftServers(c.groupServers[defaultGroup])
+	}
+	return cloneRaftServers(c.legacyServers)
+}
+
+func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]raftengine.Server(nil), in...)
 }
 
 type runtimeConfig struct {
@@ -811,7 +851,40 @@ var (
 	ErrBootstrapMembersMissingLocalNode   = errors.New("flag --raftBootstrapMembers must include local --raftId")
 	ErrBootstrapMembersLocalAddrMismatch  = errors.New("flag --raftBootstrapMembers local address must match local raft group address")
 	ErrNoBootstrapMembersConfigured       = errors.New("no bootstrap members configured")
+	ErrRaftGroupPeersMutuallyExclusive    = errors.New("flags --raftBootstrapMembers and --raftGroupPeers are mutually exclusive")
+	ErrRaftGroupPeersUnknownGroup         = errors.New("flag --raftGroupPeers references unknown raft group")
+	ErrRaftGroupPeersMissingGroup         = errors.New("flag --raftGroupPeers must include every raft group")
+	ErrRaftGroupPeersMissingLocalNode     = errors.New("flag --raftGroupPeers group must include local --raftId")
+	ErrRaftGroupPeersLocalAddrMismatch    = errors.New("flag --raftGroupPeers local address must match local raft group address")
+	ErrRaftGroupPeersTooFewVoters         = errors.New("flag --raftGroupPeers group must contain at least two voters")
+	ErrRaftGroupPeersHeterogeneous        = errors.New("flag --raftGroupPeers requires identical raft IDs across groups")
+	ErrNoRaftGroupPeersConfigured         = errors.New("no raft group peers configured")
 )
+
+const minRaftGroupPeerVoters = 2
+
+func resolveBootstrapConfig(
+	raftID string,
+	groups []groupSpec,
+	bootstrapMembers string,
+	groupPeersRaw string,
+) (raftBootstrapConfig, error) {
+	if strings.TrimSpace(groupPeersRaw) == "" {
+		servers, err := resolveBootstrapServers(raftID, groups, bootstrapMembers)
+		if err != nil {
+			return raftBootstrapConfig{}, err
+		}
+		return raftBootstrapConfig{legacyServers: servers}, nil
+	}
+	if strings.TrimSpace(bootstrapMembers) != "" {
+		return raftBootstrapConfig{}, errors.WithStack(ErrRaftGroupPeersMutuallyExclusive)
+	}
+	groupServers, err := resolveRaftGroupPeers(raftID, groups, groupPeersRaw)
+	if err != nil {
+		return raftBootstrapConfig{}, err
+	}
+	return raftBootstrapConfig{groupServers: groupServers}, nil
+}
 
 func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raftengine.Server, error) {
 	if strings.TrimSpace(bootstrapMembers) == "" {
@@ -842,13 +915,103 @@ func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers
 	return nil, errors.Wrapf(ErrBootstrapMembersMissingLocalNode, "raftId=%q", raftID)
 }
 
+func resolveRaftGroupPeers(raftID string, groups []groupSpec, raw string) (map[uint64][]raftengine.Server, error) {
+	parsed, err := parseRaftGroupPeers(raw)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse raft group peers")
+	}
+	if len(parsed) == 0 {
+		return nil, errors.WithStack(ErrNoRaftGroupPeersConfigured)
+	}
+	groupByID := make(map[uint64]groupSpec, len(groups))
+	for _, g := range groups {
+		groupByID[g.id] = g
+	}
+	if err := validateRaftGroupPeerCoverage(parsed, groupByID); err != nil {
+		return nil, err
+	}
+	if err := validateRaftGroupPeerLocalNode(raftID, parsed, groupByID); err != nil {
+		return nil, err
+	}
+	if err := validateRaftGroupPeerHomogeneity(parsed); err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
+func validateRaftGroupPeerCoverage(parsed map[uint64][]raftengine.Server, groupByID map[uint64]groupSpec) error {
+	for _, groupID := range slices.Sorted(maps.Keys(parsed)) {
+		if _, ok := groupByID[groupID]; !ok {
+			return errors.Wrapf(ErrRaftGroupPeersUnknownGroup, "group %d", groupID)
+		}
+		if len(parsed[groupID]) < minRaftGroupPeerVoters {
+			return errors.Wrapf(ErrRaftGroupPeersTooFewVoters, "group %d", groupID)
+		}
+	}
+	for _, groupID := range slices.Sorted(maps.Keys(groupByID)) {
+		if _, ok := parsed[groupID]; !ok {
+			return errors.Wrapf(ErrRaftGroupPeersMissingGroup, "group %d", groupID)
+		}
+	}
+	return nil
+}
+
+func validateRaftGroupPeerLocalNode(raftID string, parsed map[uint64][]raftengine.Server, groupByID map[uint64]groupSpec) error {
+	for _, groupID := range slices.Sorted(maps.Keys(parsed)) {
+		localAddr := groupByID[groupID].address
+		found := false
+		for _, server := range parsed[groupID] {
+			if server.ID != raftID {
+				continue
+			}
+			found = true
+			if server.Address != localAddr {
+				return errors.Wrapf(ErrRaftGroupPeersLocalAddrMismatch,
+					"group %d expected %q got %q", groupID, localAddr, server.Address)
+			}
+		}
+		if !found {
+			return errors.Wrapf(ErrRaftGroupPeersMissingLocalNode, "group %d raftId=%q", groupID, raftID)
+		}
+	}
+	return nil
+}
+
+func validateRaftGroupPeerHomogeneity(parsed map[uint64][]raftengine.Server) error {
+	var canonical []string
+	var canonicalGroup uint64
+	for _, groupID := range slices.Sorted(maps.Keys(parsed)) {
+		ids := raftServerIDs(parsed[groupID])
+		if canonical == nil {
+			canonical = ids
+			canonicalGroup = groupID
+			continue
+		}
+		if !slices.Equal(canonical, ids) {
+			return errors.Wrapf(ErrRaftGroupPeersHeterogeneous,
+				"group %d ids %v differ from group %d ids %v",
+				groupID, ids, canonicalGroup, canonical)
+		}
+	}
+	return nil
+}
+
+func raftServerIDs(servers []raftengine.Server) []string {
+	ids := make([]string, 0, len(servers))
+	for _, server := range servers {
+		ids = append(ids, server.ID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 func buildShardGroups(
 	raftID string,
 	raftDir string,
 	groups []groupSpec,
 	multi bool,
 	bootstrap bool,
-	bootstrapServers []raftengine.Server,
+	bootstrapCfg raftBootstrapConfig,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -929,7 +1092,11 @@ func buildShardGroups(
 		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 		// §M2.
 		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring)...)
-		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
+		groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(bootstrapCfg, g.id, bootstrap)
+		runtime, err := buildRuntimeForGroup(
+			raftID, g, raftDir, multi, groupBootstrap,
+			groupBootstrapServers, groupBootstrapSeed,
+			st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
@@ -958,6 +1125,15 @@ func buildShardGroups(
 		encWiring.attachRaftEnvelopeGroup(g.id, sg)
 	}
 	return runtimes, shardGroups, nil
+}
+
+func bootstrapSettingsForGroup(
+	cfg raftBootstrapConfig,
+	groupID uint64,
+	explicitBootstrap bool,
+) (bool, []raftengine.Server, []raftengine.Server) {
+	servers := cfg.serversForGroup(groupID)
+	return explicitBootstrap || len(servers) > 0, servers, cfg.bootstrapSeedForGroup(groupID)
 }
 
 func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring) []kv.FSMOption {

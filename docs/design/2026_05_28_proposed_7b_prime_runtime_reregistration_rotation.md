@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed — filename kept stable for existing links |
+| Status | implemented — filename kept stable for existing links |
 | Date | 2026-05-28 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md) (cutover case + §6 deferred-rotation analysis) |
 | Builds on | 7a (process-start propose path), 7a-2 (storage-layer `Registered()` gate), 7b (runtime watcher for the cutover case) |
@@ -11,10 +11,12 @@
 
 7b shipped the runtime registration watcher for the **cutover** case
 (Phase-0 boot or pre-bootstrap boot → runtime `EnableStorageEnvelope`).
-The watcher explicitly **defers** the rotation case via a log-once skip
-in [`runtimeRegistrationInScope`](../../main_encryption_registration.go)
-when `bootDEKID != 0 && activeDEK != bootDEKID`. This slice closes that
-gap.
+The original 7b posture explicitly deferred the rotation case via a
+log-once skip in
+[`runtimeRegistrationInScope`](../../main_encryption_registration.go)
+when `bootDEKID != 0 && activeDEK != bootDEKID`; the implemented 7b'
+watcher replaces that skip with the same verify-or-propose path used
+by the cutover case.
 
 The rotation case is a non-proposer node observing a committed
 `RotateDEK` and needing to register `(newDEK, node, ?)` so its
@@ -359,78 +361,32 @@ node's sidecar now records its own emissions accurately.
   group). Multi-group rotation atomicity is a much larger design
   problem; out of scope here.
 
-## 5. Verification action items (for the implementation PR)
+## 5. Verification record
 
-1. New `applier_test.go` cases:
-   - `TestApplier_ApplyRotateDEK_LocalEpochProviderReadAtApply`:
-     given a `WithLocalEpoch` provider returning 7, the rotation
-     entry under a fresh DEK writes `Keys[newDEK].LocalEpoch = 7`
-     to the sidecar.
-   - `TestApplier_ApplyRotateDEK_NoLocalEpochProviderFallsBack`:
-     constructing the `Applier` without the option preserves
-     today's `LocalEpoch: 0` behaviour (test-harness
-     backward-compatibility).
-   - `TestApplier_ApplyRotateDEK_LocalEpochAppliedPerApply`:
-     verify the static `a.localEpoch` value is correctly read
-     on each FSM apply call, not inadvertently reset or derived
-     from mutable state. A multi-apply test fixture (two
-     rotations in sequence) suffices to pin that the value
-     remains stable across applies.
+The implementation landed both the applier-side local-epoch plumbing
+and the runtime watcher rotation path:
 
-2. New `main_encryption_registration_test.go` cases extending the
-   existing watcher harness. Split into **propose-call** vs
-   **short-circuit** so each test exercises one path
-   independently (coderabbitai minor on PR #855):
+- `internal/encryption/applier_test.go` covers storage rotation using
+  `WithLocalEpoch`, no-option fallback to `LocalEpoch=0`, per-apply
+  stability across multiple rotations, raft-rotation isolation from
+  the storage epoch, and raft-local-epoch wiring for raft keys.
+- `main_encryption_registration_test.go` covers rotation in-scope
+  verify short-circuit, already-registered no-op, re-propose on a
+  later DEK, and B-to-C-to-B oscillation re-propose behavior.
+- The old 7b deferral branch is replaced by an in-scope rotation
+  branch in `runtimeRegistrationInScope`; the tests above pin that
+  rotations use the same verify-or-propose lifecycle as the cutover
+  case.
 
-   - `TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`:
-     `bootDEKID == X != 0`, `activeDEK == Y != X`,
-     `lastRegisteredDEK != Y`, `w.epoch == 5`. NO pre-populated
-     registry row. Asserts the tick invokes the propose path (use
-     a fake `Coordinate` whose `Propose` method records the
-     entry) with payload `(Y, node, 5)`.
-   - `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`:
-     same wiring as above, but **pre-populate** a registry row at
-     `(Y, node, 5)`. Asserts `verifyRegistered` short-circuits,
-     `MarkRegistered(Y)` fires, and the fake `Coordinate.Propose`
-     is NOT called.
-   - `TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp`:
-     after a first-tick MarkRegistered, a second tick at the same
-     `activeDEK` is a no-op. Asserts `cache.Registered()` short-
-     circuits `runtimeRegistrationInScope` and `lastRegisteredDEK`
-     is NOT updated (claude review nit on PR #855 — confirm it
-     stays at the original value, not reset to 0 or rewritten).
-   - `TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes`:
-     after registering for DEK Y, a subsequent rotation to DEK Z
-     (`activeDEK == Z`, `lastRegisteredDEK == Y`) triggers a fresh
-     propose. Pins that `lastRegisteredDEK` updates to Z.
-   - `TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes`:
-     after registering for B then C, rotation back to B does NOT
-     short-circuit (the single-DEK `StateCache` holds C, so
-     `cache.Registered() == false` for active B; §3.2.2). Asserts
-     the tick re-proposes `(B, node, w.epoch)`; the §4.1 case-2
-     idempotent apply lands as a no-op, and the success callback
-     runs `MarkRegistered(B)` flipping the cache back to
-     B-registered. Pins the documented oscillation behavior so
-     the implementation PR's tests do not mistake the
-     re-propose for a bug.
+Self-review focus:
 
-3. Replace `TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips`
-   (which pins the 7b deferral) with the two tests in §5 item 2
-   above (`TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`
-   + `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`
-   — the 7b' resolution) and document the lifecycle transition in
-   the commit message: the deferral was the 7b posture; 7b' is the
-   resolution.
-
-4. Self-review (5-lens) for the implementation PR — same template
-   as 7b. Particular attention to:
-   - **Data consistency:** Each node's `Keys[newDEK].LocalEpoch`
-     matches its own nonce factory's pinned epoch — no cross-node
-     epoch contamination.
-   - **Concurrency:** The `a.localEpoch` field is read from the
-     FSM goroutine (apply path) only; no shared-state race with
-     the watcher's read of `w.epoch` (both are the same static
-     value captured at `Applier` construction).
+- **Data consistency:** Each node's `Keys[newDEK].LocalEpoch`
+  matches its own nonce factory's pinned epoch — no cross-node
+  epoch contamination.
+- **Concurrency:** The `a.localEpoch` field is read from the FSM
+  goroutine (apply path) only; no shared-state race with the
+  watcher's read of `w.epoch` (both are the same static value
+  captured at `Applier` construction).
 
 ## 6. Rollout / migration
 

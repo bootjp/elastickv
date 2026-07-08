@@ -404,6 +404,14 @@ func TestEncodeSnapshotRejectsUnsupportedFeatures(t *testing.T) {
 			},
 			wantErr: ErrEncodeUnsupportedSQSPreserveVisibility,
 		},
+		{
+			name: "SQS include side records",
+			opts: EncodeOptions{
+				Adapters:              AdapterSet{SQS: true},
+				IncludeSQSSideRecords: true,
+			},
+			wantErr: ErrEncodeUnsupportedSQSSideRecords,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -458,6 +466,13 @@ func TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter(t *testing.T) {
 			opts: EncodeOptions{
 				Adapters:              AdapterSet{Redis: true}, // not SQS
 				PreserveSQSVisibility: true,
+			},
+		},
+		{
+			name: "IncludeSQSSideRecords with SQS disabled",
+			opts: EncodeOptions{
+				Adapters:              AdapterSet{Redis: true}, // not SQS
+				IncludeSQSSideRecords: true,
 			},
 		},
 	}

@@ -106,6 +106,8 @@ the Stage 7 work that later closed the original multi-node-churn gap.
   Stage 7a/7a-2/7c docs:
   [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md),
   [`2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md`](2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md),
+  [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md),
+  [`2026_05_28_proposed_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_proposed_7b_prime_runtime_reregistration_rotation.md),
   and [`2026_05_29_proposed_7c_confchange_time_registration.md`](2026_05_29_proposed_7c_confchange_time_registration.md).
 - KMS providers, compression, DEK retirement/rewrite (Stages 9).
 - The capability fan-out closure + multi-node e2e — that is 6D-6c-3.
@@ -263,9 +265,9 @@ hydrate+bump is gated on an active DEK:
   `node_id_collision.go`) now call `encryption.NodeID16`; the lone
   gosec-suppressed conversion lives inside the helper.
 
-## 5. Open questions for review
+## 5. Resolved decisions and deferred follow-ups
 
-0. **Redundant KEK unwrap at startup (gemini medium, deferred).**
+- **Redundant KEK unwrap at startup is deferred to Stage 9.**
    `HydrateKeystoreFromSidecar` re-unwraps every wrapped DEK that
    `CheckStartupGuards` already unwrapped to verify the KEK. For the
    file-mode KEK (the only provider today) the unwrap is a local AES
@@ -276,11 +278,9 @@ hydrate+bump is gated on an active DEK:
    the guard/hydration contract boundary. Tracked for the Stage 9 KMS
    work rather than this PR.
 
-1. Should `BumpLocalEpoch` also bump the **raft** DEK's epoch, or only
-   the storage DEK? (Raft envelope is §4.2; this PR wires only the
-   storage write path, so the proposal bumps storage only and leaves
-   raft-epoch lifecycle to the raft-envelope wiring.)
-2. Is hydrating **all** sidecar DEKs (not just the active one) the
-   right call? (Yes — reads of pre-rotation versions need historical
-   DEKs; the cipher must hold every unretired DEK, matching
-   `Cipher.LoadedKeyIDs`.)
+- **`BumpLocalEpoch` remains storage-envelope scoped for this
+  milestone.** Raft envelope is §4.2; this PR wires only the storage
+  write path, so raft-epoch lifecycle stays with raft-envelope wiring.
+- **Hydrating all sidecar DEKs is intentional.** Reads of
+  pre-rotation versions need historical DEKs; the cipher must hold
+  every unretired DEK, matching `Cipher.LoadedKeyIDs`.

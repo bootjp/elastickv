@@ -333,71 +333,23 @@ without manually patching the registry.
 - **`local_epoch` recovery if the new node crashes mid-first-boot.**
   Covered by 7a's `BumpLocalEpoch` + §9.1 startup guard already.
 
-## 5. Verification action items (for the implementation PR)
+## 5. Verification record
 
-1. New `internal/raftadmin/server_test.go` cases (with a fake
-   `MembershipChangeInterceptor`):
-   - `TestAddVoter_InvokesInterceptorBeforeConfChange`: a recording
-     fake interceptor that returns nil is invoked before
-     `s.admin.AddVoter`; assert order and raftID propagation.
-   - `TestAddVoter_InterceptorErrorAbortsConfChange`: a fake
-     interceptor that returns an error aborts the RPC; assert
-     `s.admin.AddVoter` is NOT called.
-   - `TestAddVoter_NilInterceptorSkipsPreStep`: with no interceptor
-     installed (e.g., encryption-disabled build), AddVoter proceeds
-     directly to `s.admin.AddVoter` as today.
-   - Symmetric tests for `AddLearner`.
-2. New encryption-adapter tests (location: alongside the adapter — if
-   it lives in `main`, then a new `main_encryption_confchange_test.go`;
-   if it lives in `internal/encryption/raftadmin/`, that package's
-   tests):
-   - `TestEncryptionPreRegister_ProposesCorrectEntry`: with the
-     state cache reporting `activeStorageDEK=X`, calling
-     `PreAddMember(raftID=N)` proposes a 0x03 entry for
-     `(X, deriveNodeID(N), 0)`. Use a recording fake `Coordinate.Propose`
-     and a stub `deriveNodeID` that returns a known sentinel.
-   - `TestEncryptionPreRegister_PreBootstrapSkips`: when
-     `ActiveStorageKeyID()` reports `(0, false)`, `PreAddMember`
-     returns nil without proposing. Encryption-disabled clusters
-     and pre-bootstrap clusters share this path.
-   - `TestEncryptionPreRegister_ProposeFailureSurfaces`: propose
-     errors (simulated §4.1 case-4 halt apply, ctx timeout, propose
-     gate refusal) propagate to the caller verbatim — the
-     `raftadmin.Server` will then abort the conf-change.
-   - `TestEncryptionPreRegister_IdempotentWhenRowExists`: calling
-     `PreAddMember(raftID)` when a row already exists at
-     `(activeDEK, NodeID16(raftID))` with matching `FullNodeID`
-     skips the propose and returns nil. Pins the §3.1
-     read-before-propose guard against the §4.1 case-3
-     `ErrLocalEpochRollback` regression (claude round-2 BLOCKING on
-     PR #868).
-   - `TestEncryptionPreRegister_Uint16CollisionReturnsTypedError`:
-     a row exists at the same uint16 truncation with a *different*
-     `FullNodeID` (the §6.1 collision case) → the guard returns
-     `ErrEncryptionWriterUint16Collision` without proposing. No
-     case-4 halt-apply is triggered; the conf-change is correctly
-     aborted at the RPC layer.
-3. New `main_encryption_e2e_test.go` test or extension:
-   - `TestEncryption_E2E_ConfChange_NewMemberPreRegistration`: end-
-     to-end test driving the production `AddVoter` handler in a
-     2-node test cluster (with the encryption interceptor wired),
-     then asserting the new node's writer-registry row exists at
-     `(activeDEK, newNode, 0)` immediately after the AddVoter call
-     returns.
-3. Self-review (5-lens) for the implementation PR — particular
-   attention to:
-   - **Concurrency**: the pre-register step uses the same
-     `coordinate` as the conf-change; race between leader flip
-     mid-step → second propose fails not-leader, operator retries
-     against the new leader. Retry idempotency comes from the §3.1
-     **read-before-propose guard** (same pattern as 7a's startup
-     skip-if-already-registered) — NOT from §4.1 case-2, which
-     requires strictly greater `proposed_epoch` and would reject
-     a same-epoch=0 re-propose with case-3 `ErrLocalEpochRollback`.
-   - **Data consistency**: the pre-register's `local_epoch=0` row is
-     §4.1 case-1 first-seen; subsequent 7a propose at the new
-     node's `BumpLocalEpoch(activeDEK)`-advanced epoch (typically
-     `1`) is case-2 monotonic. No brick scenario.
+The implementation landed the planned raftadmin interceptor and
+encryption pre-registration coverage:
+
+- `internal/raftadmin/server_test.go` covers AddVoter interceptor
+  ordering, AddVoter abort-on-error, nil-interceptor fallback, and
+  the symmetric AddLearner contract.
+- `main_encryption_confchange_test.go` covers pre-bootstrap skip,
+  defensive nil wiring, idempotent existing-row handling, uint16
+  collision refusal, active raft-DEK selection for cutover and
+  pre-cutover sidecars, and cutover-time registration proposal using
+  the normal Raft propose path.
+- The concurrency and data-consistency invariants are pinned by the
+  read-before-propose guard: same-row retries return without
+  re-proposing `local_epoch=0`, while a uint16 collision returns
+  `ErrWriterUint16Collision` before any conf-change is attempted.
 
 ## 6. Rollout / migration
 
