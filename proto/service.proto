@@ -247,12 +247,17 @@ message RaftAdminConfigurationChangeResponse {
   uint64 index = 1;
 }
 
-message RaftAdminTransferLeadershipRequest {
-  reserved 3, 4, 5;
-  reserved "gated", "max_lag", "target_candidates";
-
+message TransferTarget {
   string target_id = 1;
   string target_address = 2;
+}
+
+message RaftAdminTransferLeadershipRequest {
+  string target_id = 1;
+  string target_address = 2;
+  bool gated = 3;
+  uint64 max_lag = 4;
+  repeated TransferTarget target_candidates = 5;
 }
 
 message RaftAdminTransferLeadershipResponse {}

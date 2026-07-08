@@ -227,35 +227,31 @@ property: peers respond in non-deterministic order, so picking on
 first arrival would let `Start`/`End` flap between polls for the
 same bucket. If two nodes disagree on `Start`/`End`
 for the same `BucketID`, that indicates a routing-catalog
-divergence the operator should investigate; we surface it as a
-warning in the per-node status payload but do not block the
-response.
+divergence the operator should investigate. Phase 2-C does not ship
+a structured warning field for this case; the aggregator keeps the
+deterministic metadata winner and still serves the merged response.
+Surfacing catalog-divergence warnings in the per-node status payload
+is a future wire extension.
 
 ### 4.5 Time alignment
 
-All nodes use `keyvizStep` (default 1 s). The aggregator **bucket-
-aligns** column timestamps to the nearest `keyvizStep` boundary
-before pivoting, so two nodes whose flush goroutines fire fractions
-of a second apart still land on the same merged column. Without
-the alignment step a 50 ms NTP skew would split each window into
-two adjacent merged columns, halving the displayed traffic in each.
-
-In the rules below, `keyvizStep_ms` denotes the step duration in
-milliseconds — i.e. `time.Duration(--keyvizStep) / time.Millisecond`.
-The wire form already carries timestamps as `column_unix_ms` so
-millisecond-quantum arithmetic falls out naturally.
+All nodes use `keyvizStep` (default 1 s), but the shipped Phase 2-C
+aggregator does not receive `keyvizStep` and does not bucket-align
+peer column timestamps. It merges exact `column_unix_ms` values from
+the local and peer matrices. Two nodes whose flush goroutines fire at
+different millisecond offsets therefore produce adjacent merged
+columns even when they represent the same logical sampling window.
 
 Specifics:
 
-- Both sides round `column_unix_ms[i]` down to the nearest
-  multiple of `keyvizStep_ms` before merging.
+- The aggregator unions exact `column_unix_ms` entries before merging.
 - A column present in node A but absent in node B contributes
   only A's values for that bucket — B's missing column reads as
   zero (the merge-rule identity).
-- Drift larger than `keyvizStep / 2` between nodes is still an
-  operator problem (the heatmap should not paper over NTP issues
-  that big), but routine sub-step jitter no longer causes column
-  fragmentation. (Round-1 review finding on PR #685.)
+- Bucket-aligning timestamps to `keyvizStep` remains a future
+  extension. It will require passing the effective step duration into
+  the fan-out merge path so routine sub-step jitter can be coalesced
+  without hiding larger clock drift.
 
 ## 5. Wire format
 
@@ -337,9 +333,10 @@ Implemented server slice:
   `internal/admin` → handler.
 - `KeyVizRow` JSON fields `conflicts`, `raft_group_ids`, and
   `leader_terms`, each parallel to `values[]`.
-- Fan-out aggregator with the §4 merge rules, degraded peer status,
-  peer timeouts, bounded peer response bodies, cookie forwarding, and
-  recursion guard.
+- Fan-out aggregator with the shipped §4 merge rules, degraded peer
+  status, peer timeouts, bounded peer response bodies, cookie
+  forwarding, and recursion guard. Timestamp bucket alignment and
+  structured catalog-divergence warnings remain future extensions.
 - Table-driven tests for reads, canonical write merge, unknown-term
   fallback, per-cell conflict, partial failure, peer ordering, URL
   forwarding, and response-size guard paths.

@@ -2087,7 +2087,7 @@ func (x *RaftAdminConfigurationChangeResponse) GetIndex() uint64 {
 	return 0
 }
 
-type RaftAdminTransferLeadershipRequest struct {
+type TransferTarget struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TargetId      string                 `protobuf:"bytes,1,opt,name=target_id,json=targetId,proto3" json:"target_id,omitempty"`
 	TargetAddress string                 `protobuf:"bytes,2,opt,name=target_address,json=targetAddress,proto3" json:"target_address,omitempty"`
@@ -2095,9 +2095,64 @@ type RaftAdminTransferLeadershipRequest struct {
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *TransferTarget) Reset() {
+	*x = TransferTarget{}
+	mi := &file_service_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransferTarget) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransferTarget) ProtoMessage() {}
+
+func (x *TransferTarget) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransferTarget.ProtoReflect.Descriptor instead.
+func (*TransferTarget) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *TransferTarget) GetTargetId() string {
+	if x != nil {
+		return x.TargetId
+	}
+	return ""
+}
+
+func (x *TransferTarget) GetTargetAddress() string {
+	if x != nil {
+		return x.TargetAddress
+	}
+	return ""
+}
+
+type RaftAdminTransferLeadershipRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	TargetId         string                 `protobuf:"bytes,1,opt,name=target_id,json=targetId,proto3" json:"target_id,omitempty"`
+	TargetAddress    string                 `protobuf:"bytes,2,opt,name=target_address,json=targetAddress,proto3" json:"target_address,omitempty"`
+	Gated            bool                   `protobuf:"varint,3,opt,name=gated,proto3" json:"gated,omitempty"`
+	MaxLag           uint64                 `protobuf:"varint,4,opt,name=max_lag,json=maxLag,proto3" json:"max_lag,omitempty"`
+	TargetCandidates []*TransferTarget      `protobuf:"bytes,5,rep,name=target_candidates,json=targetCandidates,proto3" json:"target_candidates,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
 func (x *RaftAdminTransferLeadershipRequest) Reset() {
 	*x = RaftAdminTransferLeadershipRequest{}
-	mi := &file_service_proto_msgTypes[37]
+	mi := &file_service_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2109,7 +2164,7 @@ func (x *RaftAdminTransferLeadershipRequest) String() string {
 func (*RaftAdminTransferLeadershipRequest) ProtoMessage() {}
 
 func (x *RaftAdminTransferLeadershipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[37]
+	mi := &file_service_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2122,7 +2177,7 @@ func (x *RaftAdminTransferLeadershipRequest) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use RaftAdminTransferLeadershipRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminTransferLeadershipRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{37}
+	return file_service_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *RaftAdminTransferLeadershipRequest) GetTargetId() string {
@@ -2139,6 +2194,27 @@ func (x *RaftAdminTransferLeadershipRequest) GetTargetAddress() string {
 	return ""
 }
 
+func (x *RaftAdminTransferLeadershipRequest) GetGated() bool {
+	if x != nil {
+		return x.Gated
+	}
+	return false
+}
+
+func (x *RaftAdminTransferLeadershipRequest) GetMaxLag() uint64 {
+	if x != nil {
+		return x.MaxLag
+	}
+	return 0
+}
+
+func (x *RaftAdminTransferLeadershipRequest) GetTargetCandidates() []*TransferTarget {
+	if x != nil {
+		return x.TargetCandidates
+	}
+	return nil
+}
+
 type RaftAdminTransferLeadershipResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2147,7 +2223,7 @@ type RaftAdminTransferLeadershipResponse struct {
 
 func (x *RaftAdminTransferLeadershipResponse) Reset() {
 	*x = RaftAdminTransferLeadershipResponse{}
-	mi := &file_service_proto_msgTypes[38]
+	mi := &file_service_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2159,7 +2235,7 @@ func (x *RaftAdminTransferLeadershipResponse) String() string {
 func (*RaftAdminTransferLeadershipResponse) ProtoMessage() {}
 
 func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[38]
+	mi := &file_service_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2172,7 +2248,7 @@ func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use RaftAdminTransferLeadershipResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminTransferLeadershipResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{38}
+	return file_service_proto_rawDescGZIP(), []int{39}
 }
 
 var File_service_proto protoreflect.FileDescriptor
@@ -2304,10 +2380,16 @@ const file_service_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0eprevious_index\x18\x02 \x01(\x04R\rpreviousIndex\"<\n" +
 	"$RaftAdminConfigurationChangeResponse\x12\x14\n" +
-	"\x05index\x18\x01 \x01(\x04R\x05index\"\x9d\x01\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\"T\n" +
+	"\x0eTransferTarget\x12\x1b\n" +
+	"\ttarget_id\x18\x01 \x01(\tR\btargetId\x12%\n" +
+	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddress\"\xd5\x01\n" +
 	"\"RaftAdminTransferLeadershipRequest\x12\x1b\n" +
 	"\ttarget_id\x18\x01 \x01(\tR\btargetId\x12%\n" +
-	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddressJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05gatedR\amax_lagR\x11target_candidates\"%\n" +
+	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddress\x12\x14\n" +
+	"\x05gated\x18\x03 \x01(\bR\x05gated\x12\x17\n" +
+	"\amax_lag\x18\x04 \x01(\x04R\x06maxLag\x12<\n" +
+	"\x11target_candidates\x18\x05 \x03(\v2\x0f.TransferTargetR\x10targetCandidates\"%\n" +
 	"#RaftAdminTransferLeadershipResponse*\xa9\x01\n" +
 	"\x0eRaftAdminState\x12\x1c\n" +
 	"\x18RAFT_ADMIN_STATE_UNKNOWN\x10\x00\x12\x1d\n" +
@@ -2352,7 +2434,7 @@ func file_service_proto_rawDescGZIP() []byte {
 }
 
 var file_service_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_service_proto_goTypes = []any{
 	(RaftAdminState)(0),                          // 0: RaftAdminState
 	(*RawPutRequest)(nil),                        // 1: RawPutRequest
@@ -2392,8 +2474,9 @@ var file_service_proto_goTypes = []any{
 	(*RaftAdminPromoteLearnerRequest)(nil),       // 35: RaftAdminPromoteLearnerRequest
 	(*RaftAdminRemoveServerRequest)(nil),         // 36: RaftAdminRemoveServerRequest
 	(*RaftAdminConfigurationChangeResponse)(nil), // 37: RaftAdminConfigurationChangeResponse
-	(*RaftAdminTransferLeadershipRequest)(nil),   // 38: RaftAdminTransferLeadershipRequest
-	(*RaftAdminTransferLeadershipResponse)(nil),  // 39: RaftAdminTransferLeadershipResponse
+	(*TransferTarget)(nil),                       // 38: TransferTarget
+	(*RaftAdminTransferLeadershipRequest)(nil),   // 39: RaftAdminTransferLeadershipRequest
+	(*RaftAdminTransferLeadershipResponse)(nil),  // 40: RaftAdminTransferLeadershipResponse
 }
 var file_service_proto_depIdxs = []int32{
 	10, // 0: RawScanAtResponse.kv:type_name -> RawKVPair
@@ -2404,49 +2487,50 @@ var file_service_proto_depIdxs = []int32{
 	18, // 5: CommitResponse.errors:type_name -> KeyError
 	0,  // 6: RaftAdminStatusResponse.state:type_name -> RaftAdminState
 	31, // 7: RaftAdminConfigurationResponse.servers:type_name -> RaftAdminMember
-	1,  // 8: RawKV.RawPut:input_type -> RawPutRequest
-	3,  // 9: RawKV.RawGet:input_type -> RawGetRequest
-	5,  // 10: RawKV.RawDelete:input_type -> RawDeleteRequest
-	7,  // 11: RawKV.RawLatestCommitTS:input_type -> RawLatestCommitTSRequest
-	9,  // 12: RawKV.RawScanAt:input_type -> RawScanAtRequest
-	12, // 13: TransactionalKV.Put:input_type -> PutRequest
-	16, // 14: TransactionalKV.Get:input_type -> GetRequest
-	14, // 15: TransactionalKV.Delete:input_type -> DeleteRequest
-	20, // 16: TransactionalKV.Scan:input_type -> ScanRequest
-	22, // 17: TransactionalKV.PreWrite:input_type -> PreWriteRequest
-	24, // 18: TransactionalKV.Commit:input_type -> CommitRequest
-	26, // 19: TransactionalKV.Rollback:input_type -> RollbackRequest
-	28, // 20: RaftAdmin.Status:input_type -> RaftAdminStatusRequest
-	30, // 21: RaftAdmin.Configuration:input_type -> RaftAdminConfigurationRequest
-	33, // 22: RaftAdmin.AddVoter:input_type -> RaftAdminAddVoterRequest
-	34, // 23: RaftAdmin.AddLearner:input_type -> RaftAdminAddLearnerRequest
-	35, // 24: RaftAdmin.PromoteLearner:input_type -> RaftAdminPromoteLearnerRequest
-	36, // 25: RaftAdmin.RemoveServer:input_type -> RaftAdminRemoveServerRequest
-	38, // 26: RaftAdmin.TransferLeadership:input_type -> RaftAdminTransferLeadershipRequest
-	2,  // 27: RawKV.RawPut:output_type -> RawPutResponse
-	4,  // 28: RawKV.RawGet:output_type -> RawGetResponse
-	6,  // 29: RawKV.RawDelete:output_type -> RawDeleteResponse
-	8,  // 30: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
-	11, // 31: RawKV.RawScanAt:output_type -> RawScanAtResponse
-	13, // 32: TransactionalKV.Put:output_type -> PutResponse
-	17, // 33: TransactionalKV.Get:output_type -> GetResponse
-	15, // 34: TransactionalKV.Delete:output_type -> DeleteResponse
-	21, // 35: TransactionalKV.Scan:output_type -> ScanResponse
-	23, // 36: TransactionalKV.PreWrite:output_type -> PreCommitResponse
-	25, // 37: TransactionalKV.Commit:output_type -> CommitResponse
-	27, // 38: TransactionalKV.Rollback:output_type -> RollbackResponse
-	29, // 39: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
-	32, // 40: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
-	37, // 41: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 42: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 43: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 44: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
-	39, // 45: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
-	27, // [27:46] is the sub-list for method output_type
-	8,  // [8:27] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	38, // 8: RaftAdminTransferLeadershipRequest.target_candidates:type_name -> TransferTarget
+	1,  // 9: RawKV.RawPut:input_type -> RawPutRequest
+	3,  // 10: RawKV.RawGet:input_type -> RawGetRequest
+	5,  // 11: RawKV.RawDelete:input_type -> RawDeleteRequest
+	7,  // 12: RawKV.RawLatestCommitTS:input_type -> RawLatestCommitTSRequest
+	9,  // 13: RawKV.RawScanAt:input_type -> RawScanAtRequest
+	12, // 14: TransactionalKV.Put:input_type -> PutRequest
+	16, // 15: TransactionalKV.Get:input_type -> GetRequest
+	14, // 16: TransactionalKV.Delete:input_type -> DeleteRequest
+	20, // 17: TransactionalKV.Scan:input_type -> ScanRequest
+	22, // 18: TransactionalKV.PreWrite:input_type -> PreWriteRequest
+	24, // 19: TransactionalKV.Commit:input_type -> CommitRequest
+	26, // 20: TransactionalKV.Rollback:input_type -> RollbackRequest
+	28, // 21: RaftAdmin.Status:input_type -> RaftAdminStatusRequest
+	30, // 22: RaftAdmin.Configuration:input_type -> RaftAdminConfigurationRequest
+	33, // 23: RaftAdmin.AddVoter:input_type -> RaftAdminAddVoterRequest
+	34, // 24: RaftAdmin.AddLearner:input_type -> RaftAdminAddLearnerRequest
+	35, // 25: RaftAdmin.PromoteLearner:input_type -> RaftAdminPromoteLearnerRequest
+	36, // 26: RaftAdmin.RemoveServer:input_type -> RaftAdminRemoveServerRequest
+	39, // 27: RaftAdmin.TransferLeadership:input_type -> RaftAdminTransferLeadershipRequest
+	2,  // 28: RawKV.RawPut:output_type -> RawPutResponse
+	4,  // 29: RawKV.RawGet:output_type -> RawGetResponse
+	6,  // 30: RawKV.RawDelete:output_type -> RawDeleteResponse
+	8,  // 31: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
+	11, // 32: RawKV.RawScanAt:output_type -> RawScanAtResponse
+	13, // 33: TransactionalKV.Put:output_type -> PutResponse
+	17, // 34: TransactionalKV.Get:output_type -> GetResponse
+	15, // 35: TransactionalKV.Delete:output_type -> DeleteResponse
+	21, // 36: TransactionalKV.Scan:output_type -> ScanResponse
+	23, // 37: TransactionalKV.PreWrite:output_type -> PreCommitResponse
+	25, // 38: TransactionalKV.Commit:output_type -> CommitResponse
+	27, // 39: TransactionalKV.Rollback:output_type -> RollbackResponse
+	29, // 40: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
+	32, // 41: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
+	37, // 42: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 43: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 44: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 45: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
+	40, // 46: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
+	28, // [28:47] is the sub-list for method output_type
+	9,  // [9:28] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_service_proto_init() }
@@ -2460,7 +2544,7 @@ func file_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_service_proto_rawDesc), len(file_service_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   39,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   3,
 		},
