@@ -88,6 +88,8 @@ func TestSQSServer_ChargeQueueWithThrottleObservesMetrics(t *testing.T) {
 	t.Parallel()
 	observer := &recordingSQSThrottleObserver{}
 	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	srv.throttle = newBucketStore(func() time.Time { return now }, throttleIdleEvictAfter)
 	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
 
 	for range 10 {
