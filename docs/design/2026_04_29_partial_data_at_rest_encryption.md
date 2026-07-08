@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–5 shipped (5E deferred); Stage 6 partially shipped; Stages 7–9 open
+Status: Partial — Stages 0–6 shipped (5E deferred); Stage 7 writer-registration gate shipped; Stages 8–9 open
 Author: bootjp
 Date: 2026-04-29
 
@@ -30,7 +30,7 @@ Date: 2026-04-29
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + production storage-envelope write-path wiring | shipped | `2026_05_18_implemented_6d_enable_storage_envelope.md` + `2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md` |
 | 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself). Depends on 6B for mutator wiring AND 6C-1/6C-2 for §9.1 startup-refusal guards; bundles 6C-4 for the Phase-2-specific guards. | open | — |
 | 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
-| 7 | Writer registry + deterministic nonce (§4.1) | open | — |
+| 7 | Writer registry + deterministic nonce (§4.1) | shipped | `2026_05_26_proposed_7a_process_start_registration.md` + `2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md` + `2026_05_28_implemented_7b_runtime_reregistration.md` + `2026_05_28_proposed_7b_prime_runtime_reregistration_rotation.md` + `2026_05_29_proposed_7c_confchange_time_registration.md` |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
 | 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
 

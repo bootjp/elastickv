@@ -62,8 +62,8 @@ not yet have, plus the wiring:
 3. **A production deterministic `NonceFactory`** pinned to the bumped
    `local_epoch`, living in a non-test file.
 
-This doc pins the as-implemented design for all four pieces and draws
-the scope boundary against the remaining Stage 7 work.
+This doc pins the as-implemented design for all four pieces and records
+the Stage 7 work that later closed the original multi-node-churn gap.
 
 ## 1. Scope
 
@@ -90,7 +90,7 @@ the scope boundary against the remaining Stage 7 work.
   `WithStorageEnvelopeGate` (reading `cache.ActiveStorageKeyID` /
   `cache.StorageEnvelopeActive`) into every shard's `PebbleStore`.
 
-### Out of scope for 6D-6c-2 (implemented later by Stage 7)
+### Stage 7 deferral now closed
 
 - **Registration-before-first-write coordinator gate** (§5.2
   process-start path, §4.1 ConfChange-time path). A node bumping its
@@ -102,10 +102,11 @@ the scope boundary against the remaining Stage 7 work.
   existing startup membership pre-check (`ErrNodeIDCollision`) and the
   registry-apply-time collision check shipped in 6A; the
   propose-before-write *gate* (block the coordinator's first encrypted
-  write until registration commits) is implemented by
-  [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md),
-  [`2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md`](2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md),
-  and [`2026_05_29_implemented_7c_confchange_time_registration.md`](2026_05_29_implemented_7c_confchange_time_registration.md).
+  write until registration commits) is implemented by the existing
+  Stage 7 docs:
+  [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md),
+  [`2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md`](2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md),
+  and [`2026_05_29_proposed_7c_confchange_time_registration.md`](2026_05_29_proposed_7c_confchange_time_registration.md).
 - KMS providers, compression, DEK retirement/rewrite (Stages 9).
 - The capability fan-out closure + multi-node e2e — that is 6D-6c-3.
 
@@ -119,9 +120,9 @@ today. The single-node e2e (6D-6c-3) exercises the full
 Bootstrap → cutover → Put → read-back loop on one process load where
 the registration gate is moot (the node is the only writer and is
 registered by the §5.6 bootstrap batch). Multi-node deployments that
-add a writer after bootstrap are protected by the startup guards until
-Stage 7 lands the propose-before-write gate; this doc does **not**
-claim multi-node-churn nonce safety beyond those guards.
+add a writer after bootstrap are now covered by the Stage 7
+registration-before-first-write gate in addition to the startup guards;
+this is why the former 6D-6c-2 partial-status caveat is closed.
 
 ## 2. Startup ordering
 
