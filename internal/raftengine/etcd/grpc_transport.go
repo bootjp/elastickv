@@ -15,6 +15,7 @@ import (
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 const defaultSnapshotChunkSize = 16 << 20
@@ -236,7 +237,7 @@ func (t *GRPCTransport) Dispatch(ctx context.Context, msg raftpb.Message) error 
 }
 
 func isSnapshotMsg(msg raftpb.Message) bool {
-	return msg.Type == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0)
+	return msg.GetType() == raftpb.MsgSnap || (msg.Snapshot != nil && len(msg.Snapshot.Data) > 0)
 }
 
 func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message) error {
@@ -283,7 +284,7 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	if err != nil {
 		return err
 	}
-	client, err := t.clientFor(msg.To)
+	client, err := t.clientFor(msg.GetTo())
 	if err != nil {
 		return err
 	}
@@ -303,7 +304,7 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	}
 	slog.Info("etcd raft snapshot stream sent",
 		"index", index,
-		"to", msg.To,
+		"to", msg.GetTo(),
 		"payload_bytes", counter.n,
 	)
 	return nil
@@ -372,11 +373,11 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	ctx, cancel := transportContext(ctx, defaultDispatchTimeout)
 	defer cancel()
 
-	raw, err := msg.Marshal()
+	raw, err := proto.Marshal(&msg)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	client, err := t.clientFor(msg.To)
+	client, err := t.clientFor(msg.GetTo())
 	if err != nil {
 		return err
 	}
@@ -458,7 +459,7 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 		return &pb.EtcdRaftAck{}, nil
 	}
 	var msg raftpb.Message
-	if err := msg.Unmarshal(req.Message); err != nil {
+	if err := proto.Unmarshal(req.Message, &msg); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if err := t.handle(ctx, msg); err != nil {
@@ -468,7 +469,7 @@ func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.
 }
 
 func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) error {
-	client, err := t.clientFor(msg.To)
+	client, err := t.clientFor(msg.GetTo())
 	if err != nil {
 		return err
 	}
@@ -491,7 +492,7 @@ func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) er
 }
 
 func (t *GRPCTransport) sendSnapshotSpool(ctx context.Context, msg raftpb.Message, spool *snapshotSpool) error {
-	client, err := t.clientFor(msg.To)
+	client, err := t.clientFor(msg.GetTo())
 	if err != nil {
 		return err
 	}
@@ -588,7 +589,7 @@ func snapshotMessageHeader(msg raftpb.Message) ([]byte, error) {
 	snapshotCopy := *msg.Snapshot
 	metadata.Snapshot = &snapshotCopy
 	metadata.Snapshot.Data = nil
-	header, err := metadata.Marshal()
+	header, err := proto.Marshal(&metadata)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -819,11 +820,11 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	}
 	index := uint64(0)
 	if msg.Snapshot != nil {
-		index = msg.Snapshot.Metadata.Index
+		index = msg.Snapshot.GetMetadata().GetIndex()
 	}
 	slog.Info("etcd raft snapshot stream received",
 		"index", index,
-		"from", msg.From,
+		"from", msg.GetFrom(),
 		"payload_bytes", payloadBytes,
 		"format", snapshotDataFormatLabel(msg.Snapshot),
 	)
@@ -978,7 +979,7 @@ func finalizeReceivedSnapshot(
 	if !seenMetadata || metadata.Snapshot == nil {
 		return raftpb.Message{}, errors.WithStack(errSnapshotMetadataNil)
 	}
-	index := metadata.Snapshot.Metadata.Index
+	index := metadata.Snapshot.GetMetadata().GetIndex()
 	if fsmSnapDir == "" || index == 0 {
 		// Legacy fallback: full materialization. Used by tests that don't wire an
 		// fsmSnapDir and by the index=0 edge case (no canonical filename to
@@ -1011,7 +1012,7 @@ func maybePrepareReceivedFSMSnapshotWrite(
 	if fsmSnapDir == "" || !seenMetadata || metadata.Snapshot == nil {
 		return false
 	}
-	index := metadata.Snapshot.Metadata.Index
+	index := metadata.Snapshot.GetMetadata().GetIndex()
 	if index == 0 {
 		return false
 	}
@@ -1053,7 +1054,7 @@ func appendSnapshotChunkMetadata(metadata *raftpb.Message, chunk *pb.EtcdRaftSna
 		if seenMetadata {
 			return false, errors.WithStack(errSnapshotMetadataDuplicate)
 		}
-		if err := metadata.Unmarshal(chunk.Metadata); err != nil {
+		if err := proto.Unmarshal(chunk.Metadata, metadata); err != nil {
 			return false, errors.WithStack(err)
 		}
 		seenMetadata = true

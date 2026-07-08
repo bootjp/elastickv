@@ -101,7 +101,7 @@ func seedMigrationDir(tempDir string, peers []Peer, snapshotData []byte) error {
 	// common case during migration, where --raftBootstrapMembers is not
 	// repeated).  Without this file the engine falls back to a single-node
 	// configuration and every node elects itself leader independently.
-	if err := savePersistedPeers(tempDir, state.Snapshot.Metadata.Index, peers); err != nil {
+	if err := savePersistedPeers(tempDir, state.Snapshot.GetMetadata().GetIndex(), peers); err != nil {
 		return err
 	}
 	return nil

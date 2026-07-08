@@ -18,6 +18,7 @@ import (
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
@@ -45,13 +46,10 @@ func TestTransportContextPreservesExistingDeadline(t *testing.T) {
 
 func TestSplitSnapshotMessageReusesClonedPayload(t *testing.T) {
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
+		Type: messageTypePtr(raftpb.MsgSnap),
 		Snapshot: &raftpb.Snapshot{
-			Data: []byte("snapshot"),
-			Metadata: raftpb.SnapshotMetadata{
-				Index: 9,
-				Term:  3,
-			},
+			Data:     []byte("snapshot"),
+			Metadata: testSnapshotMetadata(9, 3, nil),
 		},
 	}
 
@@ -79,16 +77,13 @@ func TestNewSnapshotSpoolUsesConfiguredDir(t *testing.T) {
 
 func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				Index: 7,
-				Term:  3,
-			},
+			Metadata: testSnapshotMetadata(7, 3, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	transport := NewGRPCTransport(nil)
@@ -106,16 +101,13 @@ func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
 
 func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				Index: 7,
-				Term:  3,
-			},
+			Metadata: testSnapshotMetadata(7, 3, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	transport := NewGRPCTransport(nil)
@@ -163,14 +155,14 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	payload := buf.Bytes()
 
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: term},
+			Metadata: testSnapshotMetadata(index, term, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	spoolDir := t.TempDir()
@@ -217,7 +209,7 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	// materializing the payload as []byte. Verify the receiver FSM ends up
 	// with exactly the entries the sender serialized.
 	receiverFSM := &testStateMachine{}
-	_, restoreErr := restoreSnapshotState(receiverFSM, *msg.Snapshot, msg.Snapshot.Metadata.Index, fsmSnapDir, nil, nil)
+	_, restoreErr := restoreSnapshotState(receiverFSM, *msg.Snapshot, msg.Snapshot.GetMetadata().GetIndex(), fsmSnapDir, nil, nil)
 	require.NoError(t, restoreErr)
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
@@ -226,14 +218,14 @@ func TestReceiveSnapshotStreamPreparesBeforeSpoolCreation(t *testing.T) {
 	const index = uint64(124)
 	payload := []byte("payload written after cleanup")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -278,14 +270,14 @@ func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
 	require.NoError(t, snap.Close())
 
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -324,14 +316,14 @@ func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
 	const index = uint64(125)
 	payload := []byte("payload protected before final rename")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -367,14 +359,14 @@ func TestDrainSnapshotChunksRejectsStaleFSMProtection(t *testing.T) {
 	const index = uint64(127)
 	payload := []byte("stale payload must not be published")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -416,14 +408,14 @@ func TestDrainSnapshotChunksUnprotectsWhenFinalizeFails(t *testing.T) {
 	const index = uint64(126)
 	payload := []byte("payload whose final rename fails")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	spool, err := newSnapshotSpool(t.TempDir())
@@ -469,14 +461,14 @@ func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 	const index = uint64(124)
 	payload := []byte("payload written after prepare")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -553,14 +545,14 @@ func TestDrainSnapshotChunksRejectsPayloadBeforeMetadata(t *testing.T) {
 func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
 	const index = uint64(55)
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	// Distinct directories — different absolute paths so we can prove the
@@ -629,14 +621,14 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 	payload := buf.Bytes()
 
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+			Metadata: testSnapshotMetadata(index, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	fsmSnapDir := t.TempDir()
@@ -690,14 +682,14 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 func TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir(t *testing.T) {
 	payload := []byte("legacy-inline-payload")
 	metadata := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		From: 1,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: 42, Term: 1},
+			Metadata: testSnapshotMetadata(42, 1, nil),
 		},
 	}
-	raw, err := metadata.Marshal()
+	raw, err := proto.Marshal(&metadata)
 	require.NoError(t, err)
 
 	transport := NewGRPCTransport(nil)
@@ -857,14 +849,14 @@ func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
 	msg := raftpb.Message{
 		Snapshot: &raftpb.Snapshot{
 			Data:     token,
-			Metadata: raftpb.SnapshotMetadata{Index: 42},
+			Metadata: testSnapshotMetadata(42, 0, nil),
 		},
 	}
 	patched, err := transport.applyBridgeMode(context.Background(), msg)
 	require.NoError(t, err)
 	require.Equal(t, payload, patched.Snapshot.Data)
 	// Metadata must be preserved.
-	require.Equal(t, uint64(42), patched.Snapshot.Metadata.Index)
+	require.Equal(t, uint64(42), patched.Snapshot.GetMetadata().GetIndex())
 }
 
 func TestApplyBridgeModeReaderError(t *testing.T) {
@@ -1122,10 +1114,10 @@ func TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM(t *testing.T) {
 		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
 	}
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap, From: 1, To: 2,
+		Type: messageTypePtr(raftpb.MsgSnap), From: uint64Ptr(1), To: uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
 			Data:     encodeSnapshotToken(77, crc),
-			Metadata: raftpb.SnapshotMetadata{Index: 77, Term: 5},
+			Metadata: testSnapshotMetadata(77, 5, nil),
 		},
 	}
 	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 77, openFn))
@@ -1175,10 +1167,10 @@ func TestStreamFSMSnapshotOverGRPCAtChunkBoundary(t *testing.T) {
 		return openFSMSnapshotPayloadReader(fsmSnapPath(dir, index))
 	}
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap, From: 1, To: 2,
+		Type: messageTypePtr(raftpb.MsgSnap), From: uint64Ptr(1), To: uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
 			Data:     encodeSnapshotToken(91, crc),
-			Metadata: raftpb.SnapshotMetadata{Index: 91, Term: 5},
+			Metadata: testSnapshotMetadata(91, 5, nil),
 		},
 	}
 	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 91, openFn))
@@ -1205,11 +1197,11 @@ func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
 	}
 
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   3,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(3),
 		Snapshot: &raftpb.Snapshot{
 			Data:     encodeSnapshotToken(55, crc),
-			Metadata: raftpb.SnapshotMetadata{Index: 55, Term: 2},
+			Metadata: testSnapshotMetadata(55, 2, nil),
 		},
 	}
 
@@ -1245,10 +1237,10 @@ func TestStreamFSMSnapshotFileNotFound(t *testing.T) {
 	}
 
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   4,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(4),
 		Snapshot: &raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{Index: 999, Term: 1},
+			Metadata: testSnapshotMetadata(999, 1, nil),
 		},
 	}
 
@@ -1274,11 +1266,11 @@ func TestDispatchSnapshotTokenRoutesToStream(t *testing.T) {
 	})
 
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
 			Data:     encodeSnapshotToken(42, crc),
-			Metadata: raftpb.SnapshotMetadata{Index: 42, Term: 1},
+			Metadata: testSnapshotMetadata(42, 1, nil),
 		},
 	}
 
@@ -1303,11 +1295,11 @@ func TestDispatchSnapshotNonTokenRoutesToBridge(t *testing.T) {
 	injectClient(t, transport, "fake:1", &testEtcdRaftClient{stream: sendClient})
 
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
 			Data:     legacy,
-			Metadata: raftpb.SnapshotMetadata{Index: 1, Term: 1},
+			Metadata: testSnapshotMetadata(1, 1, nil),
 		},
 	}
 
@@ -1337,11 +1329,11 @@ func TestDispatchSnapshotTokenNoOpenerFallsBackToBridge(t *testing.T) {
 	// No SetFSMPayloadOpener / SetFSMPayloadReader → passthrough bridge.
 
 	msg := raftpb.Message{
-		Type: raftpb.MsgSnap,
-		To:   2,
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(2),
 		Snapshot: &raftpb.Snapshot{
 			Data:     token,
-			Metadata: raftpb.SnapshotMetadata{Index: 77, Term: 1},
+			Metadata: testSnapshotMetadata(77, 1, nil),
 		},
 	}
 
