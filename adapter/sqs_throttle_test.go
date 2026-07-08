@@ -18,8 +18,14 @@ type throttleObserveReport struct {
 	throttled       bool
 }
 
+type throttleForgetReport struct {
+	queue  string
+	action string
+}
+
 type recordingSQSThrottleObserver struct {
-	reports []throttleObserveReport
+	reports   []throttleObserveReport
+	forgotten []throttleForgetReport
 }
 
 func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
@@ -29,6 +35,10 @@ func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, act
 		tokensRemaining: tokensRemaining,
 		throttled:       throttled,
 	})
+}
+
+func (r *recordingSQSThrottleObserver) ForgetThrottleAction(queue string, action string) {
+	r.forgotten = append(r.forgotten, throttleForgetReport{queue: queue, action: action})
 }
 
 // TestBucketStore_DefaultOff_ShortCircuit pins the contract that a
@@ -66,6 +76,27 @@ func TestSQSServer_ChargeQueueWithThrottleObservesMetrics(t *testing.T) {
 	require.Equal(t, "send", last.action)
 	require.True(t, last.throttled)
 	require.InDelta(t, 0.0, last.tokensRemaining, 0.001)
+}
+
+func TestSQSServer_ChargeQueueWithThrottleForgetsDisabledMetrics(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+
+	rec := httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionReceive})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionDefault})
+
+	observer.forgotten = nil
+	rec = httptest.NewRecorder()
+	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, nil, 1))
+	require.ElementsMatch(t, []throttleForgetReport{
+		{queue: "orders.fifo", action: SQSThrottleActionSend},
+		{queue: "orders.fifo", action: SQSThrottleActionReceive},
+		{queue: "orders.fifo", action: SQSThrottleActionDefault},
+	}, observer.forgotten)
 }
 
 // TestBucketStore_Empty_ShortCircuit covers the post-validator

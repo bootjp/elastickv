@@ -9,8 +9,47 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
+
+func gatheredThrottleTokenValue(t *testing.T, reg *prometheus.Registry, labels map[string]string) (float64, bool) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "elastickv_sqs_throttle_tokens_remaining" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			if !metricLabelsMatch(metric.GetLabel(), labels) {
+				continue
+			}
+			switch {
+			case metric.GetGauge() != nil:
+				return metric.GetGauge().GetValue(), true
+			case metric.GetCounter() != nil:
+				return metric.GetCounter().GetValue(), true
+			default:
+				return 0, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func metricLabelsMatch(labels []*dto.LabelPair, want map[string]string) bool {
+	if len(labels) != len(want) {
+		return false
+	}
+	for _, label := range labels {
+		got, ok := want[label.GetName()]
+		if !ok || got != label.GetValue() {
+			return false
+		}
+	}
+	return true
+}
 
 // TestSQSMetrics_ObservePartitionMessage_IncrementsByLabelTriple
 // pins the basic counter contract: each (queue, partition,
@@ -185,10 +224,52 @@ func TestSQSMetrics_ObserveThrottleDecision_AllowedDoesNotConsumeCounterBudget(t
 	require.Empty(t, m.trackedCounterQueues, "allowed-only throttle decisions must not consume counter label budget")
 
 	m.ObserveThrottleDecision("blocked.fifo", SQSThrottleActionSend, 0, true)
+	require.Empty(t, m.trackedCounterQueues, "throttle rejects must not consume the partition counter label budget")
+	require.Len(t, m.trackedThrottleCounterQueues, 1, "throttle rejects consume the throttle counter label budget")
 	require.InDelta(t, 1.0,
 		testutil.ToFloat64(m.throttledRequests.WithLabelValues("blocked.fifo", SQSThrottleActionSend)),
 		0.001,
 		"first actual reject must keep its real queue label instead of overflowing after allowed-only decisions")
+}
+
+func TestSQSMetrics_ThrottleCounterBudgetIsIndependent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("throttle rejects do not hide later partition counters", func(t *testing.T) {
+		t.Parallel()
+		reg := prometheus.NewRegistry()
+		m := newSQSMetrics(reg)
+
+		for i := 0; i < sqsMaxTrackedQueues; i++ {
+			m.ObserveThrottleDecision("throttle-"+strconv.Itoa(i)+".fifo", SQSThrottleActionSend, 0, true)
+		}
+		require.Len(t, m.trackedThrottleCounterQueues, sqsMaxTrackedQueues)
+		require.Empty(t, m.trackedCounterQueues)
+
+		m.ObservePartitionMessage("partition.fifo", 0, SQSPartitionActionSend)
+		require.InDelta(t, 1.0,
+			testutil.ToFloat64(m.partitionMessages.WithLabelValues("partition.fifo", "0", SQSPartitionActionSend)),
+			0.001,
+			"partition counter must still get a real queue label after throttle counter budget fills")
+	})
+
+	t.Run("partition counters do not hide later throttle rejects", func(t *testing.T) {
+		t.Parallel()
+		reg := prometheus.NewRegistry()
+		m := newSQSMetrics(reg)
+
+		for i := 0; i < sqsMaxTrackedQueues; i++ {
+			m.ObservePartitionMessage("partition-"+strconv.Itoa(i)+".fifo", 0, SQSPartitionActionSend)
+		}
+		require.Len(t, m.trackedCounterQueues, sqsMaxTrackedQueues)
+		require.Empty(t, m.trackedThrottleCounterQueues)
+
+		m.ObserveThrottleDecision("blocked.fifo", SQSThrottleActionSend, 0, true)
+		require.InDelta(t, 1.0,
+			testutil.ToFloat64(m.throttledRequests.WithLabelValues("blocked.fifo", SQSThrottleActionSend)),
+			0.001,
+			"throttle counter must still get a real queue label after partition counter budget fills")
+	})
 }
 
 func TestSQSMetrics_ObserveThrottleDecision_DropsInvalidLabels(t *testing.T) {
@@ -205,6 +286,83 @@ func TestSQSMetrics_ObserveThrottleDecision_DropsInvalidLabels(t *testing.T) {
 	gaugeCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
 	require.NoError(t, err)
 	require.Equal(t, 0, gaugeCount)
+}
+
+func TestSQSMetrics_ForgetThrottleAction_DropsGaugeAndFreesSlot(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 5, false)
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionReceive, 7, false)
+	require.Len(t, m.trackedThrottleGaugeQueues, 1)
+
+	m.ForgetThrottleAction("orders.fifo", SQSThrottleActionSend)
+	_, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionSend,
+	})
+	require.False(t, found, "disabled send bucket must drop the stale token gauge")
+	remaining, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  "orders.fifo",
+		"action": SQSThrottleActionReceive,
+	})
+	require.True(t, found, "other configured actions for the same queue must survive")
+	require.InDelta(t, 7.0, remaining, 0.001)
+	require.Len(t, m.trackedThrottleGaugeQueues, 1, "queue stays admitted while another action remains")
+
+	m.ForgetThrottleAction("orders.fifo", SQSThrottleActionReceive)
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count)
+	require.Empty(t, m.trackedThrottleGaugeQueues, "last disabled action frees the throttle gauge queue slot")
+}
+
+func TestSQSMetrics_ForgetQueue_OverflowThrottleGaugeClearsPerAction(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveThrottleDecision("real-"+strconv.Itoa(i)+".fifo", SQSThrottleActionSend, 1, false)
+	}
+	require.Len(t, m.trackedThrottleGaugeQueues, sqsMaxTrackedQueues)
+
+	m.ObserveThrottleDecision("overflow-a.fifo", SQSThrottleActionSend, 10, false)
+	m.ObserveThrottleDecision("overflow-b.fifo", SQSThrottleActionReceive, 20, false)
+
+	send, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionSend,
+	})
+	require.True(t, found)
+	require.InDelta(t, 10.0, send, 0.001)
+	receive, found := gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionReceive,
+	})
+	require.True(t, found)
+	require.InDelta(t, 20.0, receive, 0.001)
+
+	m.ForgetQueue("overflow-a.fifo")
+	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionSend,
+	})
+	require.False(t, found, "last overflow send queue disappearing must drop only _other/send")
+	receive, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionReceive,
+	})
+	require.True(t, found, "_other/receive must survive while another overflow receive queue remains")
+	require.InDelta(t, 20.0, receive, 0.001)
+
+	m.ForgetQueue("overflow-b.fifo")
+	_, found = gatheredThrottleTokenValue(t, reg, map[string]string{
+		"queue":  sqsQueueOverflow,
+		"action": SQSThrottleActionReceive,
+	})
+	require.False(t, found, "last overflow receive queue disappearing must drop _other/receive")
 }
 
 // TestSQSMetrics_ObserveQueueDepth_EmitsThreeStates pins that one

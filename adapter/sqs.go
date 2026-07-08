@@ -228,19 +228,29 @@ type SQSPartitionObserver interface {
 // does not import monitoring at the package boundary.
 type SQSThrottleObserver interface {
 	ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool)
+	ForgetThrottleAction(queue string, action string)
 }
 
-// SQSPartitionAction* mirror the action label values from
-// monitoring.SQSPartitionAction*. Re-declared so adapter call
-// sites do not need a monitoring import; the observer interface
-// validates the value at runtime so a drift between these
-// constants and the monitoring side surfaces as a dropped
-// observation rather than a wedge.
+// SQS metric action labels mirror the values from monitoring/sqs.go.
+// Re-declared so adapter call sites do not need a monitoring import; the
+// observer interface validates the value at runtime so a drift between these
+// constants and the monitoring side surfaces as a dropped observation rather
+// than a wedge.
 const (
 	SQSPartitionActionSend    = "send"
 	SQSPartitionActionReceive = "receive"
 	SQSPartitionActionDelete  = "delete"
+
+	SQSThrottleActionSend    = "send"
+	SQSThrottleActionReceive = "receive"
+	SQSThrottleActionDefault = "default"
 )
+
+var sqsThrottleMetricActions = [...]string{
+	SQSThrottleActionSend,
+	SQSThrottleActionReceive,
+	SQSThrottleActionDefault,
+}
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
 // forward requests from followers to the current leader. Format mirrors
@@ -284,9 +294,12 @@ func (s *SQSServer) observePartitionMessage(queue string, partition uint32, acti
 	s.partitionObserver.ObservePartitionMessage(queue, partition, action)
 }
 
-func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome) {
+func (s *SQSServer) observeThrottleDecision(queue string, throttle *sqsQueueThrottle, outcome chargeOutcome) {
 	if s == nil || s.throttleObserver == nil {
 		return
+	}
+	for _, action := range disabledThrottleMetricActions(throttle) {
+		s.throttleObserver.ForgetThrottleAction(queue, action)
 	}
 	if !outcome.bucketPresent && outcome.allowed {
 		return
@@ -297,6 +310,23 @@ func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome)
 		outcome.tokensAfter,
 		!outcome.allowed,
 	)
+}
+
+func disabledThrottleMetricActions(throttle *sqsQueueThrottle) []string {
+	disabled := make([]string, 0, len(sqsThrottleMetricActions))
+	if throttle == nil || throttle.IsEmpty() {
+		return append(disabled, sqsThrottleMetricActions[:]...)
+	}
+	if throttle.SendCapacity == 0 {
+		disabled = append(disabled, SQSThrottleActionSend)
+	}
+	if throttle.RecvCapacity == 0 {
+		disabled = append(disabled, SQSThrottleActionReceive)
+	}
+	if throttle.DefaultCapacity == 0 {
+		disabled = append(disabled, SQSThrottleActionDefault)
+	}
+	return disabled
 }
 
 // WithSQSPartitionResolver installs the cluster's partition

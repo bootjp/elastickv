@@ -73,7 +73,7 @@ The check sits **between SigV4 authorisation and the existing handler dispatch**
 A `bucketStore` instance hangs off `*SQSServer`. Internally:
 
 ```go
-// adapter/sqs_throttle.go (new in implementation PR)
+// adapter/sqs_throttle.go
 type bucketStore struct {
     // sync.Map rather than a single mu+map so the hot SendMessage /
     // ReceiveMessage path does not contend on a process-wide lock.
@@ -213,12 +213,13 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 
 | File | Change |
 |---|---|
-| `adapter/sqs_throttle.go` (new) | `bucketStore`, `tokenBucket`, charging helper. ~250 lines. |
+| `adapter/sqs_throttle.go` | `bucketStore`, `tokenBucket`, charging helper. |
 | `adapter/sqs_catalog.go` | Add `Throttle` field to `sqsQueueMeta`. Extend `applyAttributes` with the new `Throttle*` attribute names. Render the four Throttle fields in `queueMetaToAttributes` so `GetQueueAttributes("All")` surfaces them. |
 | `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. Also forwards each configured bucket decision to the SQS throttle metrics observer. |
-| `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
-| `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
+| `adapter/sqs_throttle_test.go` | Unit tests for bucket math, observer emission, disabled-bucket metric cleanup, idle drift, burst, partial refill, batch over-charge, and default-off. |
+| `adapter/sqs_throttle_integration_test.go` | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. |
 | `monitoring/sqs.go`, `monitoring/registry.go` | Register the `elastickv_sqs_throttled_requests_total{queue, action}` counter and `elastickv_sqs_throttle_tokens_remaining{queue, action}` gauge. Queue-label cardinality uses the same capped `_other` fallback as the existing SQS metrics. |
+| `monitoring/sqs_test.go` | Pins public registration of both throttle metrics, independent queue-label budgets for throttle counters vs partition counters, short-lived queue cleanup, disabled action cleanup, and action-aware `_other` gauge cleanup. |
 | `docs/design/2026_04_24_proposed_sqs_compatible_adapter.md` §14 | Phase 3 per-queue throttling item marked landed with a link to this design. |
 
 ### 4.2 OCC interaction
@@ -325,9 +326,9 @@ Every `charge` proposes a bucket update through the FSM. **Rejected**: an extra 
 
 | Phase | Content |
 |---|---|
-| 1 | Doc lands (this PR). No code yet. Operators have time to comment. |
-| 2 | Implementation PR per §4.1. Default-off; existing queues unaffected. |
-| 3 | Operators opt in per queue via `SetQueueAttributes`. Watch caller-visible `Throttling` responses for false positives. |
+| 1 | Default-off implementation and lifecycle documentation have landed; existing queues remain unthrottled until configured. |
+| 2 | Operators opt in per queue via `SetQueueAttributes`. Watch caller-visible `Throttling` responses and `Retry-After` for false positives. |
+| 3 | Prometheus exports `elastickv_sqs_throttled_requests_total{queue, action}` and `elastickv_sqs_throttle_tokens_remaining{queue, action}` with bounded queue-label cardinality. |
 | 4 | Parent SQS adapter roadmap marks Phase 3.C as landed with a link to this design. |
 
 ---
