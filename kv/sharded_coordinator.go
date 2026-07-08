@@ -683,7 +683,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 
 // dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
 // (design doc
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M4).  Pins reqs.ObservedRouteVersion to the engine's current
 // catalog version on the FIRST attempt when the caller left it at the
 // zero sentinel — every txn that flows through ShardedCoordinator
