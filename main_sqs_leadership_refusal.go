@@ -34,12 +34,16 @@ type sqsLeadershipController interface {
 // accept SendMessage writes under the legacy keyspace, hiding
 // them from the partition-aware fanout reader. The CreateQueue
 // validateHTFIFOCapability gate prevents NEW partitioned queues from
-// being created unless every required peer advertises htfifo and the
-// partition routing map is complete, but it does nothing for queues
-// created BEFORE a rollback. The leadership-refusal hook closes that
-// gap by stepping the affected node down via TransferLeadership; the
-// cluster picks a peer that still advertises htfifo, and the
-// partitioned queue stays correct.
+// being created unless every required peer advertises htfifo and, in
+// map-backed deployments, the partition routing map is complete. That
+// gate does nothing for queues created BEFORE a rollback. For groups
+// named by --sqsFifoPartitionMap, the leadership-refusal hook closes
+// that gap by stepping the affected node down via TransferLeadership;
+// the cluster picks a peer that still advertises htfifo, and the
+// partitioned queue stays correct. Single-shard deployments with no
+// --sqsFifoPartitionMap have no per-partition group map for this hook
+// to match, so rollback of an already-created partitioned queue remains
+// an operator drain/recreate boundary there.
 //
 // When it does NOT fire
 //
@@ -47,7 +51,11 @@ type sqsLeadershipController interface {
 //     happy-path runtime — every binary past PR 4-B-3b advertises.
 //   - No partitioned queue maps to gid (partitionedGroups[gid] is
 //     false). Groups that only host non-partitioned data have no
-//     partitioned-keyspace contract to break.
+//     partitioned-keyspace contract to break. This also covers the
+//     supported single-shard/no-map deployment shape; the capability
+//     gate may admit partitioned queues there, but this refusal hook is
+//     intentionally map-driven and does not infer default-group
+//     ownership from catalog state.
 //
 // Both no-op cases return a no-op deregister so callers can defer
 // uniformly.
