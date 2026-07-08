@@ -216,7 +216,7 @@ func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte
 }
 
 func isSplitBoundaryError(err error) bool {
-	return status.Code(err) == codes.InvalidArgument &&
+	return status.Code(errors.Cause(err)) == codes.InvalidArgument &&
 		strings.Contains(err.Error(), errDistributionSplitKeyAtBoundary.Error())
 }
 

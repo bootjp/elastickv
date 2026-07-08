@@ -64,6 +64,23 @@ func (c *testCoordinator) Dispatch(
 	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
 }
 
+type recordingCoordinator struct {
+	inner    *testCoordinator
+	requests []*kv.OperationGroup[kv.OP]
+}
+
+func (c *recordingCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *recordingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	copied := *req
+	copied.Elems = append([]*kv.Elem[kv.OP](nil), req.Elems...)
+	copied.ReadKeys = cloneKeys(req.ReadKeys)
+	c.requests = append(c.requests, &copied)
+	return c.inner.Dispatch(ctx, req)
+}
+
 func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
@@ -96,6 +113,49 @@ func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 	got, err = svc.Read(ctx, created.Inode, created.FH, 0, 16)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0, 0, 'a', 'b', 'c', 0, 0, 0, 0}, got)
+}
+
+func TestServiceFullChunkWriteSkipsChunkReadKey(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+
+	rec := attachRecorder(svc)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
+	require.NoError(t, err)
+	require.Len(t, rec.requests, 1)
+	require.False(t, keyInSet(rec.requests[0].ReadKeys, fskeys.ChunkKey(file.Inode, file.Inode, 0)),
+		"full chunk overwrite should not add the chunk to readKeys")
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, stats.Capacity-stats.Free)
+}
+
+func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcdef"))
+	require.NoError(t, err)
+
+	rec := attachRecorder(svc)
+	stat, err := svc.SetAttr(ctx, file.Inode, SetAttrMask{Size: true, Mode: true}, SetAttr{
+		Size: 3,
+		Mode: 0o600,
+	})
+	require.NoError(t, err)
+	require.Len(t, rec.requests, 1)
+	require.EqualValues(t, 3, stat.Size)
+	require.EqualValues(t, 0o600, stat.Mode)
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.ChunkKey(file.Inode, file.Inode, 0)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 }
 
 func TestServiceReaddirRenameAndRmdir(t *testing.T) {
@@ -193,6 +253,31 @@ func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+
+	rec := attachRecorder(svc)
+	require.NoError(t, svc.Release(ctx, file.Inode, file.FH, []byte("client-a")))
+	require.Len(t, rec.requests, 1)
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+
+	_, err = svc.GetAttr(ctx, file.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestServiceReapsExpiredOpenHandleAndGcsOrphan(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
@@ -218,6 +303,36 @@ func TestServiceReapsExpiredOpenHandleAndGcsOrphan(t *testing.T) {
 	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
 	_, err = svc.GetAttr(ctx, file.Inode)
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestServiceReapExpiredOpenHandleGcsInSingleTxn(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3},
+		WithClock(func() time.Time { return now }),
+		WithOpenHandleLeaseTTL(time.Second),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+
+	now = now.Add(2 * time.Second)
+	rec := attachRecorder(svc)
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.ExpiredRefs)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	require.Len(t, rec.requests, 1)
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
 }
 
 func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
@@ -279,6 +394,21 @@ func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
 	require.EqualValues(t, 11, stats.Free)
 }
 
+func TestServiceStatFSUsesUsageCounter(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	elem, err := putElem(fskeys.UsageKey(), FSUsage{Files: 42, Bytes: 17})
+	require.NoError(t, err)
+	require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{fskeys.UsageKey()}))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 42, stats.Files)
+	require.EqualValues(t, 83, stats.Free)
+}
+
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
@@ -311,6 +441,42 @@ func newTestServiceWithOptions(t *testing.T, ids []uint64, opts ...Option) *Serv
 	svc, err := NewService(st, coord, serviceOpts...)
 	require.NoError(t, err)
 	return svc
+}
+
+func attachRecorder(svc *Service) *recordingCoordinator {
+	inner, ok := svc.dispatch.(*testCoordinator)
+	if !ok {
+		panic("attachRecorder requires a testCoordinator-backed service")
+	}
+	rec := &recordingCoordinator{inner: inner}
+	svc.dispatch = rec
+	return rec
+}
+
+func cloneKeys(in [][]byte) [][]byte {
+	out := make([][]byte, 0, len(in))
+	for _, key := range in {
+		out = append(out, append([]byte(nil), key...))
+	}
+	return out
+}
+
+func keyInSet(keys [][]byte, want []byte) bool {
+	for _, key := range keys {
+		if bytes.Equal(key, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func elemTouchesKey(elems []*kv.Elem[kv.OP], want []byte) bool {
+	for _, elem := range elems {
+		if bytes.Equal(elem.Key, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func sequenceIDAllocator(ids ...uint64) func() (uint64, error) {

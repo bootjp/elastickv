@@ -18,6 +18,7 @@ const (
 	refPrefix     = "!fs|ref|"
 	intentPrefix  = "!fs|intent|"
 	moveJobPrefix = "!fs|job|move|"
+	usageKey      = "!fs|usage"
 
 	chunkRoutePrefix = "!fs|route|chk|"
 
@@ -159,6 +160,11 @@ func RefPrefix(inode uint64) []byte {
 // RefAllPrefix returns the scan prefix for every open-handle lease.
 func RefAllPrefix() []byte {
 	return []byte(refPrefix)
+}
+
+// UsageKey returns the filesystem-wide StatFS counter key.
+func UsageKey() []byte {
+	return []byte(usageKey)
 }
 
 // IntentKey returns a crash-recovery intent key.
