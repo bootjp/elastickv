@@ -400,11 +400,11 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 		return nil, errors.WithStack(err)
 	}
 
-	if ttl, found, collErr := r.collectionTTLAt(ctx, userKey, readTS); collErr != nil || found {
-		return ttl, collErr
-	}
 	if ttl, found, hllErr := r.hllTTLAt(ctx, userKey, readTS); hllErr != nil || found {
 		return ttl, hllErr
+	}
+	if ttl, found, collErr := r.collectionTTLAt(ctx, userKey, readTS); collErr != nil || found {
+		return ttl, collErr
 	}
 	if r.disableLegacyTTLReadFallback {
 		return nil, nil
@@ -420,11 +420,15 @@ func (r *RedisServer) hllTTLAt(ctx context.Context, userKey []byte, readTS uint6
 		}
 		return nil, false, errors.WithStack(err)
 	}
+	newFormat := isNewRedisHLLFormat(raw)
 	_, ttl, embedded, err := decodeRedisHLL(raw)
 	if err != nil {
 		return nil, true, err
 	}
-	return ttl, embedded, nil
+	if embedded || newFormat {
+		return ttl, true, nil
+	}
+	return nil, false, nil
 }
 
 // legacyIndexTTLAt reads the TTL from the !redis|ttl| secondary index only.

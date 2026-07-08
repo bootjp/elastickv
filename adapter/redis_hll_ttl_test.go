@@ -30,6 +30,36 @@ func TestRedisHLLTTLAtReadsEmbeddedAfterScanIndexDeleted(t *testing.T) {
 	require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*got))
 }
 
+func TestRedisHLLTTLAtIgnoresStaleCollectionTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("hll:stale-collection")
+	expiredAt := time.Now().Add(-time.Minute)
+
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{
+		Len:      1,
+		ExpireAt: redisExpireAtMillis(expiredAt),
+	}), 10, 0))
+	payload, err := encodeRedisHLL(redisSetValue{Members: []string{"fresh"}}, nil)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 11, 0))
+
+	got, err := server.ttlAt(ctx, key, 11)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	expired, err := server.hasExpired(ctx, key, 11, false)
+	require.NoError(t, err)
+	require.False(t, expired)
+
+	value, err := server.loadSetAt(ctx, hllKind, key, 11)
+	require.NoError(t, err)
+	require.Equal(t, []string{"fresh"}, value.Members)
+}
+
 func TestRedisDispatchHLLExpireWritesInlineAnchorAndScanIndex(t *testing.T) {
 	t.Parallel()
 
