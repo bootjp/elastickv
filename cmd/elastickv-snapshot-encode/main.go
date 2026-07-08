@@ -1,6 +1,6 @@
 // Command elastickv-snapshot-encode is the Phase 0b M6 snapshot encoder
-// described in docs/design/2026_06_01_proposed_snapshot_encode_cli.md
-// (parent: docs/design/2026_05_25_partial_snapshot_logical_encoder.md).
+// described in docs/design/2026_06_01_implemented_snapshot_encode_cli.md
+// (parent: docs/design/2026_05_25_implemented_snapshot_logical_encoder.md).
 //
 // It reads a vendor-independent per-adapter directory tree (produced by
 // elastickv-snapshot-decode or by a future Phase 1 live extractor) and
@@ -109,6 +109,7 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 //     (codex P2 v21 #904)
 //   - ErrEncodeUnsupportedSQSPreserveVisibility: validateEncodeOptionsUnsupportedFeatures
 //     (codex P2 v21 #904)
+//   - ErrEncodeUnsupportedSQSSideRecords: validateEncodeOptionsUnsupportedFeatures
 //   - ErrEncodeAdapterData: runAdapterEncoders mark on adapter
 //     rejection (codex P2 v9 #904)
 //   - errSelfTestMismatch: writeAndPublish self-test branch
@@ -125,6 +126,7 @@ func classifyEncodeError(err error) int {
 		errors.Is(err, backup.ErrEncodeUnsupportedS3IncompleteUploads),
 		errors.Is(err, backup.ErrEncodeUnsupportedS3Orphans),
 		errors.Is(err, backup.ErrEncodeUnsupportedSQSPreserveVisibility),
+		errors.Is(err, backup.ErrEncodeUnsupportedSQSSideRecords),
 		errors.Is(err, backup.ErrEncodeAdapterData),
 		errors.Is(err, errSelfTestMismatch),
 		errors.Is(err, backup.ErrInvalidManifest),
@@ -488,6 +490,7 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 		encodeOpts.S3IncludeIncompleteUploads = manifest.Exclusions.IncludeIncompleteUploads
 		encodeOpts.S3IncludeOrphans = manifest.Exclusions.IncludeOrphans
 		encodeOpts.PreserveSQSVisibility = manifest.Exclusions.PreserveSQSVisibility
+		encodeOpts.IncludeSQSSideRecords = manifest.Exclusions.IncludeSQSSideRecords
 	}
 	if cfg.selfTest {
 		encodeOpts.SelfTestDecodeOptions = buildSelfTestDecodeOptions(cfg, manifest)

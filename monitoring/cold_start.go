@@ -10,7 +10,7 @@ import "github.com/prometheus/client_golang/prometheus"
 // soak threshold (design target: ≥ 90% in steady state) or when
 // fallback_reason rises unexpectedly.
 //
-// See docs/design/2026_06_02_idempotent_snapshot_restore.md §9.
+// See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §9.
 type ColdStartMetrics struct {
 	// restoreTotal is the per-outcome counter for the three skip-
 	// gate outcomes. Labels:

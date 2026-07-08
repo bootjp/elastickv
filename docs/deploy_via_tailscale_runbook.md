@@ -1,0 +1,276 @@
+# Deploy via Tailscale + GitHub Actions — Runbook
+
+Companion doc to `docs/design/2026_04_24_proposed_deploy_via_tailscale.md`. This
+runbook is for operators: what to configure on GitHub and Tailscale so the
+`rolling-update` workflow can execute a production deploy.
+
+## 1. Precondition: Tailscale on every node
+
+Each cluster node must have `tailscale` installed, logged into the tailnet, and
+tagged so the CI runner's ACL can reach it.
+
+```bash
+# on each kv0X node
+sudo tailscale up \
+  --ssh=false \
+  --advertise-tags=tag:elastickv-node \
+  --accept-routes=false
+```
+
+`--ssh=false` disables Tailscale SSH, so the node's regular system
+sshd must be running and authorized to accept connections on the
+tailnet interface. The workflow uses plain SSH over the tailnet
+(Tailscale is only the network layer); if you rely on Tailscale SSH
+for operator access elsewhere, drop this flag but keep in mind the
+workflow still connects to the system sshd.
+
+Verify the node is reachable by MagicDNS from another tailnet peer:
+
+```bash
+tailscale status | grep kv0X
+ping kv0X.<tailnet>.ts.net
+```
+
+## 2. Tailscale ACL
+
+In the Tailscale admin console, add the deploy rule to the tailnet ACL:
+
+```jsonc
+"tagOwners": {
+  "tag:ci-deploy":      ["autogroup:admin"],
+  "tag:elastickv-node": ["autogroup:admin"],
+},
+"acls": [
+  {
+    "action": "accept",
+    "src":    ["tag:ci-deploy"],
+    "dst":    ["tag:elastickv-node:22"],
+  },
+  {
+    "action": "accept",
+    "src":    ["tag:elastickv-node"],
+    "dst":    [
+      "tag:elastickv-node:50051", // Raft / raftadmin
+      "tag:elastickv-node:6379",  // Redis adapter, if enabled
+      "tag:elastickv-node:8000",  // DynamoDB adapter, if enabled
+      "tag:elastickv-node:9000",  // S3 adapter, if enabled
+      "tag:elastickv-node:9324",  // SQS adapter, if enabled
+    ],
+  },
+],
+```
+
+`tag:ci-deploy` must NOT have access to any other port on the tailnet. The
+deploy workflow only needs SSH. Node-to-node access is separate: every
+`tag:elastickv-node` must be able to reach the cluster ports advertised in
+`NODES_RAFT_MAP` / derived adapter maps, otherwise a restarted node can come
+back with peer addresses it cannot dial and leader-transfer probes can fail
+mid-roll.
+
+## 3. Tailscale OAuth client
+
+Admin console → Settings → OAuth clients → New client:
+
+- Description: `elastickv GitHub Actions deploy`
+- Scopes: `auth_keys` (write). The pinned `tailscale/github-action`
+  version uses this OAuth client to mint the ephemeral auth key. If the
+  join step fails with a 403 during device registration or cleanup,
+  add the exact Devices scope named by the action README and the
+  Tailscale OAuth UI for that action version; do not guess from older
+  drafts of this runbook.
+- Tags: `tag:ci-deploy`
+
+Copy the client ID and secret; they go into GitHub in the next step.
+
+## 4. GitHub environment: `production`
+
+Repo → Settings → Environments → New environment: `production`.
+
+### Required reviewers
+Configure "Required reviewers" on the environment. **Every run that targets
+this environment pauses for approval** — including dry-runs, because
+GitHub's native environment-protection rules cannot be made conditional on
+workflow inputs. Three ways to handle the dry-run-approval friction:
+
+1. **Accept the prompt for dry-runs too.** A dry-run requires one approver
+   click before it proceeds; still cheap and keeps the policy simple.
+2. **Add a second environment `production-dry-run` without required
+   reviewers** and change the workflow to pick the environment via
+   `environment: ${{ inputs.dry_run && 'production-dry-run' || 'production' }}`.
+   Cleanest but doubles the secrets/vars you must keep in sync.
+3. **Install a deployment-protection-rule GitHub App** (custom or
+   marketplace) that approves runs whose inputs show `dry_run == true`.
+   Most flexible; most setup.
+
+v1 ships with approach 1 (single environment, prompt on every run).
+Approach 2 is the recommended upgrade once the friction becomes annoying.
+
+### Deployment branch policy
+
+Restrict the `production` environment to deployments from the repository
+default branch only. The workflow also has an early guard that fails when a
+manual dispatch is started from any other branch, but the environment policy is
+the trust boundary because GitHub executes workflow YAML from the selected
+dispatch ref before checkout.
+
+### Environment secrets
+
+| Name | Value |
+|------|-------|
+| `TS_OAUTH_CLIENT_ID`        | Tailscale OAuth client ID from step 3 |
+| `TS_OAUTH_SECRET`           | Tailscale OAuth secret from step 3 |
+| `DEPLOY_SSH_PRIVATE_KEY`    | OpenSSH private key, authorized on every node under the deploy user |
+| `DEPLOY_KNOWN_HOSTS`        | `ssh-keyscan -H kv01.<tailnet>.ts.net kv02.<tailnet>.ts.net …` output. Use `-H` to hash hostnames so the secret's contents don't leak the tailnet topology if the runner environment is compromised. Regenerate this secret when the node list changes or if SSH reports `Host key verification failed`. |
+
+The SSH key should be ed25519, dedicated to CI (not a reused developer key).
+Regenerate on operator rotation.
+
+### Environment variables
+
+| Name | Value | Example |
+|------|-------|---------|
+| `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
+| `SSH_USER`        | SSH login on every node           | `bootjp` |
+| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow always renders the full map into the script's `NODES` env var, even for subset rollouts; the `nodes` input becomes `ROLLING_ORDER` so the script still derives full-cluster peer maps. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
+| `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+| `ENABLE_S3`       | `true` to start the S3 adapter, `false` to keep it disabled. The workflow defaults missing values to `false` rather than the script's local default. | `true` |
+| `S3_CREDENTIALS_FILE` | Node-local path to the SigV4 credentials file. Required when `ENABLE_S3=true`; the workflow fails before rollout if it is missing. | `/etc/elastickv/s3-credentials.json` |
+| `ENABLE_SQS`      | `true` to start the SQS adapter, `false` to keep it disabled. The workflow defaults missing values to `false`. | `true` |
+| `SQS_PORT`        | SQS-compatible listener port on each node. The workflow forwards this into `rolling-update.sh`, which derives `RAFT_TO_SQS_MAP` from `NODES_RAFT_MAP` unless overridden. | `9324` |
+| `SQS_REGION`      | SigV4 region for the SQS adapter. | `us-east-1` |
+| `SQS_CREDENTIALS_FILE` | Optional node-local SQS credentials file. If set, it must exist on each target host before rollout. | `/etc/elastickv/sqs-credentials.json` |
+| `SQS_FIFO_PARTITION_MAP` | Optional HT-FIFO partition routing map. Empty keeps partitioned FIFO routing on the default Raft group. | `queue.fifo:2=group_0,group_1` |
+
+For private GHCR packages, log every node in to `ghcr.io` with a
+deploy-scoped read token before the first rollout. The workflow's manifest check
+proves the runner can see the image tag; it does not install Docker credentials
+on the remote nodes that execute `docker pull`.
+
+**Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
+in the `production` environment to keep the GitHub-side names
+distinct from the script-side env var names it hands to
+`rolling-update.sh`. If you run the script by hand from a workstation
+you must export `NODES` and `SSH_TARGETS` directly, plus `ROLLING_ORDER`
+when you want a subset rollout — the workflow-side names are only
+understood by the workflow's render step.
+
+## 5. Running a deploy
+
+Actions tab → "Rolling update" → Run workflow.
+
+Inputs:
+
+- `ref` — the image tag/ref to deploy. The workflow code itself is always
+  dispatched and checked out from the repository default branch.
+- `image_tag` — override only for rollbacks (e.g., deploy tag `v1.2.3` of a
+  commit that was also `v1.2.3`)
+- `nodes` — subset of raft IDs, e.g., `n1,n2`. Empty rolls all nodes.
+- `dry_run` — default `true`. Checks reachability and runs
+  `./scripts/rolling-update.sh --dry-run` with the rendered environment,
+  without touching containers.
+
+Recommended first-run sequence:
+
+1. `dry_run: true`, `nodes: n1`, `ref: <target>` — confirms tailnet join,
+   SSH config, image availability, target mapping. No production impact.
+2. `dry_run: false`, `nodes: n1` — roll a single node, verify the cluster
+   stays healthy and the image is correct.
+3. `dry_run: false`, `nodes:` (empty) — full roll.
+
+## 6. Rollback
+
+Re-run the workflow with `image_tag` set to the previous-known-good sha. The
+Docker image workflow publishes both `latest` and the immutable commit-SHA tag
+for each main-branch build, so SHA rollback works without a manual retag. The
+`nodes` input can target specific nodes if only some carry the bad image.
+
+For private GHCR packages, keep the node-level Docker credential rotation
+outside this workflow for v1; the workflow only verifies that the tag exists
+from the runner side.
+
+### If a running workflow is cancelled mid-rollout
+
+GitHub cancelling the job between node steps is the one operational
+hazard that needs manual cleanup.
+
+1. **Look at the last log line from the `Roll cluster` step.** The
+   script emits `==> [<raft-id>@<host>] start` at the beginning of
+   each per-node recreate. Whichever `<raft-id>` appears in the last
+   such line is the one in flight when the cancel signal landed.
+2. **SSH into that node** over Tailscale and run `docker ps`. If the
+   container is absent or `Exited`, finish the recreate by hand. The
+   `docker run` invocation itself is redirected to `/dev/null` by the
+   script, so the workflow log does NOT contain the full argv. To
+   reconstruct it, open the `Log rollout configuration` step: it emits
+   the actual `IMAGE`, `CONTAINER_NAME`, `DATA_DIR`, `SERVER_ENTRYPOINT`,
+   `RAFT_ENGINE`, `RAFT_PORT`, `REDIS_PORT`, `DYNAMO_PORT`, `S3_PORT`,
+   `ENABLE_S3`, `S3_REGION`, `S3_CREDENTIALS_FILE`,
+   `S3_PATH_STYLE_ONLY`, `ENABLE_SQS`, `SQS_PORT`, `SQS_REGION`,
+   `SQS_CREDENTIALS_FILE`, `SQS_FIFO_PARTITION_MAP`, `RAFT_TO_SQS_MAP`,
+   `DEFAULT_EXTRA_ENV`, `EXTRA_ENV`,
+   `CONTAINER_MEMORY_LIMIT`, `NODES`, `SSH_TARGETS`, and
+   `ROLLING_ORDER` values used by the following `Roll cluster` step.
+   The workflow sets the same defaults as `scripts/rolling-update.sh`
+   except for `ENABLE_S3`, which defaults to `false` in the workflow
+   unless the `production` environment variable explicitly enables it.
+   Together those logged values plus the node's current Docker state
+   are enough to reconstruct the same `docker run` you would get from
+   re-running the workflow with the same inputs.
+3. **Confirm the new leader via `raftadmin` or metrics** before re-running
+   the workflow with `nodes:` scoped to the remaining untouched IDs. Do
+   NOT re-run the full rollout if the partial one is still in flight —
+   it will stop the same node you are trying to recover.
+4. **File a ticket** with the log excerpt so we can eventually teach the
+   workflow to set a start-marker on each node and fast-skip completed
+   nodes on re-run.
+
+The script is idempotent. `scripts/rolling-update.sh:794-798` skips a
+node when its running image id equals the target image and its gRPC
+endpoint is healthy — an already-rolled node is a no-op, not a
+redundant stop/recreate. Re-running the workflow with the same
+`ref` after confirming the interrupted node is healthy is therefore
+safe: nodes that already match the target image are passed over,
+and only the still-stale one gets recreated.
+
+## 7. What the workflow does NOT do (yet)
+
+- **No post-deploy health verification beyond SSH reachability.** The
+  script itself blocks on `raftadmin` leadership transfer and health-gate
+  timeouts, but the workflow does not independently probe Prometheus or
+  Redis after the roll. Add this when we have a canonical post-deploy
+  assertion suite.
+- **No auto-rollback on failure.** If the script exits non-zero mid-roll,
+  the cluster is left in whatever state the script reached. The operator
+  must inspect and either re-roll or roll back manually.
+- **No Jepsen gate.** The deploy does not require a green Jepsen run on
+  `ref` before proceeding.
+- **No image-signature check.** `cosign verify` on the image is a follow-up.
+
+## 8. Troubleshooting
+
+### Job pauses indefinitely at "Waiting for approval"
+Expected for **every** run in v1 — `.github/workflows/rolling-update.yml`
+sets `environment: production` unconditionally, so both dry-run and
+non-dry-run executions pause for approval. A reviewer from the
+`production` environment must click Approve. Check the "Required
+reviewers" list in the environment settings. See §4 "GitHub
+environment" for the dry-run-approval alternatives (approach 2: add a
+second `production-dry-run` environment without required reviewers)
+if the friction becomes intolerable.
+
+### SSH reachability fails for a node
+The node may not be running `tailscaled`, not tagged `tag:elastickv-node`, or
+the system `sshd` may not be reachable over the tailnet ACL. `tailscale status`
+on the node should show the tag; the admin console should show the IP in the
+`tag:elastickv-node`
+group.
+
+### `image ... not found on ghcr.io`
+The verification step hit the ghcr manifest API and got a 404. Either the
+image tag was not pushed (check the `Docker Image CI` workflow for `ref`) or
+the tag is a moving tag (`latest`) that the verification step can't
+distinguish from stale. Specify an immutable tag.
+
+### SSH `Host key verification failed`
+`DEPLOY_KNOWN_HOSTS` is stale. Re-run `ssh-keyscan -H` against every node and
+update the secret.

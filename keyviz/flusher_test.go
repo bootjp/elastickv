@@ -21,7 +21,7 @@ func TestRunFlusherTicksUntilCancel(t *testing.T) {
 
 	// Drive Observe across ticker firings.
 	for i := 0; i < 10; i++ {
-		s.Observe(1, make([]byte, 0), OpRead, 0)
+		s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
 		time.Sleep(2 * time.Millisecond)
 	}
 	cancel()

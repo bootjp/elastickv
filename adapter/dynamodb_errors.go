@@ -5,6 +5,8 @@ import (
 
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type dynamoAPIError struct {
@@ -35,6 +37,10 @@ func writeDynamoErrorFromErr(w http.ResponseWriter, err error) {
 	var apiErr *dynamoAPIError
 	if errors.As(err, &apiErr) {
 		writeDynamoError(w, apiErr.status, apiErr.errorType, apiErr.message)
+		return
+	}
+	if status.Code(errors.Cause(err)) == codes.Unavailable {
+		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "service unavailable")
 		return
 	}
 	writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())

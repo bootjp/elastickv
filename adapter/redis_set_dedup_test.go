@@ -21,19 +21,13 @@ import (
 //
 // Pins that the gate-on path uses the same dedup machinery as MULTI/EXEC.
 // Without this routing, a standalone SET under leadership churn would not
-// benefit from option-2 dedup (the design's "still open" item before this
-// PR).
+// benefit from option-2 dedup.
 func TestStandaloneSetDedup_LandedPriorAttempt_ReturnsOK(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
-	// the per-path sub-gate that opts the *standalone* SET branch into
-	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
-	// P1 — applySet diverges from executeSet on SET-over-collection).
-	// Tests that pin the dedup-on routing must explicitly enable both.
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
 
 	conn := &recordingConn{}
 	cmd := redcon.Command{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v1")}}
@@ -66,12 +60,7 @@ func TestStandaloneSetDedup_NXMissReturnsNil(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("k")), encodeRedisStr([]byte("seed"), nil), 5, 0))
 
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
-	// the per-path sub-gate that opts the *standalone* SET branch into
-	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
-	// P1 — applySet diverges from executeSet on SET-over-collection).
-	// Tests that pin the dedup-on routing must explicitly enable both.
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
 
 	conn := &recordingConn{}
 	// SET k v1 NX -- attempt 1 records resultNil because NX miss.
@@ -109,12 +98,7 @@ func TestStandaloneSetDedup_GETOptionReturnsOldBulk(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("k")), encodeRedisStr([]byte("prior"), nil), 5, 0))
 
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
-	// the per-path sub-gate that opts the *standalone* SET branch into
-	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
-	// P1 — applySet diverges from executeSet on SET-over-collection).
-	// Tests that pin the dedup-on routing must explicitly enable both.
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
 
 	conn := &recordingConn{}
 	// SET k v1 GET -- attempt 1 records resultBulk("prior").
@@ -132,6 +116,94 @@ func TestStandaloneSetDedup_GETOptionReturnsOldBulk(t *testing.T) {
 	val, _, err := decodeRedisStr(rawVal)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val, "SET GET still applies the new value; dedup just preserves the GET result")
+}
+
+// TestStandaloneSetDedup_OverwritesWideHash verifies that the default-on
+// standalone SET dedup path keeps Redis overwrite semantics: a SET without
+// GET replaces a collection value with a string and tombstones the old
+// wide-column hash rows.
+func TestStandaloneSetDedup_OverwritesWideHash(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("k")
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("f")), []byte("old"), 5, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 5, 0))
+
+	coord := newDedupTestCoordinator(st, 1, true)
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	conn := &recordingConn{}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("v1")}}
+	srv.set(conn, cmd)
+
+	require.Equal(t, "OK", string(conn.bulk))
+	require.Empty(t, conn.err)
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, 1, coord.probeNoOps)
+
+	readTS := snapshotTS(coord.Clock(), st)
+	rawVal, err := st.GetAt(ctx, redisStrKey(key), readTS)
+	require.NoError(t, err)
+	val, _, err := decodeRedisStr(rawVal)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+	_, err = st.GetAt(ctx, store.HashFieldKey(key, []byte("f")), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestStandaloneIncrDedup_LandedPriorAttemptReturnsCachedValue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("counter")
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), encodeRedisStr([]byte("1"), nil), 5, 0))
+
+	coord := newDedupTestCoordinator(st, 1, true)
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	conn := &recordingConn{}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdIncr), key}}
+	srv.incr(conn, cmd)
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(2), conn.int)
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, 1, coord.probeNoOps)
+
+	rawVal, err := st.GetAt(ctx, redisStrKey(key), snapshotTS(coord.Clock(), st))
+	require.NoError(t, err)
+	val, _, err := decodeRedisStr(rawVal)
+	require.NoError(t, err)
+	require.Equal(t, []byte("2"), val)
+}
+
+func TestStandaloneHSetDedup_LandedPriorAttemptReturnsCachedAdded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("hash")
+
+	coord := newDedupTestCoordinator(st, 1, true)
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	conn := &recordingConn{}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, []byte("f"), []byte("v")}}
+	srv.hset(conn, cmd)
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, 1, coord.probeNoOps)
+
+	readTS := snapshotTS(coord.Clock(), st)
+	raw, err := st.GetAt(ctx, store.HashFieldKey(key, []byte("f")), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), raw)
+	count, exists, err := srv.resolveHashMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(1), count)
 }
 
 // TestStandaloneSetDedup_DisabledKeepsLegacyPath verifies the gate is honored

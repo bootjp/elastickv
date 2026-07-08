@@ -196,50 +196,43 @@ func TestParseCSV(t *testing.T) {
 }
 
 func TestStartAdminServer_DisabledNoOp(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
-	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
+	prepared, err := prepareAdminServer(context.Background(), &lc, adminListenerConfig{enabled: false}, nil, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.NoError(t, err)
+	require.Nil(t, prepared)
 }
 
 func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled: true,
 		listen:  "127.0.0.1:0",
 		// missing signing key
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
+	_, err := prepareAdminServer(context.Background(), &lc, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 }
 
 func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:           true,
 		listen:            "0.0.0.0:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
+	_, err := prepareAdminServer(context.Background(), &lc, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS")
 }
 
 func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:           true,
 		listen:            "127.0.0.1:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
+	_, err := prepareAdminServer(context.Background(), &lc, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cluster info source")
 }
@@ -262,8 +255,11 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n1", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
+	prepared, err := prepareAdminServer(eCtx, &lc, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
 	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	addr := prepared.cfg.Listen
+	prepared.start(eCtx, eg)
 
 	// Poll /admin/healthz until success or the test deadline.
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -305,8 +301,11 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n-tls", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
+	prepared, err := prepareAdminServer(eCtx, &lc, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
 	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	addr := prepared.cfg.Listen
+	prepared.start(eCtx, eg)
 
 	transport := &http.Transport{TLSClientConfig: &tls.Config{
 		InsecureSkipVerify: true, //nolint:gosec // self-signed certificate in test; server identity is not what we assert here.

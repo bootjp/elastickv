@@ -106,7 +106,7 @@ func registerAdminForwardServer(gs *grpc.Server, deps adminForwardServerDeps, lo
 // roleStoreFromFlags builds the same access-key → role map that
 // admin.Config.RoleIndex produces, but from the raw flag strings so
 // the gRPC ForwardServer registration in startRaftServers does not
-// need to wait for startAdminFromFlags to parse the admin config.
+// need to wait for prepareAdminFromFlags to parse the admin config.
 // Returns nil when no keys are configured at all — that shape is the
 // "admin auth disabled" signal adminForwardServerDeps consumes to
 // skip registration.
@@ -120,7 +120,7 @@ func roleStoreFromFlags(fullKeys, readOnlyKeys []string) admin.RoleStore {
 	}
 	for _, k := range readOnlyKeys {
 		// Overlap with FullAccessKeys is rejected at admin.Config.Validate
-		// time during startAdminFromFlags. We can't replicate that here
+		// time during prepareAdminFromFlags. We can't replicate that here
 		// without parsing the full config, so the ReadOnlyAccessKeys loop
 		// runs second to mirror RoleIndex's "last-write-wins-but-only-for-
 		// non-overlapping-keys" semantics — overlap is a startup error
