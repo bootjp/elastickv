@@ -124,7 +124,7 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	// fresh commit_ts + prev_commit_ts so the FSM no-ops a commit that already
 	// landed under leadership churn, instead of re-reading and re-appending (the
 	// :duplicate-elements anomaly). See
-	// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+	// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md.
 	//
 	// Leader-only (codex P1, PR #920): the dedup path allocates commit_ts from
 	// the LOCAL HLC and carries it as prev_commit_ts, so that timestamp MUST be
@@ -196,7 +196,7 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 // leadership churn: attempt 1 commits at C1 but returns a WriteConflict, the
 // retry re-reads the now-larger list and appends again. Reuse + the FSM's
 // exact-ts dedup probe close that. See option 2 in
-// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md.
 type reusableItemWrite struct {
 	// plan holds the reused OperationGroup (plan.req: Elems + fixed StartTS) and
 	// the captured current/next item. The client-visible result

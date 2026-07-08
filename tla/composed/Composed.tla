@@ -1,7 +1,7 @@
 ------------------------------ MODULE Composed -------------------------------
 (***************************************************************************)
 (* TLA+ specification of the cross-module safety properties — the M5      *)
-(* milestone of docs/design/2026_05_28_partial_tla_safety_spec.md §5.5.   *)
+(* milestone of docs/design/2026_05_28_implemented_tla_safety_spec.md §5.5.   *)
 (*                                                                         *)
 (* M1..M4 each modelled a single subsystem in isolation.  M5 captures     *)
 (* what happens at the seams between them — specifically, two safety      *)
@@ -90,7 +90,7 @@ VARIABLES
                             \* observed-version check and the apply-time
                             \* current-version cross-version-read fence
                             \* (Composed-1a; see docs/design/
-                            \* 2026_05_29_partial_composed1_cross_group_commit_guard.md
+                            \* 2026_05_29_implemented_composed1_cross_group_commit_guard.md
                             \* §4.4 and §5).
     opCount
 
