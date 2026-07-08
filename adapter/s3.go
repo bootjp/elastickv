@@ -936,7 +936,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		if len(readBuf) == 0 {
 			break
 		}
-		n, readErr := s.readS3PutChunkWithAdmissionDeadline(w, r.Body, readBuf, !exactLength)
+		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
 		if n > 0 {
 			releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
 			if admissionErr != nil {
@@ -1488,7 +1488,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		if len(readBuf) == 0 {
 			break
 		}
-		n, readErr := s.readS3PutChunkWithAdmissionDeadline(w, r.Body, readBuf, !exactLength)
+		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
 		if n == 0 {
 			if errors.Is(readErr, io.EOF) {
 				break
@@ -2553,34 +2553,30 @@ func nextS3PutReadBuffer(buf []byte, protocol string, contentLength int64, readB
 }
 
 func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error) {
-	n, err := io.ReadFull(r, buf)
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		if !allowFinalPartial {
-			return n, errS3PutIncompleteBody
+	total := 0
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		if n > 0 {
+			total += n
 		}
-		return n, io.EOF
+		if errors.Is(err, io.EOF) {
+			return s3PutChunkEOFResult(total, len(buf), allowFinalPartial)
+		}
+		if err != nil {
+			return total, errors.WithStack(err)
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
 	}
-	if errors.Is(err, io.EOF) && !allowFinalPartial && len(buf) > 0 {
-		return n, errS3PutIncompleteBody
-	}
-	if err != nil {
-		return n, errors.WithStack(err)
-	}
-	return n, nil
+	return total, nil
 }
 
-func (s *S3Server) readS3PutChunkWithAdmissionDeadline(w http.ResponseWriter, r io.Reader, buf []byte, allowFinalPartial bool) (int, error) {
-	if s == nil || s.putAdmission == nil || s.putAdmission.timeout <= 0 {
-		return readS3PutChunk(r, buf, allowFinalPartial)
+func s3PutChunkEOFResult(total, bufLen int, allowFinalPartial bool) (int, error) {
+	if !allowFinalPartial && (total > 0 || bufLen > 0) {
+		return total, errS3PutIncompleteBody
 	}
-	controller := http.NewResponseController(w)
-	if err := controller.SetReadDeadline(time.Now().Add(s.putAdmission.timeout)); err != nil {
-		return readS3PutChunk(r, buf, allowFinalPartial)
-	}
-	defer func() {
-		_ = controller.SetReadDeadline(time.Time{})
-	}()
-	return readS3PutChunk(r, buf, allowFinalPartial)
+	return total, io.EOF
 }
 
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When

@@ -31,6 +31,7 @@ const (
 var (
 	errS3PutAdmissionExhausted      = errors.New("s3 put admission budget exhausted")
 	errS3PutAdmissionEntityTooLarge = errors.New("s3 put body exceeds maximum allowed size")
+	errS3PutAdmissionInvalidDecoded = errors.New("invalid X-Amz-Decoded-Content-Length")
 )
 
 type S3PutAdmissionObserver interface {
@@ -224,6 +225,10 @@ func (s *S3Server) admitS3PutRequest(w http.ResponseWriter, r *http.Request, buc
 			writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", tooLargeMessage, bucket, objectKey)
 			return false
 		}
+		if errors.Is(err, errS3PutAdmissionInvalidDecoded) {
+			writeS3Error(w, http.StatusBadRequest, "InvalidRequest", err.Error(), bucket, objectKey)
+			return false
+		}
 		writeS3Error(w, http.StatusLengthRequired, "MissingContentLength", err.Error(), bucket, objectKey)
 		return false
 	}
@@ -239,10 +244,8 @@ func (s *S3Server) s3PutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (
 	payloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	protocol := s3PutAdmissionProtocolForPayload(payloadSHA)
 	if protocol == s3PutAdmissionProtocolChunked {
-		if maxDecoded > 0 && maxDecoded < s3ChunkSize {
-			return maxDecoded, protocol, nil
-		}
-		return s3ChunkSize, protocol, nil
+		bytes, err := s3ChunkedPutAdmissionProbeBytes(r, maxDecoded)
+		return bytes, protocol, err
 	}
 	if r.ContentLength < 0 {
 		return 0, protocol, errors.New("Content-Length is required for non-streaming S3 PUT admission")
@@ -254,6 +257,32 @@ func (s *S3Server) s3PutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (
 		return s3ChunkSize, protocol, nil
 	}
 	return r.ContentLength, protocol, nil
+}
+
+func s3ChunkedPutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (int64, error) {
+	declared, ok, err := s3DecodedContentLength(r)
+	if err != nil {
+		return 0, err
+	}
+	if ok && maxDecoded > 0 && declared > maxDecoded {
+		return 0, errS3PutAdmissionEntityTooLarge
+	}
+	if maxDecoded > 0 && maxDecoded < s3ChunkSize {
+		return maxDecoded, nil
+	}
+	return s3ChunkSize, nil
+}
+
+func s3DecodedContentLength(r *http.Request) (int64, bool, error) {
+	declaredRaw := strings.TrimSpace(r.Header.Get("X-Amz-Decoded-Content-Length"))
+	if declaredRaw == "" {
+		return 0, false, nil
+	}
+	declared, err := strconv.ParseInt(declaredRaw, 10, 64)
+	if err != nil || declared < 0 {
+		return 0, true, errS3PutAdmissionInvalidDecoded
+	}
+	return declared, true, nil
 }
 
 func s3PutAdmissionProtocolForPayload(payloadSHA string) string {

@@ -382,6 +382,53 @@ func TestS3Server_PutObjectStreamingRejectsBadDecodedLength(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
 }
 
+func TestReadS3PutChunkPreservesFullBufferReaderError(t *testing.T) {
+	t.Parallel()
+
+	buf := make([]byte, 4)
+	reader := &s3FullBufferErrorReader{err: newAwsChunkedError(io.ErrUnexpectedEOF)}
+
+	n, err := readS3PutChunk(reader, buf, true)
+
+	require.Equal(t, len(buf), n)
+	var chunkedErr *awsChunkedError
+	require.ErrorAs(t, err, &chunkedErr)
+}
+
+type s3FullBufferErrorReader struct {
+	err error
+}
+
+func (r *s3FullBufferErrorReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), r.err
+}
+
+func TestS3Server_PutObjectStreamingRejectsTruncatedChunk(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-truncated", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bkt-truncated/obj.bin", strings.NewReader("5\r\nhel"))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bkt-truncated/obj.bin", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
 func TestS3Server_PutObjectStreamingRejectsSignedPayloadMarker(t *testing.T) {
 	t.Parallel()
 
@@ -482,6 +529,34 @@ func TestS3Server_UploadPartStreamingWithTrailerChecksum(t *testing.T) {
 	server.handle(rec, req)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "<Code>BadDigest</Code>")
+}
+
+func TestS3Server_UploadPartStreamingRejectsTruncatedChunk(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bkt-part-truncated", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bkt-part-truncated/blob.bin?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var init s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &init))
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bkt-part-truncated/blob.bin?uploadId=%s&partNumber=1", init.UploadId),
+		strings.NewReader("5\r\nhel"))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
 }
 
 func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {

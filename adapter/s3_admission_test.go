@@ -120,6 +120,20 @@ func TestS3PutAdmissionProbeUsesBootstrapForChunkedDecodedLength(t *testing.T) {
 	require.Equal(t, s3PutAdmissionProtocolChunked, protocol)
 }
 
+func TestS3PutAdmissionProbeRejectsChunkedDecodedLengthOverS3Limit(t *testing.T) {
+	t.Parallel()
+
+	server := &S3Server{putAdmission: newS3PutAdmission(s3ChunkSize, time.Second)}
+	req := newS3TestRequest(http.MethodPut, "/bucket/key", strings.NewReader("ignored"))
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.FormatInt(s3MaxObjectSizeBytes+1, 10))
+
+	bytes, protocol, err := server.s3PutAdmissionProbeBytes(req, s3MaxObjectSizeBytes)
+	require.ErrorIs(t, err, errS3PutAdmissionEntityTooLarge)
+	require.Zero(t, bytes)
+	require.Equal(t, s3PutAdmissionProtocolChunked, protocol)
+}
+
 func TestS3PutAdmissionProbeUsesChunkHeadroomForFixedLength(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +186,29 @@ func TestS3Server_PutObjectAdmissionRejectsFixedLengthOverS3LimitAsEntityTooLarg
 	require.Contains(t, rec.Body.String(), "<Message>object exceeds maximum allowed size</Message>")
 	require.Equal(t, 1, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
 	require.Zero(t, observer.lastInflight)
+}
+
+func TestS3Server_PutObjectAdmissionRejectsChunkedOverS3LimitBeforeSlowDown(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-chunked-limit")
+
+	release, err := server.putAdmission.acquire(context.Background(), s3ChunkSize)
+	require.NoError(t, err)
+	defer release()
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-chunked-limit/too-large.bin", http.NoBody)
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.FormatInt(s3MaxObjectSizeBytes+1, 10))
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>EntityTooLarge</Code>")
+	require.Equal(t, 1, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolChunked])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolChunked])
 }
 
 func TestS3Server_PutObjectAdmissionRequiresContentLengthForPlainPut(t *testing.T) {
