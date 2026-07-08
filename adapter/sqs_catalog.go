@@ -817,42 +817,6 @@ func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
 		a.DefaultRefillPerSecond == b.DefaultRefillPerSecond
 }
 
-func changedThrottleMetricActions(before, after *sqsQueueThrottle) []string {
-	changed := make([]string, 0, len(sqsThrottleMetricActions))
-	for _, action := range sqsThrottleMetricActions {
-		if !throttleMetricActionEnabled(after, action) {
-			continue
-		}
-		beforeCapacity, beforeRefill := throttleMetricActionConfig(before, action)
-		afterCapacity, afterRefill := throttleMetricActionConfig(after, action)
-		if beforeCapacity != afterCapacity || beforeRefill != afterRefill {
-			changed = append(changed, action)
-		}
-	}
-	return changed
-}
-
-func throttleMetricActionEnabled(throttle *sqsQueueThrottle, action string) bool {
-	capacity, _ := throttleMetricActionConfig(throttle, action)
-	return capacity > 0
-}
-
-func throttleMetricActionConfig(throttle *sqsQueueThrottle, action string) (float64, float64) {
-	if throttle == nil {
-		return 0, 0
-	}
-	switch action {
-	case SQSThrottleActionSend:
-		return throttle.SendCapacity, throttle.SendRefillPerSecond
-	case SQSThrottleActionReceive:
-		return throttle.RecvCapacity, throttle.RecvRefillPerSecond
-	case SQSThrottleActionDefault:
-		return throttle.DefaultCapacity, throttle.DefaultRefillPerSecond
-	default:
-		return 0, 0
-	}
-}
-
 // htfifoAttributesEqual compares the Phase 3.D HT-FIFO fields.
 //
 // PartitionCount normalisation: validatePartitionConfig documents 0
@@ -1566,10 +1530,11 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	// full capacity. trySetQueueAttributesOnce therefore
 	// compares the old and new throttle configs under the same Raft
 	// read snapshot used for the commit and reports whether the values
-	// actually moved, plus the committed throttle config and still-enabled
-	// actions whose capacity/refill changed so the metrics layer can clear
-	// disabled token gauges and reset stale token gauges even if the queue
-	// goes quiet. The bucket reconciliation in loadOrInit also
+	// actually moved, plus the committed throttle config and post-enabled
+	// actions whose gauges must be reset because the queue-wide invalidation
+	// drops every bucket. This lets the metrics layer clear disabled token
+	// gauges and reset stale enabled-token gauges even if the queue goes
+	// quiet. The bucket reconciliation in loadOrInit also
 	// catches a stale bucket if a throttle change slips past this gate
 	// (e.g. via a future admin path), so the gating here is purely a
 	// hot-path optimisation plus a no-op-bypass guard.
@@ -1642,8 +1607,9 @@ func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) 
 // meta's Throttle config differs from the pre-apply snapshot — the caller uses
 // it to gate the cache invalidation and metrics reconciliation so that a no-op
 // same-value SetQueueAttributes does not reset the bucket to full capacity or
-// churn token gauges. resetActions is the still-enabled metric-action subset
-// whose capacity/refill changed and whose stale token gauge must be removed.
+// churn token gauges. resetActions is the still-enabled metric-action set
+// whose in-memory bucket was dropped by the queue-wide invalidation and whose
+// stale token gauge must be removed.
 func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, []string, bool, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
@@ -1666,7 +1632,7 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	}
 	throttleChanged := !throttleConfigEqual(preThrottle, meta.Throttle)
 	postThrottle := snapshotThrottle(meta.Throttle)
-	resetActions := changedThrottleMetricActions(preThrottle, postThrottle)
+	resetActions := enabledThrottleMetricActions(postThrottle)
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)
 	if err != nil {

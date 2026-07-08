@@ -108,7 +108,7 @@ func TestSQSServer_ChargeQueueWithThrottleObservesMetrics(t *testing.T) {
 	require.InDelta(t, 0.0, last.tokensRemaining, 0.001)
 }
 
-func TestSQSServer_ChargeQueueWithThrottleForgetsDisabledMetrics(t *testing.T) {
+func TestSQSServer_ChargeQueueWithThrottleDoesNotSyncMetricActions(t *testing.T) {
 	t.Parallel()
 	observer := &recordingSQSThrottleObserver{}
 	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
@@ -116,21 +116,15 @@ func TestSQSServer_ChargeQueueWithThrottleForgetsDisabledMetrics(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
-	require.Contains(t, observer.syncs, throttleSyncReport{queue: "orders.fifo", enabled: []string{SQSThrottleActionSend}})
-	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionSend})
-	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionReceive})
-	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "orders.fifo", action: SQSThrottleActionDefault})
+	require.Empty(t, observer.syncs, "request-path throttle decisions must not sync enabled actions from a potentially stale meta snapshot")
+	require.Empty(t, observer.forgotten, "request-path throttle decisions must not forget gauges from a potentially stale meta snapshot")
 
 	observer.forgotten = nil
 	observer.syncs = nil
 	rec = httptest.NewRecorder()
 	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, nil, 1))
-	require.Contains(t, observer.syncs, throttleSyncReport{queue: "orders.fifo"})
-	require.ElementsMatch(t, []throttleForgetReport{
-		{queue: "orders.fifo", action: SQSThrottleActionSend},
-		{queue: "orders.fifo", action: SQSThrottleActionReceive},
-		{queue: "orders.fifo", action: SQSThrottleActionDefault},
-	}, observer.forgotten)
+	require.Empty(t, observer.syncs)
+	require.Empty(t, observer.forgotten)
 }
 
 // TestBucketStore_Empty_ShortCircuit covers the post-validator

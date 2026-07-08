@@ -295,11 +295,10 @@ func (s *SQSServer) observePartitionMessage(queue string, partition uint32, acti
 	s.partitionObserver.ObservePartitionMessage(queue, partition, action)
 }
 
-func (s *SQSServer) observeThrottleDecision(queue string, throttle *sqsQueueThrottle, outcome chargeOutcome) {
+func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome) {
 	if s == nil || s.throttleObserver == nil {
 		return
 	}
-	s.observeThrottleConfig(queue, throttle)
 	if !outcome.bucketPresent && outcome.allowed {
 		return
 	}

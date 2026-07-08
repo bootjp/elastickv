@@ -307,7 +307,7 @@ func TestSQSServer_Throttle_SetQueueAttributesSyncsDisabledMetrics(t *testing.T)
 		enabled: []string{SQSThrottleActionSend, SQSThrottleActionReceive},
 	})
 	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionSend})
-	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionReceive})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionReceive})
 
 	observer.syncs = nil
 	observer.forgotten = nil
@@ -320,7 +320,7 @@ func TestSQSServer_Throttle_SetQueueAttributesSyncsDisabledMetrics(t *testing.T)
 		queue:   "throttle-metric-sync",
 		enabled: []string{SQSThrottleActionSend},
 	})
-	require.NotContains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionSend})
+	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionSend})
 	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionReceive})
 	require.Contains(t, observer.forgotten, throttleForgetReport{queue: "throttle-metric-sync", action: SQSThrottleActionDefault})
 }

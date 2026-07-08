@@ -633,7 +633,7 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 		return true
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
-	s.observeThrottleDecision(queueName, throttle, outcome)
+	s.observeThrottleDecision(queueName, outcome)
 	if outcome.allowed {
 		return true
 	}
