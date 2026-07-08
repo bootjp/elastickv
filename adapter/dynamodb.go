@@ -98,6 +98,7 @@ var dynamoOperationTargets = map[string]string{
 const (
 	dynamoErrValidation          = "ValidationException"
 	dynamoErrInternal            = "InternalServerError"
+	dynamoErrServiceUnavailable  = "ServiceUnavailable"
 	dynamoErrConditionalFailed   = "ConditionalCheckFailedException"
 	dynamoErrTransactionCanceled = "TransactionCanceledException"
 	dynamoErrResourceNotFound    = "ResourceNotFoundException"
@@ -287,6 +288,12 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		}
 	}
 	return d
+}
+
+// SetListener installs the listener Run serves from. Startup wiring uses this
+// to build admin-forward sources before binding the public socket.
+func (d *DynamoDBServer) SetListener(listen net.Listener) {
+	d.listen = listen
 }
 
 func (d *DynamoDBServer) Run() error {
