@@ -12,9 +12,9 @@ elastickv's SQS adapter implements FIFO queues with **single-partition** semanti
 
 This matches AWS's Standard FIFO contract for *modest* throughput — but AWS's **High Throughput FIFO** (HT-FIFO) feature lifts the per-FIFO-queue ceiling from 300 transactions per second (TPS) per API per region to 70,000+ TPS per region by **partitioning** the queue across multiple data planes, with ordering preserved *within* each `MessageGroupId`. AWS exposes this as the `DeduplicationScope` and `FifoThroughputLimit` queue attributes.
 
-The Phase 1+2 of `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` deliberately deferred this — the design doc §16.6 marks it as TODO and notes "**the** large item in Phase 3" because it touches replication topology, routing, FIFO group-lock semantics, the reaper, the metrics surface, and the migration path for queues that already exist.
+The Phase 1+2 SQS adapter design deliberately deferred this because it touches replication topology, routing, FIFO group-lock semantics, the reaper, the metrics surface, and the migration path for queues that already exist.
 
-This document is the proposal that unblocks the implementation. It is **not the implementation**: the work splits naturally into multiple PRs, and any one of them is too big to land without prior agreement on the partition assignment scheme, the migration story, and the rollback story. Concretely, this proposal is **gate-of-no-return** material — once a partitioned FIFO queue exists in production, the data layout cannot change without a full migration.
+This document records the implemented HT-FIFO design and the rollout constraints that were used to land it across the PRs listed in §11. The gate-of-no-return property still matters operationally: once a partitioned FIFO queue exists in production, the data layout cannot change without draining and recreating the queue.
 
 ---
 
@@ -51,9 +51,9 @@ A partition is identified by the tuple `(queueName, partitionIndex)` where `part
 - **Legacy / `PartitionCount = 0` / Standard queues** keep today's `!sqs|msg|data|<queue>|<gen>|<msgID>` byte-for-byte. No partition segment is written or read. Existing data on disk is unaffected; existing key constructors stay unchanged on this code path.
 - **Partitioned FIFO queues (`PartitionCount > 1`)** use a *new* keyspace prefix that explicitly includes the partition: `!sqs|msg|data|p|<queue>|<partition>|<gen>|<msgID>` (note the extra `p|` discriminator after `data|`). The discriminator is what guarantees no collision with the legacy prefix even when `<partition> = 0` happens to match the first 8 bytes of a legacy `<gen>`.
 
-The `p|` discriminator is **safe by name-validator construction**, not by accident: AWS SQS queue names (and elastickv's `validateQueueName`) admit only `[A-Za-z0-9_-]` plus the optional `.fifo` suffix, so no queue name can contain `|`. The existing `!sqs|msg|data|<queue>|...` segment is therefore terminated by a `|` that no queue name can produce, and the new `!sqs|msg|data|p|<queue>|...` segment starts with a literal byte sequence (`p|`) that cannot appear at the same position in any legacy key. The on-disk queue segment is `base64.RawURLEncoding(<queue>)` (alphabet `A-Za-z0-9-_`), and `|` is outside that alphabet, so an encoded queue segment can never produce the literal three bytes `p|` that the discriminator relies on. **Each partitioned constructor terminates the variable-length encoded queue segment with a `|` byte before the fixed-width partition `uint32`** — without that terminator, a prefix scan for queue `q` would also match queue `q1` because `base64("q")` is a strict byte prefix of `base64("q1")`. The implementation PR's name validator must continue to reject `|` in queue names; any future relaxation of that rule has to revisit this prefix scheme first.
+The `p|` discriminator is **safe by name-validator construction**, not by accident: AWS SQS queue names (and elastickv's `validateQueueName`) admit only `[A-Za-z0-9_-]` plus the optional `.fifo` suffix, so no queue name can contain `|`. The existing `!sqs|msg|data|<queue>|...` segment is therefore terminated by a `|` that no queue name can produce, and the new `!sqs|msg|data|p|<queue>|...` segment starts with a literal byte sequence (`p|`) that cannot appear at the same position in any legacy key. The on-disk queue segment is `base64.RawURLEncoding(<queue>)` (alphabet `A-Za-z0-9-_`), and `|` is outside that alphabet, so an encoded queue segment can never produce the literal three bytes `p|` that the discriminator relies on. **Each partitioned constructor terminates the variable-length encoded queue segment with a `|` byte before the fixed-width partition `uint32`** — without that terminator, a prefix scan for queue `q` would also match queue `q1` because `base64("q")` is a strict byte prefix of `base64("q1")`. The queue-name validator must continue to reject `|`; any future relaxation of that rule has to revisit this prefix scheme first.
 
-Concretely, the implementation PR exposes **two named constructors** rather than a variadic dispatcher (Claude review on PR #664 flagged the variadic form as a footgun: `sqsMsgDataKey(q, gen, id, p0, p1)` would silently ignore `p1` and the compiler would not catch it). The dispatch lives at the call site, where `meta.PartitionCount` is already in scope:
+Concretely, the implementation exposes **two named constructors** rather than a variadic dispatcher (Claude review on PR #664 flagged the variadic form as a footgun: `sqsMsgDataKey(q, gen, id, p0, p1)` would silently ignore `p1` and the compiler would not catch it). The dispatch lives at the call site, where `meta.PartitionCount` is already in scope:
 
 ```go
 // Two distinct constructors, one per keyspace. Implemented in
@@ -62,9 +62,9 @@ func sqsMsgDataKey(queueName string, gen uint64, messageID string) []byte       
 func sqsPartitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
 
 // Dispatch at the call site. No variadic, no silent argument loss.
-// PR 5 wires this dispatch at every call site that today calls
-// sqsMsgDataKey directly; PR 3 only adds the partitioned constructor
-// so PR 5 stays a small change.
+// Send / Receive / Delete / reaper call sites route through the
+// dispatch helpers so legacy queues keep the old keyspace while
+// PartitionCount > 1 queues use the partitioned prefix.
 var dataKey []byte
 if meta.PartitionCount > 1 {
     dataKey = sqsPartitionedMsgDataKey(queueName, partition, gen, msgID)
@@ -225,25 +225,18 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
         or every partition tried even non-blockingly). The "deadline
         expires" condition therefore degrades long-poll calls to point
         reads, it does not cut the fanout short.
-     b. Resolve the leader for (queue, partitionIndex).
-     c. If this node is the leader: scan locally, deliver candidates,
-        long-polling for at most remainingWait.
-     d. Otherwise: forward the request to the leader-of-partition via
-        the existing leader-proxy machinery (proxyToLeader, extended
-        to accept a partition argument so the proxy target is the
-        right shard, not just "the queue's leader"). The proxied call
-        carries an `X-Elastickv-Receive-Partition: <k>` header so the
-        downstream handler knows to skip its own partition fanout and
-        scan only partition k. The remainingWait value is passed as
-        the proxied call's WaitTimeSeconds.
+     b. Build the partition-specific visibility-index bounds via
+        `sqsMsgVisScanBoundsDispatch(meta, queueName, partitionIndex, ...)`.
+     c. Call `scanAndDeliverPartition` for that partition with the
+        shared wall-clock budget and the remaining `MaxNumberOfMessages`
+        allowance. The scan and rotation stay in-process; no public or
+        internal request header selects a partition.
 5. Aggregate the per-partition results, cap at MaxNumberOfMessages.
 ```
 
-The point is that a consumer pinned to a single endpoint **must still see messages from every partition**, even partitions whose leader is elsewhere — otherwise the SDK's "ReceiveMessage returned nothing, sleep and retry" assumption silently leaks messages forever (P1/medium review findings on PR #664). The cost is one extra hop per non-local-leader partition; for the common deployment where partitions are co-located on one Raft group, every partition's leader is the same node and there is no fanout. For deployments that spread partitions across nodes, the proxy fanout is exactly what AWS does internally — clients see uniform behaviour regardless of topology.
+The point is that a consumer pinned to a single endpoint **must still see messages from every partition** — otherwise the SDK's "ReceiveMessage returned nothing, sleep and retry" assumption silently leaks messages forever (P1/medium review findings on PR #664). The implemented fanout is internal to the handler: clients cannot select a partition, and there is no request-header partition selector.
 
-**`X-Elastickv-Receive-Partition` is an internal hop hint only** (Claude medium on PR #664 round 12). The header is set by `proxyToLeader` when the local node forwards a `ReceiveMessage` call to a partition leader; it tells the downstream handler "skip your own fan-out, scan only partition k". It is **never trusted from a client request**: the ingress handler MUST strip (or unconditionally ignore) any client-supplied `X-Elastickv-Receive-Partition` value before the partition fan-out runs. Without this guard a malicious client could send `X-Elastickv-Receive-Partition: <k>` directly to the public endpoint to force single-partition reads, observe false-empty responses for groups whose `MessageGroupId` hashes to a different partition, or repeatedly drain a targeted partition while leaving the others untouched — exactly the forwarding-semantics gap the fan-out was designed to close. The implementation PR (Phase 3.D PR 5) lands the strip as part of the same handler change that adds the fan-out, and the integration-test plan in §9 covers a "client-set internal header is ignored" case.
-
-The proxy fanout is bounded: `partitionOrder` short-circuits as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message touches at most 1 remote leader (the one for the first non-empty partition in their rotation order). A FIFO with no in-flight messages costs at most N proxy round-trips to confirm empty.
+The fanout is bounded: `scanAndDeliverOnce` stops as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message scans at most up to the first non-empty partition in the per-queue rotation order. A FIFO with no in-flight messages costs at most N partition scans to confirm empty.
 
 **Why the shared deadline matters (Claude P1 on PR #664 fifth-round review).** Without step 3, a naive implementation would pass the *original* `WaitTimeSeconds` to every sub-call, so an empty queue with `WaitTimeSeconds = 20` and `PartitionCount = 8` would hold the connection for up to **160 s** before returning empty — well past any reasonable client or load-balancer idle timeout, and a behaviour shift the SDK does not expect. With the shared deadline, the total wall-clock wait is bounded by the original `WaitTimeSeconds`: each sub-call takes whatever budget remains, the long-poll can finish early on the first non-empty partition, and the response always comes back within the AWS-documented bound. (Alternative considered: probe all partitions in parallel with a shared cancellation context, returning on the first non-empty result. Rejected for the proof PR because it changes the per-partition polling order — long-polled partitions see traffic in `partitionOrder` rotation today, and parallel probing would erase that ordering. Sequential with a shared deadline is simpler, preserves rotation, and matches AWS's internal fanout semantics.)
 
@@ -356,11 +349,11 @@ This is out of scope here.
    - Assert it returns in **≤ 3 s** (2 s budget + reasonable overhead), not in 4 × 2 = 8 s. A naive implementation that drops the `remainingWait` threading and passes the original `WaitTimeSeconds` to every sub-call will time out at 8 s and the test will fail.
    - Companion variant: send no messages, call `ReceiveMessage(WaitTimeSeconds = 0)` — the loop must still iterate every partition with a non-blocking point-read (per §4.2 step 4a) and return promptly with empty.
 
-6. **`X-Elastickv-Receive-Partition` ingress strip** (`adapter/sqs_partitioned_internal_header_test.go`): pins the §4.2 security invariant that the partition hop hint is internal-only. A direct client request must not be able to bypass the fan-out.
-   - Create a partitioned queue with `PartitionCount = 4`. Send 4 messages whose `MessageGroupId` values hash to 4 different partitions (one per partition).
-   - Call `ReceiveMessage(MaxNumberOfMessages = 4)` from a direct client with `X-Elastickv-Receive-Partition: 0` set in the request headers (i.e. simulating a malicious client trying to skip the fan-out).
-   - Assert the response carries messages from **all four partitions**, identical to a call without the header. A regression that trusts the client-supplied header would return at most one message (only the partition-0 entry) and a malicious client could observe false-empty results for the other three groups.
-   - Companion variant: same request without the header — the response must be byte-identical to the variant above (same message set), so the strip path cannot accidentally introduce a divergence.
+6. **Partitioned send/receive/delete round-trip** (`adapter/sqs_partitioned_dispatch_test.go`):
+   - Create a partitioned queue shape with `PartitionCount = 4`.
+   - Send messages whose `MessageGroupId` values hash across multiple partitions.
+   - Call `ReceiveMessage(MaxNumberOfMessages = 10)` until the queue drains.
+   - Assert the response surfaces every message across the partitioned visibility prefixes, each returned receipt handle is v2 and carries the partition `partitionFor(meta, MessageGroupId)` computed, and `DeleteMessage` removes the record from the same partition.
 
 7. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
 
@@ -370,14 +363,14 @@ This is out of scope here.
 
 ## 10. Open Questions
 
-1. **Partition count limits**: 32 is the proposal's max. AWS HT-FIFO has no documented per-queue cap; 32 is enough for ~30,000 RPS per queue at the per-shard ~1,000 RPS limit. Higher would require larger per-queue meta records and more reaper cycles. Adjust later if operators demand more.
+1. **Partition count limits**: 32 is the implemented cap. AWS HT-FIFO has no documented per-queue cap; 32 is enough for ~30,000 RPS per queue at the per-shard ~1,000 RPS limit. Higher would require larger per-queue meta records and more reaper cycles. Adjust later if operators demand more.
 
 2. **Hash function**: FNV-1a is fast and stable but not cryptographically strong. An attacker who can pick `MessageGroupId` values can pin all traffic to one partition. Mitigation options:
    - Document that group IDs must be random / non-attacker-controlled.
    - Switch to xxHash64 with a process-startup-random seed (defeats the targeted attack but breaks determinism across processes — bad for the "where did this message land" question).
    - Accept the risk and document it.
 
-   The proposal's working answer is **document and accept** — the feature is for cooperative operators, not adversarial multi-tenancy.
+   The implemented answer is **document and accept** — the feature is for cooperative operators, not adversarial multi-tenancy.
 
 3. **Cross-partition ordering for visibility**: does a consumer need to see messages from partition 0 *before* partition 1 within a single ReceiveMessage call? The answer is no (within-group ordering is the only contract), but the test plan should pin this so a future "fairness" tweak does not accidentally introduce ordering across partitions.
 

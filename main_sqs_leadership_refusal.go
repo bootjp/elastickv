@@ -32,13 +32,14 @@ type sqsLeadershipController interface {
 // partitioned queue would (1) scan the legacy single-prefix
 // keyspace and report no messages (false-empty reads), and (2)
 // accept SendMessage writes under the legacy keyspace, hiding
-// them from the partition-aware fanout reader. The §11 PR 2
-// "PartitionCount > 1 rejected" gate prevents NEW partitioned
-// queues from being created in such a cluster, but does nothing
-// for queues created BEFORE the rollback. The leadership-refusal
-// hook closes that gap by stepping the affected node down via
-// TransferLeadership; the cluster picks a peer that still
-// advertises htfifo, and the partitioned queue stays correct.
+// them from the partition-aware fanout reader. The CreateQueue
+// validateHTFIFOCapability gate prevents NEW partitioned queues from
+// being created unless every required peer advertises htfifo and the
+// partition routing map is complete, but it does nothing for queues
+// created BEFORE a rollback. The leadership-refusal hook closes that
+// gap by stepping the affected node down via TransferLeadership; the
+// cluster picks a peer that still advertises htfifo, and the
+// partitioned queue stays correct.
 //
 // When it does NOT fire
 //
