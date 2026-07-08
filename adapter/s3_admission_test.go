@@ -351,6 +351,26 @@ func TestS3Server_PutObjectRejectsTruncatedFixedLengthBody(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+func TestS3Server_PutObjectRejectsUnexpectedEOFFixedLengthBody(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-unexpected")
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/admit-unexpected/short.bin", &s3UnexpectedEOFReader{payload: []byte("short")})
+	req.ContentLength = int64(len("short") + 1)
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>IncompleteBody</Code>")
+	require.Zero(t, observer.lastInflight)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-unexpected/short.bin", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
 func TestS3Server_PutObjectAdmissionReportsReadErrorBeforeSlowDown(t *testing.T) {
 	t.Parallel()
 
@@ -578,11 +598,36 @@ func TestS3Server_UploadPartAdmissionReportsReadErrorBeforeSlowDown(t *testing.T
 	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed])
 }
 
+func TestS3Server_UploadPartRejectsUnexpectedEOFFixedLengthBody(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, time.Second)
+	uploadID := initS3AdmissionMultipartUpload(t, server, "admit-part-unexpected")
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part-unexpected/object.bin?uploadId=%s&partNumber=1", uploadID),
+		&s3UnexpectedEOFReader{payload: []byte("short")},
+	)
+	req.ContentLength = int64(len("short") + 1)
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>IncompleteBody</Code>")
+	require.Zero(t, observer.lastInflight)
+}
+
 type s3AdmissionFillingErrorReader struct {
 	server  *S3Server
 	payload []byte
 	err     error
 	release func()
+	done    bool
+}
+
+type s3UnexpectedEOFReader struct {
+	payload []byte
 	done    bool
 }
 
@@ -616,6 +661,14 @@ func (r *s3AdmissionFillingErrorReader) Read(p []byte) (int, error) {
 	}
 	r.done = true
 	return copy(p, r.payload), r.err
+}
+
+func (r *s3UnexpectedEOFReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.payload), io.ErrUnexpectedEOF
 }
 
 func (r *s3AdmissionFillingErrorReader) releaseHeld() {

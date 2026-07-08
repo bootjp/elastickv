@@ -2731,7 +2731,7 @@ func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, 
 	if errors.As(err, &chunkedErr) {
 		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
 	}
-	if errors.Is(err, errS3PutIncompleteBody) {
+	if errors.Is(err, errS3PutIncompleteBody) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "IncompleteBody", Message: errS3PutIncompleteBody.Error()}, true
 	}
 	return nil, false
