@@ -49,7 +49,14 @@ const (
 	// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go:htfifoMaxPartitions.
 	// Keep this local to avoid importing adapter from internal/backup.
 	sqsMaxHTFIFOPartitions uint32 = 32
-	// sqsFifoDedupScopeQueue mirrors adapter/sqs_partitioning.go:htfifoDedupeScopeQueue.
+	// sqsFifoThroughputPerMessageGroupID mirrors
+	// adapter/sqs_partitioning.go:htfifoThroughputPerMessageGroupID.
+	sqsFifoThroughputPerMessageGroupID = "perMessageGroupId"
+	// sqsFifoDedupScopeMessageGroup mirrors
+	// adapter/sqs_partitioning.go:htfifoDedupeScopeMessageGroup.
+	sqsFifoDedupScopeMessageGroup = "messageGroup"
+	// sqsFifoDedupScopeQueue mirrors
+	// adapter/sqs_partitioning.go:htfifoDedupeScopeQueue.
 	sqsFifoDedupScopeQueue = "queue"
 )
 
@@ -638,6 +645,9 @@ func validateSQSQueueMetaPublic(pub sqsQueueMetaPublic, rel string) error {
 		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
+	if err := validateSQSQueueMetaHTFIFOEnums(pub, rel); err != nil {
+		return err
+	}
 	// PartitionCount must be a power of two when > 1. The live
 	// validator (adapter/sqs_partitioning.go:isPowerOfTwo) enforces
 	// this so partitionFor's mask AND (h & (n-1)) is equivalent to
@@ -651,13 +661,52 @@ func validateSQSQueueMetaPublic(pub sqsQueueMetaPublic, rel string) error {
 		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d exceeds max %d", rel, pub.PartitionCount, sqsMaxHTFIFOPartitions)
 	}
-	if !pub.FIFO && pub.PartitionCount > 1 {
+	if !pub.FIFO {
+		return validateSQSStandardQueueRejectsHTFIFO(pub, rel)
+	}
+	return validateSQSQueueMetaFIFOHTFIFO(pub, rel)
+}
+
+func validateSQSQueueMetaHTFIFOEnums(pub sqsQueueMetaPublic, rel string) error {
+	switch pub.FifoThroughputLimit {
+	case "", sqsFifoThroughputPerMessageGroupID, sqsFifoThroughputPerQueue:
+	default:
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: unsupported fifo_throughput_limit %q", rel, pub.FifoThroughputLimit)
+	}
+	switch pub.DeduplicationScope {
+	case "", sqsFifoDedupScopeMessageGroup, sqsFifoDedupScopeQueue:
+	default:
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: unsupported deduplication_scope %q", rel, pub.DeduplicationScope)
+	}
+	return nil
+}
+
+func validateSQSStandardQueueRejectsHTFIFO(pub sqsQueueMetaPublic, rel string) error {
+	if pub.PartitionCount > 1 {
 		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: partition_count %d is only valid on FIFO queues", rel, pub.PartitionCount)
 	}
+	if pub.FifoThroughputLimit != "" {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: fifo_throughput_limit=%q is only valid on FIFO queues", rel, pub.FifoThroughputLimit)
+	}
+	if pub.DeduplicationScope != "" {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: deduplication_scope=%q is only valid on FIFO queues", rel, pub.DeduplicationScope)
+	}
+	return nil
+}
+
+func validateSQSQueueMetaFIFOHTFIFO(pub sqsQueueMetaPublic, rel string) error {
 	if pub.PartitionCount > 1 && pub.DeduplicationScope == sqsFifoDedupScopeQueue {
 		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: deduplication_scope=%q is incompatible with partition_count %d", rel, pub.DeduplicationScope, pub.PartitionCount)
+	}
+	if pub.FifoThroughputLimit == sqsFifoThroughputPerMessageGroupID && pub.PartitionCount <= 1 {
+		return errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: fifo_throughput_limit=%q requires partition_count > 1", rel, pub.FifoThroughputLimit)
 	}
 	return nil
 }

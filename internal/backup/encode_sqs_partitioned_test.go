@@ -441,6 +441,39 @@ func TestSQSEncodeRejectsPartitionedStandardQueue(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs mirrors the live
+// validateStandardQueueRejectsHTFIFO guard: even when PartitionCount is
+// omitted or 1, Standard queues cannot carry FIFO-only HT-FIFO
+// attributes.
+func TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		extra string
+	}{
+		{name: "throughput-per-queue", extra: `"fifo_throughput_limit":"perQueue"`},
+		{name: "throughput-per-message-group", extra: `"partition_count":1,"fifo_throughput_limit":"perMessageGroupId"`},
+		{name: "dedup-queue", extra: `"deduplication_scope":"queue"`},
+		{name: "dedup-message-group", extra: `"partition_count":1,"deduplication_scope":"messageGroup"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "standard",
+				[]byte(`{"format_version":1,"name":"standard",`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,`+tc.extra+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
 // TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO pins the
 // restore-side mirror of validatePartitionConfig's HT-FIFO dedup
 // rule. Queue-scoped dedup cannot be represented by partitioned dedup
@@ -460,6 +493,63 @@ func TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO(t *testing.T) {
 	err := NewSQSRecordEncoder(in).Encode(b)
 	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
 		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+// TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions mirrors
+// the live FifoThroughputLimit=perMessageGroupId rule: callers must
+// explicitly set PartitionCount > 1. Accepting a single-partition dump
+// with that throughput mode would persist live-impossible metadata.
+func TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions(t *testing.T) {
+	t.Parallel()
+	for _, queueMeta := range []string{
+		`{"format_version":1,"name":"bad.fifo","fifo":true,` +
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,` +
+			`"delay_seconds":0,"fifo_throughput_limit":"perMessageGroupId"}`,
+		`{"format_version":1,"name":"bad.fifo","fifo":true,` +
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,` +
+			`"delay_seconds":0,"partition_count":1,"fifo_throughput_limit":"perMessageGroupId"}`,
+	} {
+		t.Run(queueMeta, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo", []byte(queueMeta), nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeRejectsUnknownHTFIFOAttributeValues mirrors the live
+// CreateQueue attribute parser vocabulary for HT-FIFO fields. Unknown
+// strings must not be persisted into restored queue metadata.
+func TestSQSEncodeRejectsUnknownHTFIFOAttributeValues(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		extra string
+	}{
+		{name: "bad-throughput", extra: `"fifo_throughput_limit":"bogus"`},
+		{name: "bad-dedup", extra: `"deduplication_scope":"bogus"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo",
+				[]byte(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":2,`+tc.extra+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
 	}
 }
 

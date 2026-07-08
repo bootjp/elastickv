@@ -98,7 +98,7 @@ Option A is recommended for parity with the classic layout and to avoid a decode
 
 The full decision matrix lives in the table under §"Dump format." The encoder fails closed with these sentinels:
 
-- `_queue.json` has a live-impossible HT-FIFO shape → **`ErrSQSEncodeInvalidQueue`**. This includes non-power-of-two `partition_count` values, values above the HT-FIFO cap of 32, `partition_count > 1` on non-FIFO queues, and `partition_count > 1` with `deduplication_scope:"queue"`. `partitionForGroup` uses the same mask contract as the live adapter, and partitioned dedup rows are keyed by `(partition, group, dedupID)`, so malformed metadata must fail before any message is staged. Pinned by `TestSQSEncodeRejectsNonPowerOfTwoPartitionCount`, `TestSQSEncodeRejectsTooLargePartitionCount`, `TestSQSEncodeRejectsPartitionedStandardQueue`, `TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO`, and `TestSQSEncodeAcceptsPowerOfTwoPartitionCount`.
+- `_queue.json` has a live-impossible HT-FIFO shape → **`ErrSQSEncodeInvalidQueue`**. This includes non-power-of-two `partition_count` values, values above the HT-FIFO cap of 32, any FIFO-only HT-FIFO attribute on a Standard queue, `fifo_throughput_limit:"perMessageGroupId"` without `partition_count > 1`, unknown `fifo_throughput_limit` / `deduplication_scope` strings, and `partition_count > 1` with `deduplication_scope:"queue"`. `partitionForGroup` uses the same mask contract as the live adapter, and partitioned dedup rows are keyed by `(partition, group, dedupID)`, so malformed metadata must fail before any message is staged. Pinned by `TestSQSEncodeRejectsNonPowerOfTwoPartitionCount`, `TestSQSEncodeRejectsTooLargePartitionCount`, `TestSQSEncodeRejectsPartitionedStandardQueue`, `TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs`, `TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions`, `TestSQSEncodeRejectsUnknownHTFIFOAttributeValues`, `TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO`, and `TestSQSEncodeAcceptsPowerOfTwoPartitionCount`.
 - `meta.PartitionCount > 1` AND `rec.Partition == nil` (pre-M5-3 dump under lifted gate, or M5-3 decoder bug) → **`ErrSQSEncodeMissingPartition`**. The operator must re-decode with an M5-3 decoder; replaying a legacy dump into a partitioned queue would silently move every message to partition 0.
 - `meta.PartitionCount > 1` AND `*rec.Partition >= meta.PartitionCount` → **`ErrSQSEncodeOutOfRangePartition`** (out-of-range partition number, dump is malformed).
 - `meta.PartitionCount > 1` AND `meta.FifoThroughputLimit == "perQueue"` AND `*rec.Partition != 0` → **`ErrSQSEncodePartitionRoutingMismatch`**. The live router (`adapter/sqs_partitioning.go:71-72` in `partitionFor`) forces every group to partition 0 whenever `FifoThroughputLimit == "perQueue"`, regardless of `PartitionCount`; ReceiveMessage only scans the partition-0 lane (`adapter/sqs_keys_dispatch.go:125-126`). Accepting `*rec.Partition >= 1` for a `perQueue` queue would restore messages onto `|p|1|...` lanes the live receive fan-out never visits — silent data loss on first read. Pinned by `TestSQSEncodeRejectsNonzeroPartitionOnPerQueueHTFIFO`.
@@ -137,7 +137,7 @@ internal/backup/sqs_test.go                  # partitioned data/side-key parser 
 
 ## Milestones (within M5-3)
 
-The slice ships as a single PR — the decoder format change and encoder partition branch are tightly coupled (a partial landing would either reject all M5-3 dumps at the new encoder or break old encoders against new dumps).
+The slice landed as a single PR because the decoder format change and encoder partition branch are tightly coupled. A partial landing would either reject all M5-3 dumps at the new encoder or break old encoders against new dumps.
 
 ## Test plan
 
@@ -153,6 +153,9 @@ The slice ships as a single PR — the decoder format change and encoder partiti
 | `TestSQSEncodeRejectsNonPowerOfTwoPartitionCount`                 | non-power-of-two `partition_count > 1` fails closed with `ErrSQSEncodeInvalidQueue`                                     |
 | `TestSQSEncodeRejectsTooLargePartitionCount`                      | power-of-two `partition_count` values above the live cap of 32 fail closed with `ErrSQSEncodeInvalidQueue`              |
 | `TestSQSEncodeRejectsPartitionedStandardQueue`                    | `partition_count > 1` on a non-FIFO queue fails closed with `ErrSQSEncodeInvalidQueue`                                  |
+| `TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs`              | Standard queues with `fifo_throughput_limit` or `deduplication_scope` fail closed even when `partition_count <= 1`      |
+| `TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions`       | FIFO queues cannot advertise `fifo_throughput_limit:"perMessageGroupId"` without `partition_count > 1`                 |
+| `TestSQSEncodeRejectsUnknownHTFIFOAttributeValues`                | unknown `fifo_throughput_limit` / `deduplication_scope` strings fail closed before metadata is staged                   |
 | `TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO`           | `partition_count > 1` with `deduplication_scope:"queue"` fails closed with `ErrSQSEncodeInvalidQueue`                   |
 | `TestSQSEncodeAcceptsPowerOfTwoPartitionCount`                    | power-of-two partition counts remain accepted                                                                          |
 | `TestSQSEncodeClassicQueueWithExplicitPartitionZeroUsesClassicKeys` | classic queue with explicit `"partition":0` still emits classic keys                                                  |
