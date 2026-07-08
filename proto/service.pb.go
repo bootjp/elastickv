@@ -2304,10 +2304,10 @@ const file_service_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0eprevious_index\x18\x02 \x01(\x04R\rpreviousIndex\"<\n" +
 	"$RaftAdminConfigurationChangeResponse\x12\x14\n" +
-	"\x05index\x18\x01 \x01(\x04R\x05index\"h\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\"z\n" +
 	"\"RaftAdminTransferLeadershipRequest\x12\x1b\n" +
 	"\ttarget_id\x18\x01 \x01(\tR\btargetId\x12%\n" +
-	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddress\"%\n" +
+	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddressJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06\"%\n" +
 	"#RaftAdminTransferLeadershipResponse*\xa9\x01\n" +
 	"\x0eRaftAdminState\x12\x1c\n" +
 	"\x18RAFT_ADMIN_STATE_UNKNOWN\x10\x00\x12\x1d\n" +
