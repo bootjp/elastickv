@@ -195,6 +195,7 @@ var (
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
+	keyvizLabelsEnabled          = flag.Bool("keyvizLabelsEnabled", false, "Enable per-adapter KeyViz row labels. Default false keeps legacy route-only rows during rolling upgrades")
 
 	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_implemented_keyviz_hot_key_topk).
 	// Off by default — the disabled-case adds one early-return branch
@@ -425,6 +426,7 @@ func run() error {
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
+		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
 
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
@@ -2046,6 +2048,7 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
 		HotKeysEnabled:         *keyvizHotKeysEnabled,
 		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
 		HotKeysSampleRate:      *keyvizHotKeysSampleRate,

@@ -21,8 +21,8 @@ import (
 // between the hot path and the aggregator (design §4 pool-vs-snapshot
 // ownership) — never aliased by an SS entry or a published snapshot.
 type hotKeyEvent struct {
-	routeID uint64
-	key     *[]byte
+	slot slotKey
+	key  *[]byte
 }
 
 // KeyvizHotKeysSnapshot is the immutable per-route view a drill-down
@@ -34,6 +34,7 @@ type hotKeyEvent struct {
 // keyviz package because the aggregator owns and publishes it.
 type KeyvizHotKeysSnapshot struct {
 	RouteID         uint64
+	Label           Label
 	SampledN        uint64    // events the sketch actually saw this window
 	DroppedSamples  uint64    // node-global: bounded-queue back-pressure drops
 	SkippedLongKeys uint64    // node-global: pre-sample length-cap rejects
@@ -69,12 +70,12 @@ type hotKeysAggregator struct {
 	// read once per publish by the aggregator).
 	dropped atomic.Uint64
 	skipped atomic.Uint64
-	// Per-route sampled-N counters (incremented by the aggregator only,
+	// Per-route/label sampled-N counters (incremented by the aggregator only,
 	// reset on publish). Map mutation is guarded by the fact that the
 	// aggregator is the single writer.
-	perRouteN map[uint64]*uint64
-	// Per-route Space-Saving sketches (single-writer-by-aggregator).
-	sketches map[uint64]*spaceSaving
+	perSlotN map[slotKey]*uint64
+	// Per-route/label Space-Saving sketches (single-writer-by-aggregator).
+	sketches map[slotKey]*spaceSaving
 	// rngState backs the sample gate. We avoid math/rand/v2 entirely
 	// (gosec G404 flags the package as a weak crypto generator — but
 	// it's also the only built-in PRNG, and we'd otherwise need a
@@ -156,8 +157,8 @@ func newHotKeysAggregator(s *MemSampler, opts MemSamplerOptions) *hotKeysAggrega
 		maxKeyLen:  maxKeyLen,
 		step:       opts.Step,
 		clock:      now,
-		perRouteN:  map[uint64]*uint64{},
-		sketches:   map[uint64]*spaceSaving{},
+		perSlotN:   map[slotKey]*uint64{},
+		sketches:   map[slotKey]*spaceSaving{},
 	}
 	a.keyPool = &sync.Pool{
 		New: func() any {
@@ -206,7 +207,7 @@ func (a *hotKeysAggregator) releaseKeyBuffer(bp *[]byte) {
 //
 // Returns true iff the event was enqueued for the aggregator. The
 // boolean is for tests; the production caller in Observe ignores it.
-func (a *hotKeysAggregator) observe(routeID uint64, key []byte) bool {
+func (a *hotKeysAggregator) observe(routeID uint64, label Label, key []byte) bool {
 	if len(key) > a.maxKeyLen {
 		a.skipped.Add(1)
 		return false
@@ -227,7 +228,7 @@ func (a *hotKeysAggregator) observe(routeID uint64, key []byte) bool {
 	bp := a.borrowKeyBuffer()
 	*bp = append(*bp, key...)
 	select {
-	case a.ch <- hotKeyEvent{routeID: routeID, key: bp}:
+	case a.ch <- hotKeyEvent{slot: slotKey{RouteID: routeID, Label: label}, key: bp}:
 		// bp will be released by the aggregator after it copies the key
 		// into the SS entry's own storage.
 		return true
@@ -250,7 +251,7 @@ func (a *hotKeysAggregator) observe(routeID uint64, key []byte) bool {
 //	  }
 //	}
 //
-// Single-writer to every per-route SS sketch and to perRouteN, so no
+// Single-writer to every per-route/label SS sketch and to perSlotN, so no
 // lock is needed on the update path. ctx cancellation drains a final
 // publish so the last window's data isn't lost on shutdown.
 func (a *hotKeysAggregator) run(ctx context.Context) {
@@ -287,17 +288,17 @@ func (a *hotKeysAggregator) run(ctx context.Context) {
 // consume handles one event: drains the sample-N counter for the route,
 // updates the Space-Saving sketch, and releases the pool buffer.
 func (a *hotKeysAggregator) consume(e hotKeyEvent) {
-	n, ok := a.perRouteN[e.routeID]
+	n, ok := a.perSlotN[e.slot]
 	if !ok {
 		n = new(uint64)
-		a.perRouteN[e.routeID] = n
+		a.perSlotN[e.slot] = n
 	}
 	*n++
 
-	sk, ok := a.sketches[e.routeID]
+	sk, ok := a.sketches[e.slot]
 	if !ok {
 		sk = newSpaceSaving(a.capacity)
-		a.sketches[e.routeID] = sk
+		a.sketches[e.slot] = sk
 	}
 	// SS copies the bytes into its own entry storage; the pool buffer
 	// is then safe to return immediately.
@@ -332,24 +333,25 @@ func (a *hotKeysAggregator) publishAndReset() {
 	dropped := a.dropped.Swap(0)
 	skipped := a.skipped.Swap(0)
 	tbl := a.s.table.Load()
-	for rid, sk := range a.sketches {
-		slot := lookupSlotForRoute(tbl, rid)
+	for skey, sk := range a.sketches {
+		slot := lookupSlotForRoute(tbl, skey.RouteID, skey.Label)
 		if slot == nil {
 			// Route was removed mid-window: drop the sketch AND its
 			// per-route counter so we don't accumulate dead entries
 			// under route churn (gemini HIGH on PR #854 — without this,
 			// every removed route's m × key bytes plus a *uint64 stays
 			// in the aggregator forever).
-			delete(a.sketches, rid)
-			delete(a.perRouteN, rid)
+			delete(a.sketches, skey)
+			delete(a.perSlotN, skey)
 			continue
 		}
 		n := uint64(0)
-		if p, ok := a.perRouteN[rid]; ok {
+		if p, ok := a.perSlotN[skey]; ok {
 			n = *p
 		}
 		snap := &KeyvizHotKeysSnapshot{
-			RouteID:         rid,
+			RouteID:         skey.RouteID,
+			Label:           skey.Label,
 			SampledN:        n,
 			DroppedSamples:  dropped,
 			SkippedLongKeys: skipped,
@@ -365,8 +367,8 @@ func (a *hotKeysAggregator) publishAndReset() {
 	// captured-and-reset by the Swap(0) calls at the top of this
 	// function — issuing another Store(0) here would re-clobber any
 	// hot-path Add that arrived during the publish loop.
-	for k := range a.perRouteN {
-		*a.perRouteN[k] = 0
+	for k := range a.perSlotN {
+		*a.perSlotN[k] = 0
 	}
 }
 
@@ -388,11 +390,11 @@ func toSnapshotEntries(es []ssEntrySnap) []KeyvizHotKeyEntry {
 // the route table. Aggregate / virtual buckets are NOT eligible for
 // hot-keys tracking (design §2.2): they coarsen multiple routes and
 // "top-K within an aggregate" is not meaningful.
-func lookupSlotForRoute(tbl *routeTable, routeID uint64) *routeSlot {
+func lookupSlotForRoute(tbl *routeTable, routeID uint64, label Label) *routeSlot {
 	if tbl == nil {
 		return nil
 	}
-	if s, ok := tbl.slots[routeID]; ok && !s.Aggregate {
+	if s, ok := tbl.slots[slotKey{RouteID: routeID, Label: label}]; ok && !s.Aggregate {
 		return s
 	}
 	return nil

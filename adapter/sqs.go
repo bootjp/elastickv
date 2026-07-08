@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -285,7 +286,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 	s := &SQSServer{
 		listen:       listen,
 		store:        st,
-		coordinator:  coordinate,
+		coordinator:  kv.WithKeyVizLabel(coordinate, keyviz.LabelSQS),
 		reaperCtx:    reaperCtx,
 		reaperCancel: reaperCancel,
 		throttle:     newBucketStoreDefault(),

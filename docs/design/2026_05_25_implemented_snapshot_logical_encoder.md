@@ -1,8 +1,8 @@
 # Snapshot Logical Encoder (Phase 0b)
 
-Status: Partial (M1–M5 merged via PRs #807 / #841 / #847 / #849 / #864 / #846 / #892; M6 CLI in review at PR #896)
+Status: Implemented (M1-M6 merged; external-sort remains a future optimization)
 Author: bootjp
-Date: 2026-05-25 (promoted proposed → partial 2026-06-01 in PR #896)
+Date: 2026-05-25
 
 ## Background
 
@@ -22,9 +22,9 @@ specifics the parent doc left at sketch level (parent §"Encoder:
 The parent doc is the format owner and remains authoritative for the
 directory-tree shape, filename encoding, and `MANIFEST.json`. This
 doc owns the **reverse-direction wire-format reconstruction** and the
-decisions that only arise on the encode side. On landing this
-proposal, the parent doc is promoted `proposed` → `partial` (Phase 0a
-shipped) via `git mv`.
+decisions that only arise on the encode side. The Phase 0b v1 encoder
+is implemented through the CLI milestone; the external-sort path
+remains a future optimization outside the implemented v1 surface.
 
 ## Why a separate design doc
 
@@ -33,7 +33,7 @@ surface only on the encode side, and each is a wire-format decision:
 
 1. **The directory tree is lossy w.r.t. the internal keyspace.** The
    decoder *drops* every re-derivable internal index (Redis TTL scan
-   index, DynamoDB GSI rows, SQS visibility / dedup / group / by-age
+   index, DynamoDB GSI rows, SQS visibility / dedup / by-age
    side records, per-scope generation counters). A loadable `.fsm`
    must contain those rows, or the restored node serves wrong results
    (a TTL'd key never expires; a GSI query returns nothing; an SQS
@@ -183,7 +183,7 @@ encode they map as follows:
 | Class | Examples | Encode behavior |
 |---|---|---|
 | **User-visible records** | Redis strings/hashes/.../streams; DynamoDB items + `_schema.json`; S3 object bodies + sidecars; SQS `messages.jsonl` + `_queue.json` | Reconstructed from the directory tree — the direct inverse of each Phase 0a `Handle*` encoder. |
-| **Re-derivable indexes** | Redis TTL scan index (`!redis\|ttl\|`); DynamoDB GSI rows (`!ddb\|gsi\|`); SQS vis/byage/dedup/group side records; per-scope generation counters (`!s3\|bucket\|gen\|`, `!ddb\|meta\|gen\|`, `!sqs\|queue\|gen\|`) + the SQS queue sequence counter (`!sqs\|queue\|seq\|`) | **Reconstructed by the encoder** from the user records + config it just read. Required for a correct loadable image. |
+| **Re-derivable indexes** | Redis TTL scan index (`!redis\|ttl\|`); DynamoDB GSI rows (`!ddb\|gsi\|`) for the supported per-item layout; SQS vis/byage/dedup side records; per-scope generation counters (`!s3\|bucket\|gen\|`, `!ddb\|meta\|gen\|`, `!sqs\|queue\|gen\|`) + the SQS queue sequence counter (`!sqs\|queue\|seq\|`) | **Reconstructed by the encoder** from the user records + config it just read. Required for a correct loadable image. |
 | **Per-cluster operational / in-flight transactional** | HLC ceiling, Raft term/index/conf, FSM markers, write-conflict counter; `!txn\|` intents/locks; `!dist\|`, `!encryption\|` rows | **Never emitted.** They belong to the receiving cluster, not the data. The restore runbook seeds HLC/Raft state via the `.snap` token, not via FSM rows. |
 
 The middle row is what makes Phase 0b larger than "reverse the
@@ -201,17 +201,20 @@ each adapter, mirroring the live adapter's index builders:
   adapter does on `PutItem`. (Parent doc: "Re-creating the table from
   `_schema.json` and replaying the items rebuilds the GSI.") The
   encoder performs that derivation offline.
-- **SQS per-message side records.** Re-derive `dedup`, `group`,
-  `byage`, `vis` rows from `messages.jsonl` + `_queue.json` using the
+- **SQS per-message side records.** Re-derive `dedup`, `byage`, `vis`
+  rows from `messages.jsonl` + `_queue.json` using the
   same rules as `adapter/sqs_messages.go` / `sqs_keys.go`. By default
   messages restore fully visible (vis rows zeroed), matching parent
   §"SQS". **Both the classic and the partitioned-FIFO variants must be
   emitted** — `adapter/sqs_keys.go` defines
-  `SqsPartitionedMsg{Data,Vis,Dedup,Group,ByAge}Prefix` for partitioned
+  `SqsPartitionedMsg{Data,Vis,Dedup,ByAge}Prefix` for partitioned
   queues (`partition_count > 1` in `_queue.json`), and emitting only
   the classic family would silently break dedup on a restored
   partitioned FIFO queue. The SQS milestone's decision gate
-  (§"Milestones") covers both families.
+  (§"Milestones") covers both families. The encoder deliberately emits
+  no `group` rows: in the live adapter, group-lock key presence means
+  "lock held", so reconstructing group rows from a dump would
+  permanently block FIFO groups after restore.
 - **Queue-level / generation counters.** Per-scope generation counters
   (`!s3|bucket|gen|`, `!ddb|meta|gen|`, `!sqs|queue|gen|`) and the SQS
   queue-level sequence counter (`!sqs|queue|seq|`,
@@ -266,14 +269,15 @@ covered by a cross-check test that asserts the encoder's derived index
 rows are byte-identical to the live adapter's output for a shared
 fixture.
 
-> **Scope note / open question.** GSI and SQS-side-record derivation
-> are the heaviest pieces. If the cross-check tests show the live
-> builders are impractical to mirror offline within Phase 0b, the
-> fallback is to emit only the user records + cheap indexes (TTL,
-> generation) and document that GSI/SQS-side-state rebuild lazily on
-> first adapter access after restart. The recommended path is full
-> reconstruction; the fallback is called out in §"Milestones" as a
-> per-adapter decision gate.
+> **Scope note.** GSI and SQS-side-record derivation were the heaviest
+> pieces. The implemented path follows the full-reconstruction option
+> for the supported dump layouts: derived GSI rows are emitted for the
+> per-item DynamoDB layout, and SQS vis/byage/dedup side rows are emitted
+> offline and pinned by cross-check tests against the live key builders.
+> DynamoDB `--bundle jsonl` is not part of the implemented encoder
+> surface; the encoder rejects that layout fail-closed. SQS group rows
+> are intentionally omitted for the lock-presence reason above. The
+> lazy-rebuild fallback below was not chosen for Phase 0b v1.
 >
 > **The fallback is not zero-cost transparency.** A missing GSI row
 > makes a DynamoDB GSI query return empty *silently* (no error); a
@@ -306,9 +310,10 @@ and the value envelopes from the same codecs
   `internal/backup/redis_string.go` `RedisHLLPrefix`) + `!redis|ttl|`.
   Plus the TTL scan index for every expiring key.
 - **DynamoDB** (`encode_dynamodb.go`): `_schema.json` → `!ddb|meta|`;
-  items → `!ddb|item|<table>|<gen>|<orderedKey>`; generation counter;
-  derived `!ddb|gsi|` rows. Reads both per-item and `--bundle jsonl`
-  layouts (`MANIFEST.dynamodb_layout`).
+  per-item layout records → `!ddb|item|<table>|<gen>|<orderedKey>`;
+  generation counter; derived `!ddb|gsi|` rows. The implemented encoder
+  does **not** read `--bundle jsonl` / `MANIFEST.dynamodb_layout=jsonl`;
+  it rejects that layout with `ErrEncodeUnsupportedDynamoDBLayout`.
 - **S3** (`encode_s3.go`): `_bucket.json` → `!s3|bucket|meta|` + gen
   counter; each object body re-split into `!s3|blob|...` chunks;
   `!s3|obj|...` manifest row from the sidecar. Reverses the
@@ -326,9 +331,10 @@ and the value envelopes from the same codecs
   the same — individual chunk byte-lengths are not load-bearing. The
   reconstructed object is byte-identical; only the internal chunk
   partitioning may differ from the original (no correctness impact).
-  An optional `--s3-chunk-size` flag (default = `s3ChunkSize`) lets an
-  operator match a non-default deployment; a mismatch changes chunk
-  count only, never object bytes.
+  There is no `--s3-chunk-size` CLI flag in the implemented surface;
+  the encoder uses the canonical `s3ChunkSize` constant. Changing the
+  chunk count would not change object bytes, but making it configurable
+  is a future CLI extension.
 - **SQS** (`encode_sqs.go`): `_queue.json` → `!sqs|queue|meta|` + gen;
   `messages.jsonl` → `!sqs|msg|data|` rows in stored order; derived
   side records.
@@ -360,8 +366,9 @@ dependency on the live key-format version (parent §"Costs"). Guards:
   restore operator can confirm the encoder matched the target
   cluster's key-format version.
 - `cluster_id` from `MANIFEST.json` is surfaced in `ENCODE_INFO.json`;
-  the restore runbook step refuses to place a file whose `cluster_id`
-  differs from the target node (parent §"Risks").
+  `cmd/elastickv-snapshot-prepare-restore` refuses to seed a target
+  data dir whose `cluster_id` differs from the sidecar unless the
+  operator explicitly declares a fresh cluster (parent §"Risks").
 
 > **Decoder cleanup folded into M1.** `internal/backup/manifest.go`'s
 > `Source.FSMCRC32C` field is dead — `emitManifest` only sets
@@ -399,9 +406,8 @@ output file, so a node never receives an unloadable `.fsm`.
 
 ## Milestones (per-adapter PRs, mirroring Phase 0a)
 
-Doc-first: this proposal lands as its own PR before any code. Then,
-in order (each its own PR, each with the cross-check + round-trip
-tests for that adapter):
+Phase 0b v1 landed in the following order (each with cross-check and
+round-trip coverage for the adapter slice):
 
 1. **Encoder core** — `encode.go`: MANIFEST read/validate, MVCC
    re-encoding, in-memory sort, EKVPBBL1 writer, in-process round-trip
@@ -433,7 +439,7 @@ P0 (per the parent doc's Phase 0b rows, made concrete here):
 | `TestEncodeRedisAllTypes` | One key per Redis type round-trips dir→fsm→dir; TTL'd keys produce the `!redis\|ttl\|` index row (cross-checked vs. live `buildTTLElems`) |
 | `TestEncodeDynamoDBItemsAndGSI` | Items + schema round-trip; derived GSI rows match the live adapter for a composite-key fixture |
 | `TestEncodeS3Rechunk` | Object body re-split into blob chunks reassembles bytewise; manifest + sidecar match |
-| `TestEncodeSQSMessagesAndSideRecords` | `messages.jsonl` → data rows in order; derived dedup/group/vis rows match the live adapter; vis zeroed by default |
+| `TestEncodeSQSMessagesAndSideRecords` | `messages.jsonl` → data rows in order; derived dedup/byage/vis rows match the live adapter; group rows are intentionally absent; vis zeroed by default |
 | `TestEncodeManifestVersionGate` | Refuses `format_version` major > supported; same-major-newer-minor allowed |
 | `TestEncodeRoundTripExact` | dir→fsm→dir equality (wall-time/provenance excluded) across an all-adapter fixture |
 | `TestEncodeRejectsOversizeEntry` | A reconstructed entry exceeding the key/value cap fails closed before any byte is written |
@@ -443,7 +449,7 @@ P1:
 | Test | Verifies |
 |---|---|
 | `TestEncoderProducesLoadableSnapshot` | Output placed under a fresh node's `fsm-snap/` + `snap/` loads on `Open`; every adapter serves the original data |
-| `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; mismatch is detectable by the runbook step |
+| `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; `elastickv-snapshot-prepare-restore` detects mismatch before creating the raft data dir |
 
 P2:
 

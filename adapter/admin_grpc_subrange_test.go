@@ -37,6 +37,33 @@ func TestMatrixToProtoSubRowsDoNotCollide(t *testing.T) {
 	require.Equal(t, []uint64{9}, byID["route:1#1"])
 }
 
+func TestMatrixToProtoLabelsDoNotCollide(t *testing.T) {
+	t.Parallel()
+	pick := func(r keyviz.MatrixRow) uint64 { return r.Writes }
+	cols := []keyviz.MatrixColumn{
+		{
+			At: time.Unix(1_700_000_000, 0),
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Label: keyviz.LabelDynamo, Start: []byte("a"), End: []byte("z"), SubBucketCount: 1, Writes: 5},
+				{RouteID: 1, Label: keyviz.LabelRedis, Start: []byte("a"), End: []byte("z"), SubBucketCount: 1, Writes: 9},
+			},
+		},
+	}
+
+	resp := matrixToProto(cols, pick, 0)
+	require.Len(t, resp.Rows, 2)
+	byID := map[string]uint64{}
+	labels := map[string]string{}
+	for _, row := range resp.Rows {
+		byID[row.BucketId] = row.Values[0]
+		labels[row.BucketId] = row.Label
+	}
+	require.Equal(t, uint64(5), byID["route:1:dynamo"])
+	require.Equal(t, "dynamo", labels["route:1:dynamo"])
+	require.Equal(t, uint64(9), byID["route:1:redis"])
+	require.Equal(t, "redis", labels["route:1:redis"])
+}
+
 // TestNewKeyVizRowFromAggregateZeroTotalFallback pins the adapter/handler
 // harmonization (Claude round-2 follow-up): an aggregate row whose
 // MemberRoutesTotal is still 0 (a just-coalesced bucket serialized before
