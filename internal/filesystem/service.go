@@ -35,6 +35,7 @@ const (
 	defaultLeaseReaperLimit          = 256
 	statFSScanPageSize               = 512
 	openRefScanLimit                 = 2
+	openTxnRetryLimit                = 4
 )
 
 var (
@@ -374,6 +375,7 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 	}
 	elems := make([]*kv.Elem[kv.OP], 0)
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
+	oldSize := meta.Size
 	var delta usageDelta
 	if mask.Size {
 		if meta.Type == TypeDirectory {
@@ -406,6 +408,8 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 	}
 	if mask.Mtime {
 		meta.MtimeNsec = attrs.MtimeNsec
+	} else if mask.Size && attrs.Size != oldSize {
+		meta.MtimeNsec = now
 	}
 	meta.CtimeNsec = now
 	elem, err := putElem(fskeys.InodeKey(inode), meta)
@@ -432,30 +436,44 @@ func (s *Service) Mkdir(ctx context.Context, parent uint64, name []byte, opts Cr
 }
 
 func (s *Service) Open(ctx context.Context, inode uint64, clientID []byte) (uint64, error) {
-	ts, err := s.readTS(ctx)
-	if err != nil {
-		return 0, err
-	}
-	meta, err := s.inodeAt(ctx, inode, ts)
-	if err != nil {
-		return 0, err
-	}
 	fh, err := s.allocID()
 	if err != nil {
 		return 0, err
 	}
+	var lastErr error
+	for range openTxnRetryLimit {
+		if err := s.openWithHandle(ctx, inode, clientID, fh); err != nil {
+			if errors.Is(err, store.ErrWriteConflict) {
+				lastErr = err
+				continue
+			}
+			return 0, err
+		}
+		return fh, nil
+	}
+	return 0, lastErr
+}
+
+func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []byte, fh uint64) error {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+		return err
+	}
 	refElem, err := s.refPutElem(inode, clientID, fh)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	inodeElem, err := putElem(fskeys.InodeKey(inode), meta)
+	fenceElem, err := s.refFenceElem(inode)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err := s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{refElem, inodeElem}, [][]byte{fskeys.InodeKey(inode)}); err != nil {
-		return 0, err
-	}
-	return fh, nil
+	return s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{refElem, fenceElem}, [][]byte{
+		fskeys.InodeKey(inode),
+		fskeys.RefFenceKey(inode),
+	})
 }
 
 //nolint:cyclop // Read handles EOF, sparse chunks, and chunk boundary copying in one linear path.
@@ -572,35 +590,14 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 		if err != nil {
 			return 0, err
 		}
-		var (
-			oldLen uint64
-			value  []byte
-		)
 		fullChunkWrite := writeStart == chunkStart && writeEnd == chunkStart+chunkSize
-		if fullChunkWrite {
-			switch {
-			case chunkStart >= meta.Size:
-				oldLen = 0
-			case chunkStart+chunkSize <= meta.Size:
-				oldLen = chunkSize
-			default:
-				oldLen = meta.Size - chunkStart
-			}
-			value = trimChunk(data[srcStart:srcEnd])
-		} else {
-			chunk := make([]byte, chunkLen)
-			raw, getErr := s.store.GetAt(ctx, chunkKey, ts)
-			if getErr != nil && !errors.Is(getErr, store.ErrKeyNotFound) {
-				return 0, errors.Wrap(getErr, "filesystem read chunk for write")
-			}
-			oldLen = uint64(len(raw))
-			copy(chunk, raw)
-			dstStart, err := checkedInt(writeStart - chunkStart)
-			if err != nil {
-				return 0, err
-			}
-			copy(chunk[dstStart:dstStart+(srcEnd-srcStart)], data[srcStart:srcEnd])
-			value = trimChunk(chunk)
+		oldLen, value, readChunk, err := s.writeChunkValue(
+			ctx, ts, chunkKey, chunkLen, fullChunkWrite, data, srcStart, srcEnd, writeStart, chunkStart,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if readChunk {
 			readKeys = append(readKeys, chunkKey)
 		}
 		delta = delta.merge(byteLenDelta(oldLen, uint64(len(value))))
@@ -625,6 +622,36 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 		return 0, err
 	}
 	return len(data), nil
+}
+
+func (s *Service) writeChunkValue(
+	ctx context.Context,
+	ts uint64,
+	chunkKey []byte,
+	chunkLen int,
+	fullChunkWrite bool,
+	data []byte,
+	srcStart int,
+	srcEnd int,
+	writeStart uint64,
+	chunkStart uint64,
+) (uint64, []byte, bool, error) {
+	raw, getErr := s.store.GetAt(ctx, chunkKey, ts)
+	if getErr != nil && !errors.Is(getErr, store.ErrKeyNotFound) {
+		return 0, nil, false, errors.Wrap(getErr, "filesystem read chunk for write")
+	}
+	oldLen := uint64(len(raw))
+	if fullChunkWrite {
+		return oldLen, trimChunk(data[srcStart:srcEnd]), false, nil
+	}
+	chunk := make([]byte, chunkLen)
+	copy(chunk, raw)
+	dstStart, err := checkedInt(writeStart - chunkStart)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	copy(chunk[dstStart:dstStart+(srcEnd-srcStart)], data[srcStart:srcEnd])
+	return oldLen, trimChunk(chunk), true, nil
 }
 
 func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error {
@@ -687,9 +714,6 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	if err := validateName(newName); err != nil {
 		return err
 	}
-	if bytes.Equal(oldName, newName) {
-		return nil
-	}
 	ts, err := s.readTS(ctx)
 	if err != nil {
 		return err
@@ -705,12 +729,12 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	if err != nil {
 		return err
 	}
-	if newEntry, getErr := s.dirEntryAt(ctx, oldParent, newName, ts); getErr == nil {
-		if newEntry.Type == TypeDirectory {
-			return ErrIsDir
-		}
-	} else if !errors.Is(getErr, ErrNotFound) {
-		return getErr
+	if bytes.Equal(oldName, newName) {
+		return nil
+	}
+	replacedMeta, err := s.renameReplacedFileMeta(ctx, oldParent, newName, oldEntry.Inode, ts)
+	if err != nil {
+		return err
 	}
 	now := s.now().UnixNano()
 	parentMeta.MtimeNsec = now
@@ -734,12 +758,56 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 		putParent,
 		putVersion,
 	}
-	err = s.dispatchTxn(ctx, ts, elems, [][]byte{
+	readKeys := [][]byte{
 		fskeys.InodeKey(oldParent),
 		fskeys.DirEntryKey(oldParent, oldName),
 		fskeys.DirEntryKey(oldParent, newName),
-	})
-	return err
+	}
+	var delta usageDelta
+	if replacedMeta != nil {
+		replacedElems, replacedReads, replacedDelta, err := s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
+		if err != nil {
+			return err
+		}
+		elems = append(elems, replacedElems...)
+		readKeys = append(readKeys, replacedReads...)
+		delta = delta.merge(replacedDelta)
+	}
+	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
+	if err != nil {
+		return err
+	}
+	return s.dispatchTxn(ctx, ts, elems, readKeys)
+}
+
+func (s *Service) renameReplacedFileMeta(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	sourceInode uint64,
+	ts uint64,
+) (*InodeMeta, error) {
+	replacedEntry, err := s.dirEntryAt(ctx, parent, name, ts)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if replacedEntry.Type == TypeDirectory {
+		return nil, ErrIsDir
+	}
+	if replacedEntry.Inode == sourceInode {
+		return nil, nil
+	}
+	meta, err := s.inodeAt(ctx, replacedEntry.Inode, ts)
+	if err != nil {
+		return nil, err
+	}
+	if meta.Type == TypeDirectory {
+		return nil, ErrIsDir
+	}
+	return meta, nil
 }
 
 //nolint:cyclop // Readdir has explicit dot-entry and paginated-cookie state transitions.
@@ -1045,30 +1113,62 @@ func (s *Service) ReapExpiredOpenHandleLeases(ctx context.Context, limit int) (L
 	if limit <= 0 {
 		limit = defaultLeaseReaperLimit
 	}
+	pageLimit := min(limit, maxScanPageSize)
 	readTS, err := s.readTS(ctx)
 	if err != nil {
 		return LeaseReapStats{}, err
 	}
-	prefix := fskeys.RefAllPrefix()
-	pairs, err := s.store.ScanAt(ctx, prefix, prefixEnd(prefix), limit, readTS)
-	if err != nil {
-		return LeaseReapStats{}, errors.Wrap(err, "filesystem scan open handle leases")
-	}
 	var stats LeaseReapStats
+	reapedCount := 0
 	nowNsec := s.now().UnixNano()
-	for _, pair := range pairs {
+	err = s.scanOpenHandleLeasePages(ctx, readTS, pageLimit, func(pair *store.KVPair) (bool, error) {
 		reaped, gcd, err := s.reapExpiredOpenHandleLease(ctx, pair, nowNsec)
 		if err != nil {
-			return stats, err
+			return false, err
 		}
 		if reaped {
+			reapedCount++
 			stats.ExpiredRefs++
 		}
 		if gcd {
 			stats.OrphanedInodesGCed++
 		}
+		return reapedCount >= limit, nil
+	})
+	return stats, err
+}
+
+func (s *Service) scanOpenHandleLeasePages(
+	ctx context.Context,
+	readTS uint64,
+	pageLimit int,
+	visit func(*store.KVPair) (bool, error),
+) error {
+	prefix := fskeys.RefAllPrefix()
+	start := append([]byte(nil), prefix...)
+	end := prefixEnd(prefix)
+	for {
+		pairs, err := s.store.ScanAt(ctx, start, end, pageLimit, readTS)
+		if err != nil {
+			return errors.Wrap(err, "filesystem scan open handle leases")
+		}
+		if len(pairs) == 0 {
+			return nil
+		}
+		for _, pair := range pairs {
+			stop, err := visit(pair)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		if len(pairs) < pageLimit {
+			return nil
+		}
+		start = scanCursorAfter(pairs[len(pairs)-1].Key)
 	}
-	return stats, nil
 }
 
 func (s *Service) reapExpiredOpenHandleLease(
@@ -1090,7 +1190,14 @@ func (s *Service) reapExpiredOpenHandleLease(
 	if err != nil {
 		return false, false, err
 	}
-	elems, readKeys, delta, gcd, err := s.releaseRefTxnParts(ctx, ts, lease.Inode, pair.Key)
+	current, ok, err := s.openHandleLeaseAt(ctx, pair.Key, ts)
+	if err != nil {
+		return false, false, err
+	}
+	if !ok || !current.expired(nowNsec) {
+		return false, false, nil
+	}
+	elems, readKeys, delta, gcd, err := s.releaseRefTxnParts(ctx, ts, current.Inode, pair.Key)
 	if err != nil {
 		return false, false, err
 	}
@@ -1264,26 +1371,13 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		readKeys = append(readKeys, fskeys.HomeKey(entry.Inode), fskeys.DirVersionKey(entry.Inode))
 		delta = delta.merge(usageDelta{filesSub: 1})
 	} else {
-		if meta.Nlink > 0 {
-			meta.Nlink--
+		fileElems, fileReads, fileDelta, err := s.unlinkFileTxnParts(ctx, ts, meta, now)
+		if err != nil {
+			return err
 		}
-		if meta.Nlink == 0 && !s.hasOpenRefs(ctx, meta.Inode, ts) {
-			gcElems, gcReads, gcDelta, err := s.gcFileElems(ctx, meta, ts)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, gcElems...)
-			readKeys = append(readKeys, gcReads...)
-			delta = delta.merge(gcDelta)
-		} else {
-			meta.Orphaned = meta.Nlink == 0
-			meta.CtimeNsec = now
-			elem, err := putElem(fskeys.InodeKey(meta.Inode), meta)
-			if err != nil {
-				return err
-			}
-			elems = append(elems, elem)
-		}
+		elems = append(elems, fileElems...)
+		readKeys = append(readKeys, fileReads...)
+		delta = delta.merge(fileDelta)
 	}
 	putParent, err := putElem(fskeys.InodeKey(parent), parentMeta)
 	if err != nil {
@@ -1299,6 +1393,49 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		return err
 	}
 	return s.dispatchTxn(ctx, ts, elems, readKeys)
+}
+
+func (s *Service) unlinkFileTxnParts(
+	ctx context.Context,
+	ts uint64,
+	meta *InodeMeta,
+	now int64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+	if meta.Nlink > 0 {
+		meta.Nlink--
+	}
+	if meta.Nlink != 0 {
+		return s.putUnlinkedFileMeta(meta, now)
+	}
+	hasRefs, refReads, err := s.openRefReadKeys(ctx, meta.Inode, ts)
+	if err != nil {
+		return nil, nil, usageDelta{}, err
+	}
+	if !hasRefs {
+		gcElems, gcReads, delta, err := s.gcFileElems(ctx, meta, ts)
+		if err != nil {
+			return nil, nil, usageDelta{}, err
+		}
+		return gcElems, append(refReads, gcReads...), delta, nil
+	}
+	meta.Orphaned = true
+	elems, _, delta, err := s.putUnlinkedFileMeta(meta, now)
+	return elems, refReads, delta, err
+}
+
+func (s *Service) putUnlinkedFileMeta(
+	meta *InodeMeta,
+	now int64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+	if meta.Nlink != 0 {
+		meta.Orphaned = false
+	}
+	meta.CtimeNsec = now
+	elem, err := putElem(fskeys.InodeKey(meta.Inode), meta)
+	if err != nil {
+		return nil, nil, usageDelta{}, err
+	}
+	return []*kv.Elem[kv.OP]{elem}, nil, usageDelta{}, nil
 }
 
 func (s *Service) truncateChunkElems(
@@ -1318,31 +1455,73 @@ func (s *Service) truncateChunkElems(
 	var delta usageDelta
 	if size > 0 && size%chunkSize != 0 {
 		tailIndex := size / chunkSize
-		tailKeep, err := checkedInt(size % chunkSize)
+		tailElems, tailReads, tailDelta, err := s.truncateTailChunkElems(ctx, meta, ts, tailIndex, size%chunkSize)
 		if err != nil {
 			return nil, nil, usageDelta{}, err
 		}
-		tailKey := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, tailIndex)
-		raw, err := s.store.GetAt(ctx, tailKey, ts)
-		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem read truncate tail chunk")
-		}
-		tail := make([]byte, tailKeep)
-		copy(tail, raw)
-		delta = delta.merge(byteLenDelta(uint64(len(raw)), uint64(len(tail))))
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: tailKey, Value: tail})
-		readKeys = append(readKeys, tailKey)
+		elems = append(elems, tailElems...)
+		readKeys = append(readKeys, tailReads...)
+		delta = delta.merge(tailDelta)
 		deleteFrom = tailIndex + 1
 	}
-	for idx := deleteFrom; idx <= oldLast; idx++ {
-		key := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, idx)
-		raw, err := s.store.GetAt(ctx, key, ts)
-		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem read truncate deleted chunk")
+	if deleteFrom <= oldLast {
+		deleteElems, deleteReads, deleteDelta, err := s.truncateDeletedChunkElems(ctx, meta, ts, deleteFrom)
+		if err != nil {
+			return nil, nil, usageDelta{}, err
 		}
-		delta = delta.merge(usageDelta{bytesSub: uint64(len(raw))})
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
-		readKeys = append(readKeys, key)
+		elems = append(elems, deleteElems...)
+		readKeys = append(readKeys, deleteReads...)
+		delta = delta.merge(deleteDelta)
+	}
+	return elems, readKeys, delta, nil
+}
+
+func (s *Service) truncateTailChunkElems(
+	ctx context.Context,
+	meta *InodeMeta,
+	ts uint64,
+	tailIndex uint64,
+	tailKeep uint64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+	keepLen, err := checkedInt(tailKeep)
+	if err != nil {
+		return nil, nil, usageDelta{}, err
+	}
+	tailKey := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, tailIndex)
+	raw, err := s.store.GetAt(ctx, tailKey, ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, [][]byte{tailKey}, usageDelta{}, nil
+		}
+		return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem read truncate tail chunk")
+	}
+	keep := min(len(raw), keepLen)
+	tail := trimChunk(raw[:keep])
+	delta := byteLenDelta(uint64(len(raw)), uint64(len(tail)))
+	if len(tail) == 0 {
+		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: tailKey}}, [][]byte{tailKey}, delta, nil
+	}
+	return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: tailKey, Value: tail}}, [][]byte{tailKey}, delta, nil
+}
+
+func (s *Service) truncateDeletedChunkElems(
+	ctx context.Context,
+	meta *InodeMeta,
+	ts uint64,
+	deleteFrom uint64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+	var elems []*kv.Elem[kv.OP]
+	var readKeys [][]byte
+	var delta usageDelta
+	start := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, deleteFrom)
+	err := s.scanExistingChunks(ctx, meta, ts, start, func(pair *store.KVPair) error {
+		delta = delta.merge(usageDelta{bytesSub: uint64(len(pair.Value))})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		readKeys = append(readKeys, pair.Key)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem scan truncate deleted chunks")
 	}
 	return elems, readKeys, delta, nil
 }
@@ -1351,25 +1530,51 @@ func (s *Service) gcFileElems(ctx context.Context, meta *InodeMeta, ts uint64) (
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: fskeys.InodeKey(meta.Inode)},
 		{Op: kv.Del, Key: fskeys.HomeKey(meta.Inode)},
+		{Op: kv.Del, Key: fskeys.RefFenceKey(meta.Inode)},
 	}
-	readKeys := [][]byte{fskeys.InodeKey(meta.Inode), fskeys.HomeKey(meta.Inode)}
+	readKeys := [][]byte{fskeys.InodeKey(meta.Inode), fskeys.HomeKey(meta.Inode), fskeys.RefFenceKey(meta.Inode)}
 	delta := usageDelta{filesSub: 1}
-	if meta.Size == 0 {
-		return elems, readKeys, delta, nil
-	}
-	chunkSize := meta.effectiveChunkSize(s.chunkSize)
-	last := (meta.Size - 1) / chunkSize
-	for idx := uint64(0); idx <= last; idx++ {
-		key := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, idx)
-		raw, err := s.store.GetAt(ctx, key, ts)
-		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem read gc chunk")
-		}
-		delta = delta.merge(usageDelta{bytesSub: uint64(len(raw))})
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
-		readKeys = append(readKeys, key)
+	if err := s.scanExistingChunks(ctx, meta, ts, fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode), func(pair *store.KVPair) error {
+		delta = delta.merge(usageDelta{bytesSub: uint64(len(pair.Value))})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		readKeys = append(readKeys, pair.Key)
+		return nil
+	}); err != nil {
+		return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem scan gc chunks")
 	}
 	return elems, readKeys, delta, nil
+}
+
+func (s *Service) scanExistingChunks(
+	ctx context.Context,
+	meta *InodeMeta,
+	ts uint64,
+	start []byte,
+	visit func(*store.KVPair) error,
+) error {
+	prefix := fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode)
+	if bytes.Compare(start, prefix) < 0 || !bytes.HasPrefix(start, prefix) {
+		start = prefix
+	}
+	end := prefixEnd(prefix)
+	for {
+		page, err := s.store.ScanAt(ctx, start, end, statFSScanPageSize, ts)
+		if err != nil {
+			return errors.Wrap(err, "filesystem scan existing chunks")
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, pair := range page {
+			if err := visit(pair); err != nil {
+				return err
+			}
+		}
+		if len(page) < statFSScanPageSize {
+			return nil
+		}
+		start = scanCursorAfter(page[len(page)-1].Key)
+	}
 }
 
 func (s *Service) appendDirectoryEntries(
@@ -1474,9 +1679,17 @@ func (s *Service) ensureDirectoryEmpty(ctx context.Context, inode uint64, ts uin
 	return nil
 }
 
-func (s *Service) hasOpenRefs(ctx context.Context, inode uint64, ts uint64) bool {
-	pairs, err := s.store.ScanAt(ctx, fskeys.RefPrefix(inode), prefixEnd(fskeys.RefPrefix(inode)), 1, ts)
-	return err == nil && len(pairs) > 0
+func (s *Service) openRefReadKeys(ctx context.Context, inode uint64, ts uint64) (bool, [][]byte, error) {
+	prefix := fskeys.RefPrefix(inode)
+	pairs, err := s.store.ScanAt(ctx, prefix, prefixEnd(prefix), 1, ts)
+	if err != nil {
+		return false, nil, errors.Wrap(err, "filesystem scan open handle refs")
+	}
+	readKeys := make([][]byte, 0, len(pairs))
+	for _, pair := range pairs {
+		readKeys = append(readKeys, pair.Key)
+	}
+	return len(pairs) > 0, readKeys, nil
 }
 
 func (s *Service) hasOtherOpenRefs(ctx context.Context, inode uint64, ts uint64, current []byte) (bool, [][]byte, error) {
@@ -1523,6 +1736,26 @@ func (s *Service) refPutElem(inode uint64, clientID []byte, fh uint64) (*kv.Elem
 		ExpiresNsec: s.openHandleExpiresNsec(now),
 	}
 	return putElem(fskeys.RefKey(inode, clientID, fh), value)
+}
+
+func (s *Service) refFenceElem(inode uint64) (*kv.Elem[kv.OP], error) {
+	return putElem(fskeys.RefFenceKey(inode), unixNsecVersion(s.now().UnixNano()))
+}
+
+func (s *Service) openHandleLeaseAt(
+	ctx context.Context,
+	refKey []byte,
+	ts uint64,
+) (OpenHandleLease, bool, error) {
+	raw, err := s.store.GetAt(ctx, refKey, ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return OpenHandleLease{}, false, nil
+		}
+		return OpenHandleLease{}, false, errors.Wrap(err, "filesystem read open handle lease")
+	}
+	lease, err := decodeJSON[OpenHandleLease](raw)
+	return lease, err == nil, err
 }
 
 func (s *Service) openHandleExpiresNsec(now time.Time) int64 {

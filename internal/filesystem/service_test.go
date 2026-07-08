@@ -135,6 +135,32 @@ func TestServiceFullChunkWriteSkipsChunkReadKey(t *testing.T) {
 	require.EqualValues(t, 4, stats.Capacity-stats.Free)
 }
 
+func TestServiceFullChunkWriteChargesSparseChunkBytes(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.NoError(t, svc.Truncate(ctx, file.Inode, testChunkSize))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
+	require.NoError(t, err)
+	stats, err = svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, stats.Capacity-stats.Free)
+
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte{0, 0, 0, 0})
+	require.NoError(t, err)
+	stats, err = svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+}
+
 func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2)
@@ -156,6 +182,45 @@ func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
 	require.EqualValues(t, 0o600, stat.Mode)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.ChunkKey(file.Inode, file.Inode, 0)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
+}
+
+func TestServiceSetAttrSizeOnlyUpdatesMtime(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithClock(func() time.Time { return now }))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcdef"))
+	require.NoError(t, err)
+	before, err := svc.GetAttr(ctx, file.Inode)
+	require.NoError(t, err)
+
+	now = now.Add(time.Second)
+	stat, err := svc.SetAttr(ctx, file.Inode, SetAttrMask{Size: true}, SetAttr{Size: 3})
+	require.NoError(t, err)
+	require.EqualValues(t, 3, stat.Size)
+	require.Equal(t, now.UnixNano(), stat.MtimeNsec)
+	require.Greater(t, stat.MtimeNsec, before.MtimeNsec)
+}
+
+func TestServiceOpenUsesRefFenceWithoutTouchingInode(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+
+	rec := attachRecorder(svc)
+	fh, err := svc.Open(ctx, file.Inode, []byte("client-a"))
+	require.NoError(t, err)
+	require.EqualValues(t, 3, fh)
+	require.Len(t, rec.requests, 1)
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), fh)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
+	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 }
 
 func TestServiceReaddirRenameAndRmdir(t *testing.T) {
@@ -196,6 +261,68 @@ func TestServiceReaddirRenameAndRmdir(t *testing.T) {
 	require.False(t, containsDirent(entries.Entries, []byte("dir")))
 }
 
+func TestServiceRenameSameNameStillChecksSource(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	err := svc.Rename(ctx, RootInode, []byte("missing"), RootInode, []byte("missing"))
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestServiceRenameOverExistingFileGcsTarget(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithCapacity(16), WithMaxFiles(10))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	src, err := svc.Create(ctx, RootInode, []byte("a"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	dst, err := svc.Create(ctx, RootInode, []byte("b"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, dst.Inode, 0, 0, []byte("payload"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Rename(ctx, RootInode, []byte("a"), RootInode, []byte("b")))
+	got, err := svc.Resolve(ctx, RootInode, []byte("b"))
+	require.NoError(t, err)
+	require.Equal(t, src.Inode, got)
+	_, err = svc.GetAttr(ctx, dst.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.Files)
+	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+}
+
+func TestServiceRenameOverOpenFileOrphansTarget(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	src, err := svc.Create(ctx, RootInode, []byte("a"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	dst, err := svc.Create(ctx, RootInode, []byte("b"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, dst.Inode, dst.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Rename(ctx, RootInode, []byte("a"), RootInode, []byte("b")))
+	got, err := svc.Resolve(ctx, RootInode, []byte("b"))
+	require.NoError(t, err)
+	require.Equal(t, src.Inode, got)
+	data, err := svc.Read(ctx, dst.Inode, dst.FH, 0, 16)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), data)
+
+	require.NoError(t, svc.Release(ctx, dst.Inode, dst.FH, []byte("client-a")))
+	_, err = svc.GetAttr(ctx, dst.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestServiceRmdirRejectsNonEmptyDirectory(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
@@ -229,6 +356,23 @@ func TestServiceUnlinkOpenFileKeepsInodeReadable(t *testing.T) {
 	got, err := svc.Read(ctx, file.Inode, file.FH, 0, 16)
 	require.NoError(t, err)
 	require.Equal(t, []byte("payload"), got)
+}
+
+func TestServiceUnlinkFencesObservedOpenRef(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+
+	rec := attachRecorder(svc)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+	require.Len(t, rec.requests, 1)
+	require.True(t, keyInSet(rec.requests[0].ReadKeys, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 }
 
 func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
@@ -272,6 +416,7 @@ func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
 	require.Len(t, rec.requests, 1)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
 
 	_, err = svc.GetAttr(ctx, file.Inode)
@@ -332,6 +477,7 @@ func TestServiceReapExpiredOpenHandleGcsInSingleTxn(t *testing.T) {
 	require.Len(t, rec.requests, 1)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
+	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
 }
 
@@ -372,6 +518,76 @@ func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestServiceReapExpiredOpenHandleRevalidatesCurrentLease(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3},
+		WithClock(func() time.Time { return now }),
+		WithOpenHandleLeaseTTL(time.Second),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+
+	now = now.Add(2 * time.Second)
+	refKey := fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)
+	staleRaw, err := svc.store.GetAt(ctx, refKey, svc.store.LastCommitTS())
+	require.NoError(t, err)
+	require.NoError(t, svc.RefreshOpenHandleLease(ctx, file.Inode, file.FH, []byte("client-a")))
+
+	reaped, gcd, err := svc.reapExpiredOpenHandleLease(ctx, &store.KVPair{
+		Key:   refKey,
+		Value: staleRaw,
+	}, now.UnixNano())
+	require.NoError(t, err)
+	require.False(t, reaped)
+	require.False(t, gcd)
+	got, err := svc.Read(ctx, file.Inode, file.FH, 0, 16)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), got)
+}
+
+func TestServiceReapExpiredOpenHandlePagesPastLiveRefs(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4, 5},
+		WithClock(func() time.Time { return now }),
+		WithOpenHandleLeaseTTL(time.Second),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	live, err := svc.Create(ctx, RootInode, []byte("live"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	expired, err := svc.Create(ctx, RootInode, []byte("expired"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("live")))
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("expired")))
+
+	now = now.Add(2 * time.Second)
+	require.NoError(t, svc.RefreshOpenHandleLease(ctx, live.Inode, live.FH, []byte("client-a")))
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 1)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.ExpiredRefs)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	_, err = svc.GetAttr(ctx, expired.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = svc.GetAttr(ctx, live.Inode)
+	require.NoError(t, err)
+}
+
 func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2},
@@ -407,6 +623,23 @@ func TestServiceStatFSUsesUsageCounter(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 42, stats.Files)
 	require.EqualValues(t, 83, stats.Free)
+}
+
+func TestServiceTruncateSparseTailPreservesUsage(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.NoError(t, svc.Truncate(ctx, file.Inode, 2*testChunkSize))
+	require.NoError(t, svc.Truncate(ctx, file.Inode, 3))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, 0), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {

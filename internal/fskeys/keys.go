@@ -10,15 +10,16 @@ const (
 	orderedTerminatorBytes = 2
 	orderedZeroEscape      = 0xff
 
-	inodePrefix   = "!fs|ino|"
-	dirPrefix     = "!fs|dir|"
-	dirVerPrefix  = "!fs|dirv|"
-	homePrefix    = "!fs|home|"
-	chunkPrefix   = "!fs|chk|"
-	refPrefix     = "!fs|ref|"
-	intentPrefix  = "!fs|intent|"
-	moveJobPrefix = "!fs|job|move|"
-	usageKey      = "!fs|usage"
+	inodePrefix    = "!fs|ino|"
+	dirPrefix      = "!fs|dir|"
+	dirVerPrefix   = "!fs|dirv|"
+	homePrefix     = "!fs|home|"
+	chunkPrefix    = "!fs|chk|"
+	refPrefix      = "!fs|ref|"
+	refFencePrefix = "!fs|reffence|"
+	intentPrefix   = "!fs|intent|"
+	moveJobPrefix  = "!fs|job|move|"
+	usageKey       = "!fs|usage"
 
 	chunkRoutePrefix = "!fs|route|chk|"
 
@@ -160,6 +161,11 @@ func RefPrefix(inode uint64) []byte {
 // RefAllPrefix returns the scan prefix for every open-handle lease.
 func RefAllPrefix() []byte {
 	return []byte(refPrefix)
+}
+
+// RefFenceKey serializes inode GC against newly-created open-handle refs.
+func RefFenceKey(inode uint64) []byte {
+	return appendU64Key([]byte(refFencePrefix), inode)
 }
 
 // UsageKey returns the filesystem-wide StatFS counter key.

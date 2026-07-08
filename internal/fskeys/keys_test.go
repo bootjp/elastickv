@@ -45,6 +45,12 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 	require.Nil(t, ExtractRouteKey(InodeKey(22)))
 }
 
+func TestRefFenceKeyIsPerInode(t *testing.T) {
+	require.Equal(t, RefFenceKey(7), RefFenceKey(7))
+	require.NotEqual(t, RefFenceKey(7), RefFenceKey(8))
+	require.False(t, bytes.HasPrefix(RefKey(7, []byte("client"), 9), RefFenceKey(7)))
+}
+
 func TestNormalizeSplitBoundarySnapsFilesystemChunkKeys(t *testing.T) {
 	rawChunk := ChunkKey(11, 22, 99)
 	routeKey := ChunkRouteKey(11, 22)

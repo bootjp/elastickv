@@ -5,6 +5,7 @@ import (
 	"syscall"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -21,6 +22,7 @@ type Core interface {
 	Flush(context.Context, uint64, uint64) error
 	Fsync(context.Context, uint64, uint64, bool) error
 	Release(context.Context, uint64, uint64, []byte) error
+	RefreshOpenHandleLease(context.Context, uint64, uint64, []byte) error
 	Create(context.Context, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error)
 	Mkdir(context.Context, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error)
 	Unlink(context.Context, uint64, []byte) error
@@ -52,6 +54,7 @@ var errnoMappings = []struct {
 	{filesystem.ErrCrossDevice, syscall.EXDEV},
 	{filesystem.ErrInvalid, syscall.EINVAL},
 	{filesystem.ErrUnsupported, syscall.EOPNOTSUPP},
+	{store.ErrWriteConflict, syscall.EAGAIN},
 }
 
 func WithReaddirLimit(limit int) Option {
@@ -116,20 +119,32 @@ func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno
 }
 
 func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint64, size uint64) ([]byte, syscall.Errno) {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+		return nil, errno
+	}
 	data, err := a.core.Read(ctx, inode, fh, offset, size)
 	return data, Errno(err)
 }
 
 func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uint64, data []byte) (int, syscall.Errno) {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+		return 0, errno
+	}
 	n, err := a.core.Write(ctx, inode, fh, offset, data)
 	return n, Errno(err)
 }
 
 func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+		return errno
+	}
 	return Errno(a.core.Flush(ctx, inode, fh))
 }
 
 func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync bool) syscall.Errno {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+		return errno
+	}
 	return Errno(a.core.Fsync(ctx, inode, fh, datasync))
 }
 
@@ -184,6 +199,10 @@ func (a *Adapter) Readdir(ctx context.Context, inode uint64, cookie string) (fil
 func (a *Adapter) StatFS(ctx context.Context, inode uint64) (filesystem.StatFS, syscall.Errno) {
 	stat, err := a.core.StatFS(ctx, inode)
 	return stat, Errno(err)
+}
+
+func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
+	return Errno(a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID))
 }
 
 func (*Adapter) Link(context.Context) syscall.Errno {

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/store"
+	cerrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,6 +27,7 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "cross device", err: filesystem.ErrCrossDevice, want: syscall.EXDEV},
 		{name: "invalid", err: filesystem.ErrInvalid, want: syscall.EINVAL},
 		{name: "unsupported", err: filesystem.ErrUnsupported, want: syscall.EOPNOTSUPP},
+		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
 		{name: "canceled", err: context.Canceled, want: syscall.EINTR},
 		{name: "deadline", err: context.DeadlineExceeded, want: syscall.ETIMEDOUT},
 		{name: "unknown", err: errors.New("boom"), want: syscall.EIO},
@@ -99,6 +102,31 @@ func TestAdapterUsesConfiguredReaddirLimit(t *testing.T) {
 	require.Equal(t, 4, core.readdirLimit)
 }
 
+func TestAdapterRefreshesHandleLeaseBeforeRead(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{readData: []byte("payload")}
+	adapter := New(core, []byte("fuse-session"))
+
+	data, errno := adapter.Read(ctx, 7, 9, 0, 16)
+	require.Zero(t, errno)
+	require.Equal(t, []byte("payload"), data)
+	require.EqualValues(t, 7, core.refreshInode)
+	require.EqualValues(t, 9, core.refreshFH)
+	require.Equal(t, []byte("fuse-session"), core.refreshClientID)
+	require.True(t, core.readCalled)
+}
+
+func TestAdapterStopsReadWhenLeaseRefreshFails(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{refreshErr: filesystem.ErrNotFound}
+	adapter := New(core, []byte("fuse-session"))
+
+	data, errno := adapter.Read(ctx, 7, 9, 0, 16)
+	require.Equal(t, syscall.ENOENT, errno)
+	require.Nil(t, data)
+	require.False(t, core.readCalled)
+}
+
 func TestUnsupportedOperationsReturnExplicitErrno(t *testing.T) {
 	adapter := New(&fakeCore{}, []byte("client-a"))
 
@@ -126,6 +154,15 @@ type fakeCore struct {
 	releaseFH       uint64
 	releaseClientID []byte
 	releaseErr      error
+
+	refreshInode    uint64
+	refreshFH       uint64
+	refreshClientID []byte
+	refreshErr      error
+
+	readCalled bool
+	readData   []byte
+	readErr    error
 
 	readdirInode  uint64
 	readdirCookie string
@@ -158,8 +195,9 @@ func (*fakeCore) Open(context.Context, uint64, []byte) (uint64, error) {
 	return 0, nil
 }
 
-func (*fakeCore) Read(context.Context, uint64, uint64, uint64, uint64) ([]byte, error) {
-	return nil, nil
+func (f *fakeCore) Read(context.Context, uint64, uint64, uint64, uint64) ([]byte, error) {
+	f.readCalled = true
+	return f.readData, f.readErr
 }
 
 func (*fakeCore) Write(context.Context, uint64, uint64, uint64, []byte) (int, error) {
@@ -179,6 +217,13 @@ func (f *fakeCore) Release(_ context.Context, inode uint64, fh uint64, clientID 
 	f.releaseFH = fh
 	f.releaseClientID = append([]byte(nil), clientID...)
 	return f.releaseErr
+}
+
+func (f *fakeCore) RefreshOpenHandleLease(_ context.Context, inode uint64, fh uint64, clientID []byte) error {
+	f.refreshInode = inode
+	f.refreshFH = fh
+	f.refreshClientID = append([]byte(nil), clientID...)
+	return f.refreshErr
 }
 
 func (f *fakeCore) Create(
