@@ -1,6 +1,6 @@
 # Per-Queue Throttling and Tenant Fairness for the SQS Adapter
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-26
 
@@ -8,15 +8,15 @@
 
 ## 1. Background and Motivation
 
-elastickv's SQS adapter currently has **no per-queue rate limiting**. A single tenant's runaway producer can:
+Before this work, elastickv's SQS adapter had **no per-queue rate limiting**. A single tenant's runaway producer could:
 
 1. Saturate the leader's Raft proposal pipeline (one OCC dispatch per `SendMessage`), pushing latency on every other queue's writes through the same shard.
 2. Exhaust the receive-path's visibility-index scan budget (`sqsVisScanPageLimit = 1024`), causing other tenants' `ReceiveMessage` calls to time out empty.
 3. Fill the message keyspace fast enough that the retention reaper cannot keep up — the keyspace grows unbounded until the next manual purge.
 
-Phase 3.C in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.5 marks this as TODO. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
+Phase 3.C in [`docs/design/2026_04_24_proposed_sqs_compatible_adapter.md`](2026_04_24_proposed_sqs_compatible_adapter.md) §14 originally listed this as future work. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
 
-This document proposes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
+This document describes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
 
 ---
 
@@ -26,10 +26,10 @@ This document proposes per-queue token-bucket throttling, configured per-queue i
 
 1. **Per-queue rate limits** that an operator can set via `SetQueueAttributes` and read back via `GetQueueAttributes`. Limits are persisted on the queue meta record (one Raft commit, no separate keyspace).
 2. **Per-action granularity** — `SendMessage` and `ReceiveMessage` have independent buckets so a slow consumer cannot pin the producer or vice versa. Batch verbs charge by entry count, not by call count.
-3. **AWS-shape errors**: throttled requests return HTTP `400` with the `Throttling` error code in whichever envelope the request protocol uses (`{"__type":"Throttling", ...}` for the JSON path, `<Code>Throttling</Code>` for the query/XML path — see §3.4 for the exact wire shape per protocol) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code.
+3. **AWS-shape errors**: throttled JSON-path requests return HTTP `400` with the `Throttling` error code (`{"__type":"Throttling", ...}`) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code. Query/XML message verbs are not claimed by this lifecycle update until the query dispatcher wires those verbs into the same throttled handlers.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
-6. **Observable**: per-queue throttle counters are exposed via the existing Prometheus registry so dashboards can spot throttling before users do.
+6. **Observable throttling outcome**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients can observe and back off from the limit immediately. The server also emits `elastickv_sqs_throttled_requests_total{queue, action}` and `elastickv_sqs_throttle_tokens_remaining{queue, action}` so operators can alert on rejects and inspect the current bucket balance.
 
 ### 2.2 Non-Goals
 
@@ -66,14 +66,14 @@ The check sits **between SigV4 authorisation and the existing handler dispatch**
 
 - the queue name (parsed from the request body's `QueueUrl` / `QueueName`);
 - this node is the verified leader for the queue's shard (`isVerifiedSQSLeader`); any non-leader has been forwarded by `proxyToLeader` and re-evaluates the limit on landing;
-- the action (`X-Amz-Target` for JSON, `Action` form parameter for query).
+- the action (`X-Amz-Target` for the implemented JSON path; future query/XML message-verb wiring will use the `Action` form parameter).
 
 ### 3.1 Where the bucket lives
 
 A `bucketStore` instance hangs off `*SQSServer`. Internally:
 
 ```go
-// adapter/sqs_throttle.go (new in implementation PR)
+// adapter/sqs_throttle.go
 type bucketStore struct {
     // sync.Map rather than a single mu+map so the hot SendMessage /
     // ReceiveMessage path does not contend on a process-wide lock.
@@ -83,7 +83,7 @@ type bucketStore struct {
     // pair. Each bucket's own mutation (charge / refill) is guarded by
     // a per-bucket sync.Mutex inside *tokenBucket, scoped to one queue,
     // so cross-queue traffic never serialises on the same lock.
-    // (Gemini medium on PR #664 flagged a single-mutex bucket store as
+    // (A medium review finding on PR #664 flagged a single-mutex bucket store as
     // a hot-path contention point; this design avoids that.)
     buckets sync.Map  // map[bucketKey]*tokenBucket
     clock   func() time.Time
@@ -112,13 +112,13 @@ The `charge` operation:
 
 No global lock is held during step 3; concurrent traffic on different queues runs in parallel.
 
-**Cache invalidation on `SetQueueAttributes`**: when an operator updates the throttle config via `SetQueueAttributes`, the handler — *after* the Raft commit that persists the new `sqsQueueThrottle` — calls `buckets.invalidateQueue(name)` (the same path described in the `DeleteQueue` / `CreateQueue` paragraph below). `invalidateQueue` ranges the map and drops every entry whose `queue` matches under a lock-then-`CompareAndDelete`-then-`evicted=true` ordering; a raw per-key `buckets.Delete(key)` would reintroduce the orphan-bucket race that ordering closes (a charger holding the old pointer pre-Delete acquires the bucket's mu after the map entry is gone, sees `evicted=false`, spends a token, then later requests mint a fresh full-capacity bucket — a transient double-allotment window). Without this step at all, the in-memory bucket would keep enforcing the old limits until the idle-eviction sweep removes the stale entry (default 1 h window), defeating the operator's intent to throttle a noisy tenant in real time. The handler also gates the invalidation on a real value change — a same-value `SetQueueAttributes` does not reset the bucket — so a caller cannot bypass the rate limit by re-submitting their own current config. Claude P1 on PR #664 caught the gap; round 9 / round 12 refined the race-free semantics and the no-op gate.
+**Cache invalidation on `SetQueueAttributes`**: when an operator updates the throttle config via `SetQueueAttributes`, the handler — *after* the Raft commit that persists the new `sqsQueueThrottle` — calls `buckets.invalidateQueue(name)` (the same path described in the `DeleteQueue` / `CreateQueue` paragraph below). `invalidateQueue` ranges the map and drops every entry whose `queue` matches under a lock-then-`CompareAndDelete`-then-`evicted=true` ordering; a raw per-key `buckets.Delete(key)` would reintroduce the orphan-bucket race that ordering closes (a charger holding the old pointer pre-Delete acquires the bucket's mu after the map entry is gone, sees `evicted=false`, spends a token, then later requests mint a fresh full-capacity bucket — a transient double-allotment window). Without this step at all, the in-memory bucket would keep enforcing the old limits until the idle-eviction sweep removes the stale entry (default 1 h window), defeating the operator's intent to throttle a noisy tenant in real time. The handler also gates the invalidation on a real value change — a same-value `SetQueueAttributes` does not reset the bucket — so a caller cannot bypass the rate limit by re-submitting their own current config. A P1 review finding on PR #664 caught the gap; round 9 / round 12 refined the race-free semantics and the no-op gate.
 
 **Cache invalidation on `DeleteQueue` / `CreateQueue`**: when a queue is deleted, the handler — *after* the Raft commit that purges the queue meta — calls `buckets.invalidateQueue(name)`, which ranges the map and drops every `bucketKey` whose `queue` matches (regardless of incarnation), mirroring the `SetQueueAttributes` path above. The `CreateQueue` handler invokes the same call after a genuine create commit (the idempotent-return path skips it) so a same-name recreate that races with in-flight stale-meta traffic still resets the bucket. **Incarnation** participates in the key — `sqsQueueMeta.Incarnation` is set to `lastGen + 1` at `CreateQueue` time and is *preserved* across `PurgeQueue` and `SetQueueAttributes` (the read-modify-write on the meta record carries it forward). A `DeleteQueue`+`CreateQueue` cycle therefore lands the new incarnation at a different `bucketKey` and starts from a fresh full bucket regardless of any per-process cache the previous incarnation left behind on this or any other node. The two mechanisms are complementary — `invalidateQueue` is the cheap hot-path optimisation that keeps the in-memory map small, and the incarnation-keyed structure is the cross-leader correctness guarantee.
 
-**Why Incarnation, not Generation** (Codex P2 on PR #664 round 9): an earlier draft of this design used `sqsQueueMeta.Generation` as the bucket-key discriminator. `Generation` bumps on every `CreateQueue` *and* on every `PurgeQueue` (because message keys are prefixed with the generation, so a purge needs a new prefix to make the old data unreachable). Keying the throttle bucket by `Generation` would therefore re-key the bucket on every purge — letting any caller authorised to call `PurgeQueue` reset the rate limiter to a fresh full bucket once per purge. The 60-second AWS-spec rate limit on `PurgeQueue` bounds the bypass but does not eliminate it. `Incarnation` solves this by isolating the "queue identity changed" semantics (DeleteQueue+CreateQueue cycle) from the "data prefix changed" semantics (any of Create / Delete / Purge), and the throttle layer keys only on the former.
+**Why Incarnation, not Generation** (P2 review finding on PR #664 round 9): an earlier draft of this design used `sqsQueueMeta.Generation` as the bucket-key discriminator. `Generation` bumps on every `CreateQueue` *and* on every `PurgeQueue` (because message keys are prefixed with the generation, so a purge needs a new prefix to make the old data unreachable). Keying the throttle bucket by `Generation` would therefore re-key the bucket on every purge — letting any caller authorised to call `PurgeQueue` reset the rate limiter to a fresh full bucket once per purge. The 60-second AWS-spec rate limit on `PurgeQueue` bounds the bypass but does not eliminate it. `Incarnation` solves this by isolating the "queue identity changed" semantics (DeleteQueue+CreateQueue cycle) from the "data prefix changed" semantics (any of Create / Delete / Purge), and the throttle layer keys only on the former.
 
-The bucket map is per-process. There is no Raft replication of bucket state. The behaviour at the moment a node assumes leadership of a queue depends on which of three failover paths fires (Claude low on PR #664 round 7 caught the over-broad earlier wording):
+The bucket map is per-process. There is no Raft replication of bucket state. The behaviour at the moment a node assumes leadership of a queue depends on which of three failover paths fires (a low-severity review finding on PR #664 round 7 caught the over-broad earlier wording):
 
 1. **First-time leader** (the most common case for a fresh process): no cached bucket, `loadOrInit` misses, the charge path mints a fresh bucket at full capacity.
 2. **Re-elected node, throttle config changed during the prior leader's term**: `loadOrInit` finds the cached bucket but its `capacity`/`refillRate` no longer match the freshly-loaded meta, so the reconciliation path evicts the stale bucket and mints a fresh full-capacity replacement.
@@ -161,14 +161,14 @@ Setting `SendCapacity = 100, SendRefillPerSecond = 50` means: bursts up to 100 `
 
 `Default*` fields catch any action not covered by an action-specific pair (so a future `PurgeQueue` rate limit costs nothing once defaults are wired).
 
-**Config-field → bucket-action mapping** (Codex P1 on PR #664 sixth-round Codex review): the JSON config field-name prefixes use short forms (`Send*`, `Recv*`, `Default*`) but the in-memory `bucketKey.action` from §3.1 uses the canonical action vocabulary (`"Send"`, `"Receive"`, `"*"`). The mapping is fixed: `Send*` → `bucketKey{action:"Send"}`, `Recv*` → `bucketKey{action:"Receive"}`, `Default*` → `bucketKey{action:"*"}`. Cache invalidation paragraphs in §3.1 use the bucket-action vocabulary (the actual map keys). Use the config-field vocabulary when discussing the JSON contract (`SetQueueAttributes` payload, `GetQueueAttributes` response) and the bucket-action vocabulary when discussing the in-memory map. Implementation must apply this mapping when looking up buckets after a `SetQueueAttributes` commit.
+**Config-field → bucket-action mapping** (P1 review finding on PR #664 sixth-round review): the JSON config field-name prefixes use short forms (`Send*`, `Recv*`, `Default*`) but the in-memory `bucketKey.action` from §3.1 uses the canonical action vocabulary (`"Send"`, `"Receive"`, `"*"`). The mapping is fixed: `Send*` → `bucketKey{action:"Send"}`, `Recv*` → `bucketKey{action:"Receive"}`, `Default*` → `bucketKey{action:"*"}`. Cache invalidation paragraphs in §3.1 use the bucket-action vocabulary (the actual map keys). Use the config-field vocabulary when discussing the JSON contract (`SetQueueAttributes` payload, `GetQueueAttributes` response) and the bucket-action vocabulary when discussing the in-memory map. Implementation must apply this mapping when looking up buckets after a `SetQueueAttributes` commit.
 
 The `SetQueueAttributes` validator enforces:
 
 - All four `Send*` / `Recv*` fields must be either both zero (disabled) or both positive.
 - Capacity ≥ refill (otherwise the bucket can never burst above the steady state).
 - A hard ceiling per queue (e.g. 100,000 RPS) so a typo (`SendCapacity = 1e9`) does not silently mean "no limit at all" but rejects with `InvalidAttributeValue`.
-- **Capacity ≥ max single-request charge** (Codex P1 on PR #664 sixth-round review). Per the §3.3 charging table, a `SendMessageBatch` charges up to 10 from the Send bucket and `DeleteMessageBatch` charges up to 10 from the Recv bucket (AWS caps both at 10 entries). Therefore: when `SendCapacity > 0` it must also be `≥ 10`, and when `RecvCapacity > 0` it must also be `≥ 10`. Without this rule, a queue configured with `SendCapacity = 5` enters a permanently unserviceable state for full batches — the bucket can never accumulate the 10 tokens a `SendMessageBatch(len=10)` requires, every full batch is rejected with `Throttling`, and `Retry-After` (§3.4) keeps reporting "wait N seconds" forever with no recovery path short of re-running `SetQueueAttributes`. The validator rejects with `InvalidAttributeValue` and an explicit message naming the per-bucket minimum so the operator sees the cause immediately. **`Default*` requires the same floor**: `resolveActionConfig` in `adapter/sqs_throttle.go` falls Send and Receive traffic through to the Default bucket whenever the dedicated `Send*` / `Recv*` pair is unset, so a `SendMessageBatch` or `DeleteMessageBatch` request can charge the Default bucket. A `DefaultCapacity < 10` therefore creates the same permanently-unserviceable-batch trap as `SendCapacity < 10`. (Earlier drafts of this proposal exempted `Default*` on the assumption that the catch-all set had no batch verb in scope; that was incorrect — the fall-through means batch verbs do hit Default*. The implementation passes `requireBatchCapacity = true` to `validateThrottlePair` for all three action sets — see Codex P1 on PR #679 round 5.)
+- **Capacity >= max single-request charge** (P1 review finding on PR #664 sixth-round review). Per the §3.3 charging table, a `SendMessageBatch` charges up to 10 from the Send bucket and `DeleteMessageBatch` charges up to 10 from the Recv bucket (AWS caps both at 10 entries). Therefore: when `SendCapacity > 0` it must also be `>= 10`, and when `RecvCapacity > 0` it must also be `>= 10`. Without this rule, a queue configured with `SendCapacity = 5` enters a permanently unserviceable state for full batches — the bucket can never accumulate the 10 tokens a `SendMessageBatch(len=10)` requires, every full batch is rejected with `Throttling`, and `Retry-After` (§3.4) keeps reporting "wait N seconds" forever with no recovery path short of re-running `SetQueueAttributes`. The validator rejects with `InvalidAttributeValue` and an explicit message naming the per-bucket minimum so the operator sees the cause immediately. **`Default*` requires the same floor**: `resolveActionConfig` in `adapter/sqs_throttle.go` falls Send and Receive traffic through to the Default bucket whenever the dedicated `Send*` / `Recv*` pair is unset, so a `SendMessageBatch` or `DeleteMessageBatch` request can charge the Default bucket. A `DefaultCapacity < 10` therefore creates the same permanently-unserviceable-batch trap as `SendCapacity < 10`. (Earlier drafts of this proposal exempted `Default*` on the assumption that the catch-all set had no batch verb in scope; that was incorrect — the fall-through means batch verbs do hit Default*. The implementation passes `requireBatchCapacity = true` to `validateThrottlePair` for all three action sets — see a P1 review finding on PR #679 round 5.)
 
 ### 3.3 Charging model
 
@@ -191,9 +191,9 @@ On rejection:
 | Protocol | Response |
 |---|---|
 | JSON | HTTP 400, body `{"__type":"Throttling","message":"Rate exceeded for queue '<name>' action '<action>'"}`, header `x-amzn-ErrorType: Throttling`, header `Retry-After: <seconds>` (computed per below) |
-| Query | HTTP 400, body `<ErrorResponse><Error><Type>Sender</Type><Code>Throttling</Code><Message>...</Message></Error><RequestId>...</RequestId></ErrorResponse>`, headers as above |
+| Query | Not implemented for throttled message verbs in this lifecycle update. The current query dispatcher wires catalog verbs only and returns `NotImplementedYet` for message actions; when query message handlers land, they should mirror the JSON throttling code with `<Code>Throttling</Code>` in the XML error body. |
 
-`Retry-After` is computed from the *actual* refill rate AND the *requested* token count so neither slow refill nor large batches cause a busy-loop of premature retries (two consecutive Claude reviews on PR #664 caught both: first the `Retry-After: 1` constant lying for sub-1-RPS refill — `SendRefillPerSecond = 0.1` needs 10 s for the next token; then the formula's hardcoded numerator `1.0` lying for batch verbs that charge >1 token — a `SendMessageBatch` of 10 against `refillRate = 1.0` and 0 tokens needs 10 s, not 1):
+`Retry-After` is computed from the *actual* refill rate AND the *requested* token count so neither slow refill nor large batches cause a busy-loop of premature retries (two consecutive review findings on PR #664 caught both: first the `Retry-After: 1` constant lying for sub-1-RPS refill — `SendRefillPerSecond = 0.1` needs 10 s for the next token; then the formula's hardcoded numerator `1.0` lying for batch verbs that charge >1 token — a `SendMessageBatch` of 10 against `refillRate = 1.0` and 0 tokens needs 10 s, not 1):
 
 ```text
 needed              := float64(requestedCount) - currentTokens
@@ -213,13 +213,14 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 
 | File | Change |
 |---|---|
-| `adapter/sqs_throttle.go` (new) | `bucketStore`, `tokenBucket`, charging helper. ~250 lines. |
+| `adapter/sqs_throttle.go` | `bucketStore`, `tokenBucket`, charging helper. |
 | `adapter/sqs_catalog.go` | Add `Throttle` field to `sqsQueueMeta`. Extend `applyAttributes` with the new `Throttle*` attribute names. Render the four Throttle fields in `queueMetaToAttributes` so `GetQueueAttributes("All")` surfaces them. |
-| `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. |
-| `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
-| `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
-| `monitoring/registry.go` | New counter `sqs_throttled_requests_total{queue, action}` and new **gauge** `sqs_throttle_tokens_remaining{queue, action}`. (Codex P2 on PR #664: tokens go up *and* down so a counter is the wrong instrument.) |
-| `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
+| `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. Also forwards each configured bucket decision to the SQS throttle metrics observer. |
+| `adapter/sqs_throttle_test.go` | Unit tests for bucket math, observer emission, disabled-bucket metric cleanup, idle drift, burst, partial refill, batch over-charge, and default-off. |
+| `adapter/sqs_throttle_integration_test.go` | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. |
+| `monitoring/sqs.go`, `monitoring/registry.go` | Register the `elastickv_sqs_throttled_requests_total{queue, action}` counter and `elastickv_sqs_throttle_tokens_remaining{queue, action}` gauge. Queue-label cardinality uses the same capped `_other` fallback as the existing SQS metrics. |
+| `monitoring/sqs_test.go` | Pins public registration of both throttle metrics, independent queue-label budgets for throttle counters vs partition counters, short-lived queue cleanup, disabled action cleanup, and action-aware `_other` gauge cleanup. |
+| `docs/design/2026_04_24_proposed_sqs_compatible_adapter.md` §14 | Phase 3 per-queue throttling item marked landed with a link to this design. |
 
 ### 4.2 OCC interaction
 
@@ -229,9 +230,9 @@ Throttling sits *outside* the OCC transaction — a rejected request never touch
 
 Each queue is owned by exactly one shard (queue-per-shard routing in `kv/shard_router.go`). The leader of that shard owns the bucket. A request that lands on a follower is forwarded by `proxyToLeader` *before* the bucket check, so the bucket is always evaluated by the leader that is also doing the OCC dispatch — no risk of a follower checking against a stale bucket and the leader committing without checking.
 
-Once Phase 3.D (split-queue FIFO) lands, a single queue may span multiple shards. At that point each *partition* gets its own bucket, **keyed by `(queueName, partitionID)`** — not by `MessageGroupId`. `MessageGroupId` is the *input* to `partitionFor`; using it directly as the bucket key would create one bucket per unique group value (unbounded, attacker-amplifiable map size, and hot groups would never share a budget). `partitionID` is bounded by `PartitionCount` so the worst-case bucket count per queue is tiny. The throttle proposal is forward-compatible: the bucket lookup key changes from `queueName` to `(queueName, partitionID)`, and the `bucketKey` struct in §3.1 grows a `partition uint32` field. Documented in §11. (Claude P1 on PR #664 caught the misnomer.)
+Split-queue FIFO has landed, but the throttle implementation still uses one aggregate bucket per `(queueName, action, incarnation)`. Partitioned queues therefore share the configured `SendCapacity` / `RecvCapacity` / `DefaultCapacity` across the logical queue; the effective queue throughput is the configured capacity, not `PartitionCount` times that value. This matches the current dispatch path: `SendMessage` charges the queue-level bucket after loading queue metadata and before partition-specific routing.
 
-**Budget semantics per partition:** each partition's bucket gets the *full* configured `SendCapacity` / `RecvCapacity` / `DefaultCapacity`. The effective aggregate throughput of an N-partition queue is therefore N × the configured per-partition limit. This is intentional and analogous to how AWS High Throughput FIFO multiplies throughput by partition count; operators sizing the throttle should treat `SendCapacity` as the *per-partition* budget. A shared queue-level budget (divided across partitions) would require cross-shard coordination on every `SendMessage` — an extra Raft round-trip per call, defeating the point of partitioning. If per-queue aggregate throttling is needed after Phase 3.D lands, a new `SendCapacityTotal` attribute could be added that gets divided by `PartitionCount` at config time and stored as the per-partition capacity; that design is out of scope for this proposal.
+Per-partition buckets remain future work. That change must move the charge point to a path that already knows `partitionFor(meta, MessageGroupId)`, extend `bucketKey` with a bounded `partition uint32` field, and audit the send/receive/batch callers so every throttled action uses the same bucket semantics. `MessageGroupId` itself must never be used as the bucket key because it is unbounded and caller-controlled.
 
 ---
 
@@ -272,7 +273,7 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 4. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values; an unknown `Throttle*` attribute name is rejected with 400 `InvalidAttributeName` (matching AWS behaviour for unrecognised attributes).
 
-5. **Cross-protocol parity**: throttled JSON and Query requests both surface `Throttling` (different envelope, same code).
+5. **JSON protocol coverage**: throttled JSON requests surface `Throttling` with `Retry-After`. Query/XML parity is a follow-up gated on wiring the query message handlers to the same throttle path.
 
 6. **Failover behaviour** (3-node cluster): kill the current leader after 3 messages, confirm the next leader starts the bucket fresh and accepts up to capacity again. Log line records the failover so operators can correlate.
 
@@ -284,10 +285,12 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 No new flags. Limits are per-queue, set via `SetQueueAttributes`. Defaults are zero (disabled).
 
-Two new Prometheus instruments (Section 4.1) expose the throttling activity:
+Throttle outcomes are visible in two places:
 
-- `sqs_throttled_requests_total{queue, action}` — **counter**. Use `rate(...)` per queue in Grafana to spot the noisy tenant.
-- `sqs_throttle_tokens_remaining{queue, action}` — **gauge** (Codex P2 on PR #664: token budgets go up *and* down over time, so a counter would mask the depletion that operators most need to see). Sample directly; trending toward zero is the early warning sign.
+1. The HTTP response: rejected JSON-path message requests return `Throttling` with `Retry-After`.
+2. Prometheus: `elastickv_sqs_throttled_requests_total{queue, action}` increments for rejected requests, and `elastickv_sqs_throttle_tokens_remaining{queue, action}` records the remaining token balance after each configured bucket decision. `action` is the effective bucket action: `send`, `receive`, or `default`.
+
+No server-side throttle access log is required for this lifecycle; deployments that need request-level forensic logs can add an HTTP access/audit layer independently of the rate-limit correctness surface.
 
 ---
 
@@ -323,10 +326,10 @@ Every `charge` proposes a bucket update through the FSM. **Rejected**: an extra 
 
 | Phase | Content |
 |---|---|
-| 1 | Doc lands (this PR). No code yet. Operators have time to comment. |
-| 2 | Implementation PR per §4.1. Default-off; existing queues unaffected. |
-| 3 | Operators opt in per queue via `SetQueueAttributes`. Monitor `sqs_throttled_requests_total` for false positives. |
-| 4 | Once stable, the partial doc's TODO list moves 3.C from TODO to Landed. |
+| 1 | Default-off implementation and lifecycle documentation have landed; existing queues remain unthrottled until configured. |
+| 2 | Operators opt in per queue via `SetQueueAttributes`. Watch caller-visible `Throttling` responses and `Retry-After` for false positives. |
+| 3 | Prometheus exports `elastickv_sqs_throttled_requests_total{queue, action}` and `elastickv_sqs_throttle_tokens_remaining{queue, action}` with bounded queue-label cardinality. |
+| 4 | Parent SQS adapter roadmap marks Phase 3.C as landed with a link to this design. |
 
 ---
 

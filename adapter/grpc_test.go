@@ -134,6 +134,81 @@ func TestGRPCServer_RawScanAt_RejectsOversizedLimit(t *testing.T) {
 	assert.Error(t, err)
 }
 
+type recordingRawGroupStore struct {
+	store.MVCCStore
+
+	getGroupID   uint64
+	getGroupKey  []byte
+	scanGroupID  uint64
+	scanStart    []byte
+	scanEnd      []byte
+	fallbackGet  bool
+	fallbackScan bool
+}
+
+func (s *recordingRawGroupStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	s.fallbackGet = true
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func (s *recordingRawGroupStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.fallbackScan = true
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingRawGroupStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error) {
+	s.getGroupID = groupID
+	s.getGroupKey = append([]byte(nil), key...)
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func (s *recordingRawGroupStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scanGroupID = groupID
+	s.scanStart = append([]byte(nil), start...)
+	s.scanEnd = append([]byte(nil), end...)
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func TestGRPCServer_RawGet_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 9, GroupId: 42})
+	require.NoError(t, err)
+	require.True(t, resp.GetExists())
+	require.Equal(t, []byte("v"), resp.GetValue())
+	require.False(t, st.fallbackGet)
+	require.Equal(t, uint64(42), st.getGroupID)
+	require.Equal(t, []byte("k"), st.getGroupKey)
+}
+
+func TestGRPCServer_RawScanAt_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       9,
+		GroupId:  42,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.False(t, st.fallbackScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
 	t.Parallel()
 

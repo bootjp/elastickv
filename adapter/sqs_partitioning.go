@@ -7,15 +7,13 @@ import (
 
 // HT-FIFO (Phase 3.D split-queue FIFO) configuration vocabulary and
 // the routing primitive partitionFor. See the design doc at
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md.
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md.
 //
-// PR 2 of the §11 rollout introduces the schema fields plus the
-// validation surface — including the temporary dormancy gate that
-// rejects PartitionCount > 1 at CreateQueue. PR 5 lifts the gate
-// atomically with the data-plane fanout so a half-deployed cluster
-// can never accept a partitioned queue without the data plane to
-// serve it. Until then the field exists in the meta type and the
-// router function compiles, but no partitioned queue can land.
+// The original §11 rollout introduced the schema under a temporary
+// dormancy gate, then replaced that gate with validateHTFIFOCapability
+// when the data plane landed. CreateQueue now admits PartitionCount > 1
+// only when every required peer advertises htfifo and every requested
+// partition is routable.
 
 const (
 	// htfifoMaxPartitions caps the per-queue partition count. 32 is
@@ -126,9 +124,9 @@ func isPowerOfTwo(n uint32) bool {
 //     with multi-partition FIFO because the dedup key cannot be
 //     globally unique across partitions without a cross-partition
 //     OCC transaction.
-//   - The §11 PR 2 dormancy gate has been lifted (Phase 3.D PR 5b-3);
-//     CreateQueue now gates PartitionCount > 1 on the cluster-wide
-//     htfifo capability via validateHTFIFOCapability instead.
+//   - CreateQueue gates PartitionCount > 1 on the cluster-wide htfifo
+//     capability via validateHTFIFOCapability. This replaced the
+//     rollout-time dormancy reject once the data plane landed.
 func validatePartitionConfig(meta *sqsQueueMeta) error {
 	if err := validatePartitionShape(meta); err != nil {
 		return err
@@ -185,9 +183,9 @@ func validatePartitionShape(meta *sqsQueueMeta) error {
 // validateStandardQueueRejectsHTFIFO enforces the FIFO-only rule on
 // the HT-FIFO attributes. PartitionCount > 1 only makes sense on FIFO
 // queues (HT-FIFO is by definition a FIFO feature). Without this guard
-// a Standard queue with PartitionCount=2 would slip past the validator
-// once PR 5 lifts the dormancy gate. PartitionCount=0 and 1 are
-// accepted because both mean
+// a Standard queue with PartitionCount=2 would slip past validation and
+// reach the CreateQueue capability gate even though standard queues have
+// no partitioned data plane. PartitionCount=0 and 1 are accepted because both mean
 // "single-partition layout" which is valid on Standard queues.
 func validateStandardQueueRejectsHTFIFO(meta *sqsQueueMeta) error {
 	if meta.PartitionCount > 1 {

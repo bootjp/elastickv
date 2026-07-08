@@ -32,6 +32,7 @@ package keyviz
 import (
 	"bytes"
 	"encoding/binary"
+	"log/slog"
 	"math"
 	"math/bits"
 	"sort"
@@ -71,12 +72,12 @@ const (
 type Sampler interface {
 	// Observe records a single request against a route. Op identifies
 	// the counter family. The key drives sub-range bucketing (the hot
-	// key/sub-range heatmap, see docs/design/2026_05_25_proposed_keyviz_subrange_sampling.md);
+	// key/sub-range heatmap, see docs/design/2026_05_25_implemented_keyviz_subrange_sampling.md);
 	// len(key) and valueLen are summed into the matching *Bytes
 	// counter; pass valueLen 0 for read-only ops where the response
 	// size is irrelevant. Implementations must no-op (not panic) when
 	// invoked on a typed-nil receiver.
-	Observe(routeID uint64, key []byte, op Op, valueLen int)
+	Observe(routeID uint64, key []byte, op Op, valueLen int, label Label)
 }
 
 // Defaults for MemSamplerOptions when fields are left zero.
@@ -92,7 +93,7 @@ const (
 )
 
 // Defaults / caps for the per-cell hot-key drill-down knobs (see
-// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §8). All
+// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md §8). All
 // off-by-default; HotKeysEnabled=false is the binary's existing
 // behaviour — no extra hot-path cost, no real key bytes retained.
 const (
@@ -159,9 +160,13 @@ type MemSamplerOptions struct {
 	// [1, MaxKeyBucketsPerRoute] at construction. Virtual aggregate
 	// buckets are never sub-divided regardless of this value.
 	KeyBucketsPerRoute int
+	// KeyVizLabelsEnabled opts into one sampler slot per known adapter
+	// label in addition to the legacy unlabeled slot. When false, only
+	// the legacy slot is pre-created and labels are ignored on Observe.
+	KeyVizLabelsEnabled bool
 	// HotKeysEnabled opts in to per-route Top-K hot-key tracking that
 	// backs the heatmap drill-down (Phase 2-A++; see
-	// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md). When
+	// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md). When
 	// false the hot path adds one early-return branch and nothing else
 	// — disabled-case behaviour is byte-identical to today. When true
 	// the sampler retains REAL key bytes in memory and exposes them on
@@ -236,7 +241,7 @@ type MemSampler struct {
 	virtualIDCounter atomic.Uint64
 
 	// hotKeys is the per-route Top-K aggregator (design 2026_05_28
-	// _proposed_keyviz_hot_key_topk). nil when HotKeysEnabled is false
+	// _implemented_keyviz_hot_key_topk). nil when HotKeysEnabled is false
 	// — the Observe hot path then skips the feature with one branch.
 	// Read from the hot path; assigned exactly once at construction.
 	hotKeys *hotKeysAggregator
@@ -299,7 +304,7 @@ func (s *MemSampler) graceWindow() time.Duration {
 type routeTable struct {
 	// slots is the live route → slot map. Lookups under the hot path
 	// run against this snapshot.
-	slots map[uint64]*routeSlot
+	slots map[slotKey]*routeSlot
 	// virtualForRoute maps a real RouteID that didn't fit under
 	// MaxTrackedRoutes to its virtual-bucket slot. Observe consults
 	// this fallback when slots[routeID] is missing.
@@ -324,6 +329,7 @@ type routeTable struct {
 type routeSlot struct {
 	metaMu  sync.RWMutex
 	RouteID uint64
+	Label   Label
 	// GroupID is the Raft group this route belongs to. Phase 2-C+
 	// stamps this on every emitted MatrixRow so the cluster fan-out
 	// aggregator can dedupe write samples by (raftGroupID,
@@ -379,7 +385,7 @@ type routeSlot struct {
 	subBuckets []subCounter
 
 	// hotKeysSnap is the most-recently-published per-route Top-K
-	// snapshot (design 2026_05_28_proposed_keyviz_hot_key_topk §4).
+	// snapshot (design 2026_05_28_implemented_keyviz_hot_key_topk §4).
 	// nil until the hot-keys aggregator's first publish for this route.
 	// Drill-down handlers load it lock-free; the aggregator is the
 	// single writer (Store) and deep-copies snapshot contents so a
@@ -429,6 +435,7 @@ type MatrixColumn struct {
 // taken at flush time.
 type MatrixRow struct {
 	RouteID      uint64
+	Label        Label
 	Start, End   []byte
 	Aggregate    bool
 	MemberRoutes []uint64
@@ -514,17 +521,17 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	return s
 }
 
-// HotKeysSnapshot returns the most-recently-published per-route Top-K
+// HotKeysSnapshot returns the most-recently-published per-route/label Top-K
 // snapshot for the given individual route, or nil if hot-keys tracking
 // is disabled, the route is unknown, the route is an aggregate, or no
 // publish has fired yet. Lock-free: an atomic.Pointer.Load (Codex-P1
 // fix from the design's round-4 review — no shared mutable PRNG state,
 // no per-route lock).
-func (s *MemSampler) HotKeysSnapshot(routeID uint64) *KeyvizHotKeysSnapshot {
+func (s *MemSampler) HotKeysSnapshot(routeID uint64, label Label) *KeyvizHotKeysSnapshot {
 	if s == nil {
 		return nil
 	}
-	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	slot := lookupSlotForRoute(s.table.Load(), routeID, label)
 	if slot == nil {
 		return nil
 	}
@@ -543,7 +550,7 @@ func (s *MemSampler) HotKeysOptions() (enabled bool, capacity, sampleRate, maxKe
 }
 
 // SubBucketBoundsFor returns the [lo, hi) key bounds of sub-bucket
-// subBucket within the individual route routeID, mirroring what Flush
+// subBucket within the individual route/label routeID, mirroring what Flush
 // emits as a MatrixRow's Start/End. The admin hot-keys handler uses
 // this to filter the route's top-m snapshot to keys in the
 // drill-down-clicked sub-range (design §5).
@@ -556,11 +563,11 @@ func (s *MemSampler) HotKeysOptions() (enabled bool, capacity, sampleRate, maxKe
 // route's unbounded tail.
 //
 // nil-receiver-safe.
-func (s *MemSampler) SubBucketBoundsFor(routeID uint64, subBucket int) (lo, hi []byte, ok bool) {
+func (s *MemSampler) SubBucketBoundsFor(routeID uint64, label Label, subBucket int) (lo, hi []byte, ok bool) {
 	if s == nil || subBucket < 0 {
 		return nil, nil, false
 	}
-	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	slot := lookupSlotForRoute(s.table.Load(), routeID, label)
 	if slot == nil {
 		return nil, nil, false
 	}
@@ -623,9 +630,16 @@ func (s *MemSampler) snapshotGroupTerms() map[uint64]uint64 {
 
 func newEmptyRouteTable() *routeTable {
 	return &routeTable{
-		slots:           map[uint64]*routeSlot{},
+		slots:           map[slotKey]*routeSlot{},
 		virtualForRoute: map[uint64]*routeSlot{},
 	}
+}
+
+func (s *MemSampler) labelsToCreate() []Label {
+	if s.opts.KeyVizLabelsEnabled {
+		return allLabelsWithLegacy()
+	}
+	return []Label{LabelLegacy}
 }
 
 // Observe records one request against a route. Cost on a hit:
@@ -633,17 +647,16 @@ func newEmptyRouteTable() *routeTable {
 // and bytes). Misses (RouteID never registered) drop silently — the
 // route-watch subscriber is responsible for Register before the
 // coordinator publishes the new RouteID.
-func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int) {
+func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int, label Label) {
 	if s == nil {
 		return
 	}
-	tbl := s.table.Load()
-	slot, ok := tbl.slots[routeID]
-	if !ok {
-		slot, ok = tbl.virtualForRoute[routeID]
-		if !ok {
-			return
-		}
+	if !s.opts.KeyVizLabelsEnabled {
+		label = LabelLegacy
+	}
+	slot := s.table.Load().slotForObservation(routeID, label)
+	if slot == nil {
+		return
 	}
 	// Sub-range bucketing: pick the counter for the key's sub-bucket.
 	// subBucketIndex reads only immutable layout fields (lock-free) and
@@ -672,6 +685,16 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int) {
 	}
 }
 
+func (tbl *routeTable) slotForObservation(routeID uint64, label Label) *routeSlot {
+	if tbl == nil {
+		return nil
+	}
+	if slot := tbl.slots[slotKey{RouteID: routeID, Label: label}]; slot != nil {
+		return slot
+	}
+	return tbl.virtualForRoute[routeID]
+}
+
 // observeHotKey is the per-Observe hot-key sampler dispatch, kept out of
 // Observe itself to stay under the cyclop ceiling. v1 tracks WRITES
 // only (design §5 series-picker note); reads follow in v2 once the
@@ -683,7 +706,7 @@ func (s *MemSampler) observeHotKey(routeID uint64, slot *routeSlot, key []byte) 
 	if s.hotKeys == nil || slot.Aggregate {
 		return
 	}
-	s.hotKeys.observe(routeID, key)
+	s.hotKeys.observe(routeID, slot.Label, key)
 }
 
 // subBucketIndex maps key to a sub-range bucket index in
@@ -967,7 +990,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 	defer s.routesMu.Unlock()
 
 	cur := s.table.Load()
-	if _, ok := cur.slots[routeID]; ok {
+	if _, ok := cur.slots[slotKey{RouteID: routeID, Label: LabelLegacy}]; ok {
 		return true
 	}
 	if _, ok := cur.virtualForRoute[routeID]; ok {
@@ -975,45 +998,39 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 	}
 
 	next := copyRouteTable(cur)
-	if len(next.slots) < s.opts.MaxTrackedRoutes {
-		slot := s.reclaimRetiredSlot(routeID)
-		if slot == nil {
-			slot = &routeSlot{
-				RouteID:           routeID,
-				GroupID:           groupID,
-				Start:             cloneBytes(start),
-				End:               cloneBytes(end),
-				MemberRoutesTotal: 1,
+	slotsPerRoute := 1
+	if s.opts.KeyVizLabelsEnabled {
+		slotsPerRoute = len(AllLabels) + 1
+	}
+	if len(next.slots)/slotsPerRoute < s.opts.MaxTrackedRoutes {
+		for _, label := range s.labelsToCreate() {
+			slot := s.reclaimRetiredSlot(routeID, label)
+			if slot == nil {
+				slot = &routeSlot{
+					RouteID:           routeID,
+					Label:             label,
+					GroupID:           groupID,
+					Start:             cloneBytes(start),
+					End:               cloneBytes(end),
+					MemberRoutesTotal: 1,
+				}
+				s.initSubLayout(slot, start, end)
+			} else {
+				// Re-registering the same (routeID, label) inside the
+				// grace window reuses the retired slot so in-flight
+				// Observe writers and new traffic drain through one
+				// slot. The immutable sub-range layout is intentionally
+				// preserved; see design §4.2.
+				slot.metaMu.Lock()
+				slot.GroupID = groupID
+				slot.Start = cloneBytes(start)
+				slot.End = cloneBytes(end)
+				slot.MemberRoutesTotal = 1
+				slot.metaMu.Unlock()
 			}
-			s.initSubLayout(slot, start, end)
-		} else {
-			// Re-registering the same routeID inside the grace window:
-			// reuse the retired slot so any in-flight Observe writers
-			// hitting the prior table snapshot land on the same slot
-			// the new traffic uses, and Flush emits a single row per
-			// RouteID instead of two (one live + one retired) with
-			// counts split across them. Refresh the metadata fields to
-			// match the new registration; counters are preserved.
-			//
-			// The sub-range layout (subPrefixLen/subStart/subEnd/subSpan
-			// + subBuckets) is intentionally NOT recomputed here: it is
-			// immutable for the slot's lifetime so the lock-free hot path
-			// can read it without racing this writer, and the counters
-			// must be preserved (not zeroed/resized) to honour the
-			// no-loss contract. A same-RouteID re-registration carries
-			// the same range in practice; the rare changed-range case
-			// keeps the original sub-ranges for the reused slot's
-			// lifetime — a bounded cosmetic mislabel, no lost counts.
-			// See design §4.2.
-			slot.metaMu.Lock()
-			slot.GroupID = groupID
-			slot.Start = cloneBytes(start)
-			slot.End = cloneBytes(end)
-			slot.MemberRoutesTotal = 1
-			slot.metaMu.Unlock()
+			next.slots[slotKey{RouteID: routeID, Label: label}] = slot
+			next.sortedSlots = appendSorted(next.sortedSlots, slot)
 		}
-		next.slots[routeID] = slot
-		next.sortedSlots = appendSorted(next.sortedSlots, slot)
 		s.table.Store(next)
 		return true
 	}
@@ -1025,6 +1042,10 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 	// for the exact selection.
 	bucket := findVirtualBucket(next.sortedSlots, start)
 	if bucket == nil {
+		slog.Warn("keyviz route coarsened into virtual bucket",
+			slog.Uint64("route_id", routeID),
+			slog.Int("max_tracked_routes", s.opts.MaxTrackedRoutes),
+		)
 		bucket = &routeSlot{
 			RouteID:           s.nextVirtualBucketID(),
 			Start:             cloneBytes(start),
@@ -1115,14 +1136,17 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 	s.routesMu.Lock()
 	defer s.routesMu.Unlock()
 	cur := s.table.Load()
-	individual, isIndividual := cur.slots[routeID]
+	individualSlots := s.individualSlotsForRoute(cur, routeID)
+	isIndividual := len(individualSlots) > 0
 	bucket, isVirtual := cur.virtualForRoute[routeID]
 	if !isIndividual && !isVirtual {
 		return
 	}
 
 	next := copyRouteTable(cur)
-	delete(next.slots, routeID)
+	for _, slot := range individualSlots {
+		delete(next.slots, slotKey{RouteID: routeID, Label: slot.Label})
+	}
 	delete(next.virtualForRoute, routeID)
 
 	retiredAt := s.now()
@@ -1135,7 +1159,9 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 		// in-flight write is caught by a later drain rather than
 		// silently lost.
 		s.retiredMu.Lock()
-		s.retiredSlots = append(s.retiredSlots, retiredSlot{slot: individual, retiredAt: retiredAt})
+		for _, slot := range individualSlots {
+			s.retiredSlots = append(s.retiredSlots, retiredSlot{slot: slot, retiredAt: retiredAt})
+		}
 		s.retiredMu.Unlock()
 	case isVirtual:
 		// Defer pruning until after the bucket's pre-removal counters
@@ -1284,22 +1310,22 @@ func (s *MemSampler) nextVirtualBucketID() uint64 {
 }
 
 // reclaimRetiredSlot looks for a non-aggregate retired slot whose
-// RouteID matches the supplied routeID and, if found, removes it
+// (RouteID, Label) matches the supplied key and, if found, removes it
 // from retiredSlots and returns it for reuse. This guarantees a
-// route removed and re-registered inside the grace window is
+// route/label removed and re-registered inside the grace window is
 // represented by a single *routeSlot — Flush would otherwise emit
-// two rows with the same RouteID (one from the new live slot, one
+// two rows with the same (RouteID, Label) (one from the new live slot, one
 // from the still-draining retired slot) and split counts across
 // them. Aggregate (orphaned virtual bucket) entries are left in
 // place because their RouteID lives in the synthetic namespace and
 // a real-ID match against an aggregate would be coincidental.
-func (s *MemSampler) reclaimRetiredSlot(routeID uint64) *routeSlot {
+func (s *MemSampler) reclaimRetiredSlot(routeID uint64, label Label) *routeSlot {
 	s.retiredMu.Lock()
 	defer s.retiredMu.Unlock()
 	var reclaimed *routeSlot
 	keep := s.retiredSlots[:0]
 	for _, r := range s.retiredSlots {
-		if reclaimed == nil && !r.slot.Aggregate && r.slot.RouteID == routeID {
+		if reclaimed == nil && !r.slot.Aggregate && r.slot.RouteID == routeID && r.slot.Label == label {
 			reclaimed = r.slot
 			continue
 		}
@@ -1308,6 +1334,19 @@ func (s *MemSampler) reclaimRetiredSlot(routeID uint64) *routeSlot {
 	clearTail(s.retiredSlots, len(keep))
 	s.retiredSlots = keep
 	return reclaimed
+}
+
+func (s *MemSampler) individualSlotsForRoute(tbl *routeTable, routeID uint64) []*routeSlot {
+	if tbl == nil {
+		return nil
+	}
+	out := make([]*routeSlot, 0, len(AllLabels)+1)
+	for _, label := range allLabelsWithLegacy() {
+		if slot := tbl.slots[slotKey{RouteID: routeID, Label: label}]; slot != nil {
+			out = append(out, slot)
+		}
+	}
+	return out
 }
 
 // memberRoutesContains reports whether routeID is already listed in
@@ -1436,6 +1475,7 @@ func appendDrainedRow(rows []MatrixRow, slot *routeSlot, terms map[uint64]uint64
 		}
 		rows = append(rows, MatrixRow{
 			RouteID:           slot.RouteID,
+			Label:             slot.Label,
 			RaftGroupID:       groupID,
 			LeaderTerm:        terms[groupID],
 			Start:             rowStart,
@@ -1473,7 +1513,7 @@ func (s *MemSampler) Snapshot(from, to time.Time) []MatrixColumn {
 
 func copyRouteTable(src *routeTable) *routeTable {
 	dst := &routeTable{
-		slots:           make(map[uint64]*routeSlot, len(src.slots)+1),
+		slots:           make(map[slotKey]*routeSlot, len(src.slots)+1),
 		virtualForRoute: make(map[uint64]*routeSlot, len(src.virtualForRoute)+1),
 		sortedSlots:     append([]*routeSlot(nil), src.sortedSlots...),
 	}
@@ -1488,12 +1528,26 @@ func copyRouteTable(src *routeTable) *routeTable {
 
 func appendSorted(slots []*routeSlot, slot *routeSlot) []*routeSlot {
 	idx := sort.Search(len(slots), func(i int) bool {
-		return bytesGE(slots[i].Start, slot.Start)
+		return routeSlotLessOrEqual(slot, slots[i])
 	})
 	slots = append(slots, nil)
 	copy(slots[idx+1:], slots[idx:])
 	slots[idx] = slot
 	return slots
+}
+
+func routeSlotLess(a, b *routeSlot) bool {
+	if c := bytes.Compare(a.Start, b.Start); c != 0 {
+		return c < 0
+	}
+	if a.RouteID != b.RouteID {
+		return a.RouteID < b.RouteID
+	}
+	return a.Label < b.Label
+}
+
+func routeSlotLessOrEqual(a, b *routeSlot) bool {
+	return !routeSlotLess(b, a)
 }
 
 func rebuildSorted(tbl *routeTable) []*routeSlot {
@@ -1513,9 +1567,7 @@ func rebuildSorted(tbl *routeTable) []*routeSlot {
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return bytesLT(out[i].Start, out[j].Start)
-	})
+	sort.Slice(out, func(i, j int) bool { return routeSlotLess(out[i], out[j]) })
 	return out
 }
 
@@ -1554,4 +1606,3 @@ func cloneBytes(b []byte) []byte {
 func bytesLT(a, b []byte) bool { return bytes.Compare(a, b) < 0 }
 func bytesLE(a, b []byte) bool { return bytes.Compare(a, b) <= 0 }
 func bytesGT(a, b []byte) bool { return bytes.Compare(a, b) > 0 }
-func bytesGE(a, b []byte) bool { return bytes.Compare(a, b) >= 0 }

@@ -6,7 +6,7 @@ Date: 2026-06-10
 
 > **Status: implemented.** `adapter.RedisServer.onePhaseTxnDedup` is
 > default-on, closing the rollout of the option-2 idempotency design landed by
-> [`2026_05_21_proposed_txn_secondary_idempotency.md`][parent]. No new
+> [`2026_05_21_implemented_txn_secondary_idempotency.md`][parent]. No new
 > mechanism — the FSM probe (`dedupProbeOnePhase` in `kv/fsm.go`), the
 > wire change (`TxnMeta.PrevCommitTS`, V2-only when non-zero), and every
 > adapter-side reuse path (RPUSH/LPUSH, MULTI/EXEC, standalone SET, etc.)
@@ -26,7 +26,7 @@ Date: 2026-06-10
 > [#937](https://github.com/bootjp/elastickv/issues/937) tracks that
 > failure; this proposal closes it by retiring the unprotected default.
 
-[parent]: 2026_05_21_proposed_txn_secondary_idempotency.md
+[parent]: 2026_05_21_implemented_txn_secondary_idempotency.md
 
 ## Background
 
@@ -110,36 +110,22 @@ Comment and `WithOnePhaseTxnDedup`'s godoc are updated to describe the
 new default; the in-file pointer to R5 stays (now reframed as "the
 ordering constraint that authorized this default flip").
 
-### M1a — Carve out standalone `SET` behind a separate sub-gate
+### M1a — Standalone `SET` parity
 
-PR #943 round-1 codex P1 flagged that `txnContext.applySet`
-(`adapter/redis.go:2356-2360`) returns `WRONGTYPE` when the existing
-key is a list/hash/set/zset/stream, while the legacy `setLegacy` →
-`executeSet` → `replaceWithStringTxn` path correctly deletes the
-collection's logical elements and writes the string. Real Redis lets
-`SET k v` overwrite any existing type unconditionally; flipping
-`onePhaseTxnDedup` default-on therefore would have silently changed
-normal Redis overwrite behaviour for every standalone-`SET`-against-
-collection configuration.
+The first default-on rollout kept standalone `SET` behind a compatibility
+sub-gate because `txnContext.applySet` did not yet match legacy
+`executeSet` semantics for SET-over-collection. That parity gap is now
+closed in the parent design: `applySet` stages a final string replacement
+and uses logical-key cleanup before writing the new string, so standalone
+SET follows `onePhaseTxnDedup` directly. `RedisServer.standaloneSetDedup`,
+`WithStandaloneSetDedup`, and `ELASTICKV_REDIS_ONEPHASE_DEDUP_SET` remain
+as compatibility no-ops for older deployments and tests that still set them.
 
-This proposal does not bring `applySet` to parity (collection-deletion
-inside the dedup txn is a larger surgery, tracked as a separate
-follow-up). Instead it introduces a dedicated sub-gate
-`RedisServer.standaloneSetDedup` (default off, opt-in via
-`WithStandaloneSetDedup(true)` or
-`ELASTICKV_REDIS_ONEPHASE_DEDUP_SET=1`). The standalone-`SET` branch
-in `set()` now requires **both** `onePhaseTxnDedup` **and**
-`standaloneSetDedup` to be true before routing through
-`runTransactionWithDedup`; the previous behaviour is preserved as the
-default. MULTI/EXEC and list-push paths (the parent design's actual
-M4-validated workloads) are unaffected.
-
-The new field, option, env var, and the regression test
-`TestRedis_SET_OverwritesList_UnderDefaultGate`
-(`adapter/redis_set_overwrite_default_test.go`) all land in this PR.
-The test seeds `RPUSH k x`, calls `SET k v`, asserts `OK` + a
-subsequent `GET` returns `v` — it fails on the pre-fix build
-(WRONGTYPE) and passes on the fixed build.
+Regression coverage:
+`TestRedis_SET_OverwritesList_UnderDefaultGate` verifies `RPUSH k x` followed
+by `SET k v` returns `OK` and makes `GET k` return `v`;
+`TestStandaloneSetDedup_OverwritesWideHash` verifies the dedup path also
+tombstones wide-column hash rows before writing the replacement string.
 
 ### M2 — Control workflow disposition
 

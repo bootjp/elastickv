@@ -1,6 +1,6 @@
 # SQS DLQ Redrive Policy and Admin Configuration UI
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-06-16
 

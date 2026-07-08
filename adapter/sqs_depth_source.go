@@ -22,9 +22,10 @@ type SQSQueueDepth struct {
 //
 // Returns:
 //
-//   - (snaps, true)  — leader, scrape OK. Observer writes snaps to
-//     the gauges and diffs against the previous tick (forgetting
-//     any queue that disappeared from this snapshot).
+//   - (snaps, true)  — leader, scrape OK. snaps is non-nil, even when
+//     there are zero queues. Observer writes snaps to the gauges and
+//     diffs against the previous tick (forgetting any queue that
+//     disappeared from this snapshot).
 //   - (nil, true)    — this node is a follower (leader-only emission
 //     keeps gauges consistent with AdminListQueues / AdminDescribeQueue
 //     at the same instant — follower scans would race the leader's

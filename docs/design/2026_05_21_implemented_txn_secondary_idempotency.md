@@ -1,14 +1,13 @@
 # Transactional secondary-commit idempotency
 
-> **Status: partial — option 2 reader landed everywhere; writer (emission)
-> gated off by default pending cluster-wide rollout.** M2a (store exact-ts
-> probe), M2b (`prev_commit_ts` in `TxnMeta` V2 + one-phase FSM probe), and
-> M1+M3 for the list-push family (write-set reuse + `OperationGroup.PrevCommitTS`
-> threading through both `ShardedCoordinator` and the legacy `Coordinate`
-> redirect path) have shipped on this branch and are tested. Emission stays
-> off by default (`RedisServer.onePhaseTxnDedup`), so the FSM is byte-identical
-> to today until operators enable it after a full probe-aware rollout — see
-> R5. Remaining: `runTransaction` EXEC-body reuse and M4 (Jepsen).
+> **Status: implemented.** Option 2 is shipped end-to-end: the store exact-ts
+> probe, `prev_commit_ts` in `TxnMeta` V2, one-phase FSM no-op on an exact hit,
+> `OperationGroup.PrevCommitTS` threading, list-push reuse, MULTI/EXEC reuse,
+> and standalone SET/INCR/HSET single-command routing all use the same
+> reusable write-set contract. The rollout gate is now default-on through
+> `RedisServer.onePhaseTxnDedup` with `ELASTICKV_REDIS_ONEPHASE_DEDUP=0` kept
+> as the operator rollback switch; scheduled Redis Jepsen covers the default
+> path.
 >
 > Triggered by the 2026-05-21 Jepsen scheduled run
 > [26198185540](https://github.com/bootjp/elastickv/actions/runs/26198185540)
@@ -463,10 +462,10 @@ preserves availability and adds correctness.
 
 - **Emission gating (R5) — LANDED.** `prev_commit_ts` is emitted only when
   `RedisServer.onePhaseTxnDedup` is on (`WithOnePhaseTxnDedup` /
-  `ELASTICKV_REDIS_ONEPHASE_DEDUP`), **default off** until the whole cluster
-  runs a probe-aware binary. While off, `listPushCore` keeps the legacy
-  recompute-on-retry loop, no V2 meta is produced, the probe never fires, and
-  the FSM is byte-identical to today — no mixed-version divergence window.
+  `ELASTICKV_REDIS_ONEPHASE_DEDUP`). It shipped default-off for the
+  reader-before-writer rollout, then flipped default-on after the probe-aware
+  binary was deployed everywhere. `ELASTICKV_REDIS_ONEPHASE_DEDUP=0` remains
+  the single rollback switch.
 - **`listPushCore` (RPUSH/LPUSH) — LANDED.** When the gate is on, the retry
   loop tracks a `reusableListPush` (the prior attempt's `ops`, `startTS`,
   `commitTS`, and computed `length`). On a retryable error it REUSES that
@@ -514,24 +513,23 @@ preserves availability and adds correctness.
        what changes is that an expired outer ctx is now respected
        promptly instead of being ignored until the fresh budget
        elapses.
-- **Standalone SET — LANDED.** The standalone `r.set` handler now routes
-  through `runTransactionWithDedup` as a single-mop EXEC body when the gate
-  is on (the dedup machinery's "free" extension to any command whose
-  `applyXxx` already exists on `txnContext`). The fast-path optimization
-  (`trySetFastPath`) is intentionally bypassed under the gate — dedup is
-  opt-in, and a non-dedup'd fast path under a dedup-on cluster would split
-  the idempotency contract. Tested by `TestStandaloneSetDedup_*` in
-  `adapter/redis_set_dedup_test.go`.
-- **Standalone INCR / HSET — still open.** Both lack a `txnContext.applyXxx`
-  implementation, so the "route through single-mop EXEC" pattern that
-  worked for SET cannot apply as-is. Bringing them into the dedup'd path
-  requires implementing `applyIncr` / `applyHSet` first (each ~30–50 LOC
-  for the txn-state-aware read-compute-write shape), then the standalone
-  handler routing is a one-liner via `runTransactionWithDedup`. Tracked
-  as separate follow-up PRs; until then, INCR and HSET keep today's
-  buggy-under-churn behaviour, which is the design doc's stated default
-  ("everything else keeps today's behaviour until its hook is added" —
-  Open questions).
+- **Standalone SET — LANDED.** The standalone `r.set` handler routes through
+  `runTransactionWithDedup` as a single-mop EXEC body when
+  `onePhaseTxnDedup` is on. `txnContext.applySet` now stages a final string
+  replacement and uses the same logical-key cleanup as `executeSet`, so
+  SET-over-list/hash/set/zset/stream preserves Redis overwrite semantics on
+  the dedup path. The fast-path optimization (`trySetFastPath`) is
+  intentionally bypassed under the gate so the standalone path does not split
+  the idempotency contract. Tested by `TestStandaloneSetDedup_*` and
+  `TestRedis_SET_OverwritesList_UnderDefaultGate`.
+- **Standalone INCR / HSET — LANDED.** `txnContext.applyIncr` preserves the
+  existing string TTL while staging the post-increment value, and
+  `txnContext.applyHSet` stages wide-column hash field updates plus the
+  corresponding hash meta delta or legacy-blob migration. The standalone
+  `INCR`, `HSET`, and `HMSET` handlers now route through the single-command
+  dedup helper when `onePhaseTxnDedup` is on; the legacy handlers remain as
+  the opt-out path. Tests pin ambiguous landed attempts returning cached
+  `INCR` / `HSET` results without reapplying.
 
 ### M4 — Validation
 
@@ -550,7 +548,7 @@ preserves availability and adds correctness.
   the Redis workload. The dedup feature ships behind the Redis
   adapter's `onePhaseTxnDedup` flag (RPUSH/LPUSH via
   `listPushCoreWithDedup`, MULTI/EXEC via `runTransactionWithDedup`,
-  standalone SET via single-mop EXEC routing); DynamoDB / S3 / SQS do
+  standalone SET/INCR/HSET via single-mop EXEC routing); DynamoDB / S3 / SQS do
   not route through the dedup loop, so re-running them under the gate
   would add hours of CI for zero signal on the new code path.
 - **Demo cluster gate confirmation.** The launch step asserts
@@ -586,12 +584,13 @@ fresh meta anyway, so the length is naturally correct.
 
 This invariance is specific to commands whose retry reuses a fixed write set.
 A MULTI/EXEC body with read-dependent results (e.g. an `INCR` whose return is
-the post-increment value) needs the same treatment — remember the
+the post-increment value) uses the same treatment: remember the
 client-visible result computed on the first attempt and return it on a dedup
-no-op — which is tractable but per-command. Mitigation unchanged: scope the
-first PR to RPUSH/LPUSH (the commands the Jepsen workload exercises); commands
-without a reuse path keep today's (buggy-under-churn, gate-off-by-default)
-recompute, so the change is strictly an improvement, never a regression.
+no-op. That contract now covers RPUSH/LPUSH, MULTI/EXEC, standalone SET,
+standalone INCR, standalone HSET, and standalone HMSET. Future write commands
+that join `txnApplyHandlers` must follow the same "stage once, cache result,
+reuse write-set" shape before their standalone handlers route through the
+dedup helper.
 
 ### R2 — Probe read cost on the retry path
 
@@ -732,20 +731,18 @@ flakiness, tracked separately from the correctness fix.
 
 ## Open questions
 
-- **Result reconstruction coverage.** The dedup no-op must reconstruct each
-  command's client-visible result at `prev_commit_ts`. RPUSH/LPUSH (length)
-  and single-mop EXEC are in scope for the first PR; multi-mop EXEC and
-  other write commands (SET/INCR/HSET/…) need per-command reconstruction
-  hooks. Which commands beyond RPUSH/LPUSH must land in the first PR vs.
-  follow-ups? (Default: only the list-append family the Jepsen workload
-  exercises; everything else keeps today's behaviour until its hook is
-  added.)
+- **Result reconstruction coverage — CLOSED 2026-07-07.** The dedup no-op
+  returns the result captured while staging the first attempt. The coverage
+  now includes RPUSH/LPUSH, multi-mop MULTI/EXEC, and standalone
+  SET/INCR/HSET/HMSET. Commands not implemented in `txnApplyHandlers` remain
+  unsupported inside this retry contract and must add staging + cached-result
+  tests before standalone routing.
 - **Race-freedom linchpin — RE-VERIFIED (2026-05-30).** The race-freedom
   argument needs **E1 applies before E2, or never** — never the other way
   round. An earlier verification (2026-05-26) appealed to `applyRequests`
   using `context.Background()` so that `Engine.Propose` could not abandon on
-  a caller timeout. That argument was based on a stale read; codex correctly
-  pointed out (PR #796 review) that the current single-shard txn path
+  a caller timeout. That argument was based on a stale read; review correctly
+  pointed out that the current single-shard txn path
   threads the caller ctx through (`dispatchSingleShardTxn` →
   `TransactionManager.Commit(ctx, …)` → `applyRequests(ctx, …)` →
   `Engine.Propose(ctx, …)`), and `Engine.Propose` has a live `ctx.Done()`
@@ -790,7 +787,7 @@ flakiness, tracked separately from the correctness fix.
 - **FSM probe determinism — retention guard reverted (2026-05-30, round-11).**
   Round-10 surfaced `ErrReadTSCompacted` from `CommittedVersionAt` when
   the probed `commit_ts` fell below `minRetainedTS`, mirroring
-  `GetAt`/`ExistsAt` semantics (codex P2 round-10). Codex P1 round-11
+  `GetAt`/`ExistsAt` semantics. Round-11
   correctly flagged that branching the FSM dedup decision on this signal
   is non-deterministic across raft replicas: FSM compaction advances
   `minRetainedTS` from local wall clock and per-replica scheduler
@@ -872,3 +869,10 @@ flakiness, tracked separately from the correctness fix.
   duplicate; not-landed→apply; genuine cross-txn conflict→recompute) against
   real OCC + the real probe, plus the gate-off legacy path. Remaining:
   `runTransaction` EXEC-body reuse (per-command result memo) and M4 (Jepsen).
+- (2026-07-07) **Standalone writer coverage completed.** `txnContext.applySet`
+  now stages final string replacement with full logical-key cleanup, removing
+  the old SET-over-collection parity gap. `txnContext.applyIncr` and
+  `txnContext.applyHSet` landed, and standalone SET/INCR/HSET/HMSET route
+  through `runTransactionWithDedup` when `onePhaseTxnDedup` is on. Tests cover
+  landed-then-error retries returning cached SET/INCR/HSET results and SET
+  replacing a wide-column hash without leaving field rows behind.

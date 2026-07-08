@@ -16,6 +16,7 @@ import (
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -265,21 +266,22 @@ const (
 )
 
 func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestoreOptions, token []byte) error {
+	confState := confStateForPeers(opts.Peers)
 	state := persistedState{
 		HardState: raftpb.HardState{
-			Term:   opts.Term,
-			Commit: opts.Index,
+			Term:   proto.Uint64(opts.Term),
+			Commit: proto.Uint64(opts.Index),
 		},
 		Snapshot: raftpb.Snapshot{
 			Data: token,
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: confStateForPeers(opts.Peers),
-				Index:     opts.Index,
-				Term:      opts.Term,
+			Metadata: &raftpb.SnapshotMetadata{
+				ConfState: &confState,
+				Index:     proto.Uint64(opts.Index),
+				Term:      proto.Uint64(opts.Term),
 			},
 		},
 	}
-	if etcdraft.IsEmptySnap(state.Snapshot) {
+	if etcdraft.IsEmptySnap(&state.Snapshot) {
 		return errors.Wrap(ErrExternalSnapshotRestoreInvalid, "empty snapshot metadata")
 	}
 	disk, err := persistBootState(zap.NewNop(),

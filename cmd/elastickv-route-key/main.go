@@ -1,7 +1,7 @@
 // elastickv-route-key prints the byte-string of a DynamoDB
 // table-route key for a given table name.  Used by the Composed-1
 // M5 launch script (`scripts/run-jepsen-local.sh`) and OQ-7
-// (docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md)
+// (docs/design/2026_06_02_implemented_composed1_m5_jepsen_route_shuffle.md)
 // to compute `--shardRanges` boundary keys without inlining the
 // base64-encoding logic in shell — the encoding is part of the
 // routing surface and any drift would silently mis-route.

@@ -72,7 +72,7 @@ type kvFSM struct {
 	// short-circuit as "unpinned" (no Composed-1 enforcement) —
 	// matching the pre-feature behaviour byte-for-byte.  Concrete
 	// production type is *distribution.Engine.  See
-	// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+	// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 	// §4.2 prerequisite block + §M2.
 	routes RouteHistory
 	// shardGroupID is the Raft group ID this FSM serves.  Used by
@@ -148,7 +148,7 @@ func (f *kvFSM) SetApplyIndex(idx uint64) {
 // (0, false, nil) propagates the strictly-additive fallback when
 // the store does not expose the seam — the future skip gate treats
 // "missing" as "fall back to full restore." See
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §3 / §4.
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3 / §4.
 func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
 	r, ok := f.store.(raftengine.AppliedIndexReader)
 	if !ok {
@@ -222,7 +222,7 @@ func WithCutoverSource(src CutoverSource) FSMOption {
 // historical owner-of-key resolution.  Zero is reserved for the
 // not-wired case.
 //
-// See docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// See docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M2 + §4.2 prerequisite block.
 func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
 	return func(f *kvFSM) {
@@ -462,7 +462,7 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	// HLC.Next() for a persistence ts, hlc.last >= every commit_ts ever
 	// committed.  This closes the HLC-4 logical-handoff gap surfaced by
 	// the tla-check gap configuration on PR #856.
-	// See docs/design/2026_05_28_partial_tla_safety_spec.md §5.1 HLC-4
+	// See docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1 HLC-4
 	// precondition (ii) (strategy (c)) and HLC.tla BecomeLeader_HLC.
 	if f.hlc != nil && commitTS > 0 {
 		f.hlc.Observe(commitTS)
@@ -665,7 +665,7 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 }
 
 // verifyComposed1 is the M3 apply-time Composed-1 gate per
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §4.2(a) + §4.4.  Runs two checks before the txn's writes land:
 //
 //	(a) Observed-version owner — the txn's read-set was captured

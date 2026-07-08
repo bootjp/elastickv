@@ -1,9 +1,24 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal (Round 7 — split CRC seam + force pebble.Sync on checkpoint)
+**Status**: Implemented (B2/B3 shipped; B4 health-timeout tightening remains an operational follow-up)
 **Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5 / 6 / 7)
 **Author**: bootjp
-**Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
+**Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s -> 300s), PR #915 (B2), PR #934 (B3)
+
+## Implementation Record
+
+The cold-start snapshot-restore skip path is implemented on `main`.
+
+- PR #915 shipped the durable `metaAppliedIndex` plumbing through raft
+  data applies, DEL_PREFIX applies, and both snapshot-persist sites.
+- PR #934 shipped the `restoreSnapshotState` skip gate, CRC-verified
+  header preservation, cold-start metrics, and duplicate replay
+  handling.
+
+B4, lowering the rolling-update health timeout again after production
+skip-rate observation, is intentionally left as an operational tuning
+follow-up. The design's central subsystem is the B2/B3 restore-skip
+mechanism.
 
 ## Problem
 

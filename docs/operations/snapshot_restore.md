@@ -101,4 +101,3 @@ It refuses to proceed when:
 Phase 0 restores one snapshot's state. It does not create a new live point-in-
 time backup and does not provide cross-shard consistency. Use a Phase 1 live
 extractor once that path exists when those properties are required.
-

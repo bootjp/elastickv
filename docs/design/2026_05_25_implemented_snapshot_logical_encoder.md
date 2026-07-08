@@ -6,7 +6,7 @@ Date: 2026-05-25
 
 ## Background
 
-Phase 0a (`2026_04_29_partial_snapshot_logical_decoder.md`,
+Phase 0a (`2026_04_29_implemented_snapshot_logical_decoder.md`,
 milestones all merged: PRs #790, #791, #792, #806, #810) shipped the
 **decoder**: an offline tool that reads a native Pebble `.fsm`
 snapshot and writes a vendor-independent, per-adapter directory tree
@@ -459,9 +459,9 @@ P2:
 
 ## References
 
-- `2026_04_29_partial_snapshot_logical_decoder.md` — Phase 0 format
-  owner; Phase 0a (decoder) shipped. Promoted to `partial` on landing
-  this doc.
+- `2026_04_29_implemented_snapshot_logical_decoder.md` — Phase 0 format
+  owner; Phase 0a (decoder), Phase 0b (encoder), and Phase 0c
+  operator integration are shipped.
 - `2026_04_29_proposed_logical_backup.md` — Phase 1 (live PIT
   extraction); produces the same directory format this encoder reads.
 - `2026_04_14_implemented_etcd_snapshot_disk_offload.md` — the `.fsm`

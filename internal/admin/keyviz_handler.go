@@ -85,6 +85,7 @@ type KeyVizMatrix struct {
 // surfaces that per-cell conflict bit on the wire via Conflicts[].
 type KeyVizRow struct {
 	BucketID          string   `json:"bucket_id"`
+	Label             string   `json:"label,omitempty"`
 	Start             []byte   `json:"start"`
 	End               []byte   `json:"end"`
 	Aggregate         bool     `json:"aggregate"`
@@ -408,6 +409,7 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 	}
 	row := &KeyVizRow{
 		BucketID:          bucketIDFor(mr),
+		Label:             string(mr.Label),
 		Start:             append([]byte(nil), mr.Start...),
 		End:               append([]byte(nil), mr.End...),
 		Aggregate:         mr.Aggregate,
@@ -431,6 +433,9 @@ func bucketIDFor(mr keyviz.MatrixRow) string {
 		return "virtual:" + strconv.FormatUint(mr.RouteID, 10)
 	}
 	id := "route:" + strconv.FormatUint(mr.RouteID, 10)
+	if mr.Label != keyviz.LabelLegacy {
+		id += ":" + string(mr.Label)
+	}
 	// Append the sub-bucket index only for genuinely sub-divided routes
 	// (SubBucketCount > 1), so a K=1 / aggregate / degenerate slot keeps
 	// the exact legacy "route:<id>" id and the change stays inert at the

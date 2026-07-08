@@ -1,6 +1,7 @@
 # 2026-05-10 — Plumb caller context through kv write & VerifyLeader paths
 
-Status: proposed
+Status: Implemented
+Implemented: 2026-07-07 status audit; code shipped earlier.
 
 ## Problem
 
@@ -162,3 +163,15 @@ Single PR, follow-up to merged #745 / #746 / #747. No design-deferred
 milestones; all four layers (`Transactional`, `Coordinate.VerifyLeader`,
 `LeaderProbe`, healthz handlers) ship together because the value
 chains end-to-end.
+
+## Implementation audit
+
+The current codebase has the ctx-bearing surfaces described above:
+
+- `kv.Transactional.Commit(ctx, ...)` / `Abort(ctx, ...)` and all in-tree
+  implementations take caller context.
+- `applyRequests` passes ctx to `raftengine.Proposer.Propose`.
+- `LeaderProxy` and `Coordinate` / `ShardedCoordinator` call
+  `verifyLeaderEngineCtx(ctx, ...)`.
+- Admin, DynamoDB, S3, and SQS leader probes pass HTTP/admin request contexts
+  into the verify path.

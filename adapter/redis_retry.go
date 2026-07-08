@@ -175,6 +175,9 @@ func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if userKey := kv.ExtractTxnUserKey(key); userKey != nil {
 		key = userKey
 	}
+	if userKey := redisTxnWideFenceUserKey(key); userKey != nil {
+		return userKey
+	}
 	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
 		return store.ExtractListUserKey(key)
 	}
