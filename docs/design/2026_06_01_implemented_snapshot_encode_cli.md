@@ -24,6 +24,7 @@ type EncodeOptions struct {
     S3IncludeIncompleteUploads   bool
     S3IncludeOrphans             bool
     PreserveSQSVisibility        bool
+    IncludeSQSSideRecords        bool
     ManifestLastCommitTS         uint64
     SelfTest                     bool
     SelfTestDecodeOptions        DecodeOptions
