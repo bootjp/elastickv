@@ -1,12 +1,12 @@
-# S3 collision-rename reversal (Phase 0b M4-2b) — proposed
+# S3 collision-rename reversal (Phase 0b M4-2b) — implemented
 
-**Status:** Proposed (no implementation yet).
+**Status:** Implemented.
 **Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves §"S3 — bodies re-chunked + manifest + collision/suffix reversal" by adding the inverse of the decoder's rename-collisions write path.
-**Predecessor on disk:** M4-1 (`PR #847`) emits `!s3|bucket|meta|` + `!s3|bucket|gen|`. M4-2a (`PR #864`) emits `!s3|obj|head|` + `!s3|blob|` for every object whose key is recoverable from the on-disk path alone. Both currently fail closed via `ErrS3EncodeUnsupportedCollision` whenever a bucket's dump tree carries a `KEYMAP.jsonl` collision-tracker — i.e., any dump that exercised the decoder's rename-collisions path is rejected without a partial restore (`internal/backup/encode_s3_objects.go:95-98`).
+**Predecessor on disk:** M4-1 (`PR #847`) emits `!s3|bucket|meta|` + `!s3|bucket|gen|`. M4-2a (`PR #864`) emits `!s3|obj|head|` + `!s3|blob|` for every object whose key is recoverable from the on-disk path alone. M4-2b removes the former collision-tracker rejection and teaches the encoder to reverse each bucket's `KEYMAP.jsonl` entries before emitting object records.
 
-## What needs to land
+## Implemented behavior
 
-For every bucket whose decoder run wrote a per-bucket `KEYMAP.jsonl`, the encoder must read that file and use it to translate on-disk dump filenames back to original S3 object keys before emitting `!s3|obj|head|<key>` / `!s3|blob|<key>` records.
+For every bucket whose decoder run wrote a per-bucket `KEYMAP.jsonl`, the encoder reads that file and uses it to translate on-disk dump filenames back to original S3 object keys before emitting `!s3|obj|head|<key>` / `!s3|blob|<key>` records.
 
 **Three rename kinds the decoder records** (`internal/backup/keymap.go:33-43`):
 
@@ -22,20 +22,20 @@ The Redis reverse encoder already consumes `KEYMAP.jsonl` for `KindSHAFallback` 
 
 The parent doc (§"Re-derivable indexes") gives each adapter discretion on the build strategy. M4-2b resolves this for S3:
 
-**Recommended: load-once per bucket (this proposal).** Open `<bucket>/KEYMAP.jsonl` once at the top of `encodeBucketObjects`, build a `map[encodedSegment]KeymapRecord`, then look up each leaf during the existing `filepath.WalkDir` of the bucket's object tree. Rationale:
+**Implemented: load-once per bucket.** Open `<bucket>/KEYMAP.jsonl` once at the top of `encodeBucketObjects`, build a `map[encodedSegment]KeymapRecord`, then look up each leaf during the existing `filepath.WalkDir` of the bucket's object tree. Rationale:
 
 - **Per-bucket cost is O(records-in-keymap).** A 1 MiB-key cap × 4 MiB-line cap × hundreds of renames is still well under the snapshot builder's working-set budget. The Redis encoder already follows this pattern (`encode_redis.go:113-132`) without measured impact.
 - **Lazy lookup is impractical.** Walking the keymap once per object would be O(objects × keymap-records), and the keymap needs O(1) reverse-lookup by encoded segment anyway.
 
-**Out of scope (deferred):**
+**Boundaries:**
 
 - **Cross-bucket keymaps.** Each bucket gets its own `KEYMAP.jsonl` because object keys are bucket-scoped; M4-2b does NOT support a single top-level keymap. The decoder enforces per-bucket already.
-- **Reserved-prefix-collision keymaps (`_incomplete_uploads`, `_orphans`).** These subtrees are gated by `ErrEncodeUnsupportedS3IncompleteUploads` / `ErrEncodeUnsupportedS3Orphans` (codex P2 v21 #904) — M4-2b will NOT touch their renames. Any KEYMAP record whose original key starts with a reserved prefix is treated as a malformed dump and fails closed.
+- **Reserved-root-collision keymaps (`_incomplete_uploads`, `_orphans`).** These subtrees are gated by `ErrEncodeUnsupportedS3IncompleteUploads` / `ErrEncodeUnsupportedS3Orphans`; M4-2b does not reverse their renames. Any KEYMAP record whose original key's first slash-split component is exactly `_incomplete_uploads` or `_orphans` is treated as a malformed dump and fails closed. Similar user keys such as `_orphansFoo/x`, `_foo/bar`, or `nested/_orphans/x` remain valid.
 - **Cross-suffix collisions.** A `KindS3LeafData` rename target that also collides with `KindMetaCollision`'s reserved suffix is already rejected at decode time (`s3.go:892`) — the encoder inherits this invariant; no separate validation needed.
 
 ## Per-bucket keymap loading
 
-New helper in `encode_s3_objects.go` (or a sibling file):
+Helper in `encode_s3_collision.go`:
 
 ```go
 // loadBucketKeymap reads <bucket>/KEYMAP.jsonl into an
@@ -45,16 +45,16 @@ New helper in `encode_s3_objects.go` (or a sibling file):
 func (e *S3RecordEncoder) loadBucketKeymap(root *os.Root, bucketDir string) (map[string]KeymapRecord, error)
 ```
 
-**Refactor target.** The existing call site is `isKeymapCollisionTracker` (`encode_s3_objects.go:108`, called at line 91; returns `(tracker bool, err error)`). The caller at line 91 currently fails closed via `ErrS3EncodeUnsupportedCollision` whenever `tracker == true`. M4-2b updates this site:
+**Refactor target.** The existing call site is `isKeymapCollisionTracker` (`encode_s3_objects.go:108`, called at line 91; returns `(tracker bool, err error)`). M4-2b updates this site:
 
-1. Keep `isKeymapCollisionTracker` to disambiguate. When it returns `tracker = false`, the bucket has a legitimate `KEYMAP.jsonl` user object — the file is paired with a `KEYMAP.jsonl.elastickv-meta.json` sidecar and round-trips as a normal S3 body (existing `TestS3EncodeKeymapObjectRoundTrip` pins this). `loadBucketKeymap` MUST NOT touch it; M4-2a's object emission already covers it. Codex P2 v913 v2 flagged this: an implementation that called `loadBucketKeymap` unconditionally would parse the user object's body as keymap JSON and either fail or consume it as collision metadata.
-2. When `tracker == true`, call `loadBucketKeymap` (NEW). Replaces the current `ErrS3EncodeUnsupportedCollision` branch.
+1. Keep `isKeymapCollisionTracker` to disambiguate. When it returns `tracker = false`, the bucket has a legitimate `KEYMAP.jsonl` user object — the file is paired with a regular-file `KEYMAP.jsonl.elastickv-meta.json` sidecar and round-trips as a normal S3 body (existing `TestS3EncodeKeymapObjectRoundTrip` pins this). A directory at `KEYMAP.jsonl.elastickv-meta.json/` is not a sidecar and keeps tracker classification active (pinned by `TestS3EncodeTrackerWithDirectorySidecar`). `loadBucketKeymap` does not touch legitimate user objects; M4-2a's object emission already covers them.
+2. When `tracker == true`, call `loadBucketKeymap`. This replaces the former `ErrS3EncodeUnsupportedCollision` branch.
 
-`loadBucketKeymap` reuses the existing per-line `KeymapReader`. **It MUST NOT use `OpenSidecarFile`** — that helper is write-side on every platform: `O_WRONLY|O_CREATE|O_TRUNC` on Windows (`open_nofollow_windows.go:32`) and the non-unix/non-windows fallback (`open_nofollow_other.go:32`), and `O_WRONLY|O_CREATE` + a deferred `Truncate(0)` on Unix (`open_nofollow_unix.go:60` + `:97`). Calling it on `KEYMAP.jsonl` would erase the file before the reader could see it, losing every rename mapping. Codex P2 v913 v3 flagged this. The loader instead uses the **read-side** pipeline that `openRootRegular` (`encode_s3_objects.go:260`) already establishes for object bodies: `root.Lstat` → `refuseHardLink` → `root.Open` (read-only). `isKeymapCollisionTracker` (`encode_s3_objects.go:108`) only performs the `root.Lstat` + `IsRegular` check on `KEYMAP.jsonl` (and a `rootEntryExists` for the sidecar); it does NOT itself `root.Open` the file. `loadBucketKeymap` therefore re-runs the full `root.Lstat` → `refuseHardLink` → `root.Open` sequence; treat the `isKeymapCollisionTracker` check as a precondition that confirms file existence and regularity, not as work `loadBucketKeymap` can skip. Claude v913 v4 caught the misleading pronoun in v4.
+`loadBucketKeymap` reuses the existing per-line `KeymapReader`. **It does not use `OpenSidecarFile`** — that helper is write-side on every platform: `O_WRONLY|O_CREATE|O_TRUNC` on Windows (`open_nofollow_windows.go:32`) and the non-unix/non-windows fallback (`open_nofollow_other.go:32`), and `O_WRONLY|O_CREATE` + a deferred `Truncate(0)` on Unix (`open_nofollow_unix.go:60` + `:97`). Calling it on `KEYMAP.jsonl` would erase the file before the reader could see it, losing every rename mapping. The loader instead uses the **read-side** pipeline that `openRootRegular` (`encode_s3_objects.go:260`) already establishes for object bodies: `root.Lstat` → `refuseHardLink` → `root.Open` (read-only). `isKeymapCollisionTracker` (`encode_s3_objects.go:108`) only performs `root.Lstat` + `IsRegular` on `KEYMAP.jsonl`, and then `root.Lstat` + `IsRegular` on `KEYMAP.jsonl.elastickv-meta.json` for the sidecar disambiguation; it does NOT itself `root.Open` the tracker. `loadBucketKeymap` therefore re-runs the full `root.Lstat` → `refuseHardLink` → `root.Open` sequence; treat the `isKeymapCollisionTracker` check as a precondition that confirms tracker classification, not as work `loadBucketKeymap` can skip.
 
-**Duplicate-key contract — diverges from `LoadKeymap`.** The shared `keymap.go:LoadKeymap` documents last-wins behavior for duplicate `Encoded` segments (the Redis encoder tolerates this because its decoder's keymap writer always emits one record per encoded segment, and a duplicate from a hand-edited dump just retains the most recent). M4-2b's invariant is stricter: the S3 decoder's `recordKeymap` writes exactly one entry per renamed object, so a duplicate `Encoded` segment means the decoder wrote two distinct rename targets for the same on-disk name — a corrupt dump the encoder cannot disambiguate. Therefore `loadBucketKeymap` does NOT call `LoadKeymap`; it iterates `KeymapReader.Next()` in a manual loop and fails closed on the second occurrence of any `Encoded` value (`TestS3EncodeRejectsDuplicateKeymapEntry`). Claude v913 v2 caught this contract divergence.
+**Duplicate-key contract — diverges from `LoadKeymap`.** The shared `keymap.go:LoadKeymap` documents last-wins behavior for duplicate `Encoded` segments (the Redis encoder tolerates this because its decoder's keymap writer always emits one record per encoded segment, and a duplicate from a hand-edited dump just retains the most recent). M4-2b's invariant is stricter: the S3 decoder's `recordKeymap` writes exactly one entry per renamed object, so a duplicate `Encoded` segment means the decoder wrote two distinct rename targets for the same on-disk name — a corrupt dump the encoder cannot disambiguate. Therefore `loadBucketKeymap` does NOT call `LoadKeymap`; it iterates `KeymapReader.Next()` in a manual loop and fails closed on the second occurrence of any `Encoded` value (`TestS3EncodeRejectsDuplicateKeymapEntry`).
 
-**Keymap key is the full relative path, NOT per-segment.** The decoder's `recordKeymap` call site (`internal/backup/s3.go:728`) records the full filesystem-relative path produced by `resolveObjectFilename` (e.g. `path/to.elastickv-leaf-data`) as the `Encoded` field and the full original S3 object key (e.g. `path/to`) as the `OriginalB64`. Per-segment lookup would miss every nested-collision entry; the encoder MUST look up the full rel-path (gemini medium / codex P1 found in this doc's first-round review).
+**Keymap key is the full relative path, NOT per-segment.** The decoder's `recordKeymap` call site (`internal/backup/s3.go:728`) records the full filesystem-relative path produced by `resolveObjectFilename` (e.g. `path/to.elastickv-leaf-data`) as the `Encoded` field and the full original S3 object key (e.g. `path/to`) as the `OriginalB64`. Per-segment lookup would miss every nested-collision entry; the encoder looks up the full rel-path.
 
 ## Object-walk integration
 
@@ -68,7 +68,7 @@ The resolved key feeds the existing `!s3|obj|head|<key>` / `!s3|blob|<key>` emis
 
 **Difference from Redis.** Redis's `loadKeymap` (`encode_redis.go:113`) handles only `KindSHAFallback`, where the keymap entry is keyed by a single filename segment (because filename-length overflow happens segment-by-segment). S3 collision records are scoped to the full object key, so the lookup unit is the full bucket-relative path rather than a single segment. No common helper between the two; the S3 lookup lives in `encode_s3_collision.go`.
 
-**`KindSHAFallback` policy for S3 (claude v913 v2 Low).** S3's decoder rename path (`s3.go:resolveObjectFilename`) currently emits only `KindS3LeafData` and `KindMetaCollision`; `KindSHAFallback` is reserved for the (not-yet-implemented) case where a single S3 key segment exceeds `EncodeSegment`'s 240-byte filesystem ceiling. M4-2b keeps the encoder permissive for forward compatibility: a `KindSHAFallback` record in an S3 `KEYMAP.jsonl` is honored by the same full-rel-path lookup (the decoder would write `Encoded = <sha-prefix>__<truncated>` as the full relative segment), so the existing object-walk path naturally handles it. Any future `Kind` value not in `{S3LeafData, MetaCollision, SHAFallback}` fails closed with `ErrS3EncodeInvalidBucket` so a hand-edited dump that injects a novel Kind cannot silently bypass invariants.
+**`KindSHAFallback` policy for S3.** S3's decoder rename path (`s3.go:resolveObjectFilename`) emits `KindS3LeafData` and `KindMetaCollision`; `KindSHAFallback` is reserved for a later case where a single S3 key segment exceeds `EncodeSegment`'s 240-byte filesystem ceiling. M4-2b keeps the encoder permissive for forward compatibility: a `KindSHAFallback` record in an S3 `KEYMAP.jsonl` is honored by the same full-rel-path lookup (the decoder would write `Encoded = <sha-prefix>__<truncated>` as the full relative segment), so the existing object-walk path naturally handles it. Any unknown `Kind` value not in `{S3LeafData, MetaCollision, SHAFallback}` fails closed with `ErrS3EncodeInvalidBucket` so a hand-edited dump that injects a novel Kind cannot silently bypass invariants.
 
 ## Error contract
 
@@ -77,37 +77,37 @@ The encoder fails closed with the existing per-adapter sentinel `ErrS3EncodeInva
 - Malformed JSON in `KEYMAP.jsonl`.
 - A `KindS3LeafData` record whose `Encoded` does not end in `.elastickv-leaf-data`.
 - A `KindMetaCollision` record whose original key does not end in `.elastickv-meta.json`.
-- An original key whose first top-level path component is exactly one of the dump-control reserved subtrees: `_incomplete_uploads` or `_orphans`. (User object keys like `_foo` or `_foo/bar` are LEGITIMATE — the whole `_` namespace is NOT reserved, only the two named subtrees are. Codex P2 found this in the first-round review of this doc.)
+- An original key whose first top-level path component is exactly one of the dump-control reserved subtrees: `_incomplete_uploads` or `_orphans`. (User object keys like `_foo` or `_foo/bar` are LEGITIMATE — the whole `_` namespace is NOT reserved, only the two named subtrees are.)
 - A keymap record referencing an on-disk segment that doesn't exist (orphan record — the dump is internally inconsistent).
 - A multiply-defined `Encoded` segment (the same on-disk name listed twice with different originals).
 
-`ErrS3EncodeUnsupportedCollision` is removed once M4-2b lands; its existing test (`encode_s3_objects_test.go:300`) is rewritten to assert the round-trip succeeds on the same fixture rather than rejecting it.
+`ErrS3EncodeUnsupportedCollision` is removed; its old rejection test (`encode_s3_objects_test.go:300`) now asserts the same fixture round-trips successfully.
 
 ## Self-test cross-check
 
-Each existing M4-2a self-test fixture (`encode_s3_objects_test.go`) gets a sibling that:
+Each existing M4-2a self-test fixture (`encode_s3_objects_test.go`) has a sibling that:
 
 1. Sets up a bucket with both `path/to` and `path/to/sub` keys (leaf-data rename).
 2. Round-trips through `S3Encoder.Decode → S3RecordEncoder.Encode`.
 3. Asserts the produced `!s3|obj|head|` keys are `path/to` and `path/to/sub` (NOT `path/to.elastickv-leaf-data`).
 
-Plus a `--rename-collisions=true` variant for `KindMetaCollision`.
+The suite also includes a `--rename-collisions=true` variant for `KindMetaCollision`.
 
-## Files to add / modify (M4-2b implementation slice)
+## Implementation files
 
 ```
 internal/backup/encode_s3_collision.go        # loadBucketKeymap + resolveS3Segment
 internal/backup/encode_s3_collision_test.go   # keymap parse, segment resolution, error paths
-internal/backup/encode_s3_objects.go          # rewrite isKeymapCollisionTracker call site + WalkDir leaf resolver; remove ErrS3EncodeUnsupportedCollision var (:59) + guard (:96)
-internal/backup/encode_s3_objects_test.go     # round-trip leaf-data + meta-collision; drop ErrS3EncodeUnsupportedCollision test
-internal/backup/encode_snapshot.go            # update comment at :655 that cites ErrS3EncodeUnsupportedCollision as an exit-2 routing example (claude v913 v3)
+internal/backup/encode_s3_objects.go          # tracker detection, bucket keymap loading, WalkDir key resolution
+internal/backup/encode_s3_objects_test.go     # round-trip leaf-data + meta-collision coverage
+internal/backup/encode_snapshot.go            # updated exit-2 routing comment after removing the unsupported-collision sentinel
 ```
 
 (v3's earlier draft of this section incorrectly named `encode_s3.go` as the home of `ErrS3EncodeUnsupportedCollision`; it is actually in `encode_s3_objects.go`. Corrected in v4.)
 
-## Milestones (within M4-2b)
+## Milestone
 
-The slice ships as a single PR since the keymap loader, segment resolver, and integration into `encodeBucketObjects` are tightly coupled (a partial landing would be incoherent — the decoder write contract and the encoder read contract are inseparable). Codex P1 v13 #904's design-doc-first discipline applies: this doc lands first, then the implementation in a follow-up PR.
+The keymap loader, segment resolver, and integration into `encodeBucketObjects` landed as one slice because a partial landing would be incoherent: the decoder write contract and the encoder read contract are inseparable.
 
 ## Test plan
 
@@ -117,10 +117,11 @@ The slice ships as a single PR since the keymap loader, segment resolver, and in
 | `TestS3EncodeRoundTripsMetaCollision`                               | Bucket with user object key ending `.elastickv-meta.json` + `--rename-collisions` → original key recovered                     |
 | `TestS3EncodeRejectsKeymapTargetingReservedSubtree`                 | `KEYMAP.jsonl` record claiming `Original="_orphans/foo"` or `"_incomplete_uploads/x"` → `ErrS3EncodeInvalidBucket` (PR body line: `TestS3EncodeRejectsKeymapWithReservedPrefix` — both refer to the same case; the doc is the authoritative name) |
 | `TestS3EncodeAcceptsKeymapWithUserUnderscoreKey`                    | `KEYMAP.jsonl` record claiming `Original="_foo"` (legitimate user key) → round-trips successfully                              |
-| `TestS3EncodeAcceptsLegitimateKeymapUserObject`                     | Bucket with a real user object named `KEYMAP.jsonl` (paired sidecar at `KEYMAP.jsonl.elastickv-meta.json`) → `isKeymapCollisionTracker` returns `tracker=false`, object round-trips as a normal S3 body, `loadBucketKeymap` is NOT called (codex P2 v913 v2) |
+| `TestS3EncodeKeymapObjectRoundTrip`                                  | Bucket with a real user object named `KEYMAP.jsonl` (paired regular-file sidecar at `KEYMAP.jsonl.elastickv-meta.json`) → `isKeymapCollisionTracker` returns `tracker=false`, object round-trips as a normal S3 body, `loadBucketKeymap` is NOT called |
+| `TestS3EncodeTrackerWithDirectorySidecar`                            | A directory at `KEYMAP.jsonl.elastickv-meta.json/` does not count as the sidecar for a legitimate `KEYMAP.jsonl` user object; the tracker remains active |
 | `TestS3EncodeRejectsOrphanKeymapEntry`                              | `KEYMAP.jsonl` record references a segment that doesn't exist on disk → fail closed                                            |
 | `TestS3EncodeRejectsDuplicateKeymapEntry`                           | Same `Encoded` listed twice → fail closed (we can't pick a winner; diverges from `LoadKeymap` last-wins)                        |
-| `TestS3EncodeRejectsUnknownKeymapKind`                              | `Kind` not in `{S3LeafData, MetaCollision, SHAFallback}` → `ErrS3EncodeInvalidBucket` (forward-compat guard, claude v913 v2)   |
+| `TestValidateKeymapRecord_UnknownKind`                               | `Kind` not in `{S3LeafData, MetaCollision, SHAFallback}` → `ErrInvalidKeymapRecord` before the bucket-level wrapper maps it to `ErrS3EncodeInvalidBucket` |
 | `TestS3EncodeRejectsMalformedKeymapJSON`                            | `KEYMAP.jsonl` has an invalid line → `ErrInvalidKeymapRecord` (existing sentinel from `internal/backup/keymap.go`)             |
 | `TestS3EncodeMissingKeymapIsValidNoCollisionDump`                   | Bucket without `KEYMAP.jsonl` continues to encode (the no-collision case M4-2a already covers)                                 |
 

@@ -1,10 +1,10 @@
 # Snapshot ↔ Logical-Format Decoder (Phase 0)
 
-Status: Partial
+Status: Implemented
 Author: bootjp
 Date: 2026-04-29
 
-> **Lifecycle (2026-05-25):** Phase 0a (decoder) has fully shipped —
+> **Lifecycle (2026-07-07):** Phase 0a (decoder) has fully shipped —
 > `internal/backup/` + `cmd/elastickv-snapshot-decode` (PRs #790,
 > #791, #792, #806, #810). Phase 0b (encoder) has shipped and is
 > specified in detail in

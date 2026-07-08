@@ -1,5 +1,5 @@
 // Command elastickv-snapshot-encode is the Phase 0b M6 snapshot encoder
-// described in docs/design/2026_06_01_proposed_snapshot_encode_cli.md
+// described in docs/design/2026_06_01_implemented_snapshot_encode_cli.md
 // (parent: docs/design/2026_05_25_implemented_snapshot_logical_encoder.md).
 //
 // It reads a vendor-independent per-adapter directory tree (produced by

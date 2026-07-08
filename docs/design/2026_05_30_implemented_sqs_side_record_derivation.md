@@ -59,7 +59,7 @@ The parent doc (§"Re-derivable indexes" → scope note) allows a per-adapter fa
 
 ## Deferred (partitioned-FIFO)
 
-M5-2 inherits M5-1's `ErrSQSEncodeUnsupportedPartitioned` gate. The coordinated decoder+encoder lift for partitioned FIFO queues is covered by [`2026_06_03_proposed_sqs_partitioned_fifo_encoder.md`](2026_06_03_proposed_sqs_partitioned_fifo_encoder.md) and remains outside this classic-queue side-record slice.
+M5-2 inherits M5-1's `ErrSQSEncodeUnsupportedPartitioned` gate. The coordinated decoder+encoder lift for partitioned FIFO queues is covered by [`2026_06_03_implemented_sqs_partitioned_fifo_encoder.md`](2026_06_03_implemented_sqs_partitioned_fifo_encoder.md) and remains outside this classic-queue side-record slice.
 
 When the partitioned slice (provisionally M5-3) lands, it should add these key shapes — sourced from `SqsPartitionedMsg{Vis,ByAge,Dedup}Prefix` + `sqsPartitionedMsg{...}Key` in `adapter/sqs_keys.go`:
 

@@ -1,5 +1,7 @@
 package kv
 
+import "github.com/bootjp/elastickv/keyviz"
+
 // OP is an operation type.
 type OP int
 
@@ -23,6 +25,9 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// KeyVizLabel tags this operation group for KeyViz attribution.
+	// The zero value is the legacy unlabeled route-only view.
+	KeyVizLabel keyviz.Label
 	// StartTS is a logical timestamp captured at transaction begin.
 	// It is ignored for non-transactional groups.
 	StartTS uint64
