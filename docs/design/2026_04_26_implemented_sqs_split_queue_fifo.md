@@ -205,10 +205,11 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
 
 ```text
 1. Decode → sqsReceiveMessageInput (existing).
-2. Compute partitionOrder := starting offset chosen by hashing the
-   request's RequestId (or random when absent) so successive calls
-   from the same consumer rotate which partition they hit first.
-   This avoids head-of-line bias toward partition 0 under load.
+2. Compute partitionOrder := starting offset returned by
+   `nextReceiveFanoutStart(queueName, PartitionCount)`. The shipped
+   path keeps a per-queue atomic counter in each `SQSServer` process;
+   consecutive receives for the same queue therefore walk partitions in
+   round-robin order. The request ID is not inspected.
 3. Set scanDeadline := start + `sqsVisScanWallClockBudget` for this
    `scanAndDeliverOnce` pass. The shipped value is 100 ms; it bounds one
    scan/rotation pass so poison-message backlogs or large partitions cannot
@@ -231,7 +232,16 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
 
 The point is that a consumer pinned to a single endpoint **must still see messages from every partition** — otherwise the SDK's "ReceiveMessage returned nothing, sleep and retry" assumption silently leaks messages forever (P1/medium review findings on PR #664). The implemented fanout is internal to the handler: clients cannot select a partition, and there is no request-header partition selector.
 
-The fanout is bounded: `scanAndDeliverOnce` stops as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message scans at most up to the first non-empty partition in the per-queue rotation order. A FIFO with no in-flight messages costs at most N partition scans to confirm empty.
+The fanout for one pass is bounded: `scanAndDeliverOnce` stops as soon
+as `MaxNumberOfMessages` are collected, so a consumer asking for 1
+message scans at most up to the first non-empty partition in the
+per-queue rotation order. A FIFO with no in-flight messages costs at
+most N partition scans per `scanAndDeliverOnce` pass. With
+`WaitTimeSeconds > 0`, `longPollReceive` runs one immediate pass and
+then repeats whole passes on each `sqsLongPollInterval` tick until the
+AWS wait budget expires; a 20 s empty long poll can therefore perform
+roughly 101 x N partition scans even though the response wall-clock
+duration remains bounded by `WaitTimeSeconds`.
 
 **Why the outer wait budget matters.** A naive implementation would pass the original `WaitTimeSeconds` to every partition scan, so an empty queue with `WaitTimeSeconds = 20` and `PartitionCount = 8` could hold the connection for up to **160 s** before returning empty — well past the AWS-documented bound. The shipped path avoids that by keeping `WaitTimeSeconds` in `longPollReceive`: each `scanAndDeliverOnce` pass uses the fixed 100 ms scanDeadline, and the outer loop repeats passes on a 200 ms ticker until the original wait budget expires. The response therefore stays bounded by `WaitTimeSeconds`, while each pass still walks partitions in the deterministic rotation order.
 
@@ -297,7 +307,7 @@ This is out of scope here.
 
 ## 8. Failure Modes and Edge Cases
 
-1. **Proxy RTT under spread deployment**: ReceiveMessage on a queue whose partitions are spread across multiple Raft groups pays one extra round-trip per non-local-leader partition (§4.2 proxies them server-side, so a consumer pinned to one endpoint still sees every partition's messages — no false-empty failure). The cost is bounded: a request for `MaxNumberOfMessages = 1` short-circuits as soon as the first non-empty partition responds, so the *typical* extra hop count is one. The pathological case is a queue with N partitions where the consumer is asking "is anything here?" against an empty queue — that costs at most N proxy round-trips before returning empty, and the **wall-clock wait is bounded by the original `WaitTimeSeconds`** (§4.2 step 3: a shared deadline is threaded through the fanout). Mitigation: latency-sensitive deployments can co-locate partitions on fewer Raft groups (at the cost of less throughput parallelism); a single-partition or co-located deployment pays nothing.
+1. **Proxy RTT under spread deployment**: ReceiveMessage on a queue whose partitions are spread across multiple Raft groups pays one extra round-trip per non-local-leader partition (§4.2 proxies them server-side, so a consumer pinned to one endpoint still sees every partition's messages — no false-empty failure). The cost of one `scanAndDeliverOnce` pass is bounded: a request for `MaxNumberOfMessages = 1` short-circuits as soon as the first non-empty partition responds, so the *typical* extra hop count is one. The pathological case is a queue with N partitions where the consumer is asking "is anything here?" against an empty queue — one pass costs at most N proxy round-trips, but a long poll repeats whole passes until the original `WaitTimeSeconds` budget expires (§4.2), so planning should account for `passes x N` scan/proxy work while the **wall-clock wait remains bounded by `WaitTimeSeconds`**. Mitigation: latency-sensitive deployments can co-locate partitions on fewer Raft groups (at the cost of less throughput parallelism); a single-partition or co-located deployment pays nothing.
 
 2. **Partition-leader churn**: a leader change on partition 3 causes that partition's ReceiveMessage to fail-over while partitions 0–2 and 4–7 keep serving. Existing `proxyToLeader` machinery handles the transition.
 
@@ -311,7 +321,7 @@ This is out of scope here.
 
    **Runtime safeguard for downgraded leaders** (P1 review finding on PR #664). The create-time gate prevents *new* partitioned queues from being created in a mixed-version cluster, but does not protect against the following sequence: (1) all nodes have `htfifo`, (2) a partitioned queue `orders.fifo` is created, (3) node A is rolled back to a pre-`htfifo` binary and rejoins, (4) node A is elected leader for one of the partition Raft groups, (5) node A's `ReceiveMessage` scans the old single-prefix keyspace (`!sqs|msg|data|orders.fifo|...`) and finds nothing — false-empty reads — and (6) any `SendMessage` it accepts is written under the old key format, so messages effectively land in a key-prefix the reaper does not enumerate.
 
-   The runtime safeguard is a node-admission check that complements the create-time gate: on startup *and* on every leadership acquisition for an SQS Raft group, the node enumerates the catalog for queues whose `PartitionCount > 1` that map to the local shard. If any such queue exists and the binary does not advertise `htfifo`, the node refuses leadership for that group with an explicit log line (`sqs: refusing leadership of group %s — partitioned queue %s requires htfifo capability`) and steps down (etcd/raft `TransferLeadership` to any peer; if no peer is willing, the group becomes leaderless until an `htfifo`-capable node joins, which is the desired fail-closed behaviour). The check piggybacks on the existing leadership-acquisition hook in `kv/lease_state.go` so it costs nothing during steady-state operation. Implementations of Phase 3.D's PR set must include this safeguard before the rollout step that marks the binary `htfifo`-eligible (§11 PR 4).
+   The runtime safeguard is map-backed, not catalog-enumerating: startup flattens `--sqsFifoPartitionMap` through `partitionedGroupSet`, installs a leader-acquired callback for each mapped Raft group, and if that group becomes leader on a binary that does not advertise `htfifo`, the hook logs `sqs: refusing leadership — partitioned queue requires htfifo capability` with the group id and calls `TransferLeadership`. Groups absent from `--sqsFifoPartitionMap` are intentionally skipped, even if a single-shard/no-map deployment's create-time capability gate admitted a partitioned queue. That deployment shape has no per-partition group map for the hook to match, so rollback after creating a partitioned queue remains an operator drain/recreate boundary rather than a fail-closed leadership refusal.
 
 ---
 
@@ -382,7 +392,7 @@ This is out of scope here.
 | 1 | This proposal doc lands. Operators have time to flag concerns. | Yes | ✅ Merged (#664) |
 | 2 | Schema: `sqsQueueMeta.PartitionCount`, `DeduplicationScope`, `FifoThroughputLimit`. Routing function `partitionFor`. CreateQueue / SetQueueAttributes validation including the §3.2 cross-attribute rules. **Temporary feature gate** (see below): `CreateQueue` rejects `PartitionCount > 1` with `InvalidAttributeValue` ("PartitionCount > 1 requires HT-FIFO data plane — not yet enabled") so the schema field exists in the meta type but cannot land in production data. | Yes (catalog only) | ✅ Merged (#681) |
 | 3 | Keyspace: thread `partitionIndex` through every `sqsMsg*Key` constructor, defaulting to 0 so existing queues stay byte-identical. Gate from PR 2 still in place — `PartitionCount > 1` remains rejected. | Yes (mechanical) | ✅ Merged (#703) |
-| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. New `--sqsFifoPartitionMap` flag (separate from the existing `--raftSqsMap` endpoint-mapping flag). Mixed-version gate (§8.5 capability advertisement via `/sqs_health` + catalog polling for `CreateQueue` gating, **and** the §8 leadership-refusal hook in `kv/lease_state.go` that calls `TransferLeadership` when a non-`htfifo` binary discovers a partitioned queue in its shard on startup or leadership acquisition — both components are required before the binary is marked `htfifo`-eligible). PR 2's temporary `PartitionCount > 1` rejection still in place. | Yes (operator-config) | ✅ Merged across 4-A / 4-B-1 / 4-B-2 / 4-B-3a / 4-B-3b (#704, #708, #715, #721, #723) |
+| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. New `--sqsFifoPartitionMap` flag (separate from the existing `--raftSqsMap` endpoint-mapping flag). Mixed-version gate (§8.5 capability advertisement via `/sqs_health` + catalog polling for `CreateQueue` gating, **and** the §8 leadership-refusal hook that calls `TransferLeadership` for groups named by `--sqsFifoPartitionMap` when a non-`htfifo` binary gains leadership — both components are required before the binary is marked `htfifo`-eligible; no-map deployments keep the drain/recreate rollback boundary). PR 2's temporary `PartitionCount > 1` rejection still in place. | Yes (operator-config) | ✅ Merged across 4-A / 4-B-1 / 4-B-2 / 4-B-3a / 4-B-3b (#704, #708, #715, #721, #723) |
 | 5 | Send / Receive partition fanout. Receipt-handle v2 codec. **Removes the PR 2 `PartitionCount > 1` rejection** in the same commit that wires the data-plane fanout — the gate and its lift land atomically so a half-deployed cluster can never accept a partitioned queue without the data plane to serve it. | Yes (data-plane) | ✅ Merged across 5a / 5b-1 / 5b-2 / 5b-3 (#724, #731, #732, #734) |
 | 6 | PurgeQueue / DeleteQueue partition iteration. Tombstone schema update. Reaper update. | Yes (control-plane) | ✅ Merged across 6a / 6b (#735, #736) |
 | 7 | Jepsen HT-FIFO workload. Metrics. | Yes (testing) | ✅ Merged across 7a / 7b (#737, #738) |

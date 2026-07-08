@@ -922,16 +922,15 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	// shared across the whole receive call instead of being
 	// multiplied by N.
 	//
-	// Rotate the starting partition by readTS so a sustained backlog
-	// on a single partition cannot permanently starve the others: a
-	// fixed start at 0 lets opts.Max fill from partition 0 on every
-	// call, so messages in higher-index partitions are never observed
-	// while the head queue stays hot. readTS is HLC-derived and
-	// advances per call, giving a uniform-enough rotation without
-	// any per-server state. FIFO ordering is unaffected because a
-	// MessageGroupId hashes to exactly one partition (partitionFor is
-	// deterministic), so cross-partition iteration order does not
-	// reorder messages within any group.
+	// Rotate the starting partition with a per-queue counter so a
+	// sustained backlog on a single partition cannot permanently
+	// starve the others: a fixed start at 0 lets opts.Max fill from
+	// partition 0 on every call, so messages in higher-index
+	// partitions are never observed while the head queue stays hot.
+	// FIFO ordering is unaffected because a MessageGroupId hashes to
+	// exactly one partition (partitionFor is deterministic), so
+	// cross-partition iteration order does not reorder messages
+	// within any group.
 	partitions := effectivePartitionCount(meta)
 	startOffset := s.nextReceiveFanoutStart(queueName, partitions)
 	for i := uint32(0); i < partitions; i++ {
