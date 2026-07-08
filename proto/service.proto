@@ -44,6 +44,7 @@ message RawPutResponse {
 message RawGetRequest {
   bytes key = 1;
   uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
+  uint64 group_id = 4; // optional explicit Raft group for non-range-owned keyspaces
 }
 
 message RawGetResponse {
@@ -76,6 +77,7 @@ message RawScanAtRequest {
   int64 limit = 3; // validated against host int size; large values may be rejected
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
   bool reverse = 5;
+  uint64 group_id = 6; // optional explicit Raft group for non-range-owned keyspaces
 }
 
 message RawKVPair {

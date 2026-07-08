@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
@@ -259,7 +260,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 	d := &DynamoDBServer{
 		listen:           listen,
 		store:            st,
-		coordinator:      coordinate,
+		coordinator:      kv.WithKeyVizLabel(coordinate, keyviz.LabelDynamo),
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0",
 	}
 	d.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){

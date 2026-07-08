@@ -56,6 +56,31 @@ func TestPivotKeyVizColumnsK1KeepsLegacyBucketID(t *testing.T) {
 	require.Equal(t, "route:7", m.Rows[0].BucketID)
 }
 
+func TestPivotKeyVizColumnsLabelsDoNotCollide(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1_700_000_000, 0)
+	cols := []keyviz.MatrixColumn{
+		{
+			At: at,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Label: keyviz.LabelDynamo, Start: []byte("a"), End: []byte("z"), SubBucketCount: 1, Writes: 5},
+				{RouteID: 1, Label: keyviz.LabelRedis, Start: []byte("a"), End: []byte("z"), SubBucketCount: 1, Writes: 9},
+			},
+		},
+	}
+
+	m := pivotKeyVizColumns(cols, keyVizSeriesWrites, keyVizRowBudgetCap)
+	require.Len(t, m.Rows, 2)
+	byID := map[string]KeyVizRow{}
+	for _, row := range m.Rows {
+		byID[row.BucketID] = row
+	}
+	require.Equal(t, "dynamo", byID["route:1:dynamo"].Label)
+	require.Equal(t, []uint64{5}, byID["route:1:dynamo"].Values)
+	require.Equal(t, "redis", byID["route:1:redis"].Label)
+	require.Equal(t, []uint64{9}, byID["route:1:redis"].Values)
+}
+
 // TestMergeKeyVizMatricesMixedKCoexist pins the §9 decision 2: in a
 // mixed-K cluster a K=1 peer emits "route:1" while a K=2 peer emits
 // "route:1#0"/"route:1#1". Because the merge dedupes by BucketID these

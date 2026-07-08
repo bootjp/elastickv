@@ -14,7 +14,7 @@ Date: 2026-06-03
 > (`OperationGroup.PrevCommitTS` → `onePhaseTxnRequestWithPrevCommit`) already
 > exist and are shared across adapters; only the DynamoDB adapter retry loop
 > and a default-off gate are new. Follows the parent design
-> [`2026_05_21_proposed_txn_secondary_idempotency.md`](2026_05_21_proposed_txn_secondary_idempotency.md);
+> [`2026_05_21_implemented_txn_secondary_idempotency.md`](2026_05_21_implemented_txn_secondary_idempotency.md);
 > read that first — this doc reuses its correctness argument verbatim and only
 > develops the DynamoDB-specific differences.
 >
@@ -484,7 +484,7 @@ change (the probe already exists), no proto change, no new store primitive.
 - (2026-06-03) Initial proposal, triggered by Jepsen run 26856696842
   (`:duplicate-elements` on the DynamoDB list-append workload). Open for
   review. Diagnosis confirmed: same anomaly class as the parent design
-  (`2026_05_21_proposed_txn_secondary_idempotency.md`); the DynamoDB
+  (`2026_05_21_implemented_txn_secondary_idempotency.md`); the DynamoDB
   single-item write recomputes its write set on a self-inflicted
   `WriteConflict` under leadership churn and double-applies. Fix: extend
   option-2 reuse-dedup to `retryItemWriteWithGeneration`.
