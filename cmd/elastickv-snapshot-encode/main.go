@@ -109,6 +109,7 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 //     (codex P2 v21 #904)
 //   - ErrEncodeUnsupportedSQSPreserveVisibility: validateEncodeOptionsUnsupportedFeatures
 //     (codex P2 v21 #904)
+//   - ErrEncodeUnsupportedSQSSideRecords: validateEncodeOptionsUnsupportedFeatures
 //   - ErrEncodeAdapterData: runAdapterEncoders mark on adapter
 //     rejection (codex P2 v9 #904)
 //   - errSelfTestMismatch: writeAndPublish self-test branch
@@ -125,6 +126,7 @@ func classifyEncodeError(err error) int {
 		errors.Is(err, backup.ErrEncodeUnsupportedS3IncompleteUploads),
 		errors.Is(err, backup.ErrEncodeUnsupportedS3Orphans),
 		errors.Is(err, backup.ErrEncodeUnsupportedSQSPreserveVisibility),
+		errors.Is(err, backup.ErrEncodeUnsupportedSQSSideRecords),
 		errors.Is(err, backup.ErrEncodeAdapterData),
 		errors.Is(err, errSelfTestMismatch),
 		errors.Is(err, backup.ErrInvalidManifest),
@@ -488,6 +490,7 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 		encodeOpts.S3IncludeIncompleteUploads = manifest.Exclusions.IncludeIncompleteUploads
 		encodeOpts.S3IncludeOrphans = manifest.Exclusions.IncludeOrphans
 		encodeOpts.PreserveSQSVisibility = manifest.Exclusions.PreserveSQSVisibility
+		encodeOpts.IncludeSQSSideRecords = manifest.Exclusions.IncludeSQSSideRecords
 	}
 	if cfg.selfTest {
 		encodeOpts.SelfTestDecodeOptions = buildSelfTestDecodeOptions(cfg, manifest)

@@ -9,7 +9,7 @@ A single binary `cmd/elastickv-snapshot-encode` that:
 
 1. Reads `MANIFEST.json` from `--input` (a directory tree produced by `elastickv-snapshot-decode` or by a future Phase 1 live extractor).
 2. Calls `backup.EncodeSnapshot(EncodeOptions)` which internally constructs the `snapshotBuilder` (unexported), invokes each enabled adapter encoder in deterministic order (redis → dynamodb → s3 → sqs; the same order `ENCODE_INFO.json` `adapters_enabled` reflects), runs the optional self-test through an on-disk temporary `.fsm`, and returns an `EncodeResult`. The final `.fsm` bytes are written to the caller-supplied `io.Writer`; they are not returned.
-3. **Write-then-rename atomic publish:** the `.fsm` bytes are written to `<output>.tmp-<random>`, fsynced + closed, and ONLY after a successful self-test (when `--self-test` is set) renamed atomically to `<output>`. A self-test failure leaves nothing at the restore-visible path — the temp file is `os.RemoveAll`'d in the failure path (codex P2 v2 #896). When `--self-test` is not set, the rename happens immediately after fsync; behavior matches the decoder's atomic-publish discipline.
+3. **Write-then-rename atomic publish:** the `.fsm` bytes are written to `<output>.tmp-<random>`, fsynced + closed, and ONLY after a successful self-test (when `--self-test` is set) renamed atomically to `<output>`. A self-test failure leaves nothing at the restore-visible path — the temp file is `os.RemoveAll`'d in the failure path. When `--self-test` is not set, the rename happens immediately after fsync; behavior matches the decoder's atomic-publish discipline.
 4. Emits `<output>.encode_info.json` next to the renamed `.fsm` (provenance + integrity anchor; see §"`ENCODE_INFO.json`" for the path-derivation rule).
 5. On `--self-test` failure: exit 2 with `<output>.mismatch.txt` (next to where the `.fsm` would have been) and no `.fsm` at the publish path.
 
@@ -24,6 +24,7 @@ type EncodeOptions struct {
     S3IncludeIncompleteUploads   bool
     S3IncludeOrphans             bool
     PreserveSQSVisibility        bool
+    IncludeSQSSideRecords        bool
     ManifestLastCommitTS         uint64
     SelfTest                     bool
     SelfTestDecodeOptions        DecodeOptions
@@ -79,7 +80,7 @@ Pinned by `TestCLIRejectsLowerLastCommitTSOverride`.
 
 ## `ENCODE_INFO.json` (provenance + integrity)
 
-A new sidecar emitted next to the output `.fsm`, NOT inside it (the EKVPBBL1 byte format is fixed). **Sidecar filename is derived from the `.fsm` path**, not a static `ENCODE_INFO.json` — multiple `.fsm` files can share a directory (e.g., per-node dumps under `/backups/`), and a static name would silently overwrite siblings (gemini medium #896). The convention is:
+A new sidecar emitted next to the output `.fsm`, NOT inside it (the EKVPBBL1 byte format is fixed). **Sidecar filename is derived from the `.fsm` path**, not a static `ENCODE_INFO.json` — multiple `.fsm` files can share a directory (e.g., per-node dumps under `/backups/`), and a static name would silently overwrite siblings. The convention is:
 
 ```
 <output>.encode_info.json
@@ -131,27 +132,28 @@ assert dirTree == dirTree'   (excluding wall-time + encoder-provenance fields)
 
 Implementation:
 
-1. After the primary `.fsm` is written + sha256-anchored, invoke `backup.DecodeSnapshot` on the produced bytes into a unique scratch subdirectory. The scratch dir is ALWAYS a fresh `encode-self-test-<random>` subdirectory under the resolved base (default base `os.TempDir()`; operator override via `--scratch-root`). The unique-suffix is non-optional even when `--scratch-root` is pinned — concurrent encodes against the same pinned base would otherwise collide and produce false failures (gemini medium #896).
+1. After the primary `.fsm` is written + sha256-anchored, invoke `backup.DecodeSnapshot` on the produced bytes into a unique scratch subdirectory. The scratch dir is ALWAYS a fresh `encode-self-test-<random>` subdirectory under the resolved base (default base `os.TempDir()`; operator override via `--scratch-root`). The unique-suffix is non-optional even when `--scratch-root` is pinned — concurrent encodes against the same pinned base would otherwise collide and produce false failures.
 2. **DecodeOptions and fail-closed guards are read back from the input MANIFEST.json.** The self-test feeds `DecodeSnapshot` option flags derived from the same manifest that described `--input`; for supported fields this prevents default-vs-set mismatches. The CLI reads `MANIFEST.json` `Exclusions.{IncludeIncompleteUploads,IncludeOrphans,PreserveSQSVisibility,IncludeSQSSideRecords,RenameS3Collisions}` and the top-level `DynamoDBLayout` field. `buildSelfTestDecodeOptions` threads those values into the scratch `DecodeOptions`; `buildEncodeOptions` separately threads the fields that are encoder guards today. For producer modes the encoder cannot faithfully reconstruct, `EncodeSnapshot` fails closed before writing bytes when the corresponding adapter is enabled:
 
    - `dynamodb_layout: "jsonl"` + DynamoDB adapter: `ErrEncodeUnsupportedDynamoDBLayout`
    - `exclusions.include_incomplete_uploads=true` + S3 adapter: `ErrEncodeUnsupportedS3IncompleteUploads`
    - `exclusions.include_orphans=true` + S3 adapter: `ErrEncodeUnsupportedS3Orphans`
    - `exclusions.preserve_sqs_visibility=true` + SQS adapter: `ErrEncodeUnsupportedSQSPreserveVisibility`
+   - `exclusions.include_sqs_side_records=true` + SQS adapter: `ErrEncodeUnsupportedSQSSideRecords`
 
-   The guards are adapter-scoped, so a Redis-only encode is not blocked by S3-only manifest flags. `IncludeSQSSideRecords` and `RenameS3Collisions` are self-test decode options, not encoder fail-closed guards: the implemented encoder can reconstruct its supported output while asking the scratch decoder to use those same manifest-derived decode modes. The S3 incomplete/orphan flags and SQS preserved-visibility flag are still threaded into the scratch decode options for manifest fidelity, but when the corresponding adapter is enabled they are rejected before self-test because the reverse encoder cannot rebuild those producer modes. Pinned by `TestCLIRejectsUnsupportedManifestExclusions`, `TestEncodeSnapshotRejectsUnsupportedFeatures`, `TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter`, and `TestEncodeSnapshotRejectsDynamoDBJSONLLayout`.
+   The guards are adapter-scoped, so a Redis-only encode is not blocked by S3-only or SQS-only manifest flags. `RenameS3Collisions` is a self-test decode option, not an encoder fail-closed guard: the implemented encoder can reconstruct its supported output while asking the scratch decoder to use the same manifest-derived rename mode. The S3 incomplete/orphan flags and SQS preserve-visibility/include-side-records flags are still threaded into the scratch decode options for manifest fidelity, but when the corresponding adapter is enabled they are rejected before self-test because the reverse encoder cannot rebuild those producer modes. Pinned by `TestCLIRejectsUnsupportedManifestExclusions`, `TestEncodeSnapshotRejectsUnsupportedFeatures`, `TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter`, and `TestEncodeSnapshotRejectsDynamoDBJSONLLayout`.
 
-> **Schema extension folded into M6.** `Exclusions` currently lacks `RenameS3Collisions` even though the decoder CLI's `--rename-collisions` flag drives `DecodeOptions.RenameS3Collisions` (codex P2 v4 #896): dumps produced with that flag CANNOT be perfectly self-tested today because the encoder has no way to know to ask for the same renaming pass. M6 adds the field to the `Exclusions` struct + JSON tag (`rename_s3_collisions`) and updates the decoder CLI's `emitManifest` to populate it. **The new field is intentionally NOT added to `exclusionsRequiredFields` (`manifest.go:350-355`)** so `ReadManifest` treats its absence as the zero value `false` (= no-rename, matching the decoder default). This is an intentional asymmetry with the four pre-existing `Exclusions` fields, all of which ARE in the required list: backward compatibility with every existing manifest (which doesn't emit `rename_s3_collisions`) is the constraint, and refusing them would be an unannounced breaking change. New manifests written by the M6 PR's `emitManifest` will always include the field; older manifests fall through to the zero value via the same `json.Unmarshal` default that protects every other new optional field added to `Manifest`. Pinned by `TestExclusionsLegacyManifestOmitsRenameS3Collisions`.
+> **Schema extension folded into M6.** `Exclusions` currently lacks `RenameS3Collisions` even though the decoder CLI's `--rename-collisions` flag drives `DecodeOptions.RenameS3Collisions`: dumps produced with that flag CANNOT be perfectly self-tested today because the encoder has no way to know to ask for the same renaming pass. M6 adds the field to the `Exclusions` struct + JSON tag (`rename_s3_collisions`) and updates the decoder CLI's `emitManifest` to populate it. **The new field is intentionally NOT added to `exclusionsRequiredFields` (`manifest.go:350-355`)** so `ReadManifest` treats its absence as the zero value `false` (= no-rename, matching the decoder default). This is an intentional asymmetry with the four pre-existing `Exclusions` fields, all of which ARE in the required list: backward compatibility with every existing manifest (which doesn't emit `rename_s3_collisions`) is the constraint, and refusing them would be an unannounced breaking change. New manifests written by the M6 PR's `emitManifest` will always include the field; older manifests fall through to the zero value via the same `json.Unmarshal` default that protects every other new optional field added to `Manifest`. Pinned by `TestExclusionsLegacyManifestOmitsRenameS3Collisions`.
 >
 > **Decoder-cleanup milestone attribution.** Parent doc said "Decoder cleanup folded into M1." M1 shipped without it. M6 picks up the `RenameS3Collisions` schema extension above. The `Source.FSMCRC32C` manifest cleanup is deferred; `<output>.encode_info.json` `output_fsm_sha256` is the authoritative SHA-256 record for encoded output.
-3. **Header check (no MANIFEST.json in scratch):** `DecodeSnapshot` returns a `DecodeResult` whose `Header.LastCommitTS` is the value the decoder read from the produced `.fsm`. Compare it against the effective `T` (manifest value or `--last-commit-ts` override). The decoder library does NOT emit `MANIFEST.json` (that is the cmd wrapper's job per `internal/backup/decode.go`); the self-test deliberately consumes the library output and compares the in-memory header instead, avoiding a redundant manifest synthesis step (codex P2 v1 #896).
+3. **Header check (no MANIFEST.json in scratch):** `DecodeSnapshot` returns a `DecodeResult` whose `Header.LastCommitTS` is the value the decoder read from the produced `.fsm`. Compare it against the effective `T` (manifest value or `--last-commit-ts` override). The decoder library does NOT emit `MANIFEST.json` (that is the cmd wrapper's job per `internal/backup/decode.go`); the self-test deliberately consumes the library output and compares the in-memory header instead, avoiding a redundant manifest synthesis step.
 4. **Tree diff:** structurally compare the scratch adapter subtrees against the corresponding subdirs of `--input`. The diff is byte-equal on adapter files (filenames + bytes — every per-adapter dump is deterministic). `MANIFEST.json` from `--input` is NOT compared at all in the scratch tree (the scratch has none); the `last_commit_ts` field is covered by the header check above. `wall_time_iso` and other manifest transient fields are not in scope.
 5. **Eager cleanup.** The scratch subdir is removed via `os.RemoveAll` on ALL exit paths (success, mismatch, encoder error), in a `defer` set up immediately after `MkdirTemp` returns. A stale `mismatch.txt` next to the output `.fsm` is removed at the start of every run (success or fresh-failure), so the file is always the latest run's record, never a stale one.
 6. **On mismatch:** exit code 2; `mismatch.txt` (next to `.fsm`, named `<output>.mismatch.txt` per the same path-derivation rule as the sidecar) lists the first N differing paths + the header check result; `ENCODE_INFO.json` records `self_test.matched: false` before the exit. Restore operators inspect `<output>.mismatch.txt`.
 
 **Why default-off:** self-test doubles encode time and uses 2× disk. It is the gold-standard correctness check, but most operational uses (re-encode a known-good tree for restore) skip it. CI runs `--self-test` on every encoder PR; the M6 CLI test file `TestCLIRoundTripSelfTest` does too.
 
-## Files to add (M6 implementation slice)
+## Implementation files (M6 slice)
 
 ```
 internal/backup/encode_snapshot.go              # EncodeSnapshot wrapper (new public entrypoint)
@@ -162,7 +164,7 @@ cmd/elastickv-snapshot-encode/main.go           # flag parsing, temp-file dance,
 cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, write-then-rename atomicity)
 ```
 
-`internal/backup/encode_snapshot.go` mirrors the decoder's `DecodeSnapshot`-in-the-same-package convention: the high-level wrapper, the per-adapter encoders, and `snapshotBuilder` all live together; `main` only handles flag parsing + filesystem-level concerns (temp dance, sidecar). `internal/backup/encode_info.go` lives in the encoder package because the schema is encoder-specific (decoder never writes it) and the writers in the package can reuse `WriteManifest`'s Sync+Close hardening (gemini r1 medium on #810).
+`internal/backup/encode_snapshot.go` mirrors the decoder's `DecodeSnapshot`-in-the-same-package convention: the high-level wrapper, the per-adapter encoders, and `snapshotBuilder` all live together; `main` only handles flag parsing + filesystem-level concerns (temp dance, sidecar). `internal/backup/encode_info.go` lives in the encoder package because the schema is encoder-specific (decoder never writes it) and the writers in the package can reuse `WriteManifest`'s Sync+Close hardening.
 
 ## Test plan
 
@@ -176,10 +178,10 @@ cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, w
 | `TestEncodeSnapshotSelfTestDetectsCorruption` | Use a same-package test-only hook (an unexported `EncodeOptions` field, `corruptBufferForTest func(*os.File)`) that runs against the disk-backed self-test temp file AFTER `WriteTo` returns but BEFORE the self-test decodes. The corruption thus reaches `DecodeSnapshot` but never reaches `out` (a self-test failure must NOT publish the corrupt bytes per the write-then-rename rule above). The decode either errors or produces a diff, and the caller gets `SelfTestMatched=false` with mismatch text. |
 | `TestEncodeInfoRoundTrip` | `WriteEncodeInfo` → `ReadEncodeInfo` of the same struct equal. Forward-compat: an `ENCODE_INFO.json` with extra fields decodes cleanly. |
 | `TestEncodeInfoRejectsUnknownFormatVersion` | format_version != 1 → typed error, mirroring decoder's `TestManifestVersionGate`. |
-| `TestCLIEncodeInfoPathDerivedFromOutput` | `--output /tmp/a.fsm` produces `/tmp/a.fsm.encode_info.json`, not `/tmp/ENCODE_INFO.json` (pins gemini medium #896). |
+| `TestCLIEncodeInfoPathDerivedFromOutput` | `--output /tmp/a.fsm` produces `/tmp/a.fsm.encode_info.json`, not `/tmp/ENCODE_INFO.json`. |
 | `TestCLIEncodeInfoTwoFilesNoCollision` | Two `--output` paths in the same dir produce two distinct sidecars; second run does not overwrite the first. |
-| `TestCLISelfTestFailureLeavesNoFsmAtOutputPath` | With `--self-test` enabled and a deliberately-mangled encoder: the corrupt `.fsm` is NEVER visible at `--output` (the publish path); the temp file is removed; exit 2 (codex P2 v2 #896). Pins the write-then-rename atomic-publish discipline. |
-| `TestEncodeSnapshotLibraryRoundTrip` | `backup.EncodeSnapshot` + immediate `DecodeSnapshot` on the returned bytes produces an equivalent adapter tree without going through `cmd/`. Pins the library entrypoint independently of the CLI, so future callers (Phase 1 live extractor, integration tests) have a tested API surface (codex P2 v2 #896 — encoder entrypoint exposure). |
+| `TestCLISelfTestFailureLeavesNoFsmAtOutputPath` | With `--self-test` enabled and a deliberately-mangled encoder: the corrupt `.fsm` is NEVER visible at `--output` (the publish path); the temp file is removed; exit 2. Pins the write-then-rename atomic-publish discipline. |
+| `TestEncodeSnapshotLibraryRoundTrip` | `backup.EncodeSnapshot` + immediate `DecodeSnapshot` on the returned bytes produces an equivalent adapter tree without going through `cmd/`. Pins the library entrypoint independently of the CLI, so future callers (Phase 1 live extractor, integration tests) have a tested API surface. |
 | `TestCLIRejectsUnsupportedManifestExclusions` | A manifest with `include_incomplete_uploads`, `include_orphans`, or `preserve_sqs_visibility` enabled is rejected with exit 2 when the matching adapter is selected, with no `.fsm` published. |
 | `TestEncodeSnapshotRejectsUnsupportedFeatures` | Library-level guard coverage for unsupported manifest-derived S3/SQS producer modes. |
 | `TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter` | Unsupported manifest-derived flags only reject when the corresponding adapter is enabled. |
@@ -190,7 +192,7 @@ cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, w
 
 ## Self-review (5 passes)
 
-1. **Data loss.** The CLI is a wrapper over already-merged + tested encoder slices. The only new write paths are the `.fsm` output and `ENCODE_INFO.json`; both use the WriteManifest-style fsync-then-close discipline (gemini r1 medium on #810). The self-test gate is a defense-in-depth check that catches encoder regressions before a restore operator does.
+1. **Data loss.** The CLI is a wrapper over already-merged + tested encoder slices. The only new write paths are the `.fsm` output and `ENCODE_INFO.json`; both use the WriteManifest-style fsync-then-close discipline. The self-test gate is a defense-in-depth check that catches encoder regressions before a restore operator does.
 2. **Concurrency / distributed failures.** Pure offline. No Raft, no HLC issuance, no cluster contact. The output `.fsm` is loaded by a STOPPED node via stop-replace-restart (parent §"Restore via stop-replace-restart"); concurrency surfaces only on the receiving cluster's restart path, which is owned by the node's existing snapshot loader.
 3. **Performance.** Encode is O(records in dump); each adapter's Encode is O(its inputs). Self-test doubles this. No hot-loop allocations introduced by the CLI itself (it just wires existing constructors). Big trees may want `GOGC` tuning; documented in the file header, not a flag.
 4. **Data consistency.** `--last-commit-ts T` validation is the load-bearing invariant — `T ≥ manifest.last_commit_ts` is fail-closed (pinned by `TestCLIRejectsLowerLastCommitTSOverride`). Self-test compares against the effective `T`, not the manifest value, per parent doc requirement. Adapter set passed to the CLI matches the adapter set the encoders walk — same parse-and-validate function as the decoder (`parseAdapterSet`) so a typo cannot silently downgrade scope.
@@ -202,7 +204,7 @@ The parent doc flags `internal/backup/manifest.go` `Source.FSMCRC32C` as dead fo
 
 ## Milestones / sequencing
 
-M6 lands as a **single PR** (this doc + implementation + tests). No further splits — the wiring is small and the self-test is integral to the CLI's value proposition; splitting it out would mean shipping an untested CLI first.
+M6 landed as a **single PR** (this doc + implementation + tests). No further splits were used — the wiring is small and the self-test is integral to the CLI's value proposition; splitting it out would have meant shipping an untested CLI first.
 
 ## Open questions
 
