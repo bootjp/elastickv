@@ -3,6 +3,8 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -118,7 +120,20 @@ func TestS3PutAdmissionProbeUsesBootstrapForChunkedDecodedLength(t *testing.T) {
 	require.Equal(t, s3PutAdmissionProtocolChunked, protocol)
 }
 
-func TestS3Server_PutObjectAdmissionRejectsOversizedRequest(t *testing.T) {
+func TestS3PutAdmissionProbeUsesChunkHeadroomForFixedLength(t *testing.T) {
+	t.Parallel()
+
+	server := &S3Server{putAdmission: newS3PutAdmission(s3ChunkSize, time.Second)}
+	req := newS3TestRequest(http.MethodPut, "/bucket/key", http.NoBody)
+	req.ContentLength = 2*s3ChunkSize + 1
+
+	bytes, protocol, err := server.s3PutAdmissionProbeBytes(req, s3MaxObjectSizeBytes)
+	require.NoError(t, err)
+	require.EqualValues(t, s3ChunkSize, bytes)
+	require.Equal(t, s3PutAdmissionProtocolFixed, protocol)
+}
+
+func TestS3Server_PutObjectAdmissionAllowsFixedLengthLargerThanBudget(t *testing.T) {
 	t.Parallel()
 
 	server, observer := newS3AdmissionTestServer(t, 2*time.Second)
@@ -126,20 +141,19 @@ func TestS3Server_PutObjectAdmissionRejectsOversizedRequest(t *testing.T) {
 
 	payload := strings.Repeat("x", s3ChunkSize+1)
 	rec := httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodPut, "/admit-big/too-large.bin", strings.NewReader(payload))
+	req := newS3TestRequest(http.MethodPut, "/admit-big/larger-than-budget.bin", strings.NewReader(payload))
 	server.handle(rec, req)
 
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-	require.Equal(t, "2", rec.Header().Get("Retry-After"))
-	require.Equal(t, "close", rec.Header().Get("Connection"))
-	require.Contains(t, rec.Body.String(), "<Code>SlowDown</Code>")
-	require.Contains(t, rec.Body.String(), "<Message>Reduce your request rate</Message>")
-	require.Equal(t, 1, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Greater(t, observer.waits[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed], 1)
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed])
 	require.Zero(t, observer.lastInflight)
 
 	rec = httptest.NewRecorder()
-	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-big/too-large.bin", nil))
-	require.Equal(t, http.StatusNotFound, rec.Code)
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-big/larger-than-budget.bin", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, payload, rec.Body.String())
 }
 
 func TestS3Server_PutObjectAdmissionRejectsFixedLengthOverS3LimitAsEntityTooLarge(t *testing.T) {
@@ -231,7 +245,7 @@ func TestS3Server_PutObjectRejectsTruncatedFixedLengthBody(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-func TestS3Server_PutObjectAdmissionChunkedMidstreamTimeoutReleasesBudget(t *testing.T) {
+func TestS3Server_PutObjectAdmissionChunkedStreamsPastSingleChunkBudget(t *testing.T) {
 	t.Parallel()
 
 	server, observer := newS3AdmissionTestServer(t, 5*time.Millisecond)
@@ -245,15 +259,49 @@ func TestS3Server_PutObjectAdmissionChunkedMidstreamTimeoutReleasesBudget(t *tes
 	req.Header.Set("X-Amz-Content-Sha256", s3StreamingUnsignedPayloadTrailer)
 	server.handle(rec, req)
 
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-	require.Contains(t, rec.Body.String(), "<Code>SlowDown</Code>")
-	require.Equal(t, 1, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolChunked])
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Greater(t, observer.waits[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolChunked], 1)
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolChunked])
 	require.Zero(t, observer.lastInflight)
 	require.Zero(t, server.putAdmission.inflight.Load())
 
 	rec = httptest.NewRecorder()
 	server.handle(rec, newS3TestRequest(http.MethodGet, "/admit-chunked/midstream.bin", nil))
-	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, string(payload), rec.Body.String())
+}
+
+func TestS3Server_UploadPartAdmissionAllowsFixedLengthLargerThanBudget(t *testing.T) {
+	t.Parallel()
+
+	server, observer := newS3AdmissionTestServer(t, 2*time.Second)
+	createS3AdmissionTestBucket(t, server, "admit-part")
+
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPost, "/admit-part/object.bin?uploads=", nil)
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+	require.NotEmpty(t, initResult.UploadId)
+
+	payload := strings.Repeat("p", s3ChunkSize+1)
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(
+		http.MethodPut,
+		fmt.Sprintf("/admit-part/object.bin?uploadId=%s&partNumber=1", initResult.UploadId),
+		strings.NewReader(payload),
+	)
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, quoteS3ETag(md5Hex(payload)), rec.Header().Get("ETag"))
+	require.Greater(t, observer.waits[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed], 1)
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePrereserve+"|"+s3PutAdmissionProtocolFixed])
+	require.Zero(t, observer.rejections[s3PutAdmissionStagePerBatch+"|"+s3PutAdmissionProtocolFixed])
+	require.Zero(t, observer.lastInflight)
+	require.Zero(t, server.putAdmission.inflight.Load())
 }
 
 func newS3AdmissionTestServer(t *testing.T, timeout time.Duration) (*S3Server, *recordingS3PutAdmissionObserver) {

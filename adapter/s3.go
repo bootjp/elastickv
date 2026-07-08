@@ -925,21 +925,25 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return nil
 	}
 	for {
+		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
+			if err := flushBatch(); err != nil {
+				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+				writeS3InternalError(w, err)
+				return
+			}
+		}
 		readBuf, exactLength := nextReadBuffer()
 		if len(readBuf) == 0 {
 			break
 		}
-		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(len(readBuf)), admissionProtocol)
-		if admissionErr != nil {
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-			return
-		}
-		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
-		if n == 0 {
-			releaseAdmission()
-		}
+		n, readErr := s.readS3PutChunkWithAdmissionDeadline(w, r.Body, readBuf, !exactLength)
 		if n > 0 {
+			releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
+			if admissionErr != nil {
+				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+				writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+				return
+			}
 			pendingAdmission = append(pendingAdmission, releaseAdmission)
 			chunk := append([]byte(nil), readBuf[:n]...)
 			if _, err := hasher.Write(chunk); err != nil {
@@ -1474,19 +1478,17 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	for {
+		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
+			if err := flushBatch(); err != nil {
+				writeS3InternalError(w, err)
+				return
+			}
+		}
 		readBuf, exactLength := nextReadBuffer()
 		if len(readBuf) == 0 {
 			break
 		}
-		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(len(readBuf)), admissionProtocol)
-		if admissionErr != nil {
-			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-			return
-		}
-		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
-		if n == 0 {
-			releaseAdmission()
-		}
+		n, readErr := s.readS3PutChunkWithAdmissionDeadline(w, r.Body, readBuf, !exactLength)
 		if n == 0 {
 			if errors.Is(readErr, io.EOF) {
 				break
@@ -1500,6 +1502,11 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 				return
 			}
 			continue
+		}
+		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(n), admissionProtocol)
+		if admissionErr != nil {
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
 		}
 		pendingAdmission = append(pendingAdmission, releaseAdmission)
 		chunk := append([]byte(nil), readBuf[:n]...)
@@ -2560,6 +2567,20 @@ func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error
 		return n, errors.WithStack(err)
 	}
 	return n, nil
+}
+
+func (s *S3Server) readS3PutChunkWithAdmissionDeadline(w http.ResponseWriter, r io.Reader, buf []byte, allowFinalPartial bool) (int, error) {
+	if s == nil || s.putAdmission == nil || s.putAdmission.timeout <= 0 {
+		return readS3PutChunk(r, buf, allowFinalPartial)
+	}
+	controller := http.NewResponseController(w)
+	if err := controller.SetReadDeadline(time.Now().Add(s.putAdmission.timeout)); err != nil {
+		return readS3PutChunk(r, buf, allowFinalPartial)
+	}
+	defer func() {
+		_ = controller.SetReadDeadline(time.Time{})
+	}()
+	return readS3PutChunk(r, buf, allowFinalPartial)
 }
 
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When

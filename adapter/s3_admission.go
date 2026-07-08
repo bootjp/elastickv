@@ -250,6 +250,9 @@ func (s *S3Server) s3PutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (
 	if maxDecoded > 0 && r.ContentLength > maxDecoded {
 		return 0, protocol, errS3PutAdmissionEntityTooLarge
 	}
+	if r.ContentLength > s3ChunkSize {
+		return s3ChunkSize, protocol, nil
+	}
 	return r.ContentLength, protocol, nil
 }
 
@@ -279,6 +282,16 @@ func (s *S3Server) acquireS3PutAdmission(ctx context.Context, bytes int64, proto
 		release()
 		s.observeS3PutAdmissionInflight()
 	}, nil
+}
+
+func (s *S3Server) shouldFlushS3PutBatchBeforeRead(protocol string, pendingAdmission int) bool {
+	if pendingAdmission == 0 || s == nil || s.putAdmission == nil {
+		return false
+	}
+	if protocol == s3PutAdmissionProtocolChunked {
+		return true
+	}
+	return pendingAdmission >= cap(s.putAdmission.sem)
 }
 
 func (s *S3Server) s3PutAdmissionRetryAfter() time.Duration {
