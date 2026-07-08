@@ -42,7 +42,7 @@ The goal is SQS compatibility for standard AWS SDK/CLI workflows against a self-
 2. IAM, STS, cross-account policy, or resource-based policies. Static SigV4 key pairs only.
 3. Server-side KMS encryption (`SqsManagedSseEnabled`, `KmsMasterKeyId`).
 4. Cross-region replication or SQS-managed dead-letter redrive API (`StartMessageMoveTask` / `ListMessageMoveTasks`). DLQ re-drive by `RedrivePolicy` on `ReceiveMessage` **is** in scope.
-5. High-throughput FIFO (unlimited per-group throughput via partitioning). Milestone 1 provides single-partition FIFO semantics.
+5. AWS SQS features beyond the implemented HT-FIFO partitioning surface. The shipped partitioned FIFO design is tracked in [`2026_04_26_implemented_sqs_split_queue_fifo.md`](2026_04_26_implemented_sqs_split_queue_fifo.md).
 6. Exactly-once pub/sub fan-out (that is SNS, not SQS).
 
 ## 3. Compatibility Scope
@@ -244,7 +244,7 @@ Every internal prefix must normalize to this route:
 2. `kv/ShardStore.routesForScan` gains an SQS-aware internal scan mapping so `ReceiveMessage`'s visibility-index scan lands on the correct shard.
 3. The queue catalog (`!sqs|queue|meta|...`, `!sqs|queue|gen|...`) routes to a fixed control-plane group like the DynamoDB table catalog.
 
-Queue-per-shard routing is the simplest model. A single hot queue that outgrows a shard is a known operational limit in Milestone 1; splitting a queue across shards while preserving FIFO is deferred.
+Milestone 1 used queue-per-shard routing as the simplest model. The follow-on HT-FIFO work now covers partitioned FIFO queues and their routing constraints in [`2026_04_26_implemented_sqs_split_queue_fifo.md`](2026_04_26_implemented_sqs_split_queue_fifo.md); this section records the original single-queue routing baseline.
 
 ## 7. Request Flows
 
