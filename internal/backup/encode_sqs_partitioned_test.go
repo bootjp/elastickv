@@ -141,10 +141,10 @@ func TestSQSEncodePartitionedMsgDedupKeyByteShape(t *testing.T) {
 // of validatePartitioning: a partitioned queue (PartitionCount > 1)
 // with a message whose Partition field is nil (legacy pre-M5-3 dump
 // shape) fails closed with ErrSQSEncodeMissingPartition. Without
-// this gate the message would route to the classic key keyspace
-// (addMessage's `partition != nil` dispatch falls to
-// sqsMsgDataKeyBytes) and become invisible to the live readers
-// scanning the partitioned keyspace (codex P1 v914 v2).
+// this gate, stageMessageRecords would still pick the partitioned
+// keyspace from raw PartitionCount and would substitute partition 0,
+// bypassing the proof that the dump was captured by a partition-aware
+// decoder.
 func TestSQSEncodeRejectsMissingPartitionOnPartitionedQueue(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
@@ -242,9 +242,8 @@ func TestSQSEncodeRejectsNonZeroPartitionOnClassicQueue(t *testing.T) {
 // effectivePartitionCount. A perQueue queue with PartitionCount=2
 // collapses effectivePartitionCount to 1; if the missing-partition
 // gate used the effective count, a message with Partition==nil
-// would slip past validation, then addMessage's `partition != nil`
-// dispatch would emit the classic-shape data key against a
-// partitioned-keyspace queue — invisible on first read.
+// would slip past validation and be staged as partition 0 without
+// proof that the decoder captured a partitioned-keyspace row.
 //
 // This test would silently pass if the gate predicate were changed
 // to effectivePartitionCount(&meta) > 1.
@@ -394,6 +393,161 @@ func TestSQSEncodeRejectsNonPowerOfTwoPartitionCount(t *testing.T) {
 			err := NewSQSRecordEncoder(in).Encode(b)
 			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
 				t.Fatalf("partition_count=%d: err = %v, want ErrSQSEncodeInvalidQueue", n, err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeRejectsTooLargePartitionCount pins the restore-side
+// mirror of the live HT-FIFO cap. partition_count=64 is a power of
+// two, so the power-of-two guard alone is not enough to keep corrupted
+// _queue.json files live-equivalent.
+func TestSQSEncodeRejectsTooLargePartitionCount(t *testing.T) {
+	t.Parallel()
+	for _, n := range []uint32{64, 128} {
+		t.Run(fmt.Sprintf("count=%d", n), func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo",
+				[]byte(fmt.Sprintf(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":%d,"fifo_throughput_limit":"perMessageGroupId"}`, n)),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("partition_count=%d: err = %v, want ErrSQSEncodeInvalidQueue", n, err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeRejectsPartitionedStandardQueue pins the live
+// FIFO-only rule for HT-FIFO metadata. A Standard queue with
+// partition_count>1 cannot be produced by CreateQueue and must not be
+// accepted from a hand-authored or corrupted dump.
+func TestSQSEncodeRejectsPartitionedStandardQueue(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "standard",
+		[]byte(`{"format_version":1,"name":"standard",`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+// TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs mirrors the live
+// validateStandardQueueRejectsHTFIFO guard: even when PartitionCount is
+// omitted or 1, Standard queues cannot carry FIFO-only HT-FIFO
+// attributes.
+func TestSQSEncodeRejectsStandardQueueWithFIFOOnlyAttrs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		extra string
+	}{
+		{name: "throughput-per-queue", extra: `"fifo_throughput_limit":"perQueue"`},
+		{name: "throughput-per-message-group", extra: `"partition_count":1,"fifo_throughput_limit":"perMessageGroupId"`},
+		{name: "dedup-queue", extra: `"deduplication_scope":"queue"`},
+		{name: "dedup-message-group", extra: `"partition_count":1,"deduplication_scope":"messageGroup"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "standard",
+				[]byte(`{"format_version":1,"name":"standard",`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,`+tc.extra+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO pins the
+// restore-side mirror of validatePartitionConfig's HT-FIFO dedup
+// rule. Queue-scoped dedup cannot be represented by partitioned dedup
+// rows, which are keyed by (partition, group, dedupID), so a
+// hand-authored dump with this live-impossible shape must fail before
+// addQueueMeta persists it.
+func TestSQSEncodeRejectsQueueScopedDedupOnPartitionedFIFO(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "bad.fifo",
+		[]byte(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perMessageGroupId",`+
+			`"deduplication_scope":"queue"}`),
+		nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}
+
+// TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions mirrors
+// the live FifoThroughputLimit=perMessageGroupId rule: callers must
+// explicitly set PartitionCount > 1. Accepting a single-partition dump
+// with that throughput mode would persist live-impossible metadata.
+func TestSQSEncodeRejectsPerMessageGroupLimitWithoutPartitions(t *testing.T) {
+	t.Parallel()
+	for _, queueMeta := range []string{
+		`{"format_version":1,"name":"bad.fifo","fifo":true,` +
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,` +
+			`"delay_seconds":0,"fifo_throughput_limit":"perMessageGroupId"}`,
+		`{"format_version":1,"name":"bad.fifo","fifo":true,` +
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,` +
+			`"delay_seconds":0,"partition_count":1,"fifo_throughput_limit":"perMessageGroupId"}`,
+	} {
+		t.Run(queueMeta, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo", []byte(queueMeta), nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeRejectsUnknownHTFIFOAttributeValues mirrors the live
+// CreateQueue attribute parser vocabulary for HT-FIFO fields. Unknown
+// strings must not be persisted into restored queue metadata.
+func TestSQSEncodeRejectsUnknownHTFIFOAttributeValues(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		extra string
+	}{
+		{name: "bad-throughput", extra: `"fifo_throughput_limit":"bogus"`},
+		{name: "bad-dedup", extra: `"deduplication_scope":"bogus"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo",
+				[]byte(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":2,`+tc.extra+`}`),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
 			}
 		})
 	}
