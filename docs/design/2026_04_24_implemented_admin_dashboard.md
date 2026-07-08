@@ -14,7 +14,7 @@
 | **P3** — React SPA + embed | ✅ shipped | #649, #650 |
 | **P4** — TLS, read-only role, CSRF, `docs/admin.md`, deployment runbook + `scripts/rolling-update.sh` admin support | ✅ shipped | TLS / role / CSRF live in P1; operator doc + runbook + script wiring in #674 / #669 / #678 |
 
-The AdminDeleteBucket TOCTOU is fully resolved: see [`2026_04_28_proposed_admin_delete_bucket_safety_net.md`](2026_04_28_proposed_admin_delete_bucket_safety_net.md) for the safety-net design and [`docs/admin_deployment.md`](../admin_deployment.md) §4.6 for the operator-side contract (a `PutObject` 200-OK landing during the race window can be swept by the concurrent admin delete; pause writes before delete to retain in-flight writes).
+The AdminDeleteBucket TOCTOU is fully resolved: see [`2026_04_28_implemented_admin_delete_bucket_safety_net.md`](2026_04_28_implemented_admin_delete_bucket_safety_net.md) for the safety-net design and [`docs/admin_deployment.md`](../admin_deployment.md) §4.6 for the operator-side contract (a `PutObject` 200-OK landing during the race window can be swept by the concurrent admin delete; pause writes before delete to retain in-flight writes).
 
 ### Out-of-scope follow-ups
 
