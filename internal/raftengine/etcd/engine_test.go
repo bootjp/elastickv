@@ -1613,11 +1613,26 @@ func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
 	engine := &Engine{storage: storage}
 	engine.appliedIndex.Store(129)
 
-	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage())
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
 	require.True(t, engine.hasPendingConfChange())
 
 	engine.clearPendingConfChange(130)
 	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorageUsesReplayAppliedFloor(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: raftpb.EntryConfChange,
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(150)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(129))
+	require.True(t, engine.hasPendingConfChange(),
+		"RawNode replay can start before the FSM applied index after restart; the transfer fence must cover that replay window")
 }
 
 func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing.T) {
@@ -1630,7 +1645,7 @@ func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing
 	engine := &Engine{storage: storage}
 	engine.appliedIndex.Store(130)
 
-	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage())
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage(engine.appliedIndex.Load()))
 	require.False(t, engine.hasPendingConfChange())
 }
 

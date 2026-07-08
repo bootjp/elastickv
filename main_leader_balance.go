@@ -465,6 +465,9 @@ func leaderBalanceGroupEligible(
 
 func leaderBalanceTargetCandidates(group leaderBalanceGroupSnapshot, counts map[string]int, threshold int) []raftengine.TransferTarget {
 	sourceCount := counts[group.leader.ID]
+	if threshold < defaultLeaderBalanceImbalanceThreshold {
+		threshold = defaultLeaderBalanceImbalanceThreshold
+	}
 	servers := append([]raftengine.Server(nil), group.voters...)
 	sort.Slice(servers, func(i, j int) bool {
 		ci := counts[servers[i].ID]

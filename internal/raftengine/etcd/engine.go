@@ -591,7 +591,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(initialApplied)
-	if err := engine.restorePendingConfChangeFenceFromStorage(); err != nil {
+	if err := engine.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
@@ -2365,11 +2365,11 @@ func (e *Engine) applyReadyEntries(entries []raftpb.Entry) error {
 	return errors.WithStack(e.storage.Append(entries))
 }
 
-func (e *Engine) restorePendingConfChangeFenceFromStorage() error {
+func (e *Engine) restorePendingConfChangeFenceFromStorage(applied uint64) error {
 	if e.storage == nil {
 		return nil
 	}
-	entries, err := e.pendingConfChangeRestoreEntries()
+	entries, err := e.pendingConfChangeRestoreEntries(applied)
 	if err != nil {
 		return err
 	}
@@ -2379,8 +2379,7 @@ func (e *Engine) restorePendingConfChangeFenceFromStorage() error {
 	return nil
 }
 
-func (e *Engine) pendingConfChangeRestoreEntries() ([]raftpb.Entry, error) {
-	applied := e.appliedIndex.Load()
+func (e *Engine) pendingConfChangeRestoreEntries(applied uint64) ([]raftpb.Entry, error) {
 	if applied == math.MaxUint64 {
 		return nil, nil
 	}
@@ -3723,7 +3722,7 @@ func (e *Engine) clearPendingConfChange(appliedIndex uint64) {
 }
 
 func (e *Engine) hasPendingConfChange() bool {
-	return e.pendingConfChangeIndex.Load() > e.appliedIndex.Load()
+	return e.pendingConfChangeIndex.Load() != 0
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {

@@ -102,7 +102,7 @@ func TestLeaderBalanceConfigNormalizeClampsOneCountThreshold(t *testing.T) {
 
 func TestLeaderBalanceTargetCandidatesRequireObjectiveImprovement(t *testing.T) {
 	group := balanceGroupForLeader(2, "n1", "127.0.0.1:5001", "n1", "n2")
-	candidates := leaderBalanceTargetCandidates(group, map[string]int{"n1": 1, "n2": 0}, defaultLeaderBalanceImbalanceThreshold)
+	candidates := leaderBalanceTargetCandidates(group, map[string]int{"n1": 1, "n2": 0}, 1)
 	require.Empty(t, candidates)
 }
 
