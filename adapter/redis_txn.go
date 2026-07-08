@@ -1405,22 +1405,16 @@ type preparedTxnDispatch struct {
 // a prepared value with empty `elems` and a no-op cancel — callers can
 // check len(prepared.elems)==0 and skip the dispatch.
 func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
-	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
-	// the coordinator assigns it during Dispatch.
-	commitTS, err := t.server.coordinator.Clock().NextFenced()
-	if err != nil {
-		return preparedTxnDispatch{cancel: func() {}}, errors.Wrap(err, "redis txn commit: allocate commitTS")
-	}
 	// Derive a single redisDispatchTimeout-bounded context covering both
-	// the stream-deletion scans (paginated ScanAt/ExistsAt over
-	// StreamEntryScanPrefix) and the final Dispatch. The parent is the
-	// txnContext's own ctx (the caller's dispatchCtx), not the server-
-	// lifetime handlerContext, so an outer cancellation (client
-	// disconnect, retryRedisWrite timeout) interrupts the prepare+dispatch
-	// promptly instead of waiting the full redisDispatchTimeout. Symmetric
-	// with the reuseCtx threading in runTransactionWithDedup. The nil-guard
-	// falls back to handlerContext for callers that construct a txnContext
-	// without setting ctx (test fixtures).
+	// the commitTS allocation, the delta-key stream-deletion scans, and
+	// the final Dispatch. The parent is the txnContext's own ctx (the
+	// caller's dispatchCtx), not the server-lifetime handlerContext, so
+	// an outer cancellation (client disconnect, retryRedisWrite timeout)
+	// interrupts the prepare+dispatch promptly instead of waiting the
+	// full redisDispatchTimeout. Symmetric with the reuseCtx threading in
+	// runTransactionWithDedup. The nil-guard falls back to handlerContext
+	// for callers that construct a txnContext without setting ctx (test
+	// fixtures).
 	parentCtx := t.ctx
 	if parentCtx == nil {
 		parentCtx = t.server.handlerContext()
@@ -1447,12 +1441,22 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(replacementElems)+len(logicalDeleteElems)+len(hashDeleteElems)+len(setDeleteElems))
+	keyElems := t.buildKeyElems()
+	elems := make([]*kv.Elem[kv.OP], 0, len(replacementElems)+len(logicalDeleteElems)+len(hashDeleteElems)+len(setDeleteElems)+len(keyElems))
 	elems = append(elems, replacementElems...)
 	elems = append(elems, logicalDeleteElems...)
 	elems = append(elems, hashDeleteElems...)
 	elems = append(elems, setDeleteElems...)
-	elems = append(elems, t.buildKeyElems()...)
+	elems = append(elems, keyElems...)
+
+	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
+	// the coordinator assigns it during Dispatch. The allocation is bounded by
+	// ctx and must floor above the transaction's read snapshot.
+	commitTS, err := t.server.nextCommitTSAfter(ctx, t.startTS, "redis txn commit: allocate commitTS")
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
+	}
 	listElems := t.buildListElems(commitTS)
 	zsetElems, err := t.buildZSetElems(commitTS)
 	if err != nil {
@@ -1464,6 +1468,9 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	// non-string keys get a !redis|ttl| element written in the same transaction.
 	ttlElems := t.buildTTLElems()
 
+	// Continue using the same redisDispatchTimeout-bounded context for
+	// the stream-deletion scans (paginated ScanAt/ExistsAt over
+	// StreamEntryScanPrefix) and the final Dispatch.
 	streamElems, err := t.buildStreamDeletionElems(ctx)
 	if err != nil {
 		cancel()
@@ -2156,9 +2163,9 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// could issue a timestamp that collides with a subsequent leader's
 	// window after renewal — the very class of bug option-2 is meant to
 	// rule out.
-	commitTS, allocErr := r.coordinator.Clock().NextFenced()
+	commitTS, allocErr := r.nextCommitTSAfter(ctx, pending.startTS, "redis exec reuse: allocate commitTS")
 	if allocErr != nil {
-		return nil, false, errors.Wrap(allocErr, "redis exec reuse: allocate commitTS")
+		return nil, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,

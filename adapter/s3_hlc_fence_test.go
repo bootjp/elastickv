@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ func TestS3TxnStartTSFailsClosedOnExpiredCeiling(t *testing.T) {
 
 	// Sentinel ^uint64(0) means "allocate via HLC" — this is the
 	// path the fence guards.
-	_, err := srv.txnStartTS(^uint64(0))
+	_, err := srv.txnStartTS(context.Background(), ^uint64(0))
 	require.ErrorIs(t, err, kv.ErrCeilingExpired,
 		"s3 txnStartTS must propagate ErrCeilingExpired when the HLC's physical ceiling is stale")
 }
@@ -48,7 +49,7 @@ func TestS3TxnStartTSPassesThroughExplicitReadTS(t *testing.T) {
 
 	srv := &S3Server{coordinator: &stubAdapterCoordinator{clock: clock}}
 
-	ts, err := srv.txnStartTS(42)
+	ts, err := srv.txnStartTS(context.Background(), 42)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), ts)
 }
@@ -76,7 +77,7 @@ func TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling(t *testing.T) {
 
 	srv := &S3Server{coordinator: &stubAdapterCoordinator{clock: pastClock}}
 
-	_, err = srv.nextTxnCommitTS(startTS)
+	_, err = srv.nextTxnCommitTS(context.Background(), startTS)
 	require.ErrorIs(t, err, kv.ErrCeilingExpired,
 		"s3 nextTxnCommitTS must propagate ErrCeilingExpired from NextFenced")
 }

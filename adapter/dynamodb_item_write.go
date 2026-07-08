@@ -274,12 +274,12 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	if plan.req == nil {
 		return plan, nil, nil
 	}
-	// NextFenced (not Next) honors the HLC physical-ceiling fence so a
-	// stale-leader window cannot mint a colliding commit_ts (HLC-4);
-	// ErrCeilingExpired is non-retryable and surfaces to the client.
-	commitTS, err := d.coordinator.Clock().NextFenced()
+	// Allocate through the coordinator so TSO-enabled deployments use the
+	// same timestamp source as Dispatch. The fallback still honors the HLC
+	// physical-ceiling fence.
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, readTS, "dynamodb item-write first attempt: allocate commitTS")
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "dynamodb item-write first attempt: allocate commitTS")
+		return nil, nil, errors.WithStack(err)
 	}
 	plan.req.StartTS = readTS
 	plan.req.CommitTS = commitTS
@@ -305,9 +305,9 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 	tableName string,
 	pending *reusableItemWrite,
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	commitTS, err := d.coordinator.Clock().NextFenced()
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, pending.plan.req.StartTS, "dynamodb item-write reuse: allocate commitTS")
 	if err != nil {
-		return nil, pending, errors.Wrap(err, "dynamodb item-write reuse: allocate commitTS")
+		return nil, pending, errors.WithStack(err)
 	}
 	pending.plan.req.CommitTS = commitTS
 	pending.plan.req.PrevCommitTS = pending.commitTS

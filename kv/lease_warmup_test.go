@@ -168,23 +168,22 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 		"HLC renewal should resume after startup rotation blocker clears")
 }
 
-// TestShardedCoordinator_RenewHLCLease_WarmsDefaultGroupLease proves the
-// sharded renewal path warms the DEFAULT group's lease on a successful
-// propose, so LeaseReadForKey on a default-group key serves from the
+// TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the
+// sharded renewal path warms the target group's lease on a successful
+// propose, so LeaseReadForKey on a key owned by that group serves from the
 // fast path without a per-shard LinearizableRead.
-func TestShardedCoordinator_RenewHLCLease_WarmsDefaultGroupLease(t *testing.T) {
+func TestShardedCoordinator_RenewHLCLease_WarmsGroupLease(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
-	// defaultGroup is 1 (see mustShardedLeaseCoord).
 	g1 := coord.groups[1]
 	require.False(t, g1.lease.valid(monoclock.Now()))
 
-	coord.renewHLCLease(context.Background(), g1)
+	coord.renewHLCLease(context.Background(), 1, g1)
 	require.Equal(t, int32(1), eng1.proposeCalls.Load())
 	require.True(t, g1.lease.valid(monoclock.Now()),
-		"a successful renewal propose must warm the default group's lease")
+		"a successful renewal propose must warm the target group's lease")
 
 	// LeaseReadForKey on a default-group key ("apple" -> group 1) now
 	// hits the warmed lease.
@@ -197,7 +196,7 @@ func TestShardedCoordinator_RenewHLCLease_WarmsDefaultGroupLease(t *testing.T) {
 
 // TestShardedCoordinator_RenewHLCLease_FailedProposeDoesNotWarmLease is
 // the sharded counterpart of the single-shard safety case: a failed
-// propose must leave the default group's lease cold.
+// propose must leave the target group's lease cold.
 func TestShardedCoordinator_RenewHLCLease_FailedProposeDoesNotWarmLease(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
@@ -206,10 +205,10 @@ func TestShardedCoordinator_RenewHLCLease_FailedProposeDoesNotWarmLease(t *testi
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
 	g1 := coord.groups[1]
 
-	coord.renewHLCLease(context.Background(), g1)
+	coord.renewHLCLease(context.Background(), 1, g1)
 	require.Equal(t, int32(1), eng1.proposeCalls.Load())
 	require.False(t, g1.lease.valid(monoclock.Now()),
-		"a failed renewal propose must NOT warm the default group's lease")
+		"a failed renewal propose must NOT warm the target group's lease")
 
 	// LeaseReadForKey on a default-group key must still take the slow path.
 	_, err := coord.LeaseReadForKey(context.Background(), []byte("apple"))
@@ -220,7 +219,7 @@ func TestShardedCoordinator_RenewHLCLease_FailedProposeDoesNotWarmLease(t *testi
 
 // TestShardedCoordinator_RenewHLCLease_LeadershipLossErrorInvalidatesLease
 // is the sharded counterpart of the sequential leadership-loss case: if
-// the default group's Propose returns a leadership-loss error, the
+// the target group's Propose returns a leadership-loss error, the
 // already-warm group lease must be eagerly invalidated, matching
 // leaseRefreshingTxn's leadership-loss branch on that same group.
 func TestShardedCoordinator_RenewHLCLease_LeadershipLossErrorInvalidatesLease(t *testing.T) {
@@ -230,18 +229,18 @@ func TestShardedCoordinator_RenewHLCLease_LeadershipLossErrorInvalidatesLease(t 
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
 	g1 := coord.groups[1]
 
-	coord.renewHLCLease(context.Background(), g1)
-	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: default group lease must be warm")
+	coord.renewHLCLease(context.Background(), 1, g1)
+	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: target group lease must be warm")
 
 	eng1.proposeErr = raftengine.ErrNotLeader
-	coord.renewHLCLease(context.Background(), g1)
+	coord.renewHLCLease(context.Background(), 1, g1)
 	require.False(t, g1.lease.valid(monoclock.Now()),
-		"a leadership-loss propose error must EAGERLY invalidate the default group's warm lease")
+		"a leadership-loss propose error must EAGERLY invalidate the target group's warm lease")
 }
 
 // TestShardedCoordinator_RenewHLCLease_NonLeadershipErrorKeepsLease
 // proves the sharded invalidation is narrow: a non-leadership propose
-// failure must NOT tear down the already-warm default group lease.
+// failure must NOT tear down the already-warm target group lease.
 func TestShardedCoordinator_RenewHLCLease_NonLeadershipErrorKeepsLease(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
@@ -249,13 +248,13 @@ func TestShardedCoordinator_RenewHLCLease_NonLeadershipErrorKeepsLease(t *testin
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
 	g1 := coord.groups[1]
 
-	coord.renewHLCLease(context.Background(), g1)
-	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: default group lease must be warm")
+	coord.renewHLCLease(context.Background(), 1, g1)
+	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: target group lease must be warm")
 
 	eng1.proposeErr = errors.New("propose rejected: no quorum")
-	coord.renewHLCLease(context.Background(), g1)
+	coord.renewHLCLease(context.Background(), 1, g1)
 	require.True(t, g1.lease.valid(monoclock.Now()),
-		"a non-leadership propose error must NOT invalidate the default group's warm lease")
+		"a non-leadership propose error must NOT invalidate the target group's warm lease")
 }
 
 // TestShardedCoordinator_RenewHLCLease_LeaderLossDuringProposeDoesNotWarm
@@ -268,7 +267,75 @@ func TestShardedCoordinator_RenewHLCLease_LeaderLossDuringProposeDoesNotWarm(t *
 	g1 := coord.groups[1]
 	eng1.proposeHook = func() { eng1.fireLeaderLoss() }
 
-	coord.renewHLCLease(context.Background(), g1)
+	coord.renewHLCLease(context.Background(), 1, g1)
 	require.False(t, g1.lease.valid(monoclock.Now()),
-		"a leader-loss racing the propose must prevent the default group's lease warm-up")
+		"a leader-loss racing the propose must prevent the target group's lease warm-up")
+}
+
+func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+	require.True(t, coord.groups[1].lease.valid(monoclock.Now()))
+	require.True(t, coord.groups[2].lease.valid(monoclock.Now()))
+
+	idx, err := coord.LeaseReadForKey(context.Background(), []byte("zebra"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(200), idx)
+	require.Equal(t, int32(0), eng2.linearizableCalls.Load(),
+		"the non-default group lease must be warmed by all-group renewal")
+}
+
+func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	eng2.state.Store(raftengine.StateFollower)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(0), eng2.proposeCalls.Load())
+	require.True(t, coord.groups[1].lease.valid(monoclock.Now()))
+	require.False(t, coord.groups[2].lease.valid(monoclock.Now()))
+}
+
+func TestShardedCoordinator_RenewHLCLeases_SlowGroupDoesNotBlockPeers(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	eng1.proposeHook = func() {
+		close(entered)
+		<-release
+	}
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	<-entered
+	require.Eventually(t, func() bool {
+		return eng2.proposeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond,
+		"a slow led group must not delay renewal for another led group")
+	close(release)
+	requireRenewalDone(t, done)
+}
+
+func requireRenewalDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HLC lease renewals")
+	}
 }

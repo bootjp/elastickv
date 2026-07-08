@@ -128,9 +128,10 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 			return err
 		}
 
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "applyHashFieldPairs: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "applyHashFieldPairs: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 
 		// Atomically migrate any legacy blob on first wide-column write.
@@ -178,7 +179,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
@@ -383,9 +384,10 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	if removed == 0 {
 		return 0, nil
 	}
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hdelWideColumn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "hdelWideColumn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
@@ -396,7 +398,7 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	})
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -720,9 +722,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 		return 0, err
 	}
 
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hincrbyTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "hincrbyTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 	fieldKey := store.HashFieldKey(key, field)
 
@@ -753,7 +756,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideHashFenceKey),
 		Elems:    elems,

@@ -246,6 +246,9 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if err := t.coord.awaitRegistrationBarrier(ctx); err != nil {
 		return nil, err
 	}
+	if err := t.stampRawTimestampsForLocalCommit(ctx, reqs); err != nil {
+		return nil, err
+	}
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(ctx, reqs)
@@ -266,6 +269,34 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	}
 	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
+}
+
+func (t *leaseRefreshingTxn) stampRawTimestampsForLocalCommit(ctx context.Context, reqs []*pb.Request) error {
+	if t == nil || t.coord == nil || !hasUnstampedRawRequests(reqs) {
+		return nil
+	}
+	if t.g != nil && t.g.Engine != nil {
+		if !isLeaderEngine(t.g.Engine) {
+			return nil
+		}
+		if !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
+			return nil
+		}
+	}
+	return t.coord.stampRawRequestTimestamps(ctx, reqs)
+}
+
+func canStampRawTimestampsOnEngine(ctx context.Context, engine raftengine.Engine) bool {
+	return verifyLeaderEngineCtx(ctx, engine) == nil
+}
+
+func hasUnstampedRawRequests(reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r != nil && !r.IsTxn && r.Ts == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *leaseRefreshingTxn) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -339,8 +370,12 @@ type ShardedCoordinator struct {
 	groups       map[uint64]*ShardGroup
 	defaultGroup uint64
 	clock        *HLC
-	store        store.MVCCStore
-	log          *slog.Logger
+	// tsAllocator is an optional TSO-backed timestamp source used for every
+	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
+	// HLC path.
+	tsAllocator TimestampAllocator
+	store       store.MVCCStore
+	log         *slog.Logger
 	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
@@ -401,6 +436,14 @@ type RegistrationGate struct {
 // registration posture.
 func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedCoordinator {
 	c.registrationGate = g
+	return c
+}
+
+// WithTSOAllocator routes sharded-coordinator timestamp issuance through a
+// TSO-compatible allocator. Existing deployments keep the legacy shared-HLC
+// path unless this is wired explicitly.
+func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
+	c.tsAllocator = alloc
 	return c
 }
 
@@ -613,7 +656,11 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		// LeaseReadForKey on that shard takes the slow path.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
 			g.lp = lp
-			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
+			group := g
+			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(func() {
+				group.lease.invalidate()
+				c.invalidateTimestampWindow()
+			}))
 		}
 	}
 	c.deregisterLeaseCbs = deregisters
@@ -922,7 +969,7 @@ func isComposed1RetryableError(err error) bool {
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
-	logs, err := c.requestLogs(reqs)
+	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -967,9 +1014,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 		return nil, err
 	}
 
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestamp(ctx, "allocate DEL_PREFIX broadcast ts")
 	if err != nil {
-		return nil, errors.Wrap(err, "allocate DEL_PREFIX broadcast ts")
+		return nil, err
 	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
@@ -1037,7 +1084,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	commitTS, err = c.resolveTxnCommitTS(startTS, commitTS)
+	commitTS, err = c.resolveTxnCommitTS(ctx, startTS, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1120,14 +1167,14 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
-func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
+func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {
 	if commitTS == 0 {
-		next, err := c.nextTxnTSAfter(startTS)
+		next, err := c.nextTxnTSAfter(ctx, startTS)
 		if err != nil {
 			return 0, err
 		}
 		commitTS = next
-	} else {
+	} else if c.clock != nil {
 		// Observe caller-provided commitTS to keep the HLC monotonic; without
 		// this the clock could later issue timestamps smaller than commitTS.
 		c.clock.Observe(commitTS)
@@ -1394,23 +1441,62 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 	return g, nil
 }
 
-func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) (uint64, error) {
+func (c *ShardedCoordinator) allocateTimestamp(ctx context.Context, label string) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, label, 0)
+}
+
+func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
+	}
+	if c.tsAllocator != nil {
+		if min > 0 {
+			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
+		}
+		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+	}
 	if c.clock == nil {
+		return 0, errors.Wrap(ErrTSOClockNil, label)
+	}
+	if min > 0 {
+		c.clock.Observe(min)
+	}
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+// Next makes ShardedCoordinator usable as a TimestampAllocator for adapter
+// helpers that need to allocate persistence-grade timestamps outside Dispatch.
+func (c *ShardedCoordinator) Next(ctx context.Context) (uint64, error) {
+	return c.allocateTimestamp(ctx, "allocate sharded timestamp")
+}
+
+func (c *ShardedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, "allocate sharded timestamp after observed ts", min)
+}
+
+func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64) (uint64, error) {
+	if c.clock == nil && c.tsAllocator == nil {
 		nextTS := startTS + 1
 		if nextTS == 0 {
 			return 0, nil
 		}
 		return nextTS, nil
 	}
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestampAfter(ctx, "allocate txn commit ts", startTS)
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate txn commit ts")
+		return 0, err
 	}
 	if ts <= startTS {
-		c.clock.Observe(startTS)
-		ts, err = c.clock.NextFenced()
+		if c.clock != nil {
+			c.clock.Observe(startTS)
+		}
+		ts, err = c.allocateTimestampAfter(ctx, "re-allocate txn commit ts after Observe", startTS)
 		if err != nil {
-			return 0, errors.Wrap(err, "re-allocate txn commit ts after Observe")
+			return 0, err
 		}
 	}
 	if ts <= startTS {
@@ -1455,12 +1541,12 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
-	if c.clock == nil {
+	if c.clock == nil && c.tsAllocator == nil {
 		return maxTS + 1, nil
 	}
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestampAfter(ctx, "allocate sharded startTS", maxTS)
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate sharded startTS")
+		return 0, err
 	}
 	return ts, nil
 }
@@ -1487,6 +1573,25 @@ func (c *ShardedCoordinator) IsLeader() bool {
 		return false
 	}
 	return isLeaderEngine(engineForGroup(g))
+}
+
+func (c *ShardedCoordinator) IsTimestampLeader() bool {
+	if c == nil {
+		return false
+	}
+	for _, g := range c.groups {
+		if isLeaderEngine(engineForGroup(g)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ShardedCoordinator) invalidateTimestampWindow() {
+	if c == nil {
+		return
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 func (c *ShardedCoordinator) VerifyLeader(ctx context.Context) error {
@@ -1807,14 +1912,14 @@ func validateOperationGroup(reqs *OperationGroup[OP]) error {
 	return nil
 }
 
-func (c *ShardedCoordinator) requestLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) requestLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	if reqs.IsTxn {
-		return c.txnLogs(reqs)
+		return c.txnLogs(ctx, reqs)
 	}
-	return c.rawLogs(reqs)
+	return c.rawLogs(ctx, reqs)
 }
 
-func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
 		return nil, err
@@ -1822,9 +1927,9 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
-		ts, err := c.clock.NextFenced()
+		ts, err := c.rawLogTimestamp(ctx)
 		if err != nil {
-			return nil, errors.Wrap(err, "allocate sharded raw log ts")
+			return nil, err
 		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
@@ -1836,7 +1941,28 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	return logs, nil
 }
 
-func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
+	if c.tsAllocator != nil {
+		return 0, nil
+	}
+	return c.allocateTimestamp(ctx, "allocate sharded raw log ts")
+}
+
+func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs []*pb.Request) error {
+	for _, r := range reqs {
+		if r == nil || r.IsTxn || r.Ts != 0 {
+			continue
+		}
+		ts, err := c.allocateTimestamp(ctx, "stamp sharded raw log ts")
+		if err != nil {
+			return err
+		}
+		r.Ts = ts
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	// NOTE: ShardedCoordinator implements distributed transactions directly in
 	// Dispatch. txnLogs is retained for compatibility and single-shard helpers.
 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
@@ -1846,7 +1972,7 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	commitTS, err := c.resolveTxnCommitTS(reqs.StartTS, reqs.CommitTS)
+	commitTS, err := c.resolveTxnCommitTS(ctx, reqs.StartTS, reqs.CommitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1979,24 +2105,25 @@ func primaryKeyAndKeyMutations(muts []*pb.Mutation) ([]byte, []*pb.Mutation) {
 	return primary, keys
 }
 
-// RunHLCLeaseRenewal periodically proposes a new physical ceiling to the
-// default shard group's Raft cluster while this node is the leader of that
-// group. This mirrors the single-shard Coordinate.RunHLCLeaseRenewal behaviour,
-// ensuring the shared HLC ceiling is maintained in multi-shard deployments.
+// RunHLCLeaseRenewal periodically proposes a new physical ceiling to every
+// shard group's Raft cluster while this node is that group's leader. This
+// mirrors the single-shard Coordinate.RunHLCLeaseRenewal behaviour while
+// avoiding the multi-shard gap where a non-default group leader could issue
+// timestamps without renewing the shared HLC's Raft-backed ceiling.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
-	group, ok := c.groups[c.defaultGroup]
-	if !ok || group.Engine == nil {
-		c.logger().WarnContext(ctx, "hlc lease renewal: default shard group not found or has no engine",
-			slog.Uint64("default_group", c.defaultGroup),
-		)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(c.groups) == 0 {
+		c.logger().WarnContext(ctx, "hlc lease renewal: no shard groups configured")
 		return
 	}
 	// Use a Timer rather than a Ticker so the next renewal is scheduled
-	// relative to the completion of the previous one. This prevents a burst
-	// of back-to-back proposals if Propose stalls (e.g. waiting for Raft
-	// quorum during a slow leader election).
+	// relative to launching the previous round. Each per-group proposal has
+	// its own timeout and goroutine, so a slow Raft group cannot delay
+	// renewal for other groups.
 	timer := time.NewTimer(hlcRenewalInterval)
 	defer timer.Stop()
 	for {
@@ -2006,9 +2133,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				timer.Reset(hlcRenewalInterval)
 				continue
 			}
-			if group.Engine.State() == raftengine.StateLeader {
-				c.renewHLCLease(ctx, group)
-			}
+			c.renewHLCLeases(ctx)
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
@@ -2016,7 +2141,39 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
-// renewHLCLease proposes a fresh physical ceiling on the default shard
+// renewHLCLeases starts one renewal proposal for every shard group this node
+// currently leads. It does not wait for those proposals before returning; the
+// returned channel closes when the launched proposals finish and exists for
+// tests/diagnostics only.
+func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for gid, group := range c.groups {
+		if group == nil || group.Engine == nil {
+			continue
+		}
+		if group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		wg.Add(1)
+		go func(gid uint64, group *ShardGroup) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+			defer cancel()
+			c.renewHLCLease(pctx, gid, group)
+		}(gid, group)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// renewHLCLease proposes a fresh physical ceiling on one shard
 // group and, on a successful (quorum-acked) propose, warms that group's
 // read lease.
 //
@@ -2039,7 +2196,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 // the callback latency window. Non-leadership errors (no quorum,
 // validation) are NOT leadership signals and must not tear down a warm
 // lease -- doing so would force every read onto the slow path.
-func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGroup) {
+func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
@@ -2054,7 +2211,7 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGrou
 			group.lease.invalidate()
 		}
 		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", c.defaultGroup),
+			slog.Uint64("group_id", gid),
 			slog.Int64("ceiling_ms", ceilingMs),
 			slog.Any("err", err),
 		)
