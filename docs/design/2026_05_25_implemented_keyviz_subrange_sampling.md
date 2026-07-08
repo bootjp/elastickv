@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-A+
 parent_design: docs/admin_ui_key_visualizer_design.md
 author: bootjp
@@ -17,7 +17,7 @@ sequential prefix, change a schema). The current sampler cannot do
 this at the granularity the name implies.
 
 Today the sampler keys every counter on **RouteID**
-(`keyviz.MemSampler`, `Observe(routeID, op, keyLen, valueLen)` —
+(`keyviz.MemSampler`, `Observe(routeID, key, op, valueLen, label)` —
 `keyviz/sampler.go`). A *route* is the key range a Raft group owns in
 the distribution catalog. The heatmap's Y axis is therefore
 **route-granular**:
@@ -209,11 +209,12 @@ non-`MaxUint64` start does sub-divide.
 // before
 Observe(routeID uint64, op Op, keyLen, valueLen int)
 // after
-Observe(routeID uint64, key []byte, op Op, valueLen int)
+Observe(routeID uint64, key []byte, op Op, valueLen int, label Label)
 ```
 
 `keyLen` is dropped in favour of the key itself (`len(key)` recovers
-it for the `*Bytes` counters). This is a **semantic-touching signature
+it for the `*Bytes` counters), while adapter labels are forwarded
+unchanged by the sub-range bucket selection. This is a **semantic-touching signature
 change**: per CLAUDE.md, every caller of `Sampler.Observe` /
 `MemSampler.Observe` will be grep-audited so each passes the real key
 (not, say, a nil placeholder that would silently bucket all traffic

@@ -59,7 +59,7 @@ The parent doc (§"Re-derivable indexes" → scope note) allows a per-adapter fa
 
 ## Partitioned-FIFO extension
 
-M5-2 originally scoped side-record derivation to classic queues. M5-3 later lifted the partitioned-FIFO gate with coordinated changes to BOTH M5-1 (decoder dump format + encoder iteration over partitions) AND M5-2 (partitioned-key constructors for vis/byage/dedup).
+M5-2 originally scoped side-record derivation to classic queues. M5-3 later lifted the partitioned-FIFO gate with coordinated changes to BOTH M5-1 (decoder dump format + encoder iteration over partitions) AND M5-2 (partitioned-key constructors for vis/byage/dedup). The coordinated decoder+encoder lift is covered by [`2026_06_03_implemented_sqs_partitioned_fifo_encoder.md`](2026_06_03_implemented_sqs_partitioned_fifo_encoder.md).
 
 The implemented M5-3 slice adds these key shapes — sourced from `SqsPartitionedMsg{Vis,ByAge,Dedup}Prefix` + `sqsPartitionedMsg{...}Key` in `adapter/sqs_keys.go`:
 

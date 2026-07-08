@@ -43,6 +43,34 @@ func TestMergeKeyVizMatricesReadsSum(t *testing.T) {
 	require.False(t, merged.Rows[0].Conflict, "reads must never raise conflict")
 }
 
+func TestMergeKeyVizMatricesPreservesLabels(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1:dynamo", Label: "dynamo", Values: []uint64{5}, RaftGroupIDs: []uint64{1}, LeaderTerms: []uint64{3}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1:redis", Label: "redis", Values: []uint64{9}, RaftGroupIDs: []uint64{1}, LeaderTerms: []uint64{3}},
+		},
+	}
+
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 2)
+	byID := map[string]KeyVizRow{}
+	for _, row := range merged.Rows {
+		byID[row.BucketID] = row
+	}
+	require.Equal(t, "dynamo", byID["route:1:dynamo"].Label)
+	require.Equal(t, "redis", byID["route:1:redis"].Label)
+}
+
 // TestMergeKeyVizMatricesWritesMaxStableLeader pins the §4.2 happy
 // path: under stable leadership exactly one node reports non-zero
 // writes. The merge picks the non-zero value without raising

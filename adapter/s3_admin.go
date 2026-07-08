@@ -379,7 +379,7 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 //	         orphans left by any PutObject that committed
 //	         chunks/manifest between the empty-probe and the
 //	         Phase-1 commit. See design doc
-//	         2026_04_28_proposed_admin_delete_bucket_safety_net.md
+//	         2026_04_28_implemented_admin_delete_bucket_safety_net.md
 //	         §6.2 for the original single-OperationGroup design
 //	         and the dispatch-shape rejection that forced the
 //	         two-phase split.

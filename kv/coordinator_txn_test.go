@@ -145,7 +145,7 @@ func TestCoordinateDispatchTxn_PassesReadKeysToRaftEntry(t *testing.T) {
 // through the dispatchTxn boundary into pb.Request.ObservedRouteVersion.
 //
 // This is the M1 round-trip witness for the Composed-1 plumbing per
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M1: at this milestone the FSM ignores the field, so the only assertion
 // is that the value survives the encoder.  M3 will add the FSM apply-time
 // gate that *uses* this value.

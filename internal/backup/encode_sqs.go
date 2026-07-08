@@ -46,16 +46,18 @@ import (
 const sqsRestoreGeneration uint64 = 1
 
 const (
-	// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go's
-	// htfifoMaxPartitions. Keep this local to avoid importing adapter.
+	// sqsMaxHTFIFOPartitions mirrors adapter/sqs_partitioning.go:htfifoMaxPartitions.
+	// Keep this local to avoid importing adapter from internal/backup.
 	sqsMaxHTFIFOPartitions uint32 = 32
-	// sqsFifoThroughputPerMessageGroupID mirrors the live AWS-compatible
-	// FifoThroughputLimit enum.
+	// sqsFifoThroughputPerMessageGroupID mirrors
+	// adapter/sqs_partitioning.go:htfifoThroughputPerMessageGroupID.
 	sqsFifoThroughputPerMessageGroupID = "perMessageGroupId"
-	// sqsFifoDedupScopeMessageGroup and sqsFifoDedupScopeQueue mirror the
-	// live AWS-compatible DeduplicationScope enums.
+	// sqsFifoDedupScopeMessageGroup mirrors
+	// adapter/sqs_partitioning.go:htfifoDedupeScopeMessageGroup.
 	sqsFifoDedupScopeMessageGroup = "messageGroup"
-	sqsFifoDedupScopeQueue        = "queue"
+	// sqsFifoDedupScopeQueue mirrors
+	// adapter/sqs_partitioning.go:htfifoDedupeScopeQueue.
+	sqsFifoDedupScopeQueue = "queue"
 )
 
 var (
@@ -71,11 +73,9 @@ var (
 	// ErrSQSEncodeMissingPartition fires when a partitioned queue
 	// (meta.PartitionCount > 1) has a message whose Partition field is
 	// nil. Pre-M5-3 dumps lack the field entirely; replaying one against
-	// a partitioned queue would silently route every message to
-	// partition 0 via the `partition != nil` dispatch in addMessage,
-	// while the live readers scan the partitioned keyspace selected
-	// from raw PartitionCount > 1 — i.e. classic-shape keys against a
-	// partitioned reader = invisible on first read. Pinned by
+	// a partitioned queue would silently substitute partition 0 before
+	// key construction and hash validation, so the operator must re-decode
+	// with a partition-aware decoder instead. Pinned by
 	// TestSQSEncodeRejectsMissingPartitionOnPartitionedQueue.
 	ErrSQSEncodeMissingPartition = errors.New("backup: sqs partitioned queue message missing partition field")
 	// ErrSQSEncodeOutOfRangePartition fires when a partitioned-queue
@@ -248,12 +248,11 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 	}
 	// Fail-closed validation up-front so a malformed dump never stages
 	// partial records. Uses raw meta.PartitionCount > 1 as the
-	// partitioned-queue predicate (NOT effectivePartitionCount; codex
-	// P2 v914 v7 - using the effective count would allow a perQueue
-	// dump with Partition == nil to slip past the missing-partition
-	// gate, then addMessage's `partition != nil` dispatch would emit
-	// classic-shape keys against a partitioned-keyspace queue, making
-	// every restored message invisible).
+	// partitioned-queue predicate, not effectivePartitionCount. Using
+	// the effective count would allow a perQueue dump with Partition ==
+	// nil to slip past the missing-partition gate and then be staged as
+	// partition 0 without proof that the dump was captured from the
+	// partitioned keyspace.
 	if err := validatePartitioning(&meta, records); err != nil {
 		return err
 	}
@@ -407,7 +406,7 @@ func validatePartitioning(meta *sqsQueueMetaPublic, records []sqsMessageRecord) 
 	return nil
 }
 
-// validatePartitioningOne checks one message against the four gates.
+// validatePartitioningOne checks one message against the partitioning gates.
 // Split out of validatePartitioning so the outer loop stays under the
 // cyclop limit.
 func validatePartitioningOne(meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
@@ -455,7 +454,7 @@ func validatePartitioningPartitioned(meta *sqsQueueMetaPublic, rec *sqsMessageRe
 		}
 		return nil
 	}
-	// Gate 5: perMessageGroupId HT-FIFO partition-hash consistency.
+	// Gate 4: perMessageGroupId HT-FIFO partition-hash consistency.
 	// For perMessageGroupId queues, the live partitionFor maps each
 	// group_id to one partition via FNV-1a hash; the receivers /
 	// group-lock reader use that partition value to find messages.
@@ -505,7 +504,7 @@ func partitionForGroup(meta *sqsQueueMetaPublic, messageGroupID string) uint32 {
 // (partition, send_timestamp_millis, sequence_number, message_id).
 // Partition is the leading key so per-partition state (maxSeq, future
 // counters) is computed deterministically; the remaining three fields
-// match sortMessagesForEmit (sqs.go:842) for the classic path.
+// match sortMessagesForEmit in internal/backup/sqs.go for the classic path.
 // validatePartitioning ensures Partition is non-nil whenever the
 // caller invokes this fn (PartitionCount > 1), so the *rec.Partition
 // dereference is safe.

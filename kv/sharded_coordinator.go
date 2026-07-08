@@ -354,6 +354,10 @@ type ShardedCoordinator struct {
 	// disabled keyviz wires through to a no-op without branching on
 	// the hot path.
 	sampler keyviz.Sampler
+	// keyvizLabelsEnabled controls whether adapter-supplied labels are
+	// allowed to reach the sampler. When false, observations keep the
+	// legacy unlabeled route-only shape.
+	keyvizLabelsEnabled bool
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -534,6 +538,11 @@ func (c *ShardedCoordinator) WithSampler(s keyviz.Sampler) *ShardedCoordinator {
 	return c
 }
 
+func (c *ShardedCoordinator) WithKeyVizLabelsEnabled(enabled bool) *ShardedCoordinator {
+	c.keyvizLabelsEnabled = enabled
+	return c
+}
+
 // WithPartitionResolver wires a PartitionResolver onto the
 // coordinator's underlying ShardRouter. The resolver runs before
 // the byte-range engine on every dispatch, so partition-keyspace
@@ -674,7 +683,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 
 // dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
 // (design doc
-// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 // §M4).  Pins reqs.ObservedRouteVersion to the engine's current
 // catalog version on the FIRST attempt when the caller left it at the
 // zero sentinel — every txn that flows through ShardedCoordinator
@@ -779,7 +788,7 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion, reqs.KeyVizLabel)
 		if err == nil {
 			return resp, nil
 		}
@@ -1003,11 +1012,11 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, label keyviz.Label) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	grouped, gids, err := c.groupMutations(elems)
+	grouped, gids, err := c.groupMutations(elems, label)
 	if err != nil {
 		return nil, err
 	}
@@ -1521,7 +1530,7 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeRead(routeID, key)
+	c.observeRead(ctx, routeID, key)
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
@@ -1543,7 +1552,7 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeRead(routeID, key)
+	c.observeRead(ctx, routeID, key)
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
@@ -1794,7 +1803,7 @@ func (c *ShardedCoordinator) requestLogs(reqs *OperationGroup[OP]) ([]*pb.Reques
 }
 
 func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
-	grouped, gids, err := c.groupMutations(reqs.Elems)
+	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -1818,7 +1827,7 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	// NOTE: ShardedCoordinator implements distributed transactions directly in
 	// Dispatch. txnLogs is retained for compatibility and single-shard helpers.
-	grouped, gids, err := c.groupMutations(reqs.Elems)
+	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -1838,11 +1847,11 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 // visualisation). The early return keeps the disabled-keyviz hot
 // path allocation-free. Reads have their own observeReadKey helper
 // (LinearizableReadForKey / LeaseReadForKey).
-func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
+func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation, label keyviz.Label) {
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value))
+	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
 }
 
 // observeRead records a single linearizable / lease read against the
@@ -1862,14 +1871,21 @@ func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 // MVCCStore.GetAt without going through the coordinator) still
 // bypass keyviz; sampling those is task B in the design's Phase 2
 // follow-up.
-func (c *ShardedCoordinator) observeRead(routeID uint64, key []byte) {
+func (c *ShardedCoordinator) observeRead(ctx context.Context, routeID uint64, key []byte) {
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, key, keyviz.OpRead, 0)
+	c.sampler.Observe(routeID, key, keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
 }
 
-func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
+func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label {
+	if !c.keyvizLabelsEnabled {
+		return keyviz.LabelLegacy
+	}
+	return label
+}
+
+func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label) (map[uint64][]*pb.Mutation, []uint64, error) {
 	grouped := make(map[uint64][]*pb.Mutation)
 	for _, req := range reqs {
 		if req == nil {
@@ -1887,7 +1903,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
 			routeID = route.RouteID
 		}
-		c.observeMutation(routeID, mut)
+		c.observeMutation(routeID, mut, label)
 		grouped[gid] = append(grouped[gid], mut)
 	}
 	gids := make([]uint64, 0, len(grouped))

@@ -110,6 +110,20 @@ func (s *SQSServer) sendMessageBatch(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, resp)
 }
 
+func (s *SQSServer) sendMessageBatchCore(ctx context.Context, queueName string, entries []sqsSendMessageBatchEntryInput) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, error) {
+	if err := validateBatchEntryShape(len(entries), batchEntryIDs(entries)); err != nil {
+		return nil, nil, err
+	}
+	if total := totalBatchPayloadBytes(entries); total > sqsBatchMaxTotalPayloadBytes {
+		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrBatchRequestTooLong,
+			"total batch payload exceeds 262144 bytes")
+	}
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionSend, throttleChargeCount(len(entries))); err != nil {
+		return nil, nil, err
+	}
+	return s.sendMessageBatchWithRetry(ctx, queueName, entries)
+}
+
 // sendMessageBatchWithRetry pre-validates every entry, splits them into
 // "will-attempt" and "rejected before storage", and runs one OCC
 // transaction over the will-attempt set. On ErrWriteConflict the whole
@@ -539,6 +553,42 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *SQSServer) deleteMessageBatchCore(ctx context.Context, queueName string, entries []sqsDeleteMessageBatchEntryInput) ([]sqsBatchResultEntry, []sqsBatchResultErrorEntry, error) {
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.Id)
+	}
+	if err := validateBatchEntryShape(len(entries), ids); err != nil {
+		return nil, nil, err
+	}
+	if err := s.requireQueueExists(ctx, queueName); err != nil {
+		return nil, nil, err
+	}
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, throttleChargeCount(len(entries))); err != nil {
+		return nil, nil, err
+	}
+	successful := make([]sqsBatchResultEntry, 0, len(entries))
+	failed := make([]sqsBatchResultErrorEntry, 0)
+	for _, entry := range entries {
+		handle, decodeErr := decodeClientReceiptHandle(entry.ReceiptHandle)
+		if decodeErr != nil {
+			failed = append(failed, sqsBatchResultErrorEntry{
+				Id:          entry.Id,
+				Code:        sqsErrReceiptHandleInvalid,
+				Message:     "receipt handle is not parseable",
+				SenderFault: true,
+			})
+			continue
+		}
+		if err := s.deleteMessageWithRetry(ctx, queueName, handle); err != nil {
+			failed = append(failed, batchErrorEntryFromErr(entry.Id, err))
+			continue
+		}
+		successful = append(successful, sqsBatchResultEntry{Id: entry.Id})
+	}
+	return successful, failed, nil
+}
+
 // ------------------------ ChangeMessageVisibilityBatch ------------------------
 
 type sqsChangeVisBatchInput struct {
@@ -593,6 +643,33 @@ func (s *SQSServer) changeMessageVisibilityBatch(w http.ResponseWriter, r *http.
 		"Successful": successful,
 		"Failed":     failed,
 	})
+}
+
+func (s *SQSServer) changeMessageVisibilityBatchCore(ctx context.Context, queueName string, entries []sqsChangeVisBatchEntryInput) ([]sqsBatchResultEntry, []sqsBatchResultErrorEntry, error) {
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.Id)
+	}
+	if err := validateBatchEntryShape(len(entries), ids); err != nil {
+		return nil, nil, err
+	}
+	if err := s.requireQueueExists(ctx, queueName); err != nil {
+		return nil, nil, err
+	}
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, throttleChargeCount(len(entries))); err != nil {
+		return nil, nil, err
+	}
+	successful := make([]sqsBatchResultEntry, 0, len(entries))
+	failed := make([]sqsBatchResultErrorEntry, 0)
+	for _, entry := range entries {
+		ok, errEntry := s.applyChangeVisibilityBatchEntry(ctx, queueName, entry)
+		if !ok {
+			failed = append(failed, errEntry)
+			continue
+		}
+		successful = append(successful, sqsBatchResultEntry{Id: entry.Id})
+	}
+	return successful, failed, nil
 }
 
 // applyChangeVisibilityBatchEntry runs the per-entry validate-and-commit

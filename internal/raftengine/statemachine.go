@@ -49,7 +49,7 @@ type ApplyIndexAware interface {
 
 // AppliedIndexReader is an OPTIONAL extension that lets the engine
 // query the FSM's durable applied-index for the cold-start skip gate.
-// See docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+// See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3.
 //
 // The returned value MUST be the largest Raft entry index whose Apply
 // produced a durable mutation on the FSM's primary store (i.e. the
@@ -70,7 +70,7 @@ type AppliedIndexReader interface {
 
 // AppliedIndexWriter is an OPTIONAL extension that lets the engine
 // pin the FSM's durable applied-index to a known value at snapshot
-// persist time. See docs/design/2026_06_02_idempotent_snapshot_restore.md
+// persist time. See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md
 // §6 "HLC lease entries — checkpoint at snapshot persist".
 //
 // The engine calls SetDurableAppliedIndex(snap.Metadata.Index)
@@ -95,7 +95,7 @@ type AppliedIndexWriter interface {
 // cold-start skip gate preserve the header state (HLC ceiling,
 // Stage 8a cutover) the FSM's Restore would normally apply, without
 // running the (multi-GiB) body restore. See
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §5.
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §5.
 //
 // The interface is two-phase by design:
 //

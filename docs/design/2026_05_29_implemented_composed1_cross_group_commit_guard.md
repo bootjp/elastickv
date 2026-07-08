@@ -1,19 +1,17 @@
 # Composed-1 — cross-group commit-time ownership guard
 
-Status: Partial — M1–M4 shipped via PR #900; M5a shipped via PRs #911 / #916 / #924 / #925; M5b (route-shuffle nemesis) still open.  See companion doc `2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md` for the detailed M5 design and per-milestone state.
+Status: Implemented — M1–M4 shipped via PR #900; M5a shipped via PRs #911 / #916 / #924 / #925; M5b route-shuffle nemesis is implemented in-tree. See companion doc `2026_06_02_implemented_composed1_m5_jepsen_route_shuffle.md` for the detailed M5 design and per-milestone state.
 Author: bootjp
-Date: 2026-05-29 (renamed *_proposed_* → *_partial_* on 2026-06-04)
+Date: 2026-05-29 (renamed *_proposed_* to *_partial_* on 2026-06-04; promoted to implemented on 2026-07-07)
 
-> **Forward-looking proposal.** Today's implementation is vacuously
+> **Implemented guard, still future-proofing cross-group movement.** Today's implementation is vacuously
 > safe with respect to Composed-1 because `SplitRange` is the only
 > route-mutating control-plane RPC and it is same-group only (per
-> CLAUDE.md). This doc designs the commit-time ownership guard that
-> would be required *before* introducing any cross-group route
+> CLAUDE.md). This doc records the commit-time ownership guard required
+> *before* introducing any cross-group route
 > mutation (cross-group `SplitRange`, `MoveRange`, key-range
-> rebalancing). The implementation is not justified by current
-> deployment state; the proposal exists so that when a follow-up
-> introduces cross-group movement, the guard is reviewed-and-ready
-> rather than patched in under time pressure.
+> rebalancing), plus the M5 Jepsen harness that keeps the guard from
+> regressing while the live route-mutation surface remains same-group.
 
 ---
 
@@ -126,7 +124,7 @@ committing group — yet the trace exhibits a G1c lost-write because
 *future* readers route to `g2`. The implementation therefore needs
 both the spec-level check AND an additional fence against late
 commits to a no-longer-current owner. §4.4 below specifies that
-second fence; codex P1 on the first revision of this doc surfaced
+second fence; review feedback on the first revision of this doc surfaced
 the gap and is the reason §4.4 exists.
 
 ---
@@ -183,7 +181,7 @@ func (f *kvFSM) verifyComposed1(r *pb.Request, observedVer uint64) error {
         // Catalog GC dropped this version.  Treated as a hard,
         // retryable error: we cannot prove the spec-level
         // predicate without the snapshot.  Coordinator retries
-        // against the new catalog (gemini medium / codex P2
+        // against the new catalog (review feedback
         // on the first revision of this doc — Composed-1 must
         // not silently degrade under aggressive catalog GC).
         return errors.WithStack(ErrComposed1VersionGCd)
@@ -203,7 +201,7 @@ func (f *kvFSM) verifyComposed1(r *pb.Request, observedVer uint64) error {
     // (b) Current-version cross-version-read fence — see §4.4.
     //     Rejects late commits to a no-longer-current owner even
     //     when the observed-version check above would have passed
-    //     (this is what the codex P1 trace in §3 exhibits).
+    //     (this is what the review trace in §3 exhibits).
     return f.verifyCurrentVersionOwner(r)
 }
 ```
@@ -233,7 +231,7 @@ guard be bypassed exactly in the cases (long-running transactions,
 high catalog churn) where the cross-version-read hazard is most
 likely; the spec safety property would then depend on a
 best-effort retention depth rather than the invariant
-(gemini medium / codex P2 on the first revision of this doc).
+(review feedback on the first revision of this doc).
 
 The ring depth becomes a *liveness* parameter — too small and
 long-running txns get spurious retries — rather than a *safety*
@@ -321,7 +319,7 @@ invariant
 so the apply-time fence is also spec-checked by TLC. That
 extension is out of scope for this proposal because it changes
 the M5 (`tla/composed`) module's state shape; tracked as an open
-follow-up in `docs/design/2026_05_28_partial_tla_safety_spec.md`'s
+follow-up in `docs/design/2026_05_28_implemented_tla_safety_spec.md`'s
 M6+ slot.
 
 ---
@@ -332,7 +330,7 @@ M6+ slot.
 |---|---|---|---|
 | M1 | `ObservedRouteVersion` plumbing | Add the field to `OperationGroup`, propagate through `dispatchTxn` and into `onePhaseTxnRequest`, encode in `pb.Request`. No FSM check yet. | Field round-trips end-to-end; no behaviour change. |
 | M2 | Catalog version ring + `kvFSM` extension | Extend `distribution/Engine` to retain the last `routeHistoryDepth` (default 32) versioned snapshots, and add `routes kv.RouteHistory` + `shardGroupID uint64` fields to `kvFSM` (today's struct has neither — see §4.2 prerequisite block). Wire both through `NewKvFSMWithHLC` / a new `NewKvFSMWithOptions`. | `SnapshotAt(v)` returns the mapping for in-flight versions; older returns nil; FSM struct compiles with the new fields wired from shard-group construction. |
-| M3 | FSM apply-time check | Wire `verifyComposed1` (observed-version §4.2(a) + current-version §4.4) into `handleTxnRequest`; emit `ErrComposed1Violation` (route shift) and `ErrComposed1VersionGCd` (retention miss) and surface both to the coordinator's retry path. | Three unit tests: (i) stale `ObservedRouteVersion` with the key moved → `ErrComposed1Violation`; (ii) `ObservedRouteVersion` older than ring → `ErrComposed1VersionGCd`; (iii) observed-version check passes but current-version differs → `ErrComposed1Violation` (the §3 codex P1 trace). |
+| M3 | FSM apply-time check | Wire `verifyComposed1` (observed-version §4.2(a) + current-version §4.4) into `handleTxnRequest`; emit `ErrComposed1Violation` (route shift) and `ErrComposed1VersionGCd` (retention miss) and surface both to the coordinator's retry path. | Three unit tests: (i) stale `ObservedRouteVersion` with the key moved -> `ErrComposed1Violation`; (ii) `ObservedRouteVersion` older than ring -> `ErrComposed1VersionGCd`; (iii) observed-version check passes but current-version differs -> `ErrComposed1Violation` (the §3 review trace). |
 | M4 | Coordinator retry | When either Composed-1 sentinel returns, the coordinator re-reads the route cache, re-routes the txn, and retries once. | Integration test: a fake `MoveRange` issued mid-txn causes the client-observable result to be a successful commit on the new owner, not a lost write. |
 | M5 | Jepsen workload | Add a route-shuffle generator to the DynamoDB suite that issues `MoveRange` concurrently with txns. | Workload finds no G1c anomaly. |
 
@@ -367,7 +365,7 @@ non-disruptive to clients. M5 is the integration-level proof.
    (§M4) converts into a successful commit on the correct owner.
    Failing closed on the §4.3 retention-miss case (rather than
    the original soft pass) closes the silent-degradation hazard
-   gemini medium + codex P2 flagged on the first revision of
+   review feedback flagged on the first revision of
    this doc.
 2. **Concurrency / distributed failures.** The check runs under
    the FSM's `applyMu`, so it is serialised with all other apply
