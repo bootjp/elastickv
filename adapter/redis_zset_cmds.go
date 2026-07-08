@@ -591,7 +591,8 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
 		return 0, err
 	}
 
@@ -648,7 +649,8 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key)
+	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey))
 }
 
 // dispatchAndSignalZSet dispatches the elems through the coordinator
@@ -664,12 +666,13 @@ func (r *RedisServer) dispatchAndSignalZSet(
 	readTS, commitTS uint64,
 	elems []*kv.Elem[kv.OP],
 	zsetKey []byte,
+	readKeys [][]byte,
 ) error {
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
-		ReadKeys: [][]byte{redisTxnWideZSetFenceKey(zsetKey)},
+		ReadKeys: readKeys,
 		Elems:    elems,
 	})
 	if err != nil {
@@ -683,7 +686,8 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
 		return 0, err
 	}
 
@@ -728,7 +732,8 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 			Value: deltaVal,
 		})
 	}
-	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key); err != nil {
+	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey)); err != nil {
 		return 0, err
 	}
 	return newScore, nil

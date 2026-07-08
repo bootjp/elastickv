@@ -100,7 +100,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		meta, _, err := r.resolveListMeta(ctx, key, readTS)
+		meta, metaExists, err := r.resolveListMeta(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -124,7 +124,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
-			ReadKeys: listPushBoundaryReadKeys(key, meta),
+			ReadKeys: listPushReadKeys(key, meta, metaExists),
 			Elems:    ops,
 		})
 		if dispErr != nil {
@@ -334,6 +334,13 @@ func listPushBoundaryReadKeys(key []byte, meta store.ListMeta) [][]byte {
 	}
 }
 
+func listPushReadKeys(key []byte, meta store.ListMeta, metaExists bool) [][]byte {
+	if !metaExists {
+		return redisTxnWideCollectionFenceKeys(key)
+	}
+	return listPushBoundaryReadKeys(key, meta)
+}
+
 // listPushCoreWithDedup is the option-2 retry loop. The first attempt computes
 // the write set from the current meta; any retryable failure makes the next
 // iteration REUSE that write set under a fresh commit_ts with prev_commit_ts
@@ -357,7 +364,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		readTS := r.readTS()
-		meta, _, err := r.resolveListMeta(ctx, key, readTS)
+		meta, metaExists, err := r.resolveListMeta(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -378,7 +385,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		startTS := normalizeStartTS(readTS)
-		boundaryReads := listPushBoundaryReadKeys(key, meta)
+		boundaryReads := listPushReadKeys(key, meta, metaExists)
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,

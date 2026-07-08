@@ -261,7 +261,8 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		if err := r.validateExactSetKind(setKind, key, readTS); err != nil {
+		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeSet)
+		if err != nil {
 			return err
 		}
 
@@ -302,7 +303,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
-			ReadKeys: [][]byte{redisTxnWideSetFenceKey(key)},
+			ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideSetFenceKey),
 			Elems:    elems,
 		})
 		return cockerrors.WithStack(dispatchErr)

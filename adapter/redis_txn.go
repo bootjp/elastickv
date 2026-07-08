@@ -245,6 +245,13 @@ func redisTxnWideCollectionFenceElems(userKey []byte) []*kv.Elem[kv.OP] {
 	return elems
 }
 
+func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey func([]byte) []byte) [][]byte {
+	if typ == redisTypeNone {
+		return redisTxnWideCollectionFenceKeys(userKey)
+	}
+	return [][]byte{fenceKey(userKey)}
+}
+
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
 	return &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: []byte{}}
 }

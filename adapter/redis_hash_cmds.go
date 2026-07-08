@@ -714,7 +714,8 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeHash); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
+	if err != nil {
 		return 0, err
 	}
 
@@ -753,6 +754,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideHashFenceKey),
 		Elems:    elems,
 	})
 	return current, cockerrors.WithStack(dispatchErr)

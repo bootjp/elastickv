@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -68,6 +69,41 @@ func requireTTLNear(t *testing.T, raw []byte, want time.Time) {
 	got, err := decodeRedisTTL(raw)
 	require.NoError(t, err)
 	require.WithinDuration(t, want, got, 3*time.Second)
+}
+
+type readKeyRecordingCoordinator struct {
+	*localAdapterCoordinator
+	lastReadKeys [][]byte
+}
+
+func newReadKeyRecordingCoordinator(st store.MVCCStore) *readKeyRecordingCoordinator {
+	return &readKeyRecordingCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st)}
+}
+
+func (c *readKeyRecordingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.lastReadKeys = cloneReadKeys(req.ReadKeys)
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+func cloneReadKeys(in [][]byte) [][]byte {
+	out := make([][]byte, 0, len(in))
+	for _, key := range in {
+		out = append(out, bytes.Clone(key))
+	}
+	return out
+}
+
+func requireReadKeysMatch(t *testing.T, got [][]byte, want [][]byte) {
+	t.Helper()
+	gotSet := make(map[string]struct{}, len(got))
+	for _, key := range got {
+		gotSet[string(key)] = struct{}{}
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, key := range want {
+		wantSet[string(key)] = struct{}{}
+	}
+	require.Equal(t, wantSet, gotSet)
 }
 
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a
@@ -499,6 +535,65 @@ func TestRedisTxnSetReplacementConflictsWithConcurrentListPush(t *testing.T) {
 	err = txn.validateReadSet(ctx)
 	require.ErrorIs(t, err, store.ErrWriteConflict,
 		"SET replacement in MULTI must conflict with concurrent RPUSH on the same key")
+}
+
+func TestRedisStandaloneMissingCreatorsReadAllWideFences(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	t.Run("sadd", func(t *testing.T) {
+		t.Parallel()
+		st := store.NewMVCCStore()
+		coord := newReadKeyRecordingCoordinator(st)
+		server := NewRedisServer(nil, "", st, coord, nil, nil)
+		key := []byte("missing-create:sadd")
+
+		conn := &recordingConn{}
+		server.mutateExactSetWide(conn, ctx, key, [][]byte{[]byte("member")}, true)
+		require.Empty(t, conn.err)
+		require.Equal(t, int64(1), conn.int)
+		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
+	})
+
+	t.Run("rpush", func(t *testing.T) {
+		t.Parallel()
+		st := store.NewMVCCStore()
+		coord := newReadKeyRecordingCoordinator(st)
+		server := NewRedisServer(nil, "", st, coord, nil, nil)
+		key := []byte("missing-create:rpush")
+
+		n, err := server.listRPush(ctx, key, [][]byte{[]byte("value")})
+		require.NoError(t, err)
+		require.Equal(t, int64(1), n)
+		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
+	})
+
+	t.Run("zadd", func(t *testing.T) {
+		t.Parallel()
+		st := store.NewMVCCStore()
+		coord := newReadKeyRecordingCoordinator(st)
+		server := NewRedisServer(nil, "", st, coord, nil, nil)
+		key := []byte("missing-create:zadd")
+
+		n, err := server.zaddTxn(ctx, key, zaddFlags{}, []zaddPair{{score: 1, member: "member"}})
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
+	})
+
+	t.Run("hincrby", func(t *testing.T) {
+		t.Parallel()
+		st := store.NewMVCCStore()
+		coord := newReadKeyRecordingCoordinator(st)
+		server := NewRedisServer(nil, "", st, coord, nil, nil)
+		key := []byte("missing-create:hincrby")
+
+		n, err := server.hincrbyTxn(ctx, key, []byte("field"), 1)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), n)
+		requireReadKeysMatch(t, coord.lastReadKeys, redisTxnWideCollectionFenceKeys(key))
+	})
 }
 
 func TestRedisTxnSetThenExpireUpdatesReplacementTTL(t *testing.T) {
