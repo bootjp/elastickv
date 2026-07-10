@@ -234,6 +234,42 @@ func TestShardStoreScanAt_RoutesFilesystemChunkSubrangeByChunkRouteKey(t *testin
 	require.Equal(t, k0, kvs[0].Key)
 }
 
+func TestShardStoreScanAt_RoutesFilesystemChunkCrossFileSubrangeEndRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	home := uint64(11)
+	inodeA := uint64(22)
+	inodeB := uint64(23)
+	routeA := fskeys.ChunkRouteKey(home, inodeA)
+	routeB := fskeys.ChunkRouteKey(home, inodeB)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeA, 1)
+	engine.UpdateRoute(routeA, routeB, 2)
+	engine.UpdateRoute(routeB, nil, 3)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		3: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	kA := fskeys.ChunkKey(home, inodeA, 7)
+	kB0 := fskeys.ChunkKey(home, inodeB, 0)
+	kB5 := fskeys.ChunkKey(home, inodeB, 5)
+	require.NoError(t, st.PutAt(ctx, kA, []byte("a7"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, kB0, []byte("b0"), 2, 0))
+	require.NoError(t, st.PutAt(ctx, kB5, []byte("b5"), 3, 0))
+
+	kvs, err := st.ScanAt(ctx, kA, kB5, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, kA, kvs[0].Key)
+	require.Equal(t, kB0, kvs[1].Key)
+}
+
 func TestShardStoreScanAt_RoutesUnboundedFilesystemChunkScanByChunkRouteKey(t *testing.T) {
 	t.Parallel()
 
