@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -280,20 +281,8 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	defer func() { _ = rdb.Close() }()
 	ctx := context.Background()
 
-	const (
-		total  = 10_000
-		probes = 100
-	)
-	lastID := ""
-	for i := range total {
-		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: "stream-lat",
-			ID:     "*",
-			Values: []string{"i", fmt.Sprint(i)},
-		}).Result()
-		require.NoError(t, err)
-		lastID = id
-	}
+	const probes = 100
+	lastID := seedStreamEntriesForXReadLatency(t, nodes[0].redisServer, ctx, "stream-lat")
 
 	measure := func() time.Duration {
 		start := time.Now()
@@ -346,6 +335,31 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	require.LessOrEqualf(t, p95, p95Ceiling,
 		"XREAD p95 latency should not grow with stream size: baseline=%s median=%s p95=%s",
 		baseline, median, p95)
+}
+
+func seedStreamEntriesForXReadLatency(t *testing.T, server *RedisServer, ctx context.Context, key string) string {
+	t.Helper()
+
+	const entryCount = 10_000
+	commitTS, err := server.coordinator.Clock().NextFenced()
+	require.NoError(t, err)
+
+	userKey := []byte(key)
+	for ms := uint64(1); ms <= entryCount; ms++ {
+		id := fmt.Sprintf("%d-0", ms)
+		value, err := marshalStreamEntry(newRedisStreamEntry(id, []string{"i", fmt.Sprint(ms - 1)}))
+		require.NoError(t, err)
+		require.NoError(t, server.store.PutAt(ctx, store.StreamEntryKey(userKey, ms, 0), value, commitTS, 0))
+	}
+
+	meta, err := store.MarshalStreamMeta(store.StreamMeta{
+		Length:  entryCount,
+		LastMs:  entryCount,
+		LastSeq: 0,
+	})
+	require.NoError(t, err)
+	require.NoError(t, server.store.PutAt(ctx, store.StreamMetaKey(userKey), meta, commitTS, 0))
+	return fmt.Sprintf("%d-0", entryCount)
 }
 
 func TestRedis_StreamXTrimMaxLen(t *testing.T) {
