@@ -222,25 +222,34 @@ not also served by node B. Summation is exact.
 
 ### 4.2 Writes → per-cell group/term dedupe
 
-Under stable leadership, exactly one node (the current leader for
-the route's group) records writes for a given
-`(bucketID, raftGroupID, leaderTerm, column)`; other nodes report
-0. Zero-valued contributions are ignored for write conflict
-purposes, so follower zeros against the leader's non-zero value do
-not perturb the result or raise `conflicts[j]`.
+Phase 2-C records writes at the ingress node before any follower-to-leader
+forwarding. Under direct-to-leader traffic this means one node (the current
+leader for the route's group) records writes for a given
+`(bucketID, raftGroupID, leaderTerm, column)` while other nodes report 0.
+Under follower ingress or multi-ingress clients, multiple nodes can record
+the same term locally before the request is forwarded and committed by the
+leader. The server therefore treats write cells as ingress-observed samples,
+not as an exact leader-only commit counter. Zero-valued contributions are
+ignored for write conflict purposes, so follower zeros against a non-zero
+value do not perturb the result or raise `conflicts[j]`.
 
 Under a leadership flip inside the requested window, the ex-leader
 and new leader report different `leaderTerm` values in different
 columns or even in the same column. The merge:
 
 - takes max within the same `(bucketID, raftGroupID, leaderTerm,
-  column)` identity, because Raft has at most one leader per group
-  and term;
+  column)` identity, preserving the pre-existing leader-only fast path
+  while avoiding double-counting duplicate ingress observations in a
+  stable term;
 - sums the resolved values across distinct `leaderTerm` values for
   the same `(bucketID, raftGroupID, column)`, preserving both sides
   of a real leadership transition;
 - sets `conflicts[j]=true` when two sources report different non-zero
-  values for the same `(group, term, column)` identity.
+  values for the same `(group, term, column)` identity. In Phase 2-C this
+  can mean either a true same-term sampling anomaly or normal rollout-era
+  multi-ingress traffic whose local ingress counters differ; the wire
+  contract intentionally surfaces the ambiguity instead of claiming exact
+  leader-only write accounting.
 
 For mixed-version clusters or cells whose identity is unknown
 (`raftGroupID == 0` or `leaderTerm == 0`), that cell falls back to
@@ -279,7 +288,7 @@ warnings is a future wire extension.
 
 ### 4.5 Time alignment
 
-All nodes use `keyvizStep` (default 1 s), but the shipped Phase 2-C
+All nodes use `keyvizStep` (default 60 s), but the shipped Phase 2-C
 aggregator does not receive `keyvizStep` and does not bucket-align
 peer column timestamps. It merges exact `column_unix_ms` values from
 the local and peer matrices. Two nodes whose flush goroutines fire at

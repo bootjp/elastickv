@@ -51,7 +51,7 @@ flowchart LR
     Node3["Node C"]
   end
 
-  Browser -- "HTTP/JSON + WebSocket" --> Node1HTTP
+  Browser -- "HTTP/JSON polling" --> Node1HTTP
   Node1HTTP -- "admin HTTP peer fan-out" --> Node2HTTP
   Node1HTTP -- "admin HTTP peer fan-out" --> Node3HTTP
 
@@ -81,12 +81,19 @@ requests to the static `--keyvizFanoutNodes` list and merges the results.
 The sampler's ring buffer lives inside each node's process, rebuildable
 after restart once Phase 3 persistence is enabled (see §5.6).
 
-### 3.1 Why a separate binary
+### 3.1 Standalone and embedded admin surfaces
 
-- Release cadence for the UI is decoupled from the data plane.
-- The admin binary can be placed on an operator workstation or a sidecar pod, so a compromised UI does not imply a compromised data node.
-- Node binaries remain free of the Prometheus client (goal §2.1-6) and of any SPA assets.
-- For the original standalone overview path,
+- The original `cmd/elastickv-admin` binary is retained as a
+  gRPC-based overview client for Phase 0 diagnostics. It can run on an
+  operator workstation or sidecar pod when operators want a client-only
+  view of node metadata.
+- The shipped KeyViz SPA and Phase 2-C fan-out path are embedded in each
+  `elastickv` server process. Server builds therefore carry the admin
+  HTTP handlers and SPA assets for this path; the standalone overview
+  binary is not the KeyViz delivery vehicle.
+- The sampler path still avoids a Prometheus client dependency in the
+  data-plane hot path (goal §2.1-6).
+- For the standalone overview path,
   `cmd/elastickv-admin --nodes=host:50051 --nodeTokenFile=/etc/elastickv/admin.token`
   remains the full invocation; KeyViz Phase 2-C fan-out uses the
   embedded HTTP handler described in §9.1 instead.
@@ -334,7 +341,7 @@ Because writes are recorded by Raft leaders and follower-local reads are recorde
 2. Route-budget test: generate more than `--keyvizMaxTrackedRoutes` routes and assert that coarsening preserves total observed traffic, keeps hot routes un-merged, and returns `aggregate`, `bucketID`, `routeCount`, and constituent route metadata correctly.
 3. Integration test in `kv/` that drives synthetic traffic through the coordinator and asserts the matrix reflects the skew.
 4. gRPC handler tests with a fake engine and fake Raft status reader.
-5. Fan-out test: admin binary against a 3-node fake cluster, including follower-local reads, one unreachable node, and a leadership transfer in the middle of a step window; the merged response must sum non-duplicate samples, preserve the partial-status array, and flag ambiguous overlap.
+5. Fan-out test: embedded admin HTTP handler against a 3-node fake cluster, including follower-local reads, one unreachable node, and a leadership transfer in the middle of a step window; the merged response must sum non-duplicate samples, preserve the partial-status array, and flag ambiguous overlap.
 6. Persistence test: write compacted columns to per-range groups, perform split and merge transitions, restart a node, take a leadership transfer, run KeyViz GC, and verify the lineage reader reconstructs complete history across groups without relying on stable `RouteID`s`.
 7. Namespace isolation test: user `ScanAt`, `ReverseScanAt`, and `maxLatestCommitTS` must ignore `!admin|keyviz|*` records, and user-plane `Put` / `Delete` / transactional writes to any `!admin|*` key must be rejected with `InvalidArgument` by every adapter (gRPC `RawKV`/`TransactionalKV`, Redis, DynamoDB, S3).
 8. Auth test: `Admin` gRPC methods reject missing or wrong tokens and accept the configured read-only token.
@@ -349,7 +356,7 @@ Because writes are recorded by Raft leaders and follower-local reads are recorde
 | 1 | Overview, Routes, Raft Groups, Adapters pages. `LiveSummary` added. No sampler. | All read-only pages match `grpcurl` ground truth. |
 | 2-A | Key Visualizer MVP server side: in-memory sampler with adaptive sub-sampling, leader writes, leader/follower reads, static matrix API with virtual-bucket metadata. | Benchmark gate green; ±5% / 95%-CI accuracy SLO holds under synthetic bursts; matrix endpoint returns the local node's view. |
 | 2-B | KeyViz SPA integration into `web/admin/`: heatmap page, series picker, row budget, manual + auto refresh. See `docs/design/2026_04_27_implemented_keyviz_spa_integration.md`. | Heatmap shows synthetic hotspot within ~5 s of `make client` driving traffic against `make run`; type check (`tsc -b --noEmit`) clean. |
-| 2-C | Cluster fan-out: admin RPC that aggregates each node's local sampler view so the SPA shows a cluster-wide heatmap rather than the local node's slice. | Fan-out returns complete view with 1 node down; SPA renders aggregate within the §10 budget. |
+| 2-C | Cluster fan-out: embedded admin HTTP fan-out that aggregates each node's local sampler view so the SPA shows a cluster-wide heatmap rather than the local node's slice. | Fan-out returns a partial cluster view with per-node failure status when a peer is down; SPA renders the aggregate within the §10 budget. |
 | 3 | Drill-down, split/merge continuity, namespace-isolated persistence of compacted columns distributed **per owning Raft group**, lineage recovery, and retention GC. | Heatmap remains continuous across a live `SplitRange`; restart preserves last 7 days; expired data and stale lineage records are collected; no single Raft group sees more than its share of KeyViz writes. |
 | 4 (deferred) | Mutating admin operations (`SplitRange` from UI), browser login, RBAC, and identity-provider integration. Out of scope for this design; a follow-up design will cover it. | — |
 
