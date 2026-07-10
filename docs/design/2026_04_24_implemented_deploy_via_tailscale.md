@@ -1,10 +1,26 @@
 # Deploy via Tailscale + GitHub Actions
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-24
 
 ---
+
+## Implementation status
+
+Implemented on `main`.
+
+- `.github/workflows/rolling-update.yml` defines the manual production
+  `Rolling update` workflow, joins Tailscale with an ephemeral OAuth-backed
+  node, verifies the target GHCR image, renders `NODES` / `SSH_TARGETS`, runs
+  an SSH reachability gate, and invokes `scripts/rolling-update.sh`.
+- `docs/deploy_via_tailscale_runbook.md` documents the production environment,
+  Tailscale ACL/OAuth setup, secrets, variables, dry-run flow, rollback, and
+  cancellation recovery procedure.
+- `scripts/rolling-update.sh` remains the canonical node-by-node rolling
+  restart implementation used by both the workflow and manual fallback.
+
+The original v1 implementation plan is retained below as historical context.
 
 ## 1. Background
 
@@ -228,7 +244,7 @@ before production cutover.
 - Tailscale SSH (option A above).
 - A shared `deploy` user with restricted sudo.
 
-## 5. Implementation plan
+## 5. Original implementation plan
 
 1. Write `.github/workflows/rolling-update.yml` implementing §2.1.
 2. Document the secrets/variables setup in

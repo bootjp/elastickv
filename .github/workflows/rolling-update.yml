@@ -2,7 +2,7 @@ name: Rolling update
 
 # Manually-triggered production rollout. Joins the Tailnet, SSHes over
 # MagicDNS into each node, and invokes scripts/rolling-update.sh.
-# See docs/design/2026_04_24_proposed_deploy_via_tailscale.md.
+# See docs/design/2026_04_24_implemented_deploy_via_tailscale.md.
 
 on:
   workflow_dispatch:
