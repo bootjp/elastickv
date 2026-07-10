@@ -33,7 +33,9 @@ rollout are correct by construction:
   that does not know about `Fanout` / `conflict` simply omits them
   and the new aggregator treats the missing values as the merge-rule
   identity. An old SPA against a new server ignores the extra
-  fields and renders the local view it always did.
+  fields, but it still renders the merged cluster `rows` returned by
+  the server. The compatibility risk is presentation-only: old
+  clients do not show the degraded-node or conflict affordances.
 - Operators flip `--keyvizFanoutNodes` per-node during the rollout.
   Until every node has the new binary AND the flag set, some peer
   HTTP calls will 404 — that surfaces as `ok=false` in the
@@ -93,23 +95,23 @@ identity needed for the canonical §9.1 write merge.
 ```sh
 elastickv \
   --address 127.0.0.1:50051 \
-  --adminAddress 127.0.0.1:8080 \
+  --adminListen 127.0.0.1:8080 \
   --keyvizEnabled \
   --keyvizFanoutNodes=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080
 ```
 
 - Self is included implicitly: `internal/admin` matches each
-  `--keyvizFanoutNodes` entry against `--adminAddress` and skips the
+  `--keyvizFanoutNodes` entry against `--adminListen` and skips the
   network round-trip for the local entry. This keeps the
   configuration symmetric across all nodes (every node lists every
   node, including itself) so an operator can stamp the same flag
   onto every host. The matching rule is:
-  - **Exact host:port equality** to `--adminAddress` is the primary
+  - **Exact host:port equality** to `--adminListen` is the primary
     case (e.g. both say `10.0.0.1:8080`).
   - **Wildcard-bind handling**: when the listener bound to
     `0.0.0.0` / `::`, an entry with the same port and a loopback
     host (`127.0.0.1` / `localhost` / `::1`) also counts as self.
-    Operators who bind `--adminAddress=0.0.0.0:8080` but stamp
+    Operators who bind `--adminListen=0.0.0.0:8080` but stamp
     `127.0.0.1:8080` into every node's flag still get the
     skip-fires behavior.
   - **Anything else** is treated as a peer. A reverse-proxy or
@@ -117,7 +119,7 @@ elastickv \
     will not match — the fan-out makes a loopback HTTP call to
     itself. This is harmless (it degrades to one extra round-trip
     per request) but wasteful; operators should prefer the literal
-    `--adminAddress` value in the flag.
+    `--adminListen` value in the flag.
 - Empty (or unset) flag → fan-out disabled, current behaviour.
 - Each entry is a host:port. TLS is out of scope for Phase 2-C
   (intra-cluster admin traffic is assumed to ride a private
@@ -324,7 +326,8 @@ represented by zero entries, matching `proto/admin.proto`'s
 This is small enough to land in the same PR as the server side or
 as an immediate follow-up; either way the wire format above is
 forwards-compatible so an old SPA against a fan-out server still
-renders correctly (it just ignores the new fields).
+renders the merged values (it just ignores the new fields and lacks
+the degraded/conflict affordances).
 
 ## 7. Implementation status
 
