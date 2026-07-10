@@ -98,7 +98,10 @@ elastickv \
   --address 10.0.0.1:50051 \
   --adminEnabled \
   --adminListen 10.0.0.1:8080 \
+  --s3CredentialsFile=/etc/elastickv/admin-s3-creds.json \
+  --adminSessionSigningKeyFile=/etc/elastickv/admin-hs256.b64 \
   --adminAllowPlaintextNonLoopback \
+  --adminAllowInsecureDevCookie \
   --keyvizEnabled \
   --keyvizFanoutNodes=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080
 ```
@@ -107,8 +110,17 @@ The example is the node-1 process. Node 2 and node 3 use their own
 reachable `--adminListen` address (`10.0.0.2:8080`,
 `10.0.0.3:8080`) while keeping the same symmetric
 `--keyvizFanoutNodes` list. `--adminEnabled` is required; without it
-the HTTP admin handler is not mounted. Non-loopback plaintext requires
-the explicit `--adminAllowPlaintextNonLoopback` opt-in shown above.
+the HTTP admin handler is not mounted. The normal admin prerequisites
+also still apply: `--s3CredentialsFile` must point at the login
+credential map, and all nodes must share the same 64-byte
+`--adminSessionSigningKey` through the flag, file, or environment
+variable form. Non-loopback plaintext requires the explicit
+`--adminAllowPlaintextNonLoopback` opt-in shown above. A working
+plaintext browser rig also requires `--adminAllowInsecureDevCookie`,
+because `--adminAllowPlaintextNonLoopback` only permits the listener
+bind; it does not remove the `Secure` attribute from admin cookies.
+This plaintext form is for short-lived private test rigs. Production
+rollouts should use admin TLS and omit both plaintext escape hatches.
 
 - Self is included implicitly: `internal/admin` matches each
   `--keyvizFanoutNodes` entry against `--adminListen` and skips the
@@ -127,16 +139,23 @@ the explicit `--adminAllowPlaintextNonLoopback` opt-in shown above.
   - **Anything else** is treated as a peer. A reverse-proxy or
     DNS-aliased entry that names the same node by a different host
     will not match — the fan-out makes a loopback HTTP call to
-    itself. This is harmless (it degrades to one extra round-trip
-    per request) but wasteful; operators should prefer the literal
-    `--adminListen` value in the flag.
+    itself. Because merge semantics sum per-source counters, this can
+    double-count the local node's read traffic rather than merely add a
+    wasted round-trip. Operators must either list the literal
+    `--adminListen` value for self or omit self aliases from
+    `--keyvizFanoutNodes`.
 - Empty (or unset) flag → fan-out disabled, current behaviour.
 - Each entry is either `host:port` or a full URL. The host-only form is
   interpreted as `http://host:port`. Deployments that enable admin TLS
   must use explicit `https://host:port` entries:
   `--keyvizFanoutNodes=https://node1.internal:8443,https://node2.internal:8443`.
   The URL builder preserves explicit schemes, so TLS fan-out does not
-  require a separate flag.
+  require a separate scheme flag. The Phase 2-C implementation uses the
+  default Go `http.Client`; HTTPS peer certificates must already chain
+  to the process or container trust roots. Private-CA or self-signed
+  admin certificates therefore need that CA installed in the trust
+  store before fan-out is enabled, otherwise peer calls fail
+  certificate verification and the cluster view is degraded.
 - **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
   the inbound user's cookies (`admin_session` + `admin_csrf` only)
   on every peer call. The peer's `SessionAuth` middleware verifies
