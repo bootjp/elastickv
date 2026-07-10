@@ -2,10 +2,11 @@
 
 | Field | Value |
 |---|---|
-| Status | partial |
+| Status | implemented |
 | Date | 2026-05-25 |
+| Implemented | 2026-07-07 status audit; Stage 7a/7a-2/7c registration gate is now shipped |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 nonce, §5.1 sidecar, §7.1 rollout), [`2026_05_18_implemented_6d_enable_storage_envelope.md`](2026_05_18_implemented_6d_enable_storage_envelope.md) (6D-6c milestone breakdown) |
-| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The full Raft-replicated writer-registry **registration-before-first-write** gate stays in Stage 7. |
+| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The Raft-replicated writer-registry **registration-before-first-write** gate is now shipped by the Stage 7a/7a-2/7c docs. |
 
 ## Lifecycle status
 
@@ -15,15 +16,13 @@ sidecar, the `local_epoch` bump-and-fsync lifecycle, the production
 `StateCache` wiring. A single-node cluster can now Bootstrap →
 EnableStorageEnvelope → Put (encrypted at rest) → read back.
 
-**Remaining (Stage 7, §1 "out of scope"):** the Raft-replicated
+**Stage 7 registration follow-up now shipped:** the Raft-replicated
 registration-before-first-write coordinator gate (the §5.2
-process-start and §4.1 ConfChange-time paths) that makes multi-node
-membership churn nonce-safe beyond the existing startup guards
-(`ErrNodeIDCollision`, `ErrLocalEpochRollback`). Until that lands the
-write path is `partial`: production-correct for single-node and
-stable-membership clusters, with the documented cross-node-churn gap
-covered only by the startup guards. The doc flips to
-`*_implemented_*` when the Stage 7 gate ships.
+process-start and §4.1 ConfChange-time paths) now makes multi-node
+membership churn nonce-safe beyond the startup guards
+(`ErrNodeIDCollision`, `ErrLocalEpochRollback`). This closes the
+partial-status caveat that previously kept this doc from being marked
+implemented.
 
 ## 0. Why this doc exists
 
@@ -63,8 +62,8 @@ not yet have, plus the wiring:
 3. **A production deterministic `NonceFactory`** pinned to the bumped
    `local_epoch`, living in a non-test file.
 
-This doc pins the as-implemented design for all four pieces and draws
-the scope boundary against the remaining Stage 7 work.
+This doc pins the as-implemented design for all four pieces and records
+the Stage 7 work that later closed the original multi-node-churn gap.
 
 ## 1. Scope
 
@@ -91,7 +90,7 @@ the scope boundary against the remaining Stage 7 work.
   `WithStorageEnvelopeGate` (reading `cache.ActiveStorageKeyID` /
   `cache.StorageEnvelopeActive`) into every shard's `PebbleStore`.
 
-### Out of scope (stays in Stage 7)
+### Stage 7 deferral now closed
 
 - **Registration-before-first-write coordinator gate** (§5.2
   process-start path, §4.1 ConfChange-time path). A node bumping its
@@ -103,7 +102,13 @@ the scope boundary against the remaining Stage 7 work.
   existing startup membership pre-check (`ErrNodeIDCollision`) and the
   registry-apply-time collision check shipped in 6A; the
   propose-before-write *gate* (block the coordinator's first encrypted
-  write until registration commits) is deferred.
+  write until registration commits) is implemented by the existing
+  Stage 7a/7a-2/7c docs:
+  [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md),
+  [`2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md`](2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md),
+  [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md),
+  [`2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md),
+  and [`2026_05_29_implemented_7c_confchange_time_registration.md`](2026_05_29_implemented_7c_confchange_time_registration.md).
 - KMS providers, compression, DEK retirement/rewrite (Stages 9).
 - The capability fan-out closure + multi-node e2e — that is 6D-6c-3.
 
@@ -117,9 +122,9 @@ today. The single-node e2e (6D-6c-3) exercises the full
 Bootstrap → cutover → Put → read-back loop on one process load where
 the registration gate is moot (the node is the only writer and is
 registered by the §5.6 bootstrap batch). Multi-node deployments that
-add a writer after bootstrap are protected by the startup guards until
-Stage 7 lands the propose-before-write gate; this doc does **not**
-claim multi-node-churn nonce safety beyond those guards.
+add a writer after bootstrap are now covered by the Stage 7a/7a-2/7c
+registration-before-first-write gate in addition to the startup guards;
+this is why the former 6D-6c-2 partial-status caveat is closed.
 
 ## 2. Startup ordering
 
@@ -212,7 +217,7 @@ hydrate+bump is gated on an active DEK:
   `ErrKeyConflict` only if the KEK-unwrap produced different bytes for
   the same id — a halt condition surfaced as a startup failure.
 
-## 4. Self-review checklist (to satisfy on the implementation PR)
+## 4. Self-review checklist
 
 - **Data loss** — hydration/bump never delete a DEK or a committed
   write; bump consumes epochs monotonically.
@@ -260,9 +265,9 @@ hydrate+bump is gated on an active DEK:
   `node_id_collision.go`) now call `encryption.NodeID16`; the lone
   gosec-suppressed conversion lives inside the helper.
 
-## 5. Open questions for review
+## 5. Resolved decisions and deferred follow-ups
 
-0. **Redundant KEK unwrap at startup (gemini medium, deferred).**
+- **Redundant KEK unwrap at startup is deferred to Stage 9.**
    `HydrateKeystoreFromSidecar` re-unwraps every wrapped DEK that
    `CheckStartupGuards` already unwrapped to verify the KEK. For the
    file-mode KEK (the only provider today) the unwrap is a local AES
@@ -273,11 +278,9 @@ hydrate+bump is gated on an active DEK:
    the guard/hydration contract boundary. Tracked for the Stage 9 KMS
    work rather than this PR.
 
-1. Should `BumpLocalEpoch` also bump the **raft** DEK's epoch, or only
-   the storage DEK? (Raft envelope is §4.2; this PR wires only the
-   storage write path, so the proposal bumps storage only and leaves
-   raft-epoch lifecycle to the raft-envelope wiring.)
-2. Is hydrating **all** sidecar DEKs (not just the active one) the
-   right call? (Yes — reads of pre-rotation versions need historical
-   DEKs; the cipher must hold every unretired DEK, matching
-   `Cipher.LoadedKeyIDs`.)
+- **`BumpLocalEpoch` remains storage-envelope scoped for this
+  milestone.** Raft envelope is §4.2; this PR wires only the storage
+  write path, so raft-epoch lifecycle stays with raft-envelope wiring.
+- **Hydrating all sidecar DEKs is intentional.** Reads of
+  pre-rotation versions need historical DEKs; the cipher must hold
+  every unretired DEK, matching `Cipher.LoadedKeyIDs`.
