@@ -1,13 +1,85 @@
 package kv
 
-import "sync"
+import (
+	"encoding/hex"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+)
+
+const (
+	defaultMaxActiveBackupPins = 64
+	defaultBackupPinSweepEvery = time.Second
+)
+
+var (
+	ErrInvalidBackupPin     = errors.New("backup pin is invalid")
+	ErrTooManyActiveBackups = errors.New("too many active backup pins")
+)
+
+type BackupPinID [16]byte
+
+func (id BackupPinID) IsZero() bool {
+	return id == BackupPinID{}
+}
+
+func (id BackupPinID) String() string {
+	return hex.EncodeToString(id[:])
+}
+
+type backupDeadlinePin struct {
+	readTS   uint64
+	deadline time.Time
+}
+
+type backupPinKey struct {
+	id      BackupPinID
+	groupID uint64
+}
+
+func newBackupPinKey(pinID BackupPinID, groupID uint64) backupPinKey {
+	return backupPinKey{id: pinID, groupID: groupID}
+}
+
+type ActiveTimestampTrackerOption func(*ActiveTimestampTracker)
+
+func WithActiveTimestampTrackerMaxBackupPins(maxPins int) ActiveTimestampTrackerOption {
+	return func(t *ActiveTimestampTracker) {
+		if maxPins > 0 {
+			t.maxBackupPins = maxPins
+		}
+	}
+}
+
+func WithActiveTimestampTrackerSweepInterval(interval time.Duration) ActiveTimestampTrackerOption {
+	return func(t *ActiveTimestampTracker) {
+		t.sweepEvery = interval
+	}
+}
+
+func WithActiveTimestampTrackerLogger(logger *slog.Logger) ActiveTimestampTrackerOption {
+	return func(t *ActiveTimestampTracker) {
+		if logger != nil {
+			t.logger = logger
+		}
+	}
+}
 
 // ActiveTimestampTracker tracks in-flight read or transaction timestamps that
 // must remain readable while background compaction is running.
 type ActiveTimestampTracker struct {
-	mu     sync.Mutex
-	nextID uint64
-	active map[uint64]uint64
+	mu            sync.Mutex
+	nextID        uint64
+	active        map[uint64]uint64
+	backupPins    map[backupPinKey]backupDeadlinePin
+	maxBackupPins int
+	sweepEvery    time.Duration
+	sweepOnce     sync.Once
+	stopCh        chan struct{}
+	closeOnce     sync.Once
+	logger        *slog.Logger
 }
 
 // ActiveTimestampToken releases one tracked timestamp when the owning
@@ -18,10 +90,21 @@ type ActiveTimestampToken struct {
 	once    sync.Once
 }
 
-func NewActiveTimestampTracker() *ActiveTimestampTracker {
-	return &ActiveTimestampTracker{
-		active: make(map[uint64]uint64),
+func NewActiveTimestampTracker(opts ...ActiveTimestampTrackerOption) *ActiveTimestampTracker {
+	t := &ActiveTimestampTracker{
+		active:        make(map[uint64]uint64),
+		backupPins:    make(map[backupPinKey]backupDeadlinePin),
+		maxBackupPins: defaultMaxActiveBackupPins,
+		sweepEvery:    defaultBackupPinSweepEvery,
+		stopCh:        make(chan struct{}),
+		logger:        slog.Default(),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(t)
+		}
+	}
+	return t
 }
 
 func (t *ActiveTimestampTracker) Pin(ts uint64) *ActiveTimestampToken {
@@ -51,7 +134,215 @@ func (t *ActiveTimestampTracker) Oldest() uint64 {
 			oldest = ts
 		}
 	}
+	now := time.Now()
+	for _, pin := range t.backupPins {
+		if !pin.deadline.After(now) {
+			continue
+		}
+		if oldest == 0 || pin.readTS < oldest {
+			oldest = pin.readTS
+		}
+	}
 	return oldest
+}
+
+func (t *ActiveTimestampTracker) PinWithDeadline(pinID BackupPinID, readTS uint64, deadline time.Time) error {
+	return t.PinWithDeadlineForGroup(pinID, 0, readTS, deadline)
+}
+
+func (t *ActiveTimestampTracker) PinWithDeadlineForGroup(pinID BackupPinID, groupID uint64, readTS uint64, deadline time.Time) error {
+	return t.pinWithDeadlineForGroup(pinID, groupID, readTS, deadline, true)
+}
+
+func (t *ActiveTimestampTracker) ApplyPinWithDeadlineForGroup(pinID BackupPinID, groupID uint64, readTS uint64, deadline time.Time) error {
+	return t.pinWithDeadlineForGroup(pinID, groupID, readTS, deadline, false)
+}
+
+func (t *ActiveTimestampTracker) pinWithDeadlineForGroup(pinID BackupPinID, groupID uint64, readTS uint64, deadline time.Time, enforceLimit bool) error {
+	if t == nil {
+		return nil
+	}
+	if pinID.IsZero() || readTS == 0 || readTS == ^uint64(0) || deadline.IsZero() {
+		return errors.WithStack(ErrInvalidBackupPin)
+	}
+	t.mu.Lock()
+	expired := t.reapExpiredBackupPinsLocked(time.Now())
+	key := newBackupPinKey(pinID, groupID)
+	if enforceLimit && !t.hasBackupPinIDLocked(pinID) && t.activeBackupPinIDCountLocked() >= t.maxBackupPins {
+		t.mu.Unlock()
+		t.logExpiredBackupPins(expired)
+		return errors.WithStack(ErrTooManyActiveBackups)
+	}
+	t.backupPins[key] = backupDeadlinePin{readTS: readTS, deadline: deadline}
+	t.startBackupPinSweeperLocked()
+	t.mu.Unlock()
+	t.logExpiredBackupPins(expired)
+	return nil
+}
+
+func (t *ActiveTimestampTracker) Extend(pinID BackupPinID, deadline time.Time) error {
+	return t.ExtendForGroup(pinID, 0, deadline)
+}
+
+func (t *ActiveTimestampTracker) ExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+	return t.extendForGroup(pinID, groupID, deadline, true)
+}
+
+func (t *ActiveTimestampTracker) ApplyExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+	return t.extendForGroup(pinID, groupID, deadline, false)
+}
+
+func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time, returnMissingExpired bool) error {
+	if t == nil {
+		return nil
+	}
+	if pinID.IsZero() || deadline.IsZero() {
+		return errors.WithStack(ErrInvalidBackupPin)
+	}
+	t.mu.Lock()
+	key := newBackupPinKey(pinID, groupID)
+	pin, exists := t.backupPins[key]
+	if !exists {
+		t.mu.Unlock()
+		if !returnMissingExpired {
+			return nil
+		}
+		return errors.WithStack(ErrInvalidBackupPin)
+	}
+	if !pin.deadline.After(time.Now()) {
+		delete(t.backupPins, key)
+		t.mu.Unlock()
+		t.logExpiredBackupPins([]expiredBackupPin{{key: key, ts: pin.readTS}})
+		if !returnMissingExpired {
+			return nil
+		}
+		return errors.WithStack(ErrInvalidBackupPin)
+	}
+	pin.deadline = deadline
+	t.backupPins[key] = pin
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *ActiveTimestampTracker) ReleaseBackupPin(pinID BackupPinID) {
+	t.ReleaseBackupPinForGroup(pinID, 0)
+}
+
+func (t *ActiveTimestampTracker) ReleaseBackupPinForGroup(pinID BackupPinID, groupID uint64) {
+	if t == nil || pinID.IsZero() {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.backupPins, newBackupPinKey(pinID, groupID))
+}
+
+func (t *ActiveTimestampTracker) ActiveBackupPinCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.backupPins)
+}
+
+func (t *ActiveTimestampTracker) BackupPinDeadline(pinID BackupPinID) (time.Time, bool) {
+	return t.BackupPinDeadlineForGroup(pinID, 0)
+}
+
+func (t *ActiveTimestampTracker) BackupPinDeadlineForGroup(pinID BackupPinID, groupID uint64) (time.Time, bool) {
+	if t == nil || pinID.IsZero() {
+		return time.Time{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	pin, ok := t.backupPins[newBackupPinKey(pinID, groupID)]
+	return pin.deadline, ok
+}
+
+func (t *ActiveTimestampTracker) startBackupPinSweeperLocked() {
+	if t.sweepEvery <= 0 {
+		return
+	}
+	t.sweepOnce.Do(func() {
+		go t.sweepBackupPins()
+	})
+}
+
+func (t *ActiveTimestampTracker) sweepBackupPins() {
+	if t.sweepEvery <= 0 {
+		return
+	}
+	ticker := time.NewTicker(t.sweepEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			t.reapExpiredBackupPins(now)
+		case <-t.stopCh:
+			return
+		}
+	}
+}
+
+// Close stops the backup-pin sweeper goroutine. It is safe to call more than
+// once and on trackers that never started the sweeper.
+func (t *ActiveTimestampTracker) Close() {
+	if t == nil {
+		return
+	}
+	t.closeOnce.Do(func() {
+		close(t.stopCh)
+	})
+}
+
+func (t *ActiveTimestampTracker) reapExpiredBackupPins(now time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	expired := t.reapExpiredBackupPinsLocked(now)
+	t.mu.Unlock()
+	t.logExpiredBackupPins(expired)
+}
+
+type expiredBackupPin struct {
+	key backupPinKey
+	ts  uint64
+}
+
+func (t *ActiveTimestampTracker) reapExpiredBackupPinsLocked(now time.Time) []expiredBackupPin {
+	expired := make([]expiredBackupPin, 0)
+	for key, pin := range t.backupPins {
+		if !pin.deadline.After(now) {
+			expired = append(expired, expiredBackupPin{key: key, ts: pin.readTS})
+			delete(t.backupPins, key)
+		}
+	}
+	return expired
+}
+
+func (t *ActiveTimestampTracker) hasBackupPinIDLocked(pinID BackupPinID) bool {
+	for key := range t.backupPins {
+		if key.id == pinID {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *ActiveTimestampTracker) activeBackupPinIDCountLocked() int {
+	seen := make(map[BackupPinID]struct{}, len(t.backupPins))
+	for key := range t.backupPins {
+		seen[key.id] = struct{}{}
+	}
+	return len(seen)
+}
+
+func (t *ActiveTimestampTracker) logExpiredBackupPins(expired []expiredBackupPin) {
+	for _, pin := range expired {
+		t.logger.Warn("backup_pin_expired", "pin_id", pin.key.id.String(), "raft_group_id", pin.key.groupID, "read_ts", pin.ts)
+	}
 }
 
 func (t *ActiveTimestampToken) Release() {

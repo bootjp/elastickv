@@ -386,6 +386,7 @@ func run() error {
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
+	readTracker := kv.NewActiveTimestampTracker()
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -412,6 +413,7 @@ func run() error {
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
+		readTracker,
 		cfg.engine,
 		redisApplyObserver,
 	)
@@ -436,7 +438,6 @@ func run() error {
 	defer cleanup.Run()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	readTracker := kv.NewActiveTimestampTracker()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -1022,6 +1023,7 @@ func buildShardGroups(
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
+	readTracker *kv.ActiveTimestampTracker,
 	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
@@ -1099,7 +1101,8 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
+		sm := kv.NewKvFSMWithHLCAndTracker(st, clock, readTracker,
+			fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
 		groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(bootstrapCfg, g.id, bootstrap)
 		runtime, err := buildRuntimeForGroup(
 			raftID, g, raftDir, multi, groupBootstrap,

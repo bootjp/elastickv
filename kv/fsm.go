@@ -51,6 +51,11 @@ type kvFSM struct {
 	// write", preserving Stage 6A behavior for backends that did
 	// not opt in).
 	pendingApplyIdx uint64
+	// readTracker is shared with the local FSM compactor. BackupPin
+	// FSM entries mutate this tracker so compaction retains versions
+	// at the live-backup read timestamp until the pin is released or
+	// its deadline expires.
+	readTracker *ActiveTimestampTracker
 	// cutoverSource provides the writer-side view of the Phase-2
 	// envelope cutover index for snapshot v1/v2 selection (Stage
 	// 8a §3.3). nil = always v1 output.
@@ -234,6 +239,12 @@ func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
 	}
 }
 
+func WithActiveTimestampTracker(tracker *ActiveTimestampTracker) FSMOption {
+	return func(f *kvFSM) {
+		f.readTracker = tracker
+	}
+}
+
 // NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
 // a HLC lease entry is applied. The caller must pass the same *HLC instance to
 // the coordinator so both sides share the agreed physical ceiling.
@@ -254,6 +265,13 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 	}
 	f.snapLatch.log = f.log
 	return f
+}
+
+func NewKvFSMWithHLCAndTracker(store store.MVCCStore, hlc *HLC, tracker *ActiveTimestampTracker, opts ...FSMOption) FSM {
+	all := make([]FSMOption, 0, len(opts)+1)
+	all = append(all, WithActiveTimestampTracker(tracker))
+	all = append(all, opts...)
+	return NewKvFSMWithHLC(store, hlc, all...)
 }
 
 var _ FSM = (*kvFSM)(nil)
@@ -351,6 +369,8 @@ func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeBackup:
+		return f.applyBackup(data), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -630,18 +650,19 @@ func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
 // is monotonic and lives purely in memory. After the cold-start skip
 // gate fires, the engine still delivers WAL committed-tail entries
 // past snapshot.Metadata.Index; without this classifier those
-// volatile entries get dropped along with KV/MVCC duplicates and the
-// post-snapshot ceiling raise is lost. Codex P1 #934 round 7.
+// volatile entries get dropped along with KV/MVCC duplicates. HLC
+// would lose the post-snapshot ceiling raise; backup pins would lose
+// a post-snapshot retention fence.
 //
 // Re-applying KV/MVCC entries would re-execute OCC validation against
 // store state that has already moved past commit_ts, surfacing
-// spurious conflicts. Returning false for any non-HLC payload tag
+// spurious conflicts. Returning false for persistent internal tags
 // preserves that idempotency. Encryption opcodes (0x03..0x07) MUST
 // also return false — they persist DEK state in the encryption
 // sidecar and re-applying would diverge the sidecar's
 // RaftAppliedIndex from the engine's appliedIndex.
 func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
-	return len(payload) > 0 && payload[0] == raftEncodeHLCLease
+	return len(payload) > 0 && (payload[0] == raftEncodeHLCLease || payload[0] == raftEncodeBackup)
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {

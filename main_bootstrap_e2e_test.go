@@ -540,7 +540,9 @@ func startBootstrapE2ENode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, raftBootstrapConfig{legacyServers: bootstrapServers}, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, cfg.engine)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
+		raftBootstrapConfig{legacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
+		nil, nil, "", encryptionWriteWiring{}, cfg.engine)
 	if err != nil {
 		return nil, err
 	}
@@ -623,7 +625,9 @@ func startBootstrapE2EMultiGroupNode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapCfg, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, cfg.engine)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
+		bootstrapCfg, factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "",
+		encryptionWriteWiring{}, cfg.engine)
 	if err != nil {
 		return nil, err
 	}
