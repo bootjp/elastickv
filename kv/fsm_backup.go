@@ -8,7 +8,7 @@ func (f *kvFSM) applyBackup(data []byte) any {
 	if f.readTracker == nil {
 		return haltErr(errors.Wrap(ErrBackupApply, "kv/fsm: backup entry arrived but no ActiveTimestampTracker is wired"))
 	}
-	entry, err := decodeBackupEntry(data)
+	entry, err := decodeBackupPayload(data)
 	if err != nil {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrBackupApply), "kv/fsm: decode backup entry"))
 	}

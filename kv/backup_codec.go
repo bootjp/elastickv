@@ -91,40 +91,47 @@ func decodeBackupEntry(data []byte) (backupEntry, error) {
 	if len(data) < backupEnvelopeHeaderLen || data[0] != raftEncodeBackup {
 		return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 	}
-	switch data[1] {
+	return decodeBackupPayload(data[1:])
+}
+
+func decodeBackupPayload(data []byte) (backupEntry, error) {
+	if len(data) < backupEnvelopeHeaderLen-1 {
+		return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
+	}
+	switch data[0] {
 	case backupSubtypePin:
-		if len(data) != backupPinEntryLen {
+		if len(data) != backupPinEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 		}
 		var id BackupPinID
-		copy(id[:], data[backupPinIDStart:backupPinIDEnd])
+		copy(id[:], data[backupPinIDStart-1:backupPinIDEnd-1])
 		return backupEntry{
 			subtype: backupSubtypePin,
 			pin: BackupPinEntry{
 				PinID:    id,
-				ReadTS:   binary.BigEndian.Uint64(data[backupReadTSStart:backupReadTSEnd]),
-				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupDeadlineStart:backupDeadlineEnd])),
+				ReadTS:   binary.BigEndian.Uint64(data[backupReadTSStart-1 : backupReadTSEnd-1]),
+				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupDeadlineStart-1 : backupDeadlineEnd-1])),
 			},
 		}, nil
 	case backupSubtypeExtend:
-		if len(data) != backupExtendEntryLen {
+		if len(data) != backupExtendEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 		}
 		var id BackupPinID
-		copy(id[:], data[backupPinIDStart:backupPinIDEnd])
+		copy(id[:], data[backupPinIDStart-1:backupPinIDEnd-1])
 		return backupEntry{
 			subtype: backupSubtypeExtend,
 			extend: BackupExtendEntry{
 				PinID:    id,
-				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupExtendMillisStart:backupExtendMillisEnd])),
+				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupExtendMillisStart-1 : backupExtendMillisEnd-1])),
 			},
 		}, nil
 	case backupSubtypeRelease:
-		if len(data) != backupReleaseEntryLen {
+		if len(data) != backupReleaseEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 		}
 		var id BackupPinID
-		copy(id[:], data[backupPinIDStart:backupPinIDEnd])
+		copy(id[:], data[backupPinIDStart-1:backupPinIDEnd-1])
 		return backupEntry{
 			subtype: backupSubtypeRelease,
 			release: BackupReleaseEntry{

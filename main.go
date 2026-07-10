@@ -436,6 +436,7 @@ func run() error {
 
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
+	cleanup.Add(readTracker.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)

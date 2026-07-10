@@ -370,7 +370,7 @@ func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
 	case data[0] == raftEncodeBackup:
-		return f.applyBackup(data), true
+		return f.applyBackup(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
