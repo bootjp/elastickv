@@ -1707,8 +1707,8 @@ func (s *pebbleStore) beginCompaction(minTS uint64) (bool, error) {
 	return true, nil
 }
 
-func (s *pebbleStore) cleanupPendingCompaction(committedDeletes *bool) {
-	if committedDeletes != nil && *committedDeletes {
+func (s *pebbleStore) cleanupPendingCompaction(retainPending *bool) {
+	if retainPending != nil && *retainPending {
 		return
 	}
 
@@ -1723,6 +1723,12 @@ func (s *pebbleStore) commitCompactionMinRetainedTS(minTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	return s.commitMinRetainedTSLocked(minTS, pebble.Sync)
+}
+
+func (s *pebbleStore) compactionWatermarks() (pending, committed uint64) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.pendingMinRetainedTS, s.minRetainedTS
 }
 
 func shouldDeleteCompactionVersion(rawKey []byte, minTS uint64, currentUserKey *[]byte, keptVisibleAtMinTS *bool, changedCurrentKey *bool) bool {
@@ -1867,44 +1873,44 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	if minTS <= s.effectiveMinRetainedTS() {
-		// Fast path: the requested watermark is already covered. However, a
-		// pending watermark may have survived a previous crash (GC ran and
-		// deleted versions but minRetainedTS was never committed). Finalize it
-		// now so reads < pending are unblocked and the pending key is not leaked.
-		s.mtx.RLock()
-		pending, committed := s.pendingMinRetainedTS, s.minRetainedTS
-		s.mtx.RUnlock()
-		if pending <= committed {
-			return nil
-		}
-		return s.commitCompactionMinRetainedTS(pending)
-	}
-
-	shouldRun, err := s.beginCompaction(minTS)
-	if err != nil {
-		return err
-	}
-	if !shouldRun {
+	pending, committed := s.compactionWatermarks()
+	resumingPending := pending > committed
+	targetMinTS := minTS
+	if resumingPending {
+		// A pending watermark means an earlier compaction may have already
+		// committed delete batches. Keep reads fail-closed, but do not finalize
+		// the watermark until an idempotent GC pass reaches EOF.
+		targetMinTS = pending
+	} else if minTS <= committed {
 		return nil
 	}
 
-	committedDeletes := false
-	defer s.cleanupPendingCompaction(&committedDeletes)
+	if !resumingPending {
+		shouldRun, err := s.beginCompaction(targetMinTS)
+		if err != nil {
+			return err
+		}
+		if !shouldRun {
+			return nil
+		}
+	}
 
-	stats, err := s.runCompactionGC(ctx, minTS)
-	committedDeletes = stats.committedDeletes
+	retainPending := resumingPending
+	defer s.cleanupPendingCompaction(&retainPending)
+
+	stats, err := s.runCompactionGC(ctx, targetMinTS)
+	retainPending = retainPending || stats.committedDeletes
 	if err != nil {
 		return err
 	}
 
-	if err := s.commitCompactionMinRetainedTS(minTS); err != nil {
+	if err := s.commitCompactionMinRetainedTS(targetMinTS); err != nil {
 		return err
 	}
-	committedDeletes = false
+	retainPending = false
 
 	s.log.InfoContext(ctx, "compact",
-		slog.Uint64("min_ts", minTS),
+		slog.Uint64("min_ts", targetMinTS),
 		slog.Int("updated_keys", stats.updatedKeys),
 		slog.Int("deleted_versions", stats.deletedVersions),
 	)

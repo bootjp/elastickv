@@ -389,6 +389,7 @@ func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t 
 	for ts := uint64(1); ts <= compactionDeleteBatchCountLimit*2+1; ts++ {
 		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
 	}
+	require.Equal(t, compactionDeleteBatchCountLimit*2+1, countPebbleVersions(t, st))
 
 	cancelAfterFirstDeleteFlush := &cancelAfterErrCallsContext{
 		Context:        ctx,
@@ -396,6 +397,7 @@ func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t 
 	}
 	require.ErrorIs(t, st.Compact(cancelAfterFirstDeleteFlush, compactionDeleteBatchCountLimit*3), context.Canceled)
 	require.Equal(t, uint64(0), requirePebbleRetentionController(t, st).MinRetainedTS())
+	require.Equal(t, compactionDeleteBatchCountLimit+1, countPebbleVersions(t, st))
 
 	_, err = st.GetAt(ctx, key, compactionDeleteBatchCountLimit+50)
 	require.ErrorIs(t, err, ErrReadTSCompacted)
@@ -412,6 +414,7 @@ func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t 
 
 	require.NoError(t, reopened.Compact(ctx, compactionDeleteBatchCountLimit*3))
 	require.Equal(t, uint64(compactionDeleteBatchCountLimit*3), requirePebbleRetentionController(t, reopened).MinRetainedTS())
+	require.Equal(t, 1, countPebbleVersions(t, reopened))
 }
 
 func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
