@@ -30,6 +30,7 @@ import (
 type EncryptionAdminServer struct {
 	sidecarPath        string
 	fullNodeID         uint64
+	writerRegistry     encryption.WriterRegistryStore
 	buildSHA           string
 	latestAppliedIndex func() uint64
 	// proposer is the raw raft proposer used for cleartext-only
@@ -179,6 +180,19 @@ func WithEncryptionAdminSidecarPath(path string) EncryptionAdminServerOption {
 func WithEncryptionAdminFullNodeID(id uint64) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.fullNodeID = id
+	}
+}
+
+// WithEncryptionAdminWriterRegistry wires the §4.1 writer-registry
+// store that read-only sidecar recovery RPCs use to project
+// writer_registry_for_caller. A nil argument is a no-op so tests and
+// encryption-disabled nodes keep the pre-Stage-7 empty-map posture.
+func WithEncryptionAdminWriterRegistry(reg encryption.WriterRegistryStore) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if reg == nil {
+			return
+		}
+		s.writerRegistry = reg
 	}
 }
 
@@ -374,10 +388,10 @@ func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*
 // pointers; the wrapped material is leakage-safe because it is
 // KEK-wrapped, which is the same property the on-disk sidecar has.
 //
-// The writer_registry_for_caller map is empty until Stage 7 wires
-// the registry. Callers in the §7.1 cutover path tolerate an empty
-// map because the §5.6 step 1a batch is sourced from the
-// GetCapability fan-out, not from this RPC.
+// When the writer registry is wired, writer_registry_for_caller
+// carries this node's recorded last_seen_local_epoch per sidecar DEK.
+// Unwired tests and encryption-disabled nodes keep the historical
+// empty non-nil map.
 func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) (*pb.SidecarStateReport, error) {
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
@@ -386,6 +400,10 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
+	writerRegistry, err := s.writerRegistryForCaller(sc, s.fullNodeID)
+	if err != nil {
+		return nil, err
+	}
 	resp := &pb.SidecarStateReport{
 		ActiveStorageId:          sc.Active.Storage,
 		ActiveRaftId:             sc.Active.Raft,
@@ -393,7 +411,7 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 		RaftEnvelopeCutoverIndex: sc.RaftEnvelopeCutoverIndex,
 		LatestAppliedIndex:       s.appliedIndex(sc.RaftAppliedIndex),
 		WrappedDeksById:          wrappedDEKMap(sc),
-		WriterRegistryForCaller:  map[uint32]uint32{},
+		WriterRegistryForCaller:  writerRegistry,
 	}
 	return resp, nil
 }
@@ -410,14 +428,6 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // state to a recovering follower and silently overwrite recent
 // rotations.
 func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
-	// req.CallerFullNodeId is intentionally unused for the
-	// recovery payload itself in PR-B; Stage 7 will use it to
-	// scope the writer-registry projection to that specific
-	// caller per §5.5. Recording it here keeps the field on the
-	// hot path so a future leader-side audit log can correlate
-	// resyncs to the requesting member without a wire-format
-	// change.
-	_ = req
 	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
@@ -428,18 +438,60 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
+	var callerFullNodeID uint64
+	if req != nil {
+		callerFullNodeID = req.GetCallerFullNodeId()
+	}
+	writerRegistry, err := s.writerRegistryForCaller(sc, callerFullNodeID)
+	if err != nil {
+		return nil, err
+	}
 	return &pb.ResyncSidecarResponse{
 		WrappedDeksById:          wrappedDEKMap(sc),
 		ActiveStorageId:          sc.Active.Storage,
 		ActiveRaftId:             sc.Active.Raft,
 		LeaderLatestAppliedIndex: s.appliedIndex(sc.RaftAppliedIndex),
-		// §5.5 follower-repair: leader's recorded
-		// last_seen_local_epoch per (dek_id, caller). Stage 7
-		// fills this from the writer registry. PR-A returns an
-		// empty non-nil map because a node recovering before
-		// the registry exists has nothing to re-derive.
-		WriterRegistryForCaller: map[uint32]uint32{},
+		WriterRegistryForCaller:  writerRegistry,
 	}, nil
+}
+
+func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, fullNodeID uint64) (map[uint32]uint32, error) {
+	out := map[uint32]uint32{}
+	if s.writerRegistry == nil {
+		return out, nil
+	}
+	if fullNodeID == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: full_node_id is required to project writer_registry_for_caller")
+	}
+	nodeID16 := encryption.NodeID16(fullNodeID)
+	for idStr := range sc.Keys {
+		dekID, err := parseSidecarKeyID(idStr)
+		if err != nil {
+			return nil, grpcStatusErrorf(codes.Internal,
+				"encryption: sidecar key id %q could not be projected into writer registry: %v", idStr, err)
+		}
+		raw, ok, err := s.writerRegistry.GetRegistryRow(encryption.RegistryKey(dekID, nodeID16))
+		if err != nil {
+			return nil, grpcStatusErrorf(codes.Internal,
+				"encryption: read writer registry row for dek_id=%d full_node_id=%#x: %v", dekID, fullNodeID, err)
+		}
+		if !ok {
+			continue
+		}
+		row, err := encryption.DecodeRegistryValue(raw)
+		if err != nil {
+			return nil, grpcStatusErrorf(codes.Internal,
+				"encryption: decode writer registry row for dek_id=%d full_node_id=%#x: %v", dekID, fullNodeID, err)
+		}
+		if row.FullNodeID != fullNodeID {
+			return nil, grpcStatusErrorf(codes.Internal,
+				"encryption: writer registry node_id collision for dek_id=%d caller_full_node_id=%#x registry_full_node_id=%#x",
+				dekID, fullNodeID, row.FullNodeID)
+		}
+		out[dekID] = uint32(row.LastSeenLocalEpoch)
+	}
+	return out, nil
 }
 
 func (s *EncryptionAdminServer) appliedIndex(sidecarValue uint64) uint64 {

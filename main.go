@@ -1468,6 +1468,7 @@ func buildShardGroups(
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
+		runtime.writerRegistry = reg
 		runtimes = append(runtimes, runtime)
 		// Stage 6E-2c: route every shard group's TransactionManager
 		// through NewLeaderProxyForShardGroup so the proposer chain
@@ -2683,6 +2684,7 @@ func startRaftServers(
 			enableMutators,
 			rt.engine,
 			encryptionCapabilityFanout,
+			adapter.WithEncryptionAdminWriterRegistry(rt.writerRegistry),
 			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
