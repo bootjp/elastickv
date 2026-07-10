@@ -230,6 +230,17 @@ func (r *Registry) S3PutAdmissionObserver() S3PutAdmissionObserver {
 	return r.s3
 }
 
+// S3BlobOffloadObserver returns the S3 blob-offload metrics observer backed by
+// this registry. The offload data path is rollout-gated in the adapter; this
+// observer records both fallback decisions and future chunkblob durability
+// outcomes.
+func (r *Registry) S3BlobOffloadObserver() S3BlobOffloadObserver {
+	if r == nil || r.s3 == nil {
+		return nil
+	}
+	return r.s3
+}
+
 // WriteConflictCollector returns a collector that polls each MVCC
 // store's per-(kind, key_prefix) OCC conflict counters and mirrors
 // them into the elastickv_store_write_conflict_total Prometheus

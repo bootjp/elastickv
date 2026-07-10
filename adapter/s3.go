@@ -113,6 +113,9 @@ type S3Server struct {
 	cleanupSem           chan struct{}
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
+	blobOffloadEnabled   bool
+	blobOffloadChecker   S3BlobOffloadCapabilityChecker
+	blobOffloadObserver  S3BlobOffloadObserver
 }
 
 type s3BucketMeta struct {
@@ -319,14 +322,15 @@ type s3ListPartEntry struct {
 
 func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[string]string, opts ...S3ServerOption) *S3Server {
 	s := &S3Server{
-		listen:       listen,
-		s3Addr:       s3Addr,
-		region:       s3DefaultRegion,
-		store:        st,
-		coordinator:  kv.WithKeyVizLabel(coordinate, keyviz.LabelS3),
-		leaderS3:     cloneLeaderAddrMap(leaderS3),
-		cleanupSem:   make(chan struct{}, s3ManifestCleanupWorkers),
-		putAdmission: newS3PutAdmissionFromEnv(),
+		listen:             listen,
+		s3Addr:             s3Addr,
+		region:             s3DefaultRegion,
+		store:              st,
+		coordinator:        kv.WithKeyVizLabel(coordinate, keyviz.LabelS3),
+		leaderS3:           cloneLeaderAddrMap(leaderS3),
+		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
+		putAdmission:       newS3PutAdmissionFromEnv(),
+		blobOffloadEnabled: newS3BlobOffloadEnabledFromEnv(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -889,6 +893,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
 		return
 	}
+	s.observeS3BlobOffloadDecision(r.Context())
 	part := s3ObjectPart{PartNo: 1}
 	sizeBytes := int64(0)
 	chunkNo := uint64(0)
@@ -1433,6 +1438,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
+	s.observeS3BlobOffloadDecision(r.Context())
 
 	// Pre-allocate the part's commit timestamp before writing any blob chunks so
 	// that the same version identifier is used for every chunk in this attempt.
