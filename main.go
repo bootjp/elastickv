@@ -107,7 +107,7 @@ var (
 	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
-	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
+	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
 	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Issue coordinator-owned persistence timestamps through the local TSO batch allocator instead of direct HLC calls")
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used when --tsoEnabled is true")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")

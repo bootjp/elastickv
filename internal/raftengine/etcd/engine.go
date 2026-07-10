@@ -224,7 +224,7 @@ func uint64Ptr(value uint64) *uint64 {
 
 // JoinRoleViolationCount returns the cumulative count of
 // --raftJoinAsLearner alarms that have fired since process start. See
-// docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+// docs/design/2026_04_26_implemented_raft_learner.md §4.5.
 func JoinRoleViolationCount() uint64 {
 	return joinRoleViolationCount.Load()
 }
@@ -377,7 +377,7 @@ type Engine struct {
 	// quorum-ack hot path. The cache exists to keep
 	// followerQuorumForClusterSize and the singleNodeLeaderAckMonoNs
 	// fast path from inflating the denominator with learners. See
-	// docs/design/2026_04_26_proposed_raft_learner.md §4.6. Rebuilt
+	// docs/design/2026_04_26_implemented_raft_learner.md §4.6. Rebuilt
 	// from scratch on each conf change — never patched — so promotion
 	// of a learner cannot leak a stale isLearnerNode[id]==true entry.
 	voterCount    int
@@ -2265,7 +2265,7 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	}
 	// Reject acks from learners. A learner does not vote and must not
 	// contribute to the voter-majority denominator on the lease-read
-	// fast path. See docs/design/2026_04_26_proposed_raft_learner.md
+	// fast path. See docs/design/2026_04_26_implemented_raft_learner.md
 	// §4.6. Both e.peers and e.isLearnerNode are written from the
 	// apply loop (single writer for both), so reading here under the
 	// run-loop goroutine is race-free for the same reason as e.peers
@@ -2907,7 +2907,7 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 }
 
 // applyConfigChange runs the four-step apply-loop sequence from
-// docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 4:
+// docs/design/2026_04_26_implemented_raft_learner.md §4.2 edit 4:
 //  1. recompute e.voterCount, e.isLearnerNode from confState
 //  2. upsertPeer / removePeer (mutates e.peers; may read e.voterCount)
 //  3. rebuild e.config.Servers via configurationFromConfState(e.peers, confState)
@@ -2936,7 +2936,7 @@ func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confS
 }
 
 // alarmIfJoinedAsVoter implements the operator-alarm semantics from
-// docs/design/2026_04_26_proposed_raft_learner.md §4.5: when the
+// docs/design/2026_04_26_implemented_raft_learner.md §4.5: when the
 // operator passed --raftJoinAsLearner but a post-apply ConfState
 // lists this node as a voter, surface a one-shot ERROR-level
 // structured log and bump a metric. The node continues running --
@@ -2975,7 +2975,7 @@ func nodeInVoters(confState raftpb.ConfState, nodeID uint64) bool {
 // from the post-change ConfState. Called from the apply loop only.
 // The map is rebuilt from scratch — never patched — so promotion of a
 // learner cannot leak a stale isLearnerNode[id]==true entry. See
-// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+// docs/design/2026_04_26_implemented_raft_learner.md §4.6.
 func (e *Engine) refreshVoterCache(confState raftpb.ConfState) {
 	e.mu.Lock()
 	e.voterCount = len(confState.Voters)
@@ -3012,7 +3012,7 @@ func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID 
 	case raftpb.ConfChangeAddLearnerNode:
 		// A learner joins the address cache the same way a voter does;
 		// suffrage is an attribute of ConfState, not of e.peers. See
-		// docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+		// docs/design/2026_04_26_implemented_raft_learner.md §4.2.
 		e.applyAddedPeer(nodeID, peer, ok)
 	}
 }
@@ -3533,7 +3533,7 @@ func (e *Engine) refreshStatus() {
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
 	// not vote and is not part of the lease-read denominator. See
-	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	// docs/design/2026_04_26_implemented_raft_learner.md §4.6.
 	voterCount := e.voterCount
 	e.mu.Unlock()
 
@@ -3881,7 +3881,7 @@ func (e *Engine) shouldCampaignSingleNode() bool {
 	// len(cfg.Servers) includes learners, so the previous check
 	// would skip Campaign() in a 1-voter + N-learner cluster on
 	// restart and incur a full electionTimeout latency for no
-	// reason. See docs/design/2026_04_26_proposed_raft_learner.md
+	// reason. See docs/design/2026_04_26_implemented_raft_learner.md
 	// §4.6 / §3.3 (the audit of len(e.peers) overloads).
 	cfg := e.currentConfiguration()
 	var soleVoter raftengine.Server
@@ -4751,7 +4751,7 @@ func (e *Engine) removePeer(nodeID uint64) {
 	// quorum threshold below uses the voter count, not the address
 	// cache size, because a learner ack must not contribute to the
 	// voter-majority denominator. See
-	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	// docs/design/2026_04_26_implemented_raft_learner.md §4.6.
 	postRemovalVoterCount := e.voterCount
 	e.mu.Unlock()
 

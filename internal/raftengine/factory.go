@@ -23,7 +23,7 @@ type FactoryConfig struct {
 	// The node keeps running -- by the time the conf change has
 	// applied, the node already counts toward quorum and an unilateral
 	// shutdown would shrink the cluster's effective fault tolerance.
-	// See docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+	// See docs/design/2026_04_26_implemented_raft_learner.md §4.5.
 	JoinAsLearner bool
 }
 
