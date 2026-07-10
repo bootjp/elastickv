@@ -2554,7 +2554,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
-	s3Server, err := newS3Server(r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	s3Server, err := newS3Server(
+		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
+		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
+		r.metricsRegistry.S3PutAdmissionObserver(),
+	)
 	if err != nil {
 		return err
 	}
