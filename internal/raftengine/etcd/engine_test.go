@@ -245,6 +245,68 @@ func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
 // the failure mode this guard exists to produce.
 var _ raftengine.Proposer = (*Engine)(nil)
 
+func TestInboundQueueCapacityScalesSmallInflight(t *testing.T) {
+	tests := []struct {
+		name        string
+		peerCount   int
+		maxInflight int
+		want        int
+	}{
+		{
+			name:        "single peer small inflight uses floor",
+			peerCount:   1,
+			maxInflight: 17,
+			want:        minInboundQueueCapacity,
+		},
+		{
+			name:        "multi peer default is memory bounded",
+			peerCount:   5,
+			maxInflight: 256,
+			want:        defaultMaxInflightMsg,
+		},
+		{
+			name:        "production inflight stays at default cap",
+			peerCount:   5,
+			maxInflight: defaultMaxInflightMsg,
+			want:        defaultMaxInflightMsg,
+		},
+		{
+			name:        "explicit large inflight is preserved",
+			peerCount:   5,
+			maxInflight: 2048,
+			want:        2048,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, inboundQueueCapacity(tc.peerCount, tc.maxInflight))
+		})
+	}
+}
+
+func TestOpenConfigMaxInflightSizesInboundQueues(t *testing.T) {
+	fsm := &testStateMachine{}
+	const maxInflight = 17
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:         1,
+		LocalID:        "n1",
+		LocalAddress:   "127.0.0.1:7011",
+		DataDir:        t.TempDir(),
+		Bootstrap:      true,
+		StateMachine:   fsm,
+		MaxInflightMsg: maxInflight,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	require.Equal(t, minInboundQueueCapacity, cap(engine.stepCh))
+	require.Equal(t, minInboundQueueCapacity, cap(engine.dispatchReportCh))
+}
+
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{

@@ -56,6 +56,9 @@ const (
 	// memory remains much lower than that worst-case bound.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
+	// minInboundQueueCapacity keeps very small test/operator inflight limits
+	// from shrinking the shared inbound queue enough to drop heartbeats.
+	minInboundQueueCapacity = 128
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages
@@ -246,7 +249,7 @@ type OpenConfig struct {
 	// per peer before waiting for an acknowledgement (Raft-level flow control).
 	// It also sets the per-peer dispatch channel capacity, so total buffered
 	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
-	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
+	// Default: 1024. Increase for deeper pipelining on high-bandwidth links;
 	// lower in memory-constrained clusters.
 	MaxInflightMsg int
 	// RaftCipher carries the AES-GCM Cipher used by the §4.2 raft
@@ -607,6 +610,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	if prepared.cfg.Transport != nil {
 		dispatchCtx, dispatchCancel = context.WithCancel(context.Background())
 	}
+	inboundQueueCap := inboundQueueCapacity(len(prepared.peers), prepared.cfg.MaxInflightMsg)
 	opened := false
 	defer func() {
 		if opened || dispatchCancel == nil {
@@ -635,8 +639,8 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		proposeCh:        make(chan proposalRequest),
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
-		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
-		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
+		stepCh:           make(chan raftpb.Message, inboundQueueCap),
+		dispatchReportCh: make(chan dispatchReport, inboundQueueCap),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -3983,6 +3987,22 @@ func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 		cfg.MaxSizePerMsg = defaultMaxSizePerMsg
 	}
 	return cfg
+}
+
+func inboundQueueCapacity(peerCount, maxInflight int) int {
+	if maxInflight <= 0 {
+		maxInflight = defaultMaxInflightMsg
+	}
+	if peerCount < 1 {
+		peerCount = 1
+	}
+
+	scaled := defaultMaxInflightMsg
+	if maxInflight <= defaultMaxInflightMsg && peerCount <= defaultMaxInflightMsg/maxInflight {
+		scaled = peerCount * maxInflight
+	}
+	capacity := max(maxInflight, scaled)
+	return max(minInboundQueueCapacity, capacity)
 }
 
 func validateConfig(cfg OpenConfig) error {

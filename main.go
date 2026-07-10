@@ -51,7 +51,7 @@ const (
 	etcdHeartbeatMinTicks = 1
 	etcdElectionMinTicks  = 2
 	etcdMaxSizePerMsg     = 1 << 20
-	etcdMaxInflightMsg    = 256
+	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
 )
 
