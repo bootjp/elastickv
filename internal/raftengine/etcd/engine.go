@@ -4326,6 +4326,12 @@ func (e *Engine) snapshotThreshold() uint64 {
 	return e.snapshotEvery
 }
 
+// SnapshotEvery returns the configured FSM-snapshot trigger threshold for
+// admin/control-plane code that needs to reason about snapshot headroom.
+func (e *Engine) SnapshotEvery() uint64 {
+	return e.snapshotThreshold()
+}
+
 // snapshotEveryFromEnv returns the FSM-snapshot trigger threshold (in applied
 // raft entries past the last snapshot). Operators can override via
 // ELASTICKV_RAFT_SNAPSHOT_COUNT; invalid or missing values fall back to

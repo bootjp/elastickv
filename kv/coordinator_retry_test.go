@@ -40,7 +40,8 @@ func (stubLeaderEngine) Status() raftengine.Status {
 func (stubLeaderEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (stubLeaderEngine) Close() error { return nil }
+func (stubLeaderEngine) SnapshotEvery() uint64 { return 10_000 }
+func (stubLeaderEngine) Close() error          { return nil }
 
 // scriptedTransactional returns the error registered in errs for the
 // 0-indexed call that triggered Commit; calls without a registered

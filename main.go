@@ -1877,7 +1877,7 @@ func configureAdminService(
 		}
 		token = loaded
 	}
-	srv := adapter.NewAdminServer(self, members)
+	srv := adapter.NewAdminServer(self, members, adapter.WithAdminNodeVersion(buildVersion()))
 	unary, stream := adapter.AdminTokenAuth(token)
 	var icept adminGRPCInterceptors
 	if unary != nil {

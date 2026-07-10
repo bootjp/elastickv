@@ -33,7 +33,8 @@ func (f *fakeLeadershipController) Status() raftengine.Status { return raftengin
 func (f *fakeLeadershipController) Configuration(_ context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (f *fakeLeadershipController) Close() error { return nil }
+func (f *fakeLeadershipController) SnapshotEvery() uint64 { return 10_000 }
+func (f *fakeLeadershipController) Close() error          { return nil }
 
 // fakeLeadershipController is a sqsLeadershipController test
 // double. It records TransferLeadership invocations and exposes
