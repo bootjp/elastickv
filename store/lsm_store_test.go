@@ -57,6 +57,23 @@ func requireChannelBlocked[T any](t *testing.T, ch <-chan T, started <-chan stru
 	}
 }
 
+type cancelAfterErrCallsContext struct {
+	context.Context
+	maxNilErrCalls int
+	errCalls       int
+}
+
+func (c *cancelAfterErrCallsContext) Err() error {
+	if err := c.Context.Err(); err != nil {
+		return err
+	}
+	c.errCalls++
+	if c.errCalls > c.maxNilErrCalls {
+		return context.Canceled
+	}
+	return nil
+}
+
 func TestPebbleStore_Basic(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-test")
 	require.NoError(t, err)
@@ -355,6 +372,46 @@ func TestPebbleStore_CompactCanceledDoesNotAdvanceMinRetainedTS(t *testing.T) {
 	val, err = reopened.GetAt(ctx, key, 15)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v10"), val)
+}
+
+func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-compact-partial-cancel-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+
+	key := []byte{0x01}
+	value := []byte("value")
+	for ts := uint64(1); ts <= compactionDeleteBatchCountLimit*2+1; ts++ {
+		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
+	}
+
+	cancelAfterFirstDeleteFlush := &cancelAfterErrCallsContext{
+		Context:        ctx,
+		maxNilErrCalls: compactionDeleteBatchCountLimit + 1,
+	}
+	require.ErrorIs(t, st.Compact(cancelAfterFirstDeleteFlush, compactionDeleteBatchCountLimit*3), context.Canceled)
+	require.Equal(t, uint64(0), requirePebbleRetentionController(t, st).MinRetainedTS())
+
+	_, err = st.GetAt(ctx, key, compactionDeleteBatchCountLimit+50)
+	require.ErrorIs(t, err, ErrReadTSCompacted)
+
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	require.Equal(t, uint64(0), requirePebbleRetentionController(t, reopened).MinRetainedTS())
+	_, err = reopened.GetAt(ctx, key, compactionDeleteBatchCountLimit+50)
+	require.ErrorIs(t, err, ErrReadTSCompacted)
+
+	require.NoError(t, reopened.Compact(ctx, compactionDeleteBatchCountLimit*3))
+	require.Equal(t, uint64(compactionDeleteBatchCountLimit*3), requirePebbleRetentionController(t, reopened).MinRetainedTS())
 }
 
 func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
