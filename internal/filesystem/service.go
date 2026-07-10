@@ -19,24 +19,25 @@ import (
 const (
 	RootInode uint64 = 1
 
-	bytesPerMiB               uint64 = 1 << 20
-	DefaultChunkSize                 = 4 * bytesPerMiB
-	defaultGeneration         uint64 = 1
-	initialEpoch              uint64 = 1
-	directoryInitialNlink     uint32 = 2
-	fileInitialNlink          uint32 = 1
-	rootParentInode           uint64 = RootInode
-	randomRetryLimit                 = 16
-	randomUint64Bytes                = 8
-	keyValuePairArity                = 2
-	maxReadSize                      = 64 * bytesPerMiB
-	maxScanPageSize                  = 1024
-	defaultOpenHandleLeaseTTL        = 5 * time.Minute
-	defaultLeaseReaperLimit          = 256
-	statFSScanPageSize               = 512
-	chunkDeleteTxnPageSize           = 512
-	openRefScanLimit                 = 2
-	openTxnRetryLimit                = 4
+	bytesPerMiB                     uint64 = 1 << 20
+	DefaultChunkSize                       = 4 * bytesPerMiB
+	defaultGeneration               uint64 = 1
+	initialEpoch                    uint64 = 1
+	directoryInitialNlink           uint32 = 2
+	fileInitialNlink                uint32 = 1
+	rootParentInode                 uint64 = RootInode
+	randomRetryLimit                       = 16
+	randomUint64Bytes                      = 8
+	keyValuePairArity                      = 2
+	maxReadSize                            = 64 * bytesPerMiB
+	maxScanPageSize                        = 1024
+	defaultOpenHandleLeaseTTL              = 5 * time.Minute
+	defaultLeaseReaperLimit                = 256
+	statFSScanPageSize                     = 512
+	chunkDeleteTxnPageSize                 = 512
+	chunkDeleteWriteConflictRetries        = 8
+	openRefScanLimit                       = 2
+	openTxnRetryLimit                      = 4
 )
 
 var (
@@ -1735,13 +1736,22 @@ func (s *Service) deleteChunkPages(ctx context.Context, plan *chunkDeletePlan) e
 		return nil
 	}
 	start := append([]byte(nil), plan.start...)
+	writeConflictRetries := 0
 	for {
-		next, done, err := s.deleteChunkPage(ctx, plan, start)
+		next, done, writeConflict, err := s.deleteChunkPage(ctx, plan, start)
 		if err != nil {
 			return err
 		}
 		if done {
 			return nil
+		}
+		if writeConflict {
+			writeConflictRetries++
+			if writeConflictRetries >= chunkDeleteWriteConflictRetries {
+				return errors.Wrap(store.ErrWriteConflict, "filesystem chunk delete retry limit reached")
+			}
+		} else {
+			writeConflictRetries = 0
 		}
 		start = next
 	}
@@ -1786,38 +1796,38 @@ func (s *Service) cleanupNonShrinkingSizeChange(
 	return refreshedTS, refreshedMeta, true, nil
 }
 
-func (s *Service) deleteChunkPage(ctx context.Context, plan *chunkDeletePlan, start []byte) ([]byte, bool, error) {
+func (s *Service) deleteChunkPage(ctx context.Context, plan *chunkDeletePlan, start []byte) ([]byte, bool, bool, error) {
 	ts, err := s.readTS(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	readKeys, adjustedStart, err := s.chunkDeletePlanReadKeys(ctx, plan, ts, start)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	page, err := s.scanExistingChunkPage(ctx, plan.homeSlot, plan.inode, ts, adjustedStart, chunkDeleteTxnPageSize+1)
 	if err != nil {
-		return nil, false, errors.Wrap(err, "filesystem scan chunk delete page")
+		return nil, false, false, errors.Wrap(err, "filesystem scan chunk delete page")
 	}
 	if len(page) == 0 {
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 	page, nextPlan := splitChunkDeletePage(page, *plan)
 	elems, pageReads, delta := chunkDeleteTxnParts(page, readKeys)
 	elems, pageReads, err = s.appendUsageUpdate(ctx, ts, elems, pageReads, delta)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, pageReads); err != nil {
 		if errors.Is(err, store.ErrWriteConflict) {
-			return adjustedStart, false, nil
+			return adjustedStart, false, true, nil
 		}
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if nextPlan == nil {
-		return nil, true, nil
+		return nil, true, false, nil
 	}
-	return nextPlan.start, false, nil
+	return nextPlan.start, false, false, nil
 }
 
 func (s *Service) chunkDeletePlanReadKeys(
