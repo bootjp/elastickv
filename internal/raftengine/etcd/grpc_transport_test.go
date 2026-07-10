@@ -907,6 +907,57 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 	require.Zero(t, client.sendStreamCalls.Load())
 }
 
+func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
+	t.Setenv(sendStreamEnabledEnvVar, "false")
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(4),
+		Index: uint64Ptr(22),
+	}))
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Zero(t, client.sendStreamCalls.Load())
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestSetSendStreamEnabledClosesCachedStreams(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(4),
+		Index: uint64Ptr(22),
+	}))
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.True(t, streamCached)
+
+	transport.SetSendStreamEnabled(false)
+
+	transport.mu.RLock()
+	_, streamCached = transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
 func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T) {
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
