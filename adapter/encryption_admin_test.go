@@ -192,6 +192,26 @@ func TestEncryptionAdmin_GetSidecarState_ProjectsWriterRegistryForLocalNode(t *t
 	}
 }
 
+func TestEncryptionAdmin_GetSidecarState_RejectsMissingLocalNodeIDAsInternal(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
+		Keys: map[string]encryption.SidecarKey{
+			"1": {Purpose: "storage", Wrapped: []byte("wrapped-1")},
+			"2": {Purpose: "raft", Wrapped: []byte("wrapped-2")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminWriterRegistry(newTestWriterRegistry()),
+	)
+
+	_, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("GetSidecarState status=%v, want Internal for missing local full node id (err=%v)", status.Code(err), err)
+	}
+}
+
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {
 	t.Helper()
 	if got.ActiveStorageId != 1 || got.ActiveRaftId != 2 {
@@ -314,6 +334,27 @@ func TestEncryptionAdmin_ResyncSidecar_ProjectsWriterRegistryForCaller(t *testin
 	want := map[uint32]uint32{3: 6, 4: 8}
 	if fmt.Sprint(got.WriterRegistryForCaller) != fmt.Sprint(want) {
 		t.Fatalf("WriterRegistryForCaller=%v, want %v", got.WriterRegistryForCaller, want)
+	}
+}
+
+func TestEncryptionAdmin_ResyncSidecar_RejectsMissingCallerNodeIDAsInvalidArgument(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminWriterRegistry(newTestWriterRegistry()),
+	)
+
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("ResyncSidecar status=%v, want InvalidArgument for missing caller full node id (err=%v)", status.Code(err), err)
 	}
 }
 
