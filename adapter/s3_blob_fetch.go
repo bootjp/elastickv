@@ -147,7 +147,7 @@ func (s *s3ChunkBlobReceiveState) finish() ([s3ChunkBlobSHA256Bytes]byte, []byte
 	if !s.seenEOF {
 		return s.digest, nil, s3BlobFetchStatus(codes.InvalidArgument, "missing s3 chunkblob eof")
 	}
-	return s.digest, bytes.Clone(s.payload.Bytes()), nil
+	return s.digest, s.payload.Bytes(), nil
 }
 
 func (s *s3ChunkBlobReceiveState) apply(req *pb.PushChunkBlobRequest) error {
