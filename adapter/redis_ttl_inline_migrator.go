@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -148,7 +149,7 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 			if err != nil {
 				return nil, err
 			}
-			if ttlMs == 0 {
+			if ttlMs == 0 && isLegacySimpleMeta(pair.Value) {
 				ttlMs, err = legacyTTLMillisAt(ctx, c.st, userKey, readTS)
 				if err != nil {
 					return nil, err
@@ -329,8 +330,10 @@ func (c *DeltaCompactor) legacyCollectionTTLInlineElems(
 	readTS uint64,
 ) ([]*kv.Elem[kv.OP], error) {
 	switch typ {
-	case redisTypeNone, redisTypeString, redisTypeList, redisTypeStream:
+	case redisTypeNone, redisTypeString, redisTypeList:
 		return nil, nil
+	case redisTypeStream:
+		return c.legacyStreamTTLInlineElems(ctx, userKey, ttlMs, readTS)
 	case redisTypeHash:
 		return c.legacyHashTTLInlineElems(ctx, userKey, ttlMs, readTS)
 	case redisTypeSet:
@@ -441,6 +444,57 @@ func (c *DeltaCompactor) legacyZSetTTLInlineElems(ctx context.Context, userKey [
 	return elems, nil
 }
 
+func (c *DeltaCompactor) legacyStreamTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := c.st.GetAt(ctx, redisStreamKey(userKey), readTS)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	value, err := unmarshalStreamValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(value.Entries) > maxWideColumnItems {
+		return nil, errors.Wrapf(ErrCollectionTooLarge, "legacy stream entry count exceeds %d", maxWideColumnItems)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)+setWideColOverhead)
+	var last redisStreamID
+	for _, entry := range value.Entries {
+		parsed, ok := tryParseRedisStreamID(entry.ID)
+		if !ok {
+			return nil, errors.WithStack(fmt.Errorf("invalid legacy stream ID %q", entry.ID))
+		}
+		if compareStreamIDs(parsed.ms, parsed.seq, last.ms, last.seq) > 0 {
+			last = parsed
+		}
+		entryValue, err := marshalStreamEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.StreamEntryKey(userKey, parsed.ms, parsed.seq),
+			Value: entryValue,
+		})
+	}
+	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
+		Length:   int64(len(value.Entries)),
+		LastMs:   last.ms,
+		LastSeq:  last.seq,
+		ExpireAt: ttlMs,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(userKey)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(userKey), Value: metaBytes},
+	)
+	return elems, nil
+}
+
 func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	if isListMetaMigrationDelta(pair) {
 		return nil, nil
@@ -453,7 +507,7 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if meta.ExpireAt == 0 {
+	if meta.ExpireAt == 0 && isLegacyWideMeta(pair.Value) {
 		legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
 		if err != nil {
 			return nil, err
@@ -484,7 +538,7 @@ func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if meta.ExpireAt == 0 {
+	if meta.ExpireAt == 0 && isLegacyWideMeta(pair.Value) {
 		legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
 		if err != nil {
 			return nil, err
@@ -497,6 +551,14 @@ func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *
 	}
 	elems := putIfChanged(pair.Key, pair.Value, desired)
 	return appendTTLIndexSyncElem(ctx, c.st, elems, userKey, meta.ExpireAt, readTS)
+}
+
+func isLegacySimpleMeta(raw []byte) bool {
+	return len(raw) == redisSimpleMetaLegacySizeBytes
+}
+
+func isLegacyWideMeta(raw []byte) bool {
+	return len(raw) == redisWideMetaLegacySizeBytes
 }
 
 func legacyTTLMillisAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, error) {

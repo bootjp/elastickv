@@ -227,15 +227,17 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+	typ, err := r.streamTypeForXAdd(ctx, key, readTS)
 	if err != nil {
 		return "", err
 	}
-	if typ != redisTypeNone && typ != redisTypeStream {
-		return "", wrongTypeError()
-	}
 
 	legacyCleanup, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
+	if err != nil {
+		return "", err
+	}
+	legacyCleanup, meta, metaFound, err = r.streamCleanupForExpiredRecreate(
+		ctx, key, readTS, typ, legacyCleanup, meta, metaFound)
 	if err != nil {
 		return "", err
 	}
@@ -254,10 +256,10 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		return "", err
 	}
 
-	// Capacity hint covers: optional legacy-cleanup Del + one entry Put +
-	// one meta Put + the trim Dels. legacyCleanup is at most one element,
-	// and only non-empty on the very first write against a stream whose
-	// pre-migration blob is still on disk.
+	// Capacity hint covers: stream cleanup Dels + one entry Put + one meta
+	// Put + the trim Dels. Cleanup is usually at most one legacy Del, but can
+	// include existing wide-column stream rows when XADD recreates an expired
+	// stream before the sweeper has physically removed it.
 	const xaddFixedElemCount = 2
 	elems := make([]*kv.Elem[kv.OP], 0,
 		len(legacyCleanup)+xaddFixedElemCount+estimateXAddTrimCount(req.maxLen, meta.Length))
@@ -287,6 +289,29 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
 	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+}
+
+func redisTTLMillisExpired(ttlMs uint64) bool {
+	return ttlMs != 0 && !redisTimeFromMillis(ttlMs).After(time.Now())
+}
+
+func (r *RedisServer) streamCleanupForExpiredRecreate(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	typ redisValueType,
+	cleanup []*kv.Elem[kv.OP],
+	meta store.StreamMeta,
+	metaFound bool,
+) ([]*kv.Elem[kv.OP], store.StreamMeta, bool, error) {
+	if typ != redisTypeNone || !metaFound || !redisTTLMillisExpired(meta.ExpireAt) {
+		return cleanup, meta, metaFound, nil
+	}
+	cleanup, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, store.StreamMeta{}, false, err
+	}
+	return cleanup, store.StreamMeta{}, false, nil
 }
 
 // dispatchAndSignalStream dispatches the elems through the coordinator
@@ -584,6 +609,21 @@ func (r *RedisServer) streamTypeForWrite(ctx context.Context, key []byte, readTS
 		return false, wrongTypeError()
 	default:
 		return false, wrongTypeError()
+	}
+}
+
+func (r *RedisServer) streamTypeForXAdd(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	switch typ {
+	case redisTypeNone, redisTypeStream:
+		return typ, nil
+	case redisTypeString, redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet:
+		return typ, wrongTypeError()
+	default:
+		return typ, wrongTypeError()
 	}
 }
 

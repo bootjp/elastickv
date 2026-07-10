@@ -700,6 +700,46 @@ func TestRedis_StreamMultiExecDelRemovesWideColumnLayout(t *testing.T) {
 	require.Len(t, entries, 1)
 }
 
+func TestRedis_StreamXAddRecreatesExpiredStreamWithoutStaleEntriesOrTTL(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	key := "stream-expired-xadd"
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1700000000000-0",
+		Values: []string{"old", "value"},
+	}).Result()
+	require.NoError(t, err)
+	require.NoError(t, rdb.PExpire(ctx, key, time.Millisecond).Err())
+	require.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, key).Result()
+		return err == nil && exists == 0
+	}, time.Second, 10*time.Millisecond)
+
+	id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1800000000000-0",
+		Values: []string{"fresh", "value"},
+	}).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1800000000000-0", id)
+
+	ttl, err := rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+	entries, err := rdb.XRange(ctx, key, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "1800000000000-0", entries[0].ID)
+	require.Equal(t, "value", entries[0].Values["fresh"])
+}
+
 // nowNanos returns the current UnixNano timestamp as uint64, failing the
 // test if the reading is non-positive. Centralising the bounds check here
 // keeps the int64->uint64 conversion safe and the individual test sites

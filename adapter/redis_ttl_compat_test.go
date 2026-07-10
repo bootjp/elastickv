@@ -389,7 +389,7 @@ func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
 	require.ErrorContains(t, err, "WRONGTYPE")
 	count, err := rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Int64()
 	require.NoError(t, err)
-	require.Equal(t, int64(1), count)
+	require.Equal(t, int64(0), count)
 }
 
 func TestRedis_MultiExec_IncrRecreatesExpiredStringWithoutTTLIndex(t *testing.T) {

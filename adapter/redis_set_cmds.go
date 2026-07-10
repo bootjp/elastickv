@@ -68,21 +68,6 @@ func (r *RedisServer) hllAnchorExistsAt(ctx context.Context, key []byte, readTS 
 	return exists, nil
 }
 
-func (r *RedisServer) loadHLLPayloadAt(ctx context.Context, key []byte, readTS uint64) (redisSetValue, bool, error) {
-	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
-	if err != nil {
-		if cockerrors.Is(err, store.ErrKeyNotFound) {
-			return redisSetValue{}, false, nil
-		}
-		return redisSetValue{}, false, cockerrors.WithStack(err)
-	}
-	value, _, _, err := decodeRedisHLL(raw)
-	if err != nil {
-		return redisSetValue{}, true, err
-	}
-	return value, true, nil
-}
-
 // buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
 // !redis|set| blob to wide-column !st|mem| keys. Returns nil if no legacy
 // blob exists.
@@ -744,18 +729,19 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 			writeRedisError(conn, err)
 			return
 		}
-		if typ != redisTypeNone {
-			hllExists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
-			if err != nil {
-				writeRedisError(conn, err)
-				return
-			}
-			if !hllExists {
-				conn.WriteError(wrongTypeMessage)
-				return
-			}
+		hllExists, err := r.hllExistsAt(key, readTS)
+		if err != nil {
+			writeRedisError(conn, err)
+			return
 		}
-		value, _, err := r.loadHLLPayloadAt(ctx, key, readTS)
+		if typ != redisTypeNone && !hllExists {
+			conn.WriteError(wrongTypeMessage)
+			return
+		}
+		if !hllExists {
+			continue
+		}
+		value, err := r.loadSetAt(ctx, hllKind, key, readTS)
 		if err != nil {
 			writeRedisError(conn, err)
 			return
