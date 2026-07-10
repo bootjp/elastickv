@@ -144,12 +144,30 @@ func ChunkScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
 	}
 	routeEnd, ok := chunkScanBound(end)
 	if !ok {
+		if bytes.Compare(start, end) < 0 {
+			if routeEnd := carriedChunkScanRouteEnd(routeStart, end); routeEnd != nil {
+				return routeStart, routeEnd, true
+			}
+		}
 		return nil, nil, false
 	}
 	if bytes.Equal(routeStart, routeEnd) && bytes.Compare(start, end) < 0 {
 		return routeStart, prefixEnd(routeStart), true
 	}
 	return routeStart, routeEnd, true
+}
+
+func carriedChunkScanRouteEnd(routeStart []byte, end []byte) []byte {
+	if len(routeStart) != chunkRouteKeyBytes {
+		return nil
+	}
+	rawPrefix := make([]byte, 0, len(chunkPrefixBytes)+2*u64Bytes)
+	rawPrefix = append(rawPrefix, chunkPrefixBytes...)
+	rawPrefix = append(rawPrefix, routeStart[len(chunkRoutePrefixBytes):]...)
+	if !bytes.Equal(end, prefixEnd(rawPrefix)) {
+		return nil
+	}
+	return prefixEnd(routeStart)
 }
 
 func chunkScanBound(key []byte) ([]byte, bool) {

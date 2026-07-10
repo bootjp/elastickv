@@ -810,7 +810,7 @@ func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) 
 	require.NoError(t, err)
 	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
 	require.NoError(t, err)
-	forceInodeSizeForTest(t, ctx, svc, file.Inode, 0)
+	forceInodeSizeZeroForTest(t, ctx, svc, file.Inode)
 
 	inner, ok := svc.dispatch.(*testCoordinator)
 	require.True(t, ok)
@@ -868,7 +868,7 @@ func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {
 	require.NoError(t, err)
 	_, err = svc.Write(ctx, file.Inode, 0, 0, bytes.Repeat([]byte{'x'}, int(3*testChunkSize)))
 	require.NoError(t, err)
-	forceInodeSizeForTest(t, ctx, svc, file.Inode, 0)
+	forceInodeSizeZeroForTest(t, ctx, svc, file.Inode)
 
 	stats, err := svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
@@ -893,7 +893,7 @@ func TestServiceTruncateGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
 	require.NoError(t, err)
 	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("stale-data"))
 	require.NoError(t, err)
-	forceInodeSizeForTest(t, ctx, svc, file.Inode, 0)
+	forceInodeSizeZeroForTest(t, ctx, svc, file.Inode)
 
 	require.NoError(t, svc.Truncate(ctx, file.Inode, 8))
 	got, err := svc.Read(ctx, file.Inode, 0, 0, 8)
@@ -902,6 +902,27 @@ func TestServiceTruncateGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
 	stats, err := svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+}
+
+func TestServiceWriteGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("stale-data"))
+	require.NoError(t, err)
+	forceInodeSizeZeroForTest(t, ctx, svc, file.Inode)
+
+	_, err = svc.Write(ctx, file.Inode, 0, 6, []byte("Z"))
+	require.NoError(t, err)
+	got, err := svc.Read(ctx, file.Inode, 0, 0, 7)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 'Z'}, got)
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, stats.Capacity-stats.Free)
 }
 
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
@@ -956,12 +977,12 @@ func cloneKeys(in [][]byte) [][]byte {
 	return out
 }
 
-func forceInodeSizeForTest(t *testing.T, ctx context.Context, svc *Service, inode uint64, size uint64) {
+func forceInodeSizeZeroForTest(t *testing.T, ctx context.Context, svc *Service, inode uint64) {
 	t.Helper()
 	ts := svc.store.LastCommitTS()
 	meta, err := svc.inodeAt(ctx, inode, ts)
 	require.NoError(t, err)
-	meta.Size = size
+	meta.Size = 0
 	elem, err := putElem(fskeys.InodeKey(inode), meta)
 	require.NoError(t, err)
 	require.NoError(t, svc.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{elem}, [][]byte{fskeys.InodeKey(inode)}))

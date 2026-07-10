@@ -609,6 +609,12 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 	if meta.Type == TypeDirectory {
 		return 0, ErrIsDir
 	}
+	if end > meta.Size {
+		ts, meta, _, err = s.cleanupNonShrinkingSizeChange(ctx, inode, end, meta, ts)
+		if err != nil {
+			return 0, err
+		}
+	}
 	chunkSize := meta.effectiveChunkSize(s.chunkSize)
 	first := offset / chunkSize
 	last := (end - 1) / chunkSize
