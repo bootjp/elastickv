@@ -10,7 +10,7 @@ import (
 )
 
 // SQS keyspace prefixes. Kept in sync with the naming in
-// docs/design/2026_04_24_partial_sqs_compatible_adapter.md.
+// docs/design/2026_04_24_implemented_sqs_compatible_adapter.md.
 const (
 	// SqsQueueMetaPrefix prefixes queue-metadata records.
 	SqsQueueMetaPrefix = "!sqs|queue|meta|"

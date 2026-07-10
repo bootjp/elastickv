@@ -15,7 +15,8 @@ const (
 	peersFileName       = "etcd-raft-peers.bin"
 	peersFileVersionV1  = uint32(1)
 	peersFileVersionV2  = uint32(2) // adds per-peer suffrage byte
-	peersFileVersion    = peersFileVersionV2
+	peersFileVersionV3  = uint32(3) // adds bootstrap seed + active marker
+	peersFileVersion    = peersFileVersionV3
 	maxPersistedPeers   = uint32(1 << 10)
 	maxPersistedPeerStr = uint32(1 << 20)
 )
@@ -29,8 +30,10 @@ const (
 var peersFileMagic = [4]byte{'E', 'K', 'V', 'P'}
 
 type persistedPeers struct {
-	Index uint64
-	Peers []Peer
+	Index               uint64
+	Peers               []Peer
+	BootstrapSeed       []Peer
+	BootstrapSeedActive bool
 }
 
 func peersFilePath(dataDir string) string {
@@ -57,6 +60,10 @@ func loadPersistedPeersState(dataDir string) (persistedPeers, bool, error) {
 }
 
 func savePersistedPeers(dataDir string, index uint64, peers []Peer) error {
+	return savePersistedPeersWithBootstrapSeed(dataDir, index, peers, nil)
+}
+
+func savePersistedPeersWithBootstrapSeed(dataDir string, index uint64, peers []Peer, bootstrapSeed []Peer) error {
 	current, ok, err := loadPersistedPeersState(dataDir)
 	if err != nil {
 		return err
@@ -64,18 +71,49 @@ func savePersistedPeers(dataDir string, index uint64, peers []Peer) error {
 	if ok && current.Index > index {
 		return nil
 	}
-	return writeCurrentPersistedPeers(dataDir, index, peers)
-}
-
-func writeCurrentPersistedPeers(dataDir string, index uint64, peers []Peer) error {
 	normalized, err := normalizePersistedPeers(peers)
 	if err != nil {
 		return err
 	}
-	return writePersistedPeersFile(peersFilePath(dataDir), persistedPeers{
+	state := persistedPeers{
 		Index: index,
 		Peers: normalized,
-	})
+	}
+	if ok {
+		state.BootstrapSeed = current.BootstrapSeed
+		state.BootstrapSeedActive = current.BootstrapSeedActive
+		if state.BootstrapSeedActive && !samePeerList(state.Peers, state.BootstrapSeed) {
+			state.BootstrapSeedActive = false
+		}
+	} else if len(bootstrapSeed) > 0 {
+		normalizedSeed, err := normalizePersistedPeers(bootstrapSeed)
+		if err != nil {
+			return err
+		}
+		state.BootstrapSeed = normalizedSeed
+		state.BootstrapSeedActive = true
+	}
+	return writePersistedPeersFile(peersFilePath(dataDir), state)
+}
+
+func writeCurrentPersistedPeers(dataDir string, index uint64, peers []Peer) error {
+	current, ok, err := loadPersistedPeersState(dataDir)
+	if err != nil {
+		return err
+	}
+	normalized, err := normalizePersistedPeers(peers)
+	if err != nil {
+		return err
+	}
+	state := persistedPeers{
+		Index: index,
+		Peers: normalized,
+	}
+	if ok {
+		state.BootstrapSeed = current.BootstrapSeed
+		state.BootstrapSeedActive = false
+	}
+	return writePersistedPeersFile(peersFilePath(dataDir), state)
 }
 
 func normalizePersistedPeers(peers []Peer) ([]Peer, error) {
@@ -117,23 +155,39 @@ func readPersistedPeersFile(path string) (persistedPeers, error) {
 	if err != nil {
 		return persistedPeers{}, err
 	}
-	count, err := readU32(reader)
+	peers, err := readPersistedPeerList(reader, version, "persisted peer")
 	if err != nil {
 		return persistedPeers{}, err
 	}
-	if count > maxPersistedPeers {
-		return persistedPeers{}, errors.WithStack(errors.Newf("persisted peer count %d exceeds limit %d", count, maxPersistedPeers))
+	state := persistedPeers{Index: index, Peers: peers}
+	if version >= peersFileVersionV3 {
+		active, seed, err := readPersistedBootstrapSeed(reader)
+		if err != nil {
+			return persistedPeers{}, err
+		}
+		state.BootstrapSeedActive = active
+		state.BootstrapSeed = seed
 	}
+	return state, nil
+}
 
+func readPersistedPeerList(reader io.Reader, version uint32, kind string) ([]Peer, error) {
+	count, err := readU32(reader)
+	if err != nil {
+		return nil, err
+	}
+	if count > maxPersistedPeers {
+		return nil, errors.WithStack(errors.Newf("%s count %d exceeds limit %d", kind, count, maxPersistedPeers))
+	}
 	peers := make([]Peer, 0, count)
 	for range count {
 		peer, err := readPersistedPeer(reader, version)
 		if err != nil {
-			return persistedPeers{}, err
+			return nil, err
 		}
 		peers = append(peers, peer)
 	}
-	return persistedPeers{Index: index, Peers: peers}, nil
+	return peers, nil
 }
 
 // readPeersFileHeader validates the magic and returns the file's
@@ -155,7 +209,7 @@ func readPeersFileHeader(r io.Reader) (uint32, error) {
 		return 0, err
 	}
 	switch version {
-	case peersFileVersionV1, peersFileVersionV2:
+	case peersFileVersionV1, peersFileVersionV2, peersFileVersionV3:
 		return version, nil
 	default:
 		return 0, errors.WithStack(errors.Newf("unsupported etcd raft peers version %d", version))
@@ -223,11 +277,58 @@ func writePersistedPeersFile(path string, state persistedPeers) error {
 				return err
 			}
 		}
+		if err := writePersistedBootstrapSeed(writer, state); err != nil {
+			return err
+		}
 		if err := writer.Flush(); err != nil {
 			return errors.WithStack(err)
 		}
 		return nil
 	})
+}
+
+func readPersistedBootstrapSeed(reader io.Reader) (bool, []Peer, error) {
+	activeRaw, err := readU8(reader)
+	if err != nil {
+		return false, nil, err
+	}
+	var active bool
+	switch activeRaw {
+	case 0:
+		active = false
+	case 1:
+		active = true
+	default:
+		return false, nil, errors.WithStack(errors.Newf("unknown bootstrap seed active byte %d", activeRaw))
+	}
+	seed, err := readPersistedPeerList(reader, peersFileVersionV3, "persisted bootstrap seed")
+	if err != nil {
+		return false, nil, err
+	}
+	return active, seed, nil
+}
+
+func writePersistedBootstrapSeed(w io.Writer, state persistedPeers) error {
+	active := uint8(0)
+	if state.BootstrapSeedActive {
+		active = 1
+	}
+	if err := writeU8(w, active); err != nil {
+		return err
+	}
+	count, err := uint32Len(len(state.BootstrapSeed))
+	if err != nil {
+		return err
+	}
+	if err := writeU32(w, count); err != nil {
+		return err
+	}
+	for _, peer := range state.BootstrapSeed {
+		if err := writePersistedPeerEntry(w, peer); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writePersistedPeerEntry(w io.Writer, peer Peer) error {

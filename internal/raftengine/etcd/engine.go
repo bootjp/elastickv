@@ -56,6 +56,19 @@ const (
 	// memory remains much lower than that worst-case bound.
 	defaultMaxInflightMsg = 1024
 	defaultMaxSizePerMsg  = 1 << 20
+	// minInboundQueueCapacity keeps very small test/operator inflight limits
+	// from shrinking the shared inbound queue enough to drop heartbeats.
+	minInboundQueueCapacity = 128
+	// priorityStepQueueCapacity is the inbound control-plane queue size.
+	// Heartbeats, votes, read-index responses, and timeout-now messages are
+	// tiny but time-sensitive; keeping them off the bulk stepCh prevents a
+	// MsgApp burst from forcing followers into avoidable elections.
+	priorityStepQueueCapacity = 1024
+	// priorityStepBurstLimit bounds consecutive non-blocking priority drains
+	// so a sustained control-message stream cannot starve Tick, proposals, or
+	// admin work. The next event goes through the blocking select, where Tick
+	// competes fairly with priority and bulk steps.
+	priorityStepBurstLimit = 64
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages
@@ -223,12 +236,13 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID       uint64
-	LocalID      string
-	LocalAddress string
-	DataDir      string
-	Peers        []Peer
-	Bootstrap    bool
+	NodeID        uint64
+	LocalID       string
+	LocalAddress  string
+	DataDir       string
+	Peers         []Peer
+	BootstrapSeed []Peer
+	Bootstrap     bool
 	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
 	// engine watches every post-apply ConfState and emits an
 	// ERROR-level alarm whenever the local node is in Voters while
@@ -245,7 +259,7 @@ type OpenConfig struct {
 	// per peer before waiting for an acknowledgement (Raft-level flow control).
 	// It also sets the per-peer dispatch channel capacity, so total buffered
 	// memory is bounded by O(numPeers * MaxInflightMsg * avgMsgSize).
-	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
+	// Default: 1024. Increase for deeper pipelining on high-bandwidth links;
 	// lower in memory-constrained clusters.
 	MaxInflightMsg int
 	// RaftCipher carries the AES-GCM Cipher used by the §4.2 raft
@@ -305,13 +319,15 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh        chan proposalRequest
-	readCh           chan readRequest
-	adminCh          chan adminRequest
-	stepCh           chan raftpb.Message
-	dispatchReportCh chan dispatchReport
-	peerDispatchers  map[uint64]*peerQueues
-	perPeerQueueSize int
+	proposeCh         chan proposalRequest
+	readCh            chan readRequest
+	adminCh           chan adminRequest
+	stepCh            chan raftpb.Message
+	priorityStepCh    chan raftpb.Message
+	priorityStepBurst int
+	dispatchReportCh  chan dispatchReport
+	peerDispatchers   map[uint64]*peerQueues
+	perPeerQueueSize  int
 	// dispatcherLanesEnabled toggles the 4-lane dispatcher layout. Captured
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
@@ -402,7 +418,7 @@ type Engine struct {
 	dispatchErrorByCode   map[string]uint64
 	// stepQueueFullCount tracks the number of inbound raft messages
 	// (from remote peers and local handlers) that were dropped because
-	// stepCh was full. Surfaced to Prometheus as
+	// the selected inbound step queue was full. Surfaced to Prometheus as
 	// elastickv_raft_step_queue_full_total so operators can correlate
 	// seek-storm goroutine spikes with raft backpressure.
 	stepQueueFullCount atomic.Uint64
@@ -606,6 +622,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	if prepared.cfg.Transport != nil {
 		dispatchCtx, dispatchCancel = context.WithCancel(context.Background())
 	}
+	inboundQueueCap := inboundQueueCapacity(len(prepared.peers), prepared.cfg.MaxInflightMsg)
 	opened := false
 	defer func() {
 		if opened || dispatchCancel == nil {
@@ -634,8 +651,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		proposeCh:        make(chan proposalRequest),
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
-		stepCh:           make(chan raftpb.Message, defaultMaxInflightMsg),
-		dispatchReportCh: make(chan dispatchReport, defaultMaxInflightMsg),
+		stepCh:           make(chan raftpb.Message, inboundQueueCap),
+		priorityStepCh:   make(chan raftpb.Message, priorityStepQueueCapacity),
+		dispatchReportCh: make(chan dispatchReport, inboundQueueCap),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
@@ -736,7 +754,12 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 	// a peers file that contradicts the snapshot's ConfState.Learners
 	// and validateConfState would reject the cluster on next open.
 	annotatePeerSuffrageInSlice(peers, confStateValue(disk.LocalSnap.GetMetadata().GetConfState()))
-	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
+	if err := savePersistedPeersWithBootstrapSeed(
+		cfg.DataDir,
+		maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index),
+		peers,
+		cfg.BootstrapSeed,
+	); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
 	}
@@ -1169,10 +1192,11 @@ func (e *Engine) recordDispatchErrorCode(code string) uint64 {
 }
 
 // StepQueueFullCount returns the total number of inbound raft messages
-// that could not be enqueued into stepCh because the channel was at
-// capacity. This is the "etcd raft inbound step queue is full" signal
-// from the task description: a spike indicates the local raft loop
-// is starved, usually by something blocking the apply path such as
+// that could not be enqueued into the selected inbound step queue
+// because the channel was at capacity. This is the "etcd raft inbound
+// step queue is full" signal from the task description: a spike
+// indicates the local raft loop is starved, usually by something
+// blocking the apply path such as
 // the pre-#560 rawKeyTypeAt seek storm.
 func (e *Engine) StepQueueFullCount() uint64 {
 	if e == nil {
@@ -1702,6 +1726,27 @@ func (e *Engine) startup() error {
 }
 
 func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
+	if e.isClosing() {
+		return false, nil
+	}
+
+	if e.tryHandlePriorityStep() {
+		return true, nil
+	}
+
+	return e.handleBlockingEvent(tick)
+}
+
+func (e *Engine) isClosing() bool {
+	select {
+	case <-e.closeCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) {
 	select {
 	case <-e.closeCh:
 		return false, nil
@@ -1713,16 +1758,47 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleRead(req)
 	case req := <-e.adminCh:
 		e.handleAdmin(req)
+	case msg := <-e.priorityStepCh:
+		e.handleStep(msg)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
 	case report := <-e.dispatchReportCh:
 		e.handleDispatchReport(report)
 	case result := <-e.snapshotResCh:
-		if err := e.handleSnapshotResult(result); err != nil {
-			return false, err
-		}
+		return e.handleSnapshotResultEvent(result)
 	}
 	return true, nil
+}
+
+func (e *Engine) handleSnapshotResultEvent(result snapshotResult) (bool, error) {
+	if err := e.handleSnapshotResult(result); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (e *Engine) tryHandlePriorityStep() bool {
+	if e.priorityStepBurst >= priorityStepBurstLimit {
+		e.priorityStepBurst = 0
+		return false
+	}
+	msg, ok := e.tryReceivePriorityStep()
+	if !ok {
+		e.priorityStepBurst = 0
+		return false
+	}
+	e.priorityStepBurst++
+	e.handleStep(msg)
+	return true
+}
+
+func (e *Engine) tryReceivePriorityStep() (raftpb.Message, bool) {
+	select {
+	case msg := <-e.priorityStepCh:
+		return msg, true
+	default:
+		return raftpb.Message{}, false
+	}
 }
 
 // dispatchReport is posted by the dispatch workers when a transport send
@@ -3870,6 +3946,9 @@ func normalizeOpenConfig(cfg OpenConfig) (OpenConfig, persistedPeers, bool, erro
 	if err != nil {
 		return OpenConfig{}, persistedPeers{}, false, err
 	}
+	if err := validateBootstrapSeed(peers, ok, cfg.BootstrapSeed); err != nil {
+		return OpenConfig{}, persistedPeers{}, false, err
+	}
 	if ok {
 		cfg.Peers = peers.Peers
 	}
@@ -3877,6 +3956,34 @@ func normalizeOpenConfig(cfg OpenConfig) (OpenConfig, persistedPeers, bool, erro
 	cfg = normalizeTimingConfig(cfg)
 	cfg = normalizeLimitConfig(cfg)
 	return cfg, peers, ok, nil
+}
+
+func validateBootstrapSeed(persisted persistedPeers, persistedOK bool, configured []Peer) error {
+	if !persistedOK || !persisted.BootstrapSeedActive || len(configured) == 0 {
+		return nil
+	}
+	normalizedConfigured, err := normalizePersistedPeers(configured)
+	if err != nil {
+		return err
+	}
+	if samePeerList(normalizedConfigured, persisted.BootstrapSeed) {
+		return nil
+	}
+	return errors.Wrapf(errClusterMismatch,
+		"bootstrap seed differs from persisted seed: configured=%v persisted=%v",
+		normalizedConfigured, persisted.BootstrapSeed)
+}
+
+func samePeerList(a, b []Peer) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOpenPeers(snapshot raftpb.Snapshot, peers []Peer, persisted persistedPeers, persistedOK bool) error {
@@ -3946,6 +4053,22 @@ func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 		cfg.MaxSizePerMsg = defaultMaxSizePerMsg
 	}
 	return cfg
+}
+
+func inboundQueueCapacity(peerCount, maxInflight int) int {
+	if maxInflight <= 0 {
+		maxInflight = defaultMaxInflightMsg
+	}
+	if peerCount < 1 {
+		peerCount = 1
+	}
+
+	scaled := defaultMaxInflightMsg
+	if maxInflight <= defaultMaxInflightMsg && peerCount <= defaultMaxInflightMsg/maxInflight {
+		scaled = peerCount * maxInflight
+	}
+	capacity := max(maxInflight, scaled)
+	return max(minInboundQueueCapacity, capacity)
 }
 
 func validateConfig(cfg OpenConfig) error {
@@ -4082,12 +4205,17 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
+	ch := e.stepCh
+	if isPriorityMsg(msg.GetType()) && e.priorityStepCh != nil {
+		ch = e.priorityStepCh
+	}
+
 	select {
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())
 	case <-e.doneCh:
 		return e.currentErrorOrClosed()
-	case e.stepCh <- msg:
+	case ch <- msg:
 		return nil
 	default:
 		e.stepQueueFullCount.Add(1)

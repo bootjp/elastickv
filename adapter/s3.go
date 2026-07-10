@@ -572,7 +572,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -596,7 +596,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		commitTS, err := s.nextTxnCommitTS(startTS)
+		commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -651,7 +651,7 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -799,7 +799,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -843,7 +843,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 //nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(r.Context(), readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -984,7 +984,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	part.ETag = etag
 	part.SizeBytes = sizeBytes
 	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 	if err != nil {
 		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
 		writeS3InternalError(w, err)
@@ -1228,7 +1228,7 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -1298,12 +1298,12 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	}
 
 	uploadID := newS3UploadID(s.clock())
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(r.Context(), readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1397,12 +1397,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	// different keys, leaving the chunk data referenced by an in-progress
 	// CompleteMultipartUpload untouched.
 	partReadTS := s.readTS()
-	partStartTS, err := s.txnStartTS(partReadTS)
+	partStartTS, err := s.txnStartTS(r.Context(), partReadTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	partCommitTS, err := s.nextTxnCommitTS(partStartTS)
+	partCommitTS, err := s.nextTxnCommitTS(r.Context(), partStartTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1680,7 +1680,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 
 	err = s.retryS3Mutation(r.Context(), func() error {
 		retryReadTS := s.readTS()
-		startTS, err := s.txnStartTS(retryReadTS)
+		startTS, err := s.txnStartTS(r.Context(), retryReadTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
 		}
@@ -1725,7 +1725,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return errors.WithStack(err)
 		}
 
-		commitTS, err := s.nextTxnCommitTS(startTS)
+		commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1792,7 +1792,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -2853,23 +2853,19 @@ func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 
 // txnStartTS returns the read/start timestamp for an S3 transaction.
 // When the caller passes the sentinel ^uint64(0) ("server, please
-// allocate"), the timestamp is drawn from the HLC via NextFenced —
-// the HLC-4 (iii) physical-ceiling fence applies here because the
-// returned value is persistence-grade (it pins MVCC reads and is the
-// startTS half of a 2PC commit). Returning ErrCeilingExpired here lets
-// the SigV4 handler surface the failure as an S3 5xx instead of
-// silently issuing a stale-leader timestamp.
-func (s *S3Server) txnStartTS(readTS uint64) (uint64, error) {
+// allocate"), the timestamp is drawn through the coordinator timestamp source.
+// TSO-enabled deployments use the allocator path; the legacy fallback still
+// applies the HLC-4 (iii) physical-ceiling fence because the returned value is
+// persistence-grade (it pins MVCC reads and is the startTS half of a 2PC
+// commit). Returning ErrCeilingExpired here lets the SigV4 handler surface the
+// failure as an S3 5xx instead of silently issuing a stale-leader timestamp.
+func (s *S3Server) txnStartTS(ctx context.Context, readTS uint64) (uint64, error) {
 	if readTS != ^uint64(0) {
 		return readTS, nil
 	}
-	clock := s.clock()
-	if clock == nil {
-		return 1, nil
-	}
-	ts, err := clock.NextFenced()
+	ts, err := kv.NextTimestampThrough(ctx, s.coordinator, "s3: allocate txn startTS")
 	if err != nil {
-		return 0, errors.Wrap(err, "s3: allocate txn startTS")
+		return 0, errors.WithStack(err)
 	}
 	return ts, nil
 }
@@ -2899,21 +2895,10 @@ func (s *S3Server) effectiveRegion() string {
 	return s.region
 }
 
-func (s *S3Server) nextTxnCommitTS(startTS uint64) (uint64, error) {
-	clock := s.clock()
-	if clock == nil {
-		if startTS == ^uint64(0) {
-			return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
-		}
-		return startTS + 1, nil
-	}
-	clock.Observe(startTS)
-	commitTS, err := clock.NextFenced()
+func (s *S3Server) nextTxnCommitTS(ctx context.Context, startTS uint64) (uint64, error) {
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, s.coordinator, startTS, "s3: allocate txn commitTS")
 	if err != nil {
-		return 0, errors.Wrap(err, "s3: allocate txn commitTS")
-	}
-	if commitTS <= startTS {
-		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
+		return 0, errors.WithStack(err)
 	}
 	return commitTS, nil
 }

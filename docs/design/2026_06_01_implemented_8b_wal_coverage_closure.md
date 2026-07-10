@@ -2,10 +2,11 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed (closure-style) |
+| Status | implemented (closure analysis; no code changes required) |
 | Date | 2026-06-01 |
+| Implemented | 2026-07-07 status audit; closure decision documented in this file |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.2 raft envelope, §4.3 etcd raft WAL files, §4.6 cleartext residuals) |
-| Related slices | Stage 6E (raft envelope cutover) — open; Stage 8a (snapshot header v2) — shipped |
+| Related slices | Stage 6E (raft envelope cutover) — open; Stage 8a (snapshot header v2) — implemented in [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) |
 | Sibling status | This is the closure analysis for the "WAL coverage" half of the parent's Stage 8 row. **No implementation work follows.** |
 
 ## 0. Why this slice exists
@@ -164,13 +165,13 @@ Either path puts §6's architectural concerns back in scope (block-boundary alig
 
 ## 7. Closure: Stage 8 row update
 
-After this doc lands, the parent design's Stage 8 row should read:
+After this doc lands, the parent design's Stage 8 row reads:
 
-> | 8 | Snapshot header v2 (§4.4) | **shipped** (#886 + 8a closure doc) |
+> | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | **shipped** |
 
 with a footnote pointing to this Stage 8b closure for the WAL-coverage half. The previous "Snapshot header v2 + WAL coverage" framing is replaced by:
 
-- 8a — snapshot header v2 — **shipped via #886**.
+- 8a — snapshot header v2 — **implemented**.
 - 8b — WAL coverage — **decided in §4.3, formally closed by this doc; no implementation work**.
 
 The parent doc's stage table can be updated in the same PR that lands this closure, or in a follow-up; mechanical edit, not architectural.
