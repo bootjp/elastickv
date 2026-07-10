@@ -354,7 +354,12 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 	defer cancel()
 	go func() { _ = c.Run(runCtx) }()
 
-	// Wait until the base meta holds the accumulated total.
+	prefix := store.HashMetaDeltaScanPrefix(userKey)
+	end := store.PrefixScanEnd(prefix)
+
+	// Wait until the base meta holds the accumulated total and the consumed
+	// delta keys are gone, so slow race-enabled CI has one explicit completion
+	// condition for the whole urgent pagination loop.
 	// The pagination loop should take two passes: first 1025, then 9.
 	require.Eventually(t, func() bool {
 		readTS := st.LastCommitTS()
@@ -363,13 +368,15 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 			return false
 		}
 		got, err := store.UnmarshalHashMeta(raw)
-		return err == nil && got.Len == int64(totalDeltasU64)
+		if err != nil || got.Len != int64(totalDeltasU64) {
+			return false
+		}
+		remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
+		return err == nil && len(remaining) == 0
 	}, 5*time.Second, 20*time.Millisecond, "all %d delta keys should be compacted into base meta", totalDeltasU64)
 
 	// No delta keys should remain after pagination compaction.
 	readTS := st.LastCommitTS()
-	prefix := store.HashMetaDeltaScanPrefix(userKey)
-	end := store.PrefixScanEnd(prefix)
 	remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all delta keys must be deleted after urgent compaction")

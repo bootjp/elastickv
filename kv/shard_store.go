@@ -17,6 +17,7 @@ import (
 )
 
 const proxyForwardTimeout = 5 * time.Second
+const minRoutesForDedup = 2
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -238,7 +239,7 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
 	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
-		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
+		return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), false
 	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
@@ -259,6 +260,22 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	}
 
 	return routes, true
+}
+
+func dedupeRoutesByGroup(routes []distribution.Route) []distribution.Route {
+	if len(routes) < minRoutesForDedup {
+		return routes
+	}
+	seen := make(map[uint64]struct{}, len(routes))
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if _, ok := seen[route.GroupID]; ok {
+			continue
+		}
+		seen[route.GroupID] = struct{}{}
+		out = append(out, route)
+	}
+	return out
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {

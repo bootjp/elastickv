@@ -205,6 +205,42 @@ func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_DeduplicatesFilesystemChunkRoutesByGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeStart := fskeys.ChunkRouteKey(home, inode)
+	routeEnd := prefixScanEnd(routeStart)
+	routeSplit := append(append([]byte(nil), routeStart...), 0x80)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeStart, 1)
+	engine.UpdateRoute(routeStart, routeSplit, 2)
+	engine.UpdateRoute(routeSplit, routeEnd, 2)
+	engine.UpdateRoute(routeEnd, nil, 3)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		3: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	k0 := fskeys.ChunkKey(home, inode, 0)
+	k1 := fskeys.ChunkKey(home, inode, 1)
+	require.NoError(t, st.PutAt(ctx, k0, []byte("c0"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, k1, []byte("c1"), 2, 0))
+
+	start := fskeys.ChunkPrefix(home, inode)
+	kvs, err := st.ScanAt(ctx, start, prefixScanEnd(start), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, k0, kvs[0].Key)
+	require.Equal(t, k1, kvs[1].Key)
+}
+
 // TestShardStoreReverseScanAt_DescendingOrderAcrossShards verifies that
 // ReverseScanAt with a nil start (clampToRoutes=false) merges results from all
 // shards and returns them in descending key order.

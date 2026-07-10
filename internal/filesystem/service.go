@@ -388,21 +388,16 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 	var delta usageDelta
 	var chunkDeletes *chunkDeletePlan
 	if mask.Size {
-		if meta.Type == TypeDirectory {
-			return Stat{}, ErrIsDir
+		var sizeElems []*kv.Elem[kv.OP]
+		var sizeReads [][]byte
+		var sizeDelta usageDelta
+		ts, meta, sizeElems, sizeReads, sizeDelta, chunkDeletes, oldSize, err = s.setAttrSizeTxnParts(ctx, inode, attrs.Size, ts, meta)
+		if err != nil {
+			return Stat{}, err
 		}
-		chunkSize := meta.effectiveChunkSize(s.chunkSize)
-		if attrs.Size < meta.Size {
-			truncateElems, truncateReads, truncateDelta, plan, err := s.truncateChunkElems(ctx, meta, ts, attrs.Size, chunkSize)
-			if err != nil {
-				return Stat{}, err
-			}
-			elems = append(elems, truncateElems...)
-			readKeys = append(readKeys, truncateReads...)
-			delta = delta.merge(truncateDelta)
-			chunkDeletes = plan
-		}
-		meta.Size = attrs.Size
+		elems = append(elems, sizeElems...)
+		readKeys = append(readKeys, sizeReads...)
+		delta = delta.merge(sizeDelta)
 	}
 	now := s.now().UnixNano()
 	if mask.Mode {
@@ -439,6 +434,41 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		return Stat{}, err
 	}
 	return meta.Stat(), nil
+}
+
+func (s *Service) setAttrSizeTxnParts(
+	ctx context.Context,
+	inode uint64,
+	size uint64,
+	ts uint64,
+	meta *InodeMeta,
+) (uint64, *InodeMeta, []*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, uint64, error) {
+	if meta.Type == TypeDirectory {
+		return 0, nil, nil, nil, usageDelta{}, nil, 0, ErrIsDir
+	}
+	oldSize := meta.Size
+	var err error
+	var refreshed bool
+	ts, meta, refreshed, err = s.cleanupNonShrinkingSizeChange(ctx, inode, size, meta, ts)
+	if err != nil {
+		return 0, nil, nil, nil, usageDelta{}, nil, 0, err
+	}
+	if refreshed {
+		oldSize = meta.Size
+	}
+	chunkSize := meta.effectiveChunkSize(s.chunkSize)
+	var elems []*kv.Elem[kv.OP]
+	var readKeys [][]byte
+	var delta usageDelta
+	var chunkDeletes *chunkDeletePlan
+	if size < meta.Size {
+		elems, readKeys, delta, chunkDeletes, err = s.truncateChunkElems(ctx, meta, ts, size, chunkSize)
+		if err != nil {
+			return 0, nil, nil, nil, usageDelta{}, nil, 0, err
+		}
+	}
+	meta.Size = size
+	return ts, meta, elems, readKeys, delta, chunkDeletes, oldSize, nil
 }
 
 func (s *Service) Create(ctx context.Context, parent uint64, name []byte, opts CreateOptions) (CreateResult, error) {
@@ -680,6 +710,10 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	if meta.Type == TypeDirectory {
 		return ErrIsDir
 	}
+	ts, meta, _, err = s.cleanupNonShrinkingSizeChange(ctx, inode, size, meta, ts)
+	if err != nil {
+		return err
+	}
 	chunkSize := meta.effectiveChunkSize(s.chunkSize)
 	elems := make([]*kv.Elem[kv.OP], 0)
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
@@ -763,10 +797,6 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	if err != nil {
 		return err
 	}
-	putParent, err := putElem(fskeys.InodeKey(oldParent), parentMeta)
-	if err != nil {
-		return err
-	}
 	putVersion, err := putElem(fskeys.DirVersionKey(oldParent), unixNsecVersion(now))
 	if err != nil {
 		return err
@@ -774,7 +804,6 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: fskeys.DirEntryKey(oldParent, oldName)},
 		putNew,
-		putParent,
 		putVersion,
 	}
 	readKeys := [][]byte{
@@ -784,16 +813,19 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	}
 	var delta usageDelta
 	var chunkDeletes *chunkDeletePlan
-	if replacedMeta != nil {
-		replacedElems, replacedReads, replacedDelta, plan, err := s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
-		if err != nil {
-			return err
-		}
-		elems = append(elems, replacedElems...)
-		readKeys = append(readKeys, replacedReads...)
-		delta = delta.merge(replacedDelta)
-		chunkDeletes = plan
+	replacedElems, replacedReads, replacedDelta, plan, err := s.renameTargetTxnParts(ctx, ts, parentMeta, replacedMeta, now)
+	if err != nil {
+		return err
 	}
+	elems = append(elems, replacedElems...)
+	readKeys = append(readKeys, replacedReads...)
+	delta = delta.merge(replacedDelta)
+	chunkDeletes = plan
+	putParent, err := putElem(fskeys.InodeKey(oldParent), parentMeta)
+	if err != nil {
+		return err
+	}
+	elems = append(elems, putParent)
 	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
 	if err != nil {
 		return err
@@ -802,6 +834,47 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 		return err
 	}
 	return s.deleteChunkPages(ctx, chunkDeletes)
+}
+
+func (s *Service) renameTargetTxnParts(
+	ctx context.Context,
+	ts uint64,
+	parentMeta *InodeMeta,
+	replacedMeta *InodeMeta,
+	now int64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
+	if replacedMeta == nil {
+		return nil, nil, usageDelta{}, nil, nil
+	}
+	if replacedMeta.Type == TypeDirectory {
+		elems, reads, delta, err := s.rmdirTargetTxnParts(ctx, ts, parentMeta, replacedMeta)
+		return elems, reads, delta, nil, err
+	}
+	return s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
+}
+
+func (s *Service) rmdirTargetTxnParts(
+	ctx context.Context,
+	ts uint64,
+	parentMeta *InodeMeta,
+	meta *InodeMeta,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+	if err := s.ensureDirectoryEmpty(ctx, meta.Inode, ts); err != nil {
+		return nil, nil, usageDelta{}, err
+	}
+	if parentMeta.Nlink > fileInitialNlink {
+		parentMeta.Nlink--
+	}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: fskeys.InodeKey(meta.Inode)},
+		{Op: kv.Del, Key: fskeys.HomeKey(meta.Inode)},
+		{Op: kv.Del, Key: fskeys.DirVersionKey(meta.Inode)},
+	}
+	readKeys := [][]byte{
+		fskeys.HomeKey(meta.Inode),
+		fskeys.DirVersionKey(meta.Inode),
+	}
+	return elems, readKeys, usageDelta{filesSub: 1}, nil
 }
 
 func (s *Service) renameReplacedFileMeta(
@@ -1674,6 +1747,45 @@ func (s *Service) deleteChunkPages(ctx context.Context, plan *chunkDeletePlan) e
 	}
 }
 
+func (s *Service) deleteChunksPastCurrentEOF(ctx context.Context, meta *InodeMeta) error {
+	chunkSize := meta.effectiveChunkSize(s.chunkSize)
+	start := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, firstChunkIndexPastSize(meta.Size, chunkSize))
+	return s.deleteChunkPages(ctx, &chunkDeletePlan{
+		homeSlot:        meta.HomeSlot,
+		inode:           meta.Inode,
+		chunkSize:       chunkSize,
+		start:           start,
+		protectLiveSize: true,
+	})
+}
+
+func (s *Service) cleanupNonShrinkingSizeChange(
+	ctx context.Context,
+	inode uint64,
+	size uint64,
+	meta *InodeMeta,
+	ts uint64,
+) (uint64, *InodeMeta, bool, error) {
+	if size < meta.Size {
+		return ts, meta, false, nil
+	}
+	if err := s.deleteChunksPastCurrentEOF(ctx, meta); err != nil {
+		return 0, nil, false, err
+	}
+	refreshedTS, err := s.readTS(ctx)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	refreshedMeta, err := s.inodeAt(ctx, inode, refreshedTS)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if refreshedMeta.Type == TypeDirectory {
+		return 0, nil, false, ErrIsDir
+	}
+	return refreshedTS, refreshedMeta, true, nil
+}
+
 func (s *Service) deleteChunkPage(ctx context.Context, plan *chunkDeletePlan, start []byte) ([]byte, bool, error) {
 	ts, err := s.readTS(ctx)
 	if err != nil {
@@ -1930,8 +2042,9 @@ func (s *Service) openHandleExpiresNsec(now time.Time) int64 {
 
 func (s *Service) readTS(ctx context.Context) (uint64, error) {
 	if reader, ok := s.dispatch.(linearizableReader); ok {
-		ts, err := reader.LinearizableRead(ctx)
-		return ts, errors.Wrap(err, "filesystem linearizable read")
+		if _, err := reader.LinearizableRead(ctx); err != nil {
+			return 0, errors.Wrap(err, "filesystem linearizable read")
+		}
 	}
 	return s.store.LastCommitTS(), nil
 }
