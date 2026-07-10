@@ -287,7 +287,7 @@ func (r *RedisServer) listMetaExpireScanErr(
 	if exists {
 		return listMetaTTLUpdateElem(key, meta, expireAtMs)
 	}
-	return nil, true, nil
+	return nil, false, ErrDeltaScanTruncated
 }
 
 func listMetaWithDeltas(meta store.ListMeta, deltas []*store.KVPair) (store.ListMeta, error) {
@@ -373,7 +373,7 @@ func (r *RedisServer) simpleMetaExpireScanErr(
 	if exists {
 		return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(baseLen, expireAtMs)}}, true, nil
 	}
-	return nil, false, nil
+	return nil, false, ErrDeltaScanTruncated
 }
 
 func simpleMetaLenWithDeltas(

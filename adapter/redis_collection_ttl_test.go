@@ -434,6 +434,12 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 		deltaValue []byte
 	}{
 		{
+			name:       "list",
+			typ:        redisTypeList,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.ListMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}),
+		},
+		{
 			name:       "hash",
 			typ:        redisTypeHash,
 			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
@@ -467,7 +473,7 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 			}
 
 			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
-			require.NoError(t, err)
+			require.ErrorIs(t, err, ErrDeltaScanTruncated)
 			require.False(t, applied)
 			_, err = st.GetAt(ctx, redisTTLKey(key), st.LastCommitTS())
 			require.ErrorIs(t, err, store.ErrKeyNotFound)

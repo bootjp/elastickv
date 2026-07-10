@@ -785,6 +785,7 @@ func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
 		ttl:   cloneTimePtr(ttl),
 	}
 	delete(t.deletedKeys, k)
+	delete(t.collectionExpireTypes, k)
 }
 
 func (t *txnContext) updateStringReplacementTTL(key []byte, ttl *time.Time) bool {
@@ -1739,6 +1740,10 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 func (t *txnContext) skipWorkingKeyForReplacement(storageKey []byte) bool {
 	if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
 		userKey := storageKey[len(redisStrPrefix):]
+		return t.hasReplacement(userKey)
+	}
+	if bytes.HasPrefix(storageKey, []byte(redisHLLPrefix)) {
+		userKey := storageKey[len(redisHLLPrefix):]
 		return t.hasReplacement(userKey)
 	}
 	return t.hasReplacement(storageKey)

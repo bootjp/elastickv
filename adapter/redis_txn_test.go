@@ -51,6 +51,15 @@ func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 	return false
 }
 
+func requireNoPutElemByKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) {
+	t.Helper()
+	for _, elem := range elems {
+		if elem != nil && elem.Op == kv.Put && string(elem.Key) == string(want) {
+			t.Fatalf("unexpected put elem key %q", string(want))
+		}
+	}
+}
+
 func requireElemByKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) *kv.Elem[kv.OP] {
 	t.Helper()
 	var found *kv.Elem[kv.OP]
@@ -878,6 +887,62 @@ func TestRedisTxnSetClearsOldTTLBeforeExpireNX(t *testing.T) {
 	elems, err := txn.buildReplacementElems(ctx)
 	require.NoError(t, err)
 	requireTTLNear(t, requireElemByKey(t, elems, redisTTLKey(key)).Value, wantExpire)
+}
+
+func TestRedisTxnSetAfterCollectionExpireSkipsInlineTTLRebuild(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-after-collection-expire")
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("v"), redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdExpire), key, []byte("20")}}, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), expireRes.integer)
+	require.Contains(t, txn.collectionExpireTypes, string(key))
+
+	setRes, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("replacement")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", setRes.str)
+	require.NotContains(t, txn.collectionExpireTypes, string(key))
+
+	replacementElems, err := txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+	strElem := requireElemByKey(t, replacementElems, redisStrKey(key))
+	value, _, err := decodeRedisStr(strElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, []byte("replacement"), value)
+
+	collectionTTLElems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+	require.NoError(t, err)
+	require.Empty(t, collectionTTLElems)
+	require.Empty(t, skipTTLIndex)
+	requireNoPutElemByKey(t, append(replacementElems, collectionTTLElems...), store.HashMetaKey(key))
+}
+
+func TestRedisTxnSetAfterHLLExpireSkipsDirtyHLLAnchor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-after-hll-expire")
+	payload, err := encodeRedisHLL(redisSetValue{Members: []string{"a"}}, nil)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("1000")}}, time.Millisecond)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), expireRes.integer)
+	require.True(t, elemKeysContain(txn.buildKeyElems(), redisHLLKey(key)))
+
+	setRes, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("replacement")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", setRes.str)
+	require.False(t, elemKeysContain(txn.buildKeyElems(), redisHLLKey(key)))
 }
 
 func TestRedisTxnStagedStringWinsOverDeletionOnlyCollectionStates(t *testing.T) {
