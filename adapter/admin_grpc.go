@@ -562,6 +562,7 @@ func (s *AdminServer) reserveLeaderVersionProbe(key string, now time.Time) (stri
 func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address string) {
 	probe := s.leaderVersionProbe
 	timeout := s.leaderVersionProbeTimeout
+	now := s.now
 	var md metadata.MD
 	if incoming, ok := metadata.FromIncomingContext(ctx); ok {
 		md = incoming.Copy()
@@ -576,7 +577,7 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address 
 		if err != nil {
 			version = ""
 		}
-		s.versionCache.Store(key, versionCacheEntry{version: version, fetchedAt: time.Now()})
+		s.versionCache.Store(key, versionCacheEntry{version: version, fetchedAt: now()})
 	}()
 }
 

@@ -197,6 +197,55 @@ func TestGetRaftGroupsLeaderVersionAsync(t *testing.T) {
 	}
 }
 
+func TestGetRaftGroupsLeaderVersionProbeUsesServerClockForCacheStamp(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1_700_000_000, 0)
+	var clockMu sync.Mutex
+	now := base
+	setNow := func(next time.Time) {
+		clockMu.Lock()
+		now = next
+		clockMu.Unlock()
+	}
+	var callsMu sync.Mutex
+	calls := 0
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		nil,
+		WithAdminLeaderVersionProbeTimeout(time.Second),
+		WithAdminLeaderVersionCacheTTL(time.Second),
+		WithAdminLeaderVersionProbe(func(context.Context, string) (string, error) {
+			callsMu.Lock()
+			defer callsMu.Unlock()
+			calls++
+			if calls == 1 {
+				return "v1", nil
+			}
+			return "v2", nil
+		}),
+	)
+	srv.SetClock(func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	})
+	srv.RegisterGroup(1, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.12:50051"})
+
+	_, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatalf("GetRaftGroups first: %v", err)
+	}
+	waitForLeaderVersion(t, srv, "v1")
+
+	setNow(base.Add(2 * time.Second))
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatalf("GetRaftGroups after TTL: %v", err)
+	}
+	requireLeaderVersion(t, resp, "", "expired")
+	waitForLeaderVersion(t, srv, "v2")
+}
+
 func requireLeaderVersion(t *testing.T, resp *pb.GetRaftGroupsResponse, want, label string) {
 	t.Helper()
 	if len(resp.Groups) != 1 {
