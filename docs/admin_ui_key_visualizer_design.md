@@ -76,7 +76,10 @@ The admin binary holds no authoritative state. All data is fetched on demand fro
 - Release cadence for the UI is decoupled from the data plane.
 - The admin binary can be placed on an operator workstation or a sidecar pod, so a compromised UI does not imply a compromised data node.
 - Node binaries remain free of the Prometheus client (goal §2.1-6) and of any SPA assets.
-- `cmd/elastickv-admin --nodes=host:50051 --nodeTokenFile=/etc/elastickv/admin.token` is the full invocation; no multi-file config bundle is required for the default use case.
+- For the original standalone overview path,
+  `cmd/elastickv-admin --nodes=host:50051 --nodeTokenFile=/etc/elastickv/admin.token`
+  remains the full invocation; KeyViz Phase 2-C fan-out uses the
+  embedded HTTP handler described in §9.1 instead.
 
 ## 4. API Surface
 
@@ -276,9 +279,21 @@ Phases 0–2 require no Raft or FSM changes. Data-plane protocol adapters only r
 
 ## 9. Deployment and Operation
 
-- The admin binary is not intended to be exposed on the public network in its initial form. Default bind is `127.0.0.1:8080`; browser login and RBAC are deferred, but node-side `Admin` gRPC calls require the shared read-only token from §4.
-- Typical operator workflow: `ssh -L 8080:localhost:8080 operator@host` then `elastickv-admin --nodes=host1:50051,host2:50051,host3:50051 --nodeTokenFile=/etc/elastickv/admin.token`, or run the binary on a laptop and point it at any reachable subset of nodes.
-- The admin binary is stateless; it can be killed and restarted without coordination.
+- The original standalone admin binary remains a local control-plane
+  overview tool, but it is not the shipped KeyViz fan-out surface. The
+  implemented KeyViz SPA and Phase 2-C fan-out are served by each
+  `elastickv` server's embedded admin HTTP handler.
+- Typical Phase 2-C operator workflow: enable the embedded admin handler
+  on every node with shared admin login prerequisites, set
+  `--keyvizEnabled`, and configure the same static
+  `--keyvizFanoutNodes` HTTP endpoint list on every node. Operators may
+  still use SSH port forwarding for private access, but the browser logs
+  into a server admin endpoint rather than into
+  `cmd/elastickv-admin --nodes`.
+- The embedded fan-out path is stateless outside the node-local sampler
+  buffers; restarting one node degrades that node's recent local samples
+  until traffic repopulates them, while other nodes continue to answer
+  peer requests.
 - CI produces release artifacts for `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`.
 
 ### 9.1 Cluster-wide fan-out
@@ -298,7 +313,10 @@ Because writes are recorded by Raft leaders and follower-local reads are recorde
 - The flush goroutine performs in-place `atomic.SwapUint64` per tracked counter; there is no write lock covering `Observe` calls and no retired pointers for late writers to hit. Splits and merges publish a copied immutable route table with child counters before publishing the new `RouteID` (§5.4), so the callback does not race with the hot path.
 - API endpoints cap `to − from` at 7 days and `rows` at 1024 to bound server work.
 - `LiveSummary` adds a second atomic increment alongside each existing Prometheus `Inc()`, plus one atomic increment on a fixed-bucket histogram counter. Cost is on the order of a nanosecond and well below the noise floor in §5.2.
-- Fan-out cost (§9.1) is N parallel gRPC calls; each node serves only its locally observed samples, so the response size is distributed and the aggregate wall-clock is bounded by the slowest node, not the sum.
+- Fan-out cost (§9.1) is N parallel admin HTTP peer requests; each node
+  serves only its locally observed samples, so the response size is
+  distributed and the aggregate wall-clock is bounded by the slowest
+  node, not the sum.
 
 ## 11. Testing
 

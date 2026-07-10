@@ -100,6 +100,7 @@ elastickv \
   --adminListen 10.0.0.1:8080 \
   --s3CredentialsFile=/etc/elastickv/admin-s3-creds.json \
   --adminSessionSigningKeyFile=/etc/elastickv/admin-hs256.b64 \
+  --adminFullAccessKeys=AKIA_ADMIN \
   --adminAllowPlaintextNonLoopback \
   --adminAllowInsecureDevCookie \
   --keyvizEnabled \
@@ -114,7 +115,11 @@ the HTTP admin handler is not mounted. The normal admin prerequisites
 also still apply: `--s3CredentialsFile` must point at the login
 credential map, and all nodes must share the same 64-byte
 `--adminSessionSigningKey` through the flag, file, or environment
-variable form. Non-loopback plaintext requires the explicit
+variable form. At least one role allow-list must also name an access key
+from that shared credentials file, for example
+`--adminFullAccessKeys=AKIA_ADMIN` or `--adminReadOnlyAccessKeys=...`;
+otherwise login succeeds at SigV4 verification but is rejected as not
+authorised for admin access. Non-loopback plaintext requires the explicit
 `--adminAllowPlaintextNonLoopback` opt-in shown above. A working
 plaintext browser rig also requires `--adminAllowInsecureDevCookie`,
 because `--adminAllowPlaintextNonLoopback` only permits the listener
@@ -149,13 +154,16 @@ rollouts should use admin TLS and omit both plaintext escape hatches.
   interpreted as `http://host:port`. Deployments that enable admin TLS
   must use explicit `https://host:port` entries:
   `--keyvizFanoutNodes=https://node1.internal:8443,https://node2.internal:8443`.
-  The URL builder preserves explicit schemes, so TLS fan-out does not
-  require a separate scheme flag. The Phase 2-C implementation uses the
-  default Go `http.Client`; HTTPS peer certificates must already chain
-  to the process or container trust roots. Private-CA or self-signed
-  admin certificates therefore need that CA installed in the trust
-  store before fan-out is enabled, otherwise peer calls fail
-  certificate verification and the cluster view is degraded.
+  Full URL entries must be bare `scheme://host:port` values with no
+  path, query, or trailing slash; self filtering compares the stripped
+  `host:port` form and treats anything else as a peer. The URL builder
+  preserves explicit schemes, so TLS fan-out does not require a separate
+  scheme flag. The Phase 2-C implementation uses the default Go
+  `http.Client`; HTTPS peer certificates must already chain to the
+  process or container trust roots. Private-CA or self-signed admin
+  certificates therefore need that CA installed in the trust store before
+  fan-out is enabled, otherwise peer calls fail certificate verification
+  and the cluster view is degraded.
 - **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
   the inbound user's cookies (`admin_session` + `admin_csrf` only)
   on every peer call. The peer's `SessionAuth` middleware verifies
