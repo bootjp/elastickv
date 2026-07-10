@@ -596,9 +596,10 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		return 0, err
 	}
 
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zaddTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "zaddTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 
 	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
@@ -694,9 +695,10 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	}
 
 	memberKey := store.ZSetMemberKey(key, []byte(member))
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zincrbyTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "zincrbyTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 
 	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
@@ -843,9 +845,10 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 		}
 		elems, lenDelta := buildZSetWideElems(key, st)
 		if lenDelta != 0 {
-			commitTS, err := r.coordinator.Clock().NextFenced()
+			startTS := normalizeStartTS(readTS)
+			commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetEntriesTxn: allocate commitTS")
 			if err != nil {
-				return cockerrors.Wrap(err, "persistZSetEntriesTxn: allocate commitTS")
+				return cockerrors.WithStack(err)
 			}
 			deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
 			elems = append(elems, &kv.Elem[kv.OP]{
@@ -855,7 +858,7 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 			})
 			_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 				IsTxn:    true,
-				StartTS:  normalizeStartTS(readTS),
+				StartTS:  startTS,
 				CommitTS: commitTS,
 				ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 				Elems:    elems,
@@ -891,9 +894,10 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	if len(probeKVs) == 0 {
 		return r.persistZSetEntriesTxn(ctx, key, readTS, remaining)
 	}
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetRemovalsTxn: allocate commitTS")
 	if err != nil {
-		return cockerrors.Wrap(err, "persistZSetRemovalsTxn: allocate commitTS")
+		return cockerrors.WithStack(err)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(removed)*zsetOpsPerEntry+1)
 	for _, entry := range removed {
@@ -912,7 +916,7 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	elems = append(elems, redisTxnWideZSetFenceElem(key))
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 		Elems:    elems,
@@ -1136,9 +1140,10 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 	}
 	if isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistBZPopMinResult: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "persistBZPopMinResult: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
 		elems := []*kv.Elem[kv.OP]{
@@ -1149,7 +1154,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 			Elems:    elems,

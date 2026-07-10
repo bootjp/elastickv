@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -27,7 +28,7 @@ func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {
 		},
 	}
 
-	err := i.stampTxnTimestamps(reqs)
+	err := i.stampTxnTimestamps(context.Background(), reqs)
 	require.ErrorIs(t, err, ErrTxnTimestampOverflow)
 }
 
@@ -49,7 +50,7 @@ func TestFillForwardedTxnCommitTS_RejectsOverflow(t *testing.T) {
 		},
 	}
 
-	err := i.fillForwardedTxnCommitTS(reqs, ^uint64(0))
+	err := i.fillForwardedTxnCommitTS(context.Background(), reqs, ^uint64(0))
 	require.ErrorIs(t, err, ErrTxnTimestampOverflow)
 }
 
@@ -72,7 +73,7 @@ func TestFillForwardedTxnCommitTS_AssignsCommitTS(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, i.fillForwardedTxnCommitTS(reqs, startTS))
+	require.NoError(t, i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS))
 
 	meta, err := kv.DecodeTxnMeta(reqs[0].Mutations[0].Value)
 	require.NoError(t, err)
@@ -97,7 +98,7 @@ func TestFillForwardedTxnCommitTS_PreservesExistingCommitTS(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, i.fillForwardedTxnCommitTS(reqs, 10))
+	require.NoError(t, i.fillForwardedTxnCommitTS(context.Background(), reqs, 10))
 	meta, err := kv.DecodeTxnMeta(reqs[0].Mutations[0].Value)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), meta.CommitTS)
@@ -127,7 +128,7 @@ func TestFillForwardedTxnCommitTS_AssignsCommitTSForOnePhaseTxn(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, i.fillForwardedTxnCommitTS(reqs, startTS))
+	require.NoError(t, i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS))
 
 	meta, err := kv.DecodeTxnMeta(reqs[0].Mutations[0].Value)
 	require.NoError(t, err)
@@ -161,7 +162,7 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	}
 	reqs := []*pb.Request{prepare, commit}
 
-	require.NoError(t, i.stampTxnTimestamps(reqs))
+	require.NoError(t, i.stampTxnTimestamps(context.Background(), reqs))
 	require.Equal(t, uint64(9), prepare.Ts)
 	require.Equal(t, uint64(9), commit.Ts)
 
