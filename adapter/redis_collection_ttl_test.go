@@ -658,6 +658,116 @@ func TestRedisLegacyCollectionMigrationPreservesLegacyTTL(t *testing.T) {
 	}
 }
 
+func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(-time.Hour)
+	cases := []struct {
+		name     string
+		legacy   func([]byte) []byte
+		payload  func(t *testing.T) []byte
+		build    func(*RedisServer, context.Context, []byte, uint64) ([]*kv.Elem[kv.OP], error)
+		metaKey  func([]byte) []byte
+		expireAt func([]byte) (uint64, error)
+	}{
+		{
+			name:   "hash",
+			legacy: redisHashKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalHashValue(redisHashValue{"field": "value"})
+				require.NoError(t, err)
+				return raw
+			},
+			build: func(server *RedisServer, ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+				return server.buildHashLegacyMigrationElems(ctx, key, readTS)
+			},
+			metaKey: store.HashMetaKey,
+			expireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalHashMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:   "set",
+			legacy: redisSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalSetValue(redisSetValue{Members: []string{"member"}})
+				require.NoError(t, err)
+				return raw
+			},
+			build: func(server *RedisServer, ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+				return server.buildSetLegacyMigrationElems(ctx, key, readTS)
+			},
+			metaKey: store.SetMetaKey,
+			expireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:   "zset",
+			legacy: redisZSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalZSetValue(redisZSetValue{Entries: []redisZSetEntry{{Member: "member", Score: 1}}})
+				require.NoError(t, err)
+				return raw
+			},
+			build: func(server *RedisServer, ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+				return server.buildZSetLegacyMigrationElems(ctx, key, readTS)
+			},
+			metaKey: store.ZSetMetaKey,
+			expireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+			key := []byte("ttl:legacy-expired-migrate:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.legacy(key), tc.payload(t), 10, 0))
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 10, 0))
+
+			elems, err := tc.build(server, ctx, key, 10)
+			require.NoError(t, err)
+			raw := elemValueForKey(t, elems, tc.metaKey(key))
+			got, err := tc.expireAt(raw)
+			require.NoError(t, err)
+			require.Zero(t, got)
+		})
+	}
+}
+
+func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("ttl:legacy-expired-migrate:stream")
+	legacy := redisStreamValue{Entries: []redisStreamEntry{
+		newRedisStreamEntry("1700000000000-0", []string{"field", "value"}),
+	}}
+	payload, err := marshalStreamValue(legacy)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisStreamKey(key), payload, 10, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 10, 0))
+
+	cleanup, meta, metaFound, err := server.streamWriteBase(ctx, key, 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, cleanup)
+	require.False(t, metaFound)
+	require.Zero(t, meta.ExpireAt)
+}
+
 func elemValueForKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) []byte {
 	t.Helper()
 	for _, elem := range elems {

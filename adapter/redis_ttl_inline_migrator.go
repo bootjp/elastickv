@@ -576,6 +576,14 @@ func legacyTTLMillisAt(ctx context.Context, st store.MVCCStore, userKey []byte, 
 	return redisExpireAtMillis(ttl), nil
 }
 
+func legacyTTLMillisForRecreateAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, error) {
+	ttlMs, err := legacyTTLMillisAt(ctx, st, userKey, readTS)
+	if err != nil || redisTTLMillisExpired(ttlMs) {
+		return 0, err
+	}
+	return ttlMs, nil
+}
+
 func appendTTLIndexSyncElem(
 	ctx context.Context,
 	st store.MVCCStore,

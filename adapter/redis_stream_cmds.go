@@ -464,7 +464,7 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 	if len(legacyCleanup) == 0 {
 		return nil, store.StreamMeta{}, false, nil
 	}
-	ttlMs, err := legacyTTLMillisAt(ctx, r.store, key, readTS)
+	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return nil, store.StreamMeta{}, false, err
 	}

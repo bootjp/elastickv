@@ -60,7 +60,7 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 			},
 		)
 	}
-	ttlMs, err := legacyTTLMillisAt(ctx, r.store, key, readTS)
+	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return nil, err
 	}
