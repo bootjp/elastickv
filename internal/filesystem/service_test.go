@@ -96,6 +96,27 @@ func (c *staleLinearizableCoordinator) Dispatch(ctx context.Context, req *kv.Ope
 	return c.inner.Dispatch(ctx, req)
 }
 
+type allGroupsFenceCoordinator struct {
+	inner             *testCoordinator
+	allGroupsCalls    int
+	linearizableCalls int
+	fenceErr          error
+}
+
+func (c *allGroupsFenceCoordinator) LeaseReadAllGroups(context.Context) error {
+	c.allGroupsCalls++
+	return c.fenceErr
+}
+
+func (c *allGroupsFenceCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	c.linearizableCalls++
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *allGroupsFenceCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	return c.inner.Dispatch(ctx, req)
+}
+
 type writeConflictCoordinator struct {
 	inner *testCoordinator
 	calls int
@@ -125,6 +146,25 @@ func (c *transientWriteConflictCoordinator) Dispatch(ctx context.Context, req *k
 	if c.remaining > 0 {
 		c.remaining--
 		return nil, store.ErrWriteConflict
+	}
+	return c.inner.Dispatch(ctx, req)
+}
+
+type failNthDispatchCoordinator struct {
+	inner  *testCoordinator
+	failAt int
+	calls  int
+	err    error
+}
+
+func (c *failNthDispatchCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *failNthDispatchCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.calls++
+	if c.calls == c.failAt {
+		return nil, c.err
 	}
 	return c.inner.Dispatch(ctx, req)
 }
@@ -178,6 +218,22 @@ func TestServiceReadTSUsesMVCCTimestampAfterLinearizableFence(t *testing.T) {
 	require.Positive(t, coord.calls)
 }
 
+func TestServiceReadTSUsesAllGroupsFenceBeforeSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
+	inner := &testCoordinator{st: st}
+	coord := &allGroupsFenceCoordinator{inner: inner}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize), WithIDAllocator(sequenceIDAllocator(2)))
+	require.NoError(t, err)
+
+	ts, err := svc.readTS(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 7, ts)
+	require.Equal(t, 1, coord.allGroupsCalls)
+	require.Zero(t, coord.linearizableCalls)
+}
+
 func TestServiceFullChunkWriteSkipsChunkReadKey(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
@@ -222,6 +278,8 @@ func TestServiceFullChunkWriteChargesSparseChunkBytes(t *testing.T) {
 	stats, err = svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, 0), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
@@ -286,6 +344,28 @@ func TestServiceOpenUsesRefFenceWithoutTouchingInode(t *testing.T) {
 	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 }
 
+func TestServiceOpenRetriesDuplicateHandleID(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 3, 4)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 3, file.FH)
+
+	fh, err := svc.Open(ctx, file.Inode, []byte("client-a"))
+	require.NoError(t, err)
+	require.EqualValues(t, 4, fh)
+
+	_, err = svc.store.GetAt(ctx, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH), svc.store.LastCommitTS())
+	require.NoError(t, err)
+	_, err = svc.store.GetAt(ctx, fskeys.RefKey(file.Inode, []byte("client-a"), fh), svc.store.LastCommitTS())
+	require.NoError(t, err)
+}
+
 func TestServiceReaddirRenameAndRmdir(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
@@ -322,6 +402,32 @@ func TestServiceReaddirRenameAndRmdir(t *testing.T) {
 	entries, err := svc.Readdir(ctx, RootInode, "", 8)
 	require.NoError(t, err)
 	require.False(t, containsDirent(entries.Entries, []byte("dir")))
+}
+
+func TestServiceReaddirRefreshesCompactedCookieSnapshot(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	_, err := svc.Create(ctx, RootInode, []byte("a"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Create(ctx, RootInode, []byte("b"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+
+	first, err := svc.Readdir(ctx, RootInode, "", 3)
+	require.NoError(t, err)
+	require.NotEmpty(t, first.NextCookie)
+	require.True(t, containsDirent(first.Entries, []byte("a")))
+
+	_, err = svc.Create(ctx, RootInode, []byte("c"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.NoError(t, svc.store.Compact(ctx, svc.store.LastCommitTS()))
+
+	second, err := svc.Readdir(ctx, RootInode, first.NextCookie, 8)
+	require.NoError(t, err)
+	require.False(t, containsDirent(second.Entries, []byte("a")))
+	require.True(t, containsDirent(second.Entries, []byte("b")))
+	require.True(t, containsDirent(second.Entries, []byte("c")))
 }
 
 func TestServiceRenameSameNameStillChecksSource(t *testing.T) {
@@ -799,6 +905,57 @@ func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
 	stats, err := svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+}
+
+func TestServiceUnlinkLargeFileGCIsRecoverableAfterPagedDeleteFailure(t *testing.T) {
+	ctx := context.Background()
+	const (
+		chunkCount             = chunkDeleteTxnPageSize + 1
+		largeChunkPayloadBytes = chunkCount * 4
+	)
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(uint64(largeChunkPayloadBytes)))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("large"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte{'x'}, largeChunkPayloadBytes)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, payload)
+	require.NoError(t, err)
+
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	failSecond := &failNthDispatchCoordinator{
+		inner:  inner,
+		failAt: 2,
+		err:    context.Canceled,
+	}
+	svc.dispatch = failSecond
+
+	err = svc.Unlink(ctx, RootInode, []byte("large"))
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = svc.Resolve(ctx, RootInode, []byte("large"))
+	require.ErrorIs(t, err, ErrNotFound)
+	raw, err := svc.store.GetAt(ctx, fskeys.InodeKey(file.Inode), svc.store.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := decodeJSON[InodeMeta](raw)
+	require.NoError(t, err)
+	require.True(t, meta.Orphaned)
+	require.Zero(t, meta.Nlink)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, chunkDeleteTxnPageSize), svc.store.LastCommitTS())
+	require.NoError(t, err)
+
+	svc.dispatch = inner
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	_, err = svc.store.GetAt(ctx, fskeys.InodeKey(file.Inode), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, chunkDeleteTxnPageSize), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	fsStats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, fsStats.Files)
+	require.EqualValues(t, 0, fsStats.Capacity-fsStats.Free)
 }
 
 func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) {
