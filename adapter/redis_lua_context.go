@@ -3138,16 +3138,18 @@ func parseLuaXTrimArgs(args []string) ([]byte, int, error) {
 }
 
 type luaCommitPlan struct {
-	preserveExisting bool
-	elems            []*kv.Elem[kv.OP]
+	preserveExisting    bool
+	inlineMetaRewritten bool
+	elems               []*kv.Elem[kv.OP]
 }
 
 // luaKeyPlan carries the data elements and TTL metadata for a single key commit.
 type luaKeyPlan struct {
-	elems            []*kv.Elem[kv.OP]
-	readKeys         [][]byte
-	finalType        redisValueType
-	preserveExisting bool
+	elems               []*kv.Elem[kv.OP]
+	readKeys            [][]byte
+	finalType           redisValueType
+	preserveExisting    bool
+	inlineMetaRewritten bool
 }
 
 func (c *luaScriptContext) commit() error {
@@ -3178,7 +3180,8 @@ func (c *luaScriptContext) commit() error {
 		// For collection keys with dirty TTL: update the inline metadata
 		// anchor and keep !redis|ttl| as the secondary scan index.
 		if isNonStringCollectionType(plan.finalType) {
-			ttlElems, err := c.nonStringTTLElems(key, plan.finalType, plan.preserveExisting)
+			updateExistingMeta := plan.preserveExisting && !plan.inlineMetaRewritten
+			ttlElems, err := c.nonStringTTLElems(key, plan.finalType, updateExistingMeta)
 			if err != nil {
 				return err
 			}
@@ -3269,10 +3272,11 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	dataElems = append(dataElems, deleteElems...)
 	dataElems = append(dataElems, valuePlan.elems...)
 	return luaKeyPlan{
-		elems:            dataElems,
-		readKeys:         readKeys,
-		finalType:        finalType,
-		preserveExisting: valuePlan.preserveExisting,
+		elems:               dataElems,
+		readKeys:            readKeys,
+		finalType:           finalType,
+		preserveExisting:    valuePlan.preserveExisting,
+		inlineMetaRewritten: valuePlan.inlineMetaRewritten,
 	}, nil
 }
 
@@ -3582,7 +3586,8 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 		return luaCommitPlan{elems: elems}, err
 	}
 	// Delta path: write only changed members + score index + metadata delta.
-	return luaCommitPlan{preserveExisting: true, elems: c.zsetDeltaCommitElems(key, st, commitTS)}, nil
+	elems, err := c.zsetDeltaCommitElems(key, st, commitTS)
+	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: luaZSetMetaRewritten(elems, []byte(key)), elems: elems}, err
 }
 
 func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(key string) (bool, error) {
@@ -3654,48 +3659,64 @@ func (c *luaScriptContext) zsetFullCommitElems(key string) ([]*kv.Elem[kv.OP], e
 // zsetDeltaCommitElems writes only the members that changed (added/updated/removed)
 // together with their score index entries and a cardinality delta key.
 // preserveExisting=true so deleteLogicalKeyElems is NOT called.
-func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, commitTS uint64) []*kv.Elem[kv.OP] {
+func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	if len(st.added) == 0 && len(st.removed) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Each added member: optionally DEL old score key + PUT member key + PUT score key.
 	// Each removed member: DEL member key + DEL score key.
 	// Plus one optional ZSetMetaDeltaKey.
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.added)*zsetElemsPerAdded+len(st.removed)*zsetElemsPerRemoved+zsetMetaBaseElems)
+	elems = appendLuaZSetAddedElems(elems, []byte(key), st)
+	elems = appendLuaZSetRemovedElems(elems, []byte(key), st)
+	metaElems, err := c.zsetDeltaMetaElems([]byte(key), st, commitTS)
+	if err != nil {
+		return nil, err
+	}
+	elems = append(elems, metaElems...)
+	if len(elems) != 0 {
+		elems = append(elems, redisTxnWideZSetFenceElem([]byte(key)))
+	}
+	return elems, nil
+}
+
+func appendLuaZSetAddedElems(elems []*kv.Elem[kv.OP], key []byte, st *luaZSetState) []*kv.Elem[kv.OP] {
 	for member, score := range st.added {
+		memberBytes := []byte(member)
 		if storageScore, ok := st.storageScores[member]; ok && storageScore != nil {
 			// Remove stale score index from storage.
 			elems = append(elems, &kv.Elem[kv.OP]{
 				Op:  kv.Del,
-				Key: store.ZSetScoreKey([]byte(key), *storageScore, []byte(member)),
+				Key: store.ZSetScoreKey(key, *storageScore, memberBytes),
 			})
 		}
 		elems = append(elems,
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
-				Key:   store.ZSetMemberKey([]byte(key), []byte(member)),
+				Key:   store.ZSetMemberKey(key, memberBytes),
 				Value: store.MarshalZSetScore(score),
 			},
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
-				Key:   store.ZSetScoreKey([]byte(key), score, []byte(member)),
+				Key:   store.ZSetScoreKey(key, score, memberBytes),
 				Value: []byte{},
 			},
 		)
 	}
+	return elems
+}
+
+func appendLuaZSetRemovedElems(elems []*kv.Elem[kv.OP], key []byte, st *luaZSetState) []*kv.Elem[kv.OP] {
 	for member := range st.removed {
 		storageScore, ok := st.storageScores[member]
 		if !ok || storageScore == nil {
 			continue
 		}
+		memberBytes := []byte(member)
 		elems = append(elems,
-			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey([]byte(key), []byte(member))},
-			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey([]byte(key), *storageScore, []byte(member))},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, memberBytes)},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, *storageScore, memberBytes)},
 		)
-	}
-	elems = append(elems, c.zsetDeltaMetaElems([]byte(key), st, commitTS)...)
-	if len(elems) != 0 {
-		elems = append(elems, redisTxnWideZSetFenceElem([]byte(key)))
 	}
 	return elems
 }
@@ -3703,20 +3724,57 @@ func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, co
 // zsetDeltaMetaElems returns the metadata element(s) for a delta commit.
 // It tries to fold existing delta keys inline (compaction); on error or when
 // below the threshold it falls back to writing a single new ZSetMetaDeltaKey.
-func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, commitTS uint64) []*kv.Elem[kv.OP] {
+func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	compactElems, compacted, err := c.server.zsetInlineMetaCompactionElems(
 		context.Background(), key, c.startTS, st.lenDelta)
 	if err == nil && compacted {
-		return compactElems
+		return c.zsetMetaElemsWithFinalTTL(key, compactElems)
 	}
 	if st.lenDelta == 0 {
-		return nil
+		return nil, nil
 	}
 	return []*kv.Elem[kv.OP]{{
 		Op:    kv.Put,
 		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
 		Value: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: st.lenDelta}),
-	}}
+	}}, nil
+}
+
+func (c *luaScriptContext) zsetMetaElemsWithFinalTTL(key []byte, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], error) {
+	ttl, err := c.finalTTL(key)
+	if err != nil {
+		return nil, err
+	}
+	expireAt := ttlMillis(ttl)
+	metaKey := store.ZSetMetaKey(key)
+	out := make([]*kv.Elem[kv.OP], 0, len(elems))
+	for _, elem := range elems {
+		if elem.Op == kv.Put && string(elem.Key) == string(metaKey) {
+			meta, err := store.UnmarshalZSetMeta(elem.Value)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			meta.ExpireAt = expireAt
+			out = append(out, &kv.Elem[kv.OP]{
+				Op:    elem.Op,
+				Key:   elem.Key,
+				Value: store.MarshalZSetMeta(meta),
+			})
+			continue
+		}
+		out = append(out, elem)
+	}
+	return out, nil
+}
+
+func luaZSetMetaRewritten(elems []*kv.Elem[kv.OP], key []byte) bool {
+	metaKey := store.ZSetMetaKey(key)
+	for _, elem := range elems {
+		if string(elem.Key) == string(metaKey) {
+			return true
+		}
+	}
+	return false
 }
 
 // streamCommitElems writes the script's final stream state in the

@@ -498,6 +498,10 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
+	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return err
+	}
 	// Wide-column rewrite: write per-field keys and a new base meta.
 	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.
 	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
@@ -511,7 +515,7 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey(key),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	// Also remove the legacy blob if it was present.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})

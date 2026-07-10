@@ -343,6 +343,40 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 				return meta.ExpireAt, err
 			},
 		},
+		{
+			name:    "set",
+			typ:     redisTypeSet,
+			metaKey: store.SetMetaKey,
+			baseValue: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalSetMeta(store.SetMeta{Len: 1})
+			},
+			deltaKey: func(key []byte, ts uint64) []byte {
+				return store.SetMetaDeltaKey(key, ts, 0)
+			},
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
+		{
+			name:    "zset",
+			typ:     redisTypeZSet,
+			metaKey: store.ZSetMetaKey,
+			baseValue: func(t *testing.T) []byte {
+				t.Helper()
+				return store.MarshalZSetMeta(store.ZSetMeta{Len: 1})
+			},
+			deltaKey: func(key []byte, ts uint64) []byte {
+				return store.ZSetMetaDeltaKey(key, ts, 0)
+			},
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+			metaExpireAt: func(raw []byte) (uint64, error) {
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.ExpireAt, err
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -350,7 +384,9 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 			t.Parallel()
 
 			st := store.NewMVCCStore()
-			server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+			coord := newLocalAdapterCoordinator(st)
+			compactor := NewDeltaCompactor(st, coord)
+			server := &RedisServer{store: st, coordinator: coord, compactor: compactor}
 			key := []byte("ttl:delta-heavy:" + tc.name)
 			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.baseValue(t), 1, 0))
 			const firstDeltaTS uint64 = 2
@@ -375,6 +411,13 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 			ttl, err := decodeRedisTTL(rawTTL)
 			require.NoError(t, err)
 			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
+			select {
+			case req := <-compactor.urgentCh:
+				require.Equal(t, tc.name, req.typeName)
+				require.Equal(t, key, req.userKey)
+			default:
+				t.Fatalf("expected urgent compaction request for %s", tc.name)
+			}
 		})
 	}
 }
@@ -425,7 +468,9 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 
 			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
 			require.NoError(t, err)
-			require.True(t, applied)
+			require.False(t, applied)
+			_, err = st.GetAt(ctx, redisTTLKey(key), st.LastCommitTS())
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
 
 			select {
 			case req := <-compactor.urgentCh:
@@ -777,6 +822,82 @@ func elemValueForKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) []byte 
 	}
 	t.Fatalf("missing Put elem for key %q", want)
 	return nil
+}
+
+func TestRedisHDelLegacyRewritePreservesLegacyTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st, coordinator: newLocalAdapterCoordinator(st)}
+	key := []byte("ttl:hdel:legacy-rewrite")
+	raw, err := marshalHashValue(redisHashValue{"drop": "old", "keep": "value"})
+	require.NoError(t, err)
+	expireAt := time.Now().Add(time.Hour)
+	require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, 10, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 11, 0))
+
+	require.NoError(t, server.persistHashTxn(ctx, key, st.LastCommitTS(), redisHashValue{"keep": "value"}))
+
+	readTS := st.LastCommitTS()
+	metaRaw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(metaRaw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+
+	require.NoError(t, st.DeleteAt(ctx, redisTTLKey(key), readTS+1))
+	got, err := server.ttlAt(ctx, key, readTS+1)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, meta.ExpireAt, redisExpireAtMillis(*got))
+}
+
+func TestRedisLuaZSetDeltaTTLCompactionPreservesCardinality(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	server := nodes[0].redisServer
+	keyString := "ttl:lua-zset-delta-compaction"
+	key := []byte(keyString)
+	require.NoError(t, server.store.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 1}), 10, 0))
+	for i := uint64(0); i < store.MaxDeltaScanLimit; i++ {
+		require.NoError(t, server.store.PutAt(ctx,
+			store.ZSetMetaDeltaKey(key, 11+i, 0),
+			store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+			11+i,
+			0,
+		))
+	}
+
+	ttl := 50 * time.Second
+	got, err := rdb.Eval(ctx, `
+redis.call("zadd", KEYS[1], "2", "new-member")
+return redis.call("pexpire", KEYS[1], ARGV[1])
+`, []string{keyString}, int(ttl/time.Millisecond)).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), got)
+
+	readTS := server.readTS()
+	raw, err := server.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalZSetMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(store.MaxDeltaScanLimit+2), meta.Len)
+	require.Greater(t, meta.ExpireAt, redisExpireAtMillis(time.Now().Add(ttl/2)))
+
+	commitTS, err := server.coordinator.Clock().NextFenced()
+	require.NoError(t, err)
+	require.NoError(t, server.store.DeleteAt(ctx, redisTTLKey(key), commitTS))
+	ttlValue, err := server.ttlAt(ctx, key, commitTS)
+	require.NoError(t, err)
+	require.NotNil(t, ttlValue)
+	require.Equal(t, meta.ExpireAt, redisExpireAtMillis(*ttlValue))
 }
 
 func TestRedisLuaStagedCollectionCreateWritesInlineTTL(t *testing.T) {

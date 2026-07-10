@@ -1509,14 +1509,14 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
 	hashElems := t.buildHashElems(commitTS)
-	collectionTTLElems, err := t.buildCollectionTTLElems(ctx)
+	collectionTTLElems, skipTTLIndex, err := t.buildCollectionTTLElems(ctx)
 	if err != nil {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
 	// TTL elements: string/HLL keys have TTL embedded in value, and collection
 	// keys also keep !redis|ttl| as the secondary scan index.
-	ttlElems := t.buildTTLElems()
+	ttlElems := t.buildTTLElems(skipTTLIndex)
 
 	// Continue using the same redisDispatchTimeout-bounded context for
 	// the stream-deletion scans (paginated ScanAt/ExistsAt over
@@ -2180,10 +2180,13 @@ func (t *txnContext) buildStreamDeletionElems(ctx context.Context) ([]*kv.Elem[k
 
 // buildTTLElems returns !redis|ttl| Raft elements for non-string keys with dirty TTL state.
 // String keys have TTL embedded in the value; they are handled by buildKeyElems.
-func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
+func (t *txnContext) buildTTLElems(skip map[string]struct{}) []*kv.Elem[kv.OP] {
 	var elems []*kv.Elem[kv.OP]
 	for k, st := range t.ttlStates {
 		if !st.dirty {
+			continue
+		}
+		if _, blocked := skip[k]; blocked {
 			continue
 		}
 		if _, ok := t.replacers[k]; ok {
@@ -2213,9 +2216,9 @@ func (t *txnContext) collectionTTLMillis(key string) (uint64, bool) {
 	return redisExpireAtMillis(*st.value), true
 }
 
-func (t *txnContext) buildCollectionTTLElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+func (t *txnContext) buildCollectionTTLElems(ctx context.Context) ([]*kv.Elem[kv.OP], map[string]struct{}, error) {
 	if len(t.collectionExpireTypes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	keys := make([]string, 0, len(t.collectionExpireTypes))
 	for key := range t.collectionExpireTypes {
@@ -2224,25 +2227,44 @@ func (t *txnContext) buildCollectionTTLElems(ctx context.Context) ([]*kv.Elem[kv
 	sort.Strings(keys)
 
 	var elems []*kv.Elem[kv.OP]
+	var skipTTLIndex map[string]struct{}
 	for _, key := range keys {
-		st := t.ttlStates[key]
-		if st == nil || !st.dirty || st.value == nil {
-			continue
-		}
-		userKey := []byte(key)
-		typ := t.collectionExpireTypes[key]
-		if t.collectionTTLRebuildWouldUseStaleBase(key, typ) {
-			continue
-		}
-		built, ok, err := t.server.collectionExpireElems(ctx, userKey, t.startTS, typ, redisExpireAtMillis(*st.value))
+		built, skipIndex, err := t.collectionTTLElemsForKey(ctx, key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if ok {
+		if !skipIndex {
 			elems = append(elems, built...)
+			continue
 		}
+		if skipTTLIndex == nil {
+			skipTTLIndex = map[string]struct{}{}
+		}
+		skipTTLIndex[key] = struct{}{}
 	}
-	return elems, nil
+	return elems, skipTTLIndex, nil
+}
+
+func (t *txnContext) collectionTTLElemsForKey(ctx context.Context, key string) ([]*kv.Elem[kv.OP], bool, error) {
+	st := t.ttlStates[key]
+	if st == nil || !st.dirty || st.value == nil {
+		return nil, false, nil
+	}
+	typ := t.collectionExpireTypes[key]
+	if t.collectionTTLRebuildWouldUseStaleBase(key, typ) {
+		return nil, false, nil
+	}
+	built, ok, err := t.server.collectionExpireElems(
+		ctx,
+		[]byte(key),
+		t.startTS,
+		typ,
+		redisExpireAtMillis(*st.value),
+	)
+	if err != nil || ok {
+		return built, false, err
+	}
+	return nil, true, nil
 }
 
 func (t *txnContext) collectionTTLRebuildWouldUseStaleBase(key string, typ redisValueType) bool {

@@ -369,11 +369,11 @@ func (r *RedisServer) simpleMetaExpireScanErr(
 	if !errors.Is(err, ErrDeltaScanTruncated) {
 		return nil, false, err
 	}
+	r.triggerUrgentCompaction(typeName, key)
 	if exists {
 		return []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(baseLen, expireAtMs)}}, true, nil
 	}
-	r.triggerUrgentCompaction(typeName, key)
-	return nil, true, nil
+	return nil, false, nil
 }
 
 func simpleMetaLenWithDeltas(
