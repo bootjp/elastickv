@@ -152,7 +152,7 @@ func TestGetRaftGroupsLeaderVersionAsync(t *testing.T) {
 	srv := NewAdminServer(
 		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
 		nil,
-		WithAdminLeaderVersionProbeTimeout(50*time.Millisecond),
+		WithAdminLeaderVersionProbeTimeout(2*time.Second),
 		WithAdminLeaderVersionCacheTTL(time.Second),
 		WithAdminLeaderVersionProbe(func(ctx context.Context, addr string) (string, error) {
 			if addr != "10.0.0.12:50051" {

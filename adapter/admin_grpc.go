@@ -472,7 +472,7 @@ func (s *AdminServer) GetRaftGroups(
 			CommitIndex:       st.CommitIndex,
 			AppliedIndex:      st.AppliedIndex,
 			LastContactUnixMs: lastContactUnixMs,
-			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader),
+			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader, now),
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil
@@ -485,12 +485,11 @@ func (s *AdminServer) GetNodeVersion(
 	return &pb.GetNodeVersionResponse{NodeVersion: s.nodeVersion}, nil
 }
 
-func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo) string {
+func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo, now time.Time) string {
 	if version, ok := s.localLeaderVersion(leader); ok {
 		return version
 	}
 	key := leaderVersionCacheKey(leader)
-	now := time.Now()
 	if version, ok := s.cachedLeaderVersion(key, now); ok {
 		return version
 	}
@@ -563,11 +562,15 @@ func (s *AdminServer) reserveLeaderVersionProbe(key string, now time.Time) (stri
 func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address string) {
 	probe := s.leaderVersionProbe
 	timeout := s.leaderVersionProbeTimeout
+	var md metadata.MD
+	if incoming, ok := metadata.FromIncomingContext(ctx); ok {
+		md = incoming.Copy()
+	}
 	go func() {
 		probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			probeCtx = metadata.NewOutgoingContext(probeCtx, md.Copy())
+		if md != nil {
+			probeCtx = metadata.NewOutgoingContext(probeCtx, md)
 		}
 		version, err := probe(probeCtx, address)
 		if err != nil {

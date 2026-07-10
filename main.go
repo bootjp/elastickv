@@ -1441,43 +1441,27 @@ type serversInput struct {
 // per-group Raft listeners needed for quorum traffic, waits for any requested
 // startup rotation, then opens the public service listeners.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
-	if err != nil {
-		return err
-	}
-	// roleStore + connCache are gated on *adminEnabled. With admin
-	// disabled, building either is wasted work AND a security
-	// regression risk: a non-empty -adminFullAccessKeys flag would
-	// otherwise still flip forwardDeps.readyForRegistration() to
-	// true, registering the leader-side gRPC AdminForward service
-	// and re-exposing the table-write surface a follower-direct
-	// admin call could reach (P1/Major review on #648).
-	// The HTTP admin listener already short-circuits in
-	// prepareAdminFromFlags when *adminEnabled is false; the gRPC path
-	// must do the same.
 	var (
 		roleStore admin.RoleStore
 		connCache *kv.GRPCConnCache
 	)
+	adminGRPCEnabled := *adminTokenFile != "" || *adminInsecureNoAuth
+	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
+	// it is wasted work AND a security regression risk: a non-empty
+	// -adminFullAccessKeys flag would otherwise still flip
+	// forwardDeps.readyForRegistration() to true, registering the leader-side
+	// gRPC AdminForward service and re-exposing the table-write surface a
+	// follower-direct admin call could reach (P1/Major review on #648).
+	//
+	// connCache is also used by the gRPC Admin GetNodeVersion probe, so create
+	// it when either admin HTTP or gRPC Admin is enabled.
+	connCache = prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
+	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler, connCache)
+	if err != nil {
+		return err
+	}
 	if *adminEnabled {
 		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
-		// connCache is shared between the follower-side LeaderForwarder
-		// (built inside prepareAdminFromFlags) and any future bridge that
-		// dials the leader's gRPC ports. Keeping a single instance per
-		// process means the two paths re-use TLS / HTTP/2 connections
-		// rather than each maintaining a parallel pool. The shutdown
-		// goroutine drains the cache on context cancellation so the
-		// accumulated HTTP/2 connections are not leaked when the
-		// process exits gracefully (Claude review on #648).
-		connCache = &kv.GRPCConnCache{}
-		cache := connCache
-		in.eg.Go(func() error {
-			<-in.ctx.Done()
-			if err := cache.Close(); err != nil {
-				return errors.Wrap(err, "close admin gRPC connection cache")
-			}
-			return nil
-		})
 	}
 	publicKVGate := &startupPublicKVGate{}
 	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
@@ -1628,6 +1612,7 @@ func setupAdminService(
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
 	keyvizSampler *keyviz.MemSampler,
+	connCache *kv.GRPCConnCache,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -1641,6 +1626,7 @@ func setupAdminService(
 		*adminInsecureNoAuth,
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
+		connCache,
 	)
 	if err != nil {
 		return nil, adminGRPCInterceptors{}, err
@@ -1862,6 +1848,7 @@ func configureAdminService(
 	insecureNoAuth bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
+	connCache *kv.GRPCConnCache,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	if tokenPath == "" && !insecureNoAuth {
 		return nil, adminGRPCInterceptors{}, nil
@@ -1877,7 +1864,11 @@ func configureAdminService(
 		}
 		token = loaded
 	}
-	srv := adapter.NewAdminServer(self, members, adapter.WithAdminNodeVersion(buildVersion()))
+	opts := []adapter.AdminOption{adapter.WithAdminNodeVersion(buildVersion())}
+	if probe := adminLeaderVersionProbe(connCache); probe != nil {
+		opts = append(opts, adapter.WithAdminLeaderVersionProbe(probe))
+	}
+	srv := adapter.NewAdminServer(self, members, opts...)
 	unary, stream := adapter.AdminTokenAuth(token)
 	var icept adminGRPCInterceptors
 	if unary != nil {
@@ -1887,6 +1878,23 @@ func configureAdminService(
 		icept.stream = append(icept.stream, stream)
 	}
 	return srv, icept, nil
+}
+
+func adminLeaderVersionProbe(connCache *kv.GRPCConnCache) adapter.LeaderVersionProbe {
+	if connCache == nil {
+		return nil
+	}
+	return func(ctx context.Context, address string) (string, error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: dial peer")
+		}
+		resp, err := pb.NewAdminClient(conn).GetNodeVersion(ctx, &pb.GetNodeVersionRequest{})
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: get node version")
+		}
+		return resp.GetNodeVersion(), nil
+	}
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
@@ -2565,6 +2573,21 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		return r.startupFailure(err)
 	}
 	return nil
+}
+
+func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool) *kv.GRPCConnCache {
+	if !enabled {
+		return nil
+	}
+	connCache := &kv.GRPCConnCache{}
+	eg.Go(func() error {
+		<-ctx.Done()
+		if err := connCache.Close(); err != nil {
+			return errors.Wrap(err, "close admin gRPC connection cache")
+		}
+		return nil
+	})
+	return connCache
 }
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
