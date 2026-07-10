@@ -38,11 +38,12 @@ This document proposes a built-in admin Web UI, shipped as a separate binary `cm
 
 ```mermaid
 flowchart LR
-  Browser["Browser (Svelte SPA, embedded)"]
+  Browser["Browser (embedded KeyViz SPA)"]
+  Standalone["cmd/elastickv-admin (overview path)"]
 
-  subgraph AdminHost["Operator machine or sidecar"]
-    Admin["cmd/elastickv-admin :8080"]
-  end
+  Node1HTTP["Node A embedded admin HTTP"]
+  Node2HTTP["Node B embedded admin HTTP"]
+  Node3HTTP["Node C embedded admin HTTP"]
 
   subgraph Cluster["Elastickv Cluster"]
     Node1["Node A"]
@@ -50,10 +51,13 @@ flowchart LR
     Node3["Node C"]
   end
 
-  Browser -- "HTTP/JSON + WebSocket" --> Admin
-  Admin -- "gRPC: Distribution, RaftAdmin, Admin.KeyViz" --> Node1
-  Admin -- "gRPC" --> Node2
-  Admin -- "gRPC" --> Node3
+  Browser -- "HTTP/JSON + WebSocket" --> Node1HTTP
+  Node1HTTP -- "admin HTTP peer fan-out" --> Node2HTTP
+  Node1HTTP -- "admin HTTP peer fan-out" --> Node3HTTP
+
+  Standalone -- "gRPC overview path" --> Node1
+  Standalone -- "gRPC overview path" --> Node2
+  Standalone -- "gRPC overview path" --> Node3
 
   subgraph NodeInternal["Inside each Node"]
     Sampler["keyviz.Sampler"]
@@ -69,7 +73,13 @@ flowchart LR
   AdminSvc --> Raft
 ```
 
-The admin binary holds no authoritative state. All data is fetched on demand from nodes via a new `Admin` gRPC service. The sampler's ring buffer lives inside each node's process, rebuildable after restart once Phase 3 persistence is enabled (see §5.6).
+The original standalone admin binary remains a stateless gRPC overview
+client. The implemented KeyViz fan-out path is embedded in each
+`elastickv` server: the browser talks to one node's admin HTTP handler,
+that handler computes its local matrix, then it issues admin HTTP peer
+requests to the static `--keyvizFanoutNodes` list and merges the results.
+The sampler's ring buffer lives inside each node's process, rebuildable
+after restart once Phase 3 persistence is enabled (see §5.6).
 
 ### 3.1 Why a separate binary
 
