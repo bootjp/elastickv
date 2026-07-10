@@ -400,7 +400,7 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
-	writerRegistry, err := s.writerRegistryForCaller(sc, s.fullNodeID)
+	writerRegistry, err := s.writerRegistryForCaller(sc, s.fullNodeID, codes.Internal)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +442,7 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 	if req != nil {
 		callerFullNodeID = req.GetCallerFullNodeId()
 	}
-	writerRegistry, err := s.writerRegistryForCaller(sc, callerFullNodeID)
+	writerRegistry, err := s.writerRegistryForCaller(sc, callerFullNodeID, codes.InvalidArgument)
 	if err != nil {
 		return nil, err
 	}
@@ -455,13 +455,13 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 	}, nil
 }
 
-func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, fullNodeID uint64) (map[uint32]uint32, error) {
+func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, fullNodeID uint64, missingIDCode codes.Code) (map[uint32]uint32, error) {
 	out := map[uint32]uint32{}
 	if s.writerRegistry == nil {
 		return out, nil
 	}
 	if fullNodeID == 0 {
-		return nil, grpcStatusError(codes.InvalidArgument,
+		return nil, grpcStatusError(missingIDCode,
 			"encryption: full_node_id is required to project writer_registry_for_caller")
 	}
 	nodeID16 := encryption.NodeID16(fullNodeID)
