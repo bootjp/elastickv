@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ const defaultSnapshotChunkSize = 16 << 20
 const defaultDispatchTimeout = 5 * time.Second
 const defaultSnapshotDispatchTimeout = 30 * time.Minute
 const defaultSendStreamReprobeInterval = 30 * time.Second
+const sendStreamEnvVar = "ELASTICKV_RAFT_SEND_STREAM"
 
 // defaultBridgeMaterializeLimit caps the number of bridge-mode snapshot
 // materializations that may hold memory concurrently. Each call allocates up
@@ -111,8 +113,9 @@ type GRPCTransport struct {
 	readFSMPayload func(index uint64) ([]byte, error)
 	// openFSMPayload is the preferred bridge callback that opens the .fsm file
 	// for streaming without allocating a large buffer.
-	openFSMPayload func(index uint64) (io.ReadCloser, error)
-	dialGroup      singleflight.Group
+	openFSMPayload    func(index uint64) (io.ReadCloser, error)
+	sendStreamEnabled bool
+	dialGroup         singleflight.Group
 	// bridgeSem limits concurrent bridge-mode snapshot materializations so
 	// that aggregate in-memory allocation stays bounded even when multiple
 	// dispatch workers run simultaneously.
@@ -142,7 +145,24 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		streamUnsupported:   make(map[string]bool),
 		streamUnsupportedAt: make(map[string]time.Time),
 		snapshotChunkSize:   defaultSnapshotChunkSize,
+		sendStreamEnabled:   sendStreamEnabledFromEnv(),
 		bridgeSem:           make(chan struct{}, defaultBridgeMaterializeLimit),
+	}
+}
+
+func sendStreamEnabledFromEnv() bool {
+	v := strings.TrimSpace(os.Getenv(sendStreamEnvVar))
+	switch strings.ToLower(v) {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		slog.Warn("invalid raft send stream flag; defaulting to enabled",
+			"env", sendStreamEnvVar,
+			"value", v,
+		)
+		return true
 	}
 }
 
@@ -470,7 +490,7 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 		return err
 	}
 	req := &pb.EtcdRaftMessage{Message: raw}
-	if isPriorityMsg(msg.GetType()) || !t.allowPeerStreamProbe(peer.Address, time.Now()) {
+	if isPriorityMsg(msg.GetType()) || !t.sendStreamAllowed(peer.Address, time.Now()) {
 		return t.dispatchRegularUnary(ctx, client, req)
 	}
 	err = t.dispatchRegularStream(ctx, peer.Address, client, req)
@@ -527,7 +547,7 @@ func (t *GRPCTransport) streamFor(ctx context.Context, address string, client pb
 	if ok {
 		return stream, nil
 	}
-	if !t.allowPeerStreamProbe(address, time.Now()) {
+	if !t.sendStreamAllowed(address, time.Now()) {
 		return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 	}
 
@@ -538,7 +558,7 @@ func (t *GRPCTransport) streamFor(ctx context.Context, address string, client pb
 		if ok {
 			return stream, nil
 		}
-		if !t.allowPeerStreamProbe(address, time.Now()) {
+		if !t.sendStreamAllowed(address, time.Now()) {
 			return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 		}
 		if err := t.probeSendStream(ctx, address, client); err != nil {
@@ -583,7 +603,7 @@ func (t *GRPCTransport) probeSendStream(ctx context.Context, address string, cli
 	if supported {
 		return nil
 	}
-	if !t.allowPeerStreamProbe(address, time.Now()) {
+	if !t.sendStreamAllowed(address, time.Now()) {
 		return errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 	}
 
@@ -608,6 +628,13 @@ func (t *GRPCTransport) peerStreamUnsupported(address string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.streamUnsupported[address]
+}
+
+func (t *GRPCTransport) sendStreamAllowed(address string, now time.Time) bool {
+	if !t.sendStreamEnabled {
+		return false
+	}
+	return t.allowPeerStreamProbe(address, now)
 }
 
 func (t *GRPCTransport) allowPeerStreamProbe(address string, now time.Time) bool {

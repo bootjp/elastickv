@@ -907,6 +907,60 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 	require.Zero(t, client.sendStreamCalls.Load())
 }
 
+func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
+	t.Setenv(sendStreamEnvVar, "false")
+
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(5),
+		Index: uint64Ptr(40),
+	}))
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Zero(t, client.sendStreamCalls.Load())
+
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	streamSupported := transport.streamSupported[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+	require.False(t, streamSupported)
+}
+
+func TestSendStreamEnabledFromEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want bool
+	}{
+		{name: "unset", want: true},
+		{name: "true", env: "true", want: true},
+		{name: "one", env: "1", want: true},
+		{name: "false", env: "false", want: false},
+		{name: "zero", env: "0", want: false},
+		{name: "invalid", env: "maybe", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "unset" {
+				t.Setenv(sendStreamEnvVar, "")
+			} else {
+				t.Setenv(sendStreamEnvVar, tt.env)
+			}
+			require.Equal(t, tt.want, sendStreamEnabledFromEnv())
+		})
+	}
+}
+
 func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T) {
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
