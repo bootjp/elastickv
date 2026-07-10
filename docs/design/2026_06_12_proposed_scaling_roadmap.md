@@ -23,7 +23,7 @@ production envelope within one growth cycle:
 
 | Dimension | Today's comfortable ceiling | Where the next operator wants to go | Triggering signal |
 | --- | --- | --- | --- |
-| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_proposed_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
+| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
 | Region/DC fan-out | Single DC, LAN-tuned etcd/raft (10 ms tick, 100 ms heartbeat, 1 s election), single default-group HLC ceiling | 2–3 regions with active-active per-shard | Disaster-recovery SLO ("survive a region outage with < 30 s data-plane reconvergence") |
 | Bytes per shard | ~1 TB before snapshot transfer / WAL replay becomes operational pain | 5–10 TB per shard, with shard counts in the 100 k range | DynamoDB-compatibility customers ingesting at multi-GiB/s per table |
 | Per-node QPS | Leader-bound write, lease-read scales across shards but only on each shard's leader | 5–10x current per-node throughput; sustained reads from non-leader replicas | Redis-compatibility migration projects ingesting from upstream Redis where the upstream serves reads from replicas |
@@ -56,8 +56,9 @@ pages of `catalogScanPageSize = 256`.
 on the hot path with no synchronization — fixed-at-startup
 contract), then `engine.GetRoute`. `groups map[uint64]*routerGroup`
 lookup is under `sync.RWMutex`. Hot-range handling is
-`Engine.RecordAccess` + ephemeral midpoint splits, persisted only via
-the M1 same-group `SplitRange` path.
+manual same-group `SplitRange` today; the earlier
+`Engine.RecordAccess` + ephemeral midpoint split path was removed by
+hotspot M3-PR1a because it was never wired into request paths.
 
 Breakage points:
 
@@ -141,11 +142,11 @@ txn re-allocates `StartTS` via `Clock().NextFenced()`. `IsLeader`,
 `VerifyLeader`, `LinearizableRead`, and `LeaseRead` (non-keyed) all
 pin to `c.groups[c.defaultGroup]`.
 
-HLC ceiling renewal is leader-only on default group → **every
-persistence-grade ts allocation across all shards depends on
-default-group default leader staying healthy**. A 3 s outage on
-default-group default leader stops cluster-wide ts issuance after
-the ceiling window expires.
+HLC ceiling renewal is now per led group, so a non-default group
+leader renews the shared local HLC through that group's Raft log.
+This removes the default-group-only ceiling-renewal chokepoint, but
+it is still not a global TSO: cross-node cross-group timestamp
+comparability remains a separate design point.
 
 `kv/lease_state.go`: per-shard lease, monotonic-raw nanos. Fast
 path single atomic load; extend mutex-serialized once per Dispatch.
@@ -163,8 +164,9 @@ across nodes.
 
 Coordinator breakage:
 
-- Default-group leader is the **HLC ceiling single point of
-  failure**. Multi-region only makes this worse.
+- The cluster still lacks a **global TSO / single oracle** for
+  cross-node cross-group timestamp allocation. Multi-region only
+  makes this more important.
 - No follower-read path; per-shard read ceiling = each shard's
   leader CPU.
 - Cross-shard txn is unsupported — adapters needing multi-key

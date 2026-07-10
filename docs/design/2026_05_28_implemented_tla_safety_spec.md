@@ -663,7 +663,7 @@ does not keep this document in `partial`.
 
 5. **Choice of TSO model.** The HLC spec models the current
    per-shard-leader ceiling. The centralized TSO proposal
-   (`2026_04_16_proposed_centralized_tso.md`) would change that. The two
+   (`2026_04_16_partial_centralized_tso.md`) would change that. The two
    docs are independent; if/when centralized TSO lands, `HLC.tla` (or a
    sibling `TSO.tla`) is updated as part of that PR. We do **not** block
    this proposal on the TSO decision.
@@ -716,7 +716,7 @@ does not keep this document in `partial`.
 - `distribution/engine.go`, `distribution/catalog.go`,
   `distribution/watcher.go` — route catalog.
 - `docs/architecture_overview.md` — system-level diagrams.
-- `docs/design/2026_04_16_proposed_centralized_tso.md` — the TSO proposal
+- `docs/design/2026_04_16_partial_centralized_tso.md` — the TSO proposal
   that this spec is independent of (Section 9, risk 5).
 - Diego Ongaro's Raft TLA+ specification — reference for the abstract
   `Raft.tla` interface.

@@ -78,4 +78,3 @@ message RelayPublishRequest {
 message RelayPublishResponse {
   int64 subscribers = 1;
 }
-

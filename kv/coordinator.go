@@ -59,6 +59,15 @@ func WithHLC(hlc *HLC) CoordinatorOption {
 	}
 }
 
+// WithTSOAllocator routes coordinator-owned persistence timestamps through a
+// TSO-compatible allocator. When unset, the coordinator keeps using its shared
+// HLC directly.
+func WithTSOAllocator(alloc TimestampAllocator) CoordinatorOption {
+	return func(c *Coordinate) {
+		c.tsAllocator = alloc
+	}
+}
+
 // LeaseReadObserver records lease-read fast-path vs slow-path outcomes
 // without coupling kv to a concrete monitoring backend. It is called once
 // per LeaseRead invocation that actually evaluates the lease (the initial
@@ -143,7 +152,10 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// pointing into this Coordinate.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
 		c.lp = lp
-		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
+		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(func() {
+			c.lease.invalidate()
+			c.invalidateTimestampWindow()
+		})
 	}
 	return c
 }
@@ -191,11 +203,15 @@ type Coordinate struct {
 	// when the engine does not implement raftengine.LeaseProvider. The
 	// engine field is never reassigned after construction, so this stays
 	// in sync without a lock.
-	lp        raftengine.LeaseProvider
-	clock     *HLC
-	connCache GRPCConnCache
-	log       *slog.Logger
-	lease     leaseState
+	lp    raftengine.LeaseProvider
+	clock *HLC
+	// tsAllocator is an optional TSO-backed timestamp source. It is used only
+	// on the leader-side allocation path; follower redirects continue to leave
+	// timestamps blank so the eventual leader allocates them.
+	tsAllocator TimestampAllocator
+	connCache   GRPCConnCache
+	log         *slog.Logger
+	lease       leaseState
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
@@ -543,7 +559,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 		// CommitTS so dispatchTxn generates both timestamps consistently.
 		// A caller-supplied CommitTS without a matching StartTS could produce
 		// CommitTS <= StartTS (an invalid transaction).
-		startTS, err := c.nextStartTS()
+		startTS, err := c.nextStartTS(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -709,6 +725,17 @@ func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err err
 
 func (c *Coordinate) IsLeader() bool {
 	return isLeaderEngine(c.engine)
+}
+
+func (c *Coordinate) IsTimestampLeader() bool {
+	return c.IsLeader()
+}
+
+func (c *Coordinate) invalidateTimestampWindow() {
+	if c == nil {
+		return
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 // IsLeaderAcceptingWrites reports whether this node is leader and not currently
@@ -960,10 +987,46 @@ func (c *Coordinate) EngineGroupIDForKey(_ []byte) uint64 {
 	return coordinateSingleGroupID
 }
 
-func (c *Coordinate) nextStartTS() (uint64, error) {
+func (c *Coordinate) allocateTimestamp(ctx context.Context, label string) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, label, 0)
+}
+
+func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
+	}
+	if c.tsAllocator != nil {
+		if min > 0 {
+			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
+		}
+		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+	}
+	if c.clock == nil {
+		return 0, errors.Wrap(ErrTSOClockNil, label)
+	}
+	if min > 0 {
+		c.clock.Observe(min)
+	}
 	ts, err := c.clock.NextFenced()
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate startTS")
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+// Next makes Coordinate usable as a TimestampAllocator for adapter helpers.
+func (c *Coordinate) Next(ctx context.Context) (uint64, error) {
+	return c.allocateTimestamp(ctx, "allocate coordinator timestamp")
+}
+
+func (c *Coordinate) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	return c.allocateTimestampAfter(ctx, "allocate coordinator timestamp after observed ts", min)
+}
+
+func (c *Coordinate) nextStartTS(ctx context.Context) (uint64, error) {
+	ts, err := c.allocateTimestamp(ctx, "allocate startTS")
+	if err != nil {
+		return 0, err
 	}
 	return ts, nil
 }
@@ -974,22 +1037,26 @@ func (c *Coordinate) nextStartTS() (uint64, error) {
 // (with an Observe-and-retry path when the first allocation is not
 // strictly above startTS); otherwise it Observes the caller-supplied
 // ts to keep HLC monotonic.
-func (c *Coordinate) resolveDispatchCommitTS(commitTS, startTS uint64) (uint64, error) {
+func (c *Coordinate) resolveDispatchCommitTS(ctx context.Context, commitTS, startTS uint64) (uint64, error) {
 	if commitTS != 0 {
-		c.clock.Observe(commitTS)
+		if c.clock != nil {
+			c.clock.Observe(commitTS)
+		}
 		return commitTS, nil
 	}
-	next, err := c.clock.NextFenced()
+	next, err := c.allocateTimestampAfter(ctx, "allocate commitTS", startTS)
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate commitTS")
+		return 0, err
 	}
 	if next > startTS {
 		return next, nil
 	}
-	c.clock.Observe(startTS)
-	retry, err := c.clock.NextFenced()
+	if c.clock != nil {
+		c.clock.Observe(startTS)
+	}
+	retry, err := c.allocateTimestampAfter(ctx, "re-allocate commitTS after Observe", startTS)
 	if err != nil {
-		return 0, errors.Wrap(err, "re-allocate commitTS after Observe")
+		return 0, err
 	}
 	return retry, nil
 }
@@ -1003,7 +1070,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	resolvedCommitTS, err := c.resolveDispatchCommitTS(commitTS, startTS)
+	resolvedCommitTS, err := c.resolveDispatchCommitTS(ctx, commitTS, startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1038,9 +1105,9 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 		muts = append(muts, elemToMutation(elem))
 	}
 
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestamp(ctx, "allocate raw dispatch ts")
 	if err != nil {
-		return nil, errors.Wrap(err, "allocate raw dispatch ts")
+		return nil, err
 	}
 	logs := []*pb.Request{{
 		IsTxn:     false,
