@@ -191,7 +191,7 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 		return []*store.KVPair{}, nil
 	}
 
-	routes, clampToRoutes := s.routesForScan(start, end)
+	routes, clampToRoutes := s.routesForForwardScan(start, end)
 	out, err := s.scanRoutesAt(ctx, routes, start, end, limit, ts, clampToRoutes)
 	if err != nil {
 		return nil, err
@@ -223,7 +223,7 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 		return []*store.KVPair{}, nil
 	}
 
-	routes, clampToRoutes := s.routesForScan(start, end)
+	routes, clampToRoutes := s.routesForReverseScan(start, end)
 	out, err := s.reverseScanRoutesAt(ctx, routes, start, end, limit, ts, clampToRoutes)
 	if err != nil {
 		return nil, err
@@ -234,12 +234,31 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 	return out, nil
 }
 
-func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
+func (s *ShardStore) routesForForwardScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	return s.routesForScan(start, end, true)
+}
+
+func (s *ShardStore) routesForReverseScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	return s.routesForScan(start, end, false)
+}
+
+func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkRoutes bool) ([]distribution.Route, bool) {
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
-	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
-		return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), false
+	if useFilesystemChunkRoutes {
+		if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+			return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), false
+		}
+	}
+	// Reverse raw-scan proxying cannot pass an explicit group ID to the remote
+	// leader, so filesystem chunk reverse scans stay on raw route bounds. The
+	// filesystem service currently uses forward scans for chunk iteration.
+	if !useFilesystemChunkRoutes {
+		if _, _, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+			routes := s.engine.GetIntersectingRoutes(start, end)
+			return routes, true
+		}
 	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.

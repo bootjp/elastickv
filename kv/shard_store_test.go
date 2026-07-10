@@ -270,6 +270,40 @@ func TestShardStoreScanAt_RoutesFilesystemChunkCrossFileSubrangeEndRoute(t *test
 	require.Equal(t, kB0, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_RoutesFilesystemChunkCrossFileCarriedPrefixEnd(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	home := uint64(11)
+	inodeA := uint64(0xfe)
+	inodeB := uint64(0xff)
+	routeA := fskeys.ChunkRouteKey(home, inodeA)
+	routeB := fskeys.ChunkRouteKey(home, inodeB)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeA, 1)
+	engine.UpdateRoute(routeA, routeB, 2)
+	engine.UpdateRoute(routeB, nil, 3)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		3: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	kA := fskeys.ChunkKey(home, inodeA, 7)
+	kB := fskeys.ChunkKey(home, inodeB, 0)
+	require.NoError(t, st.PutAt(ctx, kA, []byte("a7"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, kB, []byte("b0"), 2, 0))
+
+	kvs, err := st.ScanAt(ctx, kA, prefixScanEnd(fskeys.ChunkPrefix(home, inodeB)), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, kA, kvs[0].Key)
+	require.Equal(t, kB, kvs[1].Key)
+}
+
 func TestShardStoreScanAt_RoutesUnboundedFilesystemChunkScanByChunkRouteKey(t *testing.T) {
 	t.Parallel()
 
@@ -333,6 +367,26 @@ func TestShardStoreScanAt_DeduplicatesFilesystemChunkRoutesByGroup(t *testing.T)
 	require.Len(t, kvs, 2)
 	require.Equal(t, k0, kvs[0].Key)
 	require.Equal(t, k1, kvs[1].Key)
+}
+
+func TestShardStoreReverseScanAt_DoesNotUseFilesystemChunkRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+
+	routes, clampToRoutes := st.routesForReverseScan(fskeys.ChunkPrefix(home, inode), prefixScanEnd(fskeys.ChunkPrefix(home, inode)))
+	require.True(t, clampToRoutes)
+	require.Len(t, routes, 1)
+	require.Equal(t, uint64(1), routes[0].GroupID)
 }
 
 // TestShardStoreReverseScanAt_DescendingOrderAcrossShards verifies that

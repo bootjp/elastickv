@@ -113,6 +113,19 @@ func TestChunkScanRouteBoundsCarriedFilePrefixEnd(t *testing.T) {
 	require.Equal(t, prefixEnd(ChunkRouteKey(11, 0xff)), routeEnd)
 }
 
+func TestChunkScanRouteBoundsCrossFileCarriedPrefixEnd(t *testing.T) {
+	t.Parallel()
+
+	start := ChunkKey(11, 0xfe, 7)
+	end := prefixEnd(ChunkPrefix(11, 0xff))
+	require.Less(t, len(end), len(ChunkPrefix(11, 0xff)))
+
+	routeStart, routeEnd, ok := ChunkScanRouteBounds(start, end)
+	require.True(t, ok)
+	require.Equal(t, ChunkRouteKey(11, 0xfe), routeStart)
+	require.Equal(t, prefixEnd(ChunkRouteKey(11, 0xff)), routeEnd)
+}
+
 func TestChunkScanRouteBounds_AllChunks(t *testing.T) {
 	t.Parallel()
 

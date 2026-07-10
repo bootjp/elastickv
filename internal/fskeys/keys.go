@@ -201,7 +201,10 @@ func chunkScanBound(key []byte) ([]byte, bool) {
 		return append([]byte(nil), chunkRoutePrefixBytes...), true
 	}
 	if len(rest) < 2*u64Bytes {
-		return nil, false
+		out := make([]byte, 0, len(chunkRoutePrefixBytes)+len(rest))
+		out = append(out, chunkRoutePrefixBytes...)
+		out = append(out, rest...)
+		return out, true
 	}
 	out := make([]byte, 0, len(chunkRoutePrefixBytes)+2*u64Bytes)
 	out = append(out, chunkRoutePrefixBytes...)
