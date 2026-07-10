@@ -46,9 +46,9 @@ func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint6
 
 func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
 	ctx := context.Background()
-	exists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
+	exists, err := r.hllAnchorExistsAt(ctx, key, readTS)
 	if err != nil {
-		return false, fmt.Errorf("exists hll: %w", err)
+		return false, err
 	}
 	if !exists {
 		return false, nil
@@ -58,6 +58,29 @@ func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
 		return false, err
 	}
 	return !expired, nil
+}
+
+func (r *RedisServer) hllAnchorExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	exists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
+	if err != nil {
+		return false, fmt.Errorf("exists hll: %w", err)
+	}
+	return exists, nil
+}
+
+func (r *RedisServer) loadHLLPayloadAt(ctx context.Context, key []byte, readTS uint64) (redisSetValue, bool, error) {
+	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
+	if err != nil {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
+			return redisSetValue{}, false, nil
+		}
+		return redisSetValue{}, false, cockerrors.WithStack(err)
+	}
+	value, _, _, err := decodeRedisHLL(raw)
+	if err != nil {
+		return redisSetValue{}, true, err
+	}
+	return value, true, nil
 }
 
 // buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
@@ -293,7 +316,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		if err := r.rejectHLLPayloadForSetCreate(key, readTS, typ); err != nil {
+		if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
 			return err
 		}
 
@@ -346,11 +369,11 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 	conn.WriteInt(changed)
 }
 
-func (r *RedisServer) rejectHLLPayloadForSetCreate(key []byte, readTS uint64, typ redisValueType) error {
+func (r *RedisServer) rejectHLLPayloadForSetCreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) error {
 	if typ != redisTypeNone {
 		return nil
 	}
-	hllExists, err := r.hllExistsAt(key, readTS)
+	hllExists, err := r.hllAnchorExistsAt(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
@@ -728,7 +751,7 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 		}
-		value, err := r.loadSetAt(ctx, hllKind, key, readTS)
+		value, _, err := r.loadHLLPayloadAt(ctx, key, readTS)
 		if err != nil {
 			writeRedisError(conn, err)
 			return

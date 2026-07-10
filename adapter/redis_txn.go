@@ -1877,6 +1877,11 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 			continue
 		}
 		key := []byte(k)
+		inline, ok := t.zsetInlineTTLCreateElems(k, key, st)
+		if ok {
+			elems = append(elems, inline...)
+			continue
+		}
 		if st.isWide {
 			wideElems, lenDelta := buildZSetWideElems(key, st)
 			elems = append(elems, wideElems...)
@@ -1906,6 +1911,37 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 		)
 	}
 	return elems, nil
+}
+
+func (t *txnContext) zsetInlineTTLCreateElems(key string, userKey []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], bool) {
+	ttlMs, ok := t.collectionTTLMillis(key)
+	if !ok || st.exists || st.isWide || len(st.origMembers) != 0 || len(st.members) == 0 {
+		return nil, false
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)*zsetOpsPerEntry+setWideColOverhead)
+	for _, entry := range zsetMapToEntries(st.members) {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey(userKey, []byte(entry.Member)),
+				Value: store.MarshalZSetScore(entry.Score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey(userKey, entry.Score, []byte(entry.Member)),
+				Value: []byte{},
+			},
+		)
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ZSetMetaKey(userKey),
+			Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(st.members)), ExpireAt: ttlMs}),
+		},
+		redisTxnWideZSetFenceElem(userKey),
+	)
+	return elems, true
 }
 
 // buildZSetWideElems computes the minimal set of ops to transition from st.origMembers to

@@ -172,6 +172,8 @@ const (
 	zsetMetaBaseElems   = 1 // PUT or DEL ZSetMetaKey
 	zsetElemsPerAdded   = 3 // optional DEL stale score key + PUT member key + PUT score key
 	zsetElemsPerRemoved = 2 // DEL member key + DEL score key
+
+	listFullCommitExtraElems = 2 // PUT ListMetaKey + wide-list fence key
 )
 
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
@@ -3344,6 +3346,10 @@ func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(key)
+	if err != nil {
+		return luaCommitPlan{}, err
+	}
 	if st.materialized {
 		elems, err := c.listCommitElems(key, commitTS)
 		return luaCommitPlan{elems: elems}, err
@@ -3356,11 +3362,15 @@ func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommi
 		elems, err := c.listCommitElems(key, commitTS)
 		return luaCommitPlan{elems: elems}, err
 	}
+	if rewriteForTTL {
+		elems, err := c.listCommitElems(key, commitTS)
+		return luaCommitPlan{elems: elems}, err
+	}
 	elems, err := c.listDeltaCommitElems(key, st, commitTS)
 	return luaCommitPlan{preserveExisting: true, elems: elems}, err
 }
 
-func (c *luaScriptContext) listCommitElems(key string, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) listCommitElems(key string, _ uint64) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.listState([]byte(key))
 	if err != nil {
 		return nil, err
@@ -3368,27 +3378,31 @@ func (c *luaScriptContext) listCommitElems(key string, commitTS uint64) ([]*kv.E
 	if err := c.materializeList([]byte(key), st); err != nil {
 		return nil, err
 	}
-	values := make([][]byte, 0, len(st.values))
-	for _, value := range st.values {
-		values = append(values, []byte(value))
-	}
-
-	listElems, _, err := c.server.buildRPushOps(store.ListMeta{}, []byte(key), values, commitTS, 0)
-	if err != nil {
-		return nil, err
+	if len(st.values) == 0 {
+		return nil, nil
 	}
 	ttl, err := c.finalTTL([]byte(key))
 	if err != nil {
 		return nil, err
 	}
-	if ttl != nil {
-		meta, err := store.MarshalListMeta(store.ListMeta{ExpireAt: ttlMillis(ttl)})
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		listElems = append(listElems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaKey([]byte(key)), Value: meta})
+	keyBytes := []byte(key)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.values)+listFullCommitExtraElems)
+	for seq, value := range st.values {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   listItemKey(keyBytes, int64(seq)),
+			Value: []byte(value),
+		})
 	}
-	return listElems, nil
+	meta, err := store.MarshalListMeta(store.ListMeta{Len: int64(len(st.values)), ExpireAt: ttlMillis(ttl)})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaKey(keyBytes), Value: meta},
+		redisTxnWideListFenceElem(keyBytes),
+	)
+	return elems, nil
 }
 
 func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
@@ -3545,11 +3559,18 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(key)
+	if err != nil {
+		return luaCommitPlan{}, err
+	}
 	// physicallyExistsAtStart is true when the key had physical ZSet data in
 	// storage at script start but was TTL-expired (logically absent). Force a
 	// full commit so deleteLogicalKeyElems removes stale wide-column rows
 	// (members, score-index, meta, TTL) that were left by the expired ZSet.
 	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
+		return c.zsetFullCommitWithMerge(key, st)
+	}
+	if rewriteForTTL {
 		return c.zsetFullCommitWithMerge(key, st)
 	}
 	if st.legacyBlobBase {
@@ -3562,6 +3583,18 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	}
 	// Delta path: write only changed members + score index + metadata delta.
 	return luaCommitPlan{preserveExisting: true, elems: c.zsetDeltaCommitElems(key, st, commitTS)}, nil
+}
+
+func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(key string) (bool, error) {
+	st := c.ttls[key]
+	if st == nil || !st.dirty || st.value == nil {
+		return false, nil
+	}
+	typ, err := c.server.keyTypeAt(context.Background(), []byte(key), c.startTS)
+	if err != nil {
+		return false, err
+	}
+	return typ == redisTypeNone, nil
 }
 
 // zsetFullCommitWithMerge returns a full wide-column commit plan for key. When
