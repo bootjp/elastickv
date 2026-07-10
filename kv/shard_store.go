@@ -280,15 +280,23 @@ func dedupeRoutesByGroup(routes []distribution.Route) []distribution.Route {
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
+	seenGroups := make(map[uint64]struct{})
 	for _, route := range routes {
+		if !clampToRoutes {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
+		}
 		scanStart := start
 		scanEnd := end
+		explicitGroup := !clampToRoutes && len(start) > 0
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
 		}
 
-		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, false)
+		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, explicitGroup)
 		if err != nil {
 			return nil, err
 		}

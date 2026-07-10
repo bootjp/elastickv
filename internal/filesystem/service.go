@@ -36,6 +36,7 @@ const (
 	statFSScanPageSize                     = 512
 	chunkDeleteTxnPageSize                 = 512
 	chunkDeleteWriteConflictRetries        = 8
+	chunkDeleteWriteConflictBackoff        = 10 * time.Millisecond
 	openRefScanLimit                       = 2
 	openTxnRetryLimit                      = 4
 )
@@ -1745,15 +1746,40 @@ func (s *Service) deleteChunkPages(ctx context.Context, plan *chunkDeletePlan) e
 		if done {
 			return nil
 		}
-		if writeConflict {
-			writeConflictRetries++
-			if writeConflictRetries >= chunkDeleteWriteConflictRetries {
-				return errors.Wrap(store.ErrWriteConflict, "filesystem chunk delete retry limit reached")
-			}
-		} else {
+		if !writeConflict {
 			writeConflictRetries = 0
+		} else {
+			writeConflictRetries++
+			writeConflictRetries, err = handleChunkDeleteWriteConflict(ctx, plan, writeConflictRetries)
+			if err != nil {
+				return err
+			}
 		}
 		start = next
+	}
+}
+
+func handleChunkDeleteWriteConflict(ctx context.Context, plan *chunkDeletePlan, retries int) (int, error) {
+	if retries < chunkDeleteWriteConflictRetries {
+		return retries, nil
+	}
+	if plan.protectLiveSize {
+		return retries, errors.Wrap(store.ErrWriteConflict, "filesystem chunk delete retry limit reached")
+	}
+	if err := waitChunkDeleteRetry(ctx); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+func waitChunkDeleteRetry(ctx context.Context) error {
+	timer := time.NewTimer(chunkDeleteWriteConflictBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "filesystem chunk delete retry wait")
+	case <-timer.C:
+		return nil
 	}
 }
 

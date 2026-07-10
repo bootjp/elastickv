@@ -56,6 +56,17 @@ func TestChunkScanRouteBounds(t *testing.T) {
 	require.Equal(t, prefixEnd(ChunkRouteKey(11, 22)), routeEnd)
 }
 
+func TestChunkScanRouteBoundsSameFileSubrange(t *testing.T) {
+	t.Parallel()
+
+	start := ChunkKey(11, 22, 7)
+	end := scanCursorAfterForTest(ChunkKey(11, 22, 7))
+	routeStart, routeEnd, ok := ChunkScanRouteBounds(start, end)
+	require.True(t, ok)
+	require.Equal(t, ChunkRouteKey(11, 22), routeStart)
+	require.Equal(t, prefixEnd(ChunkRouteKey(11, 22)), routeEnd)
+}
+
 func TestChunkScanRouteBounds_AllChunks(t *testing.T) {
 	t.Parallel()
 
@@ -82,4 +93,9 @@ func TestNormalizeSplitBoundarySnapsFilesystemChunkKeys(t *testing.T) {
 	require.Equal(t, routeKey, NormalizeSplitBoundary(insideRouteKey))
 	require.Equal(t, routeKey, NormalizeSplitBoundary(routeKey))
 	require.Equal(t, InodeKey(22), NormalizeSplitBoundary(InodeKey(22)))
+}
+
+func scanCursorAfterForTest(key []byte) []byte {
+	out := append([]byte(nil), key...)
+	return append(out, 0)
 }

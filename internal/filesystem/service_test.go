@@ -110,6 +110,25 @@ func (c *writeConflictCoordinator) Dispatch(context.Context, *kv.OperationGroup[
 	return nil, store.ErrWriteConflict
 }
 
+type transientWriteConflictCoordinator struct {
+	inner     *testCoordinator
+	remaining int
+	calls     int
+}
+
+func (c *transientWriteConflictCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *transientWriteConflictCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.calls++
+	if c.remaining > 0 {
+		c.remaining--
+		return nil, store.ErrWriteConflict
+	}
+	return c.inner.Dispatch(ctx, req)
+}
+
 func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
@@ -791,10 +810,41 @@ func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) 
 	require.NoError(t, err)
 	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
 	require.NoError(t, err)
+	forceInodeSizeForTest(t, ctx, svc, file.Inode, 0)
 
 	inner, ok := svc.dispatch.(*testCoordinator)
 	require.True(t, ok)
 	conflicts := &writeConflictCoordinator{inner: inner}
+	svc.dispatch = conflicts
+
+	err = svc.deleteChunkPages(ctx, &chunkDeletePlan{
+		homeSlot:        file.Inode,
+		inode:           file.Inode,
+		chunkSize:       testChunkSize,
+		start:           fskeys.ChunkPrefix(file.Inode, file.Inode),
+		protectLiveSize: true,
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.Contains(t, err.Error(), "filesystem chunk delete retry limit reached")
+	require.Equal(t, chunkDeleteWriteConflictRetries, conflicts.calls)
+}
+
+func TestServiceDeleteChunkPagesContinuesUnprotectedAfterRetryLimit(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
+	require.NoError(t, err)
+
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{
+		inner:     inner,
+		remaining: chunkDeleteWriteConflictRetries + 1,
+	}
 	svc.dispatch = conflicts
 
 	err = svc.deleteChunkPages(ctx, &chunkDeletePlan{
@@ -803,9 +853,10 @@ func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) 
 		chunkSize: testChunkSize,
 		start:     fskeys.ChunkPrefix(file.Inode, file.Inode),
 	})
-	require.ErrorIs(t, err, store.ErrWriteConflict)
-	require.Contains(t, err.Error(), "filesystem chunk delete retry limit reached")
-	require.Equal(t, chunkDeleteWriteConflictRetries, conflicts.calls)
+	require.NoError(t, err)
+	require.Greater(t, conflicts.calls, chunkDeleteWriteConflictRetries)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, 0), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {

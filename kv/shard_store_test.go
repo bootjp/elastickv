@@ -205,6 +205,35 @@ func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_RoutesFilesystemChunkSubrangeByChunkRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	k0 := fskeys.ChunkKey(home, inode, 0)
+	k1 := fskeys.ChunkKey(home, inode, 1)
+	require.NoError(t, st.PutAt(ctx, k0, []byte("c0"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, k1, []byte("c1"), 2, 0))
+
+	kvs, err := st.ScanAt(ctx, k0, nextScanCursor(k0), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, k0, kvs[0].Key)
+}
+
 func TestShardStoreScanAt_DeduplicatesFilesystemChunkRoutesByGroup(t *testing.T) {
 	t.Parallel()
 
