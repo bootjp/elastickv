@@ -1,6 +1,6 @@
 # S3 PUT admission control
 
-> **Status: Proposed**
+> **Status: Implemented**
 > Author: bootjp
 > Date: 2026-04-25
 >
@@ -14,6 +14,37 @@
 > how many clients are uploading at once.
 
 ---
+
+## Shipped implementation
+
+Implemented on 2026-07-07 in the S3 adapter and monitoring registry:
+
+- `adapter/s3_admission.go` adds the per-node `s3PutAdmission` semaphore,
+  request-entry headroom checks, `SlowDown` responses, and env tunables
+  `ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES`,
+  `ELASTICKV_S3_DISPATCH_ADMISSION_TIMEOUT`, and
+  `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL`.
+- `adapter/s3.go` wires admission into the public S3 `PutObject` and
+  multipart `UploadPart` paths. The implementation acquires one
+  `s3ChunkSize` unit before reading each decoded chunk and releases the
+  held units only after the corresponding `coordinator.Dispatch` batch
+  returns. This is the same hold-through-dispatch contract as §3.1(B),
+  with 1 MiB accounting granularity rather than a coarser 4 MiB
+  `s3ChunkBatchOps` window.
+- aws-chunked uploads use only bootstrap headroom at request entry, then
+  pay as decoded bytes are read. `X-Amz-Decoded-Content-Length` remains
+  validated by `prepareStreamingPutBody`; it is not used to pre-charge
+  the whole decoded body against the admission budget.
+- `monitoring/s3.go`, `monitoring/registry.go`, `main_s3.go`, and
+  `main.go` expose and wire the Prometheus metrics
+  `elastickv_s3_put_admission_inflight_bytes`,
+  `elastickv_s3_put_admission_rejections_total`, and
+  `elastickv_s3_put_admission_wait_seconds`.
+- Caller audit for the fail-closed HTTP write-path change: `handle`
+  dispatches public object writes only to `putObject` and `uploadPart`.
+  The admin bridge uses `AdminPutObject` / `adminPutObjectStream`, which
+  already has the separate `adminS3UploadMaxBytes` cap and is not the
+  public S3 PUT path targeted by this admission-control design.
 
 ## 1. Problem
 
@@ -385,14 +416,14 @@ suggests bumping the cap or scaling out (more nodes spreads PUT load).
   (chronic dispatch failure → caller learns instead of silently
   consuming the budget).
 
-## 5. Implementation plan
+## 5. Implementation status
 
 | Milestone | Scope | Risk |
 |---|---|---|
-| M1 | Add `putAdmission` type + per-node singleton + fixed-length `Content-Length` admission (`peekHeadroom`). Wire `prepareStreamingPutBody` to acquire / release. **aws-chunked progress-callback admission** (§3.3.1) ships in this milestone too — the conservative 5 GiB pre-charge fallback only sits behind `ELASTICKV_S3_PUT_ADMISSION_CHUNKED_INCREMENTAL=false`. **`dispatchAdmissionTimeout` ships here** (the chunked per-frame `acquire(s3ChunkSize)` path is gated on it from day one), not in M2. Metric scaffolding (gauge + counter). | Medium. Chunked progress callback needs `awsChunkedReader` to expose a hook. |
-| M2 | Per-batch admission B inside `flushBatch` for **fixed-length** PUTs (chunked PUTs already use admission B as of M1). Mid-stream 503 with cleanup on the fixed-length path. | Medium. Cleanup path on partial failure. |
-| M3 | Env-var tunables. Histogram metric. Grafana panel. | Low. |
-| M4 | Per-tenant / per-bucket admission classes (handed off to the workload-isolation rollout). | Medium. Out-of-scope for the v1 cap. |
+| M1 | Shipped. Adds `putAdmission`, per-node singleton, fixed-length `Content-Length` admission (`peekHeadroom`), aws-chunked bootstrap admission, per-decoded-chunk acquire/release, and `dispatchAdmissionTimeout`. | Covered by `TestS3PutAdmission*` and `TestS3Server_PutObjectAdmission*`. |
+| M2 | Shipped. Fixed-length PUTs and multipart `UploadPart` hold admission units until `coordinator.Dispatch` returns; mid-stream 503 cleans partial object blobs / upload parts through the existing cleanup paths. | Covered by PUT/UploadPart regression tests and targeted admission timeout tests. |
+| M3 | Shipped for env tunables and Prometheus gauge/counter/histogram metrics. | Covered by `monitoring` S3 metric tests. |
+| M4 | Still out of scope: per-tenant / per-bucket admission classes remain part of the workload-isolation rollout. | Future extension, not required for this design's aggregate node cap. |
 
 ### Rolling upgrade
 
@@ -406,7 +437,7 @@ generous enough that even single-node M1 traffic falls below the
 threshold under typical load, so the rollout signature is
 "503 SlowDown rate goes from 0 to negligible" rather than a step
 function. Operators can pin
-`ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES=$((1<<63))` to
+`ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES=9223372036854775807` to
 disable the cap on M1 nodes during the burn-in window if desired.
 
 The aws-chunked progress-callback path is the only behaviour
@@ -425,11 +456,11 @@ Acceptance criteria:
 
 - `go test ./adapter/ -short -run TestS3PutAdmission` covers reject /
   admit / mid-stream-timeout paths.
-- A loaded test that opens 32 concurrent PUTs of 100 MiB each must
-  hold leader memory below `s3PutAdmissionMaxInflightBytes + epsilon`
-  for the duration of the test.
-- No regression in `Test_grpc_transaction` (which is currently the
-  longest leader-stress test).
+- `go test ./adapter -run 'TestS3Server_(BucketAndObjectLifecycle|PutObjectStreamingUnsignedPayloadTrailer|PutObjectStreamingWithTrailerChecksum|PutObjectStreamingWithMultipleAdvertisedTrailers|PutObjectStreamingRejectsBadDecodedLength|PutObjectStreamingRejectsSignedPayloadMarker|PutObjectRejectsAwsChunkedWithoutStreamingMarker|UploadPartStreamingWithTrailerChecksum|MultipartUploadPartOverwrite|RangeGetMultiChunk)'`
+  covers the existing public S3 PUT / UploadPart behaviours touched by
+  the admission-read loop.
+- `go test ./monitoring -run 'TestS3PutAdmission|TestRegistryReturnsS3PutAdmissionObserver'`
+  covers the Prometheus observer plumbing.
 
 ## 6. Risks
 

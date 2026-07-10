@@ -2,11 +2,20 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented |
 | Date | 2026-05-26 |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 process-start path) |
 | Builds on | 6A (`ApplyRegistration` §4.1 case 1–4 dispatch), 5B (`RegisterEncryptionWriter` RPC + leader Proposer wiring), 6C-3 (`ErrLocalEpochRollback`), 6D-6c-2 (`BumpLocalEpoch`, `DeterministicNonceFactory`, keystore hydration) |
-| Slice of | Stage 7 (writer registry + deterministic nonce). 7b (post-rotation re-registration) and 7c (ConfChange-time registration) follow. |
+| Slice of | Stage 7 (writer registry + deterministic nonce). 7b (post-rotation re-registration) and 7c (ConfChange-time registration) are implemented. |
+
+## Implementation audit
+
+Implemented in `main_encryption_registration.go`, `kv/sharded_coordinator.go`,
+and the writer-registry helpers in `store` / `internal/encryption`.
+Tests live in `kv/sharded_coordinator_registration_gate_test.go`,
+`main_encryption_registration_test.go`, and encryption/store registration
+gate suites.
 
 ## 0. Why this slice exists
 

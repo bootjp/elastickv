@@ -1,12 +1,13 @@
 # Raft Learner support
 
-> **Status: Proposed**
+> **Status: Implemented — learner membership primitive shipped; follower-served
+> reads and Jepsen partition-hardening remain separate follow-up work.**
 > Author: bootjp
 > Date: 2026-04-26
 >
 > Builds on the etcd/raft migration (`2026_04_05_implemented_etcd_raft_migration.md`).
 > Phase 3 of that doc deliberately deferred learner / non-voter membership;
-> this proposal closes that gap. It is independent of — but compatible with —
+> this implementation closes that gap. It is independent of — but compatible with —
 > the future follower-served-read effort, which would consume learners as a
 > read replica primitive.
 
@@ -79,9 +80,9 @@ dormant support on.
 - Follower-served reads (`LinearizableRead` answered locally on a follower
   or learner). That is a separate proposal that consumes this primitive;
   it requires its own treatment of staleness bounds, lease invalidation,
-  and adapter routing changes. Until that lands, learners forward
-  `LinearizableRead` to the leader's `ReadIndex` like any other follower
-  would.
+  and adapter routing changes. Until that lands, learners return
+  `ErrNotLeader` from engine-local `LinearizableRead`; callers that need
+  a read from a learner-facing endpoint must route the read to the leader.
 - Joint consensus / atomic multi-member reconfig. `validateConfState`
   continues to reject `VotersOutgoing`, `LearnersNext`, and `AutoLeave`.
   Learner add/promote uses the simple V1 single-step `ConfChange` path that
@@ -178,7 +179,7 @@ type Admin interface {
 
     AddVoter(ctx context.Context, id, address string, prevIndex uint64) (uint64, error)
     AddLearner(ctx context.Context, id, address string, prevIndex uint64) (uint64, error)
-    PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error)
+    PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
     RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 
     TransferLeadership(ctx context.Context) error
@@ -208,12 +209,11 @@ Notes on the new methods:
      proposing. The `Progress` map is read directly from `rawNode.Status()`
      inside the admin handler — same goroutine that owns the rawNode —
      so no lock or clone is required.
-  3. `minAppliedIndex == 0` is **discouraged**: it skips the
-     precondition. We accept the convention to stay consistent with the
-     existing `prevIndex` ("0 means don't check the config index") on
-     the same RPC family, but the runbook calls it out as a footgun and
-     §8 lists "should we use a separate `skip_min_applied_check` boolean
-     instead" as an open question.
+  3. `minAppliedIndex == 0` is rejected unless
+     `skipMinAppliedCheck == true`. The explicit skip flag prevents
+     scripts that omit the catch-up bound from silently disabling the
+     promotion safety check; callers that intentionally bypass the
+     guard must name that choice in the request.
 - `RemoveServer` is unchanged. etcd/raft handles `ConfChangeRemoveNode` for
   a learner correctly, and the existing path already calls `peerForID` /
   `removePeer`.
@@ -486,7 +486,8 @@ message RaftAdminAddLearnerRequest {
 message RaftAdminPromoteLearnerRequest {
   string id = 1;
   uint64 previous_index = 2;
-  uint64 min_applied_index = 3; // 0 = skip precondition
+  uint64 min_applied_index = 3; // must be >0 unless skip_min_applied_check is true
+  bool skip_min_applied_check = 4;
 }
 ```
 
@@ -498,7 +499,7 @@ existing wiring helpers (`adminError`, the `Unimplemented` guard for
 
 ```text
 raftadmin <addr> add_learner <id> <address> [previous_index]
-raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index]
+raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]
 ```
 
 The existing `configuration` subcommand already prints the per-server
@@ -750,11 +751,12 @@ because each of these passes informs the milestone breakdown.
   this. We add an explicit unit test on `LeaseProvider`:
   `LastQuorumAck()` returns the zero `Instant` on a learner regardless
   of cluster ack traffic.
-- `LinearizableRead` on a learner: the current implementation forwards
-  to the leader's `ReadIndex` and waits for local apply. Behaviour on a
-  learner is identical to behaviour on a slow follower — local apply
-  may take longer, but staleness bound is the same. We add a behaviour
-  test that exercises this.
+- `LinearizableRead` on a learner: the current implementation returns
+  `ErrNotLeader` instead of forwarding internally. That keeps the engine
+  contract identical to follower reads in the rest of elastickv: routing
+  belongs to the caller/proxy layer, and this learner primitive only
+  supplies the non-voting replication role that such a future read path
+  can consume.
 - HLC: learners never issue persistence timestamps. The
   `Coordinator.HLC().Next()` call site is leader-gated already; a
   learner that somehow got asked for a timestamp would be rejected by
@@ -789,8 +791,9 @@ because each of these passes informs the milestone breakdown.
   slow learner — the catch-up replica is exactly the slow consumer the
   spool was designed to handle, and it is the most likely place for a
   regression to land.
-- Behaviour test: `LinearizableRead` on a learner forwards to leader's
-  `ReadIndex` and returns once local apply catches up.
+- Behaviour test: `LinearizableRead` on a learner returns `ErrNotLeader`,
+  so the engine cannot accidentally serve local learner reads before a
+  separate follower-read design lands.
 - Property test for the conf-change context codec is unchanged
   (`encodeConfChangeContext` already round-trips peer metadata for the
   V1 conf-change types we use).
@@ -845,7 +848,8 @@ Exit criteria:
 - Operator runbook update in `docs/etcd_raft_migration_operations.md`
   (or a sibling runbook) covering attach-as-learner / promote / verify
   via `raftadmin configuration`.
-- Behaviour test: `LinearizableRead` on a learner forwards correctly.
+- Behaviour test: `LinearizableRead` on a learner returns `ErrNotLeader`;
+  caller/proxy forwarding is deferred to a separate follower-read design.
 
 Exit criteria: a manual operator workflow that brings up a
 single-process 3-node demo cluster, attaches a learner via
@@ -864,10 +868,14 @@ single-process 3-node demo cluster, attaches a learner via
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
 
-After Milestone 3, rename
-`docs/design/2026_04_26_proposed_raft_learner.md` →
-`docs/design/2026_04_26_implemented_raft_learner.md` (or
-`*_partial_*` if Milestone 3 slips behind Milestone 2 shipping).
+The shipped learner primitive includes the engine API, etcd backend learner
+handling, v2 peers-file suffrage persistence, admin RPC/CLI surface,
+join-as-learner alarm, monitoring suffrage labels, promotion precondition
+checks against leader `Progress.Match`, and the operator runbook
+(`docs/raft_learner_operations.md`). Remaining Milestone 3 hardening is not
+claimed shipped here: the learner attach/promote-under-partition Jepsen
+workload and a first-class `Status.PerPeer` progress field are still open, and
+follower-served read routing remains a separate proposal.
 
 ## 7. Risks
 
@@ -884,9 +892,10 @@ After Milestone 3, rename
    policy in `multiraft_runtime.go`.
 3. **Operator promotes a not-yet-caught-up learner.** Mitigation:
    `min_applied_index` precondition checked against
-   `Progress[nodeID].Match` on the leader. Default `0` skips the check
-   for compatibility with scripts that don't set it; the runbook
-   strongly recommends a non-zero value.
+   `Progress[nodeID].Match` on the leader. Default `0` is rejected
+   unless `skip_min_applied_check=true`, so scripts that omit the
+   catch-up bound get a clean `FailedPrecondition` instead of silently
+   disabling the safety check.
 4. **Learner cannot become leader by accident.** etcd/raft already
    enforces this; we inherit the property. The rejection path in
    `handleTransferLeadership` already documents it (rejects transfer to

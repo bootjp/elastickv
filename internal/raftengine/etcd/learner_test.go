@@ -11,7 +11,7 @@ import (
 )
 
 // TestAddLearnerReplicatesWithoutCountingAsVoter is the headline M1
-// test from docs/design/2026_04_26_proposed_raft_learner.md exit
+// test from docs/design/2026_04_26_implemented_raft_learner.md exit
 // criterion 1: a learner attached to a 1-voter cluster receives log
 // entries, but does not count toward the voter quorum.
 func TestAddLearnerReplicatesWithoutCountingAsVoter(t *testing.T) {
