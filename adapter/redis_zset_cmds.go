@@ -669,8 +669,6 @@ func (r *RedisServer) dispatchAndSignalZSet(
 	zsetKey []byte,
 	readKeys [][]byte,
 ) error {
-	endFastApply := r.applyObserver.beginFastZSetApply(zsetKey)
-	defer endFastApply()
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
@@ -1207,7 +1205,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	// slow probe. The first iteration is always full so an existing
 	// wrongType key surfaces an immediate WRONGTYPE; subsequent
 	// iterations after a fast-safe signal-driven wake skip the wrongType
-	// detection. Local ZADD / ZINCRBY use zsetWaiters.Signal and are
+	// detection. The post-Dispatch local ZADD / ZINCRBY signal is
 	// fast-safe; broad FSM apply notifications use SignalFull so they
 	// force the next iteration back through the full wrongType check.
 	//
