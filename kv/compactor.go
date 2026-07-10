@@ -14,6 +14,7 @@ const (
 	defaultFSMCompactorInterval        = 5 * time.Minute
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
+	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
 )
 
 type RaftStatusProvider interface {
@@ -34,6 +35,7 @@ type FSMCompactor struct {
 	interval        time.Duration
 	retentionWindow time.Duration
 	timeout         time.Duration
+	leaderTimeout   time.Duration
 	logger          *slog.Logger
 }
 
@@ -67,6 +69,14 @@ func WithFSMCompactorTimeout(timeout time.Duration) FSMCompactorOption {
 	}
 }
 
+func WithFSMCompactorLeaderTimeout(timeout time.Duration) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if timeout > 0 {
+			c.leaderTimeout = timeout
+		}
+	}
+}
+
 func WithFSMCompactorLogger(logger *slog.Logger) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if logger != nil {
@@ -81,6 +91,7 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		interval:        defaultFSMCompactorInterval,
 		retentionWindow: defaultFSMCompactorRetentionWindow,
 		timeout:         defaultFSMCompactorTimeout,
+		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
 		logger:          slog.Default(),
 	}
 	for _, opt := range opts {
@@ -166,7 +177,7 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		return nil
 	}
 
-	compactCtx, cancel := c.compactContext(ctx)
+	compactCtx, cancel := c.compactContext(ctx, status)
 	defer cancel()
 
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
@@ -197,15 +208,22 @@ func (c *FSMCompactor) targetMinTS(lastCommitTS, minRetainedTS uint64, now time.
 	return safeMinTS, true
 }
 
-func (c *FSMCompactor) compactContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.timeout <= 0 {
+func (c *FSMCompactor) compactContext(ctx context.Context, status raftengine.Status) (context.Context, context.CancelFunc) {
+	timeout := c.timeout
+	if status.State == raftengine.StateLeader && c.leaderTimeout > 0 && (timeout <= 0 || c.leaderTimeout < timeout) {
+		timeout = c.leaderTimeout
+	}
+	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.timeout)
+	return context.WithTimeout(ctx, timeout)
 }
 
 func shouldSkipFSMCompaction(status raftengine.Status) bool {
 	if status.State == raftengine.StateCandidate {
+		return true
+	}
+	if status.LeadTransferee != 0 || status.PendingConfChange {
 		return true
 	}
 	if status.FSMPending > 0 {
