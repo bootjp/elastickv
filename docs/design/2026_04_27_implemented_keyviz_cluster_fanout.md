@@ -65,7 +65,8 @@ identity needed for the canonical §9.1 write merge.
     `(bucketID, raftGroupID, leaderTerm, column)`: max within one
     `(group, term)` identity, sum across distinct leader terms for
     the same group/window, and surface `conflicts[j]=true` when
-    two sources disagree inside the same `(group, term, column)`.
+    two sources disagree inside the same `(group, term, column)` or
+    when the unknown-identity fallback sees distinct non-zero values.
     The row-level `conflict` field remains as the OR of
     `conflicts[]` for older SPAs. If any source lacks
     `raftGroupID` or `leaderTerm`, that cell falls back to the
@@ -94,11 +95,20 @@ identity needed for the canonical §9.1 write merge.
 
 ```sh
 elastickv \
-  --address 127.0.0.1:50051 \
-  --adminListen 127.0.0.1:8080 \
+  --address 10.0.0.1:50051 \
+  --adminEnabled \
+  --adminListen 10.0.0.1:8080 \
+  --adminAllowPlaintextNonLoopback \
   --keyvizEnabled \
   --keyvizFanoutNodes=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080
 ```
+
+The example is the node-1 process. Node 2 and node 3 use their own
+reachable `--adminListen` address (`10.0.0.2:8080`,
+`10.0.0.3:8080`) while keeping the same symmetric
+`--keyvizFanoutNodes` list. `--adminEnabled` is required; without it
+the HTTP admin handler is not mounted. Non-loopback plaintext requires
+the explicit `--adminAllowPlaintextNonLoopback` opt-in shown above.
 
 - Self is included implicitly: `internal/admin` matches each
   `--keyvizFanoutNodes` entry against `--adminListen` and skips the
@@ -121,11 +131,12 @@ elastickv \
     per request) but wasteful; operators should prefer the literal
     `--adminListen` value in the flag.
 - Empty (or unset) flag → fan-out disabled, current behaviour.
-- Each entry is a host:port. TLS is out of scope for Phase 2-C
-  (intra-cluster admin traffic is assumed to ride a private
-  network); the HTTP client uses `http://`. A follow-up will
-  introduce `--keyvizFanoutTLS` once the rest of the admin path
-  has TLS too.
+- Each entry is either `host:port` or a full URL. The host-only form is
+  interpreted as `http://host:port`. Deployments that enable admin TLS
+  must use explicit `https://host:port` entries:
+  `--keyvizFanoutNodes=https://node1.internal:8443,https://node2.internal:8443`.
+  The URL builder preserves explicit schemes, so TLS fan-out does not
+  require a separate flag.
 - **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
   the inbound user's cookies (`admin_session` + `admin_csrf` only)
   on every peer call. The peer's `SessionAuth` middleware verifies
@@ -149,8 +160,8 @@ elastickv \
     cookie-forwarding scheme above is what actually works.
   - **Trust model**: forwarding a session cookie to peers is safe
     when (a) every peer is operator-configured and trusted, and
-    (b) the network is private (cookies are HttpOnly but ride
-    plaintext HTTP for now). `--keyvizFanoutNodes` is the
+    (b) the network path is private or TLS-protected (cookies are
+    HttpOnly but still ride the peer request). `--keyvizFanoutNodes` is the
     operator's explicit trust list. **Do NOT point
     `--keyvizFanoutNodes` at an untrusted host** — the user's
     admin session would be replayed there.
@@ -201,14 +212,18 @@ columns or even in the same column. The merge:
 - sums the resolved values across distinct `leaderTerm` values for
   the same `(bucketID, raftGroupID, column)`, preserving both sides
   of a real leadership transition;
-- sets `conflicts[j]=true` only when two sources report different
-  non-zero values for the same `(group, term, column)` identity.
+- sets `conflicts[j]=true` when two sources report different non-zero
+  values for the same `(group, term, column)` identity.
 
 For mixed-version clusters or cells whose identity is unknown
 (`raftGroupID == 0` or `leaderTerm == 0`), that cell falls back to
 the legacy max-merge. This fallback is deliberately conservative:
 it may under-count a transition involving an old peer, but it does
-not over-count overlapping unknown and known-term samples.
+not over-count overlapping unknown and known-term samples. If the
+fallback observes multiple distinct non-zero values, it also sets the
+per-cell conflict bit because operators are seeing a rollout-era
+known/unknown disagreement, not a clean same-term Raft invariant
+violation.
 
 ### 4.3 Bytes counters
 
@@ -298,9 +313,10 @@ A future warning array would be an additive wire extension.
 
 `conflicts[]` is parallel to `values[]` and marks only the columns
 where the fan-out merge saw disagreement inside the same
-`(bucketID, raftGroupID, leaderTerm, column)` identity. `conflict`
-is the row-level OR of `conflicts[]` and remains on the wire for
-older SPAs that only know how to hatch a whole row.
+`(bucketID, raftGroupID, leaderTerm, column)` identity or distinct
+non-zero values under the unknown-identity fallback. `conflict` is the
+row-level OR of `conflicts[]` and remains on the wire for older SPAs
+that only know how to hatch a whole row.
 
 `KeyVizRow.Conflict` is tagged `json:"conflict,omitempty"`, so
 absence means `false`. Only the fan-out aggregator sets
