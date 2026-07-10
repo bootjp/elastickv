@@ -91,6 +91,7 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 		Key:   store.SetMetaKey(key),
 		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
 	})
+	elems = append(elems, redisTxnWideSetFenceElem(key))
 	return elems, nil
 }
 
@@ -288,13 +289,18 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		if err := r.validateExactSetKind(setKind, key, readTS); err != nil {
+		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeSet)
+		if err != nil {
+			return err
+		}
+		if err := r.rejectHLLPayloadForSetCreate(key, readTS, typ); err != nil {
 			return err
 		}
 
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "mutateExactSetWide: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "mutateExactSetWide: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 
 		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
@@ -319,14 +325,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return nil
 		}
 
-		if lenDelta != 0 {
-			deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.SetMetaDeltaKey(key, commitTS, 0),
-				Value: deltaVal,
-			})
-		}
+		elems = appendSetDeltaElems(elems, key, lenDelta, commitTS)
 
 		if len(elems) == 0 {
 			return nil
@@ -334,8 +333,9 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
+			ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideSetFenceKey),
 			Elems:    elems,
 		})
 		return cockerrors.WithStack(dispatchErr)
@@ -344,6 +344,33 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+func (r *RedisServer) rejectHLLPayloadForSetCreate(key []byte, readTS uint64, typ redisValueType) error {
+	if typ != redisTypeNone {
+		return nil
+	}
+	hllExists, err := r.hllExistsAt(key, readTS)
+	if err != nil {
+		return err
+	}
+	if hllExists {
+		return wrongTypeError()
+	}
+	return nil
+}
+
+func appendSetDeltaElems(elems []*kv.Elem[kv.OP], key []byte, lenDelta int64, commitTS uint64) []*kv.Elem[kv.OP] {
+	if lenDelta == 0 {
+		return elems
+	}
+	elems = append(elems, redisTxnWideSetFenceElem(key))
+	deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
+	return append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.SetMetaDeltaKey(key, commitTS, 0),
+		Value: deltaVal,
+	})
 }
 
 // scanSetMemberExistsMap does a paginated prefix scan of all member keys for

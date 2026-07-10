@@ -148,12 +148,11 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 			if err != nil {
 				return nil, err
 			}
-			legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-			if err != nil {
-				return nil, err
-			}
-			if legacyTTL != 0 && legacyTTL != ttlMs {
-				ttlMs = legacyTTL
+			if ttlMs == 0 {
+				ttlMs, err = legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+				if err != nil {
+					return nil, err
+				}
 			}
 			desired := marshal(n, ttlMs)
 			elems := putIfChanged(pair.Key, pair.Value, desired)
@@ -454,11 +453,11 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-	if err != nil {
-		return nil, err
-	}
-	if legacyTTL != 0 && legacyTTL != meta.ExpireAt {
+	if meta.ExpireAt == 0 {
+		legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+		if err != nil {
+			return nil, err
+		}
 		meta.ExpireAt = legacyTTL
 	}
 	desired, err := store.MarshalListMeta(meta)
@@ -485,11 +484,11 @@ func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
-	if err != nil {
-		return nil, err
-	}
-	if legacyTTL != 0 && legacyTTL != meta.ExpireAt {
+	if meta.ExpireAt == 0 {
+		legacyTTL, err := legacyTTLMillisAt(ctx, c.st, userKey, readTS)
+		if err != nil {
+			return nil, err
+		}
 		meta.ExpireAt = legacyTTL
 	}
 	desired, err := store.MarshalStreamMeta(meta)

@@ -18,6 +18,9 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	if r.runStandaloneDedup(conn, cmd) {
+		return
+	}
 	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:])
 	if err != nil {
 		writeRedisError(conn, err)
@@ -28,6 +31,9 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
+	if r.runStandaloneDedup(conn, cmd) {
 		return
 	}
 	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:]); err != nil {
@@ -122,9 +128,10 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 			return err
 		}
 
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "applyHashFieldPairs: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "applyHashFieldPairs: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 
 		// Atomically migrate any legacy blob on first wide-column write.
@@ -156,11 +163,14 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		// Emit a single delta key for all newly-added fields.
 		if newFields != 0 {
 			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-				Value: deltaVal,
-			})
+			elems = append(elems,
+				redisTxnWideHashFenceElem(key),
+				&kv.Elem[kv.OP]{
+					Op:    kv.Put,
+					Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+					Value: deltaVal,
+				},
+			)
 		}
 
 		if len(elems) == 0 {
@@ -169,7 +179,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			Elems:    elems,
 		})
@@ -374,9 +384,10 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	if removed == 0 {
 		return 0, nil
 	}
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hdelWideColumn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "hdelWideColumn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
@@ -387,7 +398,7 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	})
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
@@ -673,7 +684,7 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
-func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, increment int64) (int64, error) {
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64) (int64, error) {
 	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
@@ -685,16 +696,20 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-			Value: deltaVal,
-		})
+		elems = append(elems,
+			redisTxnWideHashFenceElem(key),
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			},
+		)
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideHashFenceKey),
 		Elems:    elems,
 	})
 	return current, cockerrors.WithStack(dispatchErr)
@@ -702,13 +717,15 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeHash); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
+	if err != nil {
 		return 0, err
 	}
 
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hincrbyTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "hincrbyTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 	fieldKey := store.HashFieldKey(key, field)
 
@@ -719,7 +736,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 
 	// If a legacy blob exists, migrate it atomically with the increment.
 	if len(legacyValue) > 0 {
-		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, increment)
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, typ, increment)
 	}
 
 	current += increment
@@ -728,16 +745,20 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-			Value: deltaVal,
-		})
+		elems = append(elems,
+			redisTxnWideHashFenceElem(key),
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			},
+		)
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
+		ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideHashFenceKey),
 		Elems:    elems,
 	})
 	return current, cockerrors.WithStack(dispatchErr)
@@ -747,6 +768,13 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	if r.runStandaloneDedup(conn, cmd) {
+		return
+	}
+	r.incrLegacy(conn, cmd)
+}
+
+func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var current int64

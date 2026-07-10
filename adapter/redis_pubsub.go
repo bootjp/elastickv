@@ -19,14 +19,17 @@ const (
 // so channel counts are always available without relying on reflect/unsafe
 // to introspect redcon internals.
 type redisPubSub struct {
-	mu    sync.RWMutex
-	conns map[redcon.Conn]*pubsubConn
+	mu      sync.RWMutex
+	conns   map[redcon.Conn]*pubsubConn
+	detach  func(redcon.Conn) redcon.DetachedConn
+	onClose func(redcon.Conn)
 	// subs maps channel → set of *pubsubConn subscribed to it
 	subs map[string]map[*pubsubConn]struct{}
 }
 
 type pubsubConn struct {
 	mu      sync.Mutex
+	conn    redcon.Conn
 	dconn   redcon.DetachedConn
 	chans   map[string]struct{}
 	closed  bool
@@ -34,10 +37,14 @@ type pubsubConn struct {
 }
 
 func newRedisPubSub() *redisPubSub {
-	return &redisPubSub{
+	ps := &redisPubSub{
 		conns: make(map[redcon.Conn]*pubsubConn),
 		subs:  make(map[string]map[*pubsubConn]struct{}),
 	}
+	ps.detach = func(conn redcon.Conn) redcon.DetachedConn {
+		return conn.Detach()
+	}
+	return ps
 }
 
 // Subscribe adds a connection to a channel. On first call for a given
@@ -108,8 +115,9 @@ func (ps *redisPubSub) getOrCreate(conn redcon.Conn) (*pubsubConn, bool) {
 	if ok {
 		return sc, false
 	}
-	dconn := conn.Detach()
+	dconn := ps.detach(conn)
 	sc = &pubsubConn{
+		conn:    conn,
 		dconn:   dconn,
 		chans:   make(map[string]struct{}),
 		closeCh: make(chan struct{}),
@@ -328,5 +336,8 @@ func (sc *pubsubConn) cleanup(ps *redisPubSub) {
 	sc.closed = true
 	sc.mu.Unlock()
 	sc.dconn.Close()
+	if ps.onClose != nil {
+		ps.onClose(sc.conn)
+	}
 	close(sc.closeCh)
 }

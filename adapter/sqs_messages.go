@@ -474,12 +474,13 @@ func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (
 // OCC transaction (§4.2): a rejected request never reaches the
 // coordinator.
 func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
+	throttleEpoch := s.throttle.queueEpoch(queueName)
 	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
 		return nil, 0, 0, false
 	}
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch) {
 		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
@@ -556,6 +557,57 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		"MD5OfMessageBody":       rec.MD5OfBody,
 		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
 	})
+}
+
+func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sqsSendMessageInput) (map[string]string, error) {
+	throttleEpoch := s.throttle.queueEpoch(queueName)
+	meta, readTS, apiErr := s.loadQueueMetaForSend(ctx, queueName, []byte(in.MessageBody))
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if err := s.chargeQueueWithThrottleErr(queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch); err != nil {
+		return nil, err
+	}
+	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
+		return nil, apiErr
+	}
+	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
+		return nil, apiErr
+	}
+	delay, apiErr := resolveSendDelay(meta, in.DelaySeconds)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if meta.IsFIFO {
+		return s.runFifoSendWithRetry(ctx, queueName, in)
+	}
+
+	rec, recordBytes, apiErr := buildSendRecord(meta, in, delay)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	const partition uint32 = 0
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, rec.MessageID)
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
+	req := &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: dataKey, Value: recordBytes},
+			{Op: kv.Put, Key: visKey, Value: []byte(rec.MessageID)},
+			{Op: kv.Put, Key: byAgeKey, Value: []byte(rec.MessageID)},
+		},
+	}
+	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return map[string]string{
+		"MessageId":              rec.MessageID,
+		"MD5OfMessageBody":       rec.MD5OfBody,
+		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
+	}, nil
 }
 
 // sendMessageFifoLoop runs the dedup-aware OCC send for FIFO queues
@@ -759,6 +811,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	throttleEpoch := s.throttle.queueEpoch(queueName)
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
@@ -773,7 +826,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	// don't pay an extra meta read just to discover throttling is
 	// off. Sits AFTER the QueueDoesNotExist branch — a missing queue
 	// should not consume a Recv token.
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation, throttleEpoch) {
 		return
 	}
 	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)
@@ -807,6 +860,45 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
+}
+
+func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in sqsReceiveMessageInput) ([]map[string]any, error) {
+	if _, err := kv.LeaseReadThrough(s.coordinator, ctx); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	throttleEpoch := s.throttle.queueEpoch(queueName)
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	if err := s.chargeQueueWithThrottleErr(queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation, throttleEpoch); err != nil {
+		return nil, err
+	}
+	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)
+	if maxErr != nil {
+		return nil, maxErr
+	}
+	visibilityTimeout := meta.VisibilityTimeoutSeconds
+	if in.VisibilityTimeout != nil {
+		if *in.VisibilityTimeout < 0 || *in.VisibilityTimeout > sqsChangeVisibilityMaxSeconds {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "VisibilityTimeout out of range")
+		}
+		visibilityTimeout = *in.VisibilityTimeout
+	}
+	waitSeconds, waitErr := resolveReceiveWaitSeconds(in.WaitTimeSeconds, meta.ReceiveMessageWaitSeconds)
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	return s.longPollReceive(ctx, queueName, sqsReceiveOptions{
+		Max:                   max,
+		VisibilityTimeout:     visibilityTimeout,
+		WaitSeconds:           waitSeconds,
+		MessageAttributeNames: in.MessageAttributeNames,
+	})
 }
 
 // sqsReceiveOptions bundles the per-request settings that ride down
@@ -1501,6 +1593,13 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{})
 }
 
+func (s *SQSServer) deleteMessageCore(ctx context.Context, queueName string, handle *decodedReceiptHandle) error {
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, 1); err != nil {
+		return err
+	}
+	return s.deleteMessageWithRetry(ctx, queueName, handle)
+}
+
 // deleteMessageWithRetry runs the load-check-commit flow under one OCC
 // budget. AWS SQS semantics: a stale receipt handle (message already
 // gone, or token rotated by another consumer) is a 200 no-op, NOT an
@@ -1663,6 +1762,16 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) changeMessageVisibilityCore(ctx context.Context, queueName string, handle *decodedReceiptHandle, timeout int64) error {
+	if timeout < 0 || timeout > sqsChangeVisibilityMaxSeconds {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "VisibilityTimeout out of range")
+	}
+	if err := s.chargeQueueErr(ctx, queueName, bucketActionReceive, 1); err != nil {
+		return err
+	}
+	return s.changeVisibilityWithRetry(ctx, queueName, handle, timeout)
 }
 
 // changeVisibilityWithRetry runs the validate-and-swap flow under an OCC

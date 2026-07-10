@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  NODES="n1=raft-1.internal,n2=raft-2.internal,n3=raft-3.internal" ./scripts/rolling-update.sh
+  NODES="n1=raft-1.internal,n2=raft-2.internal,n3=raft-3.internal" ./scripts/rolling-update.sh [--dry-run]
 
 Required environment:
   NODES
@@ -238,10 +238,10 @@ SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
 # fails fast on genuine crash-loop bugs (which never finish (1) or (2)).
 # Operators with smaller FSMs can shrink HEALTH_TIMEOUT_SECONDS via env.
 # Root-cause fix (skip restoreSnapshotState when the on-disk FSM is
-# already at >= snapshot.Metadata.Index): see PR #910 and
-# docs/design/2026_06_02_idempotent_snapshot_restore.md. Once that
-# lands and steady-state skip rates are observed in production, this
-# default can be tightened back down.
+# already at >= snapshot.Metadata.Index) shipped in PR #915 / #934;
+# see docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md.
+# Once steady-state skip rates are observed in production, this default
+# can be tightened back down.
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
 # Maximum leader-commit-to-candidate-last-log lag tolerated for a targeted
@@ -322,6 +322,11 @@ KEYVIZ_HOT_KEYS_SAMPLE_RATE="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
 
+DRY_RUN="${DRY_RUN:-false}"
+if [[ "$DRY_RUN_ARG" == "true" ]]; then
+  DRY_RUN=true
+fi
+
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
 # printf %q) for readability, which is only safe when the value is
@@ -354,6 +359,11 @@ fi
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
+
+if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
+  echo "DRY_RUN must be true or false" >&2
+  exit 1
+fi
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -1634,8 +1644,15 @@ merge_extra_env() {
   fi
   for pair in "${user_pairs[@]}"; do
     [[ -n "$pair" ]] || continue
-    [[ "$pair" == *=* ]] || continue
+    if [[ "$pair" != *=* || "$pair" == =* ]]; then
+      echo "rolling-update: malformed EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+      return 1
+    fi
     key="${pair%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "rolling-update: malformed EXTRA_ENV key '$key' in entry '$pair' (key must match [A-Za-z_][A-Za-z0-9_]*)" >&2
+      return 1
+    fi
     seen+="${key} "
   done
 
@@ -1658,6 +1675,11 @@ merge_extra_env() {
       fi
       if [[ "${pair%%=*}" == "" ]]; then
         echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (empty key)" >&2
+        return 1
+      fi
+      key="${pair%%=*}"
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV key '$key' in entry '$pair' (key must match [A-Za-z_][A-Za-z0-9_]*)" >&2
         return 1
       fi
     done
@@ -1703,6 +1725,16 @@ validate_extra_env_pairs() {
 
 EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
 validate_extra_env_pairs "$EXTRA_ENV_NORMALISED"
+EXTRA_ENV="$EXTRA_ENV_NORMALISED"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  print_dry_run_plan
+  exit 0
+fi
+
+ensure_local_raftadmin
+ensure_remote_raftadmin_binaries
+
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
 CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
@@ -1761,14 +1793,6 @@ KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
 KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
-
-if [[ "$DRY_RUN" == "true" ]]; then
-  print_dry_run_plan
-  exit 0
-fi
-
-ensure_local_raftadmin
-ensure_remote_raftadmin_binaries
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

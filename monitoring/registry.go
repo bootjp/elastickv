@@ -23,6 +23,7 @@ type Registry struct {
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
+	s3            *S3Metrics
 	hlc           *HLCMetrics
 	hlcObserver   *HLCObserver
 	coldStart     *ColdStartMetrics
@@ -51,6 +52,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
+	r.s3 = newS3Metrics(registerer)
 	r.hlc = newHLCMetrics(registerer)
 	r.hlcObserver = newHLCObserver(r.hlc)
 	r.coldStart = newColdStartMetrics(registerer)
@@ -216,6 +218,16 @@ func (r *Registry) SQSObserver() *SQSObserver {
 		return nil
 	}
 	return r.sqsObserver
+}
+
+// S3PutAdmissionObserver returns the S3 PUT admission metrics observer backed
+// by this registry. The adapter owns admission decisions and calls this small
+// interface directly from the hot path.
+func (r *Registry) S3PutAdmissionObserver() S3PutAdmissionObserver {
+	if r == nil || r.s3 == nil {
+		return nil
+	}
+	return r.s3
 }
 
 // WriteConflictCollector returns a collector that polls each MVCC

@@ -62,10 +62,6 @@ type adminListenerConfig struct {
 	fullAccessKeys     []string
 }
 
-// startAdminFromFlags is the single entrypoint main.run() uses to stand
-// up the admin listener. It owns the flag → config translation and the
-// credentials loading so run() does not inherit that complexity.
-//
 // keyVizFanoutConfig bundles the operator-supplied fan-out flags.
 // Empty Nodes leaves the keyviz handler in single-node mode.
 type keyVizFanoutConfig struct {
@@ -73,14 +69,16 @@ type keyVizFanoutConfig struct {
 	Timeout time.Duration
 }
 
+// prepareAdminFromFlags owns the flag → config translation and credentials
+// loading so run() does not inherit that complexity.
+//
 // When admin is disabled (the default) the function returns immediately
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(
+func prepareAdminFromFlags(
 	ctx context.Context,
 	lc *net.ListenConfig,
-	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
 	s3Server *adapter.S3Server,
@@ -89,13 +87,13 @@ func startAdminFromFlags(
 	connCache *kv.GRPCConnCache,
 	keyvizSampler *keyviz.MemSampler,
 	keyvizFanoutCfg keyVizFanoutConfig,
-) error {
+) (*preparedAdminServer, error) {
 	if !*adminEnabled {
-		return nil
+		return nil, nil
 	}
 	staticCreds, err := loadS3StaticCredentials(*s3CredsFile)
 	if err != nil {
-		return errors.Wrapf(err, "load static credentials for admin listener")
+		return nil, errors.Wrapf(err, "load static credentials for admin listener")
 	}
 	// An admin listener with zero credentials would accept logins
 	// only to reject every one of them with invalid_credentials, so a
@@ -105,16 +103,16 @@ func startAdminFromFlags(
 	// untyped `== nil` check cannot detect a nil-map-valued interface
 	// on its own).
 	if len(staticCreds) == 0 {
-		return errors.New("admin listener is enabled but no static credentials are configured; " +
+		return nil, errors.New("admin listener is enabled but no static credentials are configured; " +
 			"set -s3CredentialsFile to a file with at least one entry")
 	}
 	primaryKey, err := resolveSigningKey(*adminSessionSigningKey, *adminSessionSigningKeyFile, envAdminSessionSigningKey)
 	if err != nil {
-		return errors.Wrap(err, "resolve -adminSessionSigningKey")
+		return nil, errors.Wrap(err, "resolve -adminSessionSigningKey")
 	}
 	previousKey, err := resolveSigningKey(*adminSessionSigningKeyPrevious, *adminSessionSigningKeyPreviousFile, envAdminSessionSigningKeyPrevious)
 	if err != nil {
-		return errors.Wrap(err, "resolve -adminSessionSigningKeyPrevious")
+		return nil, errors.Wrap(err, "resolve -adminSessionSigningKeyPrevious")
 	}
 	cfg := adminListenerConfig{
 		enabled:                   *adminEnabled,
@@ -134,11 +132,10 @@ func startAdminFromFlags(
 	queuesSrc := newSqsQueuesSource(sqsServer)
 	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
 	if err != nil {
-		return errors.Wrap(err, "build admin leader forwarder")
+		return nil, errors.Wrap(err, "build admin leader forwarder")
 	}
 	leaderProbe := newAdminLeaderProbe(coordinate)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
-	return err
+	return prepareAdminServer(ctx, lc, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
 }
 
 // newAdminLeaderProbe builds the LeaderProbe consumed by
@@ -1019,21 +1016,17 @@ func buildAdminConfig(in adminListenerConfig) admin.Config {
 	}
 }
 
-// startAdminServer validates the admin configuration, constructs the admin
-// server, and attaches its lifecycle to eg. It is a no-op when the admin
-// listener is disabled. Errors at this point are hard startup failures:
-// the design doc mandates ハードエラーで起動失敗 for every invalid
-// configuration, and we honour that uniformly.
-//
-// The returned address is the actual host:port the listener bound to; it
-// differs from adminCfg.Listen only when the caller passed a port of 0,
-// but tests rely on this to avoid the bind-close-rebind race that a
-// pre-allocated free-port helper would otherwise introduce. When admin
-// is disabled the returned address is empty.
-func startAdminServer(
+type preparedAdminServer struct {
+	httpSrv    *http.Server
+	listener   net.Listener
+	cfg        admin.Config
+	tlsEnabled bool
+	version    string
+}
+
+func prepareAdminServer(
 	ctx context.Context,
 	lc *net.ListenConfig,
-	eg *errgroup.Group,
 	cfg adminListenerConfig,
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
@@ -1045,20 +1038,20 @@ func startAdminServer(
 	keyvizSampler *keyviz.MemSampler,
 	keyvizFanoutCfg keyVizFanoutConfig,
 	version string,
-) (string, error) {
+) (*preparedAdminServer, error) {
 	adminCfg := buildAdminConfig(cfg)
 	enabled, err := checkAdminConfig(&adminCfg, cluster)
 	if err != nil || !enabled {
-		return "", err
+		return nil, err
 	}
 	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	httpSrv := newAdminHTTPServer(server)
 	listener, err := lc.Listen(ctx, "tcp", adminCfg.Listen)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to listen on admin address %s", adminCfg.Listen)
+		return nil, errors.Wrapf(err, "failed to listen on admin address %s", adminCfg.Listen)
 	}
 	tlsEnabled := strings.TrimSpace(adminCfg.TLSCertFile) != "" && strings.TrimSpace(adminCfg.TLSKeyFile) != ""
 	if tlsEnabled {
@@ -1069,8 +1062,31 @@ func startAdminServer(
 	// task so the shutdown banner matches startup.
 	boundCfg := adminCfg
 	boundCfg.Listen = actualAddr
-	registerAdminLifecycle(ctx, eg, httpSrv, listener, &boundCfg, tlsEnabled, version)
-	return actualAddr, nil
+	return &preparedAdminServer{
+		httpSrv:    httpSrv,
+		listener:   listener,
+		cfg:        boundCfg,
+		tlsEnabled: tlsEnabled,
+		version:    version,
+	}, nil
+}
+
+func (p *preparedAdminServer) start(ctx context.Context, eg *errgroup.Group) {
+	if p == nil || p.httpSrv == nil || p.listener == nil {
+		return
+	}
+	registerAdminLifecycle(ctx, eg, p.httpSrv, p.listener, &p.cfg, p.tlsEnabled, p.version)
+	p.listener = nil
+}
+
+func (p *preparedAdminServer) close() {
+	if p == nil {
+		return
+	}
+	if p.listener != nil {
+		_ = p.listener.Close()
+		p.listener = nil
+	}
 }
 
 // checkAdminConfig validates adminCfg; returns (enabled=false, nil) when

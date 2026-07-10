@@ -12,6 +12,7 @@ import (
 	etcdsnap "go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
@@ -50,11 +51,11 @@ func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
 	require.Equal(t, res.CRC32C, binary.BigEndian.Uint32(fsmBytes[len(fsmBytes)-fsmFooterSize:]))
 
 	snap, err := etcdsnap.New(zap.NewNop(), filepath.Join(dataDir, snapDirName)).
-		LoadNewestAvailable([]walpb.Snapshot{{Index: 42, Term: 7}})
+		LoadNewestAvailable([]*walpb.Snapshot{{Index: proto.Uint64(42), Term: proto.Uint64(7)}})
 	require.NoError(t, err)
-	require.Equal(t, uint64(42), snap.Metadata.Index)
-	require.Equal(t, uint64(7), snap.Metadata.Term)
-	require.Equal(t, []uint64{1, 2}, snap.Metadata.ConfState.Voters)
+	require.Equal(t, uint64(42), snap.GetMetadata().GetIndex())
+	require.Equal(t, uint64(7), snap.GetMetadata().GetTerm())
+	require.Equal(t, []uint64{1, 2}, snap.GetMetadata().GetConfState().GetVoters())
 	tok, err := decodeSnapshotToken(snap.Data)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), tok.Index)

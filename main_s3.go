@@ -32,6 +32,56 @@ func startS3Server(
 	credentialsFile string,
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
+	putAdmissionObserver adapter.S3PutAdmissionObserver,
+) (*adapter.S3Server, error) {
+	s3Server, _, err := prepareS3Server(
+		ctx, lc, s3Addr, shardStore, coordinate, leaderS3, region,
+		credentialsFile, pathStyleOnly, readTracker, putAdmissionObserver,
+	)
+	if err != nil {
+		return nil, err
+	}
+	runS3Server(ctx, eg, s3Server)
+	return s3Server, nil
+}
+
+func prepareS3Server(
+	ctx context.Context,
+	lc *net.ListenConfig,
+	s3Addr string,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	leaderS3 map[string]string,
+	region string,
+	credentialsFile string,
+	pathStyleOnly bool,
+	readTracker *kv.ActiveTimestampTracker,
+	putAdmissionObserver adapter.S3PutAdmissionObserver,
+) (*adapter.S3Server, net.Listener, error) {
+	s3Server, err := newS3Server(
+		s3Addr, shardStore, coordinate, leaderS3, region, credentialsFile,
+		pathStyleOnly, readTracker, putAdmissionObserver,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	s3L, err := bindS3Server(ctx, lc, s3Addr, s3Server)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s3Server, s3L, nil
+}
+
+func newS3Server(
+	s3Addr string,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	leaderS3 map[string]string,
+	region string,
+	credentialsFile string,
+	pathStyleOnly bool,
+	readTracker *kv.ActiveTimestampTracker,
+	putAdmissionObserver adapter.S3PutAdmissionObserver,
 ) (*adapter.S3Server, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
 	if s3Addr == "" {
@@ -44,17 +94,12 @@ func startS3Server(
 	if !pathStyleOnly {
 		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
-	s3L, err := lc.Listen(ctx, "tcp", s3Addr)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen on %s", s3Addr)
-	}
 	staticCreds, err := loadS3StaticCredentials(credentialsFile)
 	if err != nil {
-		_ = s3L.Close()
 		return nil, err
 	}
 	s3Server := adapter.NewS3Server(
-		s3L,
+		nil,
 		s3Addr,
 		shardStore,
 		coordinate,
@@ -62,7 +107,28 @@ func startS3Server(
 		adapter.WithS3Region(region),
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
+		adapter.WithS3PutAdmissionObserver(putAdmissionObserver),
 	)
+	return s3Server, nil
+}
+
+func bindS3Server(ctx context.Context, lc *net.ListenConfig, s3Addr string, s3Server *adapter.S3Server) (net.Listener, error) {
+	s3Addr = strings.TrimSpace(s3Addr)
+	if s3Server == nil || s3Addr == "" {
+		return nil, nil
+	}
+	s3L, err := lc.Listen(ctx, "tcp", s3Addr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to listen on %s", s3Addr)
+	}
+	s3Server.SetListener(s3L)
+	return s3L, nil
+}
+
+func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Server) {
+	if s3Server == nil {
+		return
+	}
 	runDoneCtx, runDoneCancel := context.WithCancel(context.Background())
 	eg.Go(func() error {
 		select {
@@ -80,7 +146,6 @@ func startS3Server(
 		}
 		return errors.WithStack(err)
 	})
-	return s3Server, nil
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {

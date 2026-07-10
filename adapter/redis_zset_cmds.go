@@ -591,13 +591,15 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
 		return 0, err
 	}
 
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zaddTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "zaddTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 
 	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
@@ -638,6 +640,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		return 0, nil
 	}
 
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 	if lenDelta != 0 {
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
 		elems = append(elems, &kv.Elem[kv.OP]{
@@ -647,7 +650,8 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key)
+	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey))
 }
 
 // dispatchAndSignalZSet dispatches the elems through the coordinator
@@ -663,11 +667,13 @@ func (r *RedisServer) dispatchAndSignalZSet(
 	readTS, commitTS uint64,
 	elems []*kv.Elem[kv.OP],
 	zsetKey []byte,
+	readKeys [][]byte,
 ) error {
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: readKeys,
 		Elems:    elems,
 	})
 	if err != nil {
@@ -681,14 +687,16 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
 		return 0, err
 	}
 
 	memberKey := store.ZSetMemberKey(key, []byte(member))
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "zincrbyTxn: allocate commitTS")
 	if err != nil {
-		return 0, cockerrors.Wrap(err, "zincrbyTxn: allocate commitTS")
+		return 0, cockerrors.WithStack(err)
 	}
 
 	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
@@ -716,6 +724,7 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	elems = append(elems,
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(newScore)},
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, []byte(member)), Value: []byte{}},
+		redisTxnWideZSetFenceElem(key),
 	)
 	if !memberExists {
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1})
@@ -725,7 +734,8 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 			Value: deltaVal,
 		})
 	}
-	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key); err != nil {
+	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey)); err != nil {
 		return 0, err
 	}
 	return newScore, nil
@@ -833,9 +843,10 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 		}
 		elems, lenDelta := buildZSetWideElems(key, st)
 		if lenDelta != 0 {
-			commitTS, err := r.coordinator.Clock().NextFenced()
+			startTS := normalizeStartTS(readTS)
+			commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetEntriesTxn: allocate commitTS")
 			if err != nil {
-				return cockerrors.Wrap(err, "persistZSetEntriesTxn: allocate commitTS")
+				return cockerrors.WithStack(err)
 			}
 			deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
 			elems = append(elems, &kv.Elem[kv.OP]{
@@ -845,8 +856,9 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 			})
 			_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 				IsTxn:    true,
-				StartTS:  normalizeStartTS(readTS),
+				StartTS:  startTS,
 				CommitTS: commitTS,
+				ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 				Elems:    elems,
 			})
 			return cockerrors.WithStack(dispatchErr)
@@ -880,9 +892,10 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	if len(probeKVs) == 0 {
 		return r.persistZSetEntriesTxn(ctx, key, readTS, remaining)
 	}
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetRemovalsTxn: allocate commitTS")
 	if err != nil {
-		return cockerrors.Wrap(err, "persistZSetRemovalsTxn: allocate commitTS")
+		return cockerrors.WithStack(err)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(removed)*zsetOpsPerEntry+1)
 	for _, entry := range removed {
@@ -898,10 +911,12 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
 		Value: deltaVal,
 	})
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
+		ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 		Elems:    elems,
 	})
 	return cockerrors.WithStack(dispatchErr)
@@ -1123,20 +1138,23 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 	}
 	if isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistBZPopMinResult: allocate commitTS")
 		if err != nil {
-			return cockerrors.Wrap(err, "persistBZPopMinResult: allocate commitTS")
+			return cockerrors.WithStack(err)
 		}
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
 		elems := []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
 			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
 			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
+			redisTxnWideZSetFenceElem(key),
 		}
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
+			ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 			Elems:    elems,
 		})
 		return cockerrors.WithStack(dispatchErr)
@@ -1152,7 +1170,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
-	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+	if r.proxyBlockingToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	timeoutSeconds, err := strconv.ParseFloat(string(cmd.Args[len(cmd.Args)-1]), 64)
@@ -1186,9 +1204,10 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	// fast tracks whether the next iteration may skip the wrongType
 	// slow probe. The first iteration is always full so an existing
 	// wrongType key surfaces an immediate WRONGTYPE; subsequent
-	// iterations after a signal-driven wake skip the wrongType
-	// detection because zsetWaiters.Signal only fires for ZADD /
-	// ZINCRBY (neither of which can introduce a wrongType).
+	// iterations after a fast-safe signal-driven wake skip the wrongType
+	// detection. The post-Dispatch local ZADD / ZINCRBY signal is
+	// fast-safe; broad FSM apply notifications use SignalFull so they
+	// force the next iteration back through the full wrongType check.
 	//
 	// lastFullCheck wall-time-bounds how long the fast mode can stay
 	// active under sustained signal pressure. Without this gate, a
@@ -1210,7 +1229,14 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		if r.bzpopminTryAllKeys(conn, keys, fast) {
+		var done bool
+		if ok := r.runWithHeavyCommandSlot(func() {
+			done = r.bzpopminTryAllKeys(conn, keys, fast)
+		}); !ok {
+			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+			return
+		}
+		if done {
 			return
 		}
 		if !fast {
@@ -1220,7 +1246,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		signaled := waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
+		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline)
 		fast = signaled && time.Since(lastFullCheck) < redisBlockWaitFallback
 	}
 }
@@ -1228,9 +1254,9 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 // bzpopminTryAllKeys runs one tryBZPopMinWithMode pass across keys.
 // Returns true when a result was written (success or terminal error)
 // and the caller should stop the loop, false to continue waiting.
-// The fast flag is forwarded to tryBZPopMinWithMode: true selects
-// the signal-driven-wake path (skips wrongType detection); false
-// selects the full check.
+// The fast flag is forwarded to tryBZPopMinWithMode: true selects the
+// fast-safe signal-driven-wake path (skips wrongType detection); false selects
+// the full check.
 func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast bool) bool {
 	for _, key := range keys {
 		result, err := r.tryBZPopMinWithMode(key, fast)
@@ -1262,15 +1288,15 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast b
 // waiterC is per-domain (streamWaiters vs zsetWaiters), but the
 // timer-and-select shape is identical.
 //
-// Returns true iff the wake came from waiterC (i.e., a producer
-// Signal). False on fallback-timer fire or handlerCtx cancellation.
-// Callers that have a signal-implied invariant (e.g., "only ZADD /
-// ZINCRBY fires zsetWaiters.Signal") can use the return value to
-// pick a faster re-check on the next iteration; fallback wakes
-// always need the full check because writes that bypass Signal
-// (Lua flush, follower-applied entries, wrongType-introducing
-// commands) only become observable through the timer branch.
-func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) bool {
+// Returns true iff the wake came from a fast-safe producer Signal. False on
+// fallback-timer fire, handlerCtx cancellation, or SignalFull. Callers that have
+// a signal-implied invariant (e.g., "only ZADD / ZINCRBY fires
+// zsetWaiters.Signal") can use the return value to pick a faster re-check on
+// the next iteration; fallback and SignalFull wakes always need the full check
+// because writes that bypass fast-safe Signal (Lua flush, follower-applied
+// entries, wrongType-introducing commands) may be observable only through those
+// paths.
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiter *keyWaiter, deadline time.Time) bool {
 	fallback := redisBlockWaitFallback
 	if remaining := time.Until(deadline); remaining < fallback {
 		fallback = remaining
@@ -1289,8 +1315,8 @@ func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan stru
 		}
 	}()
 	select {
-	case <-waiterC:
-		return true
+	case <-waiter.C:
+		return waiter.fastSignalAllowed()
 	case <-timer.C:
 		return false
 	case <-handlerCtx.Done():

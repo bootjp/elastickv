@@ -111,6 +111,73 @@ func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
+func TestRouteDescriptorCodecAcceptsForwardVersionTail(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw[0] = catalogRouteCodecVersion + 1
+	raw = append(raw, bytes.Repeat([]byte{0xee}, catalogUint64Bytes)...)
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode forward route: %v", err)
+	}
+	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecAcceptsForwardVersionTailWithNilEnd(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("m"),
+		End:           nil,
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw[0] = catalogRouteCodecVersion + 1
+	raw = append(raw, bytes.Repeat([]byte{0xee}, catalogUint64Bytes)...)
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode forward route: %v", err)
+	}
+	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw[0] = catalogRouteCodecVersionMin - 1
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
 func TestCatalogRouteKeyHelpers(t *testing.T) {
 	key := CatalogRouteKey(11)
 	if !IsCatalogRouteKey(key) {

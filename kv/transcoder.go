@@ -51,7 +51,7 @@ type OperationGroup[T OP] struct {
 	// "unpinned" — every existing caller leaves it at zero so this
 	// is behaviour-neutral on the M1 plumbing PR.  M3 of the
 	// Composed-1 design
-	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md)
+	// (docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md)
 	// will gate the FSM apply path on this version so a route shift
 	// between BeginTxn and Commit is caught before it can produce a
 	// G1c anomaly across a cross-group MoveRange / SplitRange.

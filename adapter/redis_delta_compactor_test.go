@@ -172,27 +172,126 @@ func TestRedisHasExpiredSkipsLegacyTTLWhenFallbackDisabled(t *testing.T) {
 	require.False(t, expired)
 }
 
-func TestDeltaCompactor_TTLInlineRefreshesStaleInlineHashMeta(t *testing.T) {
+func TestDeltaCompactor_TTLInlineDoesNotOverwriteCurrentMetaFromStaleLegacyIndex(t *testing.T) {
 	t.Parallel()
 
-	st, c := newDeltaCompactorTestFixture(t)
 	ctx := context.Background()
-	key := []byte("ttl:migrate:stale-hash")
+	currentExpireAt := time.Now().Add(2 * time.Hour)
 	staleExpireAt := time.Now().Add(time.Hour)
-	latestExpireAt := time.Now().Add(2 * time.Hour)
-	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key),
-		store.MarshalHashMeta(store.HashMeta{Len: 3, ExpireAt: redisExpireAtMillis(staleExpireAt)}), 1, 0))
-	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(latestExpireAt), 2, 0))
+	currentMs := redisExpireAtMillis(currentExpireAt)
+	cases := []struct {
+		name string
+		key  []byte
+		seed func(store.MVCCStore, []byte) error
+		read func(store.MVCCStore, []byte, uint64) (int64, uint64, error)
+	}{
+		{
+			name: "hash",
+			key:  []byte("ttl:migrate:current-hash"),
+			seed: func(st store.MVCCStore, key []byte) error {
+				return st.PutAt(ctx, store.HashMetaKey(key),
+					store.MarshalHashMeta(store.HashMeta{Len: 3, ExpireAt: currentMs}), 1, 0)
+			},
+			read: func(st store.MVCCStore, key []byte, readTS uint64) (int64, uint64, error) {
+				raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+				if err != nil {
+					return 0, 0, err
+				}
+				meta, err := store.UnmarshalHashMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name: "set",
+			key:  []byte("ttl:migrate:current-set"),
+			seed: func(st store.MVCCStore, key []byte) error {
+				return st.PutAt(ctx, store.SetMetaKey(key),
+					store.MarshalSetMeta(store.SetMeta{Len: 3, ExpireAt: currentMs}), 1, 0)
+			},
+			read: func(st store.MVCCStore, key []byte, readTS uint64) (int64, uint64, error) {
+				raw, err := st.GetAt(ctx, store.SetMetaKey(key), readTS)
+				if err != nil {
+					return 0, 0, err
+				}
+				meta, err := store.UnmarshalSetMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name: "zset",
+			key:  []byte("ttl:migrate:current-zset"),
+			seed: func(st store.MVCCStore, key []byte) error {
+				return st.PutAt(ctx, store.ZSetMetaKey(key),
+					store.MarshalZSetMeta(store.ZSetMeta{Len: 3, ExpireAt: currentMs}), 1, 0)
+			},
+			read: func(st store.MVCCStore, key []byte, readTS uint64) (int64, uint64, error) {
+				raw, err := st.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+				if err != nil {
+					return 0, 0, err
+				}
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name: "list",
+			key:  []byte("ttl:migrate:current-list"),
+			seed: func(st store.MVCCStore, key []byte) error {
+				meta, err := store.MarshalListMeta(store.ListMeta{Head: 1, Len: 3, ExpireAt: currentMs})
+				if err != nil {
+					return err
+				}
+				return st.PutAt(ctx, store.ListMetaKey(key), meta, 1, 0)
+			},
+			read: func(st store.MVCCStore, key []byte, readTS uint64) (int64, uint64, error) {
+				raw, err := st.GetAt(ctx, store.ListMetaKey(key), readTS)
+				if err != nil {
+					return 0, 0, err
+				}
+				meta, err := store.UnmarshalListMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name: "stream",
+			key:  []byte("ttl:migrate:current-stream"),
+			seed: func(st store.MVCCStore, key []byte) error {
+				meta, err := store.MarshalStreamMeta(store.StreamMeta{Length: 3, ExpireAt: currentMs})
+				if err != nil {
+					return err
+				}
+				return st.PutAt(ctx, store.StreamMetaKey(key), meta, 1, 0)
+			},
+			read: func(st store.MVCCStore, key []byte, readTS uint64) (int64, uint64, error) {
+				raw, err := st.GetAt(ctx, store.StreamMetaKey(key), readTS)
+				if err != nil {
+					return 0, 0, err
+				}
+				meta, err := store.UnmarshalStreamMeta(raw)
+				return meta.Length, meta.ExpireAt, err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, c := newDeltaCompactorTestFixture(t)
+			require.NoError(t, tc.seed(st, tc.key))
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(tc.key), encodeRedisTTL(staleExpireAt), 2, 0))
 
-	require.NoError(t, c.SyncOnce(ctx))
+			require.NoError(t, c.SyncOnce(ctx))
 
-	readTS := st.LastCommitTS()
-	raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
-	require.NoError(t, err)
-	meta, err := store.UnmarshalHashMeta(raw)
-	require.NoError(t, err)
-	require.Equal(t, int64(3), meta.Len)
-	require.Equal(t, redisExpireAtMillis(latestExpireAt), meta.ExpireAt)
+			readTS := st.LastCommitTS()
+			n, ttlMs, err := tc.read(st, tc.key, readTS)
+			require.NoError(t, err)
+			require.Equal(t, int64(3), n)
+			require.Equal(t, currentMs, ttlMs)
+			rawTTL, err := st.GetAt(ctx, redisTTLKey(tc.key), readTS)
+			require.NoError(t, err)
+			indexTTL, err := decodeRedisTTL(rawTTL)
+			require.NoError(t, err)
+			require.Equal(t, currentMs, redisExpireAtMillis(indexTTL))
+		})
+	}
 }
 
 type trackingCompactionCoordinator struct {

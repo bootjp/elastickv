@@ -1,7 +1,7 @@
 --------------------------------- MODULE OCC ---------------------------------
 (***************************************************************************)
 (* TLA+ specification of the elastickv OCC layer (Percolator-style 2PC).   *)
-(* Per docs/design/2026_05_28_partial_tla_safety_spec.md §5.2.             *)
+(* Per docs/design/2026_05_28_implemented_tla_safety_spec.md §5.2.             *)
 (*                                                                         *)
 (* Models the transaction lifecycle Idle -> Active -> Prepared ->          *)
 (* Committed/Aborted and the lock-map (key, lock_ts) -> start_ts.  In M2  *)

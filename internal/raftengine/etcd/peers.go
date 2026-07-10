@@ -39,7 +39,7 @@ type Peer struct {
 	// to round-trip the v2 peers file across restarts so the operator
 	// view of the peers file is consistent with the eventual ConfState
 	// view after WAL replay. The empty string and SuffrageVoter are
-	// equivalent. See docs/design/2026_04_26_proposed_raft_learner.md §4.3.
+	// equivalent. See docs/design/2026_04_26_implemented_raft_learner.md §4.3.
 	Suffrage string
 }
 
@@ -212,6 +212,9 @@ func normalizePersistedPeer(peer Peer) (Peer, error) {
 		} else {
 			peer.ID = strconv.FormatUint(peer.NodeID, 10)
 		}
+	}
+	if peer.Suffrage == "" {
+		peer.Suffrage = SuffrageVoter
 	}
 	return peer, nil
 }

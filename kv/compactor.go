@@ -8,12 +8,16 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 const (
 	defaultFSMCompactorInterval        = 5 * time.Minute
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
+	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
+	defaultFSMCompactorMaxL0Files      = 256
+	defaultFSMCompactorMaxLSMDebtBytes = 512 << 20
 )
 
 type RaftStatusProvider interface {
@@ -34,7 +38,14 @@ type FSMCompactor struct {
 	interval        time.Duration
 	retentionWindow time.Duration
 	timeout         time.Duration
+	leaderTimeout   time.Duration
+	maxL0Files      int64
+	maxLSMDebtBytes uint64
 	logger          *slog.Logger
+}
+
+type pebbleMetricsSource interface {
+	Metrics() *pebble.Metrics
 }
 
 func WithFSMCompactorActiveTimestampTracker(tracker *ActiveTimestampTracker) FSMCompactorOption {
@@ -67,6 +78,25 @@ func WithFSMCompactorTimeout(timeout time.Duration) FSMCompactorOption {
 	}
 }
 
+func WithFSMCompactorLeaderTimeout(timeout time.Duration) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if timeout > 0 {
+			c.leaderTimeout = timeout
+		}
+	}
+}
+
+func WithFSMCompactorLSMBackpressureLimits(maxL0Files int64, maxDebtBytes uint64) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if maxL0Files > 0 {
+			c.maxL0Files = maxL0Files
+		}
+		if maxDebtBytes > 0 {
+			c.maxLSMDebtBytes = maxDebtBytes
+		}
+	}
+}
+
 func WithFSMCompactorLogger(logger *slog.Logger) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if logger != nil {
@@ -81,6 +111,9 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		interval:        defaultFSMCompactorInterval,
 		retentionWindow: defaultFSMCompactorRetentionWindow,
 		timeout:         defaultFSMCompactorTimeout,
+		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
+		maxL0Files:      defaultFSMCompactorMaxL0Files,
+		maxLSMDebtBytes: defaultFSMCompactorMaxLSMDebtBytes,
 		logger:          slog.Default(),
 	}
 	for _, opt := range opts {
@@ -159,6 +192,14 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	if shouldSkipFSMCompaction(status) {
 		return nil
 	}
+	if overloaded, snap := c.lsmBackpressure(runtime.Store); overloaded {
+		c.logger.WarnContext(ctx, "skipping fsm compaction under pebble backpressure",
+			"group_id", runtime.GroupID,
+			"l0_files", snap.Levels[0].TablesCount,
+			"compaction_debt_bytes", snap.Compact.EstimatedDebt,
+		)
+		return nil
+	}
 
 	lastCommitTS := runtime.Store.LastCommitTS()
 	safeMinTS, ok := c.targetMinTS(lastCommitTS, retention.MinRetainedTS(), time.Now())
@@ -166,7 +207,7 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		return nil
 	}
 
-	compactCtx, cancel := c.compactContext(ctx)
+	compactCtx, cancel := c.compactContext(ctx, status)
 	defer cancel()
 
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
@@ -197,15 +238,40 @@ func (c *FSMCompactor) targetMinTS(lastCommitTS, minRetainedTS uint64, now time.
 	return safeMinTS, true
 }
 
-func (c *FSMCompactor) compactContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.timeout <= 0 {
+func (c *FSMCompactor) compactContext(ctx context.Context, status raftengine.Status) (context.Context, context.CancelFunc) {
+	timeout := c.timeout
+	if status.State == raftengine.StateLeader && c.leaderTimeout > 0 && (timeout <= 0 || c.leaderTimeout < timeout) {
+		timeout = c.leaderTimeout
+	}
+	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.timeout)
+	return context.WithTimeout(ctx, timeout)
+}
+
+func (c *FSMCompactor) lsmBackpressure(st store.MVCCStore) (bool, *pebble.Metrics) {
+	source, ok := st.(pebbleMetricsSource)
+	if !ok {
+		return false, nil
+	}
+	snap := source.Metrics()
+	if snap == nil {
+		return false, nil
+	}
+	if c.maxL0Files > 0 && snap.Levels[0].TablesCount >= c.maxL0Files {
+		return true, snap
+	}
+	if c.maxLSMDebtBytes > 0 && snap.Compact.EstimatedDebt >= c.maxLSMDebtBytes {
+		return true, snap
+	}
+	return false, snap
 }
 
 func shouldSkipFSMCompaction(status raftengine.Status) bool {
 	if status.State == raftengine.StateCandidate {
+		return true
+	}
+	if status.LeadTransferee != 0 || status.PendingConfChange {
 		return true
 	}
 	if status.FSMPending > 0 {

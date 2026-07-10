@@ -31,13 +31,12 @@ type Route struct {
 
 // Engine holds in-memory metadata of routes and provides timestamp generation.
 type Engine struct {
-	mu               sync.RWMutex
-	routes           []Route
-	catalogVersion   uint64
-	ts               atomic.Uint64
-	hotspotThreshold uint64
+	mu             sync.RWMutex
+	routes         []Route
+	catalogVersion uint64
+	ts             atomic.Uint64
 	// history is the M2 versioned-snapshot ring for Composed-1
-	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+	// (docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 	// §M2).  Keyed by catalogVersion; populated on every successful
 	// ApplySnapshot and seeded by NewEngineWithDefaultRoute so a
 	// transaction that observed catalogVersion = 0 (the engine's
@@ -69,7 +68,12 @@ var (
 
 // NewEngine creates an Engine with no hotspot splitting.
 func NewEngine() *Engine {
-	return NewEngineWithThreshold(0)
+	return &Engine{
+		routes:       make([]Route, 0),
+		history:      make(map[uint64]RouteHistorySnapshot, DefaultRouteHistoryDepth),
+		historyOrder: make([]uint64, 0, DefaultRouteHistoryDepth),
+		historyDepth: DefaultRouteHistoryDepth,
+	}
 }
 
 // NewEngineWithDefaultRoute creates an Engine and registers a default route
@@ -82,19 +86,6 @@ func NewEngineWithDefaultRoute() *Engine {
 	engine.UpdateRoute([]byte(""), nil, defaultGroupID)
 	engine.recordHistorySnapshotLocked()
 	return engine
-}
-
-// NewEngineWithThreshold creates an Engine and sets a threshold for hotspot
-// detection. A non-zero threshold enables automatic range splitting when the
-// number of accesses to a range exceeds the threshold.
-func NewEngineWithThreshold(threshold uint64) *Engine {
-	return &Engine{
-		routes:           make([]Route, 0),
-		hotspotThreshold: threshold,
-		history:          make(map[uint64]RouteHistorySnapshot, DefaultRouteHistoryDepth),
-		historyOrder:     make([]uint64, 0, DefaultRouteHistoryDepth),
-		historyDepth:     DefaultRouteHistoryDepth,
-	}
 }
 
 // Version returns current route catalog version applied to the engine.
@@ -343,37 +334,6 @@ func (e *Engine) NextTimestamp() uint64 {
 	return e.ts.Add(1)
 }
 
-// RecordAccess increases the access counter for the range containing key and
-// splits the range if it turns into a hotspot. The load counter is updated
-// atomically under a read lock to allow concurrent access recording. If the
-// hotspot threshold is exceeded, RecordAccess acquires a full write lock and
-// re-checks the condition before splitting to avoid races with concurrent
-// splits.
-func (e *Engine) RecordAccess(key []byte) {
-	e.mu.RLock()
-	idx := e.routeIndex(key)
-	if idx < 0 {
-		e.mu.RUnlock()
-		return
-	}
-	load := atomic.AddUint64(&e.routes[idx].Load, 1)
-	threshold := e.hotspotThreshold
-	e.mu.RUnlock()
-	if threshold == 0 || load < threshold {
-		return
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	idx = e.routeIndex(key)
-	if idx < 0 {
-		return
-	}
-	if e.routes[idx].Load >= threshold {
-		e.splitRange(idx)
-	}
-}
-
 // Stats returns a snapshot of current ranges and their load counters.
 func (e *Engine) Stats() []Route {
 	e.mu.RLock()
@@ -386,7 +346,7 @@ func (e *Engine) Stats() []Route {
 			End:     CloneBytes(r.End),
 			GroupID: r.GroupID,
 			State:   r.State,
-			Load:    atomic.LoadUint64(&e.routes[i].Load),
+			Load:    r.Load,
 		}
 	}
 	return stats
@@ -419,7 +379,7 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 			End:     CloneBytes(r.End),
 			GroupID: r.GroupID,
 			State:   r.State,
-			Load:    atomic.LoadUint64(&r.Load),
+			Load:    r.Load,
 		})
 	}
 	return result
@@ -440,29 +400,6 @@ func (e *Engine) routeIndex(key []byte) int {
 		return -1
 	}
 	return i
-}
-
-func (e *Engine) splitRange(idx int) {
-	r := e.routes[idx]
-	if r.End == nil {
-		// cannot split unbounded range; reset load to avoid repeated attempts
-		e.routes[idx].Load = 0
-		return
-	}
-	mid := midpoint(r.Start, r.End)
-	if mid == nil {
-		// cannot determine midpoint; reset load to avoid repeated attempts
-		e.routes[idx].Load = 0
-		return
-	}
-	// Auto-split routes are ephemeral in-memory entries until persisted through
-	// catalog operations, so keep RouteID zero here.
-	left := Route{RouteID: 0, Start: r.Start, End: mid, GroupID: r.GroupID, State: RouteStateActive}
-	right := Route{RouteID: 0, Start: mid, End: r.End, GroupID: r.GroupID, State: RouteStateActive}
-	// replace the range at idx with left and right in an idiomatic manner
-	e.routes = append(e.routes[:idx+1], e.routes[idx:]...)
-	e.routes[idx] = left
-	e.routes[idx+1] = right
 }
 
 func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
@@ -534,14 +471,4 @@ func CloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
-}
-
-// midpoint returns a key that is lexicographically between a and b. It returns
-// nil if such a key cannot be determined (e.g. a and b are too close).
-func midpoint(a, b []byte) []byte {
-	m := append(CloneBytes(a), 0)
-	if bytes.Compare(m, b) >= 0 {
-		return nil
-	}
-	return m
 }

@@ -29,6 +29,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -99,16 +101,18 @@ const (
 )
 
 type S3Server struct {
-	listen      net.Listener
-	s3Addr      string
-	region      string
-	store       store.MVCCStore
-	coordinator kv.Coordinator
-	leaderS3    map[string]string
-	staticCreds map[string]string
-	readTracker *kv.ActiveTimestampTracker
-	httpServer  *http.Server
-	cleanupSem  chan struct{}
+	listen               net.Listener
+	s3Addr               string
+	region               string
+	store                store.MVCCStore
+	coordinator          kv.Coordinator
+	leaderS3             map[string]string
+	staticCreds          map[string]string
+	readTracker          *kv.ActiveTimestampTracker
+	httpServer           *http.Server
+	cleanupSem           chan struct{}
+	putAdmission         *s3PutAdmission
+	putAdmissionObserver S3PutAdmissionObserver
 }
 
 type s3BucketMeta struct {
@@ -315,13 +319,14 @@ type s3ListPartEntry struct {
 
 func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[string]string, opts ...S3ServerOption) *S3Server {
 	s := &S3Server{
-		listen:      listen,
-		s3Addr:      s3Addr,
-		region:      s3DefaultRegion,
-		store:       st,
-		coordinator: kv.WithKeyVizLabel(coordinate, keyviz.LabelS3),
-		leaderS3:    cloneLeaderAddrMap(leaderS3),
-		cleanupSem:  make(chan struct{}, s3ManifestCleanupWorkers),
+		listen:       listen,
+		s3Addr:       s3Addr,
+		region:       s3DefaultRegion,
+		store:        st,
+		coordinator:  kv.WithKeyVizLabel(coordinate, keyviz.LabelS3),
+		leaderS3:     cloneLeaderAddrMap(leaderS3),
+		cleanupSem:   make(chan struct{}, s3ManifestCleanupWorkers),
+		putAdmission: newS3PutAdmissionFromEnv(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -342,6 +347,12 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	mux.HandleFunc("/", s.handle)
 	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 	return s
+}
+
+// SetListener installs the listener Run serves from. Startup wiring uses this
+// to build admin-forward sources before binding the public socket.
+func (s *S3Server) SetListener(listen net.Listener) {
+	s.listen = listen
 }
 
 func (s *S3Server) Run() error {
@@ -564,7 +575,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -588,7 +599,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		commitTS, err := s.nextTxnCommitTS(startTS)
+		commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -643,7 +654,7 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -791,7 +802,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -835,7 +846,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 //nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(r.Context(), readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -869,9 +880,13 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
+	admissionProtocol := s3PutAdmissionProtocolForPayload(expectedPayloadSHA)
 	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
 		return
 	}
 	part := s3ObjectPart{PartNo: 1}
@@ -880,6 +895,17 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	buf := make([]byte, s3ChunkSize)
 	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
 	pendingChunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
+	releasePendingAdmission := func() {
+		for _, release := range pendingAdmission {
+			release()
+		}
+		pendingAdmission = pendingAdmission[:0]
+	}
+	defer releasePendingAdmission()
+	nextReadBuffer := func() ([]byte, bool) {
+		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
+	}
 	uploadedManifest := func() *s3ObjectManifest {
 		if len(part.ChunkSizes) == 0 {
 			return &s3ObjectManifest{UploadID: uploadID}
@@ -897,6 +923,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			return nil
 		}
 		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
+		releasePendingAdmission()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -907,9 +934,38 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return nil
 	}
 	for {
-		n, readErr := r.Body.Read(buf)
+		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
+			if err := flushBatch(); err != nil {
+				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+				writeS3InternalError(w, err)
+				return
+			}
+		}
+		readBuf, finalRead := nextReadBuffer()
+		if len(readBuf) == 0 {
+			break
+		}
+		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, streamBody, sizeBytes)
+		if admissionErr != nil {
+			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
+		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			releaseAdmission()
+			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, readErr)
+			return
+		}
 		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
+			pendingAdmission = append(pendingAdmission, releaseAdmission)
+			chunk := append([]byte(nil), readBuf[:n]...)
 			if _, err := hasher.Write(chunk); err != nil {
 				writeS3InternalError(w, err)
 				return
@@ -939,18 +995,11 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			}
 			sizeBytes += int64(n)
 			chunkNo++
+		} else {
+			releaseAdmission()
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
-		}
-		if readErr != nil {
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
 		}
 	}
 	if err := flushBatch(); err != nil {
@@ -976,7 +1025,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	part.ETag = etag
 	part.SizeBytes = sizeBytes
 	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 	if err != nil {
 		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
 		writeS3InternalError(w, err)
@@ -1220,7 +1269,7 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -1290,12 +1339,12 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	}
 
 	uploadID := newS3UploadID(s.clock())
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(r.Context(), readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1375,9 +1424,13 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
+	admissionProtocol := s3PutAdmissionProtocolForPayload(partPayloadSHA)
 	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
+		return
+	}
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
 
@@ -1389,12 +1442,12 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	// different keys, leaving the chunk data referenced by an in-progress
 	// CompleteMultipartUpload untouched.
 	partReadTS := s.readTS()
-	partStartTS, err := s.txnStartTS(partReadTS)
+	partStartTS, err := s.txnStartTS(r.Context(), partReadTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	partCommitTS, err := s.nextTxnCommitTS(partStartTS)
+	partCommitTS, err := s.nextTxnCommitTS(r.Context(), partStartTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1406,6 +1459,17 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	buf := make([]byte, s3ChunkSize)
 	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
 	chunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
+	releasePendingAdmission := func() {
+		for _, release := range pendingAdmission {
+			release()
+		}
+		pendingAdmission = pendingAdmission[:0]
+	}
+	defer releasePendingAdmission()
+	nextReadBuffer := func() ([]byte, bool) {
+		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
+	}
 	partCommitted := false
 	defer func() {
 		if !partCommitted && chunkNo > 0 {
@@ -1418,6 +1482,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			return nil
 		}
 		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
+		releasePendingAdmission()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1426,22 +1491,41 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	for {
-		n, readErr := r.Body.Read(buf)
+		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
+			if err := flushBatch(); err != nil {
+				writeS3InternalError(w, err)
+				return
+			}
+		}
+		readBuf, finalRead := nextReadBuffer()
+		if len(readBuf) == 0 {
+			break
+		}
+		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, partStreamBody, sizeBytes)
+		if admissionErr != nil {
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
+		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			releaseAdmission()
+			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
+				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
+				return
+			}
+			writeS3InternalError(w, readErr)
+			return
+		}
 		if n == 0 {
+			releaseAdmission()
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			if readErr != nil {
-				if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
-					writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-					return
-				}
-				writeS3InternalError(w, readErr)
-				return
-			}
 			continue
 		}
-		chunk := append([]byte(nil), buf[:n]...)
+		pendingAdmission = append(pendingAdmission, releaseAdmission)
+		chunk := append([]byte(nil), readBuf[:n]...)
 		if _, err := hasher.Write(chunk); err != nil {
 			writeS3InternalError(w, err)
 			return
@@ -1465,14 +1549,6 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		chunkNo++
 		if errors.Is(readErr, io.EOF) {
 			break
-		}
-		if readErr != nil {
-			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
 		}
 	}
 	if err := flushBatch(); err != nil {
@@ -1672,7 +1748,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 
 	err = s.retryS3Mutation(r.Context(), func() error {
 		retryReadTS := s.readTS()
-		startTS, err := s.txnStartTS(retryReadTS)
+		startTS, err := s.txnStartTS(r.Context(), retryReadTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
 		}
@@ -1717,7 +1793,7 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 			return errors.WithStack(err)
 		}
 
-		commitTS, err := s.nextTxnCommitTS(startTS)
+		commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1784,7 +1860,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(r.Context(), readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
@@ -2468,6 +2544,63 @@ func (s *S3Server) isVerifiedS3Leader(ctx context.Context) bool {
 	return s.coordinator.VerifyLeader(ctx) == nil
 }
 
+var errS3PutIncompleteBody = errors.New("request body shorter than Content-Length")
+
+func nextS3PutReadBuffer(buf []byte, protocol string, contentLength int64, readBytes int64) ([]byte, bool) {
+	if protocol != s3PutAdmissionProtocolFixed || contentLength < 0 {
+		return buf, false
+	}
+	remaining := contentLength - readBytes
+	if remaining <= 0 {
+		return nil, true
+	}
+	if remaining <= int64(len(buf)) {
+		return buf[:int(remaining)], true
+	}
+	return buf, false
+}
+
+func (s *S3Server) acquireS3PutAdmissionForRead(ctx context.Context, bytes int, protocol string, body *s3StreamingBody, readBytes int64) (func(), error) {
+	if body.decodedLengthReached(readBytes) {
+		return func() {}, nil
+	}
+	return s.acquireS3PutAdmission(ctx, int64(bytes), protocol)
+}
+
+func s3PutReadAllowsFinalPartial(protocol string, contentLength int64) bool {
+	return protocol != s3PutAdmissionProtocolFixed || contentLength < 0
+}
+
+func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool, allowEOFWithFullBuffer bool) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		if n > 0 {
+			total += n
+		}
+		if errors.Is(err, io.EOF) {
+			return s3PutChunkEOFResult(total, len(buf), allowFinalPartial, allowEOFWithFullBuffer)
+		}
+		if err != nil {
+			return total, errors.WithStack(err)
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
+}
+
+func s3PutChunkEOFResult(total, bufLen int, allowFinalPartial bool, allowEOFWithFullBuffer bool) (int, error) {
+	if allowEOFWithFullBuffer && total == bufLen {
+		return total, io.EOF
+	}
+	if !allowFinalPartial && (total > 0 || bufLen > 0) {
+		return total, errS3PutIncompleteBody
+	}
+	return total, io.EOF
+}
+
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When
 // the request is a plain (non-streaming) PUT the body is only wrapped with
 // MaxBytesReader; the streaming-body context returned is the zero value and
@@ -2606,6 +2739,9 @@ func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, 
 	var chunkedErr *awsChunkedError
 	if errors.As(err, &chunkedErr) {
 		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
+	}
+	if errors.Is(err, errS3PutIncompleteBody) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "IncompleteBody", Message: errS3PutIncompleteBody.Error()}, true
 	}
 	return nil, false
 }
@@ -2845,23 +2981,19 @@ func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 
 // txnStartTS returns the read/start timestamp for an S3 transaction.
 // When the caller passes the sentinel ^uint64(0) ("server, please
-// allocate"), the timestamp is drawn from the HLC via NextFenced —
-// the HLC-4 (iii) physical-ceiling fence applies here because the
-// returned value is persistence-grade (it pins MVCC reads and is the
-// startTS half of a 2PC commit). Returning ErrCeilingExpired here lets
-// the SigV4 handler surface the failure as an S3 5xx instead of
-// silently issuing a stale-leader timestamp.
-func (s *S3Server) txnStartTS(readTS uint64) (uint64, error) {
+// allocate"), the timestamp is drawn through the coordinator timestamp source.
+// TSO-enabled deployments use the allocator path; the legacy fallback still
+// applies the HLC-4 (iii) physical-ceiling fence because the returned value is
+// persistence-grade (it pins MVCC reads and is the startTS half of a 2PC
+// commit). Returning ErrCeilingExpired here lets the SigV4 handler surface the
+// failure as an S3 5xx instead of silently issuing a stale-leader timestamp.
+func (s *S3Server) txnStartTS(ctx context.Context, readTS uint64) (uint64, error) {
 	if readTS != ^uint64(0) {
 		return readTS, nil
 	}
-	clock := s.clock()
-	if clock == nil {
-		return 1, nil
-	}
-	ts, err := clock.NextFenced()
+	ts, err := kv.NextTimestampThrough(ctx, s.coordinator, "s3: allocate txn startTS")
 	if err != nil {
-		return 0, errors.Wrap(err, "s3: allocate txn startTS")
+		return 0, errors.WithStack(err)
 	}
 	return ts, nil
 }
@@ -2891,21 +3023,10 @@ func (s *S3Server) effectiveRegion() string {
 	return s.region
 }
 
-func (s *S3Server) nextTxnCommitTS(startTS uint64) (uint64, error) {
-	clock := s.clock()
-	if clock == nil {
-		if startTS == ^uint64(0) {
-			return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
-		}
-		return startTS + 1, nil
-	}
-	clock.Observe(startTS)
-	commitTS, err := clock.NextFenced()
+func (s *S3Server) nextTxnCommitTS(ctx context.Context, startTS uint64) (uint64, error) {
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, s.coordinator, startTS, "s3: allocate txn commitTS")
 	if err != nil {
-		return 0, errors.Wrap(err, "s3: allocate txn commitTS")
-	}
-	if commitTS <= startTS {
-		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
+		return 0, errors.WithStack(err)
 	}
 	return commitTS, nil
 }
@@ -2964,6 +3085,10 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 	}
 	if isRetryableS3MutationErr(err) {
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
+		return
+	}
+	if status.Code(errors.Cause(err)) == codes.Unavailable {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)

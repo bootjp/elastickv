@@ -10,7 +10,7 @@ import "context"
 //
 // Stage 7c uses this hook to pre-register a new node's writer-
 // registry row (see
-// docs/design/2026_05_29_proposed_7c_confchange_time_registration.md).
+// docs/design/2026_05_29_implemented_7c_confchange_time_registration.md).
 // Keeping the encryption-aware adapter outside this package preserves
 // raftadmin's engine-generic posture — no concrete dependency on
 // the KV or encryption layers.

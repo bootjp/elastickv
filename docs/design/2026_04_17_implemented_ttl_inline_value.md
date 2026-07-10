@@ -5,8 +5,9 @@ metadata anchors carry inline TTL, and `EXPIRE` updates those anchors in the
 same Raft transaction as the secondary scan-index row. A leader-only background
 migrator rewrites legacy anchors into inline form. The legacy `!redis|ttl|`
 read fallback remains enabled by default for rolling upgrades, but can be
-disabled after migration with `WithRedisLegacyTTLReadFallback(false)`. The TTL
-buffer has been removed.
+disabled after migration with `WithRedisLegacyTTLReadFallback(false)` only after
+legacy bare string keys have also been ruled out or rewritten. The TTL buffer has
+been removed.
 
 ## 1. Background and motivation
 
@@ -151,8 +152,10 @@ follows:
   and the caller treats the key as malformed (e.g. `isLeaderKeyExpired` treats
   the key as expired rather than silently alive).
 - For deployments that need a stronger guarantee, the migration compactor
-  should be run to rewrite every legacy value with the new envelope before
-  Phase 3 disables the legacy `!redis|ttl|` fallback.
+  should be run to rewrite every prefixed legacy string value with the new
+  envelope before Phase 3 disables the legacy `!redis|ttl|` fallback. Legacy
+  bare string keys are not covered by the prefix-scanning compactor and must be
+  ruled out or rewritten separately before disabling the fallback.
 
 ### 3.3 Collection metadata encoding
 
@@ -305,7 +308,8 @@ fallback remains active.
 
 ### Phase 3 — Remove legacy TTL read path
 
-Once all nodes have migrated, operators can start Redis with
+Once all nodes have migrated and legacy bare string keys have been ruled out or
+rewritten separately, operators can start Redis with
 `WithRedisLegacyTTLReadFallback(false)` to remove the `!redis|ttl|<key>` lookup
 from `ttlAt()` after the anchor-specific probes miss. The default remains
 fallback-enabled so rolling upgrades and not-yet-migrated stores preserve
@@ -390,5 +394,5 @@ adapter/
 | 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
 | 1 | Add inline TTL to list/hash/set/zset/stream metadata and HLL payloads | Medium — delta compaction must preserve TTL |
 | 2 | Background migration of existing keys | Medium — shipped as bounded compactor pass |
-| 3 | Remove legacy `!redis\|ttl\|` read path | Low — shipped as post-migration fallback gate |
+| 3 | Remove legacy `!redis\|ttl\|` read path | Medium — safe only after prefix-scanned anchors and legacy bare strings are cleared |
 | 4 | Remove TTL buffer | Low — shipped |

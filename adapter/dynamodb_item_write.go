@@ -124,7 +124,7 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	// fresh commit_ts + prev_commit_ts so the FSM no-ops a commit that already
 	// landed under leadership churn, instead of re-reading and re-appending (the
 	// :duplicate-elements anomaly). See
-	// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+	// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md.
 	//
 	// Leader-only (codex P1, PR #920): the dedup path allocates commit_ts from
 	// the LOCAL HLC and carries it as prev_commit_ts, so that timestamp MUST be
@@ -196,7 +196,7 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 // leadership churn: attempt 1 commits at C1 but returns a WriteConflict, the
 // retry re-reads the now-larger list and appends again. Reuse + the FSM's
 // exact-ts dedup probe close that. See option 2 in
-// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md.
 type reusableItemWrite struct {
 	// plan holds the reused OperationGroup (plan.req: Elems + fixed StartTS) and
 	// the captured current/next item. The client-visible result
@@ -274,12 +274,12 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	if plan.req == nil {
 		return plan, nil, nil
 	}
-	// NextFenced (not Next) honors the HLC physical-ceiling fence so a
-	// stale-leader window cannot mint a colliding commit_ts (HLC-4);
-	// ErrCeilingExpired is non-retryable and surfaces to the client.
-	commitTS, err := d.coordinator.Clock().NextFenced()
+	// Allocate through the coordinator so TSO-enabled deployments use the
+	// same timestamp source as Dispatch. The fallback still honors the HLC
+	// physical-ceiling fence.
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, readTS, "dynamodb item-write first attempt: allocate commitTS")
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "dynamodb item-write first attempt: allocate commitTS")
+		return nil, nil, errors.WithStack(err)
 	}
 	plan.req.StartTS = readTS
 	plan.req.CommitTS = commitTS
@@ -305,9 +305,9 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 	tableName string,
 	pending *reusableItemWrite,
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	commitTS, err := d.coordinator.Clock().NextFenced()
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, pending.plan.req.StartTS, "dynamodb item-write reuse: allocate commitTS")
 	if err != nil {
-		return nil, pending, errors.Wrap(err, "dynamodb item-write reuse: allocate commitTS")
+		return nil, pending, errors.WithStack(err)
 	}
 	pending.plan.req.CommitTS = commitTS
 	pending.plan.req.PrevCommitTS = pending.commitTS

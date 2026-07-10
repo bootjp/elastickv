@@ -5,7 +5,7 @@ Author: bootjp
 Date: 2026-06-11
 
 Parent: [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md).
-M1 (control plane) is as-built in [2026_02_18_partial_hotspot_split_milestone1_pr.md](2026_02_18_partial_hotspot_split_milestone1_pr.md).
+M1 (control plane) is as-built in [2026_02_18_implemented_hotspot_split_milestone1_pr.md](2026_02_18_implemented_hotspot_split_milestone1_pr.md).
 
 ## 1. Background
 
