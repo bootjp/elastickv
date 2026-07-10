@@ -10,7 +10,7 @@ import (
 )
 
 // encode.go is the Phase 0b encoder core (design:
-// docs/design/2026_05_25_proposed_snapshot_logical_encoder.md). It is
+// docs/design/2026_05_25_implemented_snapshot_logical_encoder.md). It is
 // the inverse of decode.go: per-adapter reverse encoders (added in the
 // Redis/DynamoDB/S3/SQS milestones) hand reconstructed internal
 // (userKey, userValue, expireAt) records to a snapshotBuilder, which

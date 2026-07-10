@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
@@ -50,7 +51,25 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		return s.leaderGetAt(ctx, g, key, ts)
 	}
-	return s.proxyRawGet(ctx, g, key, ts)
+	return s.proxyRawGet(ctx, g, key, ts, 0)
+}
+
+// GetGroupAt reads a key from the explicitly selected Raft group.
+// It is for keyspaces whose owner is resolved outside the byte-range
+// engine (for example SQS HT-FIFO's (queue, partition) resolver).
+func (s *ShardStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte, ts uint64) ([]byte, error) {
+	g, ok := s.groupForID(groupID)
+	if !ok || g.Store == nil {
+		return nil, store.ErrKeyNotFound
+	}
+
+	if engineForGroup(g) == nil {
+		return s.localGetAt(ctx, g, key, ts)
+	}
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
+		return s.leaderGetAt(ctx, g, key, ts)
+	}
+	return s.proxyRawGet(ctx, g, key, ts, groupID)
 }
 
 func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView) bool {
@@ -186,6 +205,18 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	return out, nil
 }
 
+// ScanGroupAt scans a range on the explicitly selected Raft group.
+// It is for keyspaces whose owner is resolved outside the byte-range
+// engine (for example SQS HT-FIFO's (queue, partition) resolver).
+// Normal callers should use ScanAt so range scans keep following the
+// distribution engine's route table.
+func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false, true)
+}
+
 func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
@@ -204,6 +235,9 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
+		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
+	}
+	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
 	// For internal list keys, shard routing is based on the logical user key
@@ -237,7 +271,7 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 			scanEnd = clampScanEnd(end, route.End)
 		}
 
-		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false)
+		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, false)
 		if err != nil {
 			return nil, err
 		}
@@ -289,7 +323,7 @@ func (s *ShardStore) reverseScanRoutesAt(
 			continue
 		}
 		seenGroups[route.GroupID] = struct{}{}
-		kvs, err := s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true)
+		kvs, err := s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true, false)
 		if err != nil {
 			return nil, err
 		}
@@ -313,7 +347,7 @@ func (s *ShardStore) clampedReverseScanRouteAt(
 
 	scanStart := clampScanStart(start, route.Start)
 	scanEnd := clampScanEnd(end, route.End)
-	kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-currentLen, ts, true)
+	kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-currentLen, ts, true, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -328,6 +362,7 @@ func (s *ShardStore) scanRouteAtDirection(
 	limit int,
 	ts uint64,
 	reverse bool,
+	explicitGroup bool,
 ) ([]*store.KVPair, error) {
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g == nil || g.Store == nil {
@@ -346,7 +381,11 @@ func (s *ShardStore) scanRouteAtDirection(
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse)
+	var groupID uint64
+	if explicitGroup {
+		groupID = route.GroupID
+	}
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -1477,7 +1516,7 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 	return g, ok
 }
 
-func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64) ([]byte, error) {
+func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64) ([]byte, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
 		return nil, store.ErrKeyNotFound
@@ -1495,7 +1534,7 @@ func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte,
 	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
 	defer cancel()
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
+	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, GroupId: groupID})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1515,6 +1554,7 @@ func (s *ShardStore) proxyRawScanAt(
 	limit int,
 	ts uint64,
 	reverse bool,
+	groupID uint64,
 ) ([]*store.KVPair, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
@@ -1539,6 +1579,7 @@ func (s *ShardStore) proxyRawScanAt(
 		Limit:    int64(limit),
 		Ts:       ts,
 		Reverse:  reverse,
+		GroupId:  groupID,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

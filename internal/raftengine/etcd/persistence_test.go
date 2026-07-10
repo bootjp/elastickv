@@ -21,8 +21,8 @@ func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
 	require.NoError(t, writeVersionedHeader(writer, fileFormat{magic: stateFileMagic, version: stateFileVersion}))
-	require.NoError(t, writeMessage(writer, (&raftpb.HardState{}).Marshal))
-	require.NoError(t, writeMessage(writer, (&raftpb.Snapshot{}).Marshal))
+	require.NoError(t, writeMessage(writer, &raftpb.HardState{}))
+	require.NoError(t, writeMessage(writer, &raftpb.Snapshot{}))
 	require.NoError(t, writeU32(writer, maxPersistedEntries+1))
 	require.NoError(t, writer.Flush())
 	require.NoError(t, os.WriteFile(path, buf.Bytes(), defaultFilePerm))
@@ -74,13 +74,8 @@ func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
 	require.NoError(t, writeVersionedHeader(writer, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}))
 	index := uint64(1)
 	for i := 0; i < int(entryCapacityCap)+1; i++ {
-		entry := raftpb.Entry{
-			Type:  raftpb.EntryNormal,
-			Index: index,
-			Term:  1,
-			Data:  []byte("x"),
-		}
-		require.NoError(t, writeMessage(writer, entry.Marshal))
+		entry := testEntry(index, 1, []byte("x"))
+		require.NoError(t, writeMessage(writer, &entry))
 		index++
 	}
 	require.NoError(t, writer.Flush())
@@ -89,19 +84,13 @@ func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
 	entries, err := loadEntriesFile(path)
 	require.NoError(t, err)
 	require.Len(t, entries, int(entryCapacityCap)+1)
-	require.Equal(t, uint64(int(entryCapacityCap)+1), entries[len(entries)-1].Index)
+	require.Equal(t, uint64(int(entryCapacityCap)+1), entries[len(entries)-1].GetIndex())
 }
 
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 	dir := t.TempDir()
 	state := persistedState{
-		Snapshot: raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1, 2}},
-				Index:     1,
-				Term:      1,
-			},
-		},
+		Snapshot: raftTestSnapshot(1, 1, []uint64{1, 2}, nil),
 	}
 	require.NoError(t, saveMetadataFile(metadataFilePath(dir), state.HardState, state.Snapshot))
 
@@ -120,18 +109,11 @@ func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
 	dir := t.TempDir()
 	legacy := persistedState{
-		Snapshot: raftpb.Snapshot{
-			Data: mustEncodeSnapshotData(t, [][]byte{[]byte("snap")}),
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     5,
-				Term:      2,
-			},
-		},
+		Snapshot: raftTestSnapshot(5, 2, []uint64{1}, mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})),
 		Entries: []raftpb.Entry{{
-			Type:  raftpb.EntryNormal,
-			Index: 6,
-			Term:  2,
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Index: uint64Ptr(6),
+			Term:  uint64Ptr(2),
 			Data:  encodeProposalEnvelope(1, []byte("tail")),
 		}},
 	}
@@ -139,8 +121,14 @@ func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
 
 	state, err := loadOrCreateState(dir, 1)
 	require.NoError(t, err)
-	require.Equal(t, legacy.Entries, state.Entries)
-	require.Equal(t, legacy.Snapshot.Metadata, state.Snapshot.Metadata)
+	require.Len(t, state.Entries, len(legacy.Entries))
+	require.Equal(t, legacy.Entries[0].GetType(), state.Entries[0].GetType())
+	require.Equal(t, legacy.Entries[0].GetIndex(), state.Entries[0].GetIndex())
+	require.Equal(t, legacy.Entries[0].GetTerm(), state.Entries[0].GetTerm())
+	require.Equal(t, legacy.Entries[0].GetData(), state.Entries[0].GetData())
+	require.Equal(t, legacy.Snapshot.GetMetadata().GetIndex(), state.Snapshot.GetMetadata().GetIndex())
+	require.Equal(t, legacy.Snapshot.GetMetadata().GetTerm(), state.Snapshot.GetMetadata().GetTerm())
+	require.Equal(t, legacy.Snapshot.GetMetadata().GetConfState().GetVoters(), state.Snapshot.GetMetadata().GetConfState().GetVoters())
 	require.Nil(t, state.Snapshot.Data)
 
 	payload, err := os.ReadFile(snapshotDataFilePath(dir))
@@ -151,13 +139,7 @@ func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
 func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
 	dir := t.TempDir()
 	legacy := persistedState{
-		Snapshot: raftpb.Snapshot{
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: raftpb.ConfState{Voters: []uint64{1}},
-				Index:     1,
-				Term:      1,
-			},
-		},
+		Snapshot: raftTestSnapshot(1, 1, []uint64{1}, nil),
 	}
 	require.NoError(t, saveStateFile(stateFilePath(dir), legacy))
 

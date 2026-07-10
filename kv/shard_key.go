@@ -49,8 +49,12 @@ var (
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 )
 
-// routeKey normalizes internal keys (e.g., list metadata/items) to the logical
+// RouteKey normalizes internal keys (e.g., list metadata/items) to the logical
 // user key used for shard routing.
+func RouteKey(key []byte) []byte {
+	return routeKey(key)
+}
+
 func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil

@@ -147,7 +147,7 @@ elastickv_raft_dispatch_dropped_total{group="1",node_address="10.0.0.1:50051",no
 # HELP elastickv_raft_dispatch_errors_total Outbound raft dispatches that reached the transport but failed. Mirrors etcd raft Engine.dispatchErrorCount.
 # TYPE elastickv_raft_dispatch_errors_total counter
 elastickv_raft_dispatch_errors_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
-# HELP elastickv_raft_step_queue_full_total Inbound raft messages that could not be enqueued because stepCh was full; indicates the raft loop is starved (classic pre-#560 seek-storm symptom).
+# HELP elastickv_raft_step_queue_full_total Inbound raft messages that could not be enqueued because the selected step queue was full; indicates the raft loop is starved (classic pre-#560 seek-storm symptom).
 # TYPE elastickv_raft_step_queue_full_total counter
 elastickv_raft_step_queue_full_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 1
 `),

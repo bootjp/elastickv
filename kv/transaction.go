@@ -98,7 +98,7 @@ func (t *TransactionManager) Close() {
 // leaseRefreshingTxn) thread the caller's context end-to-end so a Redis /
 // gRPC / S3 / SQS handler's deadline reaches Propose / VerifyLeader without
 // being silently dropped to context.Background. See PR #748 / design doc
-// 2026_05_10_proposed_kv_ctx_plumbing.md for the rationale; the prior
+// 2026_05_10_implemented_kv_ctx_plumbing.md for the rationale; the prior
 // signatures lived behind `verifyLeaderEngine`'s 5 s safety bound (#745),
 // which is preserved as the no-ctx defense-in-depth fallback.
 type Transactional interface {

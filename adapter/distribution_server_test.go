@@ -38,6 +38,25 @@ func TestDistributionServerGetRoute_HitAndMiss(t *testing.T) {
 	require.Nil(t, miss.End)
 }
 
+func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRoute(context.Background(), &pb.GetRouteRequest{
+		Key: fskeys.ChunkKey(home, inode, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, routeKey, resp.Start)
+	require.Equal(t, uint64(2), resp.RaftGroupId)
+}
+
 func TestDistributionServerGetTimestamp_IsMonotonic(t *testing.T) {
 	t.Parallel()
 

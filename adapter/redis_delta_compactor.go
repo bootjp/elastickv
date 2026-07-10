@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -113,7 +114,7 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
 		st:       st,
-		coord:    coord,
+		coord:    kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
 		logger:   slog.Default(),
 		maxCount: defaultDeltaCompactorMaxDeltaCount,
 		interval: defaultDeltaCompactorScanInterval,
@@ -485,18 +486,18 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 }
 
 // dispatchCompaction commits elems as an OCC transaction. The commit
-// timestamp is drawn via NextFenced even though compaction is
-// idempotent in outcome: an unfenced ts inside a stale leader's
-// window can still produce post-compaction OCC ordering surprises
-// against subsequent client writes, so fail-closed is the right
-// default here too (claude-bot review on PR #871 Phase 2b).
+// timestamp is drawn through the coordinator's timestamp allocator even though
+// compaction is idempotent in outcome: an unfenced ts inside a stale leader's
+// window can still produce post-compaction OCC ordering surprises against
+// subsequent client writes, so fail-closed is the right default here too
+// (claude-bot review on PR #871 Phase 2b).
 func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, elems []*kv.Elem[kv.OP]) error {
 	if len(elems) == 0 {
 		return nil
 	}
-	commitTS, err := c.coord.Clock().NextFenced()
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, c.coord, normalizeStartTS(readTS), "dispatchCompaction: allocate commitTS")
 	if err != nil {
-		return errors.Wrap(err, "dispatchCompaction: allocate commitTS")
+		return errors.WithStack(err)
 	}
 	_, err = c.coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,

@@ -8,8 +8,13 @@ type FactoryConfig struct {
 	LocalAddress string
 	DataDir      string
 	Peers        []Server
-	Bootstrap    bool
-	StateMachine StateMachine
+	// BootstrapSeed carries the original startup peer list when it
+	// came from the multi-group bootstrap surface. Engines may persist
+	// it to detect divergent bootstrap flags on restart. Empty keeps
+	// the legacy --raftBootstrapMembers behavior unchanged.
+	BootstrapSeed []Server
+	Bootstrap     bool
+	StateMachine  StateMachine
 	// JoinAsLearner records the operator-stated expectation that the
 	// local node will be added to the cluster via AddLearner, never
 	// AddVoter. The flag is purely an alarm: if a post-apply ConfState
@@ -18,7 +23,7 @@ type FactoryConfig struct {
 	// The node keeps running -- by the time the conf change has
 	// applied, the node already counts toward quorum and an unilateral
 	// shutdown would shrink the cluster's effective fault tolerance.
-	// See docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+	// See docs/design/2026_04_26_implemented_raft_learner.md §4.5.
 	JoinAsLearner bool
 }
 

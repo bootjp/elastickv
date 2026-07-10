@@ -323,6 +323,27 @@ func TestServiceRenameOverOpenFileOrphansTarget(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestServiceRenameDirectoryOverFileIsRejected(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	dir, err := svc.Mkdir(ctx, RootInode, []byte("dir"), CreateOptions{Mode: testDirMode})
+	require.NoError(t, err)
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+
+	err = svc.Rename(ctx, RootInode, []byte("dir"), RootInode, []byte("file"))
+	require.ErrorIs(t, err, ErrNotDir)
+
+	gotDir, err := svc.Resolve(ctx, RootInode, []byte("dir"))
+	require.NoError(t, err)
+	require.Equal(t, dir.Inode, gotDir)
+	gotFile, err := svc.Resolve(ctx, RootInode, []byte("file"))
+	require.NoError(t, err)
+	require.Equal(t, file.Inode, gotFile)
+}
+
 func TestServiceRmdirRejectsNonEmptyDirectory(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
@@ -640,6 +661,33 @@ func TestServiceTruncateSparseTailPreservesUsage(t *testing.T) {
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
 	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, 0), svc.store.LastCommitTS())
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
+	ctx := context.Background()
+	const (
+		chunkCount             = chunkDeleteTxnPageSize + 1
+		largeChunkPayloadBytes = chunkCount * 4
+	)
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(uint64(largeChunkPayloadBytes)))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte{'x'}, largeChunkPayloadBytes)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, payload)
+	require.NoError(t, err)
+
+	rec := attachRecorder(svc)
+	require.NoError(t, svc.Truncate(ctx, file.Inode, 0))
+	require.Len(t, rec.requests, 2)
+	for _, req := range rec.requests {
+		require.LessOrEqual(t, len(req.ReadKeys), chunkDeleteTxnPageSize+4)
+	}
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, stats.Capacity-stats.Free)
 }
 
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {

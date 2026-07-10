@@ -16,7 +16,7 @@ import (
 // to the client.
 //
 // This implements HLC-4 precondition (iii) from
-// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1: every
+// docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1: every
 // persistence-grade ts allocation is gated on `wall_now <
 // physicalCeiling`. The TLA+ MCHLC_gap.cfg counterexample at depth 5
 // demonstrates the safety property this enforces.
@@ -27,9 +27,11 @@ import (
 // bootstrap fencing is a follow-up consideration; the current
 // semantics match the spec wherever the prior-leader hazard is real.
 var ErrCeilingExpired = errors.New("hlc: physical ceiling expired (wall_now >= physicalCeiling); refusing to issue persistence timestamp")
+var ErrInvalidHLCBatchSize = errors.New("hlc: invalid batch size")
 
 const hlcLogicalBits = 16
 const hlcLogicalMask uint64 = (1 << hlcLogicalBits) - 1
+const maxHLCBatchSize = 1 << hlcLogicalBits
 
 // HLCLogicalBits is the number of low bits in an HLC timestamp
 // reserved for the in-memory logical counter (vs the upper bits
@@ -143,9 +145,16 @@ func (h *HLC) Next() uint64 {
 //   - ceiling > 0 AND wall_now < ceiling: floor wall at ceiling, then proceed.
 //
 // The TLA+ proof for this lives in tla/hlc/MCHLC_gap.cfg (HLC-4
-// counterexample, depth 5) — see docs/design/2026_05_28_partial_tla_safety_spec.md §5.1.
+// counterexample, depth 5) — see docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1.
 func (h *HLC) NextFenced() (uint64, error) {
 	return h.nextLocked(true)
+}
+
+// NextBatchFenced reserves n consecutive HLC timestamps in one atomic update.
+// It enforces the same physical-ceiling fence as NextFenced and returns the
+// first timestamp in the reserved window: [base, base+n-1].
+func (h *HLC) NextBatchFenced(n int) (uint64, error) {
+	return h.nextBatchLocked(n, true)
 }
 
 func (h *HLC) nextLocked(fence bool) (uint64, error) {
@@ -192,6 +201,47 @@ func (h *HLC) nextLocked(fence bool) (uint64, error) {
 		next := (nonNegativeUint64(newWall) << hlcLogicalBits) | uint64(newLogical)
 		if h.last.CompareAndSwap(prev, next) {
 			return next, nil
+		}
+	}
+}
+
+//nolint:cyclop // Batch reservation mirrors NextFenced plus overflow-window handling.
+func (h *HLC) nextBatchLocked(n int, fence bool) (uint64, error) {
+	if n <= 0 || n > maxHLCBatchSize {
+		return 0, errors.WithStack(ErrInvalidHLCBatchSize)
+	}
+	batch := uint64(n) //nolint:gosec // n is validated as positive and <= maxHLCBatchSize.
+	for {
+		prev := h.last.Load()
+		prevWall := clampUint64ToInt64(prev >> hlcLogicalBits)
+		prevLogical := prev & hlcLogicalMask
+
+		nowMs := time.Now().UnixMilli()
+		ceiling := h.physicalCeiling.Load()
+		if ceiling > 0 {
+			if fence && nowMs >= ceiling {
+				h.nextFencedRejections.Add(1)
+				return 0, errors.WithStack(ErrCeilingExpired)
+			}
+			if nowMs < ceiling {
+				nowMs = ceiling
+			}
+		}
+
+		newWall := nowMs
+		baseLogical := uint64(0)
+		if nowMs <= prevWall {
+			newWall = prevWall
+			baseLogical = prevLogical + 1
+			if baseLogical+batch-1 > hlcLogicalMask {
+				newWall++
+				baseLogical = 0
+			}
+		}
+		base := (nonNegativeUint64(newWall) << hlcLogicalBits) | baseLogical
+		next := base + batch - 1
+		if h.last.CompareAndSwap(prev, next) {
+			return base, nil
 		}
 	}
 }
@@ -244,7 +294,7 @@ func (h *HLC) PhysicalCeiling() int64 {
 //
 // A non-zero value here means the HLC-4 (i) bounded-skew assumption
 // (`MaxClockSkewMs < HlcPhysicalWindowMs` — see
-// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1) has at some
+// docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1) has at some
 // point been violated by enough margin that wall_now caught up to
 // physicalCeiling and the fence fired — typically because the leader's
 // lease renewal stopped (network partition, GC pause, …) for longer than

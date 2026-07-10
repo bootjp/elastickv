@@ -282,6 +282,13 @@ func (s *s3StreamingBody) writeDecoded(p []byte) {
 	_, _ = s.trailerHash.Write(p)
 }
 
+func (s *s3StreamingBody) decodedLengthReached(readBytes int64) bool {
+	return s != nil &&
+		s.reader != nil &&
+		s.reader.declaredDecoded >= 0 &&
+		readBytes >= s.reader.declaredDecoded
+}
+
 // verifyTrailer must be called after the body has been read to EOF. It
 // returns a non-nil error when the client advertised a trailer checksum via
 // X-Amz-Trailer and the value that arrived in the chunked trailer does not

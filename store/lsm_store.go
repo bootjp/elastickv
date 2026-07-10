@@ -29,24 +29,26 @@ const (
 	//   bit 0      tombstone
 	//   bits 1-2   encryption_state (0b00 cleartext, 0b01 encrypted, 0b10/0b11 reserved)
 	//   bits 3-7   reserved (must be zero)
-	encStateMask             byte = 0b0000_0110
-	encStateShift                 = 1
-	tombstoneMask            byte = 0b0000_0001
-	encStateCleartext        byte = 0b00
-	encStateEncrypted        byte = 0b01
-	encStateReservedMask     byte = 0b1111_1000 // bits 3-7 must stay zero
-	snapshotBatchCountLimit       = 1000
-	snapshotBatchByteLimit        = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
-	dirPerms                      = 0755
-	metaLastCommitTS              = "_meta_last_commit_ts"
-	metaMinRetainedTS             = "_meta_min_retained_ts"
-	metaPendingMinRetainedTS      = "_meta_pending_min_retained_ts"
+	encStateMask                    byte = 0b0000_0110
+	encStateShift                        = 1
+	tombstoneMask                   byte = 0b0000_0001
+	encStateCleartext               byte = 0b00
+	encStateEncrypted               byte = 0b01
+	encStateReservedMask            byte = 0b1111_1000 // bits 3-7 must stay zero
+	snapshotBatchCountLimit              = 1000
+	snapshotBatchByteLimit               = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
+	compactionDeleteBatchCountLimit      = 128
+	compactionDeleteBatchByteLimit       = 1 << 20
+	dirPerms                             = 0755
+	metaLastCommitTS                     = "_meta_last_commit_ts"
+	metaMinRetainedTS                    = "_meta_min_retained_ts"
+	metaPendingMinRetainedTS             = "_meta_pending_min_retained_ts"
 	// metaAppliedIndex is the durable raft-applied index meta key.
 	// Bundled atomically with each raft-Apply pebble.Batch (see
 	// applyMutationsRaftAt / deletePrefixAtRaftAt) and pinned to
 	// snap.Metadata.Index by SetDurableAppliedIndex at every snapshot
 	// persist site. See
-	// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+	// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3.
 	metaAppliedIndex = "_meta_applied_index"
 	spoolBufSize     = 32 * 1024 // buffer size for streaming I/O during restore
 
@@ -578,7 +580,7 @@ func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 // fsm.db that has not yet bumped through a raft-Apply, or a freshly
 // restored store. Callers MUST treat this as "missing" and fall back
 // to the full restore path; see
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §4 fallback
+// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §4 fallback
 // policy. Any other error propagates.
 //
 // dbMu.RLock matches the rest of the read path
@@ -1705,8 +1707,8 @@ func (s *pebbleStore) beginCompaction(minTS uint64) (bool, error) {
 	return true, nil
 }
 
-func (s *pebbleStore) cleanupPendingCompaction(committedDeletes *bool) {
-	if committedDeletes != nil && *committedDeletes {
+func (s *pebbleStore) cleanupPendingCompaction(retainPending *bool) {
+	if retainPending != nil && *retainPending {
 		return
 	}
 
@@ -1721,6 +1723,12 @@ func (s *pebbleStore) commitCompactionMinRetainedTS(minTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	return s.commitMinRetainedTSLocked(minTS, pebble.Sync)
+}
+
+func (s *pebbleStore) compactionWatermarks() (pending, committed uint64) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.pendingMinRetainedTS, s.minRetainedTS
 }
 
 func shouldDeleteCompactionVersion(rawKey []byte, minTS uint64, currentUserKey *[]byte, keptVisibleAtMinTS *bool, changedCurrentKey *bool) bool {
@@ -1791,7 +1799,7 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 		if err := addCompactionDelete(*batch, rawKey, stats, &changedCurrentKey); err != nil {
 			return err
 		}
-		if snapshotBatchShouldFlush(*batch) {
+		if compactionDeleteBatchShouldFlush(*batch) {
 			if err := s.flushCompactionBatch(batch, stats, pebble.NoSync); err != nil {
 				return err
 			}
@@ -1838,10 +1846,26 @@ func (s *pebbleStore) runCompactionGC(ctx context.Context, minTS uint64) (pebble
 
 	stats := pebbleCompactionStats{}
 	if err := s.scanCompactionDeletes(ctx, minTS, iter, &batch, &stats); err != nil {
-		return pebbleCompactionStats{}, errors.WithStack(err)
+		return stats, errors.WithStack(err)
 	}
 	if err := commitCompactionDeletes(&batch, &stats); err != nil {
-		return pebbleCompactionStats{}, err
+		return stats, err
+	}
+	return stats, nil
+}
+
+func (s *pebbleStore) runCompactionPhase(ctx context.Context, targetMinTS uint64, resumingPending bool) (pebbleCompactionStats, error) {
+	retainPending := resumingPending
+	stats, err := s.runCompactionGC(ctx, targetMinTS)
+	retainPending = retainPending || stats.committedDeletes
+	if err != nil {
+		s.cleanupPendingCompaction(&retainPending)
+		return stats, err
+	}
+
+	if err := s.commitCompactionMinRetainedTS(targetMinTS); err != nil {
+		s.cleanupPendingCompaction(&retainPending)
+		return stats, err
 	}
 	return stats, nil
 }
@@ -1865,48 +1889,43 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	if minTS <= s.effectiveMinRetainedTS() {
-		// Fast path: the requested watermark is already covered. However, a
-		// pending watermark may have survived a previous crash (GC ran and
-		// deleted versions but minRetainedTS was never committed). Finalize it
-		// now so reads < pending are unblocked and the pending key is not leaked.
-		s.mtx.RLock()
-		pending, committed := s.pendingMinRetainedTS, s.minRetainedTS
-		s.mtx.RUnlock()
-		if pending <= committed {
+	for {
+		pending, committed := s.compactionWatermarks()
+		resumingPending := pending > committed
+		targetMinTS := minTS
+		if resumingPending {
+			// A pending watermark means an earlier compaction may have already
+			// committed delete batches. Keep reads fail-closed, but do not finalize
+			// the watermark until an idempotent GC pass reaches EOF.
+			targetMinTS = pending
+		} else if minTS <= committed {
 			return nil
 		}
-		return s.commitCompactionMinRetainedTS(pending)
-	}
 
-	shouldRun, err := s.beginCompaction(minTS)
-	if err != nil {
-		return err
-	}
-	if !shouldRun {
-		return nil
-	}
+		if !resumingPending {
+			shouldRun, err := s.beginCompaction(targetMinTS)
+			if err != nil {
+				return err
+			}
+			if !shouldRun {
+				return nil
+			}
+		}
 
-	committedDeletes := false
-	defer s.cleanupPendingCompaction(&committedDeletes)
+		stats, err := s.runCompactionPhase(ctx, targetMinTS, resumingPending)
+		if err != nil {
+			return err
+		}
 
-	stats, err := s.runCompactionGC(ctx, minTS)
-	if err != nil {
-		return err
+		s.log.InfoContext(ctx, "compact",
+			slog.Uint64("min_ts", targetMinTS),
+			slog.Int("updated_keys", stats.updatedKeys),
+			slog.Int("deleted_versions", stats.deletedVersions),
+		)
+		if targetMinTS >= minTS {
+			return nil
+		}
 	}
-	committedDeletes = stats.committedDeletes
-
-	if err := s.commitCompactionMinRetainedTS(minTS); err != nil {
-		return err
-	}
-	committedDeletes = false
-
-	s.log.InfoContext(ctx, "compact",
-		slog.Uint64("min_ts", minTS),
-		slog.Int("updated_keys", stats.updatedKeys),
-		slog.Int("deleted_versions", stats.deletedVersions),
-	)
-	return nil
 }
 
 func (s *pebbleStore) Snapshot() (Snapshot, error) {
@@ -1977,6 +1996,10 @@ func restoreFieldLenInt(raw uint64, field string, maxSize int) (int, error) {
 
 func snapshotBatchShouldFlush(batch *pebble.Batch) bool {
 	return batch.Count() >= snapshotBatchCountLimit || batch.Len() >= snapshotBatchByteLimit
+}
+
+func compactionDeleteBatchShouldFlush(batch *pebble.Batch) bool {
+	return batch.Count() >= compactionDeleteBatchCountLimit || batch.Len() >= compactionDeleteBatchByteLimit
 }
 
 func commitSnapshotBatch(batch *pebble.Batch, opts *pebble.WriteOptions) error {

@@ -4,12 +4,14 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (as of February 17, 2026):
+Current implementation status (updated July 7, 2026):
 
-- `distribution/engine.go` has per-range access counters and threshold-based `splitRange`.
-- However, `RecordAccess` is not wired into real request paths.
-- The route table is in-memory only and is lost on restart.
-- Route updates are append-based via `UpdateRoute`, with no conflict detection, deduplication, or versioning.
+- M1 durable route catalog, watcher refresh, and same-group manual
+  `SplitRange` are implemented.
+- The old in-memory `RecordAccess` / midpoint `splitRange` path has been
+  removed by the M3-PR1a slice in
+  [`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md);
+  keyviz remains the only wired load-observation signal for future auto-split.
 - There is no data movement workflow to relocate part of a split range to another Raft group.
 
 So practical “hotspot splitting” is currently not connected end-to-end.
@@ -241,7 +243,8 @@ Milestone 1 implementation status (current):
 
 1. Implemented: `GetRoute`, `GetTimestamp`, `ListRoutes`, `SplitRange`.
 2. `SplitRange` currently supports same-group split only (no cross-group migration).
-3. Not implemented yet: `ReportAccess`, `WatchRoutes`, `GetSplitJob`.
+3. `ReportAccess` is superseded by the keyviz sampler for M3 automation.
+4. Not implemented yet: `WatchRoutes`, `GetSplitJob`.
 
 For operator examples, see the [Manual Route Split API section in the README](../../README.md#manual-route-split-api-milestone-1).
 
@@ -295,6 +298,11 @@ Add RPCs:
 1. Access aggregation
 2. Hotspot detector
 3. Auto-split scheduler (cooldown/hysteresis)
+
+Status: partial. M3-PR1a removed the dead engine-local `RecordAccess` /
+`splitRange` path and relaxed the route-catalog decoder for the later
+`SplitAtHLC` schema tail. Detector and scheduler wiring remain open in
+[`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md).
 
 ### Milestone 4: Hardening
 

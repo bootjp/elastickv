@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -71,6 +72,51 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
+func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1:  {Store: store.NewMVCCStore()},
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	key := []byte("!sqs|msg|vis|p|orders|partition-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("msg-2"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("!sqs|msg|vis|p|"), prefixScanEnd([]byte("!sqs|msg|vis|p|")), 10, 7)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, []byte("msg-2"), kvs[0].Value)
+}
+
+func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1:  {Store: store.NewMVCCStore()},
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("payload"), 7, 0))
+
+	val, err := st.GetGroupAt(ctx, 42, key, 7)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), val)
+
+	_, err = st.GetAt(ctx, key, 7)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 
@@ -122,6 +168,37 @@ func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) 
 	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
 	end := prefixScanEnd(start)
 	kvs, err := st.ScanAt(ctx, start, end, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, k0, kvs[0].Key)
+	require.Equal(t, k1, kvs[1].Key)
+}
+
+func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	k0 := fskeys.ChunkKey(home, inode, 0)
+	k1 := fskeys.ChunkKey(home, inode, 1)
+	require.NoError(t, st.PutAt(ctx, k0, []byte("c0"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, k1, []byte("c1"), 2, 0))
+
+	start := fskeys.ChunkPrefix(home, inode)
+	kvs, err := st.ScanAt(ctx, start, prefixScanEnd(start), 10, ^uint64(0))
 	require.NoError(t, err)
 	require.Len(t, kvs, 2)
 	require.Equal(t, k0, kvs[0].Key)

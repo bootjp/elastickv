@@ -40,6 +40,20 @@ func TestRouteKey_NormalizesFilesystemChunkKey(t *testing.T) {
 	require.Equal(t, fskeys.InodeKey(22), routeKey(fskeys.InodeKey(22)))
 }
 
+func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		[]byte("!redis|txn-wide-hash|user:key"),
+		[]byte("!redis|txn-wide-set|user:key"),
+		[]byte("!redis|txn-wide-list|user:key"),
+		[]byte("!redis|txn-wide-zset|user:key"),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+	}
+}
+
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	t.Parallel()
 

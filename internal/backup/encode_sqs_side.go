@@ -170,7 +170,7 @@ func resolveDedupID(rec *sqsMessageRecord, meta *sqsQueueMetaPublic) string {
 // addSideRecords emits the vis + byage + (conditional) dedup rows that the
 // live adapter would have written alongside the !sqs|msg|data| record M5-1
 // already stages. No !sqs|msg|group| rows are emitted at any time — see
-// docs/design/2026_05_30_proposed_sqs_side_record_derivation.md "Families"
+// docs/design/2026_05_30_implemented_sqs_side_record_derivation.md "Families"
 // table for why (loadFifoGroupLock treats key presence alone as "lock held";
 // any value would permanently block every group post-restore).
 //

@@ -16,6 +16,7 @@ import (
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -239,9 +240,9 @@ func reportColdStartExecute(obs raftengine.ColdStartObserver, logger *zap.Logger
 // index. Raft's invariant guarantees hardState.Commit >= 0; we do
 // not need to bound from below explicitly beyond snap.Index.
 func coldStartSkipThreshold(snapshot raftpb.Snapshot, hardState raftpb.HardState) uint64 {
-	threshold := snapshot.Metadata.Index
-	if hardState.Commit > threshold {
-		threshold = hardState.Commit
+	threshold := snapshot.GetMetadata().GetIndex()
+	if hardState.GetCommit() > threshold {
+		threshold = hardState.GetCommit()
 	}
 	return threshold
 }
@@ -310,7 +311,7 @@ func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.S
 // loadWalState so ValidSnapshotEntries and ReadAll share a single repair
 // pass and the "WAL tail truncated" log is emitted at most once.
 func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
-	w, err := wal.Open(logger, walDir, walSnap)
+	w, err := wal.Open(logger, walDir, &walSnap)
 	if err != nil {
 		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
 	}
@@ -324,7 +325,7 @@ func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (
 		}
 		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
 	}
-	return w, hardState, entries, nil
+	return w, hardStateValue(hardState), entryValues(entries), nil
 }
 
 func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
@@ -356,7 +357,7 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 // conflicts; HLC ceiling inversion). The execute path returns
 // snapshot.Metadata.Index to leave engine behaviour unchanged.
 func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
-	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
+	if etcdraft.IsEmptySnap(&snapshot) || len(snapshot.Data) == 0 || fsm == nil {
 		return 0, nil
 	}
 	if isSnapshotToken(snapshot.Data) {
@@ -366,7 +367,7 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalInd
 	if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	return snapshot.Metadata.Index, nil
+	return snapshot.GetMetadata().GetIndex(), nil
 }
 
 // restoreSnapshotStateFromToken handles the EKVT-token Phase-2 branch
@@ -401,7 +402,7 @@ func restoreSnapshotStateFromToken(fsm StateMachine, snapshot raftpb.Snapshot, l
 		return 0, err
 	}
 	reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
-	return snapshot.Metadata.Index, nil
+	return snapshot.GetMetadata().GetIndex(), nil
 }
 
 // coldStartDecision enumerates the three outcomes the skip gate
@@ -620,14 +621,14 @@ func readSnapshotHeaderOrDrain(setter raftengine.SnapshotHeaderApplier, hasSette
 
 func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
 	return walpb.Snapshot{
-		Index:     snapshot.Metadata.Index,
-		Term:      snapshot.Metadata.Term,
-		ConfState: &snapshot.Metadata.ConfState,
+		Index:     proto.Uint64(snapshot.GetMetadata().GetIndex()),
+		Term:      proto.Uint64(snapshot.GetMetadata().GetTerm()),
+		ConfState: snapshot.GetMetadata().GetConfState(),
 	}
 }
 
 func migrateLegacyState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
-	if !etcdraft.IsEmptySnap(state.Snapshot) && len(state.Snapshot.Data) > 0 {
+	if !etcdraft.IsEmptySnap(&state.Snapshot) && len(state.Snapshot.Data) > 0 {
 		token, err := restoreAndOffloadLegacySnapshot(fsm, fsmSnapDir, state.Snapshot)
 		if err != nil {
 			return nil, err
@@ -649,7 +650,7 @@ func restoreAndOffloadLegacySnapshot(fsm StateMachine, fsmSnapDir string, snap r
 	if fsmSnapDir == "" {
 		return snap.Data, nil
 	}
-	index := snap.Metadata.Index
+	index := snap.GetMetadata().GetIndex()
 	fsmSnap, err := fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -713,13 +714,13 @@ func ensureWalDirs(walDir string, snapDir string) error {
 }
 
 func saveBootstrapState(persist etcdstorage.Storage, state persistedState) error {
-	if !etcdraft.IsEmptySnap(state.Snapshot) {
-		if err := persist.SaveSnap(state.Snapshot); err != nil {
+	if !etcdraft.IsEmptySnap(&state.Snapshot) {
+		if err := persist.SaveSnap(&state.Snapshot); err != nil {
 			return errors.WithStack(err)
 		}
 	}
-	if !etcdraft.IsEmptyHardState(state.HardState) || len(state.Entries) > 0 {
-		if err := persist.Save(state.HardState, state.Entries); err != nil {
+	if !etcdraft.IsEmptyHardState(&state.HardState) || len(state.Entries) > 0 {
+		if err := persist.Save(&state.HardState, entryPointers(state.Entries)); err != nil {
 			return errors.WithStack(err)
 		}
 	}
@@ -762,15 +763,15 @@ func bootstrapStateForPeers(peers []Peer, snapshotData []byte) persistedState {
 	confState := confStateForPeers(peers)
 	return persistedState{
 		HardState: raftpb.HardState{
-			Term:   1,
-			Commit: 1,
+			Term:   proto.Uint64(1),
+			Commit: proto.Uint64(1),
 		},
 		Snapshot: raftpb.Snapshot{
 			Data: snapshotData,
-			Metadata: raftpb.SnapshotMetadata{
-				ConfState: confState,
-				Index:     1,
-				Term:      1,
+			Metadata: &raftpb.SnapshotMetadata{
+				ConfState: &confState,
+				Index:     proto.Uint64(1),
+				Term:      proto.Uint64(1),
 			},
 		},
 	}
@@ -782,8 +783,8 @@ func validateConfState(conf raftpb.ConfState, peers []Peer) error {
 	}
 	// Joint consensus markers are still rejected: learner add/promote
 	// uses the simple V1 single-step ConfChange path which never sets
-	// these. See docs/design/2026_04_26_proposed_raft_learner.md §4.2.
-	if len(conf.VotersOutgoing) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
+	// these. See docs/design/2026_04_26_implemented_raft_learner.md §4.2.
+	if len(conf.GetVotersOutgoing()) > 0 || len(conf.GetLearnersNext()) > 0 || conf.GetAutoLeave() {
 		return errors.Wrap(errClusterMismatch, "joint consensus state is not supported")
 	}
 	expectedVoters, learnerSet := splitPeersBySuffrage(peers)
@@ -814,7 +815,7 @@ func validateConfStateVoters(conf raftpb.ConfState, expectedVoters []uint64) err
 // no prior writer-side ordering invariant for learners, so we do not
 // pin one in the reader. A set comparison rejects both
 // same-count-member-divergence and conf-learner-not-in-peers cases —
-// see docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 3.
+// see docs/design/2026_04_26_implemented_raft_learner.md §4.2 edit 3.
 func validateConfStateLearners(conf raftpb.ConfState, expected map[uint64]struct{}) error {
 	if len(conf.Learners) != len(expected) {
 		return errors.Wrapf(errClusterMismatch, "expected %d learners got %d", len(expected), len(conf.Learners))
@@ -886,16 +887,16 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
-	if err := persist.SaveSnap(snapshot); err != nil {
+	if err := persist.SaveSnap(&snapshot); err != nil {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
-	if _, err := storage.CreateSnapshot(applied, &snapshot.Metadata.ConfState, payload); err != nil {
+	if _, err := storage.CreateSnapshot(applied, snapshot.GetMetadata().GetConfState(), payload); err != nil {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	if err := storage.Compact(applied); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
-	if err := persist.Release(snapshot); err != nil {
+	if err := persist.Release(&snapshot); err != nil {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}
 	return snapshot, nil
@@ -917,10 +918,10 @@ func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload
 	}
 	return raftpb.Snapshot{
 		Data: payload,
-		Metadata: raftpb.SnapshotMetadata{
+		Metadata: &raftpb.SnapshotMetadata{
 			ConfState: confState,
-			Index:     applied,
-			Term:      term,
+			Index:     proto.Uint64(applied),
+			Term:      proto.Uint64(term),
 		},
 	}, nil
 }

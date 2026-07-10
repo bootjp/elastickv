@@ -2,7 +2,7 @@ package keyviz
 
 // Space-Saving sketch (Metwally et al.) — Misra–Gries-equivalent
 // heavy-hitter detector backing the per-cell hot-key drill-down (Phase
-// 2-A++; see docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md
+// 2-A++; see docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md
 // §3). Maintains at most `capacity` (= `m`) entries; a key with
 // frequency f over the observed stream of length N is reported with
 // error ≤ N/m, and any key with f > N/m is guaranteed in the tracked

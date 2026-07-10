@@ -25,11 +25,12 @@ import (
 //     no §4.1 case-4 halt apply on a durable conf-change entry
 //     (guarantee 2: collision-safe membership change).
 //
-// See docs/design/2026_05_29_proposed_7c_confchange_time_registration.md.
+// See docs/design/2026_05_29_implemented_7c_confchange_time_registration.md.
 type encryptionPreRegister struct {
 	coordinate   *kv.ShardedCoordinator
 	defaultGroup *kv.ShardGroup
 	cache        *encryption.StateCache
+	sidecarPath  string
 	// deriveNodeID is injected so the adapter is engine-neutral —
 	// main.go supplies etcdraftengine.DeriveNodeID today; a future
 	// engine swap is a one-line wiring change here, not an adapter
@@ -46,6 +47,7 @@ func newEncryptionPreRegister(
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
 	cache *encryption.StateCache,
+	sidecarPath string,
 	deriveNodeID func(raftID string) uint64,
 ) raftadmin.MembershipChangeInterceptor {
 	if coordinate == nil || defaultGroup == nil || defaultGroup.Store == nil || cache == nil || deriveNodeID == nil {
@@ -55,6 +57,7 @@ func newEncryptionPreRegister(
 		coordinate:   coordinate,
 		defaultGroup: defaultGroup,
 		cache:        cache,
+		sidecarPath:  sidecarPath,
 		deriveNodeID: deriveNodeID,
 	}
 }
@@ -74,12 +77,43 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 		return nil
 	}
 	newNodeFullID := e.deriveNodeID(raftID)
+	if err := e.preRegisterDEK(ctx, activeDEK, newNodeFullID, "storage"); err != nil {
+		return err
+	}
+	raftDEK, ok, err := e.activeRaftDEKForPreRegister()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	return e.preRegisterDEK(ctx, raftDEK, newNodeFullID, "raft")
+}
+
+func (e *encryptionPreRegister) activeRaftDEKForPreRegister() (uint32, bool, error) {
+	if e.sidecarPath == "" {
+		return 0, false, nil
+	}
+	sc, err := encryption.ReadSidecar(e.sidecarPath)
+	if err != nil {
+		if encryption.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, errors.Wrap(err, "7c pre-register: read sidecar for raft DEK")
+	}
+	if sc.Active.Raft == 0 {
+		return 0, false, nil
+	}
+	return sc.Active.Raft, true, nil
+}
+
+func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK uint32, newNodeFullID uint64, purpose string) error {
 	// store.WriterRegistryFor is a stateless wrapper (same idiom as
 	// 7a §3.1 startup check); avoiding a cached field on the adapter
 	// keeps construction simple and the dependency surface narrow.
 	reg, err := store.WriterRegistryFor(e.defaultGroup.Store)
 	if err != nil {
-		return errors.Wrap(err, "7c pre-register: registry handle")
+		return errors.Wrapf(err, "7c pre-register: %s registry handle", purpose)
 	}
 	// Read-before-propose guard (design §3.1). Two purposes:
 	//
@@ -107,12 +141,12 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	// ErrWriterUint16Collision; no row → fall through to propose.
 	existing, exists, err := reg.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(newNodeFullID)))
 	if err != nil {
-		return errors.Wrap(err, "7c pre-register: read registry row")
+		return errors.Wrapf(err, "7c pre-register: %s read registry row", purpose)
 	}
 	if exists {
 		val, derr := encryption.DecodeRegistryValue(existing)
 		if derr != nil {
-			return errors.Wrap(derr, "7c pre-register: decode registry value")
+			return errors.Wrapf(derr, "7c pre-register: %s decode registry value", purpose)
 		}
 		if val.FullNodeID == newNodeFullID {
 			return nil // already registered; idempotent skip
@@ -152,5 +186,5 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	// collision TOCTOU — different FullNodeID at the same NodeID16
 	// — is the genuine case-4 halt-apply residual; see §3.3 of the
 	// design doc.)
-	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, connCache, entry, req)
+	return proposeWriterRegistrationBlockingOnCutover(ctx, e.coordinate, e.defaultGroup.Proposer(), connCache, entry, req)
 }

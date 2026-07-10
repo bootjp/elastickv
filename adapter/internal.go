@@ -10,19 +10,32 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay) *Internal {
-	return &Internal{
+type InternalOption func(*Internal)
+
+func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
+	return func(i *Internal) {
+		i.tsAllocator = alloc
+	}
+}
+
+func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
+	i := &Internal{
 		leader:             leader,
 		transactionManager: txm,
 		clock:              clock,
 		relay:              relay,
 	}
+	for _, opt := range opts {
+		opt(i)
+	}
+	return i
 }
 
 type Internal struct {
 	leader             raftengine.LeaderView
 	transactionManager kv.Transactional
 	clock              *kv.HLC
+	tsAllocator        kv.TimestampAllocator
 	relay              *RedisPubSubRelay
 
 	pb.UnimplementedInternalServer
@@ -42,7 +55,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 
-	if err := i.stampTimestamps(req); err != nil {
+	if err := i.stampTimestamps(ctx, req); err != nil {
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
@@ -72,18 +85,77 @@ func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) 
 	}, nil
 }
 
-func (i *Internal) stampTimestamps(req *pb.ForwardRequest) error {
+func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) error {
 	if req == nil {
 		return nil
 	}
 	if req.IsTxn {
-		return i.stampTxnTimestamps(req.Requests)
+		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
 
-	return i.stampRawTimestamps(req.Requests)
+	return i.stampRawTimestamps(ctx, req.Requests)
 }
 
-func (i *Internal) stampRawTimestamps(reqs []*pb.Request) error {
+func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
+	if i.tsAllocator != nil {
+		ts, err := i.tsAllocator.Next(ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, label)
+		}
+		return ts, nil
+	}
+	if i.clock == nil {
+		return 1, nil
+	}
+	ts, err := i.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+func (i *Internal) nextTimestampAfter(ctx context.Context, min uint64, label string) (uint64, error) {
+	if min == ^uint64(0) {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	if i.tsAllocator != nil {
+		return i.nextTimestampAfterFromAllocator(ctx, min, label)
+	}
+	if i.clock == nil {
+		return min + 1, nil
+	}
+	if i.clock != nil {
+		i.clock.Observe(min)
+	}
+	ts, err := i.nextTimestamp(ctx, label)
+	if err != nil {
+		return 0, err
+	}
+	if ts <= min {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	return ts, nil
+}
+
+func (i *Internal) nextTimestampAfterFromAllocator(ctx context.Context, min uint64, label string) (uint64, error) {
+	if after, ok := i.tsAllocator.(kv.TimestampAfterAllocator); ok {
+		ts, err := after.NextAfter(ctx, min)
+		if err != nil {
+			return 0, errors.Wrap(err, label)
+		}
+		return ts, nil
+	}
+	ts, err := i.tsAllocator.Next(ctx)
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if ts <= min {
+		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
+	}
+	return ts, nil
+}
+
+func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) error {
 	for _, r := range reqs {
 		if r == nil {
 			continue
@@ -91,31 +163,23 @@ func (i *Internal) stampRawTimestamps(reqs []*pb.Request) error {
 		if r.Ts != 0 {
 			continue
 		}
-		if i.clock == nil {
-			r.Ts = 1
-			continue
-		}
-		ts, err := i.clock.NextFenced()
+		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
 		if err != nil {
-			return errors.Wrap(err, "stampRawTimestamps")
+			return err
 		}
 		r.Ts = ts
 	}
 	return nil
 }
 
-func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) error {
+func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) error {
 	startTS := forwardedTxnStartTS(reqs)
 	if startTS == 0 {
-		if i.clock == nil {
-			startTS = 1
-		} else {
-			ts, err := i.clock.NextFenced()
-			if err != nil {
-				return errors.Wrap(err, "stampTxnTimestamps startTS")
-			}
-			startTS = ts
+		ts, err := i.nextTimestamp(ctx, "stampTxnTimestamps startTS")
+		if err != nil {
+			return err
 		}
+		startTS = ts
 	}
 	if startTS == ^uint64(0) {
 		return errors.WithStack(ErrTxnTimestampOverflow)
@@ -128,7 +192,7 @@ func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) error {
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(reqs, startTS)
+	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -156,7 +220,7 @@ func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, b
 	return r.Mutations[0], true
 }
 
-func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) error {
+func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) error {
 	type metaToUpdate struct {
 		m    *pb.Mutation
 		meta kv.TxnMeta
@@ -182,7 +246,7 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 		return nil
 	}
 
-	commitTS, err := i.forwardedTxnCommitTS(startTS)
+	commitTS, err := i.forwardedTxnCommitTS(ctx, startTS)
 	if err != nil {
 		return err
 	}
@@ -197,7 +261,7 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded
 // transaction, strictly greater than startTS. Pulled out of
 // fillForwardedTxnCommitTS so that function stays under cyclop.
-func (i *Internal) forwardedTxnCommitTS(startTS uint64) (uint64, error) {
+func (i *Internal) forwardedTxnCommitTS(ctx context.Context, startTS uint64) (uint64, error) {
 	commitTS := startTS + 1
 	if commitTS == 0 {
 		// Overflow: can't choose a commit timestamp strictly greater than startTS.
@@ -205,9 +269,11 @@ func (i *Internal) forwardedTxnCommitTS(startTS uint64) (uint64, error) {
 	}
 	if i.clock != nil {
 		i.clock.Observe(startTS)
-		ts, err := i.clock.NextFenced()
+	}
+	if i.tsAllocator != nil || i.clock != nil {
+		ts, err := i.nextTimestampAfter(ctx, startTS, "fillForwardedTxnCommitTS")
 		if err != nil {
-			return 0, errors.Wrap(err, "fillForwardedTxnCommitTS")
+			return 0, err
 		}
 		commitTS = ts
 	}

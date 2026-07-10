@@ -34,6 +34,7 @@ const (
 	defaultOpenHandleLeaseTTL        = 5 * time.Minute
 	defaultLeaseReaperLimit          = 256
 	statFSScanPageSize               = 512
+	chunkDeleteTxnPageSize           = 512
 	openRefScanLimit                 = 2
 	openTxnRetryLimit                = 4
 )
@@ -178,6 +179,14 @@ type usageDelta struct {
 	filesSub uint64
 	bytesAdd uint64
 	bytesSub uint64
+}
+
+type chunkDeletePlan struct {
+	homeSlot        uint64
+	inode           uint64
+	start           []byte
+	chunkSize       uint64
+	protectLiveSize bool
 }
 
 type OpenHandleLease struct {
@@ -377,19 +386,21 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
 	oldSize := meta.Size
 	var delta usageDelta
+	var chunkDeletes *chunkDeletePlan
 	if mask.Size {
 		if meta.Type == TypeDirectory {
 			return Stat{}, ErrIsDir
 		}
 		chunkSize := meta.effectiveChunkSize(s.chunkSize)
 		if attrs.Size < meta.Size {
-			truncateElems, truncateReads, truncateDelta, err := s.truncateChunkElems(ctx, meta, ts, attrs.Size, chunkSize)
+			truncateElems, truncateReads, truncateDelta, plan, err := s.truncateChunkElems(ctx, meta, ts, attrs.Size, chunkSize)
 			if err != nil {
 				return Stat{}, err
 			}
 			elems = append(elems, truncateElems...)
 			readKeys = append(readKeys, truncateReads...)
 			delta = delta.merge(truncateDelta)
+			chunkDeletes = plan
 		}
 		meta.Size = attrs.Size
 	}
@@ -422,6 +433,9 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		return Stat{}, err
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return Stat{}, err
+	}
+	if err := s.deleteChunkPages(ctx, chunkDeletes); err != nil {
 		return Stat{}, err
 	}
 	return meta.Stat(), nil
@@ -670,14 +684,16 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	elems := make([]*kv.Elem[kv.OP], 0)
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
 	var delta usageDelta
+	var chunkDeletes *chunkDeletePlan
 	if size < meta.Size {
-		truncateElems, truncateReads, truncateDelta, err := s.truncateChunkElems(ctx, meta, ts, size, chunkSize)
+		truncateElems, truncateReads, truncateDelta, plan, err := s.truncateChunkElems(ctx, meta, ts, size, chunkSize)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, truncateElems...)
 		readKeys = append(readKeys, truncateReads...)
 		delta = delta.merge(truncateDelta)
+		chunkDeletes = plan
 	}
 	now := s.now().UnixNano()
 	meta.Size = size
@@ -692,7 +708,10 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, elems, readKeys)
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return err
+	}
+	return s.deleteChunkPages(ctx, chunkDeletes)
 }
 
 func (s *Service) Unlink(ctx context.Context, parent uint64, name []byte) error {
@@ -732,7 +751,7 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	if bytes.Equal(oldName, newName) {
 		return nil
 	}
-	replacedMeta, err := s.renameReplacedFileMeta(ctx, oldParent, newName, oldEntry.Inode, ts)
+	replacedMeta, err := s.renameReplacedFileMeta(ctx, oldParent, newName, oldEntry, ts)
 	if err != nil {
 		return err
 	}
@@ -764,27 +783,32 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 		fskeys.DirEntryKey(oldParent, newName),
 	}
 	var delta usageDelta
+	var chunkDeletes *chunkDeletePlan
 	if replacedMeta != nil {
-		replacedElems, replacedReads, replacedDelta, err := s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
+		replacedElems, replacedReads, replacedDelta, plan, err := s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, replacedElems...)
 		readKeys = append(readKeys, replacedReads...)
 		delta = delta.merge(replacedDelta)
+		chunkDeletes = plan
 	}
 	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, elems, readKeys)
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return err
+	}
+	return s.deleteChunkPages(ctx, chunkDeletes)
 }
 
 func (s *Service) renameReplacedFileMeta(
 	ctx context.Context,
 	parent uint64,
 	name []byte,
-	sourceInode uint64,
+	source DirEntry,
 	ts uint64,
 ) (*InodeMeta, error) {
 	replacedEntry, err := s.dirEntryAt(ctx, parent, name, ts)
@@ -794,20 +818,33 @@ func (s *Service) renameReplacedFileMeta(
 		}
 		return nil, err
 	}
-	if replacedEntry.Type == TypeDirectory {
-		return nil, ErrIsDir
+	if err := validateRenameReplacement(source.Type, replacedEntry.Type); err != nil {
+		return nil, err
 	}
-	if replacedEntry.Inode == sourceInode {
+	if replacedEntry.Inode == source.Inode {
 		return nil, nil
 	}
 	meta, err := s.inodeAt(ctx, replacedEntry.Inode, ts)
 	if err != nil {
 		return nil, err
 	}
-	if meta.Type == TypeDirectory {
-		return nil, ErrIsDir
+	if err := validateRenameReplacement(source.Type, meta.Type); err != nil {
+		return nil, err
 	}
 	return meta, nil
+}
+
+func validateRenameReplacement(sourceType, targetType FileType) error {
+	if sourceType == TypeDirectory {
+		if targetType != TypeDirectory {
+			return ErrNotDir
+		}
+		return nil
+	}
+	if targetType == TypeDirectory {
+		return ErrIsDir
+	}
+	return nil
 }
 
 //nolint:cyclop // Readdir has explicit dot-entry and paginated-cookie state transitions.
@@ -868,7 +905,7 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 		return err
 	}
 	refKey := fskeys.RefKey(inode, clientID, fh)
-	elems, readKeys, delta, _, err := s.releaseRefTxnParts(ctx, ts, inode, refKey)
+	elems, readKeys, delta, chunkDeletes, _, err := s.releaseRefTxnParts(ctx, ts, inode, refKey)
 	if err != nil {
 		return err
 	}
@@ -876,7 +913,10 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, elems, readKeys)
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return err
+	}
+	return s.deleteChunkPages(ctx, chunkDeletes)
 }
 
 func (s *Service) releaseRefTxnParts(
@@ -884,31 +924,31 @@ func (s *Service) releaseRefTxnParts(
 	ts uint64,
 	inode uint64,
 	refKey []byte,
-) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, bool, error) {
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, bool, error) {
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: refKey}}
 	readKeys := [][]byte{refKey, fskeys.InodeKey(inode)}
 	meta, err := s.inodeAt(ctx, inode, ts)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return elems, readKeys, usageDelta{}, false, nil
+			return elems, readKeys, usageDelta{}, nil, false, nil
 		}
-		return nil, nil, usageDelta{}, false, err
+		return nil, nil, usageDelta{}, nil, false, err
 	}
 	hasOther, refReads, err := s.hasOtherOpenRefs(ctx, inode, ts, refKey)
 	if err != nil {
-		return nil, nil, usageDelta{}, false, err
+		return nil, nil, usageDelta{}, nil, false, err
 	}
 	readKeys = append(readKeys, refReads...)
 	if !meta.Orphaned || meta.Nlink != 0 || hasOther {
-		return elems, readKeys, usageDelta{}, false, nil
+		return elems, readKeys, usageDelta{}, nil, false, nil
 	}
-	gcElems, gcReads, delta, err := s.gcFileElems(ctx, meta, ts)
+	gcElems, gcReads, delta, plan, err := s.gcFileElems(ctx, meta, ts)
 	if err != nil {
-		return nil, nil, usageDelta{}, false, err
+		return nil, nil, usageDelta{}, nil, false, err
 	}
 	elems = append(elems, gcElems...)
 	readKeys = append(readKeys, gcReads...)
-	return elems, readKeys, delta, true, nil
+	return elems, readKeys, delta, plan, true, nil
 }
 
 func (s *Service) StatFS(ctx context.Context, _ uint64) (StatFS, error) {
@@ -983,6 +1023,24 @@ func (s *Service) appendUsageUpdate(
 		return nil, nil, err
 	}
 	return append(elems, elem), append(readKeys, fskeys.UsageKey()), nil
+}
+
+func (s *Service) dispatchUsageTxnAndDeleteChunks(
+	ctx context.Context,
+	ts uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	delta usageDelta,
+	chunkDeletes *chunkDeletePlan,
+) error {
+	elems, readKeys, err := s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
+	if err != nil {
+		return err
+	}
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return err
+	}
+	return s.deleteChunkPages(ctx, chunkDeletes)
 }
 
 func (d usageDelta) empty() bool {
@@ -1197,16 +1255,14 @@ func (s *Service) reapExpiredOpenHandleLease(
 	if !ok || !current.expired(nowNsec) {
 		return false, false, nil
 	}
-	elems, readKeys, delta, gcd, err := s.releaseRefTxnParts(ctx, ts, current.Inode, pair.Key)
+	elems, readKeys, delta, chunkDeletes, gcd, err := s.releaseRefTxnParts(ctx, ts, current.Inode, pair.Key)
 	if err != nil {
 		return false, false, err
 	}
-	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
-	if err != nil {
+	if err := s.dispatchUsageTxnAndDeleteChunks(ctx, ts, elems, readKeys, delta, chunkDeletes); err != nil {
 		return false, false, err
 	}
-	err = s.dispatchTxn(ctx, ts, elems, readKeys)
-	return true, gcd, err
+	return true, gcd, nil
 }
 
 func (l OpenHandleLease) expired(nowNsec int64) bool {
@@ -1359,6 +1415,7 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: fskeys.DirEntryKey(parent, name)}}
 	readKeys := [][]byte{fskeys.InodeKey(parent), fskeys.DirEntryKey(parent, name), fskeys.InodeKey(entry.Inode)}
 	var delta usageDelta
+	var chunkDeletes *chunkDeletePlan
 	if directory {
 		if parentMeta.Nlink > fileInitialNlink {
 			parentMeta.Nlink--
@@ -1371,13 +1428,14 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		readKeys = append(readKeys, fskeys.HomeKey(entry.Inode), fskeys.DirVersionKey(entry.Inode))
 		delta = delta.merge(usageDelta{filesSub: 1})
 	} else {
-		fileElems, fileReads, fileDelta, err := s.unlinkFileTxnParts(ctx, ts, meta, now)
+		fileElems, fileReads, fileDelta, plan, err := s.unlinkFileTxnParts(ctx, ts, meta, now)
 		if err != nil {
 			return err
 		}
 		elems = append(elems, fileElems...)
 		readKeys = append(readKeys, fileReads...)
 		delta = delta.merge(fileDelta)
+		chunkDeletes = plan
 	}
 	putParent, err := putElem(fskeys.InodeKey(parent), parentMeta)
 	if err != nil {
@@ -1392,7 +1450,10 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, elems, readKeys)
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return err
+	}
+	return s.deleteChunkPages(ctx, chunkDeletes)
 }
 
 func (s *Service) unlinkFileTxnParts(
@@ -1400,42 +1461,43 @@ func (s *Service) unlinkFileTxnParts(
 	ts uint64,
 	meta *InodeMeta,
 	now int64,
-) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
 	if meta.Nlink > 0 {
 		meta.Nlink--
 	}
 	if meta.Nlink != 0 {
-		return s.putUnlinkedFileMeta(meta, now)
+		elems, err := s.putUnlinkedFileMeta(meta, now)
+		return elems, nil, usageDelta{}, nil, err
 	}
 	hasRefs, refReads, err := s.openRefReadKeys(ctx, meta.Inode, ts)
 	if err != nil {
-		return nil, nil, usageDelta{}, err
+		return nil, nil, usageDelta{}, nil, err
 	}
 	if !hasRefs {
-		gcElems, gcReads, delta, err := s.gcFileElems(ctx, meta, ts)
+		gcElems, gcReads, delta, plan, err := s.gcFileElems(ctx, meta, ts)
 		if err != nil {
-			return nil, nil, usageDelta{}, err
+			return nil, nil, usageDelta{}, nil, err
 		}
-		return gcElems, append(refReads, gcReads...), delta, nil
+		return gcElems, append(refReads, gcReads...), delta, plan, nil
 	}
 	meta.Orphaned = true
-	elems, _, delta, err := s.putUnlinkedFileMeta(meta, now)
-	return elems, refReads, delta, err
+	elems, err := s.putUnlinkedFileMeta(meta, now)
+	return elems, refReads, usageDelta{}, nil, err
 }
 
 func (s *Service) putUnlinkedFileMeta(
 	meta *InodeMeta,
 	now int64,
-) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+) ([]*kv.Elem[kv.OP], error) {
 	if meta.Nlink != 0 {
 		meta.Orphaned = false
 	}
 	meta.CtimeNsec = now
 	elem, err := putElem(fskeys.InodeKey(meta.Inode), meta)
 	if err != nil {
-		return nil, nil, usageDelta{}, err
+		return nil, err
 	}
-	return []*kv.Elem[kv.OP]{elem}, nil, usageDelta{}, nil
+	return []*kv.Elem[kv.OP]{elem}, nil
 }
 
 func (s *Service) truncateChunkElems(
@@ -1444,20 +1506,21 @@ func (s *Service) truncateChunkElems(
 	ts uint64,
 	size uint64,
 	chunkSize uint64,
-) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
 	if meta.Size == 0 {
-		return nil, nil, usageDelta{}, nil
+		return nil, nil, usageDelta{}, nil, nil
 	}
 	oldLast := (meta.Size - 1) / chunkSize
 	deleteFrom := size / chunkSize
 	var elems []*kv.Elem[kv.OP]
 	var readKeys [][]byte
 	var delta usageDelta
+	var plan *chunkDeletePlan
 	if size > 0 && size%chunkSize != 0 {
 		tailIndex := size / chunkSize
 		tailElems, tailReads, tailDelta, err := s.truncateTailChunkElems(ctx, meta, ts, tailIndex, size%chunkSize)
 		if err != nil {
-			return nil, nil, usageDelta{}, err
+			return nil, nil, usageDelta{}, nil, err
 		}
 		elems = append(elems, tailElems...)
 		readKeys = append(readKeys, tailReads...)
@@ -1465,15 +1528,16 @@ func (s *Service) truncateChunkElems(
 		deleteFrom = tailIndex + 1
 	}
 	if deleteFrom <= oldLast {
-		deleteElems, deleteReads, deleteDelta, err := s.truncateDeletedChunkElems(ctx, meta, ts, deleteFrom)
+		deleteElems, deleteReads, deleteDelta, deletePlan, err := s.truncateDeletedChunkElems(ctx, meta, ts, deleteFrom, chunkSize)
 		if err != nil {
-			return nil, nil, usageDelta{}, err
+			return nil, nil, usageDelta{}, nil, err
 		}
 		elems = append(elems, deleteElems...)
 		readKeys = append(readKeys, deleteReads...)
 		delta = delta.merge(deleteDelta)
+		plan = deletePlan
 	}
-	return elems, readKeys, delta, nil
+	return elems, readKeys, delta, plan, nil
 }
 
 func (s *Service) truncateTailChunkElems(
@@ -1509,24 +1573,24 @@ func (s *Service) truncateDeletedChunkElems(
 	meta *InodeMeta,
 	ts uint64,
 	deleteFrom uint64,
-) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
-	var elems []*kv.Elem[kv.OP]
-	var readKeys [][]byte
-	var delta usageDelta
+	chunkSize uint64,
+) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
 	start := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, deleteFrom)
-	err := s.scanExistingChunks(ctx, meta, ts, start, func(pair *store.KVPair) error {
-		delta = delta.merge(usageDelta{bytesSub: uint64(len(pair.Value))})
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		readKeys = append(readKeys, pair.Key)
-		return nil
-	})
+	page, err := s.scanExistingChunkPage(ctx, meta.HomeSlot, meta.Inode, ts, start, chunkDeleteTxnPageSize+1)
 	if err != nil {
-		return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem scan truncate deleted chunks")
+		return nil, nil, usageDelta{}, nil, errors.Wrap(err, "filesystem scan truncate deleted chunks")
 	}
-	return elems, readKeys, delta, nil
+	page, plan := splitChunkDeletePage(page, chunkDeletePlan{
+		homeSlot:        meta.HomeSlot,
+		inode:           meta.Inode,
+		chunkSize:       chunkSize,
+		protectLiveSize: true,
+	})
+	elems, readKeys, delta := chunkDeleteTxnParts(page, nil)
+	return elems, readKeys, delta, plan, nil
 }
 
-func (s *Service) gcFileElems(ctx context.Context, meta *InodeMeta, ts uint64) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, error) {
+func (s *Service) gcFileElems(ctx context.Context, meta *InodeMeta, ts uint64) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: fskeys.InodeKey(meta.Inode)},
 		{Op: kv.Del, Key: fskeys.HomeKey(meta.Inode)},
@@ -1534,47 +1598,146 @@ func (s *Service) gcFileElems(ctx context.Context, meta *InodeMeta, ts uint64) (
 	}
 	readKeys := [][]byte{fskeys.InodeKey(meta.Inode), fskeys.HomeKey(meta.Inode), fskeys.RefFenceKey(meta.Inode)}
 	delta := usageDelta{filesSub: 1}
-	if err := s.scanExistingChunks(ctx, meta, ts, fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode), func(pair *store.KVPair) error {
-		delta = delta.merge(usageDelta{bytesSub: uint64(len(pair.Value))})
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
-		readKeys = append(readKeys, pair.Key)
-		return nil
-	}); err != nil {
-		return nil, nil, usageDelta{}, errors.Wrap(err, "filesystem scan gc chunks")
+	page, err := s.scanExistingChunkPage(ctx, meta.HomeSlot, meta.Inode, ts, fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode), chunkDeleteTxnPageSize+1)
+	if err != nil {
+		return nil, nil, usageDelta{}, nil, errors.Wrap(err, "filesystem scan gc chunks")
 	}
-	return elems, readKeys, delta, nil
+	page, plan := splitChunkDeletePage(page, chunkDeletePlan{
+		homeSlot:  meta.HomeSlot,
+		inode:     meta.Inode,
+		chunkSize: meta.effectiveChunkSize(s.chunkSize),
+	})
+	deleteElems, deleteReads, deleteDelta := chunkDeleteTxnParts(page, nil)
+	elems = append(elems, deleteElems...)
+	readKeys = append(readKeys, deleteReads...)
+	delta = delta.merge(deleteDelta)
+	return elems, readKeys, delta, plan, nil
 }
 
-func (s *Service) scanExistingChunks(
+func (s *Service) scanExistingChunkPage(
 	ctx context.Context,
-	meta *InodeMeta,
+	homeSlot uint64,
+	inode uint64,
 	ts uint64,
 	start []byte,
-	visit func(*store.KVPair) error,
-) error {
-	prefix := fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode)
+	limit int,
+) ([]*store.KVPair, error) {
+	prefix := fskeys.ChunkPrefix(homeSlot, inode)
 	if bytes.Compare(start, prefix) < 0 || !bytes.HasPrefix(start, prefix) {
 		start = prefix
 	}
 	end := prefixEnd(prefix)
-	for {
-		page, err := s.store.ScanAt(ctx, start, end, statFSScanPageSize, ts)
-		if err != nil {
-			return errors.Wrap(err, "filesystem scan existing chunks")
-		}
-		if len(page) == 0 {
-			return nil
-		}
-		for _, pair := range page {
-			if err := visit(pair); err != nil {
-				return err
-			}
-		}
-		if len(page) < statFSScanPageSize {
-			return nil
-		}
-		start = scanCursorAfter(page[len(page)-1].Key)
+	if end != nil && bytes.Compare(start, end) >= 0 {
+		return nil, nil
 	}
+	page, err := s.store.ScanAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, errors.Wrap(err, "filesystem scan existing chunk page")
+	}
+	return page, nil
+}
+
+func splitChunkDeletePage(page []*store.KVPair, plan chunkDeletePlan) ([]*store.KVPair, *chunkDeletePlan) {
+	if len(page) <= chunkDeleteTxnPageSize {
+		return page, nil
+	}
+	page = page[:chunkDeleteTxnPageSize]
+	plan.start = scanCursorAfter(page[len(page)-1].Key)
+	return page, &plan
+}
+
+func chunkDeleteTxnParts(page []*store.KVPair, readKeys [][]byte) ([]*kv.Elem[kv.OP], [][]byte, usageDelta) {
+	elems := make([]*kv.Elem[kv.OP], 0, len(page))
+	delta := usageDelta{}
+	for _, pair := range page {
+		delta = delta.merge(usageDelta{bytesSub: uint64(len(pair.Value))})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+		readKeys = append(readKeys, pair.Key)
+	}
+	return elems, readKeys, delta
+}
+
+func (s *Service) deleteChunkPages(ctx context.Context, plan *chunkDeletePlan) error {
+	if plan == nil {
+		return nil
+	}
+	start := append([]byte(nil), plan.start...)
+	for {
+		next, done, err := s.deleteChunkPage(ctx, plan, start)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		start = next
+	}
+}
+
+func (s *Service) deleteChunkPage(ctx context.Context, plan *chunkDeletePlan, start []byte) ([]byte, bool, error) {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	readKeys, adjustedStart, err := s.chunkDeletePlanReadKeys(ctx, plan, ts, start)
+	if err != nil {
+		return nil, false, err
+	}
+	page, err := s.scanExistingChunkPage(ctx, plan.homeSlot, plan.inode, ts, adjustedStart, chunkDeleteTxnPageSize+1)
+	if err != nil {
+		return nil, false, errors.Wrap(err, "filesystem scan chunk delete page")
+	}
+	if len(page) == 0 {
+		return nil, true, nil
+	}
+	page, nextPlan := splitChunkDeletePage(page, *plan)
+	elems, pageReads, delta := chunkDeleteTxnParts(page, readKeys)
+	elems, pageReads, err = s.appendUsageUpdate(ctx, ts, elems, pageReads, delta)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.dispatchTxn(ctx, ts, elems, pageReads); err != nil {
+		if errors.Is(err, store.ErrWriteConflict) {
+			return adjustedStart, false, nil
+		}
+		return nil, false, err
+	}
+	if nextPlan == nil {
+		return nil, true, nil
+	}
+	return nextPlan.start, false, nil
+}
+
+func (s *Service) chunkDeletePlanReadKeys(
+	ctx context.Context,
+	plan *chunkDeletePlan,
+	ts uint64,
+	start []byte,
+) ([][]byte, []byte, error) {
+	if !plan.protectLiveSize {
+		return nil, start, nil
+	}
+	inodeKey := fskeys.InodeKey(plan.inode)
+	meta, err := s.inodeAt(ctx, plan.inode, ts)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, start, nil
+		}
+		return nil, nil, err
+	}
+	chunkSize := meta.effectiveChunkSize(plan.chunkSize)
+	protectStart := fskeys.ChunkKey(plan.homeSlot, plan.inode, firstChunkIndexPastSize(meta.Size, chunkSize))
+	if bytes.Compare(start, protectStart) < 0 {
+		start = protectStart
+	}
+	return [][]byte{inodeKey}, start, nil
+}
+
+func firstChunkIndexPastSize(size uint64, chunkSize uint64) uint64 {
+	if size == 0 {
+		return 0
+	}
+	return (size-1)/chunkSize + 1
 }
 
 func (s *Service) appendDirectoryEntries(

@@ -128,6 +128,44 @@ func ExtractRouteKey(key []byte) []byte {
 	return out
 }
 
+// ChunkScanRouteBounds maps raw chunk scan bounds to the virtual chunk route
+// domain. The caller still scans raw chunk keys, but route selection uses these
+// bounds so a ShardStore scan reaches the groups selected for ChunkKey writes.
+func ChunkScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
+	routeStart, ok := chunkScanBound(start)
+	if !ok {
+		return nil, nil, false
+	}
+	if end == nil {
+		return routeStart, nil, true
+	}
+	if bytes.Equal(end, prefixEnd(chunkPrefixBytes)) {
+		return routeStart, prefixEnd(chunkRoutePrefixBytes), true
+	}
+	routeEnd, ok := chunkScanBound(end)
+	if !ok {
+		return nil, nil, false
+	}
+	return routeStart, routeEnd, true
+}
+
+func chunkScanBound(key []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(key, chunkPrefixBytes) {
+		return nil, false
+	}
+	rest := key[len(chunkPrefixBytes):]
+	if len(rest) == 0 {
+		return append([]byte(nil), chunkRoutePrefixBytes...), true
+	}
+	if len(rest) < 2*u64Bytes {
+		return nil, false
+	}
+	out := make([]byte, 0, len(chunkRoutePrefixBytes)+2*u64Bytes)
+	out = append(out, chunkRoutePrefixBytes...)
+	out = append(out, rest[:2*u64Bytes]...)
+	return out, true
+}
+
 // NormalizeSplitBoundary snaps filesystem chunk-domain split candidates to the
 // file boundary used by routeKey. This prevents a split key from bisecting one
 // file's chunk-domain route.
@@ -197,6 +235,21 @@ func appendU64(dst []byte, v uint64) []byte {
 	var buf [u64Bytes]byte
 	binary.BigEndian.PutUint64(buf[:], v)
 	return append(dst, buf[:]...)
+}
+
+func prefixEnd(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+	out := append([]byte(nil), prefix...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] == ^byte(0) {
+			continue
+		}
+		out[i]++
+		return out[:i+1]
+	}
+	return nil
 }
 
 func appendOrderedBytes(dst []byte, src []byte) []byte {

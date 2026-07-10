@@ -45,6 +45,28 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 	require.Nil(t, ExtractRouteKey(InodeKey(22)))
 }
 
+func TestChunkScanRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	start := ChunkKey(11, 22, 7)
+	end := prefixEnd(ChunkPrefix(11, 22))
+	routeStart, routeEnd, ok := ChunkScanRouteBounds(start, end)
+	require.True(t, ok)
+	require.Equal(t, ChunkRouteKey(11, 22), routeStart)
+	require.Equal(t, prefixEnd(ChunkRouteKey(11, 22)), routeEnd)
+}
+
+func TestChunkScanRouteBounds_AllChunks(t *testing.T) {
+	t.Parallel()
+
+	start := ChunkAllPrefix()
+	end := prefixEnd(start)
+	routeStart, routeEnd, ok := ChunkScanRouteBounds(start, end)
+	require.True(t, ok)
+	require.Equal(t, []byte(chunkRoutePrefix), routeStart)
+	require.Equal(t, prefixEnd([]byte(chunkRoutePrefix)), routeEnd)
+}
+
 func TestRefFenceKeyIsPerInode(t *testing.T) {
 	require.Equal(t, RefFenceKey(7), RefFenceKey(7))
 	require.NotEqual(t, RefFenceKey(7), RefFenceKey(8))

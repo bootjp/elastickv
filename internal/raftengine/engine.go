@@ -23,6 +23,18 @@ var (
 	// ErrLeadershipTransferInProgress indicates a leadership transfer
 	// is under way and proposals are being held back.
 	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
+	// ErrLeadershipTransferNoHealthyTarget indicates every supplied
+	// leadership-transfer target failed the leader-side eligibility
+	// checks.
+	ErrLeadershipTransferNoHealthyTarget = errors.New("raft engine: leadership transfer has no healthy target")
+	// ErrLeadershipTransferTargetNotCaughtUp indicates the selected
+	// transfer target is live but has not caught up to the requested
+	// max-lag budget.
+	ErrLeadershipTransferTargetNotCaughtUp = errors.New("raft engine: leadership transfer target is not caught up")
+	// ErrLeadershipTransferConfChangePending indicates the group has an
+	// unapplied configuration change, so transfer is rejected until the
+	// membership transition settles.
+	ErrLeadershipTransferConfChangePending = errors.New("raft engine: leadership transfer blocked by pending config change")
 	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
 	// cutover barrier is open on this leader and rejecting fresh
 	// USER proposals on the Propose path. The error is the step-1
@@ -60,6 +72,11 @@ type LeaderInfo struct {
 	Address string
 }
 
+type TransferTarget struct {
+	ID      string
+	Address string
+}
+
 type Configuration struct {
 	Servers []Server
 }
@@ -80,6 +97,10 @@ type Status struct {
 	// Writers should hold new proposals while this is non-zero, since etcd/raft
 	// drops proposals during transfer.
 	LeadTransferee uint64
+	// PendingConfChange reports that a configuration change is present
+	// in the local raft log and has not yet applied. Leadership transfer
+	// is rejected while this is true.
+	PendingConfChange bool
 }
 
 type ProposalResult struct {
@@ -234,7 +255,7 @@ type Admin interface {
 	// a fresh node so the cluster's effective fault tolerance is not
 	// reduced during catch-up. Promote with PromoteLearner once the
 	// learner has caught up. See
-	// docs/design/2026_04_26_proposed_raft_learner.md.
+	// docs/design/2026_04_26_implemented_raft_learner.md.
 	AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
 	// PromoteLearner promotes an existing learner to voter. The
 	// minAppliedIndex precondition is enforced against the leader's
@@ -251,6 +272,7 @@ type Admin interface {
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error
+	TransferLeadershipToServerIfEligible(ctx context.Context, candidates []TransferTarget, maxLag uint64) error
 	// RegisterLeaderAcquiredCallback registers fn to fire every
 	// time the local node's Raft state transitions INTO leader
 	// (initial election, re-election, transfer target completion).
