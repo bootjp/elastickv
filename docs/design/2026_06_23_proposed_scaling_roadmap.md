@@ -59,9 +59,10 @@ What bounds a single elastickv deployment today:
    `SplitRange` RPC (`adapter/distribution_server.go`, `distribution/catalog.go`,
    `distribution/engine.go`, `distribution/watcher.go`). There is no data
    movement (cross-group migration is M2, in flight), no auto-detection (M3,
-   in flight), and **no merge** (no design exists). The detection counters in
-   `distribution/engine.go` (`RecordAccess`) are dead code — not called from
-   any request path (confirmed in the M3 doc §1.3).
+   in flight), and **no merge** (no design exists). The old
+   `distribution.Engine.RecordAccess` midpoint path was removed by M3-PR1a
+   because it was never called from any request path; future auto-detection
+   uses keyviz.
 
 5. **Cross-group timestamps via per-group HLC, but no global TSO yet.**
    `ShardedCoordinator.RunHLCLeaseRenewal` proposes the physical-ceiling
@@ -108,7 +109,7 @@ memory each group's private cache/memtable pins.
   over-full node. Actual per-node volume relief therefore also depends on Gap 1
   plus the replica-placement / region-balance work in Gap 4. Auto-detection /
   scheduling is **PR #951**
-  (`docs/design/2026_06_11_proposed_hotspot_split_milestone3_automation.md`,
+  (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`,
   branch `design/hotspot-split-m3-automation`), which drives detection off the
   already-wired keyviz sampler rather than the dead `RecordAccess` counters.
 - **Range MERGE — missing, no design exists.** The inverse of split. Both the

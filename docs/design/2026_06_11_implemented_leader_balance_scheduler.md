@@ -4,7 +4,7 @@ Status: Implemented
 Author: bootjp
 Date: 2026-06-11
 
-Sibling: [2026_06_11_proposed_hotspot_split_milestone3_automation.md](2026_06_11_proposed_hotspot_split_milestone3_automation.md) — shares the "scheduler lives on the default-group leader, default OFF behind a flag, runtime kill switch, bounded-cardinality metrics, leader-local state reset on election" conventions. This doc reuses those conventions but does **not** depend on M3 landing.
+Sibling: [2026_06_11_partial_hotspot_split_milestone3_automation.md](2026_06_11_partial_hotspot_split_milestone3_automation.md) — shares the "scheduler lives on the default-group leader, default OFF behind a flag, runtime kill switch, bounded-cardinality metrics, leader-local state reset on election" conventions. This doc reuses those conventions but does **not** depend on M3 landing.
 
 ## Implementation status
 
