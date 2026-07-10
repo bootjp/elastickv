@@ -112,15 +112,24 @@ func (alwaysS3BlobOffloadCapable) AllPeersSupportS3BlobOffload(context.Context) 
 }
 
 type recordingS3BlobOffloadObserver struct {
-	decisions []s3BlobOffloadDecision
+	decisions           []s3BlobOffloadDecision
+	replicationDegraded int
+	shaMismatch         int
+	unrecoverable       int
 }
 
 func (o *recordingS3BlobOffloadObserver) ObserveS3BlobOffloadDecision(mode, reason string) {
 	o.decisions = append(o.decisions, s3BlobOffloadDecision{mode: mode, reason: reason})
 }
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobReplicationDegraded() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobReplicationDegraded() {
+	o.replicationDegraded++
+}
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobSHAMismatch() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobSHAMismatch() {
+	o.shaMismatch++
+}
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobUnrecoverable() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobUnrecoverable() {
+	o.unrecoverable++
+}
