@@ -2,10 +2,19 @@
 
 | Field | Value |
 |---|---|
-| Status | implemented — filename kept stable for existing links |
+| Status | implemented |
 | Date | 2026-05-26 |
-| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md) (7a coordinator-layer gate) |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
+| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md) (7a coordinator-layer gate) |
 | Builds on | 7a (coordinator-layer first-write barrier), 6D-6c-1 (`encryption.StateCache`) |
+
+## Implementation audit
+
+Implemented by `internal/encryption.StateCache.Registered`,
+`StateCache.MarkRegistered`, `store.WithStorageRegistrationGate`,
+`store.ErrWriterNotRegistered`, and the direct-vs-FSM write-path flag in
+`store`.
+The gate is wired from `main_encryption_write_wiring.go`.
 
 ## 0. Why this slice exists
 
@@ -244,9 +253,9 @@ direct path is `pebbleStore.ApplyMutations`. It is reached by:
     **MVCCStore-interface forwarders** (`kv/shard_store.go`,
     `kv/leader_routed_store.go`) which simply delegate to the
     underlying `pebbleStore.ApplyMutations` — no production hot-path
-    caller of these forwarders was found in `adapter/`, `kv/`, or
-    `main*.go`; §5 records the final `encryptForKey` call-site
-    inventory used for the implementation audit.
+    caller of these forwarders was found (grep of `adapter/`, `kv/`,
+    `main*.go`), but they are live entry points the implementation's
+    §5 verification must re-confirm.
 "admin snapshot" and "migration" are *anticipated future* direct-path
 callers named by the `lsm_store.go` doc comment as the design-time
 category, not code that exists yet. So the implementation wires the
@@ -270,12 +279,13 @@ forwarder callers before merge.
   the first direct-path write does not fail-closed (codex P1).**
 
 ### Out of scope
-- 7b (post-rotation re-registration), 7c (ConfChange-time registration).
+- 7b (post-rotation re-registration), 7c (ConfChange-time registration);
+  both are implemented by later slices.
 - Re-evaluating whether route-catalog data *should* be encrypted at all
   (it is, incidentally, when the envelope is active; changing that is a
   separate question).
 
-## 4. Self-review checklist
+## 4. Self-review checklist (for the implementation PR)
 - **Data loss** — gating only refuses to *emit* an encrypted write
   before registration (caller sees a typed error and retries); never
   drops a committed write. FSM-apply path untouched → no apply halt.
@@ -290,25 +300,20 @@ forwarder callers before merge.
 - **Test coverage** — direct vs FSM-apply path, pre/post registration,
   envelope/DEK off, catalog-bootstrap ordering.
 
-## 5. Verification record
-1. **Sequencing check completed.** `kv/fsm.go` dispatches
-   `OpRegistration` through `applyEncryption` to
-   `EncryptionApplier.ApplyRegistration`; it does not call the route
-   catalog or `distribution.Engine`, so arming the direct-write gate
-   before `EnsureCatalogSnapshot` has no hidden route-catalog cycle.
-2. **Call-site inventory completed.** The implemented code has exactly
-   three `encryptForKey` call sites: `PutAt`, `ExpireAt`, and the shared
-   `applyMutationsBatch` path. `PutAt` and `ExpireAt` pass
-   `gateRegistration=true`; `applyMutationsBatch` receives the threaded
-   direct-vs-FSM flag, so `ApplyMutations` gates and
-   `ApplyMutationsRaft` remains exempt. `PutWithTTLAt` delegates to
-   `PutAt`, and tombstone-only delete paths do not call `encryptForKey`.
-3. **Per-DEK state resolved.** §2.1 adopts
-   `registeredStorageDEKID atomic.Uint32`, lock-free and composing with
-   the 7b cutover watcher and the 7b' rotation watcher.
-4. **Test coverage landed.** `store/lsm_store_registration_gate_test.go`
-   covers direct-path fail-closed behavior, FSM-apply exemption,
-   inactive-envelope ungating, and legacy unwired behavior;
-   `main_encryption_write_wiring_test.go` covers production wiring of
-   `WithStorageRegistrationGate`; `main_encryption_registration_test.go`
-   covers barrier release and already-registered restart seeding.
+## 5. Verification action items (design decisions are settled)
+1. **Sequencing is decided** (§2.3: arm the gate first, then
+   `EnsureCatalogSnapshot`, with bounded `retryUntilRegistered` for the
+   empty-catalog + active-envelope edge). Remaining **verification**
+   before implementation: confirm the `OpRegistration` apply path in
+   `kv/fsm.go` makes no route-catalog / `distribution.Engine` call, so
+   arm-before-bootstrap has no hidden cycle.
+2. **Call-site inventory is settled** (§2.2's 4-row table: `PutAt`
+   (1031) and `ExpireAt` (1076) are *separate* direct `encryptForKey`
+   callers — `ExpireAt` does **not** delegate to `PutAt`;
+   `PutWithTTLAt` does; `applyMutationsBatch` (1177) is reached from
+   both the direct and FSM paths; `DeletePrefixAt` writes tombstones
+   only and is out of scope). Remaining **verification**: grep-confirm
+   no *other* `encryptForKey` caller exists.
+(Open question 3 — per-DEK vs single bool — is resolved: §2.1 adopts
+the per-DEK `registeredStorageDEKID atomic.Uint32`, lock-free and
+composing with 7b.)

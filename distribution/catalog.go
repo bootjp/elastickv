@@ -20,8 +20,9 @@ const (
 	catalogUint64Bytes       = 8
 	catalogVersionRecordSize = 1 + catalogUint64Bytes
 
-	catalogVersionCodecVersion byte = 1
-	catalogRouteCodecVersion   byte = 1
+	catalogVersionCodecVersion  byte = 1
+	catalogRouteCodecVersionMin byte = 1
+	catalogRouteCodecVersion    byte = 1
 
 	catalogScanPageSize          = 256
 	catalogSaveMetaMutationCount = 2
@@ -197,7 +198,8 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if len(raw) < 1 {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
-	if raw[0] != catalogRouteCodecVersion {
+	version := raw[0]
+	if version < catalogRouteCodecVersionMin {
 		return RouteDescriptor{}, errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", raw[0])
 	}
 
@@ -210,7 +212,7 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if err != nil {
 		return RouteDescriptor{}, err
 	}
-	if r.Len() != 0 {
+	if version == catalogRouteCodecVersion && r.Len() != 0 {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	if err := validateRouteDescriptor(route); err != nil {

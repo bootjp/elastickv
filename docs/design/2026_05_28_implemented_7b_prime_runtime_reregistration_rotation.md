@@ -2,21 +2,29 @@
 
 | Field | Value |
 |---|---|
-| Status | implemented — filename kept stable for existing links |
+| Status | implemented |
 | Date | 2026-05-28 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md) (cutover case + §6 deferred-rotation analysis) |
 | Builds on | 7a (process-start propose path), 7a-2 (storage-layer `Registered()` gate), 7b (runtime watcher for the cutover case) |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
+
+## Implementation audit
+
+Implemented by `internal/encryption.WithLocalEpoch`,
+`internal/encryption.WithRaftLocalEpoch`, `writeRotationSidecar`,
+`main_encryption_registration.go`'s runtime registration watcher, and
+the per-DEK `StateCache.Registered` gate. Tests cover storage and raft
+rotation-local-epoch sidecar writes plus runtime rotation registration
+scope/verify paths.
 
 ## 0. Why this slice exists
 
 7b shipped the runtime registration watcher for the **cutover** case
 (Phase-0 boot or pre-bootstrap boot → runtime `EnableStorageEnvelope`).
-The original 7b posture explicitly deferred the rotation case via a
-log-once skip in
-[`runtimeRegistrationInScope`](../../main_encryption_registration.go)
-when `bootDEKID != 0 && activeDEK != bootDEKID`; the implemented 7b'
-watcher replaces that skip with the same verify-or-propose path used
-by the cutover case.
+The watcher explicitly **defers** the rotation case via a log-once skip
+in [`runtimeRegistrationInScope`](../../main_encryption_registration.go)
+when `bootDEKID != 0 && activeDEK != bootDEKID`. This slice closes that
+gap.
 
 The rotation case is a non-proposer node observing a committed
 `RotateDEK` and needing to register `(newDEK, node, ?)` so its
@@ -112,40 +120,38 @@ cleaner but ships materially more code; we will revisit it if option
 
 ### 3.1 `applyRotateDEK` per-node sidecar mutation
 
-`applyRotateDEK` currently writes the new key with `LocalEpoch: 0`
-via `writeRotationSidecar`. The change:
+Before this slice, `applyRotateDEK` wrote the new key with
+`LocalEpoch: 0` via `writeRotationSidecar`. The change:
 
-- Inject a `localEpoch uint16` value into the `Applier` via a new
-  `WithLocalEpoch(uint16)` functional option (symmetric with
-  `WithStateCache`, `WithSidecarPath`, etc.).
-- The value is `encryptionWriteWiring.epoch` — the same pinned
-  `w.epoch` the nonce factory is constructed with at process start.
-  `main_encryption_write_wiring.go`'s `buildEncryptionWriteWiring`
-  already computes this value; this slice exposes it to the
-  `Applier` construction site in `main.go`.
-- `writeRotationSidecar` reads `a.localEpoch` (defaulting to `0`
-  when the option was not supplied — preserving the FSM-internal
-  test harnesses that construct an `Applier` without write-path
-  state) and writes that value into `sc.Keys[newDEK].LocalEpoch`
-  **only when `p.Purpose == PurposeStorage`**.
+- Inject purpose-specific epoch values into the `Applier` via
+  `WithLocalEpoch(uint16)` for storage and
+  `WithRaftLocalEpoch(uint16)` for raft-envelope writes (symmetric
+  with `WithStateCache`, `WithSidecarPath`, etc.).
+- The values are `encryptionWriteWiring.epoch` and
+  `encryptionWriteWiring.raftEpoch` — the pinned epochs the storage
+  and raft-envelope nonce factories are constructed with at process
+  start. `main_encryption_write_wiring.go`'s
+  `buildEncryptionWriteWiring` computes both values; this slice
+  exposes them to the `Applier` construction site in `main.go`.
+- `writeRotationSidecar` reads `a.localEpoch` for
+  `PurposeStorage` and `a.raftLocalEpoch` for `PurposeRaft`
+  (defaulting to `0` when the option was not supplied — preserving
+  FSM-internal test harnesses that construct an `Applier` without
+  write-path state) and writes that value into
+  `sc.Keys[newDEK].LocalEpoch`.
 
-#### 3.1.1 Why the value is storage-only — Raft DEK rotations must keep `LocalEpoch: 0`
+#### 3.1.1 Why the value is purpose-specific
 
 `applyRotateDEK` handles both `PurposeStorage` and `PurposeRaft`
 rotations today (`writeRotationSidecar` dispatches on `p.Purpose`
 when assigning `sc.Active.{Storage,Raft}`). The
 `encryptionWriteWiring.epoch` value piped in by `WithLocalEpoch` is
-the **storage** write-path's pinned `w.epoch` — the value the
-deterministic nonce factory under the storage envelope is using.
-
-A raft DEK rotation has its own (future) per-purpose epoch
-counter; cross-applying the storage nonce factory's epoch to a
-raft DEK's `LocalEpoch` would corrupt the raft DEK's counter
-before the raft envelope path consumes it (codex P2 on PR #855).
-Until raft envelope support lands with its own per-purpose
-plumbing, raft DEK rotations MUST continue to write `LocalEpoch:
-0` exactly as today — `writeRotationSidecar`'s switch on
-`p.Purpose` gates the new behaviour to storage:
+the **storage** write-path's pinned `w.epoch`; the
+`encryptionWriteWiring.raftEpoch` value piped in by
+`WithRaftLocalEpoch` is the raft-envelope counterpart. Cross-applying
+the storage nonce factory's epoch to a raft DEK's `LocalEpoch` would
+corrupt the raft counter, so `writeRotationSidecar` selects the
+matching epoch for each purpose:
 
 ```go
 switch p.Purpose {
@@ -154,7 +160,7 @@ case fsmwire.PurposeStorage:
     keyLocalEpoch = a.localEpoch
 case fsmwire.PurposeRaft:
     sc.Active.Raft = p.DEKID
-    keyLocalEpoch = 0  // current behaviour preserved
+    keyLocalEpoch = a.raftLocalEpoch
 }
 ```
 
@@ -292,14 +298,15 @@ separate slice can introduce a per-DEK cache.
 1. KEK-unwrap new DEK.
 2. Keystore set (`a.keystore.Set(p.DEKID, dek)`).
 3. **Sidecar write — with `a.localEpoch` for `Keys[newDEK].LocalEpoch`
-   when `p.Purpose == PurposeStorage`, `0` otherwise** (see §3.1.1).
+   when `p.Purpose == PurposeStorage`, and `a.raftLocalEpoch` when
+   `p.Purpose == PurposeRaft`** (see §3.1.1).
 4. **Proposer registration** (`ApplyRegistration(p.ProposerRegistration)`)
    — proposer's value is `(newDEK, proposer.node_id, proposer.w.epoch)`,
    set by the proposer at propose time. Verbatim into the writer
    registry.
 
-Step 3 changes from `LocalEpoch: 0` to `LocalEpoch: a.localEpoch` (for
-storage). Step 4 is unchanged.
+Step 3 changes from `LocalEpoch: 0` to the purpose-specific pinned
+epoch. Step 4 is unchanged.
 
 **Sidecar-before-registration is the existing `applyRotateDEK`
 ordering** (coderabbitai major review on PR #855 raised concern
@@ -361,32 +368,84 @@ node's sidecar now records its own emissions accurately.
   group). Multi-group rotation atomicity is a much larger design
   problem; out of scope here.
 
-## 5. Verification record
+## 5. Verification action items (for the implementation PR)
 
-The implementation landed both the applier-side local-epoch plumbing
-and the runtime watcher rotation path:
+1. New `applier_test.go` cases:
+   - `TestApplyRotateDEK_LocalEpochAppliedToStorageKey`:
+     given `WithLocalEpoch(7)`, the storage rotation
+     entry under a fresh DEK writes `Keys[newDEK].LocalEpoch = 7`
+     to the sidecar.
+   - `TestApplyRotateDEK_RaftLocalEpochAppliedToRaftKey`:
+     given `WithRaftLocalEpoch(9)`, the raft rotation entry writes
+     `Keys[newDEK].LocalEpoch = 9` to the raft sidecar key.
+   - `TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero`:
+     constructing the `Applier` without `WithRaftLocalEpoch` keeps
+     raft rotations at `LocalEpoch: 0` for unwired harnesses.
+   - `TestApplyRotateDEK_LocalEpoch_NoOptionFallsBackToZero`:
+     constructing the `Applier` without the option preserves
+     today's `LocalEpoch: 0` behaviour (test-harness
+     backward-compatibility).
+   - `TestApplyRotateDEK_LocalEpoch_AppliedPerApply`:
+     verify the static `a.localEpoch` value is correctly read
+     on each FSM apply call, not inadvertently reset or derived
+     from mutable state. A multi-apply test fixture (two
+     rotations in sequence) suffices to pin that the value
+     remains stable across applies.
 
-- `internal/encryption/applier_test.go` covers storage rotation using
-  `WithLocalEpoch`, no-option fallback to `LocalEpoch=0`, per-apply
-  stability across multiple rotations, raft-rotation isolation from
-  the storage epoch, and raft-local-epoch wiring for raft keys.
-- `main_encryption_registration_test.go` covers rotation in-scope
-  verify short-circuit, already-registered no-op, re-propose on a
-  later DEK, and B-to-C-to-B oscillation re-propose behavior.
-- The old 7b deferral branch is replaced by an in-scope rotation
-  branch in `runtimeRegistrationInScope`; the tests above pin that
-  rotations use the same verify-or-propose lifecycle as the cutover
-  case.
+2. New `main_encryption_registration_test.go` cases extending the
+   existing watcher harness. Split into **propose-call** vs
+   **short-circuit** so each test exercises one path
+   independently (coderabbitai minor on PR #855):
 
-Self-review focus:
+   - `TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`:
+     `bootDEKID == X != 0`, `activeDEK == Y != X`,
+     `lastRegisteredDEK != Y`, `w.epoch == 5`. NO pre-populated
+     registry row. Asserts the tick invokes the propose path (use
+     a fake `Coordinate` whose `Propose` method records the
+     entry) with payload `(Y, node, 5)`.
+   - `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`:
+     same wiring as above, but **pre-populate** a registry row at
+     `(Y, node, 5)`. Asserts `verifyRegistered` short-circuits,
+     `MarkRegistered(Y)` fires, and the fake `Coordinate.Propose`
+     is NOT called.
+   - `TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp`:
+     after a first-tick MarkRegistered, a second tick at the same
+     `activeDEK` is a no-op. Asserts `cache.Registered()` short-
+     circuits `runtimeRegistrationInScope` and `lastRegisteredDEK`
+     is NOT updated (claude review nit on PR #855 — confirm it
+     stays at the original value, not reset to 0 or rewritten).
+   - `TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes`:
+     after registering for DEK Y, a subsequent rotation to DEK Z
+     (`activeDEK == Z`, `lastRegisteredDEK == Y`) triggers a fresh
+     propose. Pins that `lastRegisteredDEK` updates to Z.
+   - `TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes`:
+     after registering for B then C, rotation back to B does NOT
+     short-circuit (the single-DEK `StateCache` holds C, so
+     `cache.Registered() == false` for active B; §3.2.2). Asserts
+     the tick re-proposes `(B, node, w.epoch)`; the §4.1 case-2
+     idempotent apply lands as a no-op, and the success callback
+     runs `MarkRegistered(B)` flipping the cache back to
+     B-registered. Pins the documented oscillation behavior so
+     the implementation PR's tests do not mistake the
+     re-propose for a bug.
 
-- **Data consistency:** Each node's `Keys[newDEK].LocalEpoch`
-  matches its own nonce factory's pinned epoch — no cross-node
-  epoch contamination.
-- **Concurrency:** The `a.localEpoch` field is read from the FSM
-  goroutine (apply path) only; no shared-state race with the
-  watcher's read of `w.epoch` (both are the same static value
-  captured at `Applier` construction).
+3. Replace `TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips`
+   (which pins the 7b deferral) with the two tests in §5 item 2
+   above (`TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`
+   + `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`
+   — the 7b' resolution) and document the lifecycle transition in
+   the commit message: the deferral was the 7b posture; 7b' is the
+   resolution.
+
+4. Self-review (5-lens) for the implementation PR — same template
+   as 7b. Particular attention to:
+   - **Data consistency:** Each node's `Keys[newDEK].LocalEpoch`
+     matches its own nonce factory's pinned epoch — no cross-node
+     epoch contamination.
+   - **Concurrency:** The `a.localEpoch` field is read from the
+     FSM goroutine (apply path) only; no shared-state race with
+     the watcher's read of `w.epoch` (both are the same static
+     value captured at `Applier` construction).
 
 ## 6. Rollout / migration
 
@@ -421,18 +480,14 @@ mitigations close this gap, in order of operator friction:
    metrics can warn if the cluster reports mixed versions and a
    `RotateDEK` is observed in the audit log.
 
-2. **Admin RPC capability gate (middle friction).** The
-   `EncryptionAdmin.RotateDEK` RPC handler (in the propose-side
-   mutator) gates on a cluster-wide capability probe — gossiped or
-   queried via `Distribution.ListNodes` — refusing to propose if
-   any peer advertises a version older than 7b'. This is
-   server-side and cannot be bypassed by a misconfigured client.
-   Failure surface: the RPC returns
-   `FailedPrecondition: cluster contains pre-7b' nodes; complete
-   the rolling upgrade before rotating`. The probe is best-effort
-   (a freshly-joined node could race the check), but the §4.1
-   case-2 idempotent posture means a false-positive admit only
-   degrades availability of the pre-7b' node — it never corrupts.
+2. **Admin RPC capability gate (middle friction; not shipped in this
+   slice).** A future `EncryptionAdmin.RotateDEK` RPC handler can gate
+   on a cluster-wide capability probe — gossiped or queried via
+   `Distribution.ListNodes` — refusing to propose if any peer
+   advertises a version older than 7b'. The current handler performs
+   leader/proposer/input validation but does not fan out this
+   capability probe, so this slice relies on the operational guideline
+   in (1) rather than a server-side mixed-version block.
 
 3. **Cluster-version Raft entry (highest friction; deferred).** A
    future slice could land a `ClusterVersion` Raft entry that
@@ -441,13 +496,15 @@ mitigations close this gap, in order of operator friction:
    strongest form but adds a new wire entry and a coordination
    protocol — overkill for a single-feature gate.
 
-7b' will ship (1) and (2). (3) is explicitly deferred — it has
+7b' ships (1). (2) and (3) are explicitly deferred — both have
 broader applicability than just this slice (snapshot v2 in Stage 8
-will face the same problem) and deserves its own design.
+will face the same problem) and deserve their own implementation
+designs.
 
 Roll-forward path: deploy 7b' to every node in the cluster, verify
-the capability probe reports all-7b', then issue `RotateDEK`. The
-7b' watcher on each node naturally absorbs the rotation.
+the rollout with the operations runbook / metrics, then issue
+`RotateDEK`. The 7b' watcher on each node naturally absorbs the
+rotation.
 
 Rollback path: rolling back to 7b after a 7b' RotateDEK has
 applied is safe (claude review on PR #855 corrected the

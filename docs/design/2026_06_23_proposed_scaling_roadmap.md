@@ -59,22 +59,20 @@ What bounds a single elastickv deployment today:
    `SplitRange` RPC (`adapter/distribution_server.go`, `distribution/catalog.go`,
    `distribution/engine.go`, `distribution/watcher.go`). There is no data
    movement (cross-group migration is M2, in flight), no auto-detection (M3,
-   in flight), and **no merge** (no design exists). The detection counters in
-   `distribution/engine.go` (`RecordAccess`) are dead code — not called from
-   any request path (confirmed in the M3 doc §1.3).
+   in flight), and **no merge** (no design exists). The old
+   `distribution.Engine.RecordAccess` midpoint path was removed by M3-PR1a
+   because it was never called from any request path; future auto-detection
+   uses keyviz.
 
-5. **Cross-group timestamps via per-group HLC, and not even per-group yet.**
+5. **Cross-group timestamps via per-group HLC, but no global TSO yet.**
    `ShardedCoordinator.RunHLCLeaseRenewal` proposes the physical-ceiling
-   renewal **only to the default group** (`kv/sharded_coordinator.go:1960-1985`,
-   `group, ok := c.groups[c.defaultGroup]` at `:1961`). A node that leads a
-   non-default group but is not a member of the default group never advances
-   its ceiling from that group — exactly the cross-group monotonicity gap the
-   centralized-TSO doc §1.1 describes. The doc's "near-term fix" (M1: iterate
-   *all* led groups in parallel) is **not yet implemented** on `main`. Today
-   this gap is masked because every group is single-node (§1.1): all FSMs in
-   the process share one `*HLC` (CLAUDE.md "Timestamp Oracle"), so the default
-   group's ceiling covers the whole process. The moment groups span nodes, the
-   gap becomes real.
+   renewal to every shard group this node currently leads
+   (`kv/sharded_coordinator.go:1960-2030`), implementing the centralized-TSO
+   doc's M1 near-term fix. This closes the default-group-only renewal gap for
+   a node that leads a non-default group. It does **not** create a single
+   global timestamp oracle: once groups span nodes, cross-group operations
+   whose timestamps can be allocated by different coordinators still need the
+   dedicated TSO / single-oracle bridge described in §2(d).
 
 6. **Large values traverse the Raft log.** Every byte of an S3 object travels
    through the Raft log as `s3keys.BlobKey` entries (the S3 raft-blob-offload
@@ -111,7 +109,7 @@ memory each group's private cache/memtable pins.
   over-full node. Actual per-node volume relief therefore also depends on Gap 1
   plus the replica-placement / region-balance work in Gap 4. Auto-detection /
   scheduling is **PR #951**
-  (`docs/design/2026_06_11_proposed_hotspot_split_milestone3_automation.md`,
+  (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`,
   branch `design/hotspot-split-m3-automation`), which drives detection off the
   already-wired keyviz sampler rather than the dead `RecordAccess` counters.
 - **Range MERGE — missing, no design exists.** The inverse of split. Both the
@@ -205,13 +203,13 @@ memory each group's private cache/memtable pins.
 
 - **Per-group HLC vs centralized TSO.** Today the ceiling is renewed only on
   the default group (§1.5); the TSO doc
-  (`docs/design/2026_04_16_proposed_centralized_tso.md`) proposes first the
-  near-term fix (renew on all led groups, in parallel — its M1) and then a
-  dedicated TSO Raft group with a batch allocator.
+  (`docs/design/2026_04_16_partial_centralized_tso.md`) has shipped the
+  near-term fix (renew on all led groups, in parallel — its M1) and still
+  leaves the dedicated TSO Raft group with a batch allocator open.
   **Assessment of whether TSO is still needed once groups multiply:** the
-  near-term per-group fix (TSO doc §6) is *necessary regardless* — it is the
+  near-term per-group fix (TSO doc §6) was *necessary regardless* — it is the
   minimum correctness fix the moment a node leads a non-default group it is
-  member of, and it should land before multi-node multi-group bootstrap (b)
+  member of, and it has landed before multi-node multi-group bootstrap (b)
   makes that topology reachable. The *full* dedicated-TSO component (TSO doc
   M6–M7) is a larger component, but the need for a shared ordering source is
   not a throughput/amortization question once cross-node cross-group

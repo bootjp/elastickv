@@ -259,7 +259,7 @@ func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincip
 // error path that the wrapping retry harness needs to see.
 func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(ctx, readTS)
 	if err != nil {
 		return nil, errors.Wrap(err, "s3 admin: allocate startTS for adminCreateBucketTxn")
 	}
@@ -277,7 +277,7 @@ func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrin
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -327,7 +327,7 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 
 	err := s.retryS3Mutation(ctx, func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(ctx, readTS)
 		if err != nil {
 			return errors.Wrap(err, "s3 admin: allocate startTS for mutation")
 		}
@@ -438,7 +438,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 // allocation (PR #867 Phase 2a).
 func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, deletedGeneration *uint64) error {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(ctx, readTS)
 	if err != nil {
 		return errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteBucket")
 	}

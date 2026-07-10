@@ -104,11 +104,11 @@ the Stage 7 work that later closed the original multi-node-churn gap.
   propose-before-write *gate* (block the coordinator's first encrypted
   write until registration commits) is implemented by the existing
   Stage 7a/7a-2/7c docs:
-  [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md),
-  [`2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md`](2026_05_26_proposed_7a2_storage_layer_registration_enforcement.md),
+  [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md),
+  [`2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md`](2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md),
   [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md),
-  [`2026_05_28_proposed_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_proposed_7b_prime_runtime_reregistration_rotation.md),
-  and [`2026_05_29_proposed_7c_confchange_time_registration.md`](2026_05_29_proposed_7c_confchange_time_registration.md).
+  [`2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md),
+  and [`2026_05_29_implemented_7c_confchange_time_registration.md`](2026_05_29_implemented_7c_confchange_time_registration.md).
 - KMS providers, compression, DEK retirement/rewrite (Stages 9).
 - The capability fan-out closure + multi-node e2e — that is 6D-6c-3.
 

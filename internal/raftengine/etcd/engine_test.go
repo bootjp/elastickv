@@ -245,6 +245,68 @@ func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
 // the failure mode this guard exists to produce.
 var _ raftengine.Proposer = (*Engine)(nil)
 
+func TestInboundQueueCapacityScalesSmallInflight(t *testing.T) {
+	tests := []struct {
+		name        string
+		peerCount   int
+		maxInflight int
+		want        int
+	}{
+		{
+			name:        "single peer small inflight uses floor",
+			peerCount:   1,
+			maxInflight: 17,
+			want:        minInboundQueueCapacity,
+		},
+		{
+			name:        "multi peer default is memory bounded",
+			peerCount:   5,
+			maxInflight: 256,
+			want:        defaultMaxInflightMsg,
+		},
+		{
+			name:        "production inflight stays at default cap",
+			peerCount:   5,
+			maxInflight: defaultMaxInflightMsg,
+			want:        defaultMaxInflightMsg,
+		},
+		{
+			name:        "explicit large inflight is preserved",
+			peerCount:   5,
+			maxInflight: 2048,
+			want:        2048,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, inboundQueueCapacity(tc.peerCount, tc.maxInflight))
+		})
+	}
+}
+
+func TestOpenConfigMaxInflightSizesInboundQueues(t *testing.T) {
+	fsm := &testStateMachine{}
+	const maxInflight = 17
+
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:         1,
+		LocalID:        "n1",
+		LocalAddress:   "127.0.0.1:7011",
+		DataDir:        t.TempDir(),
+		Bootstrap:      true,
+		StateMachine:   fsm,
+		MaxInflightMsg: maxInflight,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	require.Equal(t, minInboundQueueCapacity, cap(engine.stepCh))
+	require.Equal(t, minInboundQueueCapacity, cap(engine.dispatchReportCh))
+}
+
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{
@@ -525,6 +587,71 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
 	require.Error(t, err)
 	require.Equal(t, uint64(2), engine.StepQueueFullCount())
+}
+
+func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
+	engine := &Engine{
+		doneCh:         make(chan struct{}),
+		stepCh:         make(chan raftpb.Message, 1),
+		priorityStepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)}
+
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), engine.StepQueueFullCount())
+
+	select {
+	case msg := <-engine.priorityStepCh:
+		require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
+	default:
+		t.Fatal("priority heartbeat was not enqueued")
+	}
+
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errStepQueueFull))
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+}
+
+func TestHandleEventDrainsPriorityStepBeforeBulkStep(t *testing.T) {
+	engine := &Engine{
+		closeCh:          make(chan struct{}),
+		proposeCh:        make(chan proposalRequest),
+		readCh:           make(chan readRequest),
+		adminCh:          make(chan adminRequest),
+		stepCh:           make(chan raftpb.Message, 1),
+		priorityStepCh:   make(chan raftpb.Message, 1),
+		dispatchReportCh: make(chan dispatchReport),
+		snapshotResCh:    make(chan snapshotResult),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)}
+	engine.priorityStepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	handled, err := engine.handleEvent(make(chan time.Time))
+	require.NoError(t, err)
+	require.True(t, handled)
+
+	require.Empty(t, engine.priorityStepCh)
+	require.Len(t, engine.stepCh, 1)
+	msg := <-engine.stepCh
+	require.Equal(t, raftpb.MsgApp, msg.GetType())
+}
+
+func TestTryHandlePriorityStepYieldsAfterBurstLimit(t *testing.T) {
+	engine := &Engine{
+		priorityStepCh:    make(chan raftpb.Message, 1),
+		priorityStepBurst: priorityStepBurstLimit,
+	}
+	engine.priorityStepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	require.False(t, engine.tryHandlePriorityStep())
+	require.Zero(t, engine.priorityStepBurst)
+	require.Len(t, engine.priorityStepCh, 1)
+
+	require.True(t, engine.tryHandlePriorityStep())
+	require.Equal(t, 1, engine.priorityStepBurst)
+	require.Empty(t, engine.priorityStepCh)
 }
 
 func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {

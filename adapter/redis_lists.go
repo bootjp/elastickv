@@ -106,9 +106,10 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		}
 
 		// Pre-allocate commitTS so we can embed it in the Delta key.
-		commitTS, err := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "listPushCore: allocate commitTS")
 		if err != nil {
-			return errors.Wrap(err, "listPushCore: allocate commitTS")
+			return errors.WithStack(err)
 		}
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
@@ -122,7 +123,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		// Dispatch with the pre-allocated commitTS.
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  normalizeStartTS(readTS),
+			StartTS:  startTS,
 			CommitTS: commitTS,
 			ReadKeys: listPushReadKeys(key, meta, typ, metaExists),
 			Elems:    ops,
@@ -196,9 +197,9 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	// as non-retryable, so it exits retryRedisWrite directly to the
 	// client — same shape as the other persistence-grade Next call
 	// sites in this file.
-	commitTS, allocErr := r.coordinator.Clock().NextFenced()
+	commitTS, allocErr := r.nextCommitTSAfter(ctx, pending.startTS, "redis list-push reuse: allocate commitTS")
 	if allocErr != nil {
-		return 0, false, errors.Wrap(allocErr, "redis list-push reuse: allocate commitTS")
+		return 0, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
@@ -383,9 +384,10 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 
 		// HLC-4 parity with prepareDispatch / dispatchExecReuse —
 		// see dispatchListPushReuse above for the rationale.
-		commitTS, allocErr := r.coordinator.Clock().NextFenced()
+		startTS := normalizeStartTS(readTS)
+		commitTS, allocErr := r.nextCommitTSAfter(ctx, startTS, "redis list-push first-attempt: allocate commitTS")
 		if allocErr != nil {
-			return errors.Wrap(allocErr, "redis list-push first-attempt: allocate commitTS")
+			return errors.WithStack(allocErr)
 		}
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
@@ -396,7 +398,6 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			return nil
 		}
 
-		startTS := normalizeStartTS(readTS)
 		boundaryReads := listPushReadKeys(key, meta, typ, metaExists)
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
@@ -610,9 +611,10 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 	// n is the number of sequence positions claimed (including any holes).
 	// HeadDelta and LenDelta must use n, not len(values), so that Head
 	// advances past holes and the metadata stays consistent with Tail.
-	commitTS, err := r.coordinator.Clock().NextFenced()
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "commitListPop: allocate commitTS")
 	if err != nil {
-		return errors.Wrap(err, "commitListPop: allocate commitTS")
+		return errors.WithStack(err)
 	}
 	var headDelta int64
 	if left {
@@ -630,7 +632,7 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 
 	if _, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
+		StartTS:  startTS,
 		CommitTS: commitTS,
 		Elems:    elems,
 	}); dispErr != nil {
