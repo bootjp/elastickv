@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,6 +49,15 @@ func (s *deadlineCapturingStore) Compact(ctx context.Context, minTS uint64) erro
 	s.compactMinTS = minTS
 	s.deadline, s.hasDeadline = ctx.Deadline()
 	return nil
+}
+
+type metricsCapturingStore struct {
+	deadlineCapturingStore
+	metrics *pebble.Metrics
+}
+
+func (s *metricsCapturingStore) Metrics() *pebble.Metrics {
+	return s.metrics
 }
 
 func requireDeadlineWithin(t *testing.T, deadline time.Time, start time.Time, timeout time.Duration) {
@@ -210,6 +220,36 @@ func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *te
 	require.True(t, st.hasDeadline)
 	requireDeadlineWithin(t, st.deadline, start, configuredTimeout)
 	require.Greater(t, st.deadline.Sub(start), defaultFSMCompactorLeaderTimeout)
+}
+
+func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].TablesCount = defaultFSMCompactorMaxL0Files
+	st := &metricsCapturingStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
+		metrics:                metrics,
+	}
+	ctx := context.Background()
+
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
+				NumPeers:     1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorTimeout(time.Second),
+	)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.False(t, st.compactCalled)
 }
 
 func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.T) {
