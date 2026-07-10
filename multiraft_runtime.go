@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -27,8 +28,9 @@ type raftGroupRuntime struct {
 	engineMu sync.RWMutex
 	engine   raftengine.Engine
 
-	store        store.MVCCStore
-	stateMachine raftengine.StateMachine
+	store          store.MVCCStore
+	writerRegistry encryption.WriterRegistryStore
+	stateMachine   raftengine.StateMachine
 
 	registerTransport func(grpc.ServiceRegistrar)
 	closeFactory      func() error // releases factory-created resources (transport, stores)

@@ -463,8 +463,8 @@ that bypass the standard workflow) must rely on the
 `ErrNodeIDCollision` startup membership pre-check before issuing the
 ConfChange.
 
-This closes the 7c ConfChange-time registration slice. The parent
-Stage 7 remains partial until the §5.5 `WriterRegistryForCaller`
-projection is wired into `GetSidecarState` / `ResyncSidecar`.
+This closes the 7c ConfChange-time registration slice. The remaining
+Stage 7 §5.5 `WriterRegistryForCaller` projection is tracked by
+`2026_07_11_implemented_7d_sidecar_registry_projection.md`.
 Stage 8 (snapshot header v2) and Stage 9 (KMS + compress +
 rotation/retire/rewrite + Jepsen) follow.
