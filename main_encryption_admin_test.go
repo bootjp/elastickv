@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	pb "github.com/bootjp/elastickv/proto"
@@ -41,6 +42,20 @@ func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, erro
 	return 0, nil
 }
 
+type stubEncryptionAdminRegistry struct {
+	name string
+}
+
+func (stubEncryptionAdminRegistry) GetRegistryRow([]byte) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (stubEncryptionAdminRegistry) SetRegistryRow(_, _ []byte) error {
+	return nil
+}
+
+var _ encryption.WriterRegistryStore = stubEncryptionAdminRegistry{}
+
 // TestEncryptionAdminFullNodeID_DistinctPerRaftId pins the
 // PR760 r1 Codex P1 regression: full_node_id must be derived from
 // --raftId (per-node-stable) and NOT from the Raft group id
@@ -62,6 +77,29 @@ func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
 			t.Fatalf("DeriveNodeID(%q) = DeriveNodeID(%q) = %d; full_node_id must be distinct across raftIds — BootstrapEncryption uniqueness would reject", id, dup, got)
 		}
 		seen[got] = id
+	}
+}
+
+func TestWriterRegistryForEncryptionAdminUsesDefaultGroup(t *testing.T) {
+	defaultRegistry := stubEncryptionAdminRegistry{name: "default"}
+	otherRegistry := stubEncryptionAdminRegistry{name: "other"}
+	runtimes := []*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, writerRegistry: otherRegistry},
+		{spec: groupSpec{id: 1}, writerRegistry: defaultRegistry},
+	}
+
+	got := writerRegistryForEncryptionAdmin(runtimes, 1)
+	if got != defaultRegistry {
+		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want default group registry %#v", got, defaultRegistry)
+	}
+}
+
+func TestWriterRegistryForEncryptionAdminMissingDefaultGroup(t *testing.T) {
+	got := writerRegistryForEncryptionAdmin([]*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, writerRegistry: stubEncryptionAdminRegistry{name: "other"}},
+	}, 1)
+	if got != nil {
+		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want nil when default group runtime is missing", got)
 	}
 }
 
