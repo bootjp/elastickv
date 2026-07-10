@@ -348,9 +348,9 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	first := coord.renewHLCLeases(context.Background())
 	<-entered
 	require.Eventually(t, func() bool {
-		return coord.groups[2].lease.valid(monoclock.Now())
+		return eng2.proposeCalls.Load() == 1 && !hlcRenewalInFlight(coord, 2)
 	}, time.Second, 10*time.Millisecond,
-		"precondition: the first round must finish for the non-blocked group")
+		"precondition: the first round must fully finish for the non-blocked group")
 
 	second := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, second)
@@ -367,6 +367,13 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	requireRenewalDone(t, third)
 	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
 		"the group must be eligible for renewal after the in-flight proposal finishes")
+}
+
+func hlcRenewalInFlight(coord *ShardedCoordinator, gid uint64) bool {
+	coord.hlcRenewalMu.Lock()
+	defer coord.hlcRenewalMu.Unlock()
+	_, ok := coord.hlcRenewalInFlight[gid]
+	return ok
 }
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {
