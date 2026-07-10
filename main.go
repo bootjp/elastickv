@@ -1546,6 +1546,14 @@ func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]
 	return proposerForGroup(rt, shardGroups)
 }
 
+func writerRegistryForEncryptionAdmin(runtimes []*raftGroupRuntime, defaultGroup uint64) encryption.WriterRegistryStore {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil {
+		return nil
+	}
+	return defaultRuntime.writerRegistry
+}
+
 func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
 	applied, ok := engine.(interface{ AppliedIndex() uint64 })
 	if !ok {
@@ -1859,6 +1867,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		encWiring:          in.encWiring,
 		redisApplyObserver: in.redisApplyObserver,
 		dynamoAddress:      *dynamoAddr,
+		defaultGroup:       in.cfg.defaultGroup,
 		leaderDynamo:       in.cfg.leaderDynamo,
 		s3Address:          *s3Addr,
 		leaderS3:           in.cfg.leaderS3,
@@ -2612,6 +2621,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	defaultGroup uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
@@ -2622,6 +2632,7 @@ func startRaftServers(
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	adminWriterRegistry := writerRegistryForEncryptionAdmin(runtimes, defaultGroup)
 	for _, rt := range runtimes {
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
@@ -2684,7 +2695,7 @@ func startRaftServers(
 			enableMutators,
 			rt.engine,
 			encryptionCapabilityFanout,
-			adapter.WithEncryptionAdminWriterRegistry(rt.writerRegistry),
+			adapter.WithEncryptionAdminWriterRegistry(adminWriterRegistry),
 			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
@@ -3014,6 +3025,7 @@ type runtimeServerRunner struct {
 	redisApplyObserver              *adapter.RedisApplyObserver
 	encWiring                       encryptionWriteWiring
 	dynamoAddress                   string
+	defaultGroup                    uint64
 	leaderDynamo                    map[string]string
 	s3Address                       string
 	leaderS3                        map[string]string
@@ -3132,6 +3144,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.defaultGroup,
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		s3BlobPushBlocked,
 	); err != nil {
