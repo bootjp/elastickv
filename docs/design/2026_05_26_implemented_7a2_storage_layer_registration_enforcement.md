@@ -2,10 +2,19 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented |
 | Date | 2026-05-26 |
-| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md) (7a coordinator-layer gate) |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
+| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md) (7a coordinator-layer gate) |
 | Builds on | 7a (coordinator-layer first-write barrier), 6D-6c-1 (`encryption.StateCache`) |
+
+## Implementation audit
+
+Implemented by `internal/encryption.StateCache.Registered`,
+`StateCache.MarkRegistered`, `store.WithStorageRegistrationGate`,
+`store.ErrWriterNotRegistered`, and the direct-vs-FSM write-path flag in
+`store`.
+The gate is wired from `main_encryption_write_wiring.go`.
 
 ## 0. Why this slice exists
 
@@ -270,7 +279,8 @@ forwarder callers before merge.
   the first direct-path write does not fail-closed (codex P1).**
 
 ### Out of scope
-- 7b (post-rotation re-registration), 7c (ConfChange-time registration).
+- 7b (post-rotation re-registration), 7c (ConfChange-time registration);
+  both are implemented by later slices.
 - Re-evaluating whether route-catalog data *should* be encrypted at all
   (it is, incidentally, when the envelope is active; changing that is a
   separate question).
