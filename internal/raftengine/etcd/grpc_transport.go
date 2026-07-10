@@ -516,6 +516,9 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 		t.markPeerStreamUnsupported(peer.Address)
 		return t.dispatchRegularUnary(ctx, client, req)
 	}
+	if !t.sendStreamEnabledNow() {
+		return t.dispatchRegularUnary(ctx, client, req)
+	}
 	return errors.WithStack(err)
 }
 
@@ -556,59 +559,76 @@ func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address strin
 }
 
 func (t *GRPCTransport) streamFor(ctx context.Context, address string, client pb.EtcdRaftClient) (*peerStream, error) {
-	t.mu.RLock()
-	stream, ok := t.streams[address]
-	t.mu.RUnlock()
-	if ok {
-		return stream, nil
+	stream, err := t.cachedStream(address)
+	if err != nil || stream != nil {
+		return stream, err
 	}
 	if !t.allowPeerStreamProbe(address, time.Now()) {
 		return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
 	}
 
 	value, err, _ := t.dialGroup.Do("stream:"+address, func() (any, error) {
-		t.mu.RLock()
-		stream, ok := t.streams[address]
-		t.mu.RUnlock()
-		if ok {
-			return stream, nil
-		}
-		if !t.allowPeerStreamProbe(address, time.Now()) {
-			return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
-		}
-		if err := t.probeSendStream(ctx, address, client); err != nil {
-			return nil, err
-		}
-
-		streamCtx, cancel := context.WithCancel(context.Background())
-		sendStream, err := client.SendStream(streamCtx)
-		if err != nil {
-			cancel()
-			return nil, errors.WithStack(err)
-		}
-		opened := newPeerStream(sendStream, cancel)
-
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		if existing, ok := t.streams[address]; ok {
-			cancel()
-			return existing, nil
-		}
-		t.streams[address] = opened
-		go func() {
-			<-opened.done
-			t.closePeerStream(address, opened)
-		}()
-		return opened, nil
+		return t.openPeerStream(ctx, address, client)
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	stream, ok = value.(*peerStream)
+	stream, ok := value.(*peerStream)
 	if !ok {
 		return nil, errors.New("etcd raft transport stream group returned unexpected stream type")
 	}
 	return stream, nil
+}
+
+func (t *GRPCTransport) cachedStream(address string) (*peerStream, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.sendStreamDisabled {
+		return nil, errors.WithStack(status.Error(codes.Unavailable, "etcd raft SendStream is disabled"))
+	}
+	stream, ok := t.streams[address]
+	if ok {
+		return stream, nil
+	}
+	return nil, nil
+}
+
+func (t *GRPCTransport) openPeerStream(ctx context.Context, address string, client pb.EtcdRaftClient) (*peerStream, error) {
+	stream, err := t.cachedStream(address)
+	if err != nil || stream != nil {
+		return stream, err
+	}
+	if !t.allowPeerStreamProbe(address, time.Now()) {
+		return nil, errors.WithStack(status.Error(codes.Unimplemented, "etcd raft SendStream is not supported by peer"))
+	}
+	if err := t.probeSendStream(ctx, address, client); err != nil {
+		return nil, err
+	}
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	sendStream, err := client.SendStream(streamCtx)
+	if err != nil {
+		cancel()
+		return nil, errors.WithStack(err)
+	}
+	opened := newPeerStream(sendStream, cancel)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sendStreamDisabled {
+		cancel()
+		return nil, errors.WithStack(status.Error(codes.Unavailable, "etcd raft SendStream is disabled"))
+	}
+	if existing, ok := t.streams[address]; ok {
+		cancel()
+		return existing, nil
+	}
+	t.streams[address] = opened
+	go func() {
+		<-opened.done
+		t.closePeerStream(address, opened)
+	}()
+	return opened, nil
 }
 
 func (t *GRPCTransport) probeSendStream(ctx context.Context, address string, client pb.EtcdRaftClient) error {

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -958,6 +959,100 @@ func TestSetSendStreamEnabledClosesCachedStreams(t *testing.T) {
 	require.False(t, streamCached)
 }
 
+func TestStreamForAbortsCachingWhenSendStreamDisabledDuringOpen(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+
+	secondStream := &testRaftSendStreamClient{}
+	openStarted := make(chan struct{})
+	releaseOpen := make(chan struct{})
+	client := &testEtcdRaftClient{
+		raftStreams:         []*testRaftSendStreamClient{{}, secondStream},
+		blockSendStreamCall: 2,
+		sendStreamStarted:   openStarted,
+		releaseSendStream:   releaseOpen,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := transport.streamFor(context.Background(), addr, client)
+		errCh <- err
+	}()
+
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendStream open")
+	}
+	transport.SetSendStreamEnabled(false)
+	close(releaseOpen)
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.Equal(t, codes.Unavailable, grpcStatusCode(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("streamFor did not return after SendStream was disabled")
+	}
+
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+
+	select {
+	case <-secondStream.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("opened stream context was not cancelled")
+	}
+}
+
+func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringSend(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	sendStarted := make(chan struct{})
+	client := &testEtcdRaftClient{
+		raftStreams: []*testRaftSendStreamClient{
+			{},
+			{blockSend: true, sendStarted: sendStarted},
+		},
+	}
+	injectClient(t, transport, addr, client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- transport.dispatchRegular(context.Background(), raftpb.Message{
+			Type:  messageTypePtr(raftpb.MsgApp),
+			From:  uint64Ptr(1),
+			To:    uint64Ptr(2),
+			Term:  uint64Ptr(5),
+			Index: uint64Ptr(50),
+		})
+	}()
+
+	select {
+	case <-sendStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stream Send to start")
+	}
+	transport.SetSendStreamEnabled(false)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchRegular did not fall back after SendStream was disabled")
+	}
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
 func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T) {
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
@@ -1316,11 +1411,14 @@ func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
 // testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
 // SendSnapshot calls to a pre-wired testSnapshotSendClient.
 type testEtcdRaftClient struct {
-	stream          *testSnapshotSendClient
-	raftStream      *testRaftSendStreamClient
-	raftStreams     []*testRaftSendStreamClient
-	sendCalls       atomic.Int32
-	sendStreamCalls atomic.Int32
+	stream              *testSnapshotSendClient
+	raftStream          *testRaftSendStreamClient
+	raftStreams         []*testRaftSendStreamClient
+	blockSendStreamCall int32
+	sendStreamStarted   chan struct{}
+	releaseSendStream   chan struct{}
+	sendCalls           atomic.Int32
+	sendStreamCalls     atomic.Int32
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
@@ -1329,7 +1427,15 @@ func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ..
 }
 
 func (c *testEtcdRaftClient) SendStream(ctx context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
-	c.sendStreamCalls.Add(1)
+	call := c.sendStreamCalls.Add(1)
+	if c.blockSendStreamCall != 0 && call == c.blockSendStreamCall {
+		if c.sendStreamStarted != nil {
+			close(c.sendStreamStarted)
+		}
+		if c.releaseSendStream != nil {
+			<-c.releaseSendStream
+		}
+	}
 	if len(c.raftStreams) > 0 {
 		stream := c.raftStreams[0]
 		c.raftStreams = c.raftStreams[1:]
