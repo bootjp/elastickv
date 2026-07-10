@@ -276,9 +276,10 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	elems = appendMaxLenZeroSelfDel(elems, req.maxLen, key, parsedID)
 
 	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
-		Length:  nextLen,
-		LastMs:  parsedID.ms,
-		LastSeq: parsedID.seq,
+		Length:   nextLen,
+		LastMs:   parsedID.ms,
+		LastSeq:  parsedID.seq,
+		ExpireAt: meta.ExpireAt,
 	})
 	if err != nil {
 		return "", cockerrors.WithStack(err)
@@ -435,7 +436,14 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 	if err != nil {
 		return nil, store.StreamMeta{}, false, err
 	}
-	return legacyCleanup, store.StreamMeta{}, false, nil
+	if len(legacyCleanup) == 0 {
+		return nil, store.StreamMeta{}, false, nil
+	}
+	ttlMs, err := legacyTTLMillisAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, store.StreamMeta{}, false, err
+	}
+	return legacyCleanup, store.StreamMeta{ExpireAt: ttlMs}, false, nil
 }
 
 // legacyStreamCleanupElems returns a Del elem for the legacy single-blob

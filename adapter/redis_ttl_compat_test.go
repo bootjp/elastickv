@@ -272,6 +272,44 @@ func TestRedis_MultiExec_ExpireRecreatedListKeepsStagedMeta(t *testing.T) {
 	require.NotZero(t, meta.ExpireAt)
 }
 
+func TestRedis_MultiExec_ExpireRecreatedHashKeepsStagedMeta(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	key := "multi:recreated-hash-expire"
+	require.NoError(t, rdb.HSet(ctx, key, "old-a", "1", "old-b", "2").Err())
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", key).Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", key, "fresh", "new").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "EXPIRE", key, "60").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{int64(1), int64(1), int64(1)}, execRes)
+
+	got, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"fresh": "new"}, got)
+
+	ttl, err := rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 60*time.Second)
+
+	readTS := nodes[0].redisServer.readTS()
+	raw, err := nodes[0].redisServer.store.GetAt(ctx, store.HashMetaKey([]byte(key)), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.NotZero(t, meta.ExpireAt)
+}
+
 func TestRedis_MultiExec_HSetRecreatesExpiredHash(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

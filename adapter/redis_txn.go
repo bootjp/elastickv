@@ -122,6 +122,7 @@ type txnContext struct {
 	logicalDeletes map[string][]byte
 	hashDeletes    map[string][]byte
 	setDeletes     map[string][]byte
+	hashCreates    map[string]struct{}
 	// collectionExpireTypes remembers non-string keys whose TTL changed in this
 	// EXEC so commit can update the inline metadata anchor with the scan index.
 	collectionExpireTypes map[string]redisValueType
@@ -145,12 +146,13 @@ type listTxnState struct {
 }
 
 type hashTxnState struct {
-	fields      map[string][]byte
-	origFields  map[string][]byte
-	dirtyFields map[string]struct{}
-	legacy      bool
-	deleted     bool
-	dirty       bool
+	fields         map[string][]byte
+	origFields     map[string][]byte
+	dirtyFields    map[string]struct{}
+	legacy         bool
+	legacyExpireAt uint64
+	deleted        bool
+	dirty          bool
 }
 
 type zsetTxnState struct {
@@ -422,6 +424,7 @@ func reviveDeletedHashState(st *hashTxnState) *hashTxnState {
 		st.origFields = map[string][]byte{}
 		st.dirtyFields = map[string]struct{}{}
 		st.legacy = false
+		st.legacyExpireAt = 0
 		st.deleted = false
 		st.dirty = true
 	}
@@ -465,11 +468,19 @@ func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashT
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	var legacyExpireAt uint64
+	if legacy {
+		legacyExpireAt, err = legacyTTLMillisAt(ctx, t.server.store, key, t.startTS)
+		if err != nil {
+			return nil, err
+		}
+	}
 	st := &hashTxnState{
-		fields:      fields,
-		origFields:  origFields,
-		dirtyFields: map[string]struct{}{},
-		legacy:      legacy,
+		fields:         fields,
+		origFields:     origFields,
+		dirtyFields:    map[string]struct{}{},
+		legacy:         legacy,
+		legacyExpireAt: legacyExpireAt,
 	}
 	t.hashStates[keyString] = st
 	return st, nil
@@ -937,6 +948,7 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 	if typ != redisTypeNone && typ != redisTypeHash {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
+	t.markHashCreateIfMissing(cmd.Args[1], typ)
 	t.trackMissingKeyCreatorFenceReads(cmd.Args[1], typ)
 	fields := hashCommandFields(cmd.Args[2:])
 	st, err := t.loadHashStateForFields(cmd.Args[1], fields)
@@ -1211,6 +1223,19 @@ func (t *txnContext) trackCollectionExpireType(key []byte, typ redisValueType) {
 	t.collectionExpireTypes[string(key)] = typ
 }
 
+func (t *txnContext) markHashCreateIfMissing(key []byte, typ redisValueType) {
+	if typ == redisTypeNone {
+		t.markHashCreate(key)
+	}
+}
+
+func (t *txnContext) markHashCreate(key []byte) {
+	if t.hashCreates == nil {
+		t.hashCreates = map[string]struct{}{}
+	}
+	t.hashCreates[string(key)] = struct{}{}
+}
+
 // markStringDirty loads the string value into the working set so that
 // buildKeyElems will re-encode it with the updated embedded TTL.
 func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
@@ -1268,6 +1293,7 @@ func (t *txnContext) markLogicalDeletion(key []byte, k string) {
 	}
 	t.hashDeletes[k] = bytes.Clone(key)
 	t.setDeletes[k] = bytes.Clone(key)
+	delete(t.hashCreates, k)
 	t.trackWideCollectionFenceReads(key)
 	if st, ok := t.hashStates[k]; ok {
 		st.deleted = true
@@ -2007,7 +2033,10 @@ func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, s
 		return elems, false
 	}
 	if st.legacy {
-		return append(elems, buildHashLegacyRewriteElems(key, st.fields)...), false
+		return append(elems, buildHashLegacyRewriteElems(key, st.fields, t.hashLegacyRewriteExpireAt(string(key), st))...), false
+	}
+	if inline, ok := t.hashInlineTTLCreateElems(string(key), key, st); ok {
+		return append(elems, inline...), false
 	}
 	next, newFields := appendHashChangedFieldElems(elems, key, st)
 	if newFields == 0 {
@@ -2047,9 +2076,39 @@ func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, c
 
 const hashLegacyRewriteOverhead = 2
 
-func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Elem[kv.OP] {
+func (t *txnContext) hashLegacyRewriteExpireAt(key string, st *hashTxnState) uint64 {
+	if ttlMs, ok := t.collectionTTLMillis(key); ok {
+		return ttlMs
+	}
+	ttlState := t.ttlStates[key]
+	if ttlState != nil && ttlState.dirty && ttlState.value == nil {
+		return 0
+	}
+	return st.legacyExpireAt
+}
+
+func (t *txnContext) hashInlineTTLCreateElems(key string, userKey []byte, st *hashTxnState) ([]*kv.Elem[kv.OP], bool) {
+	ttlMs, ok := t.collectionTTLMillis(key)
+	if !ok || !t.isHashCreate(key) || len(st.fields) == 0 {
+		return nil, false
+	}
+	return buildHashFullRewriteElems(userKey, st.fields, ttlMs), true
+}
+
+func (t *txnContext) isHashCreate(key string) bool {
+	_, ok := t.hashCreates[key]
+	return ok
+}
+
+func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte, expireAt uint64) []*kv.Elem[kv.OP] {
+	elems := buildHashFullRewriteElems(key, fields, expireAt)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	return elems
+}
+
+func buildHashFullRewriteElems(key []byte, fields map[string][]byte, expireAt uint64) []*kv.Elem[kv.OP] {
 	fieldNames := sortedHashFieldNames(fields)
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldNames)+hashLegacyRewriteOverhead+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldNames)+hashLegacyRewriteOverhead)
 	for _, field := range fieldNames {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -2058,11 +2117,10 @@ func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Ele
 		})
 	}
 	elems = append(elems,
-		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)},
 		&kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.HashMetaKey(key),
-			Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(fieldNames))}),
+			Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(fieldNames)), ExpireAt: expireAt}),
 		},
 		redisTxnWideHashFenceElem(key),
 	)
@@ -2188,7 +2246,7 @@ func (t *txnContext) buildCollectionTTLElems(ctx context.Context) ([]*kv.Elem[kv
 }
 
 func (t *txnContext) collectionTTLRebuildWouldUseStaleBase(key string, typ redisValueType) bool {
-	if !t.isLogicallyDeleted(key) {
+	if !t.hasStagedLogicalDelete(key) {
 		return false
 	}
 	switch typ {
@@ -2200,6 +2258,25 @@ func (t *txnContext) collectionTTLRebuildWouldUseStaleBase(key string, typ redis
 		return t.zsetTTLRebuildWouldUseStaleBase(key)
 	case redisTypeSet, redisTypeStream, redisTypeNone, redisTypeString:
 		return false
+	}
+	return false
+}
+
+func (t *txnContext) hasStagedLogicalDelete(key string) bool {
+	if _, ok := t.deletedKeys[key]; ok {
+		return true
+	}
+	if _, ok := t.logicalDeletes[key]; ok {
+		return true
+	}
+	if _, ok := t.hashDeletes[key]; ok {
+		return true
+	}
+	if _, ok := t.setDeletes[key]; ok {
+		return true
+	}
+	if _, ok := t.streamDeletions[key]; ok {
+		return true
 	}
 	return false
 }
@@ -2261,6 +2338,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 			logicalDeletes:        map[string][]byte{},
 			hashDeletes:           map[string][]byte{},
 			setDeletes:            map[string][]byte{},
+			hashCreates:           map[string]struct{}{},
 			collectionExpireTypes: map[string]redisValueType{},
 			streamDeletions:       map[string][]byte{},
 			startTS:               startTS,
@@ -2469,6 +2547,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		logicalDeletes:        map[string][]byte{},
 		hashDeletes:           map[string][]byte{},
 		setDeletes:            map[string][]byte{},
+		hashCreates:           map[string]struct{}{},
 		collectionExpireTypes: map[string]redisValueType{},
 		streamDeletions:       map[string][]byte{},
 		startTS:               startTS,

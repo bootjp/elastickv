@@ -67,13 +67,17 @@ func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []b
 			Value: []byte(val),
 		})
 	}
+	ttlMs, err := legacyTTLMillisAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, err
+	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
 	// Write a base meta so that resolveHashMeta starts from an accurate count.
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey(key),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	return elems, nil
 }

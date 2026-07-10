@@ -106,13 +106,17 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 			Value: []byte{},
 		})
 	}
+	ttlMs, err := legacyTTLMillisAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, err
+	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
 	// Write a base meta so that resolveSetMeta starts from an accurate count.
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.SetMetaKey(key),
-		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members)), ExpireAt: ttlMs}),
 	})
 	elems = append(elems, redisTxnWideSetFenceElem(key))
 	return elems, nil
@@ -144,7 +148,7 @@ func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readT
 		return wrongTypeError()
 	}
 
-	hllExists, err := r.hllExistsAt(key, readTS)
+	hllExists, err := r.hllAnchorExistsAt(context.Background(), key, readTS)
 	if err != nil {
 		return err
 	}

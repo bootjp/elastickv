@@ -36,6 +36,7 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 		logicalDeletes:  map[string][]byte{},
 		hashDeletes:     map[string][]byte{},
 		setDeletes:      map[string][]byte{},
+		hashCreates:     map[string]struct{}{},
 		streamDeletions: map[string][]byte{},
 		startTS:         redisTxnTestStartTS,
 	}
@@ -1008,8 +1009,21 @@ func TestRedisTxnHashLegacyRewriteWritesFence(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("legacy-rewrite:hash")
-	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")})
+	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")}, 0)
 	require.True(t, elemKeysContain(elems, redisTxnWideHashFenceKey(key)))
+}
+
+func TestRedisTxnHashLegacyRewritePreservesTTL(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("legacy-rewrite:hash-ttl")
+	expireAt := redisExpireAtMillis(time.Now().Add(time.Hour))
+	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")}, expireAt)
+	metaElem := requireElemByKey(t, elems, store.HashMetaKey(key))
+	meta, err := store.UnmarshalHashMeta(metaElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, expireAt, meta.ExpireAt)
 }
 
 func TestRedisSetLegacyMigrationWritesFenceWithoutLenDelta(t *testing.T) {
