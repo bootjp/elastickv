@@ -442,13 +442,19 @@ Deferred follow-ups:
    `MaxHistoryColumns` in the
    sampler is **100 000** at the upper bound; a peer that returns
    the full ring (~1024 rows × 100 000 cols ≈ 800 MiB raw) would
-   trip the cap. The cap firing surfaces as a JSON-decode error
-   from the peer (the LimitReader returns EOF mid-stream), which
-   the aggregator records as `ok=false` with the decode error in
-   that node's status entry plus a `WARN`-level server log. No
-   partial data is accepted. Operators who actually want >64 MiB
-   peer responses should override via a future flag; for now the
-   conservative default is the correct trade. (Review finding on PR #685.)
+   trip the cap. The implementation distinguishes two cases:
+   - If a complete JSON object is decoded before the extra capped byte
+     is consumed (for example, a small object plus trailing whitespace),
+     the peer remains `ok=true`, the decoded matrix is accepted, and a
+     `WARN`-level server log records that the response crossed the
+     configured body limit.
+   - If the cap cuts through the JSON object, decode returns an error;
+     the aggregator records that peer as `ok=false` with the decode
+     error in the node status entry, and no partial data from that peer
+     is merged.
+   Operators who actually want >64 MiB peer responses should override
+   via a future flag; for now the conservative default is the correct
+   trade. (Review finding on PR #685.)
 4. **Data consistency** — Reads are exact in steady state and during
    transitions. Writes use the implemented §9.1 group/term merge
    when all contributors provide identity, so leadership transitions

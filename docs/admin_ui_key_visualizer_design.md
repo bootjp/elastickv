@@ -102,7 +102,7 @@ after restart once Phase 3 persistence is enabled (see §5.6).
 
 Two layers:
 
-**Layer A — gRPC, node → admin binary.** A new `Admin` service on each node, registered on the same gRPC port as `RawKV` (`--address`, default `:50051`). All methods are read-only in Phases 0–3 and require `authorization: Bearer <admin-token>` metadata. Nodes load the token from `--adminTokenFile`; the admin binary sends it from `--nodeTokenFile`. An explicit `--adminInsecureNoAuth` flag exists only for local development and logs a warning at startup.
+**Layer A — gRPC, node → standalone admin binary.** A new `Admin` service on each node, registered on the same gRPC port as `RawKV` (`--address`, default `:50051`). All methods are read-only in Phases 0–3 and require `authorization: Bearer <admin-token>` metadata. Nodes load the token from `--adminTokenFile`; the standalone admin binary sends it from `--nodeTokenFile`. An explicit `--adminInsecureNoAuth` flag exists only for local development and logs a warning at startup. This layer remains the Phase 0 overview path; the implemented KeyViz SPA and Phase 2-C fan-out use the embedded admin HTTP surface below.
 
 | RPC | Purpose |
 |---|---|
@@ -110,22 +110,19 @@ Two layers:
 | `ListRoutes` | Existing `Distribution.ListRoutes` (reused, not duplicated) |
 | `GetRaftGroups` | Per-group state (leader, term, commit/applied, last contact) |
 | `GetAdapterSummary` | Per-adapter QPS and latency quantiles from the in-process aggregator |
-| `GetKeyVizMatrix` | Heatmap matrix for **this node's locally observed samples**: leader writes plus reads served locally, including follower-local reads (see §5.1). The admin binary fans out and merges. |
-| `GetRouteDetail` | Time series for one route or virtual bucket (drill-down). The admin binary fans out because reads may be observed by followers. |
+| `GetKeyVizMatrix` | Original gRPC matrix surface for **this node's locally observed samples**. The shipped Phase 2-C SPA does not call this path; it uses `/admin/api/v1/keyviz/matrix` on an embedded server and lets that handler perform HTTP fan-out. |
+| `GetRouteDetail` | Original drill-down surface for one route or virtual bucket. Embedded KeyViz drill-down endpoints live under `/admin/api/v1/keyviz/*`. |
 | `StreamEvents` | Server-stream of route-state transitions and fresh matrix columns |
 
-**Layer B — HTTP/JSON, browser → admin binary.** Thin pass-through wrappers over the gRPC calls, plus static asset serving.
+**Layer B — HTTP/JSON, browser → embedded admin handler.** Implemented server routes live under `/admin/api/v1/*` and are mounted by each `elastickv` process when `--adminEnabled` is set. `cmd/elastickv-admin` still has a small `/api/cluster/overview` wrapper for the standalone overview workflow, but it is not the KeyViz delivery vehicle.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/` (and `/assets/*`) | Embedded SPA |
-| GET | `/api/cluster/overview` | Wraps `GetClusterOverview` |
-| GET | `/api/routes` | Wraps `ListRoutes` + derived size/leader |
-| GET | `/api/raft/groups` | Wraps `GetRaftGroups` |
-| GET | `/api/adapters/summary` | Wraps `GetAdapterSummary` |
-| GET | `/api/keyviz/matrix` | Wraps `GetKeyVizMatrix` |
-| GET | `/api/keyviz/buckets/{bucketID}` | Wraps `GetRouteDetail` for a real route bucket or coarsened virtual bucket |
-| WS  | `/api/stream` | Multiplexes `StreamEvents` from all targeted nodes |
+| GET | `/admin/` (and `/admin/assets/*`) | Embedded SPA served by the node process |
+| POST | `/admin/api/v1/auth/login` | Browser login; mints `admin_session` and `admin_csrf` cookies |
+| GET | `/admin/api/v1/cluster` | Embedded cluster overview |
+| GET | `/admin/api/v1/keyviz/matrix` | Local KeyViz matrix plus optional Phase 2-C HTTP peer fan-out |
+| GET | `/admin/api/v1/keyviz/hotkeys` | Hot-key drill-down when `--keyvizHotKeysEnabled` is set |
 
 HTTP errors use a minimal `{code, message}` envelope. No caching headers on read endpoints.
 
@@ -160,7 +157,22 @@ sampler.Observe(routeID, key, op, valueLen, label)
 
 `sampler` is an interface; the default implementation is nil-safe (a nil sampler compiles to one branch and no allocation). The hook runs *before* Raft proposal so it measures offered load, not applied load.
 
-Writes are sampled exactly once by the current Raft leader before proposal. Reads are sampled by the node that actually serves the read: leader reads are marked `leaderRead`, and lease/follower-local reads are marked `followerRead`. Requests forwarded between nodes carry an internal "already sampled" marker so a logical operation is not counted twice. Because read load can be spread across followers, a cluster-wide heatmap requires the admin binary to fan out and merge across nodes (§9.1) — pointing at a single node would produce a partial view.
+Writes are sampled at the ingress `ShardedCoordinator` before Raft
+forwarding or proposal, so write cells are offered-load observations
+from the node that accepted the request rather than exact leader-only
+applied-write counters. In follower-ingress or multi-ingress
+deployments, two nodes can legitimately report same-term write samples
+for the same bucket. The fan-out merge dedupes by
+`(bucketID, raftGroupID, leaderTerm, column)` when identity is present
+and treats same-identity disagreements as ambiguity, not necessarily as
+a Raft safety anomaly. Reads are sampled by the node that actually
+serves the read: leader reads are marked `leaderRead`, and
+lease/follower-local reads are marked `followerRead`. Requests forwarded
+between nodes carry an internal "already sampled" marker so a logical
+operation is not counted twice. Because read load can be spread across
+followers, a cluster-wide heatmap requires embedded admin HTTP fan-out
+and server-side merge across nodes (§9.1) — pointing at a single node
+would produce a partial view.
 
 **Leadership loss.** Each sample carries the `(raftGroupID, leaderTerm)` under which it was recorded. When the node's lease-loss callback fires for a group, the sampler stamps all `leaderWrite` samples for that group in the current and previous step window with `staleLeader=true` rather than deleting them — keeping them visible on the heatmap helps operators diagnose rapid leadership churn, and they remain authoritative for the window in which this node was in fact the leader. The admin fan-out (§9.1) merges writes by `(bucketID, raftGroupID, leaderTerm, windowStart)`, so the stale samples from an old leader and the fresh samples from a new leader never double-count: distinct terms are summed (each term's leader only saw its own term's writes), and within a single term the one leader's samples are authoritative. If fan-out receives `staleLeader=true` samples that conflict with a concurrent newer-term sample for the same window, the cell is flagged `conflict=true` and rendered hatched.
 
@@ -315,7 +327,11 @@ Phases 0–2 require no Raft or FSM changes. Data-plane protocol adapters only r
 
 ### 9.1 Cluster-wide fan-out
 
-Because writes are recorded by Raft leaders and follower-local reads are recorded by the followers that serve them (§5.1), a single node's local admin view produces a **partial heatmap**. Phase 2-C ships a narrower embedded fan-out path inside each server process:
+Because write cells are ingress-observed offered-load samples and
+follower-local reads are recorded by the followers that serve them
+(§5.1), a single node's local admin view produces a **partial heatmap**.
+Phase 2-C ships a narrower embedded fan-out path inside each server
+process:
 
 - `--keyvizFanoutNodes` accepts a comma-separated static list of peer admin HTTP endpoints. Empty disables fan-out. The local node is added in-process, and the configured peers are queried over the existing admin HTTP surface with the `X-Admin-Fanout-Peer` recursion guard. Phase 2-C does not use `cmd/elastickv-admin --nodes`, `GetClusterOverview` membership discovery, or `--nodesRefreshInterval`; dynamic discovery remains a future extension.
 - For each KeyViz matrix request, the embedded admin handler computes the local matrix, issues parallel HTTP calls to the configured peers, and merges results server-side before sending one combined JSON payload to the browser.

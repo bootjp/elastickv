@@ -1568,9 +1568,10 @@ Scope: out of this proposal; mentioned only to draw the boundary.
   between two `read_ts` values and dumps the delta in the same
   per-adapter format under a `delta/<from-ts>-<to-ts>/` subtree.
 - Concurrent multi-cluster fan-out (one logical backup spanning shards
-  on different physical clusters) — depends on the `Distribution`
-  control plane being fan-out-aware (see
-  `2026_04_27_implemented_keyviz_cluster_fanout.md`).
+  on different physical clusters) — depends on a future
+  `Distribution` control-plane fan-out and membership-discovery design.
+  The implemented KeyViz fan-out is a static admin-HTTP heatmap
+  aggregator, not the backup discovery contract.
 
 ## Required Tests
 
