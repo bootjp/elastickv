@@ -205,6 +205,11 @@ type RedisServer struct {
 	// redis_key_waiters.go.
 	zsetWaiters *keyWaiterRegistry
 
+	// applyObserver is the shared FSM observer when this RedisServer is wired
+	// through WithRedisApplyObserver. Local zset writes use it to keep their
+	// FSM-originated wake fast-safe.
+	applyObserver *RedisApplyObserver
+
 	// onePhaseTxnDedup enables option-2 one-phase idempotency: on a
 	// retryable write error, list-push retries reuse the failed attempt's
 	// write set and carry prev_commit_ts so the FSM can dedup a commit that

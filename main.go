@@ -385,6 +385,7 @@ func run() error {
 		return err
 	}
 	keystore := encryption.NewKeystore()
+	redisApplyObserver := adapter.NewRedisApplyObserver()
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -412,6 +413,7 @@ func run() error {
 		*encryptionSidecarPath,
 		*encryptionEnabled,
 		cfg.engine,
+		redisApplyObserver,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
@@ -539,6 +541,7 @@ func run() error {
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
+		redisApplyObserver:              redisApplyObserver,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -1024,6 +1027,7 @@ func buildShardGroups(
 	sidecarPath string,
 	encWiring encryptionWriteWiring,
 	routeEngine *distribution.Engine,
+	applyObservers ...kv.ApplyObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	// Defend the "cache is always non-nil" contract for callers that
 	// pass a zero-value encryptionWriteWiring{} (the encryption-off
@@ -1095,7 +1099,7 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring)...)
+		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
 		groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(bootstrapCfg, g.id, bootstrap)
 		runtime, err := buildRuntimeForGroup(
 			raftID, g, raftDir, multi, groupBootstrap,
@@ -1140,13 +1144,16 @@ func bootstrapSettingsForGroup(
 	return explicitBootstrap || len(servers) > 0, servers, cfg.bootstrapSeedForGroup(groupID)
 }
 
-func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring) []kv.FSMOption {
+func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
 	opts := []kv.FSMOption{
 		kv.WithEncryption(applier),
 		kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), groupID),
 	}
 	if encWiring.raftEnvelope != nil {
 		opts = append(opts, kv.WithCutoverSource(encWiring.raftEnvelope))
+	}
+	for _, observer := range applyObservers {
+		opts = append(opts, kv.WithApplyObserver(observer))
 	}
 	return opts
 }
@@ -1396,20 +1403,21 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 // serversInput bundles the values run() passes to startServers so the
 // signature stays compact and run() stays under the cyclop budget.
 type serversInput struct {
-	ctx              context.Context
-	eg               *errgroup.Group
-	cancel           context.CancelFunc
-	lc               *net.ListenConfig
-	runtimes         []*raftGroupRuntime
-	shardGroups      map[uint64]*kv.ShardGroup
-	bootstrapServers []raftengine.Server
-	shardStore       *kv.ShardStore
-	coordinate       kv.Coordinator
-	distServer       *adapter.DistributionServer
-	readTracker      *kv.ActiveTimestampTracker
-	metricsRegistry  *monitoring.Registry
-	cfg              runtimeConfig
-	encWiring        encryptionWriteWiring
+	ctx                context.Context
+	eg                 *errgroup.Group
+	cancel             context.CancelFunc
+	lc                 *net.ListenConfig
+	runtimes           []*raftGroupRuntime
+	shardGroups        map[uint64]*kv.ShardGroup
+	bootstrapServers   []raftengine.Server
+	shardStore         *kv.ShardStore
+	coordinate         kv.Coordinator
+	distServer         *adapter.DistributionServer
+	readTracker        *kv.ActiveTimestampTracker
+	metricsRegistry    *monitoring.Registry
+	cfg                runtimeConfig
+	encWiring          encryptionWriteWiring
+	redisApplyObserver *adapter.RedisApplyObserver
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
@@ -1474,33 +1482,34 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		gate:  publicKVGate,
 	}
 	runner := runtimeServerRunner{
-		ctx:             in.ctx,
-		lc:              in.lc,
-		eg:              in.eg,
-		cancel:          in.cancel,
-		runtimes:        in.runtimes,
-		shardGroups:     in.shardGroups,
-		shardStore:      in.shardStore,
-		coordinate:      adapterCoordinate,
-		distServer:      in.distServer,
-		adminServer:     adminServer,
-		adminGRPCOpts:   adminGRPCOpts,
-		redisAddress:    *redisAddr,
-		leaderRedis:     in.cfg.leaderRedis,
-		pubsubRelay:     adapter.NewRedisPubSubRelay(),
-		readTracker:     in.readTracker,
-		encWiring:       in.encWiring,
-		dynamoAddress:   *dynamoAddr,
-		leaderDynamo:    in.cfg.leaderDynamo,
-		s3Address:       *s3Addr,
-		leaderS3:        in.cfg.leaderS3,
-		s3Region:        *s3Region,
-		s3CredsFile:     *s3CredsFile,
-		s3PathStyleOnly: *s3PathStyleOnly,
-		sqsAddress:      *sqsAddr,
-		leaderSQS:       in.cfg.leaderSQS,
-		sqsRegion:       *sqsRegion,
-		sqsCredsFile:    *sqsCredsFile,
+		ctx:                in.ctx,
+		lc:                 in.lc,
+		eg:                 in.eg,
+		cancel:             in.cancel,
+		runtimes:           in.runtimes,
+		shardGroups:        in.shardGroups,
+		shardStore:         in.shardStore,
+		coordinate:         adapterCoordinate,
+		distServer:         in.distServer,
+		adminServer:        adminServer,
+		adminGRPCOpts:      adminGRPCOpts,
+		redisAddress:       *redisAddr,
+		leaderRedis:        in.cfg.leaderRedis,
+		pubsubRelay:        adapter.NewRedisPubSubRelay(),
+		readTracker:        in.readTracker,
+		encWiring:          in.encWiring,
+		redisApplyObserver: in.redisApplyObserver,
+		dynamoAddress:      *dynamoAddr,
+		leaderDynamo:       in.cfg.leaderDynamo,
+		s3Address:          *s3Addr,
+		leaderS3:           in.cfg.leaderS3,
+		s3Region:           *s3Region,
+		s3CredsFile:        *s3CredsFile,
+		s3PathStyleOnly:    *s3PathStyleOnly,
+		sqsAddress:         *sqsAddr,
+		leaderSQS:          in.cfg.leaderSQS,
+		sqsRegion:          *sqsRegion,
+		sqsCredsFile:       *sqsCredsFile,
 		// sqsPartitionResolver is rebuilt from the same config map
 		// the coordinator's WithPartitionResolver consumes (line
 		// ~328) so the SQS server's CreateQueue capability gate
@@ -2166,7 +2175,7 @@ func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOptio
 	return nil
 }
 
-func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
+func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
@@ -2179,6 +2188,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
 		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
+		adapter.WithRedisApplyObserver(redisApplyObserver),
 	)
 	// Wire the bounded Lua VM pool into Prometheus. The metrics
 	// (hits/misses/drops/idle/max_idle) are read at scrape time via
@@ -2431,6 +2441,7 @@ type runtimeServerRunner struct {
 	leaderRedis                     map[string]string
 	pubsubRelay                     *adapter.RedisPubSubRelay
 	readTracker                     *kv.ActiveTimestampTracker
+	redisApplyObserver              *adapter.RedisApplyObserver
 	encWiring                       encryptionWriteWiring
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
@@ -2570,6 +2581,7 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 	redisServer, redisCompactor, redisListener, err := prepareRedisServer(
 		r.ctx, r.lc, r.redisAddress, r.shardStore, r.coordinate,
 		r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker,
+		r.redisApplyObserver,
 	)
 	if err != nil {
 		return err

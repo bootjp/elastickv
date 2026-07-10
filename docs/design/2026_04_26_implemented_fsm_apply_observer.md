@@ -1,8 +1,9 @@
 # FSM ApplyObserver for cross-node event-driven Redis BLOCK paths
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-04-26
+Implemented: 2026-07-07
 
 ## Summary
 
@@ -37,6 +38,20 @@ into a 100ms-latency floor for any waiter that depends on them.
 A FSM-level observer fixes all three with one hook: every Put/Del that
 applies on any node, regardless of which adapter or path produced it,
 fires the callback.
+
+## Implementation notes
+
+The shipped implementation adds `kv.ApplyObserver` and `kv.WithApplyObserver`.
+`kvFSM` notifies observers after successful raw applies, `DEL_PREFIX` applies,
+one-phase transaction commits, and two-phase COMMIT applies. PREPARE and ABORT
+do not notify because they only make lock/intent metadata visible, not the
+logical user mutation.
+
+`adapter.RedisApplyObserver` owns the shared `keyWaiterRegistry` instances used
+by `RedisServer`. It wakes XREAD BLOCK waiters on `store.StreamEntryKey` puts
+and BZPOPMIN waiters on zset member/score-key puts. The existing local
+`dispatchAndSignal*` wake calls remain as redundant fast wakes; duplicate
+signals coalesce in the buffered waiter channel.
 
 ## Background
 
@@ -244,20 +259,20 @@ waiter.
 
 ## Phase plan
 
-- **Phase 2.1** — Land `kv.ApplyObserver` interface + `WithApplyObserver`
+- **Phase 2.1 (shipped)** — Land `kv.ApplyObserver` interface + `WithApplyObserver`
   option + the inline call in `handleRawRequest`. No subscribers yet.
   Tests: a mock observer asserts it sees every Put/Del op and key;
   benchmark confirms <1% throughput regression on the existing FSM
   apply benchmark.
-- **Phase 2.2** — Add `streamApplyObserver`, wire it in `main.go`,
-  drop the leader-side `xaddTxn` signal call (now redundant: the
-  observer fires for all paths). Tests: existing
+- **Phase 2.2 (shipped)** — Add `RedisApplyObserver`, wire it in `main.go`,
+  and keep the leader-side `xaddTxn` / zset signal calls as redundant
+  fast wakes. Tests: existing
   `TestRedis_StreamXReadBlockWakesOnXAdd` still passes; new
   `TestRedis_StreamXReadBlockWakesOnFollowerApply` confirms a
   follower-side waiter wakes within ~µs of FSM apply (rather than
   ≤100ms via fallback); a Lua-script XADD test confirms the same.
-- **Phase 2.3** — Generalize the registry into a `keyWaiterRegistry`
-  shared by XREAD, BZPOPMIN (Phase C), BLPOP / BRPOP / BLMOVE. Each
+- **Phase 2.3 (partially shipped)** — Generalize the registry into a `keyWaiterRegistry`
+  shared by XREAD and BZPOPMIN. BLPOP / BRPOP / BLMOVE can reuse it. Each
   command's adapter handler picks the right key-prefix filter on
   registration; the observer remains a single subscriber.
 

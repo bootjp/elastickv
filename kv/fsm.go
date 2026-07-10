@@ -83,6 +83,9 @@ type kvFSM struct {
 	// short-circuit (matches the pre-feature behaviour).  Wired by
 	// WithRouteHistory from main.go's shard-group construction.
 	shardGroupID uint64
+	// applyObservers are called after successful logical mutations.
+	// They are never mutated after NewKvFSMWithHLC returns.
+	applyObservers []ApplyObserver
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -453,20 +456,7 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	if err := f.handleRequest(ctx, r, commitTS); err != nil {
 		return errors.WithStack(err)
 	}
-	// HLC-4 strategy (c) — observe every applied commit_ts so this node's
-	// hlc.last dominates the max committed timestamp visible in the FSM.
-	// On a follower this keeps the in-memory logical counter aligned with
-	// the cluster; when a follower is elected leader of any group,
-	// etcd/raft applies all uncommitted entries from prior terms before
-	// the leader serves a write, so by the time the new leader calls
-	// HLC.Next() for a persistence ts, hlc.last >= every commit_ts ever
-	// committed.  This closes the HLC-4 logical-handoff gap surfaced by
-	// the tla-check gap configuration on PR #856.
-	// See docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1 HLC-4
-	// precondition (ii) (strategy (c)) and HLC.tla BecomeLeader_HLC.
-	if f.hlc != nil && commitTS > 0 {
-		f.hlc.Observe(commitTS)
-	}
+	f.observeAppliedCommitTS(commitTS)
 	return nil
 }
 
@@ -506,7 +496,11 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	}
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
-	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, muts, nil, commitTS, commitTS, f.pendingApplyIdx))
+	if err := f.store.ApplyMutationsRaftAt(ctx, muts, nil, commitTS, commitTS, f.pendingApplyIdx); err != nil {
+		return errors.WithStack(err)
+	}
+	f.notifyApplyObservers(commitTS, r.Mutations)
+	return nil
 }
 
 // extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
@@ -523,7 +517,11 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	return errors.WithStack(f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx))
+	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
+		return errors.WithStack(err)
+	}
+	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
+	return nil
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -913,7 +911,11 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx))
+	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
+		return errors.WithStack(err)
+	}
+	f.notifyApplyObservers(commitTS, uniq)
+	return nil
 }
 
 // dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
@@ -966,7 +968,11 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS)
+	if err := f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS); err != nil {
+		return err
+	}
+	f.notifyApplyObserversForStoreMutations(commitTS, storeMuts)
+	return nil
 }
 
 // commitApplyStartTS resolves the startTS to use for MVCC conflict detection
