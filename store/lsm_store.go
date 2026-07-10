@@ -1854,6 +1854,22 @@ func (s *pebbleStore) runCompactionGC(ctx context.Context, minTS uint64) (pebble
 	return stats, nil
 }
 
+func (s *pebbleStore) runCompactionPhase(ctx context.Context, targetMinTS uint64, resumingPending bool) (pebbleCompactionStats, error) {
+	retainPending := resumingPending
+	stats, err := s.runCompactionGC(ctx, targetMinTS)
+	retainPending = retainPending || stats.committedDeletes
+	if err != nil {
+		s.cleanupPendingCompaction(&retainPending)
+		return stats, err
+	}
+
+	if err := s.commitCompactionMinRetainedTS(targetMinTS); err != nil {
+		s.cleanupPendingCompaction(&retainPending)
+		return stats, err
+	}
+	return stats, nil
+}
+
 func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	ctx = ensureContext(ctx)
 
@@ -1873,48 +1889,43 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	pending, committed := s.compactionWatermarks()
-	resumingPending := pending > committed
-	targetMinTS := minTS
-	if resumingPending {
-		// A pending watermark means an earlier compaction may have already
-		// committed delete batches. Keep reads fail-closed, but do not finalize
-		// the watermark until an idempotent GC pass reaches EOF.
-		targetMinTS = pending
-	} else if minTS <= committed {
-		return nil
-	}
+	for {
+		pending, committed := s.compactionWatermarks()
+		resumingPending := pending > committed
+		targetMinTS := minTS
+		if resumingPending {
+			// A pending watermark means an earlier compaction may have already
+			// committed delete batches. Keep reads fail-closed, but do not finalize
+			// the watermark until an idempotent GC pass reaches EOF.
+			targetMinTS = pending
+		} else if minTS <= committed {
+			return nil
+		}
 
-	if !resumingPending {
-		shouldRun, err := s.beginCompaction(targetMinTS)
+		if !resumingPending {
+			shouldRun, err := s.beginCompaction(targetMinTS)
+			if err != nil {
+				return err
+			}
+			if !shouldRun {
+				return nil
+			}
+		}
+
+		stats, err := s.runCompactionPhase(ctx, targetMinTS, resumingPending)
 		if err != nil {
 			return err
 		}
-		if !shouldRun {
+
+		s.log.InfoContext(ctx, "compact",
+			slog.Uint64("min_ts", targetMinTS),
+			slog.Int("updated_keys", stats.updatedKeys),
+			slog.Int("deleted_versions", stats.deletedVersions),
+		)
+		if targetMinTS >= minTS {
 			return nil
 		}
 	}
-
-	retainPending := resumingPending
-	defer s.cleanupPendingCompaction(&retainPending)
-
-	stats, err := s.runCompactionGC(ctx, targetMinTS)
-	retainPending = retainPending || stats.committedDeletes
-	if err != nil {
-		return err
-	}
-
-	if err := s.commitCompactionMinRetainedTS(targetMinTS); err != nil {
-		return err
-	}
-	retainPending = false
-
-	s.log.InfoContext(ctx, "compact",
-		slog.Uint64("min_ts", targetMinTS),
-		slog.Int("updated_keys", stats.updatedKeys),
-		slog.Int("deleted_versions", stats.deletedVersions),
-	)
-	return nil
 }
 
 func (s *pebbleStore) Snapshot() (Snapshot, error) {

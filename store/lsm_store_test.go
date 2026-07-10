@@ -417,6 +417,54 @@ func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t 
 	require.Equal(t, 1, countPebbleVersions(t, reopened))
 }
 
+func TestPebbleStore_CompactResumedPendingAdvancesToRequestedMinTS(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-compact-resume-higher-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+
+	key := []byte{0x01}
+	value := []byte("value")
+	pendingMinTS := uint64(compactionDeleteBatchCountLimit * 2)
+	requestedMinTS := uint64(compactionDeleteBatchCountLimit * 3)
+	for ts := uint64(1); ts <= pendingMinTS+1; ts++ {
+		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
+	}
+
+	cancelAfterFirstDeleteFlush := &cancelAfterErrCallsContext{
+		Context:        ctx,
+		maxNilErrCalls: compactionDeleteBatchCountLimit + 10,
+	}
+	require.ErrorIs(t, st.Compact(cancelAfterFirstDeleteFlush, pendingMinTS), context.Canceled)
+	require.Equal(t, uint64(0), requirePebbleRetentionController(t, st).MinRetainedTS())
+	for ts := pendingMinTS + 2; ts <= requestedMinTS+10; ts++ {
+		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
+	}
+
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	_, err = reopened.GetAt(ctx, key, pendingMinTS-1)
+	require.ErrorIs(t, err, ErrReadTSCompacted)
+
+	require.NoError(t, reopened.Compact(ctx, requestedMinTS))
+	require.Equal(t, requestedMinTS, requirePebbleRetentionController(t, reopened).MinRetainedTS())
+
+	_, err = reopened.GetAt(ctx, key, requestedMinTS-1)
+	require.ErrorIs(t, err, ErrReadTSCompacted)
+
+	val, err := reopened.GetAt(ctx, key, requestedMinTS+1)
+	require.NoError(t, err)
+	require.Equal(t, value, val)
+}
+
 func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-compact-lock-*")
 	require.NoError(t, err)

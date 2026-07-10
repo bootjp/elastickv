@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -315,8 +316,9 @@ func TestShardedCoordinator_RenewHLCLeases_SlowGroupDoesNotBlockPeers(t *testing
 	eng2 := newShardedLeaseEngine(200)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var enteredOnce sync.Once
 	eng1.proposeHook = func() {
-		close(entered)
+		enteredOnce.Do(func() { close(entered) })
 		<-release
 	}
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
@@ -329,6 +331,42 @@ func TestShardedCoordinator_RenewHLCLeases_SlowGroupDoesNotBlockPeers(t *testing
 		"a slow led group must not delay renewal for another led group")
 	close(release)
 	requireRenewalDone(t, done)
+}
+
+func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	eng1.proposeHook = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	first := coord.renewHLCLeases(context.Background())
+	<-entered
+	require.Eventually(t, func() bool {
+		return coord.groups[2].lease.valid(monoclock.Now())
+	}, time.Second, 10*time.Millisecond,
+		"precondition: the first round must finish for the non-blocked group")
+
+	second := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, second)
+
+	require.Equal(t, int32(1), eng1.proposeCalls.Load(),
+		"an in-flight group must not receive a second concurrent renewal proposal")
+	require.Equal(t, int32(2), eng2.proposeCalls.Load(),
+		"other led groups must still renew while one group is in flight")
+
+	close(release)
+	requireRenewalDone(t, first)
+
+	third := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, third)
+	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
+		"the group must be eligible for renewal after the in-flight proposal finishes")
 }
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {

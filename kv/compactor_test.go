@@ -181,10 +181,10 @@ func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T
 	requireDeadlineWithin(t, st.deadline, start, leaderTimeout)
 }
 
-func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithShortTimeout(t *testing.T) {
+func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *testing.T) {
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
-	raftTimeout := 20 * time.Millisecond
+	configuredTimeout := 2 * time.Second
 	start := time.Now()
 
 	compactor := NewFSMCompactor(
@@ -201,15 +201,15 @@ func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithShortTimeout(t *testing
 		}},
 		WithFSMCompactorInterval(time.Hour),
 		WithFSMCompactorRetentionWindow(time.Millisecond),
-		WithFSMCompactorTimeout(time.Hour),
-		WithFSMCompactorRaftTimeout(raftTimeout),
+		WithFSMCompactorTimeout(configuredTimeout),
 	)
 
 	require.NoError(t, compactor.SyncOnce(ctx))
 
 	require.True(t, st.compactCalled)
 	require.True(t, st.hasDeadline)
-	requireDeadlineWithin(t, st.deadline, start, raftTimeout)
+	requireDeadlineWithin(t, st.deadline, start, configuredTimeout)
+	require.Greater(t, st.deadline.Sub(start), defaultFSMCompactorLeaderTimeout)
 }
 
 func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.T) {

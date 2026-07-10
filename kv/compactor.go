@@ -15,7 +15,6 @@ const (
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
 	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
-	defaultFSMCompactorRaftTimeout     = 500 * time.Millisecond
 )
 
 type RaftStatusProvider interface {
@@ -37,7 +36,6 @@ type FSMCompactor struct {
 	retentionWindow time.Duration
 	timeout         time.Duration
 	leaderTimeout   time.Duration
-	raftTimeout     time.Duration
 	logger          *slog.Logger
 }
 
@@ -79,14 +77,6 @@ func WithFSMCompactorLeaderTimeout(timeout time.Duration) FSMCompactorOption {
 	}
 }
 
-func WithFSMCompactorRaftTimeout(timeout time.Duration) FSMCompactorOption {
-	return func(c *FSMCompactor) {
-		if timeout > 0 {
-			c.raftTimeout = timeout
-		}
-	}
-}
-
 func WithFSMCompactorLogger(logger *slog.Logger) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if logger != nil {
@@ -102,7 +92,6 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		retentionWindow: defaultFSMCompactorRetentionWindow,
 		timeout:         defaultFSMCompactorTimeout,
 		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
-		raftTimeout:     defaultFSMCompactorRaftTimeout,
 		logger:          slog.Default(),
 	}
 	for _, opt := range opts {
@@ -221,9 +210,6 @@ func (c *FSMCompactor) targetMinTS(lastCommitTS, minRetainedTS uint64, now time.
 
 func (c *FSMCompactor) compactContext(ctx context.Context, status raftengine.Status) (context.Context, context.CancelFunc) {
 	timeout := c.timeout
-	if status.NumPeers > 0 && c.raftTimeout > 0 && (timeout <= 0 || c.raftTimeout < timeout) {
-		timeout = c.raftTimeout
-	}
 	if status.State == raftengine.StateLeader && c.leaderTimeout > 0 && (timeout <= 0 || c.leaderTimeout < timeout) {
 		timeout = c.leaderTimeout
 	}
