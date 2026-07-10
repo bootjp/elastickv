@@ -396,6 +396,10 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
+	// another background HLC lease proposal for the same group on the next tick.
+	hlcRenewalMu       sync.Mutex
+	hlcRenewalInFlight map[uint64]struct{}
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -2158,9 +2162,13 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		if group.Engine.State() != raftengine.StateLeader {
 			continue
 		}
+		if !c.startHLCLeaseRenewal(gid) {
+			continue
+		}
 		wg.Add(1)
 		go func(gid uint64, group *ShardGroup) {
 			defer wg.Done()
+			defer c.finishHLCLeaseRenewal(gid)
 			pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
 			defer cancel()
 			c.renewHLCLease(pctx, gid, group)
@@ -2171,6 +2179,25 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		close(done)
 	}()
 	return done
+}
+
+func (c *ShardedCoordinator) startHLCLeaseRenewal(gid uint64) bool {
+	c.hlcRenewalMu.Lock()
+	defer c.hlcRenewalMu.Unlock()
+	if c.hlcRenewalInFlight == nil {
+		c.hlcRenewalInFlight = make(map[uint64]struct{})
+	}
+	if _, ok := c.hlcRenewalInFlight[gid]; ok {
+		return false
+	}
+	c.hlcRenewalInFlight[gid] = struct{}{}
+	return true
+}
+
+func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
+	c.hlcRenewalMu.Lock()
+	defer c.hlcRenewalMu.Unlock()
+	delete(c.hlcRenewalInFlight, gid)
 }
 
 // renewHLCLease proposes a fresh physical ceiling on one shard

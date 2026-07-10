@@ -1,7 +1,7 @@
 # Raft Learner operations
 
 Runbook for attaching a Raft learner replica and promoting it to voter.
-Companion to the design doc `docs/design/2026_04_26_proposed_raft_learner.md`.
+Companion to the design doc `docs/design/2026_04_26_implemented_raft_learner.md`.
 
 The learner primitive lets you attach a fresh node, let it catch up
 on the log, and then promote it to voter — without ever shrinking the
