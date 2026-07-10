@@ -59,6 +59,16 @@ const (
 	// minInboundQueueCapacity keeps very small test/operator inflight limits
 	// from shrinking the shared inbound queue enough to drop heartbeats.
 	minInboundQueueCapacity = 128
+	// priorityStepQueueCapacity is the inbound control-plane queue size.
+	// Heartbeats, votes, read-index responses, and timeout-now messages are
+	// tiny but time-sensitive; keeping them off the bulk stepCh prevents a
+	// MsgApp burst from forcing followers into avoidable elections.
+	priorityStepQueueCapacity = 1024
+	// priorityStepBurstLimit bounds consecutive non-blocking priority drains
+	// so a sustained control-message stream cannot starve Tick, proposals, or
+	// admin work. The next event goes through the blocking select, where Tick
+	// competes fairly with priority and bulk steps.
+	priorityStepBurstLimit = 64
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
 	// leader-transfer, and their corresponding response messages
@@ -309,13 +319,15 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh        chan proposalRequest
-	readCh           chan readRequest
-	adminCh          chan adminRequest
-	stepCh           chan raftpb.Message
-	dispatchReportCh chan dispatchReport
-	peerDispatchers  map[uint64]*peerQueues
-	perPeerQueueSize int
+	proposeCh         chan proposalRequest
+	readCh            chan readRequest
+	adminCh           chan adminRequest
+	stepCh            chan raftpb.Message
+	priorityStepCh    chan raftpb.Message
+	priorityStepBurst int
+	dispatchReportCh  chan dispatchReport
+	peerDispatchers   map[uint64]*peerQueues
+	perPeerQueueSize  int
 	// dispatcherLanesEnabled toggles the 4-lane dispatcher layout. Captured
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
@@ -406,7 +418,7 @@ type Engine struct {
 	dispatchErrorByCode   map[string]uint64
 	// stepQueueFullCount tracks the number of inbound raft messages
 	// (from remote peers and local handlers) that were dropped because
-	// stepCh was full. Surfaced to Prometheus as
+	// the selected inbound step queue was full. Surfaced to Prometheus as
 	// elastickv_raft_step_queue_full_total so operators can correlate
 	// seek-storm goroutine spikes with raft backpressure.
 	stepQueueFullCount atomic.Uint64
@@ -640,6 +652,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
 		stepCh:           make(chan raftpb.Message, inboundQueueCap),
+		priorityStepCh:   make(chan raftpb.Message, priorityStepQueueCapacity),
 		dispatchReportCh: make(chan dispatchReport, inboundQueueCap),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
@@ -1179,10 +1192,11 @@ func (e *Engine) recordDispatchErrorCode(code string) uint64 {
 }
 
 // StepQueueFullCount returns the total number of inbound raft messages
-// that could not be enqueued into stepCh because the channel was at
-// capacity. This is the "etcd raft inbound step queue is full" signal
-// from the task description: a spike indicates the local raft loop
-// is starved, usually by something blocking the apply path such as
+// that could not be enqueued into the selected inbound step queue
+// because the channel was at capacity. This is the "etcd raft inbound
+// step queue is full" signal from the task description: a spike
+// indicates the local raft loop is starved, usually by something
+// blocking the apply path such as
 // the pre-#560 rawKeyTypeAt seek storm.
 func (e *Engine) StepQueueFullCount() uint64 {
 	if e == nil {
@@ -1712,6 +1726,27 @@ func (e *Engine) startup() error {
 }
 
 func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
+	if e.isClosing() {
+		return false, nil
+	}
+
+	if e.tryHandlePriorityStep() {
+		return true, nil
+	}
+
+	return e.handleBlockingEvent(tick)
+}
+
+func (e *Engine) isClosing() bool {
+	select {
+	case <-e.closeCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) {
 	select {
 	case <-e.closeCh:
 		return false, nil
@@ -1723,16 +1758,47 @@ func (e *Engine) handleEvent(tick <-chan time.Time) (bool, error) {
 		e.handleRead(req)
 	case req := <-e.adminCh:
 		e.handleAdmin(req)
+	case msg := <-e.priorityStepCh:
+		e.handleStep(msg)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
 	case report := <-e.dispatchReportCh:
 		e.handleDispatchReport(report)
 	case result := <-e.snapshotResCh:
-		if err := e.handleSnapshotResult(result); err != nil {
-			return false, err
-		}
+		return e.handleSnapshotResultEvent(result)
 	}
 	return true, nil
+}
+
+func (e *Engine) handleSnapshotResultEvent(result snapshotResult) (bool, error) {
+	if err := e.handleSnapshotResult(result); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (e *Engine) tryHandlePriorityStep() bool {
+	if e.priorityStepBurst >= priorityStepBurstLimit {
+		e.priorityStepBurst = 0
+		return false
+	}
+	msg, ok := e.tryReceivePriorityStep()
+	if !ok {
+		e.priorityStepBurst = 0
+		return false
+	}
+	e.priorityStepBurst++
+	e.handleStep(msg)
+	return true
+}
+
+func (e *Engine) tryReceivePriorityStep() (raftpb.Message, bool) {
+	select {
+	case msg := <-e.priorityStepCh:
+		return msg, true
+	default:
+		return raftpb.Message{}, false
+	}
 }
 
 // dispatchReport is posted by the dispatch workers when a transport send
@@ -4139,12 +4205,17 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
+	ch := e.stepCh
+	if isPriorityMsg(msg.GetType()) && e.priorityStepCh != nil {
+		ch = e.priorityStepCh
+	}
+
 	select {
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())
 	case <-e.doneCh:
 		return e.currentErrorOrClosed()
-	case e.stepCh <- msg:
+	case ch <- msg:
 		return nil
 	default:
 		e.stepQueueFullCount.Add(1)
