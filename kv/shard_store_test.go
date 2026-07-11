@@ -169,6 +169,41 @@ func TestShardStoreScanKeysAt_IncludesKeysAcrossShards(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("x")}, keys)
 }
 
+func TestShardStoreScanKeysAt_DeduplicatesUnclampedGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 2, 0))
+
+	keys, err := st.ScanKeysAt(ctx, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, keys)
+}
+
+func TestKeyOnlyScanHelpersPreserveEmptyKey(t *testing.T) {
+	t.Parallel()
+
+	keys := keysFromKVs(kvPairsFromKeys([][]byte{nil, []byte(""), []byte("a")}))
+	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
+}
+
+func TestMergeAndTrimScanKeysSortsBeforeTruncating(t *testing.T) {
+	t.Parallel()
+
+	keys := mergeAndTrimScanKeys(nil, [][]byte{[]byte("c"), []byte("d"), []byte("b")}, 2)
+	require.Equal(t, [][]byte{[]byte("b"), []byte("c")}, keys)
+}
+
 func TestBackupScannerPaging(t *testing.T) {
 	t.Parallel()
 
@@ -203,7 +238,7 @@ func TestBackupScannerPaging(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
 }
 
-func TestBackupScannerEmptyKeyTerminatesAfterPage(t *testing.T) {
+func TestBackupScannerEmptyKeyContinuesAfterPage(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -214,8 +249,9 @@ func TestBackupScannerEmptyKeyTerminatesAfterPage(t *testing.T) {
 	}
 	st := NewShardStore(engine, groups)
 	require.NoError(t, st.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("later"), 2, 0))
 
-	sc := st.NewBackupScanner(nil, []byte("\x00"), ^uint64(0), 1)
+	sc := st.NewBackupScanner(nil, nil, ^uint64(0), 1)
 	defer sc.Close()
 
 	kvp, ok, err := sc.Next(ctx)
@@ -223,6 +259,12 @@ func TestBackupScannerEmptyKeyTerminatesAfterPage(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, []byte(""), kvp.Key)
 	require.Equal(t, []byte("empty"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("later"), kvp.Value)
 
 	kvp, ok, err = sc.Next(ctx)
 	require.NoError(t, err)

@@ -89,7 +89,7 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		return nil
 	}
 	last := page[len(page)-1]
-	if last == nil || len(last.Key) == 0 {
+	if last == nil {
 		s.exhausted = true
 		return nil
 	}

@@ -305,12 +305,18 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 
 func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([][]byte, error) {
 	out := make([][]byte, 0)
+	seenGroups := make(map[uint64]struct{})
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
+		} else {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
 		}
 
 		keys, err := s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
@@ -318,9 +324,8 @@ func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.
 			return nil, err
 		}
 		if clampToRoutes {
-			out = append(out, keys...)
+			out = mergeAndTrimScanKeys(out, keys, limit)
 			if len(out) >= limit {
-				out = out[:limit]
 				break
 			}
 			continue
@@ -666,7 +671,7 @@ func countNonInternalKVs(kvs []*store.KVPair) int {
 func kvPairsFromKeys(keys [][]byte) []*store.KVPair {
 	kvs := make([]*store.KVPair, 0, len(keys))
 	for _, key := range keys {
-		if len(key) == 0 {
+		if key == nil {
 			continue
 		}
 		kvs = append(kvs, &store.KVPair{Key: key})
@@ -677,7 +682,7 @@ func kvPairsFromKeys(keys [][]byte) []*store.KVPair {
 func keysFromKVs(kvs []*store.KVPair) [][]byte {
 	keys := make([][]byte, 0, len(kvs))
 	for _, kvp := range kvs {
-		if kvp == nil || len(kvp.Key) == 0 {
+		if kvp == nil || kvp.Key == nil {
 			continue
 		}
 		keys = append(keys, kvp.Key)
