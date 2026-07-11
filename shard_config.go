@@ -496,6 +496,18 @@ func defaultGroupID(groups []groupSpec) uint64 {
 	return min
 }
 
+func dataGroupIDs(groups []groupSpec) []uint64 {
+	ids := make([]uint64, 0, len(groups))
+	for _, g := range groups {
+		if g.id == dedicatedTSORaftGroupID {
+			continue
+		}
+		ids = append(ids, g.id)
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids)
+}
+
 func validateShardRanges(ranges []rangeSpec, groups []groupSpec) error {
 	ids := map[uint64]struct{}{}
 	for _, g := range groups {

@@ -452,8 +452,9 @@ func run() error {
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
+		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate, cfg.groups); err != nil {
+	if err := configureCoordinatorTSO(coordinate); err != nil {
 		return err
 	}
 
@@ -821,6 +822,9 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 	if len(parsed) == 0 {
 		return parsed, nil
 	}
+	if err := validateSQSFifoPartitionMapNoDedicatedTSOGroup(parsed); err != nil {
+		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
+	}
 	groupIDs := make(map[string]struct{}, len(groups))
 	for _, g := range groups {
 		groupIDs[strconv.FormatUint(g.id, 10)] = struct{}{}
@@ -829,6 +833,19 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
 	}
 	return parsed, nil
+}
+
+func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsFifoQueueRouting) error {
+	for queue, routing := range partitionMap {
+		for partition, group := range routing.groups {
+			if group == strconv.FormatUint(dedicatedTSORaftGroupID, 10) {
+				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+					"queue %q partition %d: group %q is reserved for TSO",
+					queue, partition, group)
+			}
+		}
+	}
+	return nil
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
@@ -1572,13 +1589,12 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	return nil
 }
 
-func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator, groups []groupSpec) error {
+func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
 	if !*tsoEnabled {
 		return nil
 	}
-	if hasDedicatedTSOGroup(groups) {
-		coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
-	}
+	// Group 0 is reserved for TSO state, but data-shard leaders must keep
+	// issuing timestamps locally until a TSO-leader redirect path exists.
 	tso, err := kv.NewLocalTSOAllocator(coordinate)
 	if err != nil {
 		return errors.Wrap(err, "configure tso allocator")
@@ -1589,15 +1605,6 @@ func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator, groups []groupSp
 	}
 	coordinate.WithTSOAllocator(batch)
 	return nil
-}
-
-func hasDedicatedTSOGroup(groups []groupSpec) bool {
-	for _, g := range groups {
-		if g.id == dedicatedTSORaftGroupID {
-			return true
-		}
-	}
-	return false
 }
 
 type hlcLeaseRenewalBlocker interface {

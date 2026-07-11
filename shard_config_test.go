@@ -305,6 +305,18 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 	})
 }
 
+func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
+
+	_, err := buildSQSFifoPartitionMap(
+		[]groupSpec{{id: 0}, {id: 1}},
+		"orders.fifo:2=1,0",
+	)
+	require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	require.Contains(t, err.Error(), "reserved for TSO")
+	require.Contains(t, err.Error(), "partition 1")
+}
+
 func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
@@ -370,6 +382,11 @@ func TestDefaultGroupID(t *testing.T) {
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 0}, {id: 2}}))
 	require.Equal(t, uint64(1), defaultGroupID([]groupSpec{{id: 0}}))
+}
+
+func TestDataGroupIDsExcludeDedicatedTSOGroup(t *testing.T) {
+	require.Equal(t, []uint64{1, 2}, dataGroupIDs([]groupSpec{{id: 0}, {id: 2}, {id: 1}}))
+	require.Empty(t, dataGroupIDs([]groupSpec{{id: 0}}))
 }
 
 func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T) {

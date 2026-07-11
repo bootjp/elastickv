@@ -379,6 +379,12 @@ type ShardedCoordinator struct {
 	// behavior where any locally-led shard group can issue TSO timestamps.
 	timestampGroup           uint64
 	timestampGroupConfigured bool
+	// allShardGroupIDs, when configured, is the explicit set of data groups
+	// that whole-keyspace operations must visit. It lets callers keep
+	// non-data groups (for example a reserved timestamp group) in c.groups
+	// without letting Scan fences or DEL_PREFIX broadcasts touch them.
+	allShardGroupIDs         []uint64
+	allShardGroupsConfigured bool
 	store                    store.MVCCStore
 	log                      *slog.Logger
 	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
@@ -457,11 +463,23 @@ func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *Sharded
 }
 
 // WithTimestampGroup pins timestamp issuance leadership to one Raft group.
-// Dedicated TSO deployments use this so a data-shard leader cannot allocate
-// persistence timestamps unless it also leads the timestamp group.
+// Callers should only enable this once a data-shard leader can redirect
+// timestamp allocation to that group; otherwise data leaders would stop being
+// able to commit writes when they do not also lead the timestamp group.
 func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
 	c.timestampGroup = groupID
 	c.timestampGroupConfigured = true
+	return c
+}
+
+// WithAllShardGroups restricts whole-keyspace operations to the supplied data
+// groups. When unset, the coordinator preserves the legacy behaviour and uses
+// every group it owns.
+func (c *ShardedCoordinator) WithAllShardGroups(groupIDs ...uint64) *ShardedCoordinator {
+	c.allShardGroupIDs = append([]uint64(nil), groupIDs...)
+	slices.Sort(c.allShardGroupIDs)
+	c.allShardGroupIDs = slices.Compact(c.allShardGroupIDs)
+	c.allShardGroupsConfigured = true
 	return c
 }
 
@@ -1021,9 +1039,10 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 }
 
 // dispatchDelPrefixBroadcast validates and broadcasts DEL_PREFIX operations
-// to every shard group. Each element becomes a separate pb.Request (the FSM's
-// extractDelPrefix processes only the first DEL_PREFIX mutation per request).
-// All requests are batched into a single Commit call per shard group.
+// to every configured all-shard data group. Each element becomes a separate
+// pb.Request (the FSM's extractDelPrefix processes only the first DEL_PREFIX
+// mutation per request). All requests are batched into a single Commit call
+// per shard group.
 func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
@@ -1049,8 +1068,8 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	return c.broadcastToAllGroups(ctx, requests)
 }
 
-// broadcastToAllGroups sends the same set of requests to every shard group in
-// parallel and returns the maximum commit index.
+// broadcastToAllGroups sends the same set of requests to every configured
+// all-shard data group in parallel and returns the maximum commit index.
 func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests []*pb.Request) (*CoordinateResponse, error) {
 	var (
 		maxIndex atomic.Uint64
@@ -1058,7 +1077,11 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 		errMu    sync.Mutex
 		wg       sync.WaitGroup
 	)
-	for _, g := range c.groups {
+	groups, err := c.allShardGroups()
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
 		wg.Add(1)
 		go func(g *ShardGroup) {
 			defer wg.Done()
@@ -1694,25 +1717,68 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
-// LeaseReadAllGroups establishes the lease freshness bound on every shard
-// group this coordinator owns. Multi-shard reads (Scan, GSI/whole-table
-// Query) visit all intersecting routes across all groups (see
-// ShardStore.ScanAt), so fencing only the default group would let those
-// reads sample a snapshot on a non-default group without the freshness
-// bound. It fails closed on the first group that cannot confirm its lease,
-// since a partially-fenced read is exactly the stale read this guards
-// against. Group iteration order is unspecified; correctness does not
-// depend on it because every group must succeed.
+// LeaseReadAllGroups establishes the lease freshness bound on every configured
+// all-shard data group. Multi-shard reads (Scan, GSI/whole-table Query) visit
+// all intersecting data routes across all groups (see ShardStore.ScanAt), so
+// fencing only the default group would let those reads sample a snapshot on a
+// non-default group without the freshness bound. It fails closed on the first
+// group that cannot confirm its lease, since a partially-fenced read is exactly
+// the stale read this guards against. Group iteration order is deterministic
+// but correctness does not depend on it because every configured group must
+// succeed.
 func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
-	if len(c.groups) == 0 {
-		return errors.WithStack(ErrLeaderNotFound)
+	groups, err := c.allShardGroups()
+	if err != nil {
+		return err
 	}
-	for _, g := range c.groups {
+	for _, g := range groups {
 		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) allShardGroups() ([]*ShardGroup, error) {
+	if c == nil || len(c.groups) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	if c.allShardGroupsConfigured {
+		return c.configuredAllShardGroups()
+	}
+	return c.ownedAllShardGroups()
+}
+
+func (c *ShardedCoordinator) configuredAllShardGroups() ([]*ShardGroup, error) {
+	if len(c.allShardGroupIDs) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	out := make([]*ShardGroup, 0, len(c.allShardGroupIDs))
+	for _, gid := range c.allShardGroupIDs {
+		g, ok := c.groups[gid]
+		if !ok || g == nil {
+			return nil, errors.WithStack(ErrLeaderNotFound)
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+func (c *ShardedCoordinator) ownedAllShardGroups() ([]*ShardGroup, error) {
+	gids := make([]uint64, 0, len(c.groups))
+	for gid := range c.groups {
+		gids = append(gids, gid)
+	}
+	slices.Sort(gids)
+	out := make([]*ShardGroup, 0, len(gids))
+	for _, gid := range gids {
+		g := c.groups[gid]
+		if g == nil {
+			return nil, errors.WithStack(ErrLeaderNotFound)
+		}
+		out = append(out, g)
+	}
+	return out, nil
 }
 
 // observeLeaseRead forwards a hit / miss signal to observer when it
