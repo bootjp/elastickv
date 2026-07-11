@@ -281,7 +281,7 @@ func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []
 		if kvp == nil {
 			continue
 		}
-		keys = append(keys, bytes.Clone(kvp.Key))
+		keys = append(keys, kvp.Key)
 	}
 	return keys, nil
 }

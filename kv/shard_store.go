@@ -669,7 +669,7 @@ func kvPairsFromKeys(keys [][]byte) []*store.KVPair {
 		if len(key) == 0 {
 			continue
 		}
-		kvs = append(kvs, &store.KVPair{Key: bytes.Clone(key)})
+		kvs = append(kvs, &store.KVPair{Key: key})
 	}
 	return kvs
 }
@@ -680,7 +680,7 @@ func keysFromKVs(kvs []*store.KVPair) [][]byte {
 		if kvp == nil || len(kvp.Key) == 0 {
 			continue
 		}
-		keys = append(keys, bytes.Clone(kvp.Key))
+		keys = append(keys, kvp.Key)
 	}
 	return keys
 }

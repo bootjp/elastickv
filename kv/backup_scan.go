@@ -17,14 +17,15 @@ type BackupScanner interface {
 }
 
 type backupScanner struct {
-	store    *ShardStore
-	end      []byte
-	ts       uint64
-	pageSize int
-	cursor   []byte
-	page     []*store.KVPair
-	index    int
-	closed   bool
+	store     *ShardStore
+	end       []byte
+	ts        uint64
+	pageSize  int
+	cursor    []byte
+	page      []*store.KVPair
+	index     int
+	closed    bool
+	exhausted bool
 }
 
 func NewBackupScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupScanner {
@@ -61,19 +62,22 @@ func (s *backupScanner) Next(ctx context.Context) (*store.KVPair, bool, error) {
 	if kvp == nil {
 		return nil, true, nil
 	}
-	return &store.KVPair{
-		Key:   bytes.Clone(kvp.Key),
-		Value: bytes.Clone(kvp.Value),
-	}, true, nil
+	return kvp, true, nil
 }
 
 func (s *backupScanner) Close() error {
 	s.closed = true
+	s.exhausted = true
 	s.page = nil
 	return nil
 }
 
 func (s *backupScanner) loadNextPage(ctx context.Context) error {
+	if s.exhausted {
+		s.page = nil
+		s.index = 0
+		return nil
+	}
 	page, err := s.store.ScanAt(ctx, s.cursor, s.end, s.pageSize, s.ts)
 	if err != nil {
 		return err
@@ -81,11 +85,12 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	s.page = page
 	s.index = 0
 	if len(page) == 0 {
+		s.exhausted = true
 		return nil
 	}
 	last := page[len(page)-1]
 	if last == nil || len(last.Key) == 0 {
-		s.cursor = nil
+		s.exhausted = true
 		return nil
 	}
 	s.cursor = nextScanCursor(last.Key)

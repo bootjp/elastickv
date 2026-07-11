@@ -203,6 +203,33 @@ func TestBackupScannerPaging(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
 }
 
+func TestBackupScannerEmptyKeyTerminatesAfterPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, st.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
+
+	sc := st.NewBackupScanner(nil, []byte("\x00"), ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte(""), kvp.Key)
+	require.Equal(t, []byte("empty"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
 func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) {
 	t.Parallel()
 

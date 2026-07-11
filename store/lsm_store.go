@@ -1119,7 +1119,7 @@ func (s *pebbleStore) collectScanKeys(iter *pebble.Iterator, start, end []byte, 
 			return nil, err
 		}
 		if visible {
-			result = append(result, bytes.Clone(userKey))
+			result = append(result, userKey)
 		}
 
 		if !s.skipToNextUserKey(iter, userKey) {
