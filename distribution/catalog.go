@@ -22,7 +22,8 @@ const (
 
 	catalogVersionCodecVersion  byte = 1
 	catalogRouteCodecVersionMin byte = 1
-	catalogRouteCodecVersion    byte = 1
+	catalogRouteCodecVersionV2  byte = 2
+	catalogRouteCodecVersion    byte = catalogRouteCodecVersionV2
 
 	catalogScanPageSize          = 256
 	catalogSaveMetaMutationCount = 2
@@ -76,6 +77,7 @@ type RouteDescriptor struct {
 	GroupID       uint64
 	State         RouteState
 	ParentRouteID uint64
+	SplitAtHLC    uint64
 }
 
 // CatalogSnapshot is a point-in-time snapshot of the route catalog.
@@ -183,12 +185,14 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 
 	if route.End == nil {
 		out = append(out, 0)
+		out = appendU64(out, route.SplitAtHLC)
 		return out, nil
 	}
 
 	out = append(out, 1)
 	out = appendU64(out, uint64(len(route.End)))
 	out = append(out, route.End...)
+	out = appendU64(out, route.SplitAtHLC)
 
 	return out, nil
 }
@@ -212,7 +216,13 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if err != nil {
 		return RouteDescriptor{}, err
 	}
-	if version == catalogRouteCodecVersion && r.Len() != 0 {
+	if version >= catalogRouteCodecVersionV2 {
+		route.SplitAtHLC, err = decodeRouteDescriptorSplitAtHLC(r)
+		if err != nil {
+			return RouteDescriptor{}, err
+		}
+	}
+	if version <= catalogRouteCodecVersion && r.Len() != 0 {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	if err := validateRouteDescriptor(route); err != nil {
@@ -375,6 +385,7 @@ func CloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 		GroupID:       route.GroupID,
 		State:         route.State,
 		ParentRouteID: route.ParentRouteID,
+		SplitAtHLC:    route.SplitAtHLC,
 	}
 }
 
@@ -698,7 +709,8 @@ func routeDescriptorEqual(left, right RouteDescriptor) bool {
 		bytes.Equal(left.End, right.End) &&
 		left.GroupID == right.GroupID &&
 		left.State == right.State &&
-		left.ParentRouteID == right.ParentRouteID
+		left.ParentRouteID == right.ParentRouteID &&
+		left.SplitAtHLC == right.SplitAtHLC
 }
 
 func appendU64(dst []byte, v uint64) []byte {
@@ -712,6 +724,7 @@ func routeDescriptorEncodedSize(route RouteDescriptor) int {
 	if route.End != nil {
 		size += catalogUint64Bytes + len(route.End)
 	}
+	size += catalogUint64Bytes
 	return size
 }
 
@@ -768,6 +781,17 @@ func decodeRouteDescriptorEnd(r *bytes.Reader) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 	return readU64LenBytes(r, endLen)
+}
+
+func decodeRouteDescriptorSplitAtHLC(r *bytes.Reader) (uint64, error) {
+	if r.Len() < catalogUint64Bytes {
+		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	var splitAtHLC uint64
+	if err := binary.Read(r, binary.BigEndian, &splitAtHLC); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return splitAtHLC, nil
 }
 
 func appendRoutePage(out []*store.KVPair, page []*store.KVPair, prefix []byte) ([]*store.KVPair, []byte, bool) {
