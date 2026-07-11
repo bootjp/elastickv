@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -907,6 +908,255 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 	require.Zero(t, client.sendStreamCalls.Load())
 }
 
+func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
+	t.Setenv(sendStreamEnabledEnvVar, "false")
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(4),
+		Index: uint64Ptr(22),
+	}))
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Zero(t, client.sendStreamCalls.Load())
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestSetSendStreamEnabledClosesCachedStreams(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(4),
+		Index: uint64Ptr(22),
+	}))
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.True(t, streamCached)
+
+	transport.SetSendStreamEnabled(false)
+
+	transport.mu.RLock()
+	_, streamCached = transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestStreamForAbortsCachingWhenSendStreamDisabledDuringOpen(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+
+	openStarted := make(chan struct{})
+	client := &testEtcdRaftClient{
+		raftStreams:                 []*testRaftSendStreamClient{{}},
+		blockSendStreamCall:         2,
+		blockSendStreamUntilContext: true,
+		sendStreamStarted:           openStarted,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := transport.streamFor(context.Background(), addr, client)
+		errCh <- err
+	}()
+
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendStream open")
+	}
+	transport.SetSendStreamEnabled(false)
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.Equal(t, codes.Unavailable, grpcStatusCode(err))
+		require.True(t, isSendStreamDisabled(err))
+	case <-time.After(5 * time.Second):
+		t.Fatal("streamFor did not return after SendStream was disabled")
+	}
+
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringSend(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	sendStarted := make(chan struct{})
+	client := &testEtcdRaftClient{
+		raftStreams: []*testRaftSendStreamClient{
+			{},
+			{blockSend: true, sendStarted: sendStarted},
+		},
+	}
+	injectClient(t, transport, addr, client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- transport.dispatchRegular(context.Background(), raftpb.Message{
+			Type:  messageTypePtr(raftpb.MsgApp),
+			From:  uint64Ptr(1),
+			To:    uint64Ptr(2),
+			Term:  uint64Ptr(5),
+			Index: uint64Ptr(50),
+		})
+	}()
+
+	select {
+	case <-sendStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stream Send to start")
+	}
+	transport.SetSendStreamEnabled(false)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchRegular did not fall back after SendStream was disabled")
+	}
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringProbe(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	probeStarted := make(chan struct{})
+	client := &testEtcdRaftClient{
+		blockSendStreamCall:         1,
+		blockSendStreamUntilContext: true,
+		sendStreamStarted:           probeStarted,
+	}
+	injectClient(t, transport, addr, client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- transport.dispatchRegular(context.Background(), raftpb.Message{
+			Type:  messageTypePtr(raftpb.MsgApp),
+			From:  uint64Ptr(1),
+			To:    uint64Ptr(2),
+			Term:  uint64Ptr(5),
+			Index: uint64Ptr(51),
+		})
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendStream probe")
+	}
+	transport.SetSendStreamEnabled(false)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchRegular did not fall back after SendStream probe was disabled")
+	}
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Equal(t, int32(1), client.sendStreamCalls.Load())
+}
+
+func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringOpen(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	openStarted := make(chan struct{})
+	client := &testEtcdRaftClient{
+		raftStreams:                 []*testRaftSendStreamClient{{}},
+		blockSendStreamCall:         2,
+		blockSendStreamUntilContext: true,
+		sendStreamStarted:           openStarted,
+	}
+	injectClient(t, transport, addr, client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- transport.dispatchRegular(context.Background(), raftpb.Message{
+			Type:  messageTypePtr(raftpb.MsgApp),
+			From:  uint64Ptr(1),
+			To:    uint64Ptr(2),
+			Term:  uint64Ptr(5),
+			Index: uint64Ptr(52),
+		})
+	}()
+
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SendStream open")
+	}
+	transport.SetSendStreamEnabled(false)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchRegular did not fall back after SendStream open was disabled")
+	}
+
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Equal(t, int32(2), client.sendStreamCalls.Load())
+	transport.mu.RLock()
+	_, streamCached := transport.streams[addr]
+	transport.mu.RUnlock()
+	require.False(t, streamCached)
+}
+
+func TestDispatchRegularFallsBackToUnaryForSendStreamDisabledErrorAfterReenable(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{
+		raftStreams: []*testRaftSendStreamClient{
+			{},
+			{sendErr: sendStreamDisabledError()},
+		},
+	}
+	injectClient(t, transport, addr, client)
+
+	require.NoError(t, transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgApp),
+		From:  uint64Ptr(1),
+		To:    uint64Ptr(2),
+		Term:  uint64Ptr(5),
+		Index: uint64Ptr(53),
+	}))
+
+	require.True(t, transport.sendStreamEnabledNow())
+	require.Equal(t, int32(1), client.sendCalls.Load())
+	require.Equal(t, int32(2), client.sendStreamCalls.Load())
+}
+
 func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T) {
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
@@ -1265,11 +1515,15 @@ func (*testSnapshotSendClient) RecvMsg(any) error            { return nil }
 // testEtcdRaftClient is a minimal mock of pb.EtcdRaftClient that routes
 // SendSnapshot calls to a pre-wired testSnapshotSendClient.
 type testEtcdRaftClient struct {
-	stream          *testSnapshotSendClient
-	raftStream      *testRaftSendStreamClient
-	raftStreams     []*testRaftSendStreamClient
-	sendCalls       atomic.Int32
-	sendStreamCalls atomic.Int32
+	stream                      *testSnapshotSendClient
+	raftStream                  *testRaftSendStreamClient
+	raftStreams                 []*testRaftSendStreamClient
+	blockSendStreamCall         int32
+	blockSendStreamUntilContext bool
+	sendStreamStarted           chan struct{}
+	releaseSendStream           chan struct{}
+	sendCalls                   atomic.Int32
+	sendStreamCalls             atomic.Int32
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
@@ -1278,7 +1532,19 @@ func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ..
 }
 
 func (c *testEtcdRaftClient) SendStream(ctx context.Context, _ ...grpc.CallOption) (pb.EtcdRaft_SendStreamClient, error) {
-	c.sendStreamCalls.Add(1)
+	call := c.sendStreamCalls.Add(1)
+	if c.blockSendStreamCall != 0 && call == c.blockSendStreamCall {
+		if c.sendStreamStarted != nil {
+			close(c.sendStreamStarted)
+		}
+		if c.blockSendStreamUntilContext {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		if c.releaseSendStream != nil {
+			<-c.releaseSendStream
+		}
+	}
 	if len(c.raftStreams) > 0 {
 		stream := c.raftStreams[0]
 		c.raftStreams = c.raftStreams[1:]
@@ -1301,6 +1567,7 @@ type testRaftSendStreamClient struct {
 	closed      bool
 	ctx         context.Context
 	recvErr     chan error
+	sendErr     error
 	blockSend   bool
 	sendStarted chan struct{}
 	sendOnce    sync.Once
@@ -1314,6 +1581,9 @@ func (c *testRaftSendStreamClient) Send(msg *pb.EtcdRaftMessage) error {
 	if c.blockSend {
 		<-c.Context().Done()
 		return c.Context().Err()
+	}
+	if c.sendErr != nil {
+		return c.sendErr
 	}
 	return nil
 }
