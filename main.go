@@ -2061,6 +2061,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	s3BlobObserver adapter.S3BlobOffloadObserver,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2089,7 +2090,7 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(rt.store, coordinate.Clock(), nil))
+		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(rt.store, coordinate.Clock(), s3BlobObserver))
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2133,7 +2134,14 @@ func startRaftServers(
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook
 		// (nil when encryption is not wired); raftadmin.Server invokes
 		// it before AddVoter/AddLearner propose the conf-change.
-		internalraftadmin.RegisterOperationalServicesWithInterceptor(ctx, gs, rt.engine, []string{"RawKV", "S3BlobFetch"}, confChangeInterceptor)
+		internalraftadmin.RegisterOperationalServicesWithInterceptorAndStaticServing(
+			ctx,
+			gs,
+			rt.engine,
+			[]string{"RawKV"},
+			[]string{"S3BlobFetch"},
+			confChangeInterceptor,
+		)
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
@@ -2559,6 +2567,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.metricsRegistry.S3BlobOffloadObserver(),
 	); err != nil {
 		return r.startupFailure(err)
 	}
