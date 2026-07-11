@@ -95,9 +95,22 @@ func TestS3Server_BucketAndObjectLifecycle(t *testing.T) {
 func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	t.Parallel()
 
-	var proxied bool
+	type proxiedRequest struct {
+		host           string
+		path           string
+		rawQuery       string
+		forwardedHost  string
+		forwardedProto string
+	}
+	proxied := make(chan proxiedRequest, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied = true
+		proxied <- proxiedRequest{
+			host:           r.Host,
+			path:           r.URL.Path,
+			rawQuery:       r.URL.RawQuery,
+			forwardedHost:  r.Header.Get("X-Forwarded-Host"),
+			forwardedProto: r.Header.Get("X-Forwarded-Proto"),
+		}
 		_, _ = io.WriteString(w, "proxied")
 	}))
 	defer upstream.Close()
@@ -108,10 +121,16 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodGet, "/", nil)
+	req := newS3TestRequest(http.MethodGet, "/?uploadId=abc%2F123", nil)
+	req.Host = "signed-s3.example.test"
 	server.handle(rec, req)
 
-	require.True(t, proxied)
+	got := <-proxied
+	require.Equal(t, "signed-s3.example.test", got.host)
+	require.Equal(t, "/", got.path)
+	require.Equal(t, "uploadId=abc%2F123", got.rawQuery)
+	require.Equal(t, "signed-s3.example.test", got.forwardedHost)
+	require.Equal(t, "http", got.forwardedProto)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "proxied", rec.Body.String())
 }
