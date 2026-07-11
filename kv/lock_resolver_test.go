@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -105,6 +107,34 @@ func TestLockResolver_ResolvesExpiredCommittedLock(t *testing.T) {
 	require.Equal(t, "v2", string(v))
 }
 
+func TestLockResolver_ResolvesCommittedLockWhenPrimaryGroupBackpressured(t *testing.T) {
+	t.Parallel()
+
+	lr, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	primaryKey := []byte("b")   // group 1
+	secondaryKey := []byte("n") // group 2
+
+	prepareLock(t, groups[1], startTS, primaryKey, primaryKey, []byte("v1"), 0)
+	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
+	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
+
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
+
+	err := lr.resolveGroupLocks(ctx, 2, groups[2])
+	require.NoError(t, err)
+
+	v, err := ss.GetAt(ctx, secondaryKey, commitTS)
+	require.NoError(t, err)
+	require.Equal(t, "v2", string(v))
+}
+
 func TestLockResolver_ResolvesExpiredCommittedPrimaryLock(t *testing.T) {
 	t.Parallel()
 
@@ -174,6 +204,31 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	// After abort resolution, the secondary key should not be visible.
 	_, err = ss.GetAt(ctx, secondaryKey, startTS+1)
 	require.Error(t, err)
+}
+
+func TestLockResolver_SkipsPendingPrimaryAbortWhenPrimaryGroupBackpressured(t *testing.T) {
+	t.Parallel()
+
+	lr, _, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS := uint64(25)
+	primaryKey := []byte("b")   // group 1
+	secondaryKey := []byte("n") // group 2
+
+	prepareLock(t, groups[1], startTS, primaryKey, primaryKey, []byte("v1"), 0)
+	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
+
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
+
+	err := lr.resolveGroupLocks(ctx, 2, groups[2])
+	require.NoError(t, err)
+
+	_, err = groups[2].Store.GetAt(ctx, txnLockKey(secondaryKey), ^uint64(0))
+	require.NoError(t, err)
 }
 
 func TestLockResolver_SkipsNonExpiredLocks(t *testing.T) {
@@ -258,4 +313,139 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("LockResolver.Close() did not return within 5s")
 	}
+}
+
+func TestLockResolverRaftReadyRequiresSettledLeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		engine any
+		want   bool
+	}{
+		{name: "nil engine", engine: nil},
+		{
+			name: "follower",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateFollower,
+				status: raftengine.Status{State: raftengine.StateFollower, CommitIndex: 10, AppliedIndex: 10},
+			},
+		},
+		{
+			name: "state/status mismatch fails closed",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateFollower, CommitIndex: 10, AppliedIndex: 10},
+			},
+		},
+		{
+			name: "leader transfer in progress",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, LeadTransferee: 2},
+			},
+		},
+		{
+			name: "pending conf change",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, PendingConfChange: true},
+			},
+		},
+		{
+			name: "fsm backlog",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, FSMPending: 1},
+			},
+		},
+		{
+			name: "applied lag",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 9},
+			},
+		},
+		{
+			name: "settled leader",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10},
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, _ := tc.engine.(interface {
+				raftengine.LeaderView
+				raftengine.StatusReader
+			})
+			require.Equal(t, tc.want, lockResolverRaftReady(engine))
+		})
+	}
+}
+
+func TestLockResolverLSMBackpressured(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	tests := []struct {
+		name  string
+		setup func(*pebble.Metrics)
+		want  bool
+	}{
+		{name: "no pressure", setup: func(*pebble.Metrics) {}, want: false},
+		{
+			name: "l0 files at threshold",
+			setup: func(m *pebble.Metrics) {
+				m.Levels[0].TablesCount = lockResolverMaxL0Files
+			},
+			want: true,
+		},
+		{
+			name: "compaction debt at threshold",
+			setup: func(m *pebble.Metrics) {
+				m.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := &pebble.Metrics{}
+			tc.setup(metrics)
+			st := &lockResolverBackpressureStore{MVCCStore: base, metrics: metrics}
+			overloaded, _ := lockResolverLSMBackpressured(st)
+			require.Equal(t, tc.want, overloaded)
+		})
+	}
+}
+
+type lockResolverStatusEngine struct {
+	state  raftengine.State
+	status raftengine.Status
+}
+
+func (e lockResolverStatusEngine) State() raftengine.State { return e.state }
+
+func (e lockResolverStatusEngine) Leader() raftengine.LeaderInfo { return e.status.Leader }
+
+func (e lockResolverStatusEngine) VerifyLeader(context.Context) error { return nil }
+
+func (e lockResolverStatusEngine) LinearizableRead(context.Context) (uint64, error) {
+	return e.status.AppliedIndex, nil
+}
+
+func (e lockResolverStatusEngine) Status() raftengine.Status { return e.status }
+
+type lockResolverBackpressureStore struct {
+	store.MVCCStore
+	metrics *pebble.Metrics
+}
+
+func (s *lockResolverBackpressureStore) Metrics() *pebble.Metrics {
+	return s.metrics
 }

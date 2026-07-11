@@ -305,9 +305,12 @@ func computeScanCapHint(treeSize, limit int) int {
 	return capHint
 }
 
-func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) []*KVPair {
+func (s *mvccStore) collectScanResults(ctx context.Context, it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, capHint)
 	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
 		k, keyOK := it.Key().([]byte)
 		if !keyOK {
 			continue
@@ -325,12 +328,18 @@ func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, 
 			Value: bytes.Clone(val),
 		})
 	}
-	return result
+	return result, nil
 }
 
-func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+func (s *mvccStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return nil, ErrReadTSCompacted
 	}
@@ -344,7 +353,7 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 	if !seekForwardIteratorStart(s.tree, &it, start) {
 		return make([]*KVPair, 0, capHint), nil
 	}
-	return s.collectScanResults(&it, end, limit, capHint, ts), nil
+	return s.collectScanResults(ctx, &it, end, limit, capHint, ts)
 }
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.
