@@ -267,12 +267,18 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
+	seenGroups := make(map[uint64]struct{})
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
+		} else {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
 		}
 
 		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, false)
@@ -658,6 +664,9 @@ func (s *ShardStore) scanRouteAtForward(
 			return nil, err
 		}
 		out = mergeAndTrimScanResults(out, page.kvs, limit)
+		if len(out) >= limit {
+			break
+		}
 		if !page.full || page.advanceKey == nil {
 			break
 		}
@@ -720,15 +729,14 @@ func (s *ShardStore) scanRouteAtForwardPage(
 		}, nil
 	}
 
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, route.GroupID)
+	raw, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, route.GroupID)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs = filterTxnInternalKVs(kvs)
 	return scanRoutePage{
-		kvs:        kvs,
-		advanceKey: lastKVKey(kvs),
-		full:       len(kvs) >= limit,
+		kvs:        filterTxnInternalKVs(raw),
+		advanceKey: lastKVKey(raw),
+		full:       len(raw) >= limit,
 	}, nil
 }
 

@@ -100,6 +100,42 @@ func TestPebbleStoreScanKeysAtCursorAfterKeyDoesNotRepeat(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
 
+func TestPebbleStoreScanAtPreservesPrefixExtensionKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	highTS := ^uint64(0) - 1
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), highTS, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a\x00"), []byte("vax"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 20, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte("a"), []byte("c"), 3, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("a\x00"), []byte("b")}, keysFromStoreKVs(kvs))
+}
+
+func TestPebbleStoreScanKeysAtPreservesPrefixExtensionKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	highTS := ^uint64(0) - 1
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), highTS, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a\x00"), []byte("vax"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 20, 0))
+
+	keys, err := st.ScanKeysAt(ctx, []byte("a"), []byte("c"), 3, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("a\x00"), []byte("b")}, keys)
+}
+
 func cursorAfterTestKey(key []byte) []byte {
 	cursor := make([]byte, len(key)+1)
 	copy(cursor, key)

@@ -1007,15 +1007,20 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 }
 
 func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
-	if !iter.SeekGE(encodeKey(userKey, 0)) {
-		return false
+	for iter.Next() {
+		rawKey := iter.Key()
+		if isPebbleMetaKey(rawKey) {
+			continue
+		}
+		nextUserKey, _ := decodeKeyView(rawKey)
+		if nextUserKey == nil {
+			continue
+		}
+		if !bytes.Equal(nextUserKey, userKey) {
+			return true
+		}
 	}
-	k := iter.Key()
-	u, _ := decodeKeyView(k)
-	if bytes.Equal(u, userKey) {
-		return iter.Next()
-	}
-	return true
+	return false
 }
 
 func pastScanEnd(userKey, end []byte) bool {

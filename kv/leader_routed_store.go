@@ -276,14 +276,7 @@ func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []
 	if err != nil {
 		return nil, err
 	}
-	keys := make([][]byte, 0, len(kvs))
-	for _, kvp := range kvs {
-		if kvp == nil {
-			continue
-		}
-		keys = append(keys, kvp.Key)
-	}
-	return keys, nil
+	return keysFromKVs(kvs), nil
 }
 
 func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
