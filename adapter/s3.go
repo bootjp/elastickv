@@ -2424,15 +2424,23 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 		return true
 	}
 	target := &url.URL{Scheme: "http", Host: targetHost}
-	originalHost := r.Host
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	origDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = originalHost
-	}
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		writeS3InternalError(rw, err)
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			// ReverseProxy removes unparsable query parameters before Rewrite.
+			// Preserve the exact client query because SigV4 signs the raw value.
+			req.Out.URL.RawQuery = req.In.URL.RawQuery
+			// SigV4 includes Host in the canonical request, so the leader must see
+			// the same Host value that the client signed for the follower endpoint.
+			req.Out.Host = req.In.Host
+			// Rewrite strips forwarding headers before this callback. Rebuild them
+			// explicitly to preserve the legacy Director behavior.
+			req.Out.Header["X-Forwarded-For"] = req.In.Header["X-Forwarded-For"]
+			req.SetXForwarded()
+		},
+		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			writeS3InternalError(rw, err)
+		},
 	}
 	proxy.ServeHTTP(w, r)
 	return true
