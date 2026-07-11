@@ -295,6 +295,37 @@ func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
 	require.Equal(t, uint64(42), fake.lastScanGroupID)
 }
 
+func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{
+			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 42)
+	g := &ShardGroup{
+		Engine: &followerProxyEngine{leader: addr},
+		Store:  store.NewMVCCStore(),
+	}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: g})
+
+	kvs, err := st.ScanAt(ctx, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("k"), kvs[0].Key)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, 1, fake.scanCalls)
+	require.Equal(t, uint64(42), fake.lastScanGroupID)
+}
+
 func TestKeyOnlyScanHelpersPreserveEmptyKey(t *testing.T) {
 	t.Parallel()
 
@@ -341,6 +372,67 @@ func TestBackupScannerPaging(t *testing.T) {
 		got = append(got, kvp.Key)
 	}
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
+}
+
+func TestBackupScannerPreservesFullRoutingAfterListKeyCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	listKey := store.ListItemKey([]byte("x"), 0)
+	require.NoError(t, st.PutAt(ctx, listKey, []byte("list"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("plain"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{listKey, []byte("a")}, got)
+}
+
+func TestBackupScannerContinuesPastTxnInternalOnlyPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
 }
 
 func TestBackupScannerEmptyKeyContinuesAfterPage(t *testing.T) {

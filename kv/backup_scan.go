@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/store"
 )
 
@@ -17,27 +18,37 @@ type BackupScanner interface {
 }
 
 type backupScanner struct {
-	store     *ShardStore
-	end       []byte
-	ts        uint64
-	pageSize  int
-	cursor    []byte
-	page      []*store.KVPair
-	index     int
-	closed    bool
-	exhausted bool
+	store         *ShardStore
+	routes        []distribution.Route
+	clampToRoutes bool
+	end           []byte
+	ts            uint64
+	pageSize      int
+	cursor        []byte
+	page          []*store.KVPair
+	index         int
+	closed        bool
+	exhausted     bool
 }
 
 func NewBackupScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupScanner {
 	if pageSize <= 0 {
 		pageSize = defaultBackupScanPageSize
 	}
+	var routes []distribution.Route
+	var clampToRoutes bool
+	if st != nil {
+		routes, clampToRoutes = st.routesForScan(start, end)
+		routes = append([]distribution.Route(nil), routes...)
+	}
 	return &backupScanner{
-		store:    st,
-		cursor:   bytes.Clone(start),
-		end:      bytes.Clone(end),
-		ts:       ts,
-		pageSize: pageSize,
+		store:         st,
+		routes:        routes,
+		clampToRoutes: clampToRoutes,
+		cursor:        bytes.Clone(start),
+		end:           bytes.Clone(end),
+		ts:            ts,
+		pageSize:      pageSize,
 	}
 }
 
@@ -78,7 +89,7 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		s.index = 0
 		return nil
 	}
-	page, err := s.store.ScanAt(ctx, s.cursor, s.end, s.pageSize, s.ts)
+	page, err := s.store.scanRoutesAtSorted(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
 	if err != nil {
 		return err
 	}
