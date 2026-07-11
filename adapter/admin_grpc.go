@@ -475,7 +475,7 @@ func (s *AdminServer) GetRaftGroups(
 			CommitIndex:       st.CommitIndex,
 			AppliedIndex:      st.AppliedIndex,
 			LastContactUnixMs: lastContactUnixMs,
-			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader, now),
+			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader, now, s.leaderProbeAddressesLocked(st.Leader)),
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil
@@ -488,7 +488,7 @@ func (s *AdminServer) GetNodeVersion(
 	return &pb.GetNodeVersionResponse{NodeVersion: s.nodeVersion}, nil
 }
 
-func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo, now time.Time) string {
+func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo, now time.Time, addresses []string) string {
 	if version, ok := s.localLeaderVersion(leader); ok {
 		return version
 	}
@@ -496,15 +496,46 @@ func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.L
 	if version, ok := s.cachedLeaderVersion(key, now); ok {
 		return version
 	}
-	if s.leaderVersionProbe == nil || leader.Address == "" {
+	if s.leaderVersionProbe == nil || len(addresses) == 0 {
 		return ""
 	}
 	version, reservation, reserved := s.reserveLeaderVersionProbe(key, now)
 	if !reserved {
 		return version
 	}
-	s.probeLeaderVersionAsync(ctx, key, leader.Address, reservation)
+	s.probeLeaderVersionAsync(ctx, key, addresses, reservation)
 	return ""
+}
+
+func (s *AdminServer) leaderProbeAddressesLocked(leader raftengine.LeaderInfo) []string {
+	seen := map[string]struct{}{}
+	addresses := make([]string, 0, 1)
+	add := func(address string) {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			return
+		}
+		if _, ok := seen[address]; ok {
+			return
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
+	add(leader.Address)
+	if leader.ID == "" {
+		return addresses
+	}
+	for _, id := range sortedGroupIDs(s.groups) {
+		group := s.groups[id]
+		if group == nil {
+			continue
+		}
+		st := group.Status()
+		if st.Leader.ID == leader.ID {
+			add(st.Leader.Address)
+		}
+	}
+	return addresses
 }
 
 func (s *AdminServer) localLeaderVersion(leader raftengine.LeaderInfo) (string, bool) {
@@ -572,10 +603,11 @@ func (s *AdminServer) reserveLeaderVersionProbe(key string, now time.Time) (stri
 	}
 }
 
-func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address string, reservation versionCacheEntry) {
+func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key string, addresses []string, reservation versionCacheEntry) {
 	probe := s.leaderVersionProbe
 	timeout := s.leaderVersionProbeTimeout
 	now := s.now
+	candidates := append([]string(nil), addresses...)
 	var md metadata.MD
 	if incoming, ok := metadata.FromIncomingContext(ctx); ok {
 		md = incoming.Copy()
@@ -586,9 +618,16 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address 
 		if md != nil {
 			probeCtx = metadata.NewOutgoingContext(probeCtx, md)
 		}
-		version, err := probe(probeCtx, address)
-		if err != nil {
-			version = ""
+		version := ""
+		for _, address := range candidates {
+			probed, err := probe(probeCtx, address)
+			if err == nil {
+				version = probed
+				break
+			}
+			if probeCtx.Err() != nil {
+				break
+			}
 		}
 		s.versionCache.CompareAndSwap(key, reservation, versionCacheEntry{version: version, fetchedAt: now()})
 	}()

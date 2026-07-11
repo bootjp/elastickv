@@ -367,7 +367,7 @@ func TestGetRaftGroupsLeaderVersionTriesAlternateAddressForSameLeaderID(t *testi
 		if err != nil || len(resp.Groups) != 2 {
 			return false
 		}
-		return resp.Groups[0].LeaderNodeVersion == "" && resp.Groups[1].LeaderNodeVersion == "v-good"
+		return resp.Groups[0].LeaderNodeVersion == "v-good" && resp.Groups[1].LeaderNodeVersion == "v-good"
 	}, time.Second, 10*time.Millisecond)
 	callsMu.Lock()
 	defer callsMu.Unlock()
