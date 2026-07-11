@@ -107,6 +107,34 @@ func TestLockResolver_ResolvesExpiredCommittedLock(t *testing.T) {
 	require.Equal(t, "v2", string(v))
 }
 
+func TestLockResolver_ResolvesCommittedLockWhenPrimaryGroupBackpressured(t *testing.T) {
+	t.Parallel()
+
+	lr, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	primaryKey := []byte("b")   // group 1
+	secondaryKey := []byte("n") // group 2
+
+	prepareLock(t, groups[1], startTS, primaryKey, primaryKey, []byte("v1"), 0)
+	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
+	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
+
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
+
+	err := lr.resolveGroupLocks(ctx, 2, groups[2])
+	require.NoError(t, err)
+
+	v, err := ss.GetAt(ctx, secondaryKey, commitTS)
+	require.NoError(t, err)
+	require.Equal(t, "v2", string(v))
+}
+
 func TestLockResolver_ResolvesExpiredCommittedPrimaryLock(t *testing.T) {
 	t.Parallel()
 
@@ -178,7 +206,7 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLockResolver_SkipsWhenPrimaryGroupBackpressured(t *testing.T) {
+func TestLockResolver_SkipsPendingPrimaryAbortWhenPrimaryGroupBackpressured(t *testing.T) {
 	t.Parallel()
 
 	lr, _, groups, cleanup := setupLockResolverEnv(t)

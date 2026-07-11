@@ -202,9 +202,6 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 	if !txnLockExpired(lock) {
 		return lockResolveSkippedActive, nil
 	}
-	if !lr.primaryGroupReadyForBackgroundResolve(lock.PrimaryKey) {
-		return lockResolveIgnored, nil
-	}
 
 	opCtx, cancel := context.WithTimeout(ctx, lockResolverOperationBudget)
 	defer cancel()
@@ -237,7 +234,7 @@ func (lr *LockResolver) groupReadyForBackgroundResolve(ctx context.Context, gid 
 	return ready
 }
 
-func (lr *LockResolver) primaryGroupReadyForBackgroundResolve(primaryKey []byte) bool {
+func (lr *LockResolver) primaryGroupReadyForBackgroundAbort(primaryKey []byte) bool {
 	pg, ok := lr.store.groupForKey(primaryKey)
 	return ok && lockResolverGroupCanResolve(pg)
 }
@@ -298,7 +295,7 @@ func lockResolverBudgetExhausted(err error, workCtx, parentCtx context.Context) 
 }
 
 func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, userKey []byte, lock txnLock) error {
-	status, commitTS, err := lr.store.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	status, commitTS, err := lr.backgroundPrimaryTxnStatus(ctx, lock)
 	if err != nil {
 		return err
 	}
@@ -313,12 +310,33 @@ func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, u
 		}
 		return applyTxnResolution(ctx, g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{userKey})
 	case txnStatusPending:
-		// Lock is expired but primary is still pending — the primary's
-		// tryAbortExpiredPrimary inside primaryTxnStatus should have
-		// attempted to abort it. If it couldn't (e.g., primary shard
-		// unreachable), we skip and retry next cycle.
+		// Lock is expired but primary is still pending. The background path
+		// skips abort when the primary shard is not locally ready, so retry
+		// cleanup on a later cycle.
 		return nil
 	default:
 		return errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(userKey))
 	}
+}
+
+func (lr *LockResolver) backgroundPrimaryTxnStatus(ctx context.Context, lock txnLock) (txnStatus, uint64, error) {
+	status, commitTS, done, err := lr.store.primaryTxnRecordedStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil || done {
+		return status, commitTS, err
+	}
+
+	primaryLock, locked, err := lr.store.primaryTxnLock(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if !locked {
+		return txnStatusRolledBack, 0, nil
+	}
+	if !txnLockExpired(primaryLock) {
+		return txnStatusPending, 0, nil
+	}
+	if !lr.primaryGroupReadyForBackgroundAbort(lock.PrimaryKey) {
+		return txnStatusPending, 0, nil
+	}
+	return lr.store.expiredPrimaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
 }
