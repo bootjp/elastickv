@@ -137,6 +137,28 @@ func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
+	old := adminBuildVersion
+	adminBuildVersion = "v-admin-test"
+	t.Cleanup(func() { adminBuildVersion = old })
+
+	if got := buildVersion(); got != "v-admin-test" {
+		t.Fatalf("buildVersion = %q, want v-admin-test", got)
+	}
+	srv, _, err := configureAdminService(
+		"",
+		true,
+		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+	resp, err := srv.GetNodeVersion(context.Background(), &pb.GetNodeVersionRequest{})
+	require.NoError(t, err)
+	require.Equal(t, "v-admin-test", resp.GetNodeVersion())
+}
+
 type adminVersionProbeGroup struct {
 	leader raftengine.LeaderInfo
 }

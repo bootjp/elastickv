@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -96,6 +97,7 @@ func WithAdminLeaderVersionCacheTTL(ttl time.Duration) AdminOption {
 type versionCacheEntry struct {
 	version   string
 	fetchedAt time.Time
+	probeID   uint64
 }
 
 const (
@@ -130,6 +132,7 @@ type AdminServer struct {
 	leaderVersionProbe        LeaderVersionProbe
 	leaderVersionProbeTimeout time.Duration
 	leaderVersionCacheTTL     time.Duration
+	leaderVersionProbeSeq     atomic.Uint64
 	versionCache              sync.Map
 
 	pb.UnimplementedAdminServer
@@ -496,10 +499,11 @@ func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.L
 	if s.leaderVersionProbe == nil || leader.Address == "" {
 		return ""
 	}
-	if version, ok := s.reserveLeaderVersionProbe(key, now); ok {
+	version, reservation, reserved := s.reserveLeaderVersionProbe(key, now)
+	if !reserved {
 		return version
 	}
-	s.probeLeaderVersionAsync(ctx, key, leader.Address)
+	s.probeLeaderVersionAsync(ctx, key, leader.Address, reservation)
 	return ""
 }
 
@@ -514,6 +518,9 @@ func (s *AdminServer) localLeaderVersion(leader raftengine.LeaderInfo) (string, 
 }
 
 func leaderVersionCacheKey(leader raftengine.LeaderInfo) string {
+	if leader.ID != "" && leader.Address != "" {
+		return leader.ID + "\x00" + leader.Address
+	}
 	if leader.ID != "" {
 		return leader.ID
 	}
@@ -534,32 +541,38 @@ func (s *AdminServer) cachedLeaderVersion(key string, now time.Time) (string, bo
 		return "", false
 	}
 	if now.Sub(entry.fetchedAt) > s.leaderVersionCacheTTL {
-		s.versionCache.Delete(key)
+		s.versionCache.CompareAndDelete(key, entry)
 		return "", false
 	}
 	return entry.version, true
 }
 
-func (s *AdminServer) reserveLeaderVersionProbe(key string, now time.Time) (string, bool) {
-	marker := versionCacheEntry{fetchedAt: now}
-	actual, loaded := s.versionCache.LoadOrStore(key, marker)
-	if !loaded {
-		return "", false
+func (s *AdminServer) reserveLeaderVersionProbe(key string, now time.Time) (string, versionCacheEntry, bool) {
+	reservation := versionCacheEntry{
+		fetchedAt: now,
+		probeID:   s.leaderVersionProbeSeq.Add(1),
 	}
-	entry, ok := actual.(versionCacheEntry)
-	switch {
-	case !ok:
-		s.versionCache.Store(key, marker)
-		return "", false
-	case now.Sub(entry.fetchedAt) <= s.leaderVersionCacheTTL:
-		return entry.version, true
-	default:
-		s.versionCache.Store(key, marker)
-		return "", false
+	for {
+		actual, loaded := s.versionCache.LoadOrStore(key, reservation)
+		if !loaded {
+			return "", reservation, true
+		}
+		entry, ok := actual.(versionCacheEntry)
+		switch {
+		case !ok:
+			s.versionCache.Store(key, reservation)
+			return "", reservation, true
+		case now.Sub(entry.fetchedAt) <= s.leaderVersionCacheTTL:
+			return entry.version, versionCacheEntry{}, false
+		default:
+			if s.versionCache.CompareAndSwap(key, entry, reservation) {
+				return "", reservation, true
+			}
+		}
 	}
 }
 
-func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address string) {
+func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address string, reservation versionCacheEntry) {
 	probe := s.leaderVersionProbe
 	timeout := s.leaderVersionProbeTimeout
 	now := s.now
@@ -577,7 +590,7 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key, address 
 		if err != nil {
 			version = ""
 		}
-		s.versionCache.Store(key, versionCacheEntry{version: version, fetchedAt: now()})
+		s.versionCache.CompareAndSwap(key, reservation, versionCacheEntry{version: version, fetchedAt: now()})
 	}()
 }
 

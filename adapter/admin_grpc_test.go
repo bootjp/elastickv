@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -244,6 +245,135 @@ func TestGetRaftGroupsLeaderVersionProbeUsesServerClockForCacheStamp(t *testing.
 	}
 	requireLeaderVersion(t, resp, "", "expired")
 	waitForLeaderVersion(t, srv, "v2")
+}
+
+func TestGetRaftGroupsLeaderVersionStaleProbeCannotOverwriteFreshCache(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1_700_000_000, 0)
+	var clockMu sync.Mutex
+	now := base
+	setNow := func(next time.Time) {
+		clockMu.Lock()
+		now = next
+		clockMu.Unlock()
+	}
+	probeCalls := make(chan chan leaderVersionProbeResult, 2)
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		nil,
+		WithAdminLeaderVersionProbeTimeout(5*time.Second),
+		WithAdminLeaderVersionCacheTTL(time.Second),
+		WithAdminLeaderVersionProbe(blockingLeaderVersionProbe(probeCalls)),
+	)
+	srv.SetClock(func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	})
+	srv.RegisterGroup(1, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.12:50051"})
+
+	_, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	firstProbe := receiveLeaderVersionProbeCall(t, probeCalls, "first")
+
+	setNow(base.Add(2 * time.Second))
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	requireLeaderVersion(t, resp, "", "second")
+	secondProbe := receiveLeaderVersionProbeCall(t, probeCalls, "second")
+	secondProbe <- leaderVersionProbeResult{version: "v-fresh"}
+	waitForLeaderVersion(t, srv, "v-fresh")
+
+	firstProbe <- leaderVersionProbeResult{version: "v-stale"}
+	requireLeaderVersionNever(t, srv, "v-stale", 100*time.Millisecond)
+	resp, err = srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	requireLeaderVersion(t, resp, "v-fresh", "after stale completion")
+}
+
+type leaderVersionProbeResult struct {
+	version string
+	err     error
+}
+
+func blockingLeaderVersionProbe(calls chan<- chan leaderVersionProbeResult) LeaderVersionProbe {
+	return func(ctx context.Context, _ string) (string, error) {
+		resultCh := make(chan leaderVersionProbeResult)
+		select {
+		case calls <- resultCh:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		select {
+		case result := <-resultCh:
+			return result.version, result.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+}
+
+func requireLeaderVersionNever(t *testing.T, srv *AdminServer, unwanted string, waitFor time.Duration) {
+	t.Helper()
+	require.Never(t, func() bool {
+		resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+		return err == nil && len(resp.Groups) == 1 && resp.Groups[0].LeaderNodeVersion == unwanted
+	}, waitFor, 10*time.Millisecond)
+}
+
+func receiveLeaderVersionProbeCall(
+	t *testing.T,
+	calls <-chan chan leaderVersionProbeResult,
+	label string,
+) chan leaderVersionProbeResult {
+	t.Helper()
+	select {
+	case resultCh := <-calls:
+		return resultCh
+	case <-time.After(time.Second):
+		t.Fatalf("%s leader version probe was not started", label)
+		return nil
+	}
+}
+
+func TestGetRaftGroupsLeaderVersionTriesAlternateAddressForSameLeaderID(t *testing.T) {
+	t.Parallel()
+	var callsMu sync.Mutex
+	callsByAddr := map[string]int{}
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		nil,
+		WithAdminLeaderVersionProbeTimeout(time.Second),
+		WithAdminLeaderVersionCacheTTL(time.Second),
+		WithAdminLeaderVersionProbe(func(_ context.Context, addr string) (string, error) {
+			callsMu.Lock()
+			callsByAddr[addr]++
+			callsMu.Unlock()
+			if addr == "10.0.0.12:50051" {
+				return "", status.Error(codes.Unavailable, "stale listener")
+			}
+			return "v-good", nil
+		}),
+	)
+	srv.RegisterGroup(1, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.12:50051"})
+	srv.RegisterGroup(2, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.22:50051"})
+
+	_, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatalf("GetRaftGroups first: %v", err)
+	}
+	require.Eventually(t, func() bool {
+		resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+		if err != nil || len(resp.Groups) != 2 {
+			return false
+		}
+		return resp.Groups[0].LeaderNodeVersion == "" && resp.Groups[1].LeaderNodeVersion == "v-good"
+	}, time.Second, 10*time.Millisecond)
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
+		t.Fatalf("probe calls by address = %v, want both stale and alternate addresses", callsByAddr)
+	}
 }
 
 func requireLeaderVersion(t *testing.T, resp *pb.GetRaftGroupsResponse, want, label string) {
