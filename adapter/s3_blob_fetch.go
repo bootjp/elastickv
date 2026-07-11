@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -29,17 +30,39 @@ const (
 // internal peer-to-peer RPC substrate for the chunkref/chunkblob rollout; it
 // deliberately does not enable the public S3 PUT/GET offload path by itself.
 type S3BlobFetchServer struct {
-	store    store.MVCCStore
-	observer S3BlobOffloadObserver
+	store       store.MVCCStore
+	observer    S3BlobOffloadObserver
+	clock       *kv.HLC
+	pushBlocked func() bool
 
 	pb.UnimplementedS3BlobFetchServer
 }
 
-func NewS3BlobFetchServer(st store.MVCCStore, observer S3BlobOffloadObserver) *S3BlobFetchServer {
-	return &S3BlobFetchServer{
+type S3BlobFetchServerOption func(*S3BlobFetchServer)
+
+func WithS3BlobFetchClock(clock *kv.HLC) S3BlobFetchServerOption {
+	return func(s *S3BlobFetchServer) {
+		s.clock = clock
+	}
+}
+
+func WithS3BlobFetchPushBlocked(blocked func() bool) S3BlobFetchServerOption {
+	return func(s *S3BlobFetchServer) {
+		s.pushBlocked = blocked
+	}
+}
+
+func NewS3BlobFetchServer(st store.MVCCStore, observer S3BlobOffloadObserver, opts ...S3BlobFetchServerOption) *S3BlobFetchServer {
+	server := &S3BlobFetchServer{
 		store:    st,
 		observer: observer,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(server)
+		}
+	}
+	return server
 }
 
 func (s *S3BlobFetchServer) FetchChunkBlob(req *pb.FetchChunkBlobRequest, stream pb.S3BlobFetch_FetchChunkBlobServer) error {
@@ -96,11 +119,17 @@ func (s *S3BlobFetchServer) PushChunkBlob(stream pb.S3BlobFetch_PushChunkBlobSer
 	if s == nil || s.store == nil {
 		return s3BlobFetchStatus(codes.FailedPrecondition, "s3 blob fetch server is not configured")
 	}
+	if err := s.ensurePushAllowed(); err != nil {
+		return err
+	}
 	digest, payload, commitTS, err := s.recvChunkBlob(stream)
 	if err != nil {
 		return err
 	}
 	if err := s.verifyChunkBlobDigest(digest, payload, codes.InvalidArgument); err != nil {
+		return err
+	}
+	if err := s.ensurePushAllowed(); err != nil {
 		return err
 	}
 	if err := s.storeChunkBlob(stream, digest, payload, commitTS); err != nil {
@@ -116,44 +145,71 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 	commitTS uint64,
 ) error {
 	key := s3keys.ChunkBlobKey(digest)
-	stored, err := s.chunkBlobAlreadyStored(stream.Context(), key, digest, payload)
-	if err != nil {
-		return err
-	}
-	if stored {
-		return nil
-	}
-	startTS, err := s.chunkBlobWriteStartTS(stream.Context(), key, commitTS)
-	if err != nil {
-		return err
-	}
-	if err := s.applyChunkBlobUntilRegistered(stream.Context(), key, payload, startTS, commitTS); err != nil {
-		if stored, retryErr := s.storedAfterWriteConflict(stream.Context(), err, key, digest, payload); stored || retryErr != nil {
-			return retryErr
-		}
-		if code := status.Code(err); code != codes.Unknown {
+	for {
+		if err := s.ensurePushAllowed(); err != nil {
 			return err
 		}
-		return s3BlobFetchStatusf(codes.Internal, "write s3 chunkblob: %v", err)
+		startTS, err := s.chunkBlobWriteStartTS(stream.Context(), key, digest, payload, commitTS)
+		if err != nil {
+			return err
+		}
+		if startTS == commitTS {
+			s.observeCommitTS(commitTS)
+			return nil
+		}
+		if err := s.applyChunkBlobUntilRegistered(stream.Context(), key, payload, startTS, commitTS); err != nil {
+			done, retry, retryErr := s.retryAfterChunkBlobWriteConflict(stream.Context(), err, key, digest, payload, commitTS)
+			if retryErr != nil {
+				return retryErr
+			}
+			if done {
+				s.observeCommitTS(commitTS)
+				return nil
+			}
+			if retry {
+				continue
+			}
+			if code := status.Code(err); code != codes.Unknown {
+				return err
+			}
+			return s3BlobFetchStatusf(codes.Internal, "write s3 chunkblob: %v", err)
+		}
+		s.observeCommitTS(commitTS)
+		return nil
 	}
-	return nil
 }
 
-func (s *S3BlobFetchServer) storedAfterWriteConflict(
+func (s *S3BlobFetchServer) retryAfterChunkBlobWriteConflict(
 	ctx context.Context,
 	err error,
 	key []byte,
 	digest [s3ChunkBlobSHA256Bytes]byte,
 	payload []byte,
-) (bool, error) {
+	commitTS uint64,
+) (bool, bool, error) {
 	if !errors.Is(err, store.ErrWriteConflict) {
-		return false, nil
+		return false, false, nil
 	}
-	stored, retryErr := s.chunkBlobAlreadyStored(ctx, key, digest, payload)
-	if retryErr != nil {
-		return false, retryErr
+	latestTS, exists, latestErr := s.latestChunkBlobTS(ctx, key)
+	if latestErr != nil {
+		return false, false, latestErr
 	}
-	return stored, nil
+	stored, storedErr := s.chunkBlobAlreadyStored(ctx, key, digest, payload)
+	if storedErr != nil {
+		return false, false, storedErr
+	}
+	if stored {
+		return exists && latestTS >= commitTS, exists && latestTS < commitTS, nil
+	}
+	if exists && latestTS < commitTS {
+		return false, true, nil
+	}
+	return false, false, s3BlobFetchStatusf(
+		codes.FailedPrecondition,
+		"s3 chunkblob commit timestamp %d is not after latest version %d",
+		commitTS,
+		latestTS,
+	)
 }
 
 func sendChunkBlobPushAck(stream pb.S3BlobFetch_PushChunkBlobServer) error {
@@ -190,15 +246,28 @@ func (s *S3BlobFetchServer) chunkBlobAlreadyStored(
 	return false, s3BlobFetchStatus(codes.InvalidArgument, "s3 chunkblob already exists with different payload")
 }
 
-func (s *S3BlobFetchServer) chunkBlobWriteStartTS(ctx context.Context, key []byte, commitTS uint64) (uint64, error) {
+func (s *S3BlobFetchServer) chunkBlobWriteStartTS(
+	ctx context.Context,
+	key []byte,
+	digest [s3ChunkBlobSHA256Bytes]byte,
+	payload []byte,
+	commitTS uint64,
+) (uint64, error) {
 	if commitTS == 0 {
 		return 0, s3BlobFetchStatus(codes.InvalidArgument, "missing s3 chunkblob commit timestamp")
 	}
-	latestTS, exists, err := s.store.LatestCommitTS(ctx, key)
+	latestTS, exists, err := s.latestChunkBlobTS(ctx, key)
 	if err != nil {
-		return 0, s3BlobFetchStatusf(codes.Internal, "read s3 chunkblob latest timestamp: %v", err)
+		return 0, err
 	}
 	if exists && commitTS <= latestTS {
+		stored, storedErr := s.chunkBlobAlreadyStored(ctx, key, digest, payload)
+		if storedErr != nil {
+			return 0, storedErr
+		}
+		if stored {
+			return commitTS, nil
+		}
 		return 0, s3BlobFetchStatusf(
 			codes.FailedPrecondition,
 			"s3 chunkblob commit timestamp %d is not after latest version %d",
@@ -207,6 +276,14 @@ func (s *S3BlobFetchServer) chunkBlobWriteStartTS(ctx context.Context, key []byt
 		)
 	}
 	return latestTS, nil
+}
+
+func (s *S3BlobFetchServer) latestChunkBlobTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	latestTS, exists, err := s.store.LatestCommitTS(ctx, key)
+	if err != nil {
+		return 0, false, s3BlobFetchStatusf(codes.Internal, "read s3 chunkblob latest timestamp: %v", err)
+	}
+	return latestTS, exists, nil
 }
 
 func (s *S3BlobFetchServer) applyChunkBlob(ctx context.Context, key, payload []byte, startTS, commitTS uint64) error {
@@ -242,6 +319,9 @@ func (s *S3BlobFetchServer) applyChunkBlobUntilRegistered(ctx context.Context, k
 func (s *S3BlobFetchServer) recvChunkBlob(stream pb.S3BlobFetch_PushChunkBlobServer) ([s3ChunkBlobSHA256Bytes]byte, []byte, uint64, error) {
 	var state s3ChunkBlobReceiveState
 	for {
+		if err := s.ensurePushAllowed(); err != nil {
+			return state.digest, nil, 0, err
+		}
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			return state.finish()
@@ -252,6 +332,19 @@ func (s *S3BlobFetchServer) recvChunkBlob(stream pb.S3BlobFetch_PushChunkBlobSer
 		if err := state.apply(req); err != nil {
 			return state.digest, nil, 0, err
 		}
+	}
+}
+
+func (s *S3BlobFetchServer) ensurePushAllowed() error {
+	if s != nil && s.pushBlocked != nil && s.pushBlocked() {
+		return s3BlobFetchStatus(codes.Unavailable, "startup rotation has not completed")
+	}
+	return nil
+}
+
+func (s *S3BlobFetchServer) observeCommitTS(commitTS uint64) {
+	if s != nil && s.clock != nil {
+		s.clock.Observe(commitTS)
 	}
 }
 

@@ -2077,6 +2077,7 @@ func startRaftServers(
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
+	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2105,7 +2106,12 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(rt.store, s3BlobObserver))
+		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(
+			rt.store,
+			s3BlobObserver,
+			adapter.WithS3BlobFetchClock(coordinate.Clock()),
+			adapter.WithS3BlobFetchPushBlocked(s3BlobPushBlocked),
+		))
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2560,6 +2566,10 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
 		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
 	}
+	var s3BlobPushBlocked func() bool
+	if r.publicKVGate != nil {
+		s3BlobPushBlocked = r.publicKVGate.blocked
+	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
 		buckets: newBucketsSource(r.s3Server),
@@ -2584,6 +2594,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 		r.metricsRegistry.S3BlobOffloadObserver(),
+		s3BlobPushBlocked,
 	); err != nil {
 		return r.startupFailure(err)
 	}

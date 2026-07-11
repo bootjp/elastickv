@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -164,9 +165,35 @@ func TestS3BlobFetchPushIsIdempotent(t *testing.T) {
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 42)))
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 43)))
 
-	require.Equal(t, 1, st.applyCalls)
+	require.Equal(t, 2, st.applyCalls)
 	require.Zero(t, st.putCalls)
-	require.Equal(t, []uint64{42}, st.applyCommitTS)
+	require.Equal(t, []uint64{42, 43}, st.applyCommitTS)
+
+	key := s3keys.ChunkBlobKey(digest)
+	latestTS, exists, err := st.LatestCommitTS(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(43), latestTS)
+}
+
+func TestS3BlobFetchPushRestampsExistingPayloadAtLeaderCommitTS(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &recordingS3BlobFetchStore{MVCCStore: base}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("already present payload")
+	digest := sha256.Sum256(payload)
+	key := s3keys.ChunkBlobKey(digest)
+	require.NoError(t, base.PutAt(context.Background(), key, payload, 10, 0))
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 30)))
+
+	require.Equal(t, []uint64{30}, st.applyCommitTS)
+	latestTS, exists, err := st.LatestCommitTS(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(30), latestTS)
 }
 
 func TestS3BlobFetchPushAcknowledgesConcurrentMatchingWrite(t *testing.T) {
@@ -179,6 +206,69 @@ func TestS3BlobFetchPushAcknowledgesConcurrentMatchingWrite(t *testing.T) {
 
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 51)))
 	require.Equal(t, 1, st.applyCalls)
+}
+
+func TestS3BlobFetchPushRetriesAfterConcurrentTombstone(t *testing.T) {
+	t.Parallel()
+
+	st := &tombstoneConflictS3BlobFetchStore{
+		recordingS3BlobFetchStore: recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()},
+		tombstoneTS:               20,
+	}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("retry after tombstone")
+	digest := sha256.Sum256(payload)
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 30)))
+	require.Equal(t, 2, st.applyCalls)
+	require.Equal(t, []uint64{0, 20}, st.applyStartTS)
+	require.Equal(t, []uint64{30, 30}, st.applyCommitTS)
+}
+
+func TestS3BlobFetchPushObservesLeaderCommitTS(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	server := NewS3BlobFetchServer(
+		store.NewMVCCStore(),
+		nil,
+		WithS3BlobFetchClock(clock),
+	)
+	payload := []byte("observe commit timestamp")
+	digest := sha256.Sum256(payload)
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 100)))
+	require.Equal(t, uint64(100), clock.Current())
+}
+
+func TestS3BlobFetchPushRechecksGateBetweenFrames(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
+	blocked := false
+	server := NewS3BlobFetchServer(
+		st,
+		nil,
+		WithS3BlobFetchPushBlocked(func() bool { return blocked }),
+	)
+	payload := []byte("gate closes while streaming")
+	digest := sha256.Sum256(payload)
+	push := &recordingS3BlobPushStream{
+		ctx: context.Background(),
+		reqs: []*pb.PushChunkBlobRequest{
+			{ContentSha256: digest[:], CommitTs: 10, Payload: payload[:4]},
+			{Payload: payload[4:], Eof: true},
+		},
+		afterRecv: func(n int) {
+			if n == 1 {
+				blocked = true
+			}
+		},
+	}
+
+	err := server.PushChunkBlob(push)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Zero(t, st.applyCalls)
 }
 
 func TestS3BlobFetchRejectsPushMissingCommitTS(t *testing.T) {
@@ -334,10 +424,11 @@ func (*recordingS3BlobFetchStream) SendMsg(any) error { return nil }
 func (*recordingS3BlobFetchStream) RecvMsg(any) error { return nil }
 
 type recordingS3BlobPushStream struct {
-	ctx      context.Context
-	reqs     []*pb.PushChunkBlobRequest
-	next     int
-	response *pb.PushChunkBlobResponse
+	ctx       context.Context
+	reqs      []*pb.PushChunkBlobRequest
+	next      int
+	afterRecv func(int)
+	response  *pb.PushChunkBlobResponse
 }
 
 func (s *recordingS3BlobPushStream) Recv() (*pb.PushChunkBlobRequest, error) {
@@ -346,6 +437,9 @@ func (s *recordingS3BlobPushStream) Recv() (*pb.PushChunkBlobRequest, error) {
 	}
 	req := s.reqs[s.next]
 	s.next++
+	if s.afterRecv != nil {
+		s.afterRecv(s.next)
+	}
 	return req, nil
 }
 
@@ -375,6 +469,7 @@ type recordingS3BlobFetchStore struct {
 	store.MVCCStore
 	applyCalls    int
 	putCalls      int
+	applyStartTS  []uint64
 	applyCommitTS []uint64
 }
 
@@ -391,6 +486,7 @@ func (s *recordingS3BlobFetchStore) ApplyMutations(
 	commitTS uint64,
 ) error {
 	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
 	s.applyCommitTS = append(s.applyCommitTS, commitTS)
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
@@ -429,9 +525,37 @@ func (s *registrationOnceS3BlobFetchStore) ApplyMutations(
 	commitTS uint64,
 ) error {
 	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
 	if s.applyCalls == 1 {
 		return store.ErrWriterNotRegistered
 	}
 	s.applyCommitTS = append(s.applyCommitTS, commitTS)
+	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
+type tombstoneConflictS3BlobFetchStore struct {
+	recordingS3BlobFetchStore
+	tombstoneTS uint64
+}
+
+func (s *tombstoneConflictS3BlobFetchStore) ApplyMutations(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
+	s.applyCommitTS = append(s.applyCommitTS, commitTS)
+	if s.applyCalls == 1 {
+		if len(mutations) == 0 {
+			return store.ErrWriteConflict
+		}
+		if err := s.DeleteAt(ctx, mutations[0].Key, s.tombstoneTS); err != nil {
+			return err
+		}
+		return store.ErrWriteConflict
+	}
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
