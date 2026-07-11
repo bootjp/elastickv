@@ -17,7 +17,7 @@ const (
 	defaultFSMCompactorTimeout         = 5 * time.Second
 	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
 	defaultFSMCompactorMaxL0Files      = 256
-	defaultFSMCompactorMaxL0Sublevels  = 20
+	defaultFSMCompactorMaxL0Sublevels  = 12
 	defaultFSMCompactorMaxLSMDebtBytes = 512 << 20
 )
 

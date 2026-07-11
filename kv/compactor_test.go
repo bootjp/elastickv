@@ -252,6 +252,12 @@ func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
 	require.False(t, st.compactCalled)
 }
 
+func TestFSMCompactorDefaultL0SublevelLimitMatchesPebbleStopWrites(t *testing.T) {
+	var opts pebble.Options
+	opts.EnsureDefaults()
+	require.Equal(t, defaultFSMCompactorMaxL0Sublevels, opts.L0StopWritesThreshold)
+}
+
 func TestFSMCompactorAllowsStableWideL0(t *testing.T) {
 	metrics := &pebble.Metrics{}
 	metrics.Levels[0].Sublevels = 1
