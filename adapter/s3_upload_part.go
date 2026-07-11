@@ -58,8 +58,7 @@ func parseS3UploadPartNumber(raw, bucket, objectKey string) (uint64, error) {
 	if err != nil || partNumber < s3MinPartNumber || partNumber > s3MaxPartNumber {
 		return 0, newS3ResponseError(http.StatusBadRequest, "InvalidArgument", "part number must be between 1 and 10000", bucket, objectKey)
 	}
-	partNo, err := uint64FromInt(partNumber)
-	return partNo, errors.WithStack(err)
+	return uint64(partNumber), nil
 }
 
 func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3UploadPartState, bucket, objectKey, uploadID, admissionProtocol string) (s3ChunkUploadResult, *s3PartDescriptor, *s3PutBodyError, error) {

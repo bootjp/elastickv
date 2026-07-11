@@ -50,9 +50,6 @@ type s3ChunkUploader struct {
 // The caller remains responsible for protocol setup, metadata transactions,
 // and cleanup of any chunks reported in the result.
 func (s *S3Server) uploadS3Chunks(ctx context.Context, cfg s3ChunkUploadConfig) (s3ChunkUploadResult, *s3PutBodyError, error) {
-	if cfg.request == nil || cfg.request.Body == nil || cfg.chunkKey == nil {
-		return s3ChunkUploadResult{}, nil, errors.New("s3: invalid chunk upload configuration")
-	}
 	uploader := &s3ChunkUploader{
 		server:            s,
 		ctx:               ctx,
@@ -160,10 +157,7 @@ func (u *s3ChunkUploader) appendChunk(data []byte, release func()) error {
 		Key:   u.cfg.chunkKey(u.result.ChunkCount),
 		Value: chunk,
 	})
-	chunkSize, err := uint64FromInt(len(data))
-	if err != nil {
-		return err
-	}
+	chunkSize := uint64(len(data))
 	u.result.ChunkSizes = append(u.result.ChunkSizes, chunkSize)
 	u.pendingChunkSizes = append(u.pendingChunkSizes, chunkSize)
 	u.result.SizeBytes += int64(len(data))

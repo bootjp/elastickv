@@ -118,10 +118,7 @@ func (s *S3Server) loadS3MultipartParts(ctx context.Context, readTS uint64, requ
 }
 
 func (s *S3Server) loadS3MultipartPart(ctx context.Context, readTS uint64, requested s3CompleteMultipartUploadPart, last bool, completion *s3MultipartCompletion) (s3ObjectPart, []byte, error) {
-	partNo, err := uint64FromInt(requested.PartNumber)
-	if err != nil {
-		return s3ObjectPart{}, nil, errors.WithStack(err)
-	}
+	partNo := uint64(requested.PartNumber) //nolint:gosec // validated by validateS3MultipartCompletionParts before loading parts.
 	partKey := s3keys.UploadPartKey(completion.bucket, completion.generation, completion.objectKey, completion.uploadID, partNo)
 	raw, err := s.store.GetAt(ctx, partKey, readTS)
 	if err != nil {
