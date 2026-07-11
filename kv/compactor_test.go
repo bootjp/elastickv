@@ -160,11 +160,9 @@ func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 	require.Equal(t, []byte("v10"), val)
 }
 
-func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T) {
+func TestFSMCompactorSkipsMultiPeerLeaderRuntime(t *testing.T) {
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
-	leaderTimeout := 20 * time.Millisecond
-	start := time.Now()
 
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
@@ -180,15 +178,10 @@ func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T
 		}},
 		WithFSMCompactorInterval(time.Hour),
 		WithFSMCompactorRetentionWindow(time.Millisecond),
-		WithFSMCompactorTimeout(time.Hour),
-		WithFSMCompactorLeaderTimeout(leaderTimeout),
 	)
 
 	require.NoError(t, compactor.SyncOnce(ctx))
-
-	require.True(t, st.compactCalled)
-	require.True(t, st.hasDeadline)
-	requireDeadlineWithin(t, st.deadline, start, leaderTimeout)
+	require.False(t, st.compactCalled)
 }
 
 func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *testing.T) {

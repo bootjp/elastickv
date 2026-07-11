@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -447,6 +449,52 @@ func TestLockResolverLSMBackpressured(t *testing.T) {
 			require.Equal(t, tc.want, overloaded)
 		})
 	}
+}
+
+func TestLockResolverScanCursorAdvancesAfterKey(t *testing.T) {
+	t.Parallel()
+
+	lockEnd := prefixScanEnd(txnLockKey(nil))
+	key := txnLockKey([]byte("queue:0"))
+
+	next := lockResolverNextScanStartAfter(key, lockEnd)
+	require.NotEmpty(t, next)
+	require.Greater(t, bytes.Compare(next, key), 0)
+	require.Less(t, bytes.Compare(next, lockEnd), 0)
+	require.Equal(t, append(append([]byte(nil), key...), 0), next)
+}
+
+func TestLockResolverScanCursorWrapsAtRangeEnd(t *testing.T) {
+	t.Parallel()
+
+	lockEnd := prefixScanEnd(txnLockKey(nil))
+	require.Empty(t, lockResolverNextScanStartAfter([]byte{0xff}, lockEnd))
+	require.Empty(t, lockResolverNextScanStartAfter(lockEnd, lockEnd))
+}
+
+func TestLockResolverBackoffActiveExpires(t *testing.T) {
+	t.Parallel()
+
+	lr := &LockResolver{resolveBackoff: make(map[uint64]time.Time)}
+	lr.resolveBackoff[1] = time.Now().Add(time.Second)
+
+	require.True(t, lr.resolveBackoffActive(1, time.Now()))
+	require.False(t, lr.resolveBackoffActive(1, time.Now().Add(2*time.Second)))
+	require.Empty(t, lr.resolveBackoff)
+}
+
+func TestLockResolverBudgetExhaustedUsesWorkContext(t *testing.T) {
+	t.Parallel()
+
+	workCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.True(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), workCtx, context.Background()))
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), workCtx, parentCtx))
+	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), context.Background(), context.Background()))
 }
 
 type lockResolverStatusEngine struct {

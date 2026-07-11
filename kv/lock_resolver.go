@@ -1,9 +1,11 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -24,6 +26,9 @@ const (
 	// lockResolverOperationBudget bounds a single background resolution attempt.
 	// Foreground read/write paths still use their own caller deadlines.
 	lockResolverOperationBudget = 250 * time.Millisecond
+	// lockResolverBudgetBackoff keeps best-effort cleanup from immediately
+	// hammering the same saturated Raft/LSM path after a budget timeout.
+	lockResolverBudgetBackoff   = time.Minute
 	lockResolverMaxL0Files      = defaultFSMCompactorMaxL0Files
 	lockResolverMaxL0Sublevels  = defaultFSMCompactorMaxL0Sublevels
 	lockResolverMaxLSMDebtBytes = defaultFSMCompactorMaxLSMDebtBytes
@@ -35,11 +40,14 @@ var errLockResolverBudgetExhausted = errors.New("lock resolver budget exhausted"
 // them. This handles the case where secondary commit fails and leaves orphaned
 // locks that no read path would discover (e.g., cold keys).
 type LockResolver struct {
-	store  *ShardStore
-	groups map[uint64]*ShardGroup
-	log    *slog.Logger
-	cancel context.CancelFunc
-	done   chan struct{}
+	store             *ShardStore
+	groups            map[uint64]*ShardGroup
+	log               *slog.Logger
+	mu                sync.Mutex
+	nextLockScanStart map[uint64][]byte
+	resolveBackoff    map[uint64]time.Time
+	cancel            context.CancelFunc
+	done              chan struct{}
 }
 
 // NewLockResolver creates and starts a background lock resolver.
@@ -49,11 +57,13 @@ func NewLockResolver(ss *ShardStore, groups map[uint64]*ShardGroup, log *slog.Lo
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	lr := &LockResolver{
-		store:  ss,
-		groups: groups,
-		log:    log,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		store:             ss,
+		groups:            groups,
+		log:               log,
+		nextLockScanStart: make(map[uint64][]byte),
+		resolveBackoff:    make(map[uint64]time.Time),
+		cancel:            cancel,
+		done:              make(chan struct{}),
 	}
 	go lr.run(ctx)
 	return lr
@@ -89,6 +99,9 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if lr.resolveBackoffActive(gid, time.Now()) {
+			continue
+		}
 		if passCtx.Err() != nil {
 			lr.logLockResolverYield(gid, passCtx.Err())
 			return
@@ -96,6 +109,7 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 		err := lr.resolveGroupLocks(passCtx, gid, g)
 		if err != nil {
 			if errors.Is(err, errLockResolverBudgetExhausted) || lockResolverBudgetExhausted(err, passCtx, ctx) {
+				lr.backoffGroupResolve(gid, lockResolverBudgetBackoff)
 				lr.logLockResolverYield(gid, err)
 				return
 			}
@@ -113,12 +127,17 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 	}
 
 	// Scan lock key range: [!txn|lock| ... prefixEnd(!txn|lock|))
-	lockStart := txnLockKey(nil)
-	lockEnd := prefixScanEnd(lockStart)
+	lockRangeStart := txnLockKey(nil)
+	lockEnd := prefixScanEnd(lockRangeStart)
+	lockStart := lr.lockScanStart(gid, lockRangeStart, lockEnd)
 
 	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, lockResolverBatchSize, math.MaxUint64)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if len(lockKVs) == 0 {
+		lr.resetLockScanStart(gid)
+		return nil
 	}
 
 	var resolved, skipped int
@@ -126,6 +145,7 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 		if ctx.Err() != nil {
 			return errors.WithStack(ctx.Err())
 		}
+		lr.advanceLockScanStart(gid, kvp.Key, lockEnd)
 		if !lockResolverRaftReady(engineForGroup(g)) {
 			return nil
 		}
@@ -136,6 +156,9 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 		resolvedDelta, skippedDelta := lockResolveOutcomeCounts(outcome)
 		resolved += resolvedDelta
 		skipped += skippedDelta
+	}
+	if len(lockKVs) < lockResolverBatchSize {
+		lr.resetLockScanStart(gid)
 	}
 
 	if resolved > 0 {
@@ -246,8 +269,84 @@ func (lr *LockResolver) primaryGroupReadyForBackgroundAbort(primaryKey []byte) b
 func (lr *LockResolver) logLockResolverYield(gid uint64, err error) {
 	lr.log.Warn("lock resolver: yielding after resolver budget",
 		slog.Uint64("gid", gid),
+		slog.Duration("backoff", lockResolverBudgetBackoff),
 		slog.Any("err", err),
 	)
+}
+
+func (lr *LockResolver) lockScanStart(gid uint64, lockRangeStart, lockRangeEnd []byte) []byte {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	start := lr.nextLockScanStart[gid]
+	if len(start) == 0 || !lockScanStartInRange(start, lockRangeStart, lockRangeEnd) {
+		return append([]byte(nil), lockRangeStart...)
+	}
+	return append([]byte(nil), start...)
+}
+
+func (lr *LockResolver) advanceLockScanStart(gid uint64, key, lockRangeEnd []byte) {
+	next := lockResolverNextScanStartAfter(key, lockRangeEnd)
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.ensureStateLocked()
+	if len(next) == 0 {
+		delete(lr.nextLockScanStart, gid)
+		return
+	}
+	lr.nextLockScanStart[gid] = next
+}
+
+func (lr *LockResolver) resetLockScanStart(gid uint64) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	delete(lr.nextLockScanStart, gid)
+}
+
+func (lr *LockResolver) resolveBackoffActive(gid uint64, now time.Time) bool {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	until, ok := lr.resolveBackoff[gid]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(lr.resolveBackoff, gid)
+	return false
+}
+
+func (lr *LockResolver) backoffGroupResolve(gid uint64, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.ensureStateLocked()
+	lr.resolveBackoff[gid] = time.Now().Add(d)
+}
+
+func (lr *LockResolver) ensureStateLocked() {
+	if lr.nextLockScanStart == nil {
+		lr.nextLockScanStart = make(map[uint64][]byte)
+	}
+	if lr.resolveBackoff == nil {
+		lr.resolveBackoff = make(map[uint64]time.Time)
+	}
+}
+
+func lockScanStartInRange(start, lockRangeStart, lockRangeEnd []byte) bool {
+	return bytes.Compare(start, lockRangeStart) >= 0 && (len(lockRangeEnd) == 0 || bytes.Compare(start, lockRangeEnd) < 0)
+}
+
+func lockResolverNextScanStartAfter(key, lockRangeEnd []byte) []byte {
+	next := append(append([]byte(nil), key...), 0)
+	if len(lockRangeEnd) > 0 && bytes.Compare(next, lockRangeEnd) >= 0 {
+		return nil
+	}
+	return next
 }
 
 func lockResolverRaftReady(engine interface {
@@ -293,7 +392,7 @@ func lockResolverBudgetExhausted(err error, workCtx, parentCtx context.Context) 
 	if parentCtx != nil && parentCtx.Err() != nil {
 		return false
 	}
-	return workCtx.Err() != nil && errors.Is(err, workCtx.Err())
+	return workCtx.Err() != nil
 }
 
 func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, userKey []byte, lock txnLock) error {

@@ -280,6 +280,9 @@ func (c *FSMCompactor) lsmBackpressure(st store.MVCCStore) (bool, *pebble.Metric
 }
 
 func shouldSkipFSMCompaction(status raftengine.Status) bool {
+	if status.State == raftengine.StateLeader && status.NumPeers > 0 {
+		return true
+	}
 	if status.State == raftengine.StateCandidate {
 		return true
 	}
