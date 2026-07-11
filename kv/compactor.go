@@ -17,6 +17,7 @@ const (
 	defaultFSMCompactorTimeout         = 5 * time.Second
 	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
 	defaultFSMCompactorMaxL0Files      = 256
+	defaultFSMCompactorMaxL0Sublevels  = 20
 	defaultFSMCompactorMaxLSMDebtBytes = 512 << 20
 )
 
@@ -40,6 +41,7 @@ type FSMCompactor struct {
 	timeout         time.Duration
 	leaderTimeout   time.Duration
 	maxL0Files      int64
+	maxL0Sublevels  int32
 	maxLSMDebtBytes uint64
 	logger          *slog.Logger
 }
@@ -97,6 +99,14 @@ func WithFSMCompactorLSMBackpressureLimits(maxL0Files int64, maxDebtBytes uint64
 	}
 }
 
+func WithFSMCompactorLSMBackpressureSublevelLimit(maxL0Sublevels int32) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if maxL0Sublevels > 0 {
+			c.maxL0Sublevels = maxL0Sublevels
+		}
+	}
+}
+
 func WithFSMCompactorLogger(logger *slog.Logger) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if logger != nil {
@@ -113,6 +123,7 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		timeout:         defaultFSMCompactorTimeout,
 		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
 		maxL0Files:      defaultFSMCompactorMaxL0Files,
+		maxL0Sublevels:  defaultFSMCompactorMaxL0Sublevels,
 		maxLSMDebtBytes: defaultFSMCompactorMaxLSMDebtBytes,
 		logger:          slog.Default(),
 	}
@@ -196,7 +207,10 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		c.logger.WarnContext(ctx, "skipping fsm compaction under pebble backpressure",
 			"group_id", runtime.GroupID,
 			"l0_files", snap.Levels[0].TablesCount,
+			"l0_sublevels", snap.Levels[0].Sublevels,
 			"compaction_debt_bytes", snap.Compact.EstimatedDebt,
+			"compactions_in_progress", snap.Compact.NumInProgress,
+			"compaction_in_progress_bytes", snap.Compact.InProgressBytes,
 		)
 		return nil
 	}
@@ -258,13 +272,11 @@ func (c *FSMCompactor) lsmBackpressure(st store.MVCCStore) (bool, *pebble.Metric
 	if snap == nil {
 		return false, nil
 	}
-	if c.maxL0Files > 0 && snap.Levels[0].TablesCount >= c.maxL0Files {
-		return true, snap
-	}
-	if c.maxLSMDebtBytes > 0 && snap.Compact.EstimatedDebt >= c.maxLSMDebtBytes {
-		return true, snap
-	}
-	return false, snap
+	return lsmWriteBackpressured(snap, lsmBackpressureLimits{
+		maxL0Files:      c.maxL0Files,
+		maxL0Sublevels:  c.maxL0Sublevels,
+		maxLSMDebtBytes: c.maxLSMDebtBytes,
+	}), snap
 }
 
 func shouldSkipFSMCompaction(status raftengine.Status) bool {

@@ -224,7 +224,7 @@ func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *te
 
 func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
 	metrics := &pebble.Metrics{}
-	metrics.Levels[0].TablesCount = defaultFSMCompactorMaxL0Files
+	metrics.Levels[0].Sublevels = defaultFSMCompactorMaxL0Sublevels
 	st := &metricsCapturingStore{
 		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
 		metrics:                metrics,
@@ -250,6 +250,38 @@ func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
 
 	require.NoError(t, compactor.SyncOnce(ctx))
 	require.False(t, st.compactCalled)
+}
+
+func TestFSMCompactorAllowsStableWideL0(t *testing.T) {
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].Sublevels = 1
+	metrics.Levels[0].TablesCount = defaultFSMCompactorMaxL0Files * 2
+	metrics.Compact.EstimatedDebt = defaultFSMCompactorMaxLSMDebtBytes * 2
+	st := &metricsCapturingStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
+		metrics:                metrics,
+	}
+	ctx := context.Background()
+
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
+				NumPeers:     1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorTimeout(time.Second),
+	)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.True(t, st.compactCalled)
 }
 
 func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.T) {

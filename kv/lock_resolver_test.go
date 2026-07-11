@@ -124,7 +124,7 @@ func TestLockResolver_ResolvesCommittedLockWhenPrimaryGroupBackpressured(t *test
 	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
 
 	metrics := &pebble.Metrics{}
-	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
@@ -221,7 +221,7 @@ func TestLockResolver_SkipsPendingPrimaryAbortWhenPrimaryGroupBackpressured(t *t
 	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
 
 	metrics := &pebble.Metrics{}
-	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
@@ -398,16 +398,41 @@ func TestLockResolverLSMBackpressured(t *testing.T) {
 	}{
 		{name: "no pressure", setup: func(*pebble.Metrics) {}, want: false},
 		{
-			name: "l0 files at threshold",
+			name: "stable wide l0 and debt without active compaction",
 			setup: func(m *pebble.Metrics) {
-				m.Levels[0].TablesCount = lockResolverMaxL0Files
+				m.Levels[0].Sublevels = 1
+				m.Levels[0].TablesCount = lockResolverMaxL0Files * 2
+				m.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes * 2
+			},
+			want: false,
+		},
+		{
+			name: "l0 sublevels at threshold",
+			setup: func(m *pebble.Metrics) {
+				m.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 			},
 			want: true,
 		},
 		{
-			name: "compaction debt at threshold",
+			name: "l0 files at threshold with active compaction",
+			setup: func(m *pebble.Metrics) {
+				m.Levels[0].TablesCount = lockResolverMaxL0Files
+				m.Compact.NumInProgress = 1
+			},
+			want: true,
+		},
+		{
+			name: "compaction debt at threshold without active compaction",
 			setup: func(m *pebble.Metrics) {
 				m.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
+			},
+			want: false,
+		},
+		{
+			name: "compaction debt at threshold with active compaction",
+			setup: func(m *pebble.Metrics) {
+				m.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
+				m.Compact.NumInProgress = 1
 			},
 			want: true,
 		},
