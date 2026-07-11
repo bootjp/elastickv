@@ -76,6 +76,7 @@ var (
 	errDistributionRouteIDOverflow      = errors.New("route id overflow")
 	errDistributionNotLeader            = errors.New("not leader for distribution catalog")
 	errDistributionCoordinatorRequired  = errors.New("distribution coordinator is not configured")
+	errDistributionCoordinatorClock     = errors.New("distribution coordinator clock is not configured")
 	errDistributionEngineNotConfigured  = errors.New("distribution engine is not configured")
 )
 
@@ -153,7 +154,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	parent, _, found := findRouteByID(snapshot.Routes, req.GetRouteId())
+	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
 	if !found {
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
@@ -167,9 +168,13 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
-	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID)
+	splitAtHLC, err := s.allocateSplitCommitTS(snapshot.ReadTS)
+	if err != nil {
+		return nil, err
+	}
+	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, splitAtHLC)
 
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, splitAtHLC, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +213,7 @@ func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
 func (s *DistributionServer) saveSplitResultViaCoordinator(
 	ctx context.Context,
 	readTS uint64,
+	commitTS uint64,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
@@ -227,13 +233,33 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems:   ops,
-		IsTxn:   true,
-		StartTS: readTS,
+		Elems:    ops,
+		IsTxn:    true,
+		StartTS:  readTS,
+		CommitTS: commitTS,
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
 	return s.loadCatalogSnapshotAtLeastVersion(ctx, nextVersion)
+}
+
+func (s *DistributionServer) allocateSplitCommitTS(readTS uint64) (uint64, error) {
+	if readTS == math.MaxUint64 {
+		return 0, grpcStatusError(codes.Internal, "split read timestamp overflow")
+	}
+	clock := s.coordinator.Clock()
+	if clock == nil {
+		return 0, grpcStatusError(codes.FailedPrecondition, errDistributionCoordinatorClock.Error())
+	}
+	clock.Observe(readTS)
+	commitTS, err := clock.NextFenced()
+	if err != nil {
+		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate split commit timestamp: %v", err)
+	}
+	if commitTS <= readTS {
+		return 0, grpcStatusError(codes.Internal, "split commit timestamp did not advance")
+	}
+	return commitTS, nil
 }
 
 func buildCatalogSplitOps(
@@ -381,6 +407,7 @@ func splitCatalogRoutes(
 	splitKey []byte,
 	leftID uint64,
 	rightID uint64,
+	splitAtHLC uint64,
 ) (distribution.RouteDescriptor, distribution.RouteDescriptor) {
 	// parent and splitKey are already cloned before this point and are immutable here.
 	left := distribution.RouteDescriptor{
@@ -390,6 +417,7 @@ func splitCatalogRoutes(
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
+		SplitAtHLC:    splitAtHLC,
 	}
 	right := distribution.RouteDescriptor{
 		RouteID:       rightID,
@@ -398,6 +426,7 @@ func splitCatalogRoutes(
 		GroupID:       parent.GroupID,
 		State:         parent.State,
 		ParentRouteID: parent.RouteID,
+		SplitAtHLC:    splitAtHLC,
 	}
 	return left, right
 }
@@ -428,13 +457,13 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, readTS u
 	return leftID, rightID, nil
 }
 
-func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, int, bool) {
-	for i, route := range routes {
+func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {
+	for _, route := range routes {
 		if route.RouteID == routeID {
-			return distribution.CloneRouteDescriptor(route), i, true
+			return distribution.CloneRouteDescriptor(route), true
 		}
 	}
-	return distribution.RouteDescriptor{}, -1, false
+	return distribution.RouteDescriptor{}, false
 }
 
 func toProtoRouteDescriptors(routes []distribution.RouteDescriptor) []*pb.RouteDescriptor {

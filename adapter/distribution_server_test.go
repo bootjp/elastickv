@@ -183,6 +183,8 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(3), snapshot.Routes[0].RouteID)
 	require.Equal(t, uint64(4), snapshot.Routes[1].RouteID)
 	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
+	require.NotZero(t, snapshot.Routes[0].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, snapshot.Routes[1].SplitAtHLC)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))
@@ -304,6 +306,17 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
+	require.NotZero(t, coordinator.lastCommitTS)
+	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
+
+	snapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	left, found := findRouteByID(snapshot.Routes, resp.Left.RouteId)
+	require.True(t, found)
+	right, found := findRouteByID(snapshot.Routes, resp.Right.RouteId)
+	require.True(t, found)
+	require.Equal(t, coordinator.lastCommitTS, left.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -590,8 +603,10 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 type distributionCoordinatorStub struct {
 	store           store.MVCCStore
 	leader          bool
+	clock           *kv.HLC
 	nextTS          uint64
 	lastStartTS     uint64
+	lastCommitTS    uint64
 	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
 	asyncApplyDone  chan error
 	asyncApplyDelay time.Duration
@@ -602,6 +617,7 @@ func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributi
 	return &distributionCoordinatorStub{
 		store:  st,
 		leader: leader,
+		clock:  kv.NewHLC(),
 	}
 }
 
@@ -610,8 +626,9 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
-	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
+	startTS, commitTS := s.nextTimestamps(reqs.StartTS, reqs.CommitTS)
 	s.lastStartTS = startTS
+	s.lastCommitTS = commitTS
 
 	mutations, err := coordinatorStubMutations(reqs.Elems)
 	if err != nil {
@@ -645,7 +662,13 @@ func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[k
 	return nil
 }
 
-func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64) (uint64, uint64) {
+func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCommitTS uint64) (uint64, uint64) {
+	if requestedCommitTS != 0 {
+		if s.clock != nil {
+			s.clock.Observe(requestedCommitTS)
+		}
+		return startTS, requestedCommitTS
+	}
 	if s.nextTS == 0 {
 		s.nextTS = s.store.LastCommitTS() + 1
 	}
@@ -740,7 +763,7 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 }
 
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
-	return nil
+	return s.clock
 }
 
 func (s *distributionCoordinatorStub) LinearizableRead(_ context.Context) (uint64, error) {
