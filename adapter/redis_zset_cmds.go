@@ -60,9 +60,12 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 			},
 		)
 	}
-	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return nil, err
+	}
+	if expired {
+		return legacyExpiredCollectionCleanupElems(key, redisZSetKey(key)), nil
 	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})

@@ -155,15 +155,17 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyStreamTTL(t *testing.T) {
 	require.Len(t, raw, redisWideMetaInlineSizeBytes)
 	meta, err := store.UnmarshalStreamMeta(raw)
 	require.NoError(t, err)
-	require.Equal(t, int64(2), meta.Length)
-	require.Equal(t, uint64(1700000000000), meta.LastMs)
-	require.Equal(t, uint64(5), meta.LastSeq)
+	require.Zero(t, meta.Length)
+	require.Zero(t, meta.LastMs)
+	require.Zero(t, meta.LastSeq)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
-	entryRaw, err := st.GetAt(ctx, store.StreamEntryKey(key, 1700000000000, 5), readTS)
+	_, err = st.GetAt(ctx, store.StreamEntryKey(key, 1700000000000, 5), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	server := &RedisServer{store: st}
+	got, err := server.loadStreamAt(ctx, key, readTS)
 	require.NoError(t, err)
-	entry, err := unmarshalStreamEntry(entryRaw)
-	require.NoError(t, err)
-	require.Equal(t, "1700000000000-5", entry.ID)
+	require.Empty(t, got.Entries)
 }
 
 func TestRedisTTLAt_LegacyFallbackCanBeDisabled(t *testing.T) {

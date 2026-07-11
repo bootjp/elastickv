@@ -709,18 +709,17 @@ func TestRedisLegacyCollectionMigrationPreservesLegacyTTL(t *testing.T) {
 	}
 }
 
-func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
+func TestRedisLegacyCollectionMigrationCleansExpiredLegacyBlob(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	expireAt := time.Now().Add(-time.Hour)
 	cases := []struct {
-		name     string
-		legacy   func([]byte) []byte
-		payload  func(t *testing.T) []byte
-		build    func(*RedisServer, context.Context, []byte, uint64) ([]*kv.Elem[kv.OP], error)
-		metaKey  func([]byte) []byte
-		expireAt func([]byte) (uint64, error)
+		name    string
+		legacy  func([]byte) []byte
+		payload func(t *testing.T) []byte
+		build   func(*RedisServer, context.Context, []byte, uint64) ([]*kv.Elem[kv.OP], error)
+		metaKey func([]byte) []byte
 	}{
 		{
 			name:   "hash",
@@ -735,10 +734,6 @@ func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
 				return server.buildHashLegacyMigrationElems(ctx, key, readTS)
 			},
 			metaKey: store.HashMetaKey,
-			expireAt: func(raw []byte) (uint64, error) {
-				meta, err := store.UnmarshalHashMeta(raw)
-				return meta.ExpireAt, err
-			},
 		},
 		{
 			name:   "set",
@@ -753,10 +748,6 @@ func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
 				return server.buildSetLegacyMigrationElems(ctx, key, readTS)
 			},
 			metaKey: store.SetMetaKey,
-			expireAt: func(raw []byte) (uint64, error) {
-				meta, err := store.UnmarshalSetMeta(raw)
-				return meta.ExpireAt, err
-			},
 		},
 		{
 			name:   "zset",
@@ -771,10 +762,6 @@ func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
 				return server.buildZSetLegacyMigrationElems(ctx, key, readTS)
 			},
 			metaKey: store.ZSetMetaKey,
-			expireAt: func(raw []byte) (uint64, error) {
-				meta, err := store.UnmarshalZSetMeta(raw)
-				return meta.ExpireAt, err
-			},
 		},
 	}
 	for _, tc := range cases {
@@ -789,12 +776,40 @@ func TestRedisLegacyCollectionMigrationClearsExpiredLegacyTTL(t *testing.T) {
 
 			elems, err := tc.build(server, ctx, key, 10)
 			require.NoError(t, err)
-			raw := elemValueForKey(t, elems, tc.metaKey(key))
-			got, err := tc.expireAt(raw)
-			require.NoError(t, err)
-			require.Zero(t, got)
+			requireNoPutElemByKey(t, elems, tc.metaKey(key))
+			require.True(t, elemOpKeysContain(elems, kv.Del, tc.legacy(key)))
+			require.True(t, elemOpKeysContain(elems, kv.Del, redisTTLKey(key)))
 		})
 	}
+}
+
+func TestRedisHSetExpiredLegacyHashRecreatesWithoutStaleFields(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("ttl:legacy-expired-hset")
+	raw, err := marshalHashValue(redisHashValue{"stale": "old"})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, 10, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 10, 0))
+
+	added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("fresh"), []byte("new")})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+
+	readTS := st.LastCommitTS()
+	value, err := server.loadHashAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisHashValue{"fresh": "new"}, value)
+	ttl, err := server.ttlAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Nil(t, ttl)
+	_, err = st.GetAt(ctx, redisHashKey(key), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, redisTTLKey(key), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
@@ -828,6 +843,15 @@ func elemValueForKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) []byte 
 	}
 	t.Fatalf("missing Put elem for key %q", want)
 	return nil
+}
+
+func elemOpKeysContain(elems []*kv.Elem[kv.OP], op kv.OP, want []byte) bool {
+	for _, elem := range elems {
+		if elem.Op == op && string(elem.Key) == string(want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRedisHDelLegacyRewritePreservesLegacyTTL(t *testing.T) {

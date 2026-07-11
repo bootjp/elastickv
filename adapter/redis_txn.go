@@ -2269,7 +2269,39 @@ func (t *txnContext) collectionTTLElemsForKey(ctx context.Context, key string) (
 	if err != nil || ok {
 		return built, false, err
 	}
+	if t.hasStagedInlineTTLCollectionCreate(key, typ) {
+		return nil, false, nil
+	}
 	return nil, true, nil
+}
+
+func (t *txnContext) hasStagedInlineTTLCollectionCreate(key string, typ redisValueType) bool {
+	switch typ {
+	case redisTypeList:
+		return t.hasStagedInlineTTLListCreate(key)
+	case redisTypeHash:
+		return t.hasStagedInlineTTLHashCreate(key)
+	case redisTypeZSet:
+		return t.hasStagedInlineTTLZSetCreate(key)
+	case redisTypeNone, redisTypeString, redisTypeSet, redisTypeStream:
+		return false
+	}
+	return false
+}
+
+func (t *txnContext) hasStagedInlineTTLListCreate(key string) bool {
+	st, ok := t.listStates[key]
+	return ok && !st.deleted && len(st.appends) > 0 && !st.metaExists && (len(st.existingDeltas) == 0 || st.purge)
+}
+
+func (t *txnContext) hasStagedInlineTTLHashCreate(key string) bool {
+	st, ok := t.hashStates[key]
+	return ok && st.dirty && !st.deleted && t.isHashCreate(key) && len(st.fields) > 0
+}
+
+func (t *txnContext) hasStagedInlineTTLZSetCreate(key string) bool {
+	st, ok := t.zsetStates[key]
+	return ok && st.dirty && !st.exists && !st.isWide && len(st.origMembers) == 0 && len(st.members) > 0
 }
 
 func (t *txnContext) collectionTTLRebuildWouldUseStaleBase(key string, typ redisValueType) bool {

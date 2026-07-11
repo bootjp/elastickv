@@ -67,9 +67,12 @@ func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []b
 			Value: []byte(val),
 		})
 	}
-	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return nil, err
+	}
+	if expired {
+		return legacyExpiredCollectionCleanupElems(key, redisHashKey(key)), nil
 	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
@@ -498,9 +501,12 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return err
+	}
+	if expired {
+		return r.dispatchElems(ctx, true, readTS, legacyExpiredCollectionCleanupElems(key, redisHashKey(key)))
 	}
 	// Wide-column rewrite: write per-field keys and a new base meta.
 	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.

@@ -923,6 +923,66 @@ func TestRedisTxnSetAfterCollectionExpireSkipsInlineTTLRebuild(t *testing.T) {
 	requireNoPutElemByKey(t, append(replacementElems, collectionTTLElems...), store.HashMetaKey(key))
 }
 
+func TestRedisTxnCollectionCreateExpireKeepsTTLIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		create func(*testing.T, *txnContext, []byte) error
+	}{
+		{
+			name: "list",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyRPush(redcon.Command{Args: [][]byte{[]byte(cmdRPush), key, []byte("v")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+				return nil
+			},
+		},
+		{
+			name: "hash",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, []byte("f"), []byte("v")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+				return nil
+			},
+		},
+		{
+			name: "zset",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyZIncrBy(redcon.Command{Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), []byte("m")}})
+				require.NoError(t, err)
+				require.Equal(t, resultBulk, res.typ)
+				require.Equal(t, []byte("1"), res.bulk)
+				return nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := newRedisStorageMigrationTestServer(t)
+			txn := newRedisTxnTestContext(server)
+			key := []byte("txn:create-expire-ttl-index:" + tc.name)
+
+			require.NoError(t, tc.create(t, txn, key))
+			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), expireRes.integer)
+
+			collectionTTLElems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+			require.NoError(t, err)
+			require.Empty(t, collectionTTLElems)
+			require.Empty(t, skipTTLIndex)
+			requireElemByKey(t, txn.buildTTLElems(skipTTLIndex), redisTTLKey(key))
+		})
+	}
+}
+
 func TestRedisTxnSetAfterHLLExpireSkipsDirtyHLLAnchor(t *testing.T) {
 	t.Parallel()
 
