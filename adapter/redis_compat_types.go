@@ -428,7 +428,11 @@ func (r *RedisServer) hllTTLAt(ctx context.Context, userKey []byte, readTS uint6
 	if embedded || newFormat {
 		return ttl, true, nil
 	}
-	return nil, false, nil
+	if r.disableLegacyTTLReadFallback {
+		return nil, true, nil
+	}
+	ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+	return ttl, true, err
 }
 
 // legacyIndexTTLAt reads the TTL from the !redis|ttl| secondary index only.

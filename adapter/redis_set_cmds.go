@@ -308,7 +308,8 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
+		cleanupElems, migrationElems, legacyMemberBase, expiredRecreate, err := r.setWideMutationBase(ctx, key, readTS, typ)
+		if err != nil {
 			return err
 		}
 
@@ -318,25 +319,18 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return cockerrors.WithStack(err)
 		}
 
-		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
-		if migErr != nil {
-			return migErr
-		}
-		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(members)+setWideColOverhead)
+		elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+len(members)+setWideColOverhead)
+		elems = append(elems, cleanupElems...)
 		elems = append(elems, migrationElems...)
-
-		// Extract legacy member names from migration ops so that applySetMemberMutations
-		// can treat them as already-existing (they are not yet visible at readTS).
-		legacyMemberBase := buildLegacySetMemberBase(migrationElems, key)
 
 		var lenDelta int64
 		var mutErr error
-		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase)
+		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase, expiredRecreate)
 		if mutErr != nil {
 			return mutErr
 		}
 
-		if changed == 0 && len(migrationElems) == 0 {
+		if changed == 0 && len(migrationElems) == 0 && len(cleanupElems) == 0 {
 			return nil
 		}
 
@@ -359,6 +353,31 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+func (r *RedisServer) setWideMutationBase(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	typ redisValueType,
+) ([]*kv.Elem[kv.OP], []*kv.Elem[kv.OP], map[string]struct{}, bool, error) {
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
+		return nil, nil, nil, false, err
+	}
+	if expiredRecreate {
+		return cleanupElems, nil, nil, true, nil
+	}
+	migrationElems, err := r.buildSetLegacyMigrationElems(ctx, key, readTS)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	// Extract legacy member names from migration ops so that applySetMemberMutations
+	// can treat them as already-existing (they are not yet visible at readTS).
+	return cleanupElems, migrationElems, buildLegacySetMemberBase(migrationElems, key), false, nil
 }
 
 func (r *RedisServer) rejectHLLPayloadForSetCreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) error {
@@ -496,8 +515,11 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 // scan; otherwise it returns an empty (non-nil) map for per-member ExistsAt
 // fallback. Legacy members from migration elems are merged in so that members
 // already in-flight in the same transaction are treated as existing.
-func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}) (map[string]struct{}, error) {
+func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}, ignoreExisting bool) (map[string]struct{}, error) {
 	existsMap := make(map[string]struct{})
+	if ignoreExisting {
+		return existsMap, nil
+	}
 	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
 		var err error
 		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
@@ -538,12 +560,12 @@ func (r *RedisServer) lookupSetMemberExists(ctx context.Context, memberStr strin
 // The bulk scan threshold is wideColumnBulkScanThreshold.
 // legacyBase contains members from a legacy blob being migrated in the same
 // transaction; they are not visible at readTS and must be treated as existing.
-func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}) ([]*kv.Elem[kv.OP], int, int64, error) {
-	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase)
+func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}, ignoreExisting bool) ([]*kv.Elem[kv.OP], int, int64, error) {
+	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase, ignoreExisting)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	isSmallClean := len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
+	isSmallClean := !ignoreExisting && len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
 	changed := 0
 	lenDelta := int64(0)
 	for _, member := range members {

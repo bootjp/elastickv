@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
@@ -777,8 +778,8 @@ func TestRedisLegacyCollectionMigrationCleansExpiredLegacyBlob(t *testing.T) {
 			elems, err := tc.build(server, ctx, key, 10)
 			require.NoError(t, err)
 			requireNoPutElemByKey(t, elems, tc.metaKey(key))
-			require.True(t, elemOpKeysContain(elems, kv.Del, tc.legacy(key)))
-			require.True(t, elemOpKeysContain(elems, kv.Del, redisTTLKey(key)))
+			require.True(t, elemDelKeysContain(elems, tc.legacy(key)))
+			require.True(t, elemDelKeysContain(elems, redisTTLKey(key)))
 		})
 	}
 }
@@ -810,6 +811,194 @@ func TestRedisHSetExpiredLegacyHashRecreatesWithoutStaleFields(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	_, err = st.GetAt(ctx, redisTTLKey(key), readTS)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestRedisExpiredInlineCollectionRecreateCleansPhysicalRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expiredAt := time.Now().Add(-time.Hour)
+	expiredMs := redisExpireAtMillis(expiredAt)
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewMVCCStore()
+		server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+		key := []byte("ttl:inline-expired-recreate:list")
+		metaRaw, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1, ExpireAt: expiredMs})
+		require.NoError(t, err)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), metaRaw, 10, 0))
+		require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("old"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expiredAt), 10, 0))
+
+		n, err := server.listRPush(ctx, key, [][]byte{[]byte("new")})
+		require.NoError(t, err)
+		require.Equal(t, int64(1), n)
+
+		readTS := st.LastCommitTS()
+		values, err := server.listValuesAt(ctx, key, readTS)
+		require.NoError(t, err)
+		require.Equal(t, []string{"new"}, values)
+		requireNoTTLAt(t, server, st, key, readTS)
+	})
+
+	t.Run("hash", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewMVCCStore()
+		server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+		key := []byte("ttl:inline-expired-recreate:hash")
+		require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1, ExpireAt: expiredMs}), 10, 0))
+		require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("stale"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expiredAt), 10, 0))
+
+		added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("fresh"), []byte("new")})
+		require.NoError(t, err)
+		require.Equal(t, 1, added)
+
+		readTS := st.LastCommitTS()
+		value, err := server.loadHashAt(ctx, key, readTS)
+		require.NoError(t, err)
+		require.Equal(t, redisHashValue{"fresh": "new"}, value)
+		requireMissingAt(t, st, store.HashFieldKey(key, []byte("old")), readTS)
+		requireNoTTLAt(t, server, st, key, readTS)
+	})
+
+	t.Run("set", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewMVCCStore()
+		server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+		key := []byte("ttl:inline-expired-recreate:set")
+		require.NoError(t, st.PutAt(ctx, store.SetMetaKey(key), store.MarshalSetMeta(store.SetMeta{Len: 1, ExpireAt: expiredMs}), 10, 0))
+		require.NoError(t, st.PutAt(ctx, store.SetMemberKey(key, []byte("old")), []byte{}, 10, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expiredAt), 10, 0))
+
+		conn := &recordingConn{}
+		server.sadd(conn, redcon.Command{Args: [][]byte{[]byte(cmdSAdd), key, []byte("new")}})
+		require.Empty(t, conn.err)
+		require.Equal(t, int64(1), conn.int)
+
+		readTS := st.LastCommitTS()
+		requireMissingAt(t, st, store.SetMemberKey(key, []byte("old")), readTS)
+		requireExistsAt(t, st, store.SetMemberKey(key, []byte("new")), readTS)
+		requireNoTTLAt(t, server, st, key, readTS)
+	})
+
+	t.Run("zset", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewMVCCStore()
+		server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+		key := []byte("ttl:inline-expired-recreate:zset")
+		require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 1, ExpireAt: expiredMs}), 10, 0))
+		require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, []byte("old")), store.MarshalZSetScore(1), 10, 0))
+		require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey(key, 1, []byte("old")), []byte{}, 10, 0))
+		require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expiredAt), 10, 0))
+
+		conn := &recordingConn{}
+		server.zadd(conn, redcon.Command{Args: [][]byte{[]byte(cmdZAdd), key, []byte("2"), []byte("new")}})
+		require.Empty(t, conn.err)
+		require.Equal(t, int64(1), conn.int)
+
+		readTS := st.LastCommitTS()
+		requireMissingAt(t, st, store.ZSetMemberKey(key, []byte("old")), readTS)
+		requireMissingAt(t, st, store.ZSetScoreKey(key, 1, []byte("old")), readTS)
+		requireExistsAt(t, st, store.ZSetMemberKey(key, []byte("new")), readTS)
+		requireNoTTLAt(t, server, st, key, readTS)
+	})
+}
+
+func TestRedisHIncrByExpiredLegacyHashStartsFromZero(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("ttl:legacy-expired-hincrby")
+	raw, err := marshalHashValue(redisHashValue{"counter": "not-an-int"})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, 10, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 10, 0))
+
+	conn := &recordingConn{}
+	server.hincrby(conn, redcon.Command{Args: [][]byte{[]byte(cmdHIncrBy), key, []byte("counter"), []byte("1")}})
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+
+	readTS := st.LastCommitTS()
+	value, err := server.loadHashAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisHashValue{"counter": "1"}, value)
+	requireMissingAt(t, st, redisHashKey(key), readTS)
+	requireNoTTLAt(t, server, st, key, readTS)
+}
+
+func TestRedisTTLInlineMigratorCleansExpiredLegacyTTLIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(-time.Hour)
+	cases := []struct {
+		name    string
+		legacy  func([]byte) []byte
+		payload func(t *testing.T) []byte
+		metaKey func([]byte) []byte
+	}{
+		{
+			name:   "hash",
+			legacy: redisHashKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalHashValue(redisHashValue{"field": "value"})
+				require.NoError(t, err)
+				return raw
+			},
+			metaKey: store.HashMetaKey,
+		},
+		{
+			name:   "set",
+			legacy: redisSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalSetValue(redisSetValue{Members: []string{"member"}})
+				require.NoError(t, err)
+				return raw
+			},
+			metaKey: store.SetMetaKey,
+		},
+		{
+			name:   "zset",
+			legacy: redisZSetKey,
+			payload: func(t *testing.T) []byte {
+				t.Helper()
+				raw, err := marshalZSetValue(redisZSetValue{Entries: []redisZSetEntry{{Member: "member", Score: 1}}})
+				require.NoError(t, err)
+				return raw
+			},
+			metaKey: store.ZSetMetaKey,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			compactor := NewDeltaCompactor(st, newLocalAdapterCoordinator(st))
+			key := []byte("ttl:migrator-expired-legacy:" + tc.name)
+			ttlKey := redisTTLKey(key)
+			ttlPayload := encodeRedisTTL(expireAt)
+			require.NoError(t, st.PutAt(ctx, tc.legacy(key), tc.payload(t), 10, 0))
+			require.NoError(t, st.PutAt(ctx, ttlKey, ttlPayload, 10, 0))
+
+			elems, err := compactor.migrateTTLIndexedCollectionElems(ctx, &store.KVPair{Key: ttlKey, Value: ttlPayload}, 10)
+			require.NoError(t, err)
+			requireNoPutElemByKey(t, elems, tc.metaKey(key))
+			require.True(t, elemDelKeysContain(elems, tc.legacy(key)))
+			require.True(t, elemDelKeysContain(elems, ttlKey))
+		})
+	}
 }
 
 func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
@@ -845,13 +1034,34 @@ func elemValueForKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) []byte 
 	return nil
 }
 
-func elemOpKeysContain(elems []*kv.Elem[kv.OP], op kv.OP, want []byte) bool {
+func elemDelKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 	for _, elem := range elems {
-		if elem.Op == op && string(elem.Key) == string(want) {
+		if elem.Op == kv.Del && string(elem.Key) == string(want) {
 			return true
 		}
 	}
 	return false
+}
+
+func requireMissingAt(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) {
+	t.Helper()
+	_, err := st.GetAt(context.Background(), key, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func requireExistsAt(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) {
+	t.Helper()
+	exists, err := st.ExistsAt(context.Background(), key, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+}
+
+func requireNoTTLAt(t *testing.T, server *RedisServer, st store.MVCCStore, key []byte, readTS uint64) {
+	t.Helper()
+	ttl, err := server.ttlAt(context.Background(), key, readTS)
+	require.NoError(t, err)
+	require.Nil(t, ttl)
+	requireMissingAt(t, st, redisTTLKey(key), readTS)
 }
 
 func TestRedisHDelLegacyRewritePreservesLegacyTTL(t *testing.T) {

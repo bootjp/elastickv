@@ -285,10 +285,12 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 	if err != nil {
 		return nil, err
 	}
-	switch typ {
-	case redisTypeNone, redisTypeString:
+	if !ttlIndexedCollectionMigrationType(typ) {
 		return nil, nil
-	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+	}
+	if redisTTLMillisExpired(ttlMs) {
+		elems, _, err := server.deleteLogicalKeyElems(ctx, userKey, readTS)
+		return elems, err
 	}
 	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
 	if err != nil || baseExists {
@@ -299,6 +301,16 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 		return elems, err
 	}
 	return c.legacyCollectionTTLInlineElems(ctx, userKey, typ, ttlMs, readTS)
+}
+
+func ttlIndexedCollectionMigrationType(typ redisValueType) bool {
+	switch typ {
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+		return true
+	case redisTypeNone, redisTypeString:
+		return false
+	}
+	return false
 }
 
 func (c *DeltaCompactor) collectionBaseMetaExistsAt(ctx context.Context, userKey []byte, typ redisValueType, readTS uint64) (bool, error) {

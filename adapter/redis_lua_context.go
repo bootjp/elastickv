@@ -3181,7 +3181,7 @@ func (c *luaScriptContext) commit() error {
 		// anchor and keep !redis|ttl| as the secondary scan index.
 		if isNonStringCollectionType(plan.finalType) {
 			updateExistingMeta := plan.preserveExisting && !plan.inlineMetaRewritten
-			ttlElems, err := c.nonStringTTLElems(key, plan.finalType, updateExistingMeta)
+			ttlElems, err := c.nonStringTTLElems(ctx, key, plan.finalType, updateExistingMeta)
 			if err != nil {
 				return err
 			}
@@ -3214,19 +3214,19 @@ func luaCommitFloor(startTS uint64) uint64 {
 
 // nonStringTTLElems returns TTL metadata elements for a collection key if the
 // TTL state is dirty, or the key was fully rewritten and needs index sync.
-func (c *luaScriptContext) nonStringTTLElems(key string, typ redisValueType, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) nonStringTTLElems(ctx context.Context, key string, typ redisValueType, preserveExisting bool) ([]*kv.Elem[kv.OP], error) {
 	st := c.ttls[key]
 	if preserveExisting && (st == nil || !st.dirty) {
 		return nil, nil
 	}
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
 	keyBytes := []byte(key)
 	elems := []*kv.Elem[kv.OP]{}
 	if preserveExisting {
-		metaElems, ok, err := c.server.collectionExpireElems(context.Background(), keyBytes, c.startTS, typ, ttlMillis(ttl))
+		metaElems, ok, err := c.server.collectionExpireElems(ctx, keyBytes, c.startTS, typ, ttlMillis(ttl))
 		if err != nil {
 			return nil, err
 		}
@@ -3244,17 +3244,17 @@ func (c *luaScriptContext) nonStringTTLElems(key string, typ redisValueType, pre
 
 // commitPlanForKey builds the data Raft elements for a single key.
 func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, commitTS uint64) (luaKeyPlan, error) {
-	finalType, err := c.finalType([]byte(key))
+	finalType, err := c.finalType(ctx, []byte(key))
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
 
-	valuePlan, err := c.valueCommitPlan(key, finalType, commitTS)
+	valuePlan, err := c.valueCommitPlan(ctx, key, finalType, commitTS)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
 
-	startType, err := c.server.keyTypeAt(context.Background(), []byte(key), c.startTS)
+	startType, err := c.server.keyTypeAt(ctx, []byte(key), c.startTS)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
@@ -3299,37 +3299,37 @@ func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType
 	return nil
 }
 
-func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
+func (c *luaScriptContext) valueCommitPlan(ctx context.Context, key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
 	switch finalType {
 	case redisTypeNone:
 		return luaCommitPlan{}, nil
 	case redisTypeString:
-		elems, err := c.stringCommitElems(key)
+		elems, err := c.stringCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems}, err
 	case redisTypeList:
-		return c.listCommitPlan(key, commitTS)
+		return c.listCommitPlan(ctx, key, commitTS)
 	case redisTypeHash:
-		elems, err := c.hashCommitElems(key)
+		elems, err := c.hashCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems}, err
 	case redisTypeSet:
-		elems, err := c.setCommitElems(key)
+		elems, err := c.setCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems}, err
 	case redisTypeZSet:
-		return c.zsetCommitPlan(key, commitTS)
+		return c.zsetCommitPlan(ctx, key, commitTS)
 	case redisTypeStream:
-		elems, err := c.streamCommitElems(key)
+		elems, err := c.streamCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems}, err
 	default:
 		return luaCommitPlan{}, errors.New("ERR unsupported final redis type")
 	}
 }
 
-func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) stringCommitElems(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.stringState([]byte(key))
 	if err != nil {
 		return nil, err
 	}
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
@@ -3345,17 +3345,17 @@ func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	return elems, nil
 }
 
-func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommitPlan, error) {
+func (c *luaScriptContext) listCommitPlan(ctx context.Context, key string, commitTS uint64) (luaCommitPlan, error) {
 	st := c.lists[key]
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(key)
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
 	if err != nil {
 		return luaCommitPlan{}, err
 	}
 	if st.materialized {
-		elems, err := c.listCommitElems(key, commitTS)
+		elems, err := c.listCommitElems(ctx, key, commitTS)
 		return luaCommitPlan{elems: elems}, err
 	}
 	// If the key was deleted earlier in this script and later recreated as a
@@ -3363,18 +3363,18 @@ func (c *luaScriptContext) listCommitPlan(key string, commitTS uint64) (luaCommi
 	// deleteLogicalKeyElems is called and any orphaned storage items from the
 	// previous incarnation of the key are cleaned up before writing the delta.
 	if c.everDeleted[key] {
-		elems, err := c.listCommitElems(key, commitTS)
+		elems, err := c.listCommitElems(ctx, key, commitTS)
 		return luaCommitPlan{elems: elems}, err
 	}
 	if rewriteForTTL {
-		elems, err := c.listCommitElems(key, commitTS)
+		elems, err := c.listCommitElems(ctx, key, commitTS)
 		return luaCommitPlan{elems: elems}, err
 	}
 	elems, err := c.listDeltaCommitElems(key, st, commitTS)
 	return luaCommitPlan{preserveExisting: true, elems: elems}, err
 }
 
-func (c *luaScriptContext) listCommitElems(key string, _ uint64) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) listCommitElems(ctx context.Context, key string, _ uint64) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.listState([]byte(key))
 	if err != nil {
 		return nil, err
@@ -3385,7 +3385,7 @@ func (c *luaScriptContext) listCommitElems(key string, _ uint64) ([]*kv.Elem[kv.
 	if len(st.values) == 0 {
 		return nil, nil
 	}
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
@@ -3490,7 +3490,7 @@ func appendListPuts(elems []*kv.Elem[kv.OP], key []byte, values []string, startS
 	return elems
 }
 
-func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) hashCommitElems(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.hashState([]byte(key))
 	if err != nil {
 		return nil, err
@@ -3501,7 +3501,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	}
 	// Wide-column: write per-field keys and a base meta key with the final count.
 	// deleteLogicalKeyElems (called by the Lua commit flow) clears any old keys.
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
@@ -3522,7 +3522,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	return elems, nil
 }
 
-func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) setCommitElems(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.setState([]byte(key))
 	if err != nil {
 		return nil, err
@@ -3532,7 +3532,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 		return nil, nil
 	}
 	// Wide-column: write per-member keys and a base meta key with the final count.
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
@@ -3558,12 +3558,12 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 // are fully loaded (triggered by any read command), or when the base data was in
 // legacy blob format (one-time migration). Delta commit is used for write-only
 // scripts (typically ZADD without prior reads) on an already-wide-column ZSet.
-func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommitPlan, error) {
+func (c *luaScriptContext) zsetCommitPlan(ctx context.Context, key string, commitTS uint64) (luaCommitPlan, error) {
 	st := c.zsets[key]
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(key)
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
 	if err != nil {
 		return luaCommitPlan{}, err
 	}
@@ -3572,30 +3572,30 @@ func (c *luaScriptContext) zsetCommitPlan(key string, commitTS uint64) (luaCommi
 	// full commit so deleteLogicalKeyElems removes stale wide-column rows
 	// (members, score-index, meta, TTL) that were left by the expired ZSet.
 	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
-		return c.zsetFullCommitWithMerge(key, st)
+		return c.zsetFullCommitWithMerge(ctx, key, st)
 	}
 	if rewriteForTTL {
-		return c.zsetFullCommitWithMerge(key, st)
+		return c.zsetFullCommitWithMerge(ctx, key, st)
 	}
 	if st.legacyBlobBase {
 		// One-time migration: load legacy blob, write wide-column, let deleteLogicalKeyElems clean up.
 		if err := c.ensureZSetLoaded(st, []byte(key)); err != nil {
 			return luaCommitPlan{}, err
 		}
-		elems, err := c.zsetFullCommitElems(key)
+		elems, err := c.zsetFullCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems}, err
 	}
 	// Delta path: write only changed members + score index + metadata delta.
-	elems, err := c.zsetDeltaCommitElems(key, st, commitTS)
+	elems, err := c.zsetDeltaCommitElems(ctx, key, st, commitTS)
 	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: luaZSetMetaRewritten(elems, []byte(key)), elems: elems}, err
 }
 
-func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(key string) (bool, error) {
+func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(ctx context.Context, key string) (bool, error) {
 	st := c.ttls[key]
 	if st == nil || !st.dirty || st.value == nil {
 		return false, nil
 	}
-	typ, err := c.server.keyTypeAt(context.Background(), []byte(key), c.startTS)
+	typ, err := c.server.keyTypeAt(ctx, []byte(key), c.startTS)
 	if err != nil {
 		return false, err
 	}
@@ -3606,7 +3606,7 @@ func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(key string) (b
 // the key was deleted during the script but delta members were added afterwards
 // (membersLoaded=false), st.added is merged into st.members so that
 // zsetFullCommitElems does not silently drop the newly added entries.
-func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState) (luaCommitPlan, error) {
+func (c *luaScriptContext) zsetFullCommitWithMerge(ctx context.Context, key string, st *luaZSetState) (luaCommitPlan, error) {
 	if !st.membersLoaded && len(st.added) > 0 {
 		if st.members == nil {
 			st.members = make(map[string]float64, len(st.added))
@@ -3616,19 +3616,19 @@ func (c *luaScriptContext) zsetFullCommitWithMerge(key string, st *luaZSetState)
 		}
 		st.added = map[string]float64{}
 	}
-	elems, err := c.zsetFullCommitElems(key)
+	elems, err := c.zsetFullCommitElems(ctx, key)
 	return luaCommitPlan{elems: elems}, err // preserveExisting=false -> deleteLogicalKeyElems called
 }
 
 // zsetFullCommitElems writes all members in wide-column format (member keys,
 // score index keys, and a base meta key). deleteLogicalKeyElems is responsible
 // for cleaning up any previous storage before these ops are applied.
-func (c *luaScriptContext) zsetFullCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) zsetFullCommitElems(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
 	st := c.zsets[key]
 	if st == nil || len(st.members) == 0 {
 		return nil, nil
 	}
-	ttl, err := c.finalTTL([]byte(key))
+	ttl, err := c.finalTTL(ctx, []byte(key))
 	if err != nil {
 		return nil, err
 	}
@@ -3659,7 +3659,7 @@ func (c *luaScriptContext) zsetFullCommitElems(key string) ([]*kv.Elem[kv.OP], e
 // zsetDeltaCommitElems writes only the members that changed (added/updated/removed)
 // together with their score index entries and a cardinality delta key.
 // preserveExisting=true so deleteLogicalKeyElems is NOT called.
-func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) zsetDeltaCommitElems(ctx context.Context, key string, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	if len(st.added) == 0 && len(st.removed) == 0 {
 		return nil, nil
 	}
@@ -3669,7 +3669,7 @@ func (c *luaScriptContext) zsetDeltaCommitElems(key string, st *luaZSetState, co
 	elems := make([]*kv.Elem[kv.OP], 0, len(st.added)*zsetElemsPerAdded+len(st.removed)*zsetElemsPerRemoved+zsetMetaBaseElems)
 	elems = appendLuaZSetAddedElems(elems, []byte(key), st)
 	elems = appendLuaZSetRemovedElems(elems, []byte(key), st)
-	metaElems, err := c.zsetDeltaMetaElems([]byte(key), st, commitTS)
+	metaElems, err := c.zsetDeltaMetaElems(ctx, []byte(key), st, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -3724,11 +3724,11 @@ func appendLuaZSetRemovedElems(elems []*kv.Elem[kv.OP], key []byte, st *luaZSetS
 // zsetDeltaMetaElems returns the metadata element(s) for a delta commit.
 // It tries to fold existing delta keys inline (compaction); on error or when
 // below the threshold it falls back to writing a single new ZSetMetaDeltaKey.
-func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) zsetDeltaMetaElems(ctx context.Context, key []byte, st *luaZSetState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	compactElems, compacted, err := c.server.zsetInlineMetaCompactionElems(
-		context.Background(), key, c.startTS, st.lenDelta)
+		ctx, key, c.startTS, st.lenDelta)
 	if err == nil && compacted {
-		return c.zsetMetaElemsWithFinalTTL(key, compactElems)
+		return c.zsetMetaElemsWithFinalTTL(ctx, key, compactElems)
 	}
 	if st.lenDelta == 0 {
 		return nil, nil
@@ -3740,8 +3740,8 @@ func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, comm
 	}}, nil
 }
 
-func (c *luaScriptContext) zsetMetaElemsWithFinalTTL(key []byte, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], error) {
-	ttl, err := c.finalTTL(key)
+func (c *luaScriptContext) zsetMetaElemsWithFinalTTL(ctx context.Context, key []byte, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], error) {
+	ttl, err := c.finalTTL(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -3787,13 +3787,13 @@ func luaZSetMetaRewritten(elems []*kv.Elem[kv.OP], key []byte) bool {
 // deleteLogicalKeyElems which clears every prior layout for this key, so
 // we can safely rewrite the new-layout entries from scratch instead of
 // computing a delta against the original load.
-func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) streamCommitElems(ctx context.Context, key string) ([]*kv.Elem[kv.OP], error) {
 	st, err := c.streamState([]byte(key))
 	if err != nil {
 		return nil, err
 	}
 	keyBytes := []byte(key)
-	ttl, err := c.finalTTL(keyBytes)
+	ttl, err := c.finalTTL(ctx, keyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -3834,19 +3834,19 @@ func (c *luaScriptContext) streamCommitElems(key string) ([]*kv.Elem[kv.OP], err
 	return elems, nil
 }
 
-func (c *luaScriptContext) finalType(key []byte) (redisValueType, error) {
+func (c *luaScriptContext) finalType(ctx context.Context, key []byte) (redisValueType, error) {
 	if typ, ok := c.cachedType(key); ok {
 		return typ, nil
 	}
-	return c.server.keyTypeAt(context.Background(), key, c.startTS)
+	return c.server.keyTypeAt(ctx, key, c.startTS)
 }
 
-func (c *luaScriptContext) finalTTL(key []byte) (*time.Time, error) {
+func (c *luaScriptContext) finalTTL(ctx context.Context, key []byte) (*time.Time, error) {
 	st := c.ttls[string(key)]
 	if st != nil && st.loaded {
 		return st.value, nil
 	}
-	ttl, err := c.server.ttlAt(context.Background(), key, c.startTS)
+	ttl, err := c.server.ttlAt(ctx, key, c.startTS)
 	if err != nil {
 		return nil, err
 	}

@@ -60,6 +60,55 @@ func TestRedisHLLTTLAtIgnoresStaleCollectionTTL(t *testing.T) {
 	require.Equal(t, []string{"fresh"}, value.Members)
 }
 
+func TestRedisLegacyHLLTTLAtIgnoresStaleCollectionTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expiredAt := time.Now().Add(-time.Minute)
+	liveAt := time.Now().Add(time.Hour)
+
+	cases := []struct {
+		name           string
+		writeLegacyTTL bool
+		wantTTL        *time.Time
+	}{
+		{name: "no-ttl"},
+		{name: "legacy-ttl", writeLegacyTTL: true, wantTTL: &liveAt},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			server := &RedisServer{store: st}
+			key := []byte("hll:legacy-stale-collection:" + tc.name)
+
+			require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{
+				Len:      1,
+				ExpireAt: redisExpireAtMillis(expiredAt),
+			}), 10, 0))
+			payload, err := marshalSetValue(redisSetValue{Members: []string{"fresh"}})
+			require.NoError(t, err)
+			require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 11, 0))
+			if tc.writeLegacyTTL {
+				require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(*tc.wantTTL), 12, 0))
+			}
+			readTS := st.LastCommitTS()
+
+			got, err := server.ttlAt(ctx, key, readTS)
+			require.NoError(t, err)
+			if tc.wantTTL == nil {
+				require.Nil(t, got)
+			} else {
+				require.NotNil(t, got)
+				require.Equal(t, redisExpireAtMillis(*tc.wantTTL), redisExpireAtMillis(*got))
+			}
+
+			expired, err := server.hasExpired(ctx, key, readTS, false)
+			require.NoError(t, err)
+			require.False(t, expired)
+		})
+	}
+}
+
 func TestRedisDispatchHLLExpireWritesInlineAnchorAndScanIndex(t *testing.T) {
 	t.Parallel()
 

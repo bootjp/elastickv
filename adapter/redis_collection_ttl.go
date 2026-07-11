@@ -158,6 +158,21 @@ func (r *RedisServer) collectionExpireElems(
 	return r.legacyCollectionExpireFallback(ctx, key, readTS, typ)
 }
 
+func (r *RedisServer) expiredCollectionCleanupForRecreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+	if typ != redisTypeNone {
+		return nil, false, nil
+	}
+	expired, err := r.hasExpired(ctx, key, readTS, true)
+	if err != nil || !expired {
+		return nil, false, err
+	}
+	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, redisTxnWideCollectionFenceElems(key)...), true, nil
+}
+
 func (r *RedisServer) collectionMetaExpireElems(
 	ctx context.Context,
 	key []byte,
