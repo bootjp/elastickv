@@ -278,6 +278,7 @@ message PushChunkBlobRequest {
   bytes content_sha256 = 1;
   bytes payload = 2;
   bool eof = 3;
+  uint64 commit_ts = 4;
 }
 
 message PushChunkBlobResponse {

@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
-	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -23,15 +22,14 @@ func TestS3BlobFetchPushStoresAndFetchStreamsPayload(t *testing.T) {
 
 	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
 	observer := &recordingS3BlobOffloadObserver{}
-	clock := &s3BlobFetchTestClock{next: 99}
-	server := NewS3BlobFetchServer(st, clock, observer)
+	server := NewS3BlobFetchServer(st, observer)
 	payload := bytes.Repeat([]byte("payload-"), (s3BlobFetchFrameBytes/len("payload-"))+2)
 	digest := sha256.Sum256(payload)
 
 	push := &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: digest[:], Payload: payload[:17]},
+			{ContentSha256: digest[:], CommitTs: 100, Payload: payload[:17]},
 			{Payload: payload[17:], Eof: true},
 		},
 	}
@@ -40,7 +38,6 @@ func TestS3BlobFetchPushStoresAndFetchStreamsPayload(t *testing.T) {
 	require.Equal(t, 1, st.applyCalls)
 	require.Zero(t, st.putCalls)
 	require.Equal(t, []uint64{100}, st.applyCommitTS)
-	require.Equal(t, 1, clock.calls)
 
 	key := s3keys.ChunkBlobKey(digest)
 	readTS, exists, err := st.LatestCommitTS(context.Background(), key)
@@ -68,7 +65,7 @@ func TestS3BlobFetchPushStoresAndFetchStreamsPayload(t *testing.T) {
 func TestS3BlobFetchRejectsMissingBlob(t *testing.T) {
 	t.Parallel()
 
-	server := NewS3BlobFetchServer(store.NewMVCCStore(), &s3BlobFetchTestClock{}, nil)
+	server := NewS3BlobFetchServer(store.NewMVCCStore(), nil)
 	digest := sha256.Sum256([]byte("missing"))
 	fetch := &recordingS3BlobFetchStream{ctx: context.Background()}
 
@@ -82,13 +79,13 @@ func TestS3BlobFetchRejectsPushDigestMismatch(t *testing.T) {
 
 	st := store.NewMVCCStore()
 	observer := &recordingS3BlobOffloadObserver{}
-	server := NewS3BlobFetchServer(st, &s3BlobFetchTestClock{}, observer)
+	server := NewS3BlobFetchServer(st, observer)
 	wrongDigest := sha256.Sum256([]byte("expected"))
 	payload := []byte("actual")
 	push := &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: wrongDigest[:], Payload: payload, Eof: true},
+			{ContentSha256: wrongDigest[:], CommitTs: 1, Payload: payload, Eof: true},
 		},
 	}
 
@@ -104,13 +101,13 @@ func TestS3BlobFetchRejectsPushDigestMismatch(t *testing.T) {
 func TestS3BlobFetchRejectsOversizedPush(t *testing.T) {
 	t.Parallel()
 
-	server := NewS3BlobFetchServer(store.NewMVCCStore(), &s3BlobFetchTestClock{}, nil)
+	server := NewS3BlobFetchServer(store.NewMVCCStore(), nil)
 	payload := bytes.Repeat([]byte{0xab}, s3ChunkSize+1)
 	digest := sha256.Sum256(payload)
 	push := &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: digest[:], Payload: payload, Eof: true},
+			{ContentSha256: digest[:], CommitTs: 1, Payload: payload, Eof: true},
 		},
 	}
 
@@ -122,7 +119,7 @@ func TestS3BlobFetchRejectsOversizedPush(t *testing.T) {
 func TestS3BlobFetchRejectsInvalidDigestLength(t *testing.T) {
 	t.Parallel()
 
-	server := NewS3BlobFetchServer(store.NewMVCCStore(), &s3BlobFetchTestClock{}, nil)
+	server := NewS3BlobFetchServer(store.NewMVCCStore(), nil)
 	fetch := &recordingS3BlobFetchStream{ctx: context.Background()}
 	err := server.FetchChunkBlob(&pb.FetchChunkBlobRequest{ContentSha256: []byte("short")}, fetch)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
@@ -130,7 +127,7 @@ func TestS3BlobFetchRejectsInvalidDigestLength(t *testing.T) {
 	push := &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: []byte("short"), Eof: true},
+			{ContentSha256: []byte("short"), CommitTs: 1, Eof: true},
 		},
 	}
 	err = server.PushChunkBlob(push)
@@ -141,12 +138,12 @@ func TestS3BlobFetchRejectsInvalidDigestLength(t *testing.T) {
 func TestS3BlobFetchRejectsFrameAfterEOF(t *testing.T) {
 	t.Parallel()
 
-	server := NewS3BlobFetchServer(store.NewMVCCStore(), &s3BlobFetchTestClock{}, nil)
+	server := NewS3BlobFetchServer(store.NewMVCCStore(), nil)
 	digest := sha256.Sum256([]byte("payloadextra"))
 	push := &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: digest[:], Payload: []byte("payload"), Eof: true},
+			{ContentSha256: digest[:], CommitTs: 1, Payload: []byte("payload"), Eof: true},
 			{Payload: []byte("extra")},
 		},
 	}
@@ -160,49 +157,90 @@ func TestS3BlobFetchPushIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
-	clock := &s3BlobFetchTestClock{next: 41}
-	server := NewS3BlobFetchServer(st, clock, nil)
+	server := NewS3BlobFetchServer(st, nil)
 	payload := []byte("idempotent payload")
 	digest := sha256.Sum256(payload)
 
-	require.NoError(t, server.PushChunkBlob(newS3BlobPushStream(digest, payload)))
-	require.NoError(t, server.PushChunkBlob(newS3BlobPushStream(digest, payload)))
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 42)))
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 43)))
 
 	require.Equal(t, 1, st.applyCalls)
 	require.Zero(t, st.putCalls)
 	require.Equal(t, []uint64{42}, st.applyCommitTS)
-	require.Equal(t, 1, clock.calls)
 }
 
 func TestS3BlobFetchPushAcknowledgesConcurrentMatchingWrite(t *testing.T) {
 	t.Parallel()
 
 	st := &conflictOnceS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
-	clock := &s3BlobFetchTestClock{next: 50}
-	server := NewS3BlobFetchServer(st, clock, nil)
+	server := NewS3BlobFetchServer(st, nil)
 	payload := []byte("concurrent payload")
 	digest := sha256.Sum256(payload)
 
-	require.NoError(t, server.PushChunkBlob(newS3BlobPushStream(digest, payload)))
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 51)))
 	require.Equal(t, 1, st.applyCalls)
-	require.Equal(t, 1, clock.calls)
 }
 
-func TestS3BlobFetchPushFailsWhenFenceExpired(t *testing.T) {
+func TestS3BlobFetchRejectsPushMissingCommitTS(t *testing.T) {
 	t.Parallel()
 
 	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
-	server := NewS3BlobFetchServer(st, &s3BlobFetchTestClock{err: kv.ErrCeilingExpired}, nil)
-	payload := []byte("fenced payload")
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("missing commit timestamp")
 	digest := sha256.Sum256(payload)
 
-	err := server.PushChunkBlob(newS3BlobPushStream(digest, payload))
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	err := server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 0))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.Zero(t, st.applyCalls)
 	require.Zero(t, st.putCalls)
 	_, exists, latestErr := st.LatestCommitTS(context.Background(), s3keys.ChunkBlobKey(digest))
 	require.NoError(t, latestErr)
 	require.False(t, exists)
+}
+
+func TestS3BlobFetchPushRecreatesAfterTombstone(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("recreated payload")
+	digest := sha256.Sum256(payload)
+	key := s3keys.ChunkBlobKey(digest)
+	require.NoError(t, st.DeleteAt(context.Background(), key, 100))
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 101)))
+	require.Equal(t, []uint64{101}, st.applyCommitTS)
+
+	stored, err := st.GetAt(context.Background(), key, 101)
+	require.NoError(t, err)
+	require.Equal(t, payload, stored)
+}
+
+func TestS3BlobFetchPushRejectsStaleCommitTSAfterTombstone(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("stale payload")
+	digest := sha256.Sum256(payload)
+	key := s3keys.ChunkBlobKey(digest)
+	require.NoError(t, st.DeleteAt(context.Background(), key, 100))
+
+	err := server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 100))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Zero(t, st.applyCalls)
+}
+
+func TestS3BlobFetchPushRetriesUntilWriterRegistered(t *testing.T) {
+	t.Parallel()
+
+	st := &registrationOnceS3BlobFetchStore{recordingS3BlobFetchStore: recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("registration retry payload")
+	digest := sha256.Sum256(payload)
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 12)))
+	require.Equal(t, 2, st.applyCalls)
 }
 
 func TestS3BlobFetchFetchReadsInMemoryAfterCompaction(t *testing.T) {
@@ -232,7 +270,7 @@ func requireFetchAfterCompaction(t *testing.T, st store.MVCCStore) {
 	_, err := st.GetAt(context.Background(), key, 10)
 	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 
-	server := NewS3BlobFetchServer(st, nil, nil)
+	server := NewS3BlobFetchServer(st, nil)
 	fetch := &recordingS3BlobFetchStream{ctx: context.Background()}
 	require.NoError(t, server.FetchChunkBlob(&pb.FetchChunkBlobRequest{ContentSha256: digest[:]}, fetch))
 	require.Len(t, fetch.responses, 1)
@@ -248,7 +286,7 @@ func TestS3BlobFetchFetchDigestMismatchReturnsInvalidArgument(t *testing.T) {
 	expected := sha256.Sum256([]byte("expected payload"))
 	require.NoError(t, st.PutAt(context.Background(), s3keys.ChunkBlobKey(expected), []byte("corrupt payload"), 10, 0))
 
-	server := NewS3BlobFetchServer(st, nil, observer)
+	server := NewS3BlobFetchServer(st, observer)
 	fetch := &recordingS3BlobFetchStream{ctx: context.Background()}
 	err := server.FetchChunkBlob(&pb.FetchChunkBlobRequest{ContentSha256: expected[:]}, fetch)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
@@ -256,11 +294,11 @@ func TestS3BlobFetchFetchDigestMismatchReturnsInvalidArgument(t *testing.T) {
 	require.Equal(t, 1, observer.shaMismatch)
 }
 
-func newS3BlobPushStream(digest [s3ChunkBlobSHA256Bytes]byte, payload []byte) *recordingS3BlobPushStream {
+func newS3BlobPushStreamAt(digest [s3ChunkBlobSHA256Bytes]byte, payload []byte, commitTS uint64) *recordingS3BlobPushStream {
 	return &recordingS3BlobPushStream{
 		ctx: context.Background(),
 		reqs: []*pb.PushChunkBlobRequest{
-			{ContentSha256: digest[:], Payload: payload, Eof: true},
+			{ContentSha256: digest[:], CommitTs: commitTS, Payload: payload, Eof: true},
 		},
 	}
 }
@@ -333,21 +371,6 @@ func (*recordingS3BlobPushStream) SendMsg(any) error { return nil }
 
 func (*recordingS3BlobPushStream) RecvMsg(any) error { return nil }
 
-type s3BlobFetchTestClock struct {
-	next  uint64
-	calls int
-	err   error
-}
-
-func (c *s3BlobFetchTestClock) NextFenced() (uint64, error) {
-	c.calls++
-	if c.err != nil {
-		return 0, c.err
-	}
-	c.next++
-	return c.next, nil
-}
-
 type recordingS3BlobFetchStore struct {
 	store.MVCCStore
 	applyCalls    int
@@ -391,5 +414,24 @@ func (s *conflictOnceS3BlobFetchStore) ApplyMutations(
 		}
 		return store.ErrWriteConflict
 	}
+	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
+type registrationOnceS3BlobFetchStore struct {
+	recordingS3BlobFetchStore
+}
+
+func (s *registrationOnceS3BlobFetchStore) ApplyMutations(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	if s.applyCalls == 1 {
+		return store.ErrWriterNotRegistered
+	}
+	s.applyCommitTS = append(s.applyCommitTS, commitTS)
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }

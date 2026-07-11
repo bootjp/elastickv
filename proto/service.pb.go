@@ -2316,6 +2316,7 @@ type PushChunkBlobRequest struct {
 	ContentSha256 []byte                 `protobuf:"bytes,1,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
 	Eof           bool                   `protobuf:"varint,3,opt,name=eof,proto3" json:"eof,omitempty"`
+	CommitTs      uint64                 `protobuf:"varint,4,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2369,6 +2370,13 @@ func (x *PushChunkBlobRequest) GetEof() bool {
 		return x.Eof
 	}
 	return false
+}
+
+func (x *PushChunkBlobRequest) GetCommitTs() uint64 {
+	if x != nil {
+		return x.CommitTs
+	}
+	return 0
 }
 
 type PushChunkBlobResponse struct {
@@ -2594,11 +2602,12 @@ const file_service_proto_rawDesc = "" +
 	"\x0econtent_sha256\x18\x01 \x01(\fR\rcontentSha256\"D\n" +
 	"\x16FetchChunkBlobResponse\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\x12\x10\n" +
-	"\x03eof\x18\x02 \x01(\bR\x03eof\"i\n" +
+	"\x03eof\x18\x02 \x01(\bR\x03eof\"\x86\x01\n" +
 	"\x14PushChunkBlobRequest\x12%\n" +
 	"\x0econtent_sha256\x18\x01 \x01(\fR\rcontentSha256\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12\x10\n" +
-	"\x03eof\x18\x03 \x01(\bR\x03eof\"1\n" +
+	"\x03eof\x18\x03 \x01(\bR\x03eof\x12\x1b\n" +
+	"\tcommit_ts\x18\x04 \x01(\x04R\bcommitTs\"1\n" +
 	"\x15PushChunkBlobResponse\x12\x18\n" +
 	"\adurable\x18\x01 \x01(\bR\adurable\"%\n" +
 	"#RaftAdminTransferLeadershipResponse*\xa9\x01\n" +

@@ -1815,6 +1815,20 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	return handler(ctx, req)
 }
 
+func (g *startupPublicKVGate) streamInterceptor(
+	srv interface{},
+	stream grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler,
+) error {
+	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
+		// Return a raw gRPC status so clients and retry policy see Unavailable.
+		//nolint:wrapcheck
+		return status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return handler(srv, stream)
+}
+
 func (g *startupPublicKVGate) blocked() bool {
 	if g == nil {
 		return false
@@ -1840,7 +1854,8 @@ func startupRotationGatedMethod(fullMethod string) bool {
 		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
 		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
 		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
-		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName:
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+		pb.S3BlobFetch_PushChunkBlob_FullMethodName:
 		return true
 	default:
 		return strings.HasPrefix(fullMethod, "/RawKV/") ||
@@ -2090,7 +2105,7 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(rt.store, coordinate.Clock(), s3BlobObserver))
+		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(rt.store, s3BlobObserver))
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2543,6 +2558,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	adminGRPCOpts := r.adminGRPCOpts
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
+		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
