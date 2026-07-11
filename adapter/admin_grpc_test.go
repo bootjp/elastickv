@@ -376,6 +376,47 @@ func TestGetRaftGroupsLeaderVersionTriesAlternateAddressForSameLeaderID(t *testi
 	}
 }
 
+func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
+	t.Parallel()
+	var callsMu sync.Mutex
+	callsByAddr := map[string]int{}
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		nil,
+		WithAdminLeaderVersionProbeTimeout(200*time.Millisecond),
+		WithAdminLeaderVersionCacheTTL(time.Second),
+		WithAdminLeaderVersionProbe(func(ctx context.Context, addr string) (string, error) {
+			callsMu.Lock()
+			callsByAddr[addr]++
+			callsMu.Unlock()
+			if addr == "10.0.0.12:50051" {
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			return "v-good", nil
+		}),
+	)
+	srv.RegisterGroup(1, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.12:50051"})
+	srv.RegisterGroup(2, fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.22:50051"})
+
+	_, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	if err != nil {
+		t.Fatalf("GetRaftGroups first: %v", err)
+	}
+	require.Eventually(t, func() bool {
+		resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+		if err != nil || len(resp.Groups) != 2 {
+			return false
+		}
+		return resp.Groups[0].LeaderNodeVersion == "v-good" && resp.Groups[1].LeaderNodeVersion == "v-good"
+	}, time.Second, 10*time.Millisecond)
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
+		t.Fatalf("probe calls by address = %v, want timeout candidate and alternate address", callsByAddr)
+	}
+}
+
 func requireLeaderVersion(t *testing.T, resp *pb.GetRaftGroupsResponse, want, label string) {
 	t.Helper()
 	if len(resp.Groups) != 1 {

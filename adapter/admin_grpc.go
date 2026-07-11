@@ -608,6 +608,7 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key string, a
 	timeout := s.leaderVersionProbeTimeout
 	now := s.now
 	candidates := append([]string(nil), addresses...)
+	attemptTimeout := leaderVersionProbeAttemptTimeout(timeout, len(candidates))
 	var md metadata.MD
 	if incoming, ok := metadata.FromIncomingContext(ctx); ok {
 		md = incoming.Copy()
@@ -615,12 +616,14 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key string, a
 	go func() {
 		probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if md != nil {
-			probeCtx = metadata.NewOutgoingContext(probeCtx, md)
-		}
 		version := ""
 		for _, address := range candidates {
-			probed, err := probe(probeCtx, address)
+			attemptCtx, attemptCancel := context.WithTimeout(probeCtx, attemptTimeout)
+			if md != nil {
+				attemptCtx = metadata.NewOutgoingContext(attemptCtx, md)
+			}
+			probed, err := probe(attemptCtx, address)
+			attemptCancel()
 			if err == nil {
 				version = probed
 				break
@@ -631,6 +634,17 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key string, a
 		}
 		s.versionCache.CompareAndSwap(key, reservation, versionCacheEntry{version: version, fetchedAt: now()})
 	}()
+}
+
+func leaderVersionProbeAttemptTimeout(total time.Duration, candidates int) time.Duration {
+	if total <= 0 || candidates <= 1 {
+		return total
+	}
+	perCandidate := total / time.Duration(candidates)
+	if perCandidate <= 0 {
+		return total
+	}
+	return perCandidate
 }
 
 func (s *AdminServer) snapshotLeaders() []*pb.GroupLeader {
