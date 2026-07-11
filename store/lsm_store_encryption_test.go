@@ -686,6 +686,33 @@ func TestEncryption_ValueHeaderTamperRejected(t *testing.T) {
 	}
 }
 
+func TestEncryptionScanKeysAtHeaderTamperRejected(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 1059)
+	ctx := context.Background()
+	const writeTS uint64 = 100
+	const readTS uint64 = 200
+	if err := f.mvcc.PutAt(ctx, []byte("scan-key"), []byte("payload"), writeTS, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+	keys, err := f.mvcc.ScanKeysAt(ctx, []byte("scan-"), []byte("scan."), 10, readTS)
+	if err != nil {
+		t.Fatalf("ScanKeysAt before tamper: %v", err)
+	}
+	if len(keys) != 1 || !bytes.Equal(keys[0], []byte("scan-key")) {
+		t.Fatalf("ScanKeysAt before tamper = %q, want scan-key", keys)
+	}
+
+	f.tamperPebbleValue(t, []byte("scan-key"), writeTS, func(raw []byte) []byte {
+		raw[0] |= tombstoneMask
+		return raw
+	})
+	_, err = f.mvcc.ScanKeysAt(ctx, []byte("scan-"), []byte("scan."), 10, readTS)
+	if !errors.Is(err, ErrEncryptedReadIntegrity) {
+		t.Fatalf("ScanKeysAt over a tampered encrypted entry should fail integrity, got %v", err)
+	}
+}
+
 // TestEncryption_DeletePrefixHeaderTamperRejected covers the PR742
 // claude[bot] round-5 follow-up: isVisibleLiveKey is the write-side
 // counterpart to readVisibleVersion / processFoundValue (read paths

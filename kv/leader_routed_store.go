@@ -260,6 +260,32 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, false)
 }
 
+func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if s == nil || s.local == nil {
+		return [][]byte{}, nil
+	}
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
+		return keys, errors.WithStack(err)
+	}
+	kvs, err := s.proxyRawScanAt(ctx, start, end, limit, ts, false)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([][]byte, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		keys = append(keys, bytes.Clone(kvp.Key))
+	}
+	return keys, nil
+}
+
 func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil

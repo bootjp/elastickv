@@ -328,6 +328,25 @@ func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, 
 	return result
 }
 
+func (s *mvccStore) collectScanKeys(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) [][]byte {
+	result := make([][]byte, 0, capHint)
+	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if end != nil && bytes.Compare(k, end) >= 0 {
+			break
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		if _, visible := visibleValue(versions, ts); !visible {
+			continue
+		}
+		result = append(result, bytes.Clone(k))
+	}
+	return result
+}
+
 func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -345,6 +364,25 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 		return make([]*KVPair, 0, capHint), nil
 	}
 	return s.collectScanResults(&it, end, limit, capHint, ts), nil
+}
+
+func (s *mvccStore) ScanKeysAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
+
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+
+	capHint := computeScanCapHint(s.tree.Size(), limit)
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return make([][]byte, 0, capHint), nil
+	}
+	return s.collectScanKeys(&it, end, limit, capHint, ts), nil
 }
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.

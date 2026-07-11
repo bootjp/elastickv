@@ -179,11 +179,11 @@ func tryEngineLinearizableFence(ctx context.Context, engine raftengine.LeaderVie
 	return err == nil
 }
 
-// ScanAt scans keys across shards at the given timestamp. Note: when the range
-// spans multiple shards, each shard may have a different Raft apply position.
-// This means the returned view is NOT a globally consistent snapshot — it is
-// a best-effort point-in-time scan. Callers requiring cross-shard consistency
-// should use a transaction or implement a cross-shard snapshot fence.
+// ScanAt scans keys across shards at the given timestamp. When the caller has
+// already fenced every group to applied_index >= f(ts), as BeginBackup does,
+// the result is consistent across groups. Without that fence, ranges spanning
+// multiple shards are best-effort because each shard may have a different Raft
+// apply position.
 func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
@@ -197,6 +197,25 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *ShardStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+
+	routes, clampToRoutes := s.routesForScan(start, end)
+	out, err := s.scanKeyRoutesAt(ctx, routes, start, end, limit, ts, clampToRoutes)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i], out[j]) < 0
 	})
 	if len(out) > limit {
 		out = out[:limit]
@@ -284,6 +303,33 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 	return out, nil
 }
 
+func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([][]byte, error) {
+	out := make([][]byte, 0)
+	for _, route := range routes {
+		scanStart := start
+		scanEnd := end
+		if clampToRoutes {
+			scanStart = clampScanStart(start, route.Start)
+			scanEnd = clampScanEnd(end, route.End)
+		}
+
+		keys, err := s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+		if err != nil {
+			return nil, err
+		}
+		if clampToRoutes {
+			out = append(out, keys...)
+			if len(out) >= limit {
+				out = out[:limit]
+				break
+			}
+			continue
+		}
+		out = mergeAndTrimScanKeys(out, keys, limit)
+	}
+	return out, nil
+}
+
 func (s *ShardStore) reverseScanRoutesAt(
 	ctx context.Context,
 	routes []distribution.Route,
@@ -326,6 +372,85 @@ func (s *ShardStore) reverseScanRoutesAt(
 		out = mergeAndTrimReverseScanResults(out, kvs, limit)
 	}
 	return out, nil
+}
+
+func (s *ShardStore) scanKeyRouteAt(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, nil
+	}
+
+	if engineForGroup(g) == nil {
+		return s.scanKeysRouteLocal(ctx, g, start, end, limit, ts)
+	}
+
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
+		return s.scanKeysRouteAtLeader(ctx, g, start, end, limit, ts)
+	}
+
+	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts)
+}
+
+func (s *ShardStore) scanKeysRouteLocal(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	keys, err := g.Store.ScanKeysAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return filterTxnInternalKeys(keys), nil
+}
+
+func (s *ShardStore) scanKeysRouteAtLeader(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	keys, err := g.Store.ScanKeysAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	keyKVs := kvPairsFromKeys(keys)
+	lockStart, lockEnd := scanLockBoundsForKVs(keyKVs, start, end, limit)
+	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, limit)
+	if err != nil {
+		return nil, err
+	}
+	kvs, err := s.resolveScanLocks(ctx, g, keyKVs, lockKVs, ts)
+	if err != nil {
+		return nil, err
+	}
+	return keysFromKVs(kvs), nil
+}
+
+func (s *ShardStore) proxyScanKeysAt(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	return keysFromKVs(filterTxnInternalKVs(kvs)), nil
 }
 
 func (s *ShardStore) clampedReverseScanRouteAt(
@@ -497,6 +622,21 @@ func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int
 	return out[:limit]
 }
 
+func mergeAndTrimScanKeys(out [][]byte, keys [][]byte, limit int) [][]byte {
+	if len(keys) == 0 {
+		return out
+	}
+	out = append(out, keys...)
+	if len(out) <= limit {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i], out[j]) < 0
+	})
+	clear(out[limit:])
+	return out[:limit]
+}
+
 func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
 	if len(kvs) == 0 {
 		return out
@@ -521,6 +661,42 @@ func countNonInternalKVs(kvs []*store.KVPair) int {
 		count++
 	}
 	return count
+}
+
+func kvPairsFromKeys(keys [][]byte) []*store.KVPair {
+	kvs := make([]*store.KVPair, 0, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		kvs = append(kvs, &store.KVPair{Key: bytes.Clone(key)})
+	}
+	return kvs
+}
+
+func keysFromKVs(kvs []*store.KVPair) [][]byte {
+	keys := make([][]byte, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil || len(kvp.Key) == 0 {
+			continue
+		}
+		keys = append(keys, bytes.Clone(kvp.Key))
+	}
+	return keys
+}
+
+func filterTxnInternalKeys(keys [][]byte) [][]byte {
+	if len(keys) == 0 {
+		return keys
+	}
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		if isTxnInternalKey(key) {
+			continue
+		}
+		out = append(out, key)
+	}
+	return out
 }
 
 func (s *ShardStore) groupForID(groupID uint64) (*ShardGroup, bool) {

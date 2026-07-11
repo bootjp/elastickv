@@ -144,6 +144,65 @@ func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	require.Equal(t, k2, kvs[1].Key)
 }
 
+func TestShardStoreScanKeysAt_IncludesKeysAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 2, 0))
+	require.NoError(t, st.DeleteAt(ctx, []byte("b"), 3))
+	require.NoError(t, st.PutAt(ctx, []byte("x"), []byte("vx"), 4, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 5, 0))
+
+	keys, err := st.ScanKeysAt(ctx, []byte(""), nil, 2, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("x")}, keys)
+}
+
+func TestBackupScannerPaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	var commitTS uint64 = 1
+	for _, key := range [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")} {
+		require.NoError(t, st.PutAt(ctx, key, []byte("v"), commitTS, 0))
+		commitTS++
+	}
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 2)
+	defer sc.Close()
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
+}
+
 func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) {
 	t.Parallel()
 
