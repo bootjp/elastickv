@@ -752,6 +752,9 @@ func TestRedis_StreamXAddRecreatesExpiredStreamWithoutStaleEntriesOrTTL(t *testi
 	require.Len(t, entries, 1)
 	require.Equal(t, "1800000000000-0", entries[0].ID)
 	require.Equal(t, "value", entries[0].Values["fresh"])
+
+	server := nodes[0].redisServer
+	requireMissingAt(t, server.store, redisTTLKey([]byte(key)), server.readTS())
 }
 
 // nowNanos returns the current UnixNano timestamp as uint64, failing the

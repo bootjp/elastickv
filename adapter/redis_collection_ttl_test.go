@@ -1021,6 +1021,8 @@ func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
 	require.NotEmpty(t, cleanup)
 	require.False(t, metaFound)
 	require.Zero(t, meta.ExpireAt)
+	require.True(t, elemDelKeysContain(cleanup, redisStreamKey(key)))
+	require.True(t, elemDelKeysContain(cleanup, redisTTLKey(key)))
 }
 
 func elemValueForKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) []byte {

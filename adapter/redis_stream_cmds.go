@@ -311,6 +311,7 @@ func (r *RedisServer) streamCleanupForExpiredRecreate(
 	if err != nil {
 		return nil, store.StreamMeta{}, false, err
 	}
+	cleanup = append(cleanup, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	return cleanup, store.StreamMeta{}, false, nil
 }
 
@@ -464,9 +465,13 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 	if len(legacyCleanup) == 0 {
 		return nil, store.StreamMeta{}, false, nil
 	}
-	ttlMs, err := legacyTTLMillisForRecreateAt(ctx, r.store, key, readTS)
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return nil, store.StreamMeta{}, false, err
+	}
+	if expired {
+		legacyCleanup = append(legacyCleanup, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
+		ttlMs = 0
 	}
 	return legacyCleanup, store.StreamMeta{ExpireAt: ttlMs}, false, nil
 }
