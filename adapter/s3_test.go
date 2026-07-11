@@ -121,14 +121,20 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodGet, "/?uploadId=abc%2F123", nil)
+	const rawQuery = "uploadId=abc%2F123&response-content-disposition=attachment;filename=x"
+	req := newS3TestRequest(http.MethodGet, "/?"+rawQuery, nil)
 	req.Host = "signed-s3.example.test"
 	server.handle(rec, req)
 
-	got := <-proxied
+	var got proxiedRequest
+	select {
+	case got = <-proxied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request was not proxied to the leader")
+	}
 	require.Equal(t, "signed-s3.example.test", got.host)
 	require.Equal(t, "/", got.path)
-	require.Equal(t, "uploadId=abc%2F123", got.rawQuery)
+	require.Equal(t, rawQuery, got.rawQuery)
 	require.Equal(t, "signed-s3.example.test", got.forwardedHost)
 	require.Equal(t, "http", got.forwardedProto)
 	require.Equal(t, http.StatusOK, rec.Code)

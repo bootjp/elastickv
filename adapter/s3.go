@@ -2427,6 +2427,9 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
+			// ReverseProxy removes unparsable query parameters before Rewrite.
+			// Preserve the exact client query because SigV4 signs the raw value.
+			req.Out.URL.RawQuery = req.In.URL.RawQuery
 			// SigV4 includes Host in the canonical request, so the leader must see
 			// the same Host value that the client signed for the follower endpoint.
 			req.Out.Host = req.In.Host
