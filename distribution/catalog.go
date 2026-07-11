@@ -787,11 +787,11 @@ func decodeRouteDescriptorSplitAtHLC(r *bytes.Reader) (uint64, error) {
 	if r.Len() < catalogUint64Bytes {
 		return 0, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
-	var splitAtHLC uint64
-	if err := binary.Read(r, binary.BigEndian, &splitAtHLC); err != nil {
+	var buf [catalogUint64Bytes]byte
+	if _, err := r.Read(buf[:]); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	return splitAtHLC, nil
+	return binary.BigEndian.Uint64(buf[:]), nil
 }
 
 func appendRoutePage(out []*store.KVPair, page []*store.KVPair, prefix []byte) ([]*store.KVPair, []byte, bool) {
