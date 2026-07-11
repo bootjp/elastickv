@@ -25,6 +25,7 @@ const (
 	// Foreground read/write paths still use their own caller deadlines.
 	lockResolverOperationBudget = 250 * time.Millisecond
 	lockResolverMaxL0Files      = defaultFSMCompactorMaxL0Files
+	lockResolverMaxL0Sublevels  = defaultFSMCompactorMaxL0Sublevels
 	lockResolverMaxLSMDebtBytes = defaultFSMCompactorMaxLSMDebtBytes
 )
 
@@ -228,7 +229,10 @@ func (lr *LockResolver) groupReadyForBackgroundResolve(ctx context.Context, gid 
 		lr.log.WarnContext(ctx, "lock resolver: skipping under pebble backpressure",
 			slog.Uint64("gid", gid),
 			slog.Any("l0_files", snap.Levels[0].TablesCount),
+			slog.Any("l0_sublevels", snap.Levels[0].Sublevels),
 			slog.Any("compaction_debt_bytes", snap.Compact.EstimatedDebt),
+			slog.Any("compactions_in_progress", snap.Compact.NumInProgress),
+			slog.Any("compaction_in_progress_bytes", snap.Compact.InProgressBytes),
 		)
 	}
 	return ready
@@ -275,13 +279,11 @@ func lockResolverLSMBackpressured(st store.MVCCStore) (bool, *pebble.Metrics) {
 	if snap == nil {
 		return false, nil
 	}
-	if lockResolverMaxL0Files > 0 && snap.Levels[0].TablesCount >= lockResolverMaxL0Files {
-		return true, snap
-	}
-	if lockResolverMaxLSMDebtBytes > 0 && snap.Compact.EstimatedDebt >= lockResolverMaxLSMDebtBytes {
-		return true, snap
-	}
-	return false, snap
+	return lsmWriteBackpressured(snap, lsmBackpressureLimits{
+		maxL0Files:      lockResolverMaxL0Files,
+		maxL0Sublevels:  lockResolverMaxL0Sublevels,
+		maxLSMDebtBytes: lockResolverMaxLSMDebtBytes,
+	}), snap
 }
 
 func lockResolverBudgetExhausted(err error, workCtx, parentCtx context.Context) bool {
