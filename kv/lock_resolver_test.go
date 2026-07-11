@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -258,4 +260,122 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("LockResolver.Close() did not return within 5s")
 	}
+}
+
+func TestLockResolverRaftReadyRequiresSettledLeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		engine any
+		want   bool
+	}{
+		{name: "nil engine", engine: nil},
+		{
+			name: "follower",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateFollower,
+				status: raftengine.Status{State: raftengine.StateFollower, CommitIndex: 10, AppliedIndex: 10},
+			},
+		},
+		{
+			name: "state/status mismatch fails closed",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateFollower, CommitIndex: 10, AppliedIndex: 10},
+			},
+		},
+		{
+			name: "leader transfer in progress",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, LeadTransferee: 2},
+			},
+		},
+		{
+			name: "pending conf change",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, PendingConfChange: true},
+			},
+		},
+		{
+			name: "fsm backlog",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10, FSMPending: 1},
+			},
+		},
+		{
+			name: "applied lag",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 9},
+			},
+		},
+		{
+			name: "settled leader",
+			engine: lockResolverStatusEngine{
+				state:  raftengine.StateLeader,
+				status: raftengine.Status{State: raftengine.StateLeader, CommitIndex: 10, AppliedIndex: 10},
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, _ := tc.engine.(interface {
+				raftengine.LeaderView
+				raftengine.StatusReader
+			})
+			require.Equal(t, tc.want, lockResolverRaftReady(engine))
+		})
+	}
+}
+
+func TestLockResolverLSMBackpressured(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+
+	noPressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
+	overloaded, _ := lockResolverLSMBackpressured(noPressure)
+	require.False(t, overloaded)
+
+	l0Pressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
+	l0Pressure.metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	overloaded, _ = lockResolverLSMBackpressured(l0Pressure)
+	require.True(t, overloaded)
+
+	debtPressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
+	debtPressure.metrics.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
+	overloaded, _ = lockResolverLSMBackpressured(debtPressure)
+	require.True(t, overloaded)
+}
+
+type lockResolverStatusEngine struct {
+	state  raftengine.State
+	status raftengine.Status
+}
+
+func (e lockResolverStatusEngine) State() raftengine.State { return e.state }
+
+func (e lockResolverStatusEngine) Leader() raftengine.LeaderInfo { return e.status.Leader }
+
+func (e lockResolverStatusEngine) VerifyLeader(context.Context) error { return nil }
+
+func (e lockResolverStatusEngine) LinearizableRead(context.Context) (uint64, error) {
+	return e.status.AppliedIndex, nil
+}
+
+func (e lockResolverStatusEngine) Status() raftengine.Status { return e.status }
+
+type lockResolverBackpressureStore struct {
+	store.MVCCStore
+	metrics *pebble.Metrics
+}
+
+func (s *lockResolverBackpressureStore) Metrics() *pebble.Metrics {
+	return s.metrics
 }
