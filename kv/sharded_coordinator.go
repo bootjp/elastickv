@@ -1092,6 +1092,9 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
+		return nil, err
+	}
 
 	if len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0]) {
 		// Fast path: all mutations and read keys are in a single shard.
@@ -1100,6 +1103,9 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
 		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
+	}
+	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
+		return nil, err
 	}
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion)
 }
@@ -1168,7 +1174,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
 }
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {
@@ -1219,7 +1225,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	if resp == nil {
 		return &CoordinateResponse{}, nil
 	}
-	return &CoordinateResponse{CommitIndex: resp.CommitIndex}, nil
+	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
 }
 
 type preparedGroup struct {
@@ -1978,6 +1984,9 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	}
 	commitTS, err := c.resolveTxnCommitTS(ctx, reqs.StartTS, reqs.CommitTS)
 	if err != nil {
+		return nil, err
+	}
+	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion)

@@ -76,7 +76,6 @@ var (
 	errDistributionRouteIDOverflow      = errors.New("route id overflow")
 	errDistributionNotLeader            = errors.New("not leader for distribution catalog")
 	errDistributionCoordinatorRequired  = errors.New("distribution coordinator is not configured")
-	errDistributionCoordinatorClock     = errors.New("distribution coordinator clock is not configured")
 	errDistributionEngineNotConfigured  = errors.New("distribution engine is not configured")
 )
 
@@ -168,24 +167,24 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
-	splitAtHLC, err := s.allocateSplitCommitTS(snapshot.ReadTS)
-	if err != nil {
-		return nil, err
-	}
-	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, splitAtHLC)
+	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, 0)
 
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, splitAtHLC, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.applyEngineSnapshot(saved); err != nil {
 		return nil, err
 	}
+	savedLeft, savedRight, err := splitChildrenFromSnapshot(saved, left.RouteID, right.RouteID)
+	if err != nil {
+		return nil, err
+	}
 
 	return &pb.SplitRangeResponse{
 		CatalogVersion: saved.Version,
-		Left:           toProtoRouteDescriptor(left),
-		Right:          toProtoRouteDescriptor(right),
+		Left:           toProtoRouteDescriptor(savedLeft),
+		Right:          toProtoRouteDescriptor(savedRight),
 	}, nil
 }
 
@@ -213,7 +212,6 @@ func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
 func (s *DistributionServer) saveSplitResultViaCoordinator(
 	ctx context.Context,
 	readTS uint64,
-	commitTS uint64,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
@@ -233,33 +231,13 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems:    ops,
-		IsTxn:    true,
-		StartTS:  readTS,
-		CommitTS: commitTS,
+		Elems:   ops,
+		IsTxn:   true,
+		StartTS: readTS,
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
 	return s.loadCatalogSnapshotAtLeastVersion(ctx, nextVersion)
-}
-
-func (s *DistributionServer) allocateSplitCommitTS(readTS uint64) (uint64, error) {
-	if readTS == math.MaxUint64 {
-		return 0, grpcStatusError(codes.Internal, "split read timestamp overflow")
-	}
-	clock := s.coordinator.Clock()
-	if clock == nil {
-		return 0, grpcStatusError(codes.FailedPrecondition, errDistributionCoordinatorClock.Error())
-	}
-	clock.Observe(readTS)
-	commitTS, err := clock.NextFenced()
-	if err != nil {
-		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate split commit timestamp: %v", err)
-	}
-	if commitTS <= readTS {
-		return 0, grpcStatusError(codes.Internal, "split commit timestamp did not advance")
-	}
-	return commitTS, nil
 }
 
 func buildCatalogSplitOps(
@@ -281,10 +259,15 @@ func buildCatalogSplitOps(
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
+		patchOffset, err := splitAtHLCPatchOffset(encoded)
+		if err != nil {
+			return nil, err
+		}
 		ops = append(ops, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   distribution.CatalogRouteKey(route.RouteID),
-			Value: encoded,
+			Op:                  kv.Put,
+			Key:                 distribution.CatalogRouteKey(route.RouteID),
+			Value:               encoded,
+			CommitTSValueOffset: patchOffset,
 		})
 	}
 	ops = append(ops, &kv.Elem[kv.OP]{
@@ -298,6 +281,26 @@ func buildCatalogSplitOps(
 		Value: distribution.EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return ops, nil
+}
+
+func splitAtHLCPatchOffset(encoded []byte) (uint64, error) {
+	const splitAtHLCTailBytes = 8
+	if len(encoded) < splitAtHLCTailBytes {
+		return 0, errors.WithStack(distribution.ErrCatalogInvalidRouteRecord)
+	}
+	return uint64(len(encoded) - splitAtHLCTailBytes), nil //nolint:gosec // len was checked to be at least splitAtHLCTailBytes.
+}
+
+func splitChildrenFromSnapshot(snapshot distribution.CatalogSnapshot, leftID uint64, rightID uint64) (distribution.RouteDescriptor, distribution.RouteDescriptor, error) {
+	left, found := findRouteByID(snapshot.Routes, leftID)
+	if !found {
+		return distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, grpcStatusError(codes.Internal, "catalog split committed but left child is missing")
+	}
+	right, found := findRouteByID(snapshot.Routes, rightID)
+	if !found {
+		return distribution.RouteDescriptor{}, distribution.RouteDescriptor{}, grpcStatusError(codes.Internal, "catalog split committed but right child is missing")
+	}
+	return left, right, nil
 }
 
 func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribution.CatalogSnapshot, error) {

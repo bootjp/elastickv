@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -116,6 +117,30 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	meta, err := DecodeTxnMeta(tx.reqs[0][0].Mutations[0].Value)
 	require.NoError(t, err)
 	require.Equal(t, commitTS, meta.CommitTS)
+}
+
+func TestCoordinateDispatchTxn_StampsCommitTSValueOffsetWithoutMutatingElem(t *testing.T) {
+	t.Parallel()
+
+	tx := &stubTransactional{}
+	c := &Coordinate{
+		transactionManager: tx,
+		clock:              NewHLC(),
+	}
+
+	startTS := uint64(10)
+	commitTS := uint64(25)
+	value := make([]byte, 16)
+	resp, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
+		{Op: Put, Key: []byte("k"), Value: value, CommitTSValueOffset: 4},
+	}, nil, startTS, commitTS, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, resp.CommitTS)
+	require.Len(t, tx.reqs, 1)
+
+	got := tx.reqs[0][0].Mutations[1].Value
+	require.Equal(t, commitTS, binary.BigEndian.Uint64(got[4:12]))
+	require.Zero(t, binary.BigEndian.Uint64(value[4:12]))
 }
 
 func TestCoordinateDispatchTxn_PassesReadKeysToRaftEntry(t *testing.T) {

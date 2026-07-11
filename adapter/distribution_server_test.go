@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -306,6 +307,7 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
+	require.Zero(t, coordinator.lastRequestedCommitTS)
 	require.NotZero(t, coordinator.lastCommitTS)
 	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
 
@@ -601,16 +603,17 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 }
 
 type distributionCoordinatorStub struct {
-	store           store.MVCCStore
-	leader          bool
-	clock           *kv.HLC
-	nextTS          uint64
-	lastStartTS     uint64
-	lastCommitTS    uint64
-	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
-	asyncApplyDone  chan error
-	asyncApplyDelay time.Duration
-	dispatchCalls   int
+	store                 store.MVCCStore
+	leader                bool
+	clock                 *kv.HLC
+	nextTS                uint64
+	lastStartTS           uint64
+	lastCommitTS          uint64
+	lastRequestedCommitTS uint64
+	afterDispatch         func(context.Context, store.MVCCStore, uint64) error
+	asyncApplyDone        chan error
+	asyncApplyDelay       time.Duration
+	dispatchCalls         int
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
@@ -626,11 +629,15 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
+	s.lastRequestedCommitTS = reqs.CommitTS
 	startTS, commitTS := s.nextTimestamps(reqs.StartTS, reqs.CommitTS)
 	s.lastStartTS = startTS
 	s.lastCommitTS = commitTS
 
-	mutations, err := coordinatorStubMutations(reqs.Elems)
+	if err := kv.ValidateElemCommitTSPatches(reqs.Elems, commitTS); err != nil {
+		return nil, err
+	}
+	mutations, err := coordinatorStubMutations(reqs.Elems, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -644,12 +651,12 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 				done <- err
 			}
 		}()
-		return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+		return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 	}
 	if err := s.applyDispatch(ctx, mutations, startTS, commitTS); err != nil {
 		return nil, err
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+	return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 }
 
 func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[kv.OP]) error {
@@ -697,10 +704,10 @@ func (s *distributionCoordinatorStub) applyDispatch(
 	return nil
 }
 
-func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
+func coordinatorStubMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
-		mutation, err := coordinatorStubMutation(elem)
+		mutation, err := coordinatorStubMutation(elem, commitTS)
 		if err != nil {
 			return nil, err
 		}
@@ -709,16 +716,20 @@ func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation,
 	return mutations, nil
 }
 
-func coordinatorStubMutation(elem *kv.Elem[kv.OP]) (*store.KVPairMutation, error) {
+func coordinatorStubMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPairMutation, error) {
 	if elem == nil {
 		return nil, kv.ErrInvalidRequest
 	}
 	switch elem.Op {
 	case kv.Put:
+		value := distribution.CloneBytes(elem.Value)
+		if elem.CommitTSValueOffset != 0 {
+			binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:elem.CommitTSValueOffset+8], commitTS)
+		}
 		return &store.KVPairMutation{
 			Op:    store.OpTypePut,
 			Key:   distribution.CloneBytes(elem.Key),
-			Value: distribution.CloneBytes(elem.Value),
+			Value: value,
 		}, nil
 	case kv.Del:
 		return &store.KVPairMutation{
