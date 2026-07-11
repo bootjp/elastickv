@@ -207,6 +207,26 @@ func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
 	require.True(t, coord.IsTimestampLeader())
 }
 
+func TestShardedCoordinatorUsesDedicatedTimestampGroupLeader(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	dataLeaderOnly := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		0: {Engine: &stubFollowerEngine{}},
+		1: {Engine: stubLeaderEngine{}},
+		2: {Engine: &stubFollowerEngine{}},
+	}, 1, NewHLC(), nil).WithTimestampGroup(0)
+	require.False(t, dataLeaderOnly.IsTimestampLeader())
+
+	tsoLeader := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		0: {Engine: stubLeaderEngine{}},
+		1: {Engine: &stubFollowerEngine{}},
+		2: {Engine: &stubFollowerEngine{}},
+	}, 1, NewHLC(), nil).WithTimestampGroup(0)
+	require.True(t, tsoLeader.IsTimestampLeader())
+}
+
 func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) {
 	got, err := NextTimestampThrough(context.Background(), &Coordinate{}, "test")
 	require.NoError(t, err)

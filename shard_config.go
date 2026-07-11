@@ -23,7 +23,10 @@ type rangeSpec struct {
 	groupID uint64
 }
 
-const splitParts = 2
+const (
+	splitParts              = 2
+	dedicatedTSORaftGroupID = 0
+)
 
 var (
 	ErrAddressRequired         = errors.New("address is required")
@@ -39,6 +42,7 @@ var (
 	ErrInvalidSQSFifoPartitionMapEntry  = errors.New("invalid sqsFifoPartitionMap entry")
 	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
 	ErrInvalidRaftGroupPeersEntry       = errors.New("invalid raftGroupPeers entry")
+	ErrShardRangeReservedTSOGroup       = errors.New("shard range references reserved TSO group")
 )
 
 // sqsFifoPartitionMaxPartitions caps the per-queue partition count so
@@ -479,6 +483,9 @@ func parseRaftGroupPeer(entry, part string) (raftengine.Server, error) {
 func defaultGroupID(groups []groupSpec) uint64 {
 	min := uint64(0)
 	for _, g := range groups {
+		if g.id == dedicatedTSORaftGroupID {
+			continue
+		}
 		if min == 0 || g.id < min {
 			min = g.id
 		}
@@ -495,6 +502,9 @@ func validateShardRanges(ranges []rangeSpec, groups []groupSpec) error {
 		ids[g.id] = struct{}{}
 	}
 	for _, r := range ranges {
+		if r.groupID == dedicatedTSORaftGroupID {
+			return errors.Wrapf(ErrShardRangeReservedTSOGroup, "group %d", r.groupID)
+		}
 		if _, ok := ids[r.groupID]; !ok {
 			return errors.WithStack(errors.Newf("shard range references unknown group %d", r.groupID))
 		}

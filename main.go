@@ -453,7 +453,7 @@ func run() error {
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate); err != nil {
+	if err := configureCoordinatorTSO(coordinate, cfg.groups); err != nil {
 		return err
 	}
 
@@ -1572,9 +1572,12 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	return nil
 }
 
-func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
+func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator, groups []groupSpec) error {
 	if !*tsoEnabled {
 		return nil
+	}
+	if hasDedicatedTSOGroup(groups) {
+		coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
 	}
 	tso, err := kv.NewLocalTSOAllocator(coordinate)
 	if err != nil {
@@ -1586,6 +1589,15 @@ func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
 	}
 	coordinate.WithTSOAllocator(batch)
 	return nil
+}
+
+func hasDedicatedTSOGroup(groups []groupSpec) bool {
+	for _, g := range groups {
+		if g.id == dedicatedTSORaftGroupID {
+			return true
+		}
+	}
+	return false
 }
 
 type hlcLeaseRenewalBlocker interface {

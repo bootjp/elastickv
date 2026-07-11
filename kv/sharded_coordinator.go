@@ -374,8 +374,13 @@ type ShardedCoordinator struct {
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
 	tsAllocator TimestampAllocator
-	store       store.MVCCStore
-	log         *slog.Logger
+	// timestampGroup pins IsTimestampLeader to a dedicated Raft group when
+	// timestampGroupConfigured is true. Nil/false preserves the M3 bridge
+	// behavior where any locally-led shard group can issue TSO timestamps.
+	timestampGroup           uint64
+	timestampGroupConfigured bool
+	store                    store.MVCCStore
+	log                      *slog.Logger
 	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
@@ -448,6 +453,15 @@ func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedC
 // path unless this is wired explicitly.
 func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
 	c.tsAllocator = alloc
+	return c
+}
+
+// WithTimestampGroup pins timestamp issuance leadership to one Raft group.
+// Dedicated TSO deployments use this so a data-shard leader cannot allocate
+// persistence timestamps unless it also leads the timestamp group.
+func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
+	c.timestampGroup = groupID
+	c.timestampGroupConfigured = true
 	return c
 }
 
@@ -1582,6 +1596,9 @@ func (c *ShardedCoordinator) IsLeader() bool {
 func (c *ShardedCoordinator) IsTimestampLeader() bool {
 	if c == nil {
 		return false
+	}
+	if c.timestampGroupConfigured {
+		return isLeaderEngine(engineForGroup(c.groups[c.timestampGroup]))
 	}
 	for _, g := range c.groups {
 		if isLeaderEngine(engineForGroup(g)) {
