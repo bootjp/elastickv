@@ -69,6 +69,43 @@ func TestPebbleStoreScanKeysAtMatchesScanAtVisibility(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
 
+func TestPebbleStoreScanAtCursorAfterKeyDoesNotRepeat(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 20, 0))
+
+	kvs, err := st.ScanAt(ctx, cursorAfterTestKey([]byte("a")), nil, 1, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("b"), kvs[0].Key)
+}
+
+func TestPebbleStoreScanKeysAtCursorAfterKeyDoesNotRepeat(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	require.NoError(t, st.PutAt(ctx, []byte(""), []byte("empty"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 20, 0))
+
+	keys, err := st.ScanKeysAt(ctx, cursorAfterTestKey([]byte("")), nil, 1, 20)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a")}, keys)
+}
+
+func cursorAfterTestKey(key []byte) []byte {
+	cursor := make([]byte, len(key)+1)
+	copy(cursor, key)
+	return cursor
+}
+
 func keysFromStoreKVs(kvs []*KVPair) [][]byte {
 	keys := make([][]byte, 0, len(kvs))
 	for _, kvp := range kvs {

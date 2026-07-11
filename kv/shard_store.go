@@ -400,7 +400,7 @@ func (s *ShardStore) scanKeyRouteAt(
 		return s.scanKeysRouteAtLeader(ctx, g, start, end, limit, ts)
 	}
 
-	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts)
+	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts, route.GroupID)
 }
 
 func (s *ShardStore) scanKeysRouteLocal(
@@ -411,11 +411,13 @@ func (s *ShardStore) scanKeysRouteLocal(
 	limit int,
 	ts uint64,
 ) ([][]byte, error) {
-	keys, err := g.Store.ScanKeysAt(ctx, start, end, limit, ts)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return filterTxnInternalKeys(keys), nil
+	return scanKeysWithRefill(start, end, limit, func(cursor []byte, pageLimit int) ([][]byte, error) {
+		keys, err := g.Store.ScanKeysAt(ctx, cursor, end, pageLimit, ts)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return keys, nil
+	})
 }
 
 func (s *ShardStore) scanKeysRouteAtLeader(
@@ -426,21 +428,40 @@ func (s *ShardStore) scanKeysRouteAtLeader(
 	limit int,
 	ts uint64,
 ) ([][]byte, error) {
-	keys, err := g.Store.ScanKeysAt(ctx, start, end, limit, ts)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	if limit <= 0 {
+		return [][]byte{}, nil
 	}
-	keyKVs := kvPairsFromKeys(keys)
-	lockStart, lockEnd := scanLockBoundsForKVs(keyKVs, start, end, limit)
-	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, limit)
-	if err != nil {
-		return nil, err
+
+	out := make([][]byte, 0, limit)
+	cursor := start
+	for len(out) < limit {
+		keys, err := g.Store.ScanKeysAt(ctx, cursor, end, limit, ts)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(keys) == 0 {
+			break
+		}
+
+		keyKVs := kvPairsFromKeys(keys)
+		lockStart, lockEnd := scanLockBoundsForKVs(keyKVs, cursor, end, limit)
+		lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, limit)
+		if err != nil {
+			return nil, err
+		}
+		kvs, err := s.resolveScanLocks(ctx, g, keyKVs, lockKVs, ts)
+		if err != nil {
+			return nil, err
+		}
+		out = mergeAndTrimScanKeys(out, filterTxnInternalKeys(keysFromKVs(kvs)), limit)
+
+		nextCursor, ok := nextKeyScanCursor(keys, end, limit)
+		if !ok {
+			break
+		}
+		cursor = nextCursor
 	}
-	kvs, err := s.resolveScanLocks(ctx, g, keyKVs, lockKVs, ts)
-	if err != nil {
-		return nil, err
-	}
-	return keysFromKVs(kvs), nil
+	return out, nil
 }
 
 func (s *ShardStore) proxyScanKeysAt(
@@ -450,12 +471,68 @@ func (s *ShardStore) proxyScanKeysAt(
 	end []byte,
 	limit int,
 	ts uint64,
+	groupID uint64,
 ) ([][]byte, error) {
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, 0)
-	if err != nil {
-		return nil, err
+	return scanKeysWithRefill(start, end, limit, func(cursor []byte, pageLimit int) ([][]byte, error) {
+		kvs, err := s.proxyRawScanAt(ctx, g, cursor, end, pageLimit, ts, false, groupID)
+		if err != nil {
+			return nil, err
+		}
+		return keysFromKVs(kvs), nil
+	})
+}
+
+func scanKeysWithRefill(
+	start []byte,
+	end []byte,
+	limit int,
+	scan func(cursor []byte, pageLimit int) ([][]byte, error),
+) ([][]byte, error) {
+	if limit <= 0 {
+		return [][]byte{}, nil
 	}
-	return keysFromKVs(filterTxnInternalKVs(kvs)), nil
+
+	out := make([][]byte, 0, limit)
+	cursor := start
+	for len(out) < limit {
+		keys, err := scan(cursor, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(keys) == 0 {
+			break
+		}
+
+		out = mergeAndTrimScanKeys(out, filterTxnInternalKeys(keys), limit)
+
+		nextCursor, ok := nextKeyScanCursor(keys, end, limit)
+		if !ok {
+			break
+		}
+		cursor = nextCursor
+	}
+	return out, nil
+}
+
+func nextKeyScanCursor(keys [][]byte, end []byte, limit int) ([]byte, bool) {
+	lastKey := lastScanKey(keys)
+	if len(keys) < limit || lastKey == nil {
+		return nil, false
+	}
+	nextCursor := nextScanCursor(lastKey)
+	if end != nil && bytes.Compare(nextCursor, end) >= 0 {
+		return nil, false
+	}
+	return nextCursor, true
+}
+
+func lastScanKey(keys [][]byte) []byte {
+	for i := len(keys) - 1; i >= 0; i-- {
+		if keys[i] != nil {
+			return keys[i]
+		}
+	}
+	return nil
 }
 
 func (s *ShardStore) clampedReverseScanRouteAt(
@@ -584,26 +661,28 @@ func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte,
 func observedScanUserBounds(kvs []*store.KVPair) ([]byte, []byte, bool) {
 	var minKey []byte
 	var maxKey []byte
+	seen := false
 	for _, kvp := range kvs {
 		userKey, ok := scanUserKey(kvp)
 		if !ok {
 			continue
 		}
-		if minKey == nil || bytes.Compare(userKey, minKey) < 0 {
+		if !seen || bytes.Compare(userKey, minKey) < 0 {
 			minKey = userKey
 		}
-		if maxKey == nil || bytes.Compare(userKey, maxKey) > 0 {
+		if !seen || bytes.Compare(userKey, maxKey) > 0 {
 			maxKey = userKey
 		}
+		seen = true
 	}
-	if len(minKey) == 0 || len(maxKey) == 0 {
+	if !seen {
 		return nil, nil, false
 	}
 	return minKey, maxKey, true
 }
 
 func scanUserKey(kvp *store.KVPair) ([]byte, bool) {
-	if kvp == nil || len(kvp.Key) == 0 {
+	if kvp == nil || kvp.Key == nil {
 		return nil, false
 	}
 	if !isTxnInternalKey(kvp.Key) {
@@ -632,12 +711,25 @@ func mergeAndTrimScanKeys(out [][]byte, keys [][]byte, limit int) [][]byte {
 		return out
 	}
 	out = append(out, keys...)
-	if len(out) <= limit {
-		return out
-	}
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i], out[j]) < 0
 	})
+	write := 0
+	for _, key := range out {
+		if key == nil {
+			continue
+		}
+		if write > 0 && bytes.Equal(out[write-1], key) {
+			continue
+		}
+		out[write] = key
+		write++
+	}
+	clear(out[write:])
+	out = out[:write]
+	if len(out) <= limit {
+		return out
+	}
 	clear(out[limit:])
 	return out[:limit]
 }
@@ -660,7 +752,7 @@ func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, li
 func countNonInternalKVs(kvs []*store.KVPair) int {
 	count := 0
 	for _, kvp := range kvs {
-		if kvp == nil || isTxnInternalKey(kvp.Key) {
+		if kvp == nil || kvp.Key == nil || isTxnInternalKey(kvp.Key) {
 			continue
 		}
 		count++
@@ -696,7 +788,7 @@ func filterTxnInternalKeys(keys [][]byte) [][]byte {
 	}
 	out := make([][]byte, 0, len(keys))
 	for _, key := range keys {
-		if isTxnInternalKey(key) {
+		if key == nil || isTxnInternalKey(key) {
 			continue
 		}
 		out = append(out, key)
@@ -1064,7 +1156,7 @@ func appendScanLockResolutionBatch(plan *scanLockPlan, txnKey lockTxnKey, phase 
 }
 
 func appendScanItem(plan *scanLockPlan, kvp *store.KVPair, locked bool) {
-	if kvp == nil || len(kvp.Key) == 0 {
+	if kvp == nil || kvp.Key == nil {
 		return
 	}
 	keyID := string(kvp.Key)

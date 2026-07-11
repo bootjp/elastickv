@@ -1022,6 +1022,10 @@ func pastScanEnd(userKey, end []byte) bool {
 	return end != nil && bytes.Compare(userKey, end) >= 0
 }
 
+func beforeScanStart(userKey, start []byte) bool {
+	return start != nil && bytes.Compare(userKey, start) < 0
+}
+
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
@@ -1041,6 +1045,21 @@ func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 		return userKey, version, true
 	}
 	return nil, 0, false
+}
+
+func (s *pebbleStore) nextForwardScanUserKey(iter *pebble.Iterator, start []byte) ([]byte, uint64, bool) {
+	for {
+		userKey, version, ok := nextScannableUserKey(iter)
+		if !ok {
+			return nil, 0, false
+		}
+		if !beforeScanStart(userKey, start) {
+			return userKey, version, true
+		}
+		if !s.skipToNextUserKey(iter, userKey) {
+			return nil, 0, false
+		}
+	}
 }
 
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
@@ -1068,7 +1087,7 @@ func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byt
 	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version, ok := nextScannableUserKey(iter)
+		userKey, version, ok := s.nextForwardScanUserKey(iter, start)
 		if !ok {
 			break
 		}
@@ -1101,7 +1120,7 @@ func (s *pebbleStore) collectScanKeys(iter *pebble.Iterator, start, end []byte, 
 	result := make([][]byte, 0, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version, ok := nextScannableUserKey(iter)
+		userKey, version, ok := s.nextForwardScanUserKey(iter, start)
 		if !ok {
 			break
 		}
