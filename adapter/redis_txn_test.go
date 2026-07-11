@@ -983,6 +983,56 @@ func TestRedisTxnCollectionCreateExpireKeepsTTLIndex(t *testing.T) {
 	}
 }
 
+func TestRedisTxnCollectionExpireDeltaOnlyTruncatedReturnsError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name       string
+		deltaKey   func([]byte, uint64) []byte
+		deltaValue []byte
+	}{
+		{
+			name:       "hash",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "set",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "zset",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("txn:ttl:delta-only-truncated:" + tc.name)
+			for ts := uint64(1); ts <= store.MaxDeltaScanLimit+1; ts++ {
+				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
+			}
+
+			txn := newRedisTxnTestContext(server)
+			txn.startTS = store.MaxDeltaScanLimit + 2
+			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), expireRes.integer)
+
+			elems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+			require.ErrorIs(t, err, ErrDeltaScanTruncated)
+			require.Empty(t, elems)
+			require.Empty(t, skipTTLIndex)
+		})
+	}
+}
+
 func TestRedisTxnSetAfterHLLExpireSkipsDirtyHLLAnchor(t *testing.T) {
 	t.Parallel()
 

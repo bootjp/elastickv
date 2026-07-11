@@ -1140,6 +1140,61 @@ return redis.call("pexpire", KEYS[1], ARGV[1])
 	require.Equal(t, meta.ExpireAt, redisExpireAtMillis(*ttlValue))
 }
 
+func TestRedisLuaNonStringTTLDeltaOnlyTruncatedReturnsError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name       string
+		typ        redisValueType
+		deltaKey   func([]byte, uint64) []byte
+		deltaValue []byte
+	}{
+		{
+			name:       "hash",
+			typ:        redisTypeHash,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "set",
+			typ:        redisTypeSet,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "zset",
+			typ:        redisTypeZSet,
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("ttl:lua:delta-only-truncated:" + tc.name)
+			for ts := uint64(1); ts <= store.MaxDeltaScanLimit+1; ts++ {
+				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
+			}
+
+			expireAt := time.Now().Add(time.Minute)
+			scriptCtx := &luaScriptContext{
+				server:  server,
+				startTS: store.MaxDeltaScanLimit + 2,
+				ttls: map[string]*luaTTLState{
+					string(key): {loaded: true, dirty: true, value: &expireAt},
+				},
+			}
+			elems, err := scriptCtx.nonStringTTLElems(ctx, string(key), tc.typ, true)
+			require.ErrorIs(t, err, ErrDeltaScanTruncated)
+			require.Empty(t, elems)
+		})
+	}
+}
+
 func TestRedisLuaStagedCollectionCreateWritesInlineTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
