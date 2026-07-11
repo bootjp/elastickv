@@ -18,10 +18,41 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type s3BlobFetchPreservingStore interface {
+	ApplyMutationsPreservingLastCommitTS(context.Context, []*store.KVPairMutation, [][]byte, uint64, uint64) error
+}
+
+type s3BlobFetchLastCommitTSStore interface {
+	LastCommitTS() uint64
+}
+
+func requireS3BlobFetchLastCommitTS(t *testing.T, st store.MVCCStore, want uint64) {
+	t.Helper()
+	reader, ok := st.(s3BlobFetchLastCommitTSStore)
+	require.True(t, ok)
+	require.Equal(t, want, reader.LastCommitTS())
+}
+
+func applyS3BlobFetchMutationsPreservingLastCommitTS(
+	st store.MVCCStore,
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	preserving, ok := st.(s3BlobFetchPreservingStore)
+	if !ok {
+		return errors.New("s3 blob fetch test store cannot preserve last commit timestamp")
+	}
+	return preserving.ApplyMutationsPreservingLastCommitTS(ctx, mutations, readKeys, startTS, commitTS)
+}
+
 func TestS3BlobFetchPushStoresAndFetchStreamsPayload(t *testing.T) {
 	t.Parallel()
 
-	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
+	base := store.NewMVCCStore()
+	st := &recordingS3BlobFetchStore{MVCCStore: base}
 	observer := &recordingS3BlobOffloadObserver{}
 	server := NewS3BlobFetchServer(st, observer)
 	payload := bytes.Repeat([]byte("payload-"), (s3BlobFetchFrameBytes/len("payload-"))+2)
@@ -39,6 +70,7 @@ func TestS3BlobFetchPushStoresAndFetchStreamsPayload(t *testing.T) {
 	require.Equal(t, 1, st.applyCalls)
 	require.Zero(t, st.putCalls)
 	require.Equal(t, []uint64{100}, st.applyCommitTS)
+	requireS3BlobFetchLastCommitTS(t, base, 0)
 
 	key := s3keys.ChunkBlobKey(digest)
 	readTS, exists, err := st.LatestCommitTS(context.Background(), key)
@@ -190,10 +222,57 @@ func TestS3BlobFetchPushRestampsExistingPayloadAtLeaderCommitTS(t *testing.T) {
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 30)))
 
 	require.Equal(t, []uint64{30}, st.applyCommitTS)
+	requireS3BlobFetchLastCommitTS(t, base, 10)
 	latestTS, exists, err := st.LatestCommitTS(context.Background(), key)
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(30), latestTS)
+}
+
+func TestS3BlobFetchPushDoesNotAdvanceMVCCWatermark(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &recordingS3BlobFetchStore{MVCCStore: base}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("remote leader timestamp must not become local watermark")
+	digest := sha256.Sum256(payload)
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 500)))
+
+	requireS3BlobFetchLastCommitTS(t, base, 0)
+	key := s3keys.ChunkBlobKey(digest)
+	latestTS, exists, err := st.LatestCommitTS(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(500), latestTS)
+	got, err := st.GetAt(context.Background(), key, 500)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestS3BlobFetchPushDoesNotAdvancePebbleMVCCWatermark(t *testing.T) {
+	t.Parallel()
+
+	base, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.Close()) })
+	st := &recordingS3BlobFetchStore{MVCCStore: base}
+	server := NewS3BlobFetchServer(st, nil)
+	payload := []byte("remote leader timestamp must not become pebble watermark")
+	digest := sha256.Sum256(payload)
+
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 700)))
+
+	require.Equal(t, uint64(0), base.LastCommitTS())
+	key := s3keys.ChunkBlobKey(digest)
+	latestTS, exists, latestErr := st.LatestCommitTS(context.Background(), key)
+	require.NoError(t, latestErr)
+	require.True(t, exists)
+	require.Equal(t, uint64(700), latestTS)
+	got, getErr := st.GetAt(context.Background(), key, 700)
+	require.NoError(t, getErr)
+	require.Equal(t, payload, got)
 }
 
 func TestS3BlobFetchPushAcknowledgesConcurrentMatchingWrite(t *testing.T) {
@@ -291,7 +370,8 @@ func TestS3BlobFetchRejectsPushMissingCommitTS(t *testing.T) {
 func TestS3BlobFetchPushRecreatesAfterTombstone(t *testing.T) {
 	t.Parallel()
 
-	st := &recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()}
+	base := store.NewMVCCStore()
+	st := &recordingS3BlobFetchStore{MVCCStore: base}
 	server := NewS3BlobFetchServer(st, nil)
 	payload := []byte("recreated payload")
 	digest := sha256.Sum256(payload)
@@ -300,6 +380,7 @@ func TestS3BlobFetchPushRecreatesAfterTombstone(t *testing.T) {
 
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 101)))
 	require.Equal(t, []uint64{101}, st.applyCommitTS)
+	requireS3BlobFetchLastCommitTS(t, base, 100)
 
 	stored, err := st.GetAt(context.Background(), key, 101)
 	require.NoError(t, err)
@@ -331,6 +412,27 @@ func TestS3BlobFetchPushRetriesUntilWriterRegistered(t *testing.T) {
 
 	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 12)))
 	require.Equal(t, 2, st.applyCalls)
+}
+
+func TestS3BlobFetchPushRechecksGateDuringRegistrationRetry(t *testing.T) {
+	t.Parallel()
+
+	blocked := false
+	st := &registrationOnceS3BlobFetchStore{
+		recordingS3BlobFetchStore: recordingS3BlobFetchStore{MVCCStore: store.NewMVCCStore()},
+		afterFirstErr:             func() { blocked = true },
+	}
+	server := NewS3BlobFetchServer(
+		st,
+		nil,
+		WithS3BlobFetchPushBlocked(func() bool { return blocked }),
+	)
+	payload := []byte("registration retry gate closes")
+	digest := sha256.Sum256(payload)
+
+	err := server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 12))
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, 1, st.applyCalls)
 }
 
 func TestS3BlobFetchFetchReadsInMemoryAfterCompaction(t *testing.T) {
@@ -491,6 +593,19 @@ func (s *recordingS3BlobFetchStore) ApplyMutations(
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
+func (s *recordingS3BlobFetchStore) ApplyMutationsPreservingLastCommitTS(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
+	s.applyCommitTS = append(s.applyCommitTS, commitTS)
+	return applyS3BlobFetchMutationsPreservingLastCommitTS(s.MVCCStore, ctx, mutations, readKeys, startTS, commitTS)
+}
+
 type conflictOnceS3BlobFetchStore struct {
 	store.MVCCStore
 	applyCalls int
@@ -513,8 +628,26 @@ func (s *conflictOnceS3BlobFetchStore) ApplyMutations(
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
+func (s *conflictOnceS3BlobFetchStore) ApplyMutationsPreservingLastCommitTS(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	if s.applyCalls == 1 {
+		if err := applyS3BlobFetchMutationsPreservingLastCommitTS(s.MVCCStore, ctx, mutations, readKeys, startTS, commitTS); err != nil {
+			return err
+		}
+		return store.ErrWriteConflict
+	}
+	return applyS3BlobFetchMutationsPreservingLastCommitTS(s.MVCCStore, ctx, mutations, readKeys, startTS, commitTS)
+}
+
 type registrationOnceS3BlobFetchStore struct {
 	recordingS3BlobFetchStore
+	afterFirstErr func()
 }
 
 func (s *registrationOnceS3BlobFetchStore) ApplyMutations(
@@ -531,6 +664,25 @@ func (s *registrationOnceS3BlobFetchStore) ApplyMutations(
 	}
 	s.applyCommitTS = append(s.applyCommitTS, commitTS)
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
+func (s *registrationOnceS3BlobFetchStore) ApplyMutationsPreservingLastCommitTS(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
+	if s.applyCalls == 1 {
+		if s.afterFirstErr != nil {
+			s.afterFirstErr()
+		}
+		return store.ErrWriterNotRegistered
+	}
+	s.applyCommitTS = append(s.applyCommitTS, commitTS)
+	return applyS3BlobFetchMutationsPreservingLastCommitTS(s.MVCCStore, ctx, mutations, readKeys, startTS, commitTS)
 }
 
 type tombstoneConflictS3BlobFetchStore struct {
@@ -558,4 +710,26 @@ func (s *tombstoneConflictS3BlobFetchStore) ApplyMutations(
 		return store.ErrWriteConflict
 	}
 	return s.MVCCStore.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
+func (s *tombstoneConflictS3BlobFetchStore) ApplyMutationsPreservingLastCommitTS(
+	ctx context.Context,
+	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) error {
+	s.applyCalls++
+	s.applyStartTS = append(s.applyStartTS, startTS)
+	s.applyCommitTS = append(s.applyCommitTS, commitTS)
+	if s.applyCalls == 1 {
+		if len(mutations) == 0 {
+			return store.ErrWriteConflict
+		}
+		if err := s.DeleteAt(ctx, mutations[0].Key, s.tombstoneTS); err != nil {
+			return err
+		}
+		return store.ErrWriteConflict
+	}
+	return applyS3BlobFetchMutationsPreservingLastCommitTS(s.MVCCStore, ctx, mutations, readKeys, startTS, commitTS)
 }

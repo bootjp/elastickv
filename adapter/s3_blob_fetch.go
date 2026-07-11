@@ -40,6 +40,10 @@ type S3BlobFetchServer struct {
 
 type S3BlobFetchServerOption func(*S3BlobFetchServer)
 
+type s3ChunkBlobMutationStore interface {
+	ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
+}
+
 func WithS3BlobFetchClock(clock *kv.HLC) S3BlobFetchServerOption {
 	return func(s *S3BlobFetchServer) {
 		s.clock = clock
@@ -287,7 +291,11 @@ func (s *S3BlobFetchServer) latestChunkBlobTS(ctx context.Context, key []byte) (
 }
 
 func (s *S3BlobFetchServer) applyChunkBlob(ctx context.Context, key, payload []byte, startTS, commitTS uint64) error {
-	if err := s.store.ApplyMutations(ctx, []*store.KVPairMutation{{
+	chunkStore, ok := s.store.(s3ChunkBlobMutationStore)
+	if !ok {
+		return s3BlobFetchStatus(codes.FailedPrecondition, "s3 chunkblob store cannot preserve mvcc watermark")
+	}
+	if err := chunkStore.ApplyMutationsPreservingLastCommitTS(ctx, []*store.KVPairMutation{{
 		Op:    store.OpTypePut,
 		Key:   key,
 		Value: payload,
@@ -300,6 +308,9 @@ func (s *S3BlobFetchServer) applyChunkBlob(ctx context.Context, key, payload []b
 func (s *S3BlobFetchServer) applyChunkBlobUntilRegistered(ctx context.Context, key, payload []byte, startTS, commitTS uint64) error {
 	backoff := s3BlobFetchRegistrationRetryInitial
 	for {
+		if err := s.ensurePushAllowed(); err != nil {
+			return err
+		}
 		err := s.applyChunkBlob(ctx, key, payload, startTS, commitTS)
 		if err == nil || !errors.Is(err, store.ErrWriterNotRegistered) {
 			return err
