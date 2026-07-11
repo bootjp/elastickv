@@ -178,6 +178,31 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestLockResolver_SkipsWhenPrimaryGroupBackpressured(t *testing.T) {
+	t.Parallel()
+
+	lr, _, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS := uint64(25)
+	primaryKey := []byte("b")   // group 1
+	secondaryKey := []byte("n") // group 2
+
+	prepareLock(t, groups[1], startTS, primaryKey, primaryKey, []byte("v1"), 0)
+	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
+
+	metrics := &pebble.Metrics{}
+	metrics.Levels[0].TablesCount = lockResolverMaxL0Files
+	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
+
+	err := lr.resolveGroupLocks(ctx, 2, groups[2])
+	require.NoError(t, err)
+
+	_, err = groups[2].Store.GetAt(ctx, txnLockKey(secondaryKey), ^uint64(0))
+	require.NoError(t, err)
+}
+
 func TestLockResolver_SkipsNonExpiredLocks(t *testing.T) {
 	t.Parallel()
 
@@ -338,20 +363,37 @@ func TestLockResolverLSMBackpressured(t *testing.T) {
 	t.Parallel()
 
 	base := store.NewMVCCStore()
+	tests := []struct {
+		name  string
+		setup func(*pebble.Metrics)
+		want  bool
+	}{
+		{name: "no pressure", setup: func(*pebble.Metrics) {}, want: false},
+		{
+			name: "l0 files at threshold",
+			setup: func(m *pebble.Metrics) {
+				m.Levels[0].TablesCount = lockResolverMaxL0Files
+			},
+			want: true,
+		},
+		{
+			name: "compaction debt at threshold",
+			setup: func(m *pebble.Metrics) {
+				m.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
+			},
+			want: true,
+		},
+	}
 
-	noPressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
-	overloaded, _ := lockResolverLSMBackpressured(noPressure)
-	require.False(t, overloaded)
-
-	l0Pressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
-	l0Pressure.metrics.Levels[0].TablesCount = lockResolverMaxL0Files
-	overloaded, _ = lockResolverLSMBackpressured(l0Pressure)
-	require.True(t, overloaded)
-
-	debtPressure := &lockResolverBackpressureStore{MVCCStore: base, metrics: &pebble.Metrics{}}
-	debtPressure.metrics.Compact.EstimatedDebt = lockResolverMaxLSMDebtBytes
-	overloaded, _ = lockResolverLSMBackpressured(debtPressure)
-	require.True(t, overloaded)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := &pebble.Metrics{}
+			tc.setup(metrics)
+			st := &lockResolverBackpressureStore{MVCCStore: base, metrics: metrics}
+			overloaded, _ := lockResolverLSMBackpressured(st)
+			require.Equal(t, tc.want, overloaded)
+		})
+	}
 }
 
 type lockResolverStatusEngine struct {

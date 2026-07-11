@@ -81,23 +81,22 @@ func (lr *LockResolver) run(ctx context.Context) {
 }
 
 func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, lockResolverCycleBudget)
+	defer cancel()
+
 	for gid, g := range lr.groups {
 		if ctx.Err() != nil {
 			return
 		}
-		if !lr.groupReadyForBackgroundResolve(ctx, gid, g) {
-			continue
+		if passCtx.Err() != nil {
+			lr.logLockResolverYield(gid, passCtx.Err())
+			return
 		}
-		groupCtx, cancel := context.WithTimeout(ctx, lockResolverCycleBudget)
-		err := lr.resolveGroupLocks(groupCtx, gid, g)
-		cancel()
+		err := lr.resolveGroupLocks(passCtx, gid, g)
 		if err != nil {
-			if errors.Is(err, errLockResolverBudgetExhausted) || lockResolverBudgetExhausted(err, groupCtx, ctx) {
-				lr.log.Warn("lock resolver: yielding after resolver budget",
-					slog.Uint64("gid", gid),
-					slog.Any("err", err),
-				)
-				continue
+			if errors.Is(err, errLockResolverBudgetExhausted) || lockResolverBudgetExhausted(err, passCtx, ctx) {
+				lr.logLockResolverYield(gid, err)
+				return
 			}
 			lr.log.Warn("lock resolver: group scan failed",
 				slog.Uint64("gid", gid),
@@ -108,7 +107,7 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 }
 
 func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *ShardGroup) error {
-	if !lockResolverGroupCanResolve(g) {
+	if !lr.groupReadyForBackgroundResolve(ctx, gid, g) {
 		return nil
 	}
 
@@ -149,14 +148,19 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 }
 
 func lockResolverGroupCanResolve(g *ShardGroup) bool {
+	ready, _, _ := lockResolverGroupResolveState(g)
+	return ready
+}
+
+func lockResolverGroupResolveState(g *ShardGroup) (ready bool, overloaded bool, snap *pebble.Metrics) {
 	if g == nil || g.Store == nil {
-		return false
+		return false, false, nil
 	}
 	if !lockResolverRaftReady(engineForGroup(g)) {
-		return false
+		return false, false, nil
 	}
-	overloaded, _ := lockResolverLSMBackpressured(g.Store)
-	return !overloaded
+	overloaded, snap = lockResolverLSMBackpressured(g.Store)
+	return !overloaded, overloaded, snap
 }
 
 func lockResolveOutcomeCounts(outcome lockResolveOutcome) (resolved int, skippedActive int) {
@@ -198,10 +202,13 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 	if !txnLockExpired(lock) {
 		return lockResolveSkippedActive, nil
 	}
+	if !lr.primaryGroupReadyForBackgroundResolve(lock.PrimaryKey) {
+		return lockResolveIgnored, nil
+	}
 
 	opCtx, cancel := context.WithTimeout(ctx, lockResolverOperationBudget)
+	defer cancel()
 	err = lr.resolveExpiredLock(opCtx, g, userKey, lock)
-	cancel()
 	if err == nil {
 		return lockResolveResolved, nil
 	}
@@ -219,21 +226,27 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 }
 
 func (lr *LockResolver) groupReadyForBackgroundResolve(ctx context.Context, gid uint64, g *ShardGroup) bool {
-	if g == nil || g.Store == nil {
-		return false
-	}
-	if !lockResolverRaftReady(engineForGroup(g)) {
-		return false
-	}
-	if overloaded, snap := lockResolverLSMBackpressured(g.Store); overloaded {
+	ready, overloaded, snap := lockResolverGroupResolveState(g)
+	if overloaded {
 		lr.log.WarnContext(ctx, "lock resolver: skipping under pebble backpressure",
-			"group_id", gid,
-			"l0_files", snap.Levels[0].TablesCount,
-			"compaction_debt_bytes", snap.Compact.EstimatedDebt,
+			slog.Uint64("gid", gid),
+			slog.Any("l0_files", snap.Levels[0].TablesCount),
+			slog.Any("compaction_debt_bytes", snap.Compact.EstimatedDebt),
 		)
-		return false
 	}
-	return true
+	return ready
+}
+
+func (lr *LockResolver) primaryGroupReadyForBackgroundResolve(primaryKey []byte) bool {
+	pg, ok := lr.store.groupForKey(primaryKey)
+	return ok && lockResolverGroupCanResolve(pg)
+}
+
+func (lr *LockResolver) logLockResolverYield(gid uint64, err error) {
+	lr.log.Warn("lock resolver: yielding after resolver budget",
+		slog.Uint64("gid", gid),
+		slog.Any("err", err),
+	)
 }
 
 func lockResolverRaftReady(engine interface {

@@ -1029,6 +1029,30 @@ func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	return nil, 0, false
 }
 
+func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]byte, uint64, bool, error) {
+	for iter.Valid() {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, false, errors.WithStack(err)
+		}
+		rawKey := iter.Key()
+		if isPebbleMetaKey(rawKey) {
+			if !iter.Next() {
+				return nil, 0, false, nil
+			}
+			continue
+		}
+		userKey, version := decodeKey(rawKey)
+		if userKey == nil {
+			if !iter.Next() {
+				return nil, 0, false, nil
+			}
+			continue
+		}
+		return userKey, version, true, nil
+	}
+	return nil, 0, false, nil
+}
+
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
@@ -1050,11 +1074,14 @@ func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	return nil, false
 }
 
-func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+func (s *pebbleStore) collectScanResults(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version, ok := nextScannableUserKey(iter)
+		userKey, version, ok, err := nextScannableUserKeyContext(ctx, iter)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			break
 		}
@@ -1087,11 +1114,17 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 	if limit <= 0 {
 		return []*KVPair{}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	// Acquire dbMu.RLock before reading effectiveMinRetainedTS (which takes
 	// mtx.RLock) to preserve the global lock ordering: dbMu before mtx.
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
@@ -1105,7 +1138,7 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 	}
 	defer iter.Close()
 
-	return s.collectScanResults(iter, start, end, limit, ts)
+	return s.collectScanResults(ctx, iter, start, end, limit, ts)
 }
 
 func (s *pebbleStore) collectReverseScanResults(
