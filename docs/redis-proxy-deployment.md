@@ -36,6 +36,8 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
 | `-elastickv-pool-size` | `4` | ElasticKV backend connection pool size |
+| `-secondary-write-concurrency` | `0` | Maximum concurrent asynchronous secondary writes. `0` derives half of the secondary backend pool size, minimum `1` |
+| `-secondary-script-concurrency` | `0` | Maximum concurrent asynchronous secondary Lua-script writes. `0` derives half of `-secondary-write-concurrency`, minimum `1` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
 | `-secondary-timeout` | `5s` | Secondary write timeout |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
@@ -91,6 +93,8 @@ docker run --rm \
   -primary-password "${REDIS_PASSWORD}" \
   -secondary elastickv.internal:6380 \
   -elastickv-pool-size 4 \
+  -secondary-write-concurrency 2 \
+  -secondary-script-concurrency 1 \
   -mode dual-write-shadow \
   -secondary-timeout 5s \
   -shadow-timeout 3s \
@@ -113,6 +117,8 @@ services:
       - -primary=redis:6379
       - -secondary=elastickv:6380
       - -elastickv-pool-size=4
+      - -secondary-write-concurrency=2
+      - -secondary-script-concurrency=1
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
