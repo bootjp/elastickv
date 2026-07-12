@@ -145,7 +145,6 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 		if ctx.Err() != nil {
 			return errors.WithStack(ctx.Err())
 		}
-		lr.advanceLockScanStart(gid, kvp.Key, lockEnd)
 		if !lockResolverRaftReady(engineForGroup(g)) {
 			return nil
 		}
@@ -153,6 +152,7 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 		if err != nil {
 			return err
 		}
+		lr.advanceLockScanStart(gid, kvp.Key, lockEnd)
 		resolvedDelta, skippedDelta := lockResolveOutcomeCounts(outcome)
 		resolved += resolvedDelta
 		skipped += skippedDelta

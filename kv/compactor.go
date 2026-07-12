@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -16,6 +17,7 @@ const (
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
 	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
+	defaultFSMCompactorTimeoutBackoff  = 30 * time.Minute
 	defaultFSMCompactorMaxL0Files      = 256
 	defaultFSMCompactorMaxL0Sublevels  = 12
 	defaultFSMCompactorMaxLSMDebtBytes = 512 << 20
@@ -40,10 +42,13 @@ type FSMCompactor struct {
 	retentionWindow time.Duration
 	timeout         time.Duration
 	leaderTimeout   time.Duration
+	timeoutBackoff  time.Duration
 	maxL0Files      int64
 	maxL0Sublevels  int32
 	maxLSMDebtBytes uint64
 	logger          *slog.Logger
+	mu              sync.Mutex
+	backoffUntil    map[uint64]time.Time
 }
 
 type pebbleMetricsSource interface {
@@ -88,6 +93,14 @@ func WithFSMCompactorLeaderTimeout(timeout time.Duration) FSMCompactorOption {
 	}
 }
 
+func WithFSMCompactorTimeoutBackoff(backoff time.Duration) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if backoff >= 0 {
+			c.timeoutBackoff = backoff
+		}
+	}
+}
+
 func WithFSMCompactorLSMBackpressureLimits(maxL0Files int64, maxDebtBytes uint64) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if maxL0Files > 0 {
@@ -122,10 +135,12 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		retentionWindow: defaultFSMCompactorRetentionWindow,
 		timeout:         defaultFSMCompactorTimeout,
 		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
+		timeoutBackoff:  defaultFSMCompactorTimeoutBackoff,
 		maxL0Files:      defaultFSMCompactorMaxL0Files,
 		maxL0Sublevels:  defaultFSMCompactorMaxL0Sublevels,
 		maxLSMDebtBytes: defaultFSMCompactorMaxLSMDebtBytes,
 		logger:          slog.Default(),
+		backoffUntil:    make(map[uint64]time.Time),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -203,6 +218,10 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	if shouldSkipFSMCompaction(status) {
 		return nil
 	}
+	now := time.Now()
+	if c.compactionBackoffActive(runtime.GroupID, now) {
+		return nil
+	}
 	if overloaded, snap := c.lsmBackpressure(runtime.Store); overloaded {
 		c.logger.WarnContext(ctx, "skipping fsm compaction under pebble backpressure",
 			"group_id", runtime.GroupID,
@@ -216,7 +235,7 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	}
 
 	lastCommitTS := runtime.Store.LastCommitTS()
-	safeMinTS, ok := c.targetMinTS(lastCommitTS, retention.MinRetainedTS(), time.Now())
+	safeMinTS, ok := c.targetMinTS(lastCommitTS, retention.MinRetainedTS(), now)
 	if !ok {
 		return nil
 	}
@@ -225,6 +244,9 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	defer cancel()
 
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
+		if fsmCompactionBudgetExhausted(err, compactCtx, ctx) {
+			c.backoffCompaction(runtime.GroupID, c.timeoutBackoff)
+		}
 		return errors.Wrapf(err, "compact group %d", runtime.GroupID)
 	}
 	c.logger.InfoContext(compactCtx, "fsm compacted",
@@ -280,9 +302,6 @@ func (c *FSMCompactor) lsmBackpressure(st store.MVCCStore) (bool, *pebble.Metric
 }
 
 func shouldSkipFSMCompaction(status raftengine.Status) bool {
-	if status.State == raftengine.StateLeader && status.NumPeers > 0 {
-		return true
-	}
 	if status.State == raftengine.StateCandidate {
 		return true
 	}
@@ -293,6 +312,47 @@ func shouldSkipFSMCompaction(status raftengine.Status) bool {
 		return true
 	}
 	return status.AppliedIndex < status.CommitIndex
+}
+
+func (c *FSMCompactor) compactionBackoffActive(groupID uint64, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	until, ok := c.backoffUntil[groupID]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(c.backoffUntil, groupID)
+	return false
+}
+
+func (c *FSMCompactor) backoffCompaction(groupID uint64, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureStateLocked()
+	c.backoffUntil[groupID] = time.Now().Add(d)
+}
+
+func (c *FSMCompactor) ensureStateLocked() {
+	if c.backoffUntil == nil {
+		c.backoffUntil = make(map[uint64]time.Time)
+	}
+}
+
+func fsmCompactionBudgetExhausted(err error, workCtx, parentCtx context.Context) bool {
+	if err == nil || workCtx == nil {
+		return false
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return false
+	}
+	return workCtx.Err() != nil
 }
 
 func (c *FSMCompactor) safeMinTS(now time.Time) uint64 {

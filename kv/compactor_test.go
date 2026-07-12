@@ -60,6 +60,20 @@ func (s *metricsCapturingStore) Metrics() *pebble.Metrics {
 	return s.metrics
 }
 
+type timeoutCompactionStore struct {
+	deadlineCapturingStore
+	calls int
+}
+
+func (s *timeoutCompactionStore) Compact(ctx context.Context, minTS uint64) error {
+	s.calls++
+	s.compactCalled = true
+	s.compactMinTS = minTS
+	s.deadline, s.hasDeadline = ctx.Deadline()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func requireDeadlineWithin(t *testing.T, deadline time.Time, start time.Time, timeout time.Duration) {
 	t.Helper()
 	require.False(t, deadline.Before(start))
@@ -160,9 +174,11 @@ func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 	require.Equal(t, []byte("v10"), val)
 }
 
-func TestFSMCompactorSkipsMultiPeerLeaderRuntime(t *testing.T) {
+func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T) {
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
+	leaderTimeout := 20 * time.Millisecond
+	start := time.Now()
 
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
@@ -178,10 +194,15 @@ func TestFSMCompactorSkipsMultiPeerLeaderRuntime(t *testing.T) {
 		}},
 		WithFSMCompactorInterval(time.Hour),
 		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorTimeout(time.Hour),
+		WithFSMCompactorLeaderTimeout(leaderTimeout),
 	)
 
 	require.NoError(t, compactor.SyncOnce(ctx))
-	require.False(t, st.compactCalled)
+
+	require.True(t, st.compactCalled)
+	require.True(t, st.hasDeadline)
+	requireDeadlineWithin(t, st.deadline, start, leaderTimeout)
 }
 
 func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *testing.T) {
@@ -312,6 +333,40 @@ func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.
 	require.True(t, st.compactCalled)
 	require.True(t, st.hasDeadline)
 	requireDeadlineWithin(t, st.deadline, start, leaderTimeout)
+}
+
+func TestFSMCompactorBacksOffLeaderRuntimeAfterTimeout(t *testing.T) {
+	st := &timeoutCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
+	}
+	ctx := context.Background()
+	leaderTimeout := 5 * time.Millisecond
+
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateLeader,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
+				NumPeers:     1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorTimeout(time.Hour),
+		WithFSMCompactorLeaderTimeout(leaderTimeout),
+		WithFSMCompactorTimeoutBackoff(time.Hour),
+	)
+
+	require.Error(t, compactor.SyncOnce(ctx))
+	require.True(t, st.hasDeadline)
+	require.Equal(t, 1, st.calls)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.Equal(t, 1, st.calls)
 }
 
 func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {
