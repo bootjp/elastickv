@@ -21,6 +21,17 @@ func newDeltaCompactorTestFixture(t *testing.T) (store.MVCCStore, *DeltaCompacto
 	return st, c
 }
 
+type timeoutScanStore struct {
+	store.MVCCStore
+	scans int
+}
+
+func (s *timeoutScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scans++
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 type recordingCompactorCoordinator struct {
 	stubAdapterCoordinator
 	labels []keyviz.Label
@@ -40,6 +51,27 @@ func TestDeltaCompactorStampsRedisKeyVizLabel(t *testing.T) {
 	_, err := c.coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{})
 	require.NoError(t, err)
 	require.Equal(t, []keyviz.Label{keyviz.LabelRedis}, rec.labels)
+}
+
+func TestDeltaCompactor_BackoffAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &timeoutScanStore{MVCCStore: base}
+	coord := newLocalAdapterCoordinator(st)
+	c := NewDeltaCompactor(
+		st,
+		coord,
+		WithDeltaCompactorTimeout(time.Millisecond),
+		WithDeltaCompactorTimeoutBackoff(time.Hour),
+	)
+
+	err := c.SyncOnce(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, st.scans, "timeout pass should run one scan before yielding")
+
+	require.NoError(t, c.SyncOnce(context.Background()))
+	require.Equal(t, 1, st.scans, "backoff pass should not scan again")
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {

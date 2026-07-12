@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	defaultDeltaCompactorMaxDeltaCount = 64
-	defaultDeltaCompactorScanInterval  = 30 * time.Second
-	defaultDeltaCompactorTimeout       = 5 * time.Second
+	defaultDeltaCompactorMaxDeltaCount  = 64
+	defaultDeltaCompactorScanInterval   = 30 * time.Second
+	defaultDeltaCompactorTimeout        = 5 * time.Second
+	defaultDeltaCompactorTimeoutBackoff = time.Minute
 
 	// deltaCompactorTickScanLimit is the maximum number of delta keys scanned
 	// per collection type per compaction tick. It bounds per-tick I/O while
@@ -45,12 +46,13 @@ type urgentCompactionRequest struct {
 // tick silently. Compaction is performed as an OCC transaction so concurrent
 // writers never conflict with the compactor.
 type DeltaCompactor struct {
-	st       store.MVCCStore
-	coord    kv.Coordinator
-	logger   *slog.Logger
-	maxCount int
-	interval time.Duration
-	timeout  time.Duration
+	st             store.MVCCStore
+	coord          kv.Coordinator
+	logger         *slog.Logger
+	maxCount       int
+	interval       time.Duration
+	timeout        time.Duration
+	timeoutBackoff time.Duration
 	// cursors tracks the exclusive lower bound for the next scan of each
 	// collection type (keyed by collectionDeltaHandler.typeName). This allows
 	// each tick to resume where the previous one stopped, ensuring that keys
@@ -67,6 +69,9 @@ type DeltaCompactor struct {
 	// loop drains this channel between regular ticks so hot keys are unblocked
 	// quickly without waiting for the next scheduled pass.
 	urgentCh chan urgentCompactionRequest
+
+	stateMu      sync.Mutex
+	backoffUntil time.Time
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -101,6 +106,16 @@ func WithDeltaCompactorTimeout(d time.Duration) DeltaCompactorOption {
 	}
 }
 
+// WithDeltaCompactorTimeoutBackoff sets how long background passes are skipped
+// after a tick exhausts its timeout. Default: 1m.
+func WithDeltaCompactorTimeoutBackoff(d time.Duration) DeltaCompactorOption {
+	return func(c *DeltaCompactor) {
+		if d >= 0 {
+			c.timeoutBackoff = d
+		}
+	}
+}
+
 // WithDeltaCompactorLogger sets the logger.
 func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 	return func(c *DeltaCompactor) {
@@ -113,14 +128,15 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 // NewDeltaCompactor creates a DeltaCompactor that operates on st using coord.
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
-		st:       st,
-		coord:    kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
-		logger:   slog.Default(),
-		maxCount: defaultDeltaCompactorMaxDeltaCount,
-		interval: defaultDeltaCompactorScanInterval,
-		timeout:  defaultDeltaCompactorTimeout,
-		cursors:  make(map[string][]byte),
-		urgentCh: make(chan urgentCompactionRequest, urgentCompactionChanSize),
+		st:             st,
+		coord:          kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
+		logger:         slog.Default(),
+		maxCount:       defaultDeltaCompactorMaxDeltaCount,
+		interval:       defaultDeltaCompactorScanInterval,
+		timeout:        defaultDeltaCompactorTimeout,
+		timeoutBackoff: defaultDeltaCompactorTimeoutBackoff,
+		cursors:        make(map[string][]byte),
+		urgentCh:       make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -266,11 +282,19 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 // which uses IsLeaderForKey for per-key routing. buildBatchElems adds an
 // additional per-key IsLeaderForKey filter so a default-group leader never
 // dispatches mutations for shards it does not own.
-// Each collection-type handler runs in its own goroutine so that a slow
-// handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
-// compaction. All goroutines share the same per-tick timeout context.
+// Collection-type handlers run sequentially under one per-tick timeout. A
+// production leader can otherwise receive four full-prefix scans at the same
+// time; under Redis migration load that can starve Raft heartbeats and cause
+// callers to see connection resets. Urgent single-key compaction remains
+// independent, so a hot key that has exceeded MaxDeltaScanLimit can still be
+// repaired promptly between regular ticks.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	if c.coord == nil || !c.coord.IsLeader() {
+		return nil
+	}
+	if c.backgroundBackoffActive(time.Now()) {
+		c.logger.DebugContext(ctx, "delta compactor: skipping pass during timeout backoff",
+			"backoff_until", c.currentBackoffUntil())
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
@@ -278,32 +302,74 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	defer cancel()
 
 	handlers := c.allHandlers()
-	errs := make([]error, len(handlers))
-	var wg sync.WaitGroup
-	for i, h := range handlers {
-		wg.Add(1)
-		go func(idx int, handler collectionDeltaHandler) {
-			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					c.logger.Error("DeltaCompactor: panic in handler",
-						slog.String("type", handler.typeName),
-						slog.Any("panic", rec))
-					errs[idx] = errors.Errorf("panic in %s compactor: %v", handler.typeName, rec)
-				}
-			}()
-			errs[idx] = c.compactHandler(tickCtx, handler, readTS)
-		}(i, h)
-	}
-	wg.Wait()
-
 	var combined error
-	for _, err := range errs {
+	for _, h := range handlers {
+		if tickCtx.Err() != nil {
+			combined = errors.CombineErrors(combined, tickCtx.Err())
+			break
+		}
+		err := c.compactHandlerSafely(tickCtx, h, readTS)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
+	if deltaCompactorBudgetExhausted(combined, tickCtx, ctx) {
+		c.backoffBackgroundCompaction(c.timeoutBackoff)
+		c.logger.WarnContext(ctx, "delta compactor: backing off after timeout",
+			"backoff", c.timeoutBackoff,
+			"error", combined)
+	}
 	return errors.WithStack(combined)
+}
+
+func (c *DeltaCompactor) compactHandlerSafely(ctx context.Context, h collectionDeltaHandler, readTS uint64) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.logger.Error("DeltaCompactor: panic in handler",
+				slog.String("type", h.typeName),
+				slog.Any("panic", rec))
+			err = errors.Errorf("panic in %s compactor: %v", h.typeName, rec)
+		}
+	}()
+	return c.compactHandler(ctx, h, readTS)
+}
+
+func (c *DeltaCompactor) backgroundBackoffActive(now time.Time) bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.backoffUntil.IsZero() {
+		return false
+	}
+	if now.Before(c.backoffUntil) {
+		return true
+	}
+	c.backoffUntil = time.Time{}
+	return false
+}
+
+func (c *DeltaCompactor) currentBackoffUntil() time.Time {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.backoffUntil
+}
+
+func (c *DeltaCompactor) backoffBackgroundCompaction(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.backoffUntil = time.Now().Add(d)
+}
+
+func deltaCompactorBudgetExhausted(err error, workCtx, parentCtx context.Context) bool {
+	if err == nil || workCtx == nil {
+		return false
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return false
+	}
+	return workCtx.Err() != nil
 }
 
 // collectionDeltaHandler holds the type-specific functions for one collection type.
