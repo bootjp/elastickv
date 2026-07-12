@@ -34,6 +34,8 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary` | `localhost:6380` | Secondary (ElasticKV) address |
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
+| `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
+| `-elastickv-pool-size` | `4` | ElasticKV backend connection pool size |
 | `-mode` | `dual-write` | Proxy mode (see below) |
 | `-secondary-timeout` | `5s` | Secondary write timeout |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
@@ -88,6 +90,7 @@ docker run --rm \
   -primary redis.internal:6379 \
   -primary-password "${REDIS_PASSWORD}" \
   -secondary elastickv.internal:6380 \
+  -elastickv-pool-size 4 \
   -mode dual-write-shadow \
   -secondary-timeout 5s \
   -shadow-timeout 3s \
@@ -109,6 +112,7 @@ services:
       - -listen=:6479
       - -primary=redis:6379
       - -secondary=elastickv:6380
+      - -elastickv-pool-size=4
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
@@ -201,6 +205,7 @@ Override backend wiring via env vars before `docker compose up`:
 ```bash
 REDIS_PROXY_PRIMARY=redis.prod.internal:6379 \
 REDIS_PROXY_SECONDARY=elastickv-1.prod.internal:6380,elastickv-2.prod.internal:6380,elastickv-3.prod.internal:6380 \
+REDIS_PROXY_ELASTICKV_POOL_SIZE=4 \
 REDIS_PROXY_MODE=dual-write-shadow \
   docker compose -f docker-compose.ha.yml up -d
 ```

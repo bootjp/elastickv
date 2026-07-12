@@ -813,6 +813,14 @@ func TestDefaultBackendOptions(t *testing.T) {
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 }
 
+func TestDefaultElasticKVBackendOptions(t *testing.T) {
+	opts := DefaultElasticKVBackendOptions()
+	assert.Equal(t, 4, opts.PoolSize)
+	assert.Equal(t, 5*time.Second, opts.DialTimeout)
+	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
+	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
+}
+
 func TestNewRedisBackend_UsesRESP2(t *testing.T) {
 	backend := NewRedisBackend("127.0.0.1:6379", "test")
 	t.Cleanup(func() {

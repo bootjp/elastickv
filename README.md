@@ -202,6 +202,7 @@ docker run --rm \
   -listen :6479 \
   -primary redis.internal:6379 \
   -secondary elastickv.internal:6380 \
+  -elastickv-pool-size 4 \
   -mode dual-write
 ```
 
