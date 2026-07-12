@@ -392,7 +392,10 @@ func lockResolverBudgetExhausted(err error, workCtx, parentCtx context.Context) 
 	if parentCtx != nil && parentCtx.Err() != nil {
 		return false
 	}
-	return workCtx.Err() != nil
+	if workCtx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, userKey []byte, lock txnLock) error {

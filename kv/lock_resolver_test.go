@@ -508,6 +508,9 @@ func TestLockResolverBudgetExhaustedUsesWorkContext(t *testing.T) {
 	cancelParent()
 	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), workCtx, parentCtx))
 	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), context.Background(), context.Background()))
+
+	require.True(t, lockResolverBudgetExhausted(context.DeadlineExceeded, context.Background(), context.Background()))
+	require.False(t, lockResolverBudgetExhausted(context.DeadlineExceeded, context.Background(), parentCtx))
 }
 
 type lockResolverStatusEngine struct {
