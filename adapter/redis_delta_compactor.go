@@ -292,9 +292,9 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	if c.coord == nil || !c.coord.IsLeader() {
 		return nil
 	}
-	if c.backgroundBackoffActive(time.Now()) {
+	if active, until := c.backgroundBackoffActive(time.Now()); active {
 		c.logger.DebugContext(ctx, "delta compactor: skipping pass during timeout backoff",
-			"backoff_until", c.currentBackoffUntil())
+			"backoff_until", until)
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
@@ -334,23 +334,17 @@ func (c *DeltaCompactor) compactHandlerSafely(ctx context.Context, h collectionD
 	return c.compactHandler(ctx, h, readTS)
 }
 
-func (c *DeltaCompactor) backgroundBackoffActive(now time.Time) bool {
+func (c *DeltaCompactor) backgroundBackoffActive(now time.Time) (bool, time.Time) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.backoffUntil.IsZero() {
-		return false
+		return false, time.Time{}
 	}
 	if now.Before(c.backoffUntil) {
-		return true
+		return true, c.backoffUntil
 	}
 	c.backoffUntil = time.Time{}
-	return false
-}
-
-func (c *DeltaCompactor) currentBackoffUntil() time.Time {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	return c.backoffUntil
+	return false, time.Time{}
 }
 
 func (c *DeltaCompactor) backoffBackgroundCompaction(d time.Duration) {
