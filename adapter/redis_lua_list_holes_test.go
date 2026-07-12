@@ -186,6 +186,60 @@ func TestRedisLua_RPopLPushScansPastLargeTailHole(t *testing.T) {
 	require.Equal(t, []string{"job-1"}, dstValues)
 }
 
+func TestRedisLua_RPopLPushKeepsRemainingSparseHeadItem(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:remaining-head")
+	dst := []byte("bull:test:active:remaining-head")
+	largeLen := int64(luaSparseListPopScanLimit) + 2
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: largeLen, Tail: largeLen})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 1), []byte("job-2"), 3, 0))
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	reply, err := scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyString, reply.kind)
+	require.Equal(t, "job-2", reply.text)
+	require.NoError(t, scriptCtx.commit())
+
+	readTS := r.readTS()
+	srcValues, err := r.listValuesAt(ctx, src, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-1"}, srcValues)
+	dstValues, err := r.listValuesAt(ctx, dst, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-2"}, dstValues)
+}
+
+func TestRedisLua_RPopLPushFailsOnTooManyPhysicalTailTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:tombstone-tail")
+	dst := []byte("bull:test:active:tombstone-tail")
+	largeLen := int64(luaSparseListPopScanLimit) + 2
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: largeLen, Tail: largeLen})
+	commitTS := uint64(3)
+	for seq := int64(1); seq <= int64(luaSparseListPopScanLimit)+1; seq++ {
+		require.NoError(t, r.store.DeleteAt(ctx, listItemKey(src, seq), commitTS))
+		commitTS++
+	}
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	_, err = scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.ErrorIs(t, err, ErrCollectionTooLarge)
+}
+
 func TestRedisLua_RPopLPushDeletesLargeSparseListWithoutItems(t *testing.T) {
 	t.Parallel()
 
