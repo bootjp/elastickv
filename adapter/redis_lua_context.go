@@ -172,6 +172,8 @@ const (
 	zsetMetaBaseElems   = 1 // PUT or DEL ZSetMetaKey
 	zsetElemsPerAdded   = 3 // optional DEL stale score key + PUT member key + PUT score key
 	zsetElemsPerRemoved = 2 // DEL member key + DEL score key
+
+	luaSparseListPopScanLimit = store.MaxDeltaScanLimit
 )
 
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
@@ -1880,7 +1882,7 @@ func (c *luaScriptContext) cmdLRem(args []string) (luaReply, error) {
 	st.dirty = true
 	if len(values) == 0 {
 		st.exists = false
-		c.deleted[args[0]] = true
+		c.markListDeleted(args[0])
 		c.clearTTL([]byte(args[0]))
 	}
 	c.markTouched([]byte(args[0]))
@@ -1971,7 +1973,7 @@ func (c *luaScriptContext) cmdLTrim(args []string) (luaReply, error) {
 		st.exists = false
 		st.dirty = true
 		c.clearTTL([]byte(args[0]))
-		c.deleted[args[0]] = true
+		c.markListDeleted(args[0])
 		c.markTouched([]byte(args[0]))
 		return luaStatusReply("OK"), nil
 	}
@@ -2002,19 +2004,48 @@ func (c *luaScriptContext) popList(key string, left bool) (luaReply, error) {
 	}
 	var value string
 	if st.materialized {
-		if left {
-			value = st.values[0]
-			st.values = st.values[1:]
-		} else {
-			value = st.values[len(st.values)-1]
-			st.values = st.values[:len(st.values)-1]
-		}
+		value = popMaterializedListValue(st, left)
 	} else {
-		value, err = c.popLazyListValue([]byte(key), st, left)
+		var ok bool
+		value, ok, err = c.popLazyListValue([]byte(key), st, left)
 		if err != nil {
 			return luaReply{}, err
 		}
+		if !ok {
+			c.markListEmptyAfterLazyPop(key, st)
+			return luaNilReply(), nil
+		}
 	}
+	return c.finishPoppedListValue(key, st, value), nil
+}
+
+func popMaterializedListValue(st *luaListState, left bool) string {
+	if left {
+		value := st.values[0]
+		st.values = st.values[1:]
+		return value
+	}
+	value := st.values[len(st.values)-1]
+	st.values = st.values[:len(st.values)-1]
+	return value
+}
+
+func (c *luaScriptContext) markListEmptyAfterLazyPop(key string, st *luaListState) {
+	st.dirty = true
+	st.exists = false
+	st.materialized = false
+	st.meta = store.ListMeta{}
+	st.leftTrim = 0
+	st.rightTrim = 0
+	st.leftValues = nil
+	st.rightValues = nil
+	st.values = nil
+	c.markListDeleted(key)
+	c.clearTTL([]byte(key))
+	c.markTouched([]byte(key))
+}
+
+func (c *luaScriptContext) finishPoppedListValue(key string, st *luaListState, value string) luaReply {
 	st.dirty = true
 	if st.currentLen() == 0 {
 		st.exists = false
@@ -2025,65 +2056,152 @@ func (c *luaScriptContext) popList(key string, left bool) (luaReply, error) {
 		st.leftValues = nil
 		st.rightValues = nil
 		st.values = nil
-		c.deleted[key] = true
+		c.markListDeleted(key)
 		c.clearTTL([]byte(key))
 	}
 	c.markTouched([]byte(key))
-	return luaStringReply(value), nil
+	return luaStringReply(value)
 }
 
-func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, error) {
+func (c *luaScriptContext) markListDeleted(key string) {
+	c.everDeleted[key], c.deleted[key] = true, true
+}
+
+func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, bool, error) {
 	if left {
 		return c.popLazyListLeft(key, st)
 	}
 	return c.popLazyListRight(key, st)
 }
 
-func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string, error) {
-	if len(st.leftValues) > 0 {
-		value := st.leftValues[0]
-		st.leftValues = st.leftValues[1:]
-		return value, nil
-	}
-	if remaining := st.remainingOriginalLen(); remaining > 0 {
-		values, err := c.server.fetchListRange(context.Background(), key, st.meta, st.leftTrim, st.leftTrim, c.startTS)
-		if err != nil {
-			return "", err
+func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string, bool, error) {
+	for {
+		if len(st.leftValues) > 0 {
+			value := st.leftValues[0]
+			st.leftValues = st.leftValues[1:]
+			return value, true, nil
 		}
-		if len(values) == 0 {
-			return "", errors.WithStack(store.ErrKeyNotFound)
+		if remaining := st.remainingOriginalLen(); remaining > 0 {
+			item, ok, err := c.scanLazyListBoundaryItem(key, st, true)
+			if err != nil {
+				return "", false, err
+			}
+			if !ok {
+				st.leftTrim += remaining
+				continue
+			}
+			st.leftTrim = item.index + 1
+			return item.value, true, nil
 		}
-		st.leftTrim++
-		return values[0], nil
+		if len(st.rightValues) == 0 {
+			return "", false, nil
+		}
+		value := st.rightValues[0]
+		st.rightValues = st.rightValues[1:]
+		return value, true, nil
 	}
-	value := st.rightValues[0]
-	st.rightValues = st.rightValues[1:]
-	return value, nil
 }
 
-func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (string, error) {
-	if len(st.rightValues) > 0 {
-		last := len(st.rightValues) - 1
-		value := st.rightValues[last]
-		st.rightValues = st.rightValues[:last]
-		return value, nil
-	}
-	if remaining := st.remainingOriginalLen(); remaining > 0 {
-		index := st.meta.Len - st.rightTrim - 1
-		values, err := c.server.fetchListRange(context.Background(), key, st.meta, index, index, c.startTS)
-		if err != nil {
-			return "", err
+func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (string, bool, error) {
+	for {
+		if len(st.rightValues) > 0 {
+			last := len(st.rightValues) - 1
+			value := st.rightValues[last]
+			st.rightValues = st.rightValues[:last]
+			return value, true, nil
 		}
-		if len(values) == 0 {
-			return "", errors.WithStack(store.ErrKeyNotFound)
+		if remaining := st.remainingOriginalLen(); remaining > 0 {
+			item, ok, err := c.scanLazyListBoundaryItem(key, st, false)
+			if err != nil {
+				return "", false, err
+			}
+			if !ok {
+				st.rightTrim += remaining
+				continue
+			}
+			st.rightTrim = st.meta.Len - item.index
+			return item.value, true, nil
 		}
-		st.rightTrim++
-		return values[0], nil
+		if len(st.leftValues) == 0 {
+			return "", false, nil
+		}
+		last := len(st.leftValues) - 1
+		value := st.leftValues[last]
+		st.leftValues = st.leftValues[:last]
+		return value, true, nil
 	}
-	last := len(st.leftValues) - 1
-	value := st.leftValues[last]
-	st.leftValues = st.leftValues[:last]
-	return value, nil
+}
+
+type luaLazyListBoundaryItem struct {
+	value string
+	index int64
+}
+
+func (c *luaScriptContext) scanLazyListBoundaryItem(key []byte, st *luaListState, left bool) (luaLazyListBoundaryItem, bool, error) {
+	remaining := st.remainingOriginalLen()
+	if remaining <= 0 {
+		return luaLazyListBoundaryItem{}, false, nil
+	}
+
+	startIdx := st.leftTrim
+	endIdx := st.meta.Len - st.rightTrim - 1
+	scanLen := remaining
+	if scanLen > int64(luaSparseListPopScanLimit) {
+		scanLen = int64(luaSparseListPopScanLimit)
+		if left {
+			endIdx = startIdx + scanLen - 1
+		} else {
+			startIdx = endIdx - scanLen + 1
+		}
+	}
+
+	item, ok, err := c.scanListItemWindow(key, st.meta, startIdx, endIdx, left)
+	if err != nil || ok {
+		return item, ok, err
+	}
+	if remaining > int64(luaSparseListPopScanLimit) {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop skipped more than %d missing items", string(key), luaSparseListPopScanLimit)
+	}
+	return luaLazyListBoundaryItem{}, false, nil
+}
+
+func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, startIdx, endIdx int64, left bool) (luaLazyListBoundaryItem, bool, error) {
+	if endIdx < startIdx {
+		return luaLazyListBoundaryItem{}, false, nil
+	}
+	startKey := listItemKey(key, meta.Head+startIdx)
+	endKey := listItemKey(key, meta.Head+endIdx+1)
+
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	scanLimit := luaSparseListPopScanLimit
+
+	if left {
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	} else {
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	}
+	if err != nil {
+		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
+	}
+	for _, kvp := range kvs {
+		seq, ok := store.ExtractListItemSeq(kvp.Key, key)
+		if !ok {
+			continue
+		}
+		return luaLazyListBoundaryItem{
+			value: string(kvp.Value),
+			index: seq - meta.Head,
+		}, true, nil
+	}
+	if len(kvs) >= scanLimit {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
+	}
+	return luaLazyListBoundaryItem{}, false, nil
 }
 
 func (c *luaScriptContext) cmdRPopLPush(args []string) (luaReply, error) {
@@ -3385,7 +3503,7 @@ func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, co
 	// Emit Delta keys for any appended values and trims instead of writing base meta.
 	// Trims are counted separately as negative deltas.
 	var seqInTxn uint32
-	if len(st.rightValues) > 0 {
+	if len(st.rightValues) > 0 || st.rightTrim > 0 {
 		rightDelta := store.MarshalListMetaDelta(store.ListMetaDelta{
 			HeadDelta: 0,
 			LenDelta:  int64(len(st.rightValues)) - st.rightTrim,
