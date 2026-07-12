@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -41,6 +43,13 @@ func setupLockResolverEnv(t *testing.T) (*LockResolver, *ShardStore, map[uint64]
 		stop1()
 		stop2()
 	}
+}
+
+func requireLockResolverGroupReady(t *testing.T, g *ShardGroup) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return lockResolverGroupCanResolve(g)
+	}, time.Second, 10*time.Millisecond)
 }
 
 // prepareLock writes a PREPARE request (which creates a lock) for a key.
@@ -98,6 +107,7 @@ func TestLockResolver_ResolvesExpiredCommittedLock(t *testing.T) {
 	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
 
 	// Run the resolver on the secondary shard — it should resolve the lock.
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -127,6 +137,7 @@ func TestLockResolver_ResolvesCommittedLockWhenPrimaryGroupBackpressured(t *test
 	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -159,6 +170,7 @@ func TestLockResolver_ResolvesExpiredCommittedPrimaryLock(t *testing.T) {
 	})
 	require.NoError(t, groups[1].Store.PutAt(ctx, txnLockKey(primaryKey), staleLock, commitTS, 0))
 
+	requireLockResolverGroupReady(t, groups[1])
 	err := lr.resolveGroupLocks(ctx, 1, groups[1])
 	require.NoError(t, err)
 
@@ -198,6 +210,7 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	require.NoError(t, err)
 
 	// Resolve expired locks on the secondary shard.
+	requireLockResolverGroupReady(t, groups[2])
 	err = lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -224,6 +237,7 @@ func TestLockResolver_SkipsPendingPrimaryAbortWhenPrimaryGroupBackpressured(t *t
 	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -245,6 +259,7 @@ func TestLockResolver_SkipsNonExpiredLocks(t *testing.T) {
 	prepareLock(t, groups[1], startTS, key, key, []byte("v1"), 60_000)
 
 	// Run the resolver — it should not touch this lock.
+	requireLockResolverGroupReady(t, groups[1])
 	err := lr.resolveGroupLocks(ctx, 1, groups[1])
 	require.NoError(t, err)
 
@@ -447,6 +462,52 @@ func TestLockResolverLSMBackpressured(t *testing.T) {
 			require.Equal(t, tc.want, overloaded)
 		})
 	}
+}
+
+func TestLockResolverScanCursorAdvancesAfterKey(t *testing.T) {
+	t.Parallel()
+
+	lockEnd := prefixScanEnd(txnLockKey(nil))
+	key := txnLockKey([]byte("queue:0"))
+
+	next := lockResolverNextScanStartAfter(key, lockEnd)
+	require.NotEmpty(t, next)
+	require.Greater(t, bytes.Compare(next, key), 0)
+	require.Less(t, bytes.Compare(next, lockEnd), 0)
+	require.Equal(t, append(append([]byte(nil), key...), 0), next)
+}
+
+func TestLockResolverScanCursorWrapsAtRangeEnd(t *testing.T) {
+	t.Parallel()
+
+	lockEnd := prefixScanEnd(txnLockKey(nil))
+	require.Empty(t, lockResolverNextScanStartAfter([]byte{0xff}, lockEnd))
+	require.Empty(t, lockResolverNextScanStartAfter(lockEnd, lockEnd))
+}
+
+func TestLockResolverBackoffActiveExpires(t *testing.T) {
+	t.Parallel()
+
+	lr := &LockResolver{resolveBackoff: make(map[uint64]time.Time)}
+	lr.resolveBackoff[1] = time.Now().Add(time.Second)
+
+	require.True(t, lr.resolveBackoffActive(1, time.Now()))
+	require.False(t, lr.resolveBackoffActive(1, time.Now().Add(2*time.Second)))
+	require.Empty(t, lr.resolveBackoff)
+}
+
+func TestLockResolverBudgetExhaustedUsesWorkContext(t *testing.T) {
+	t.Parallel()
+
+	workCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.True(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), workCtx, context.Background()))
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), workCtx, parentCtx))
+	require.False(t, lockResolverBudgetExhausted(errors.New("grpc deadline"), context.Background(), context.Background()))
 }
 
 type lockResolverStatusEngine struct {
