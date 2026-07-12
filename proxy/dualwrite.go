@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -47,6 +48,10 @@ const (
 	// compactedRetryJitterDivisor bounds the jitter to backoff/divisor so
 	// jitter stays small relative to the base delay.
 	compactedRetryJitterDivisor = 2
+
+	// asyncDropLogInterval keeps the secondary-drop warning useful without
+	// emitting one log line per dropped fire-and-forget write under load.
+	asyncDropLogInterval = 5 * time.Second
 )
 
 // readTSCompactedMarker is the substring produced by
@@ -83,6 +88,12 @@ type DualWriter struct {
 	scripts  map[string]string
 	// scriptOrder tracks insertion order for FIFO eviction of the bounded script cache.
 	scriptOrder []string
+	asyncDropMu sync.Mutex
+	// nextAsyncDropLog and suppressedAsyncDrops are accessed on the hot drop
+	// path, so use atomics for the fast path and keep the mutex for the rare
+	// logging path.
+	nextAsyncDropLog     int64
+	suppressedAsyncDrops int64
 }
 
 // NewDualWriter creates a DualWriter with the given backends.
@@ -450,8 +461,36 @@ func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
 	default:
 		d.mu.Unlock()
 		d.metrics.AsyncDrops.Inc()
-		d.logger.Warn("async goroutine limit reached, dropping secondary operation")
+		d.logAsyncDrop()
 	}
+}
+
+func (d *DualWriter) logAsyncDrop() {
+	nowNano := time.Now().UnixNano()
+
+	nextLog := atomic.LoadInt64(&d.nextAsyncDropLog)
+	if nextLog != 0 && nowNano < nextLog {
+		atomic.AddInt64(&d.suppressedAsyncDrops, 1)
+		return
+	}
+
+	d.asyncDropMu.Lock()
+	defer d.asyncDropMu.Unlock()
+
+	nowNano = time.Now().UnixNano()
+	nextLog = atomic.LoadInt64(&d.nextAsyncDropLog)
+	if nextLog != 0 && nowNano < nextLog {
+		atomic.AddInt64(&d.suppressedAsyncDrops, 1)
+		return
+	}
+	suppressed := atomic.SwapInt64(&d.suppressedAsyncDrops, 0)
+	atomic.StoreInt64(&d.nextAsyncDropLog, time.Now().Add(asyncDropLogInterval).UnixNano())
+
+	if suppressed > 0 {
+		d.logger.Warn("async goroutine limit reached, dropping secondary operation", "suppressed", suppressed)
+		return
+	}
+	d.logger.Warn("async goroutine limit reached, dropping secondary operation")
 }
 
 func (d *DualWriter) hasSecondaryWrite() bool {

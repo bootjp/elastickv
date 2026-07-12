@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -657,6 +659,33 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 
 	close(blocker) // unblock all
 	d.Close()      // wait for all goroutines to finish
+}
+
+func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), logger)
+
+	blocker := make(chan struct{})
+	d.goAsync(func() {
+		<-blocker
+	})
+
+	for range 3 {
+		d.goAsync(func() { t.Error("should not run") })
+	}
+
+	assert.InDelta(t, 3, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.Equal(t, 1, strings.Count(logs.String(), "async goroutine limit reached"))
+
+	close(blocker)
+	d.Close()
 }
 
 func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
