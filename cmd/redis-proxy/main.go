@@ -33,6 +33,8 @@ func main() {
 func run() error {
 	cfg := proxy.DefaultConfig()
 	var modeStr string
+	primaryPoolSize := proxy.DefaultBackendOptions().PoolSize
+	elasticKVPoolSize := proxy.DefaultElasticKVBackendOptions().PoolSize
 
 	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "Proxy listen address")
 	flag.StringVar(&cfg.PrimaryAddr, "primary", cfg.PrimaryAddr, "Primary (Redis) address")
@@ -41,6 +43,8 @@ func run() error {
 	flag.StringVar(&cfg.SecondaryAddr, "secondary", cfg.SecondaryAddr, "Secondary (ElasticKV) address. Comma-separated list of seeds is supported; the proxy discovers the current Raft leader via INFO replication.")
 	flag.IntVar(&cfg.SecondaryDB, "secondary-db", cfg.SecondaryDB, "Secondary Redis DB number")
 	flag.StringVar(&cfg.SecondaryPassword, "secondary-password", cfg.SecondaryPassword, "Secondary Redis password")
+	flag.IntVar(&primaryPoolSize, "primary-pool-size", primaryPoolSize, "Primary Redis backend connection pool size")
+	flag.IntVar(&elasticKVPoolSize, "elastickv-pool-size", elasticKVPoolSize, "ElasticKV backend connection pool size")
 	flag.StringVar(&modeStr, "mode", "dual-write", "Proxy mode: redis-only, dual-write, dual-write-shadow, elastickv-primary, elastickv-only")
 	flag.DurationVar(&cfg.SecondaryTimeout, "secondary-timeout", cfg.SecondaryTimeout, "Secondary write timeout")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", cfg.ShadowTimeout, "Shadow read timeout")
@@ -50,9 +54,9 @@ func run() error {
 	flag.StringVar(&cfg.MetricsAddr, "metrics", cfg.MetricsAddr, "Prometheus metrics address")
 	flag.Parse()
 
-	mode, ok := proxy.ParseProxyMode(modeStr)
-	if !ok {
-		return fmt.Errorf("unknown mode: %s", modeStr)
+	mode, err := parseRuntimeOptions(modeStr, primaryPoolSize, elasticKVPoolSize)
+	if err != nil {
+		return err
 	}
 	cfg.Mode = mode
 
@@ -70,9 +74,11 @@ func run() error {
 	primaryOpts := proxy.DefaultBackendOptions()
 	primaryOpts.DB = cfg.PrimaryDB
 	primaryOpts.Password = cfg.PrimaryPassword
-	secondaryOpts := proxy.DefaultBackendOptions()
+	primaryOpts.PoolSize = primaryPoolSize
+	secondaryOpts := proxy.DefaultElasticKVBackendOptions()
 	secondaryOpts.DB = cfg.SecondaryDB
 	secondaryOpts.Password = cfg.SecondaryPassword
+	secondaryOpts.PoolSize = elasticKVPoolSize
 
 	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
 	if len(secondarySeeds) == 0 {
@@ -129,6 +135,20 @@ func run() error {
 		return fmt.Errorf("proxy server: %w", err)
 	}
 	return nil
+}
+
+func parseRuntimeOptions(modeStr string, primaryPoolSize, elasticKVPoolSize int) (proxy.ProxyMode, error) {
+	mode, ok := proxy.ParseProxyMode(modeStr)
+	if !ok {
+		return 0, fmt.Errorf("unknown mode: %s", modeStr)
+	}
+	if primaryPoolSize <= 0 {
+		return 0, fmt.Errorf("primary-pool-size must be positive: %d", primaryPoolSize)
+	}
+	if elasticKVPoolSize <= 0 {
+		return 0, fmt.Errorf("elastickv-pool-size must be positive: %d", elasticKVPoolSize)
+	}
+	return mode, nil
 }
 
 func parseAddrList(raw string) []string {
