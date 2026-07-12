@@ -347,6 +347,40 @@ func TestHasSecondaryWrite(t *testing.T) {
 	}
 }
 
+func TestNewDualWriter_UsesConfiguredSecondaryConcurrency(t *testing.T) {
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		newMockBackend("secondary"),
+		ProxyConfig{
+			Mode:                       ModeDualWrite,
+			SecondaryWriteConcurrency:  2,
+			SecondaryScriptConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	assert.Equal(t, 2, cap(d.writeSem))
+	assert.Equal(t, 1, cap(d.scriptSem))
+}
+
+func TestNewDualWriter_DefaultSecondaryConcurrency(t *testing.T) {
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		newMockBackend("secondary"),
+		ProxyConfig{Mode: ModeDualWrite},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	assert.Equal(t, maxWriteGoroutines, cap(d.writeSem))
+	assert.Equal(t, maxScriptWriteGoroutines, cap(d.scriptSem))
+}
+
 func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)

@@ -94,9 +94,9 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		metrics:   metrics,
 		sentry:    sentryReporter,
 		logger:    logger,
-		writeSem:  make(chan struct{}, maxWriteGoroutines),
+		writeSem:  make(chan struct{}, secondaryWriteConcurrency(cfg)),
 		shadowSem: make(chan struct{}, maxShadowGoroutines),
-		scriptSem: make(chan struct{}, maxScriptWriteGoroutines),
+		scriptSem: make(chan struct{}, secondaryScriptConcurrency(cfg)),
 		scripts:   make(map[string]string),
 	}
 
@@ -109,6 +109,21 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 	}
 
 	return d
+}
+
+func secondaryWriteConcurrency(cfg ProxyConfig) int {
+	return configuredConcurrencyOrDefault(cfg.SecondaryWriteConcurrency, maxWriteGoroutines)
+}
+
+func secondaryScriptConcurrency(cfg ProxyConfig) int {
+	return configuredConcurrencyOrDefault(cfg.SecondaryScriptConcurrency, maxScriptWriteGoroutines)
+}
+
+func configuredConcurrencyOrDefault(configured, fallback int) int {
+	if configured > 0 {
+		return configured
+	}
+	return fallback
 }
 
 // Close waits for all in-flight async goroutines to finish.
