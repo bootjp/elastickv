@@ -79,6 +79,7 @@ type luaListState struct {
 	meta         store.ListMeta
 	leftTrim     int64
 	rightTrim    int64
+	trimDeletes  []int64
 	leftValues   []string
 	rightValues  []string
 	values       []string
@@ -175,6 +176,11 @@ const (
 
 	luaSparseListPopScanLimit = store.MaxDeltaScanLimit
 )
+
+type luaPhysicalLimitedScanStore interface {
+	ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
+	ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
+}
 
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
 type luaRenameHandler func(*luaScriptContext, []byte, []byte) error
@@ -356,6 +362,7 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 		st.meta = store.ListMeta{}
 		st.leftTrim = 0
 		st.rightTrim = 0
+		st.trimDeletes = nil
 		st.leftValues = nil
 		st.rightValues = nil
 		st.values = nil
@@ -610,6 +617,7 @@ func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
 	st.materialized = true
 	st.leftTrim = 0
 	st.rightTrim = 0
+	st.trimDeletes = nil
 	st.leftValues = nil
 	st.rightValues = nil
 	st.values = values
@@ -990,6 +998,7 @@ func (c *luaScriptContext) markListValue(key []byte, values []string) error {
 	st.meta = store.ListMeta{}
 	st.leftTrim = 0
 	st.rightTrim = 0
+	st.trimDeletes = nil
 	st.leftValues = nil
 	st.rightValues = nil
 	st.values = append([]string(nil), values...)
@@ -1761,6 +1770,7 @@ func (c *luaScriptContext) pushList(args []string, left bool) (luaReply, error) 
 		st.meta = store.ListMeta{}
 		st.leftTrim = 0
 		st.rightTrim = 0
+		st.trimDeletes = nil
 		st.leftValues = nil
 		st.rightValues = nil
 		st.values = nil
@@ -2037,6 +2047,7 @@ func (c *luaScriptContext) markListEmptyAfterLazyPop(key string, st *luaListStat
 	st.meta = store.ListMeta{}
 	st.leftTrim = 0
 	st.rightTrim = 0
+	st.trimDeletes = nil
 	st.leftValues = nil
 	st.rightValues = nil
 	st.values = nil
@@ -2053,6 +2064,7 @@ func (c *luaScriptContext) finishPoppedListValue(key string, st *luaListState, v
 		st.meta = store.ListMeta{}
 		st.leftTrim = 0
 		st.rightTrim = 0
+		st.trimDeletes = nil
 		st.leftValues = nil
 		st.rightValues = nil
 		st.values = nil
@@ -2091,6 +2103,7 @@ func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string
 				continue
 			}
 			st.leftTrim = item.index + 1
+			st.trimDeletes = append(st.trimDeletes, st.meta.Head+item.index)
 			return item.value, true, nil
 		}
 		if len(st.rightValues) == 0 {
@@ -2120,6 +2133,7 @@ func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (strin
 				continue
 			}
 			st.rightTrim = st.meta.Len - item.index
+			st.trimDeletes = append(st.trimDeletes, st.meta.Head+item.index)
 			return item.value, true, nil
 		}
 		if len(st.leftValues) == 0 {
@@ -2145,23 +2159,10 @@ func (c *luaScriptContext) scanLazyListBoundaryItem(key []byte, st *luaListState
 
 	startIdx := st.leftTrim
 	endIdx := st.meta.Len - st.rightTrim - 1
-	scanLen := remaining
-	if scanLen > int64(luaSparseListPopScanLimit) {
-		scanLen = int64(luaSparseListPopScanLimit)
-		if left {
-			endIdx = startIdx + scanLen - 1
-		} else {
-			startIdx = endIdx - scanLen + 1
-		}
-	}
 
 	item, ok, err := c.scanListItemWindow(key, st.meta, startIdx, endIdx, left)
 	if err != nil || ok {
 		return item, ok, err
-	}
-	if remaining > int64(luaSparseListPopScanLimit) {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop skipped more than %d missing items", string(key), luaSparseListPopScanLimit)
 	}
 	return luaLazyListBoundaryItem{}, false, nil
 }
@@ -2174,15 +2175,16 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 	endKey := listItemKey(key, meta.Head+endIdx+1)
 
 	var (
-		kvs []*store.KVPair
-		err error
+		kvs                  []*store.KVPair
+		physicalLimitReached bool
+		err                  error
 	)
 	scanLimit := luaSparseListPopScanLimit
 
 	if left {
-		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+		kvs, physicalLimitReached, err = c.scanAtPhysicalLimit(startKey, endKey, scanLimit)
 	} else {
-		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+		kvs, physicalLimitReached, err = c.reverseScanAtPhysicalLimit(startKey, endKey, scanLimit)
 	}
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
@@ -2197,11 +2199,33 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 			index: seq - meta.Head,
 		}, true, nil
 	}
+	if physicalLimitReached {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
+	}
 	if len(kvs) >= scanLimit {
 		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
 			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
 	}
 	return luaLazyListBoundaryItem{}, false, nil
+}
+
+func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
+	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
+		kvs, limitReached, err := scanner.ScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		return kvs, limitReached, errors.WithStack(err)
+	}
+	kvs, err := c.server.store.ScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	return kvs, false, errors.WithStack(err)
+}
+
+func (c *luaScriptContext) reverseScanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
+	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
+		kvs, limitReached, err := scanner.ReverseScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		return kvs, limitReached, errors.WithStack(err)
+	}
+	kvs, err := c.server.store.ReverseScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	return kvs, false, errors.WithStack(err)
 }
 
 func (c *luaScriptContext) cmdRPopLPush(args []string) (luaReply, error) {
@@ -3495,7 +3519,7 @@ func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, co
 		return nil, err
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, int(st.leftTrim+st.rightTrim)+len(st.leftValues)+len(st.rightValues)+setWideColOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.trimDeletes)+len(st.leftValues)+len(st.rightValues)+setWideColOverhead)
 	elems = appendListTrimDeletes(elems, []byte(key), st)
 	elems = appendListPuts(elems, []byte(key), st.leftValues, newHead)
 	elems = appendListPuts(elems, []byte(key), st.rightValues, rightStart)
@@ -3546,10 +3570,7 @@ func validateListDeltaRanges(st *luaListState) (int64, int64, error) {
 }
 
 func appendListTrimDeletes(elems []*kv.Elem[kv.OP], key []byte, st *luaListState) []*kv.Elem[kv.OP] {
-	for seq := st.meta.Head; seq < st.meta.Head+st.leftTrim; seq++ {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
-	}
-	for seq := st.meta.Tail - st.rightTrim; seq < st.meta.Tail; seq++ {
+	for _, seq := range st.trimDeletes {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listItemKey(key, seq)})
 	}
 	return elems
