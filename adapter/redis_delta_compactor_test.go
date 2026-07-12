@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -23,11 +24,13 @@ func newDeltaCompactorTestFixture(t *testing.T) (store.MVCCStore, *DeltaCompacto
 
 type timeoutScanStore struct {
 	store.MVCCStore
-	scans int
+	scans  int
+	starts [][]byte
 }
 
 func (s *timeoutScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	s.scans++
+	s.starts = append(s.starts, bytes.Clone(start))
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -72,6 +75,35 @@ func TestDeltaCompactor_BackoffAfterTimeout(t *testing.T) {
 
 	require.NoError(t, c.SyncOnce(context.Background()))
 	require.Equal(t, 1, st.scans, "backoff pass should not scan again")
+}
+
+func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &timeoutScanStore{MVCCStore: base}
+	coord := newLocalAdapterCoordinator(st)
+	c := NewDeltaCompactor(
+		st,
+		coord,
+		WithDeltaCompactorTimeout(10*time.Millisecond),
+		WithDeltaCompactorTimeoutBackoff(0),
+	)
+
+	wantPrefixes := []string{
+		store.ListMetaDeltaPrefix,
+		store.HashMetaDeltaPrefix,
+		store.SetMetaDeltaPrefix,
+		store.ZSetMetaDeltaPrefix,
+		store.ListMetaDeltaPrefix,
+	}
+	for _, prefix := range wantPrefixes {
+		err := c.SyncOnce(context.Background())
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Len(t, st.starts, st.scans)
+		require.True(t, bytes.HasPrefix(st.starts[len(st.starts)-1], []byte(prefix)),
+			"scan should start with %q after timeout rotation; got %q", prefix, st.starts[len(st.starts)-1])
+	}
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {
