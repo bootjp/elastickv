@@ -1884,7 +1884,16 @@ func (s *pebbleStore) staleRaftApplyFastPathLocked(mutations []*KVPairMutation, 
 	return true, s.markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex, writeOpts)
 }
 
+func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.lastCommitTS > startTS
+}
+
 func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
+	if !s.hasCommitsAfter(startTS) {
+		return nil
+	}
 	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
 		return err
 	}

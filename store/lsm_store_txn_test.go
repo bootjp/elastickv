@@ -53,6 +53,23 @@ func TestConflictCheckLinearAdvanceLimitFor(t *testing.T) {
 	require.Equal(t, conflictCheckLargeLinearAdvanceLimit, conflictCheckLinearAdvanceLimitFor(conflictCheckLargeBatchThreshold))
 }
 
+func TestPebbleStore_HasCommitsAfter(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer st.Close()
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok, "expected *pebbleStore, got %T", st)
+
+	ctx := context.Background()
+	require.False(t, ps.hasCommitsAfter(0))
+
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+	require.True(t, ps.hasCommitsAfter(9))
+	require.False(t, ps.hasCommitsAfter(10))
+	require.False(t, ps.hasCommitsAfter(11))
+}
+
 func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
