@@ -2145,23 +2145,10 @@ func (c *luaScriptContext) scanLazyListBoundaryItem(key []byte, st *luaListState
 
 	startIdx := st.leftTrim
 	endIdx := st.meta.Len - st.rightTrim - 1
-	scanLen := remaining
-	if scanLen > int64(luaSparseListPopScanLimit) {
-		scanLen = int64(luaSparseListPopScanLimit)
-		if left {
-			endIdx = startIdx + scanLen - 1
-		} else {
-			startIdx = endIdx - scanLen + 1
-		}
-	}
 
 	item, ok, err := c.scanListItemWindow(key, st.meta, startIdx, endIdx, left)
 	if err != nil || ok {
 		return item, ok, err
-	}
-	if remaining > int64(luaSparseListPopScanLimit) {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop skipped more than %d missing items", string(key), luaSparseListPopScanLimit)
 	}
 	return luaLazyListBoundaryItem{}, false, nil
 }
