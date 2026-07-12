@@ -96,6 +96,54 @@ func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v1"), val)
 }
 
+func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	muts := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	const (
+		startTS  uint64 = 100
+		commitTS uint64 = 200
+		entryIdx uint64 = 42
+	)
+
+	require.NoError(t, ps.ApplyMutations(ctx, muts, nil, commitTS, commitTS))
+	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, []byte{0x01}, pebble.Sync))
+
+	require.NoError(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, startTS, commitTS, entryIdx))
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("k1"), commitTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+}
+
+func TestApplyMutationsRaftAt_AlreadyLandedFastPathDoesNotHideConflict(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("newer"), 200, 0))
+
+	err := ps.ApplyMutationsRaftAt(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k"), Value: []byte("raft")},
+	}, nil, 100, 300, 42)
+	require.ErrorIs(t, err, ErrWriteConflict)
+
+	got, present, idxErr := ps.LastAppliedIndex()
+	require.NoError(t, idxErr)
+	require.False(t, present)
+	require.Equal(t, uint64(0), got)
+}
+
 // TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey covers the
 // appliedIndex==0 escape hatch — callers without a raft entry index
 // (test fakes, legacy ApplyMutationsRaft) MUST NOT bump the meta key.

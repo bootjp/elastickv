@@ -1050,6 +1050,10 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	return s.committedVersionAtLocked(key, commitTS)
+}
+
+func (s *pebbleStore) committedVersionAtLocked(key []byte, commitTS uint64) (bool, error) {
 	_, closer, err := s.db.Get(encodeKey(key, commitTS))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -1808,6 +1812,85 @@ func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVP
 	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
 }
 
+func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, commitTS uint64) (bool, error) {
+	if len(mutations) == 0 {
+		return false, nil
+	}
+	for _, mut := range mutations {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		return s.committedVersionAtLocked(mut.Key, commitTS)
+	}
+	return false, nil
+}
+
+func (s *pebbleStore) shouldWriteAppliedIndexLocked(appliedIndex uint64) (bool, error) {
+	if appliedIndex == 0 {
+		return false, nil
+	}
+	existing, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return false, err
+	}
+	return !present || existing < appliedIndex, nil
+}
+
+func (s *pebbleStore) writeRaftApplyMetaLocked(newLastTS uint64, writeAppliedIndex bool, appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	b := s.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		return err
+	}
+	if writeAppliedIndex {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+	return errors.WithStack(b.Commit(writeOpts))
+}
+
+func (s *pebbleStore) markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	writeAppliedIndex, err := s.shouldWriteAppliedIndexLocked(appliedIndex)
+	if err != nil {
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if !writeAppliedIndex && newLastTS == s.lastCommitTS {
+		return nil
+	}
+	if err := s.writeRaftApplyMetaLocked(newLastTS, writeAppliedIndex, appliedIndex, writeOpts); err != nil {
+		return err
+	}
+	s.updateLastCommitTS(newLastTS)
+	return nil
+}
+
+func (s *pebbleStore) staleRaftApplyFastPathLocked(mutations []*KVPairMutation, commitTS, appliedIndex uint64, writeOpts *pebble.WriteOptions) (bool, error) {
+	if appliedIndex == 0 {
+		return false, nil
+	}
+	landed, err := s.raftApplyAlreadyLandedLocked(mutations, commitTS)
+	if err != nil || !landed {
+		return false, err
+	}
+	return true, s.markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex, writeOpts)
+}
+
+func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
+	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
+		return err
+	}
+	return s.checkReadConflicts(ctx, readKeys, startTS)
+}
+
 func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
@@ -1817,16 +1900,21 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
+	fastPathDone, err := s.staleRaftApplyFastPathLocked(mutations, commitTS, appliedIndex, writeOpts)
+	if err != nil {
+		return err
+	}
+	if fastPathDone {
+		return nil
+	}
+
 	b := s.db.NewBatch()
 	defer b.Close()
 
 	// Keep OCC at the store boundary: callers pass the read snapshot via
 	// startTS/readKeys, and leader-issued commit timestamps alone do not prove
 	// the read set is still current.
-	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
-		return err
-	}
-	if err := s.checkReadConflicts(ctx, readKeys, startTS); err != nil {
+	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS); err != nil {
 		return err
 	}
 
