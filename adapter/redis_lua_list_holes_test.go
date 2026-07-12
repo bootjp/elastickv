@@ -105,10 +105,10 @@ func TestRedisLua_RPopLPushSkipsPrefixCollisionItem(t *testing.T) {
 	r := newListPopTestServer(t)
 	src := []byte("bull:test:wait:prefix")
 	dst := []byte("bull:test:active:prefix")
-	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: 2, Tail: 2})
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: 1, Tail: 1})
 	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
 	collider := append([]byte{}, src...)
-	collider = append(collider, listItemKey(src, 1)[len(store.ListItemPrefix)+len(src):]...)
+	collider = append(collider, listItemKey(src, 0)[len(store.ListItemPrefix)+len(src):]...)
 	collider = append(collider, 'x')
 	require.NoError(t, r.store.PutAt(ctx, listItemKey(collider, 0), []byte("other-list-job"), 2, 0))
 

@@ -2177,15 +2177,12 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 		kvs []*store.KVPair
 		err error
 	)
-	scanLimit := endIdx - startIdx + 1
-	if scanLimit > int64(luaSparseListPopScanLimit) {
-		scanLimit = int64(luaSparseListPopScanLimit)
-	}
+	scanLimit := luaSparseListPopScanLimit
 
 	if left {
-		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, int(scanLimit), c.startTS)
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
 	} else {
-		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, int(scanLimit), c.startTS)
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
 	}
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
@@ -2200,7 +2197,7 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 			index: seq - meta.Head,
 		}, true, nil
 	}
-	if len(kvs) >= int(scanLimit) {
+	if len(kvs) >= scanLimit {
 		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
 			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
 	}
