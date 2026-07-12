@@ -45,6 +45,13 @@ func setupLockResolverEnv(t *testing.T) (*LockResolver, *ShardStore, map[uint64]
 	}
 }
 
+func requireLockResolverGroupReady(t *testing.T, g *ShardGroup) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return lockResolverGroupCanResolve(g)
+	}, time.Second, 10*time.Millisecond)
+}
+
 // prepareLock writes a PREPARE request (which creates a lock) for a key.
 func prepareLock(t *testing.T, g *ShardGroup, startTS uint64, key, primaryKey, value []byte, lockTTLms uint64) {
 	t.Helper()
@@ -100,6 +107,7 @@ func TestLockResolver_ResolvesExpiredCommittedLock(t *testing.T) {
 	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
 
 	// Run the resolver on the secondary shard — it should resolve the lock.
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -129,6 +137,7 @@ func TestLockResolver_ResolvesCommittedLockWhenPrimaryGroupBackpressured(t *test
 	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -161,6 +170,7 @@ func TestLockResolver_ResolvesExpiredCommittedPrimaryLock(t *testing.T) {
 	})
 	require.NoError(t, groups[1].Store.PutAt(ctx, txnLockKey(primaryKey), staleLock, commitTS, 0))
 
+	requireLockResolverGroupReady(t, groups[1])
 	err := lr.resolveGroupLocks(ctx, 1, groups[1])
 	require.NoError(t, err)
 
@@ -200,6 +210,7 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	require.NoError(t, err)
 
 	// Resolve expired locks on the secondary shard.
+	requireLockResolverGroupReady(t, groups[2])
 	err = lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -226,6 +237,7 @@ func TestLockResolver_SkipsPendingPrimaryAbortWhenPrimaryGroupBackpressured(t *t
 	metrics.Levels[0].Sublevels = lockResolverMaxL0Sublevels
 	groups[1].Store = &lockResolverBackpressureStore{MVCCStore: groups[1].Store, metrics: metrics}
 
+	requireLockResolverGroupReady(t, groups[2])
 	err := lr.resolveGroupLocks(ctx, 2, groups[2])
 	require.NoError(t, err)
 
@@ -247,6 +259,7 @@ func TestLockResolver_SkipsNonExpiredLocks(t *testing.T) {
 	prepareLock(t, groups[1], startTS, key, key, []byte("v1"), 60_000)
 
 	// Run the resolver — it should not touch this lock.
+	requireLockResolverGroupReady(t, groups[1])
 	err := lr.resolveGroupLocks(ctx, 1, groups[1])
 	require.NoError(t, err)
 
