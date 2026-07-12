@@ -64,6 +64,65 @@ func TestRedisLua_RPopLPushSkipsTailHole(t *testing.T) {
 	require.Equal(t, []string{"job-1"}, dstValues)
 }
 
+func TestRedisLua_RPopLPushSparseTailEmitsRightTrimDelta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:tail-trim")
+	dst := []byte("bull:test:active:tail-trim")
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: 3, Tail: 3})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 1), []byte("job-2"), 2, 0))
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	reply, err := scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyString, reply.kind)
+	require.Equal(t, "job-2", reply.text)
+	require.NoError(t, scriptCtx.commit())
+
+	readTS := r.readTS()
+	meta, exists, err := r.resolveListMeta(ctx, src, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(1), meta.Len)
+	srcValues, err := r.listValuesAt(ctx, src, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-1"}, srcValues)
+	dstValues, err := r.listValuesAt(ctx, dst, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-2"}, dstValues)
+}
+
+func TestRedisLua_RPopLPushSkipsPrefixCollisionItem(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:prefix")
+	dst := []byte("bull:test:active:prefix")
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: 2, Tail: 2})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
+	collider := append([]byte{}, src...)
+	collider = append(collider, listItemKey(src, 1)[len(store.ListItemPrefix)+len(src):]...)
+	collider = append(collider, 'x')
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(collider, 0), []byte("other-list-job"), 2, 0))
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	reply, err := scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyString, reply.kind)
+	require.Equal(t, "job-1", reply.text)
+	require.NoError(t, scriptCtx.commit())
+}
+
 func TestRedisLua_RPopLPushMissingTailThenRecreateRewritesMeta(t *testing.T) {
 	t.Parallel()
 

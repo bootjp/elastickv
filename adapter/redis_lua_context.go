@@ -2177,10 +2177,15 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 		kvs []*store.KVPair
 		err error
 	)
+	scanLimit := endIdx - startIdx + 1
+	if scanLimit > int64(luaSparseListPopScanLimit) {
+		scanLimit = int64(luaSparseListPopScanLimit)
+	}
+
 	if left {
-		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, int(scanLimit), c.startTS)
 	} else {
-		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, int(scanLimit), c.startTS)
 	}
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
@@ -2194,6 +2199,10 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 			value: string(kvp.Value),
 			index: seq - meta.Head,
 		}, true, nil
+	}
+	if len(kvs) >= int(scanLimit) {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
 	}
 	return luaLazyListBoundaryItem{}, false, nil
 }
@@ -3497,7 +3506,7 @@ func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, co
 	// Emit Delta keys for any appended values and trims instead of writing base meta.
 	// Trims are counted separately as negative deltas.
 	var seqInTxn uint32
-	if len(st.rightValues) > 0 {
+	if len(st.rightValues) > 0 || st.rightTrim > 0 {
 		rightDelta := store.MarshalListMetaDelta(store.ListMetaDelta{
 			HeadDelta: 0,
 			LenDelta:  int64(len(st.rightValues)) - st.rightTrim,
