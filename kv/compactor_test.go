@@ -174,11 +174,35 @@ func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 	require.Equal(t, []byte("v10"), val)
 }
 
-func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T) {
+func TestFSMCompactorSkipsMultiPeerLeaderRuntimeDuringCooldown(t *testing.T) {
+	st := &deadlineCapturingStore{lastCommitTS: 20}
+	ctx := context.Background()
+
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateLeader,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
+				NumPeers:     1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.False(t, st.compactCalled)
+}
+
+func TestFSMCompactorCompactsMultiPeerLeaderRuntimeAfterCooldown(t *testing.T) {
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
 	leaderTimeout := 20 * time.Millisecond
-	start := time.Now()
+	leaderCooldown := 5 * time.Millisecond
 
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
@@ -196,8 +220,14 @@ func TestFSMCompactorCompactsMultiPeerLeaderRuntimeWithShortTimeout(t *testing.T
 		WithFSMCompactorRetentionWindow(time.Millisecond),
 		WithFSMCompactorTimeout(time.Hour),
 		WithFSMCompactorLeaderTimeout(leaderTimeout),
+		WithFSMCompactorLeaderCooldown(leaderCooldown),
 	)
 
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.False(t, st.compactCalled)
+
+	time.Sleep(leaderCooldown + 5*time.Millisecond)
+	start := time.Now()
 	require.NoError(t, compactor.SyncOnce(ctx))
 
 	require.True(t, st.compactCalled)
@@ -358,6 +388,7 @@ func TestFSMCompactorBacksOffLeaderRuntimeAfterTimeout(t *testing.T) {
 		WithFSMCompactorRetentionWindow(time.Millisecond),
 		WithFSMCompactorTimeout(time.Hour),
 		WithFSMCompactorLeaderTimeout(leaderTimeout),
+		WithFSMCompactorLeaderCooldown(0),
 		WithFSMCompactorTimeoutBackoff(time.Hour),
 	)
 
@@ -367,6 +398,45 @@ func TestFSMCompactorBacksOffLeaderRuntimeAfterTimeout(t *testing.T) {
 
 	require.NoError(t, compactor.SyncOnce(ctx))
 	require.Equal(t, 1, st.calls)
+}
+
+func TestFSMCompactorResumesLeaderRuntimeAfterTimeoutBackoffExpires(t *testing.T) {
+	st := &timeoutCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
+	}
+	ctx := context.Background()
+	leaderTimeout := 5 * time.Millisecond
+	timeoutBackoff := 10 * time.Millisecond
+
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateLeader,
+				FSMPending:   0,
+				AppliedIndex: 10,
+				CommitIndex:  10,
+				NumPeers:     1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorTimeout(time.Hour),
+		WithFSMCompactorLeaderTimeout(leaderTimeout),
+		WithFSMCompactorLeaderCooldown(0),
+		WithFSMCompactorTimeoutBackoff(timeoutBackoff),
+	)
+
+	require.Error(t, compactor.SyncOnce(ctx))
+	require.Equal(t, 1, st.calls)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+	require.Equal(t, 1, st.calls)
+
+	time.Sleep(timeoutBackoff + 5*time.Millisecond)
+	require.Error(t, compactor.SyncOnce(ctx))
+	require.Equal(t, 2, st.calls)
 }
 
 func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {

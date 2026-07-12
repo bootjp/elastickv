@@ -17,6 +17,7 @@ const (
 	defaultFSMCompactorRetentionWindow = 30 * time.Minute
 	defaultFSMCompactorTimeout         = 5 * time.Second
 	defaultFSMCompactorLeaderTimeout   = 500 * time.Millisecond
+	defaultFSMCompactorLeaderCooldown  = 30 * time.Minute
 	defaultFSMCompactorTimeoutBackoff  = 30 * time.Minute
 	defaultFSMCompactorMaxL0Files      = 256
 	defaultFSMCompactorMaxL0Sublevels  = 12
@@ -42,6 +43,7 @@ type FSMCompactor struct {
 	retentionWindow time.Duration
 	timeout         time.Duration
 	leaderTimeout   time.Duration
+	leaderCooldown  time.Duration
 	timeoutBackoff  time.Duration
 	maxL0Files      int64
 	maxL0Sublevels  int32
@@ -49,6 +51,7 @@ type FSMCompactor struct {
 	logger          *slog.Logger
 	mu              sync.Mutex
 	backoffUntil    map[uint64]time.Time
+	leaderUntil     map[uint64]time.Time
 }
 
 type pebbleMetricsSource interface {
@@ -89,6 +92,14 @@ func WithFSMCompactorLeaderTimeout(timeout time.Duration) FSMCompactorOption {
 	return func(c *FSMCompactor) {
 		if timeout > 0 {
 			c.leaderTimeout = timeout
+		}
+	}
+}
+
+func WithFSMCompactorLeaderCooldown(cooldown time.Duration) FSMCompactorOption {
+	return func(c *FSMCompactor) {
+		if cooldown >= 0 {
+			c.leaderCooldown = cooldown
 		}
 	}
 }
@@ -135,12 +146,14 @@ func NewFSMCompactor(runtimes []FSMCompactRuntime, opts ...FSMCompactorOption) *
 		retentionWindow: defaultFSMCompactorRetentionWindow,
 		timeout:         defaultFSMCompactorTimeout,
 		leaderTimeout:   defaultFSMCompactorLeaderTimeout,
+		leaderCooldown:  defaultFSMCompactorLeaderCooldown,
 		timeoutBackoff:  defaultFSMCompactorTimeoutBackoff,
 		maxL0Files:      defaultFSMCompactorMaxL0Files,
 		maxL0Sublevels:  defaultFSMCompactorMaxL0Sublevels,
 		maxLSMDebtBytes: defaultFSMCompactorMaxLSMDebtBytes,
 		logger:          slog.Default(),
 		backoffUntil:    make(map[uint64]time.Time),
+		leaderUntil:     make(map[uint64]time.Time),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -206,31 +219,13 @@ func (c *FSMCompactor) validate() error {
 }
 
 func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRuntime) error {
-	if runtime.StatusReader == nil || runtime.Store == nil {
-		return nil
-	}
-	retention, ok := runtime.Store.(store.RetentionController)
+	retention, status, ok := c.compactionRuntimeReady(runtime)
 	if !ok {
 		return nil
 	}
-
-	status := runtime.StatusReader.Status()
-	if shouldSkipFSMCompaction(status) {
-		return nil
-	}
 	now := time.Now()
-	if c.compactionBackoffActive(runtime.GroupID, now) {
-		return nil
-	}
-	if overloaded, snap := c.lsmBackpressure(runtime.Store); overloaded {
-		c.logger.WarnContext(ctx, "skipping fsm compaction under pebble backpressure",
-			"group_id", runtime.GroupID,
-			"l0_files", snap.Levels[0].TablesCount,
-			"l0_sublevels", snap.Levels[0].Sublevels,
-			"compaction_debt_bytes", snap.Compact.EstimatedDebt,
-			"compactions_in_progress", snap.Compact.NumInProgress,
-			"compaction_in_progress_bytes", snap.Compact.InProgressBytes,
-		)
+	replicatedLeader := isReplicatedLeader(status)
+	if c.shouldDeferRuntimeCompaction(ctx, runtime, status, now) {
 		return nil
 	}
 
@@ -244,10 +239,11 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	defer cancel()
 
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
-		if fsmCompactionBudgetExhausted(err, compactCtx, ctx) {
-			c.backoffCompaction(runtime.GroupID, c.timeoutBackoff)
-		}
+		c.handleCompactError(ctx, runtime.GroupID, status, compactCtx, err)
 		return errors.Wrapf(err, "compact group %d", runtime.GroupID)
+	}
+	if replicatedLeader {
+		c.cooldownLeaderCompaction(runtime.GroupID, c.leaderCooldown)
 	}
 	c.logger.InfoContext(compactCtx, "fsm compacted",
 		"group_id", runtime.GroupID,
@@ -255,6 +251,78 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		"last_commit_ts", lastCommitTS,
 	)
 	return nil
+}
+
+func (c *FSMCompactor) compactionRuntimeReady(runtime FSMCompactRuntime) (store.RetentionController, raftengine.Status, bool) {
+	if runtime.StatusReader == nil || runtime.Store == nil {
+		return nil, raftengine.Status{}, false
+	}
+	retention, ok := runtime.Store.(store.RetentionController)
+	if !ok {
+		return nil, raftengine.Status{}, false
+	}
+	status := runtime.StatusReader.Status()
+	if shouldSkipFSMCompaction(status) {
+		return nil, raftengine.Status{}, false
+	}
+	return retention, status, true
+}
+
+func (c *FSMCompactor) shouldDeferRuntimeCompaction(ctx context.Context, runtime FSMCompactRuntime, status raftengine.Status, now time.Time) bool {
+	if c.skipCompactionBackoff(ctx, runtime.GroupID, now) {
+		return true
+	}
+	if isReplicatedLeader(status) && !c.replicatedLeaderCompactionDue(ctx, runtime.GroupID, now) {
+		return true
+	}
+	overloaded, snap := c.lsmBackpressure(runtime.Store)
+	if !overloaded {
+		return false
+	}
+	c.logger.WarnContext(ctx, "skipping fsm compaction under pebble backpressure",
+		"group_id", runtime.GroupID,
+		"l0_files", snap.Levels[0].TablesCount,
+		"l0_sublevels", snap.Levels[0].Sublevels,
+		"compaction_debt_bytes", snap.Compact.EstimatedDebt,
+		"compactions_in_progress", snap.Compact.NumInProgress,
+		"compaction_in_progress_bytes", snap.Compact.InProgressBytes,
+	)
+	return true
+}
+
+func (c *FSMCompactor) skipCompactionBackoff(ctx context.Context, groupID uint64, now time.Time) bool {
+	if !c.compactionBackoffActive(groupID, now) {
+		return false
+	}
+	c.logger.DebugContext(ctx, "skipping fsm compaction during timeout backoff",
+		"group_id", groupID,
+	)
+	return true
+}
+
+func (c *FSMCompactor) replicatedLeaderCompactionDue(ctx context.Context, groupID uint64, now time.Time) bool {
+	due, until := c.leaderCompactionDue(groupID, now)
+	if due {
+		return true
+	}
+	c.logger.DebugContext(ctx, "skipping fsm compaction on replicated leader cooldown",
+		"group_id", groupID,
+		"leader_cooldown_until", until,
+		"leader_cooldown", c.leaderCooldown,
+	)
+	return false
+}
+
+func (c *FSMCompactor) handleCompactError(ctx context.Context, groupID uint64, status raftengine.Status, compactCtx context.Context, err error) {
+	if !fsmCompactionBudgetExhausted(err, compactCtx, ctx) {
+		return
+	}
+	c.backoffCompaction(groupID, c.timeoutBackoff)
+	c.logger.WarnContext(ctx, "backing off fsm compaction after timeout",
+		"group_id", groupID,
+		"backoff", c.timeoutBackoff,
+		"leader", status.State == raftengine.StateLeader,
+	)
 }
 
 func (c *FSMCompactor) targetMinTS(lastCommitTS, minRetainedTS uint64, now time.Time) (uint64, bool) {
@@ -314,6 +382,10 @@ func shouldSkipFSMCompaction(status raftengine.Status) bool {
 	return status.AppliedIndex < status.CommitIndex
 }
 
+func isReplicatedLeader(status raftengine.Status) bool {
+	return status.State == raftengine.StateLeader && status.NumPeers > 0
+}
+
 func (c *FSMCompactor) compactionBackoffActive(groupID uint64, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -339,9 +411,43 @@ func (c *FSMCompactor) backoffCompaction(groupID uint64, d time.Duration) {
 	c.backoffUntil[groupID] = time.Now().Add(d)
 }
 
+func (c *FSMCompactor) leaderCompactionDue(groupID uint64, now time.Time) (bool, time.Time) {
+	if c.leaderCooldown <= 0 {
+		return true, time.Time{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureStateLocked()
+
+	until, ok := c.leaderUntil[groupID]
+	if !ok {
+		until = now.Add(c.leaderCooldown)
+		c.leaderUntil[groupID] = until
+		return false, until
+	}
+	if now.Before(until) {
+		return false, until
+	}
+	delete(c.leaderUntil, groupID)
+	return true, time.Time{}
+}
+
+func (c *FSMCompactor) cooldownLeaderCompaction(groupID uint64, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureStateLocked()
+	c.leaderUntil[groupID] = time.Now().Add(d)
+}
+
 func (c *FSMCompactor) ensureStateLocked() {
 	if c.backoffUntil == nil {
 		c.backoffUntil = make(map[uint64]time.Time)
+	}
+	if c.leaderUntil == nil {
+		c.leaderUntil = make(map[uint64]time.Time)
 	}
 }
 
