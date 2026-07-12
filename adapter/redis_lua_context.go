@@ -2002,19 +2002,48 @@ func (c *luaScriptContext) popList(key string, left bool) (luaReply, error) {
 	}
 	var value string
 	if st.materialized {
-		if left {
-			value = st.values[0]
-			st.values = st.values[1:]
-		} else {
-			value = st.values[len(st.values)-1]
-			st.values = st.values[:len(st.values)-1]
-		}
+		value = popMaterializedListValue(st, left)
 	} else {
-		value, err = c.popLazyListValue([]byte(key), st, left)
+		var ok bool
+		value, ok, err = c.popLazyListValue([]byte(key), st, left)
 		if err != nil {
 			return luaReply{}, err
 		}
+		if !ok {
+			c.markListEmptyAfterLazyPop(key, st)
+			return luaNilReply(), nil
+		}
 	}
+	return c.finishPoppedListValue(key, st, value), nil
+}
+
+func popMaterializedListValue(st *luaListState, left bool) string {
+	if left {
+		value := st.values[0]
+		st.values = st.values[1:]
+		return value
+	}
+	value := st.values[len(st.values)-1]
+	st.values = st.values[:len(st.values)-1]
+	return value
+}
+
+func (c *luaScriptContext) markListEmptyAfterLazyPop(key string, st *luaListState) {
+	st.dirty = true
+	st.exists = false
+	st.materialized = false
+	st.meta = store.ListMeta{}
+	st.leftTrim = 0
+	st.rightTrim = 0
+	st.leftValues = nil
+	st.rightValues = nil
+	st.values = nil
+	c.deleted[key] = true
+	c.clearTTL([]byte(key))
+	c.markTouched([]byte(key))
+}
+
+func (c *luaScriptContext) finishPoppedListValue(key string, st *luaListState, value string) luaReply {
 	st.dirty = true
 	if st.currentLen() == 0 {
 		st.exists = false
@@ -2029,61 +2058,71 @@ func (c *luaScriptContext) popList(key string, left bool) (luaReply, error) {
 		c.clearTTL([]byte(key))
 	}
 	c.markTouched([]byte(key))
-	return luaStringReply(value), nil
+	return luaStringReply(value)
 }
 
-func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, error) {
+func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, bool, error) {
 	if left {
 		return c.popLazyListLeft(key, st)
 	}
 	return c.popLazyListRight(key, st)
 }
 
-func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string, error) {
-	if len(st.leftValues) > 0 {
-		value := st.leftValues[0]
-		st.leftValues = st.leftValues[1:]
-		return value, nil
-	}
-	if remaining := st.remainingOriginalLen(); remaining > 0 {
-		values, err := c.server.fetchListRange(context.Background(), key, st.meta, st.leftTrim, st.leftTrim, c.startTS)
-		if err != nil {
-			return "", err
+func (c *luaScriptContext) popLazyListLeft(key []byte, st *luaListState) (string, bool, error) {
+	for {
+		if len(st.leftValues) > 0 {
+			value := st.leftValues[0]
+			st.leftValues = st.leftValues[1:]
+			return value, true, nil
 		}
-		if len(values) == 0 {
-			return "", errors.WithStack(store.ErrKeyNotFound)
+		if remaining := st.remainingOriginalLen(); remaining > 0 {
+			values, err := c.server.fetchListRange(context.Background(), key, st.meta, st.leftTrim, st.leftTrim, c.startTS)
+			if err != nil {
+				return "", false, err
+			}
+			st.leftTrim++
+			if len(values) == 0 {
+				continue
+			}
+			return values[0], true, nil
 		}
-		st.leftTrim++
-		return values[0], nil
+		if len(st.rightValues) == 0 {
+			return "", false, nil
+		}
+		value := st.rightValues[0]
+		st.rightValues = st.rightValues[1:]
+		return value, true, nil
 	}
-	value := st.rightValues[0]
-	st.rightValues = st.rightValues[1:]
-	return value, nil
 }
 
-func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (string, error) {
-	if len(st.rightValues) > 0 {
-		last := len(st.rightValues) - 1
-		value := st.rightValues[last]
-		st.rightValues = st.rightValues[:last]
-		return value, nil
-	}
-	if remaining := st.remainingOriginalLen(); remaining > 0 {
-		index := st.meta.Len - st.rightTrim - 1
-		values, err := c.server.fetchListRange(context.Background(), key, st.meta, index, index, c.startTS)
-		if err != nil {
-			return "", err
+func (c *luaScriptContext) popLazyListRight(key []byte, st *luaListState) (string, bool, error) {
+	for {
+		if len(st.rightValues) > 0 {
+			last := len(st.rightValues) - 1
+			value := st.rightValues[last]
+			st.rightValues = st.rightValues[:last]
+			return value, true, nil
 		}
-		if len(values) == 0 {
-			return "", errors.WithStack(store.ErrKeyNotFound)
+		if remaining := st.remainingOriginalLen(); remaining > 0 {
+			index := st.meta.Len - st.rightTrim - 1
+			values, err := c.server.fetchListRange(context.Background(), key, st.meta, index, index, c.startTS)
+			if err != nil {
+				return "", false, err
+			}
+			st.rightTrim++
+			if len(values) == 0 {
+				continue
+			}
+			return values[0], true, nil
 		}
-		st.rightTrim++
-		return values[0], nil
+		if len(st.leftValues) == 0 {
+			return "", false, nil
+		}
+		last := len(st.leftValues) - 1
+		value := st.leftValues[last]
+		st.leftValues = st.leftValues[:last]
+		return value, true, nil
 	}
-	last := len(st.leftValues) - 1
-	value := st.leftValues[last]
-	st.leftValues = st.leftValues[:last]
-	return value, nil
 }
 
 func (c *luaScriptContext) cmdRPopLPush(args []string) (luaReply, error) {
