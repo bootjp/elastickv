@@ -303,8 +303,9 @@ func (s *LeaderRoutedStore) scanAtPhysicalLimit(ctx context.Context, start []byt
 		kvs, err := s.local.ReverseScanAt(ctx, start, end, visibleLimit, max(ts, fenceTS))
 		return kvs, false, errors.WithStack(err)
 	}
-	kvs, err := s.proxyRawScanAt(ctx, start, end, visibleLimit, ts, reverse)
-	return kvs, false, errors.WithStack(err)
+	// RawScanAt cannot enforce physicalLimit, so report truncation and let
+	// callers fail closed instead of proxying an unbounded physical scan.
+	return nil, true, nil
 }
 
 func (s *LeaderRoutedStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {

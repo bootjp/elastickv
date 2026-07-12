@@ -446,11 +446,9 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 		return s.scanRouteAtLeaderPhysicalLimit(ctx, g, start, end, visibleLimit, physicalLimit, ts, reverse)
 	}
 
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, visibleLimit, ts, reverse, 0)
-	if err != nil {
-		return nil, false, err
-	}
-	return filterTxnInternalKVs(kvs), false, nil
+	// RawScanAt cannot enforce physicalLimit, so report truncation and let
+	// callers fail closed instead of proxying an unbounded physical scan.
+	return nil, true, nil
 }
 
 func scanLocalPhysicalLimit(
