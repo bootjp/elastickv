@@ -146,6 +146,36 @@ func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
 	require.Equal(t, uint64(42), reopened.LastCommitTS())
 }
 
+func TestPebbleStore_GetAtBatch(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-get-at-batch-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.PutAt(ctx, []byte("b"), []byte("v-b"), 10, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("a"), []byte("v-a"), 20, 0))
+	require.NoError(t, s.DeleteAt(ctx, []byte("deleted"), 30))
+
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+	got, err := ps.GetAtBatch(ctx, [][]byte{
+		[]byte("missing"),
+		[]byte("b"),
+		[]byte("a"),
+		[]byte("b"),
+		[]byte("deleted"),
+	}, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, map[string][]byte{
+		"b": []byte("v-b"),
+		"a": []byte("v-a"),
+	}, got)
+}
+
 func TestPebbleStore_MinRetainedTSPersistedAcrossRestart(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-min-retained-ts-test")
 	require.NoError(t, err)

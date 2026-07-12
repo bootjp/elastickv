@@ -177,10 +177,10 @@ func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
 	require.Empty(t, obs.fallbacks)
 }
 
-// TestSkipGate_ReturnsEffectiveAppliedOnSkip pins codex P1 #934
-// round 2. The skip path MUST return `have` so Engine.Open can seed
-// e.applied above snapshot.Index, preventing applyCommitted from
-// re-delivering the snapshot..have tail.
+// TestSkipGate_ReturnsEffectiveAppliedOnSkip verifies that the skip
+// path returns `have` so Engine.Open can seed e.applied above
+// snapshot.Index, preventing applyCommitted from re-delivering the
+// snapshot..have tail.
 func TestSkipGate_ReturnsEffectiveAppliedOnSkip(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -230,8 +230,8 @@ func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
 	require.Empty(t, obs.fallbacks)
 }
 
-// TestColdStartSkipThreshold pins codex P2 #934 round 3. The
-// threshold caps at hardState.Commit so a follower carrying an
+// TestColdStartSkipThreshold verifies that the threshold caps at
+// hardState.Commit so a follower carrying an
 // uncommitted WAL suffix is NOT forced to run the full restore
 // every restart (the original gate used the WAL tail, which can
 // exceed Commit, and raft would not deliver those entries until
@@ -260,29 +260,20 @@ func TestColdStartSkipThreshold(t *testing.T) {
 	}
 }
 
-// TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries pins
-// codex P1 #934. When the FSM is past tok.Index but the WAL still
-// carries entries tok.Index+1 .. have (the normal interval between
-// snapshots — metaAppliedIndex advances on each Apply), the skip
-// path MUST NOT fire even though have > tok.Index. Those WAL
-// entries would re-apply onto a Pebble store that already contains
-// them, hitting OCC conflicts and leaving the HLC below timestamps
-// already on disk.
-//
-// Fixture: snap.Index=100, fsm.applied=150, lastWalIndex=150 (the
-// WAL has entries 101..150 mirroring the applied tail). Gate
-// criterion is have >= lastWalIndex, which holds; that's the
-// happy-skip case. To exercise the bug, set lastWalIndex=200 (the
-// WAL still has entries 151..200 that have NOT been applied yet);
-// have=150 < lastWalIndex=200 must trigger execute, not skip.
-func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
+// TestSkipGate_SkipsWhenFSMAtSnapshotButBehindCommitTail verifies
+// the cold-start fast path for the normal crash window: the FSM is
+// already at or beyond the snapshot pointer, but durable Raft commit
+// is ahead. The snapshot body must still be skipped; Engine.Open uses
+// the returned EffectiveApplied to replay only the committed WAL suffix
+// above the FSM's durable applied index.
+func TestSkipGate_SkipsWhenFSMAtSnapshotButBehindCommitTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
-		snapIndex    uint64 = 100
-		appliedIdx   uint64 = 150
-		lastWalIndex uint64 = 200
+		snapIndex          uint64 = 100
+		appliedIdx         uint64 = 150
+		committedTailIndex uint64 = 200
 	)
-	payload := []byte("body-bytes-for-execute")
+	payload := []byte("body-bytes-for-skip")
 	crc, _ := writeFSMFileForTest(t, dir, snapIndex, payload)
 
 	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
@@ -291,19 +282,15 @@ func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
 		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil)
+	effective, gateErr := restoreSnapshotState(fsm, snap, committedTailIndex, dir, obs, nil)
 	require.NoError(t, gateErr)
 
-	require.Equal(t, payload, fsm.bodyBytes,
-		"have(150) < lastWalIndex(200) MUST execute full restore so the WAL replay does not duplicate-apply")
-	require.False(t, fsm.restoredHeader, "execute path MUST NOT use ApplySnapshotHeader")
-	require.Empty(t, obs.skipped)
-	// recordingObs now stores |snapIndex - have| (round-5 fix; mirrors
-	// monitoring.ColdStartObserver semantics so the FSM-ahead-of-
-	// snapshot case doesn't underflow). For have(150) > snapIndex(100)
-	// the absolute gap is 50.
-	require.Equal(t, []uint64{appliedIdx - snapIndex}, obs.executed,
-		"observer MUST record the absolute snapshot-relative gap")
+	require.Equal(t, appliedIdx, effective,
+		"skip path MUST return the durable FSM applied index so WAL replay starts above it")
+	require.Empty(t, fsm.bodyBytes, "skip path MUST NOT call fsm.Restore")
+	require.True(t, fsm.restoredHeader, "skip path MUST still apply snapshot header state")
+	require.Equal(t, []uint64{appliedIdx - snapIndex}, obs.skipped)
+	require.Empty(t, obs.executed)
 	require.Empty(t, obs.fallbacks)
 }
 

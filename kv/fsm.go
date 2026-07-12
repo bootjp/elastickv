@@ -485,9 +485,9 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		if isTxnInternalKey(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
-		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
-			return err
-		}
+	}
+	if err := f.assertNoConflictingTxnLocks(ctx, r.Mutations, nil, 0); err != nil {
+		return err
 	}
 
 	muts, err := toStoreMutations(r.Mutations)
@@ -1111,9 +1111,9 @@ func (f *kvFSM) buildOnePhaseStoreMutations(ctx context.Context, muts []*pb.Muta
 		if isTxnInternalKey(mut.Key) {
 			return nil, errors.WithStack(ErrInvalidRequest)
 		}
-		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
-			return nil, err
-		}
+	}
+	if err := f.assertNoConflictingTxnLocks(ctx, muts, nil, 0); err != nil {
+		return nil, err
 	}
 	storeMuts, err := toStoreMutations(muts)
 	if err != nil {
@@ -1388,6 +1388,131 @@ func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key, primaryKey 
 		}
 		return errors.WithStack(err)
 	}
+	lock, err := decodeTxnLock(lockBytes)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if startTS != 0 && lock.StartTS == startTS && bytes.Equal(lock.PrimaryKey, primaryKey) {
+		return nil
+	}
+	return NewTxnLockedError(key)
+}
+
+type txnLockCheckTarget struct {
+	key     []byte
+	lockKey []byte
+	index   int
+}
+
+type txnLockCheckResult struct {
+	err   error
+	index int
+}
+
+const txnLockBatchScanPageSize = 1024
+
+type mvccBatchGetter interface {
+	GetAtBatch(ctx context.Context, keys [][]byte, ts uint64) (map[string][]byte, error)
+}
+
+func (f *kvFSM) assertNoConflictingTxnLocks(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS uint64) error {
+	if len(muts) == 0 {
+		return nil
+	}
+	targets, scanStart, scanEnd := txnLockCheckTargets(muts)
+	if len(targets) == 0 {
+		return nil
+	}
+	if getter, ok := f.store.(mvccBatchGetter); ok {
+		return errors.WithStack(assertNoConflictingTxnLocksWithBatchGet(ctx, getter, targets, primaryKey, startTS, len(muts)))
+	}
+	return f.assertNoConflictingTxnLocksWithScan(ctx, targets, scanStart, scanEnd, primaryKey, startTS, len(muts))
+}
+
+func (f *kvFSM) assertNoConflictingTxnLocksWithScan(ctx context.Context, targets map[string]txnLockCheckTarget, scanStart, scanEnd, primaryKey []byte, startTS uint64, targetCount int) error {
+	best := txnLockCheckResult{index: targetCount}
+	for start := scanStart; len(start) > 0; {
+		kvs, err := f.store.ScanAt(ctx, start, scanEnd, txnLockBatchScanPageSize, ^uint64(0))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if len(kvs) == 0 {
+			break
+		}
+		updateTxnLockCheckResult(kvs, targets, primaryKey, startTS, &best)
+		next := nextScanCursor(kvs[len(kvs)-1].Key)
+		if scanEnd != nil && bytes.Compare(next, scanEnd) >= 0 {
+			break
+		}
+		start = next
+	}
+	return best.err
+}
+
+func assertNoConflictingTxnLocksWithBatchGet(ctx context.Context, getter mvccBatchGetter, targets map[string]txnLockCheckTarget, primaryKey []byte, startTS uint64, targetCount int) error {
+	values, err := getter.GetAtBatch(ctx, txnLockTargetKeys(targets), ^uint64(0))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	best := txnLockCheckResult{index: targetCount}
+	for lockKey, value := range values {
+		target, ok := targets[lockKey]
+		if !ok || target.index >= best.index {
+			continue
+		}
+		if err := txnLockConflictError(value, target.key, primaryKey, startTS); err != nil {
+			best.err = err
+			best.index = target.index
+		}
+	}
+	return best.err
+}
+
+func txnLockTargetKeys(targets map[string]txnLockCheckTarget) [][]byte {
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.lockKey)
+	}
+	return keys
+}
+
+func updateTxnLockCheckResult(kvs []*store.KVPair, targets map[string]txnLockCheckTarget, primaryKey []byte, startTS uint64, best *txnLockCheckResult) {
+	for _, kvp := range kvs {
+		target, ok := targets[string(kvp.Key)]
+		if !ok || target.index >= best.index {
+			continue
+		}
+		if err := txnLockConflictError(kvp.Value, target.key, primaryKey, startTS); err != nil {
+			best.err = err
+			best.index = target.index
+		}
+	}
+}
+
+func txnLockCheckTargets(muts []*pb.Mutation) (map[string]txnLockCheckTarget, []byte, []byte) {
+	targets := make(map[string]txnLockCheckTarget, len(muts))
+	var minLockKey []byte
+	var maxLockKey []byte
+	for i, mut := range muts {
+		lockKey := txnLockKey(mut.Key)
+		if _, ok := targets[string(lockKey)]; ok {
+			continue
+		}
+		targets[string(lockKey)] = txnLockCheckTarget{key: mut.Key, lockKey: lockKey, index: i}
+		if minLockKey == nil || bytes.Compare(lockKey, minLockKey) < 0 {
+			minLockKey = lockKey
+		}
+		if maxLockKey == nil || bytes.Compare(lockKey, maxLockKey) > 0 {
+			maxLockKey = lockKey
+		}
+	}
+	if minLockKey == nil {
+		return nil, nil, nil
+	}
+	return targets, minLockKey, nextScanCursor(maxLockKey)
+}
+
+func txnLockConflictError(lockBytes []byte, key, primaryKey []byte, startTS uint64) error {
 	lock, err := decodeTxnLock(lockBytes)
 	if err != nil {
 		return errors.WithStack(err)
