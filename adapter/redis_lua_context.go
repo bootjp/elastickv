@@ -1882,8 +1882,7 @@ func (c *luaScriptContext) cmdLRem(args []string) (luaReply, error) {
 	st.dirty = true
 	if len(values) == 0 {
 		st.exists = false
-		c.deleted[args[0]] = true
-		c.everDeleted[args[0]] = true
+		c.markListDeleted(args[0])
 		c.clearTTL([]byte(args[0]))
 	}
 	c.markTouched([]byte(args[0]))
@@ -1974,8 +1973,7 @@ func (c *luaScriptContext) cmdLTrim(args []string) (luaReply, error) {
 		st.exists = false
 		st.dirty = true
 		c.clearTTL([]byte(args[0]))
-		c.deleted[args[0]] = true
-		c.everDeleted[args[0]] = true
+		c.markListDeleted(args[0])
 		c.markTouched([]byte(args[0]))
 		return luaStatusReply("OK"), nil
 	}
@@ -2042,8 +2040,7 @@ func (c *luaScriptContext) markListEmptyAfterLazyPop(key string, st *luaListStat
 	st.leftValues = nil
 	st.rightValues = nil
 	st.values = nil
-	c.deleted[key] = true
-	c.everDeleted[key] = true
+	c.markListDeleted(key)
 	c.clearTTL([]byte(key))
 	c.markTouched([]byte(key))
 }
@@ -2059,12 +2056,15 @@ func (c *luaScriptContext) finishPoppedListValue(key string, st *luaListState, v
 		st.leftValues = nil
 		st.rightValues = nil
 		st.values = nil
-		c.deleted[key] = true
-		c.everDeleted[key] = true
+		c.markListDeleted(key)
 		c.clearTTL([]byte(key))
 	}
 	c.markTouched([]byte(key))
 	return luaStringReply(value)
+}
+
+func (c *luaScriptContext) markListDeleted(key string) {
+	c.everDeleted[key], c.deleted[key] = true, true
 }
 
 func (c *luaScriptContext) popLazyListValue(key []byte, st *luaListState, left bool) (string, bool, error) {
