@@ -20,6 +20,10 @@ func TestGroupDataDir(t *testing.T) {
 		require.Equal(t, filepath.Join(base, raftID), groupDataDir(base, raftID, 1, false))
 	})
 
+	t.Run("reserved TSO group stays isolated in single data-group mode", func(t *testing.T) {
+		require.Equal(t, filepath.Join(base, raftID, "group-0"), groupDataDir(base, raftID, 0, false))
+	})
+
 	t.Run("multi", func(t *testing.T) {
 		require.Equal(t, filepath.Join(base, raftID, "group-2"), groupDataDir(base, raftID, 2, true))
 	})

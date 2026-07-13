@@ -1623,12 +1623,39 @@ func (c *ShardedCoordinator) IsTimestampLeader() bool {
 	if c.timestampGroupConfigured {
 		return isLeaderEngine(engineForGroup(c.groups[c.timestampGroup]))
 	}
-	for _, g := range c.groups {
-		if isLeaderEngine(engineForGroup(g)) {
+	for _, groupID := range c.timestampBridgeCandidateGroupIDs() {
+		if isLeaderEngine(engineForGroup(c.groups[groupID])) {
 			return true
 		}
 	}
 	return false
+}
+
+func (c *ShardedCoordinator) timestampBridgeCandidateGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if c.allShardGroupsConfigured {
+		ids := make([]uint64, 0, len(c.allShardGroupIDs))
+		for _, groupID := range c.allShardGroupIDs {
+			if groupID == 0 {
+				continue
+			}
+			if _, ok := c.groups[groupID]; ok {
+				ids = append(ids, groupID)
+			}
+		}
+		return ids
+	}
+	ids := make([]uint64, 0, len(c.groups))
+	for groupID := range c.groups {
+		if groupID == 0 {
+			continue
+		}
+		ids = append(ids, groupID)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 func (c *ShardedCoordinator) invalidateTimestampWindow() {

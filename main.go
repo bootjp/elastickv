@@ -714,7 +714,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGrou
 		leaderDynamo:        leaderDynamo,
 		leaderSQS:           leaderSQS,
 		sqsFifoPartitionMap: sqsFifoPartitionMap,
-		multi:               len(groups) > 1,
+		multi:               len(dataGroupIDs(groups)) > 1,
 	}, nil
 }
 

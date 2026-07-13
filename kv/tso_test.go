@@ -219,6 +219,26 @@ func TestShardedCoordinatorDedicatedGroupDoesNotBlockDataLeaderTimestampBridge(t
 	require.True(t, coord.IsTimestampLeader())
 }
 
+func TestShardedCoordinatorTimestampBridgeIgnoresReservedGroupLeader(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	newCoord := func() *ShardedCoordinator {
+		return NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+			0: {Engine: stubLeaderEngine{}},
+			1: {Engine: &stubFollowerEngine{}},
+		}, 1, NewHLC(), nil)
+	}
+
+	t.Run("configured data groups", func(t *testing.T) {
+		require.False(t, newCoord().WithAllShardGroups(1).IsTimestampLeader())
+	})
+
+	t.Run("legacy fallback", func(t *testing.T) {
+		require.False(t, newCoord().IsTimestampLeader())
+	})
+}
+
 func TestShardedCoordinatorUsesDedicatedTimestampGroupLeader(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)

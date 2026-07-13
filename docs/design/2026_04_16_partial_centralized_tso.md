@@ -38,10 +38,12 @@ Implemented:
    and SQS FIFO partition maps cannot route queue partitions to it. Existing
    `--raftGroups` / `--raftGroupPeers` bootstrap the group as a compatibility
    bridge, and the all-led-group HLC renewal loop keeps its ceiling warm
-   alongside data groups. The current `--tsoEnabled` bridge still issues
-   timestamps from the locally led data shard through `LocalTSOAllocator`;
-   pinning timestamp issuance to group 0 remains deferred until the TSO-leader
-   redirect path exists.
+   alongside data groups. Adding only group 0 to an existing single-data-group
+   deployment keeps the data group on its legacy `base/raftID` directory while
+   isolating group 0 under `base/raftID/group-0`. The current `--tsoEnabled`
+   bridge still issues timestamps from the locally led data shard through
+   `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
+   until the TSO-leader redirect path exists.
 
 Remaining:
 

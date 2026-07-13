@@ -413,6 +413,18 @@ func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T)
 	route, ok := cfg.engine.GetRoute([]byte("user-key"))
 	require.True(t, ok)
 	require.Equal(t, uint64(2), route.GroupID)
+	require.False(t, cfg.multi)
+}
+
+func TestParseRuntimeConfigMultipleDataGroupsEnableMultiDataDirs(t *testing.T) {
+	cfg, err := parseRuntimeConfig(
+		"127.0.0.1:50051",
+		"", "", "", "",
+		"0=127.0.0.1:50050,1=127.0.0.1:50051,2=127.0.0.1:50052",
+		"", "", "", "", "", "",
+	)
+	require.NoError(t, err)
+	require.True(t, cfg.multi)
 }
 
 func TestValidateShardRanges(t *testing.T) {
