@@ -358,6 +358,42 @@ func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
 	require.Equal(t, []TargetStagedReadinessState{state}, states)
 }
 
+func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-prefix-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	pebbleStore, ok := st.(*pebbleStore)
+	require.True(t, ok)
+	junkKey := append([]byte(migrationReadyPrefix), []byte("side-record")...)
+	require.NoError(t, pebbleStore.db.Set(junkKey, []byte("not-readiness-state"), pebbleStore.directApplyWriteOpts()))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
+}
+
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-import-persist-*")

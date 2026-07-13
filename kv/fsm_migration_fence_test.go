@@ -43,7 +43,7 @@ func newTargetReadinessFSM(t *testing.T, route distribution.RouteDescriptor) *kv
 	t.Helper()
 
 	engine := distribution.NewEngine()
-	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{route})
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{route})
 	fsm := newComposed1FSM(t, engine, route.GroupID)
 	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
 	require.True(t, ok)

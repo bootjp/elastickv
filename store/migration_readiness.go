@@ -79,6 +79,9 @@ func (s *pebbleStore) loadPebbleTargetReadinessStatesFromDB() ([]TargetStagedRea
 
 	var out []TargetStagedReadinessState
 	for valid := iter.First(); valid; valid = iter.Next() {
+		if !isTargetReadinessRecordKey(iter.Key()) {
+			continue
+		}
 		state, ok := decodeTargetStagedReadinessState(iter.Value())
 		if !ok {
 			return nil, errors.New("corrupt target staged readiness state")
@@ -90,6 +93,11 @@ func (s *pebbleStore) loadPebbleTargetReadinessStatesFromDB() ([]TargetStagedRea
 	}
 	sortTargetStagedReadinessStates(out)
 	return out, nil
+}
+
+func isTargetReadinessRecordKey(rawKey []byte) bool {
+	return len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes &&
+		bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix))
 }
 
 func encodeTargetStagedReadinessState(state TargetStagedReadinessState) []byte {

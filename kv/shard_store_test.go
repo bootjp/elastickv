@@ -185,6 +185,31 @@ func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *tes
 	require.NoError(t, err)
 }
 
+func TestShardStoreTargetReadinessRejectsClearedDescriptorBeforeCutoverVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
+
+	_, err := st.GetAt(ctx, []byte("k"), 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
 	t.Parallel()
 
@@ -208,6 +233,49 @@ func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
 	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
 	require.NoError(t, err)
 	require.Len(t, kvs, 2)
+}
+
+func TestShardStoreScanGroupAtChecksEveryCoveredRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte("a"),
+				End:                 []byte("m"),
+				GroupID:             42,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID: 2,
+				Start:   []byte("m"),
+				End:     []byte("z"),
+				GroupID: 42,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("m"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("left"), 120, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("x"), []byte("right"), 120, 0))
+
+	_, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
 func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
@@ -400,6 +468,33 @@ func TestShardStoreDeletePrefixAtChecksTargetReadinessBeforeDelete(t *testing.T)
 		State:   distribution.RouteStateActive,
 	})
 	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtFailsClosedWithoutRouteProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("m"),
+			End:     []byte("z"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
 	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
 
 	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)

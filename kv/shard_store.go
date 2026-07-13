@@ -121,7 +121,7 @@ func routeHasStagedVisibility(route distribution.Route) bool {
 	return route.StagedVisibilityActive && route.MigrationJobID != 0
 }
 
-func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetStagedReadinessState) bool {
+func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetStagedReadinessState, catalogVersion uint64) bool {
 	if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
 		return false
 	}
@@ -131,7 +131,10 @@ func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetS
 	if route.StagedVisibilityActive {
 		return route.MigrationJobID == ready.MigrationJobID
 	}
-	return route.MigrationJobID == 0
+	if route.MigrationJobID != 0 {
+		return false
+	}
+	return ready.ExpectedCutoverVersion == 0 || catalogVersion >= ready.ExpectedCutoverVersion
 }
 
 func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) error {
@@ -151,11 +154,15 @@ func (s *ShardStore) verifyTargetReadinessForRouteRange(ctx context.Context, g *
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	var catalogVersion uint64
+	if s != nil && s.engine != nil {
+		catalogVersion = s.engine.Version()
+	}
 	for _, ready := range states {
 		if !targetReadinessAppliesToRoute(route, routeStart, routeEnd, ready) {
 			continue
 		}
-		if !routeSatisfiesTargetReadiness(route, ready) {
+		if !routeSatisfiesTargetReadiness(route, ready, catalogVersion) {
 			return errors.WithStack(ErrRouteCutoverPending)
 		}
 	}
@@ -388,7 +395,11 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	return s.scanRouteAtDirection(ctx, s.explicitGroupRouteForRange(groupID, start, end), start, end, limit, ts, false, true)
+	routes := s.explicitGroupRoutesForRange(groupID, start, end)
+	if err := s.verifyExplicitGroupRoutesForRange(ctx, groupID, routes, start, end); err != nil {
+		return nil, err
+	}
+	return s.scanRouteAtDirection(ctx, routes[0], start, end, limit, ts, false, true)
 }
 
 func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
@@ -1901,7 +1912,11 @@ func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte
 		return nil
 	}
 	routeStart, routeEnd := routePrefixRange(prefix)
-	for _, route := range s.engine.GetIntersectingRoutes(routeStart, routeEnd) {
+	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
+	if len(routes) == 0 {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
+	for _, route := range routes {
 		g, ok := s.groupForID(route.GroupID)
 		if !ok || g == nil || g.Store == nil {
 			return store.ErrNotSupported
@@ -2109,18 +2124,38 @@ func (s *ShardStore) explicitGroupRouteForKey(groupID uint64, key []byte) distri
 	return route
 }
 
-func (s *ShardStore) explicitGroupRouteForRange(groupID uint64, start []byte, end []byte) distribution.Route {
+func (s *ShardStore) explicitGroupRoutesForRange(groupID uint64, start []byte, end []byte) []distribution.Route {
 	fallback := distribution.Route{GroupID: groupID}
 	if s == nil || s.engine == nil {
-		return fallback
+		return []distribution.Route{fallback}
 	}
 	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
-	for _, route := range s.engine.GetIntersectingRoutes(routeStart, routeEnd) {
-		if route.GroupID == groupID {
-			return route
+	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
+	if len(routes) == 0 {
+		return []distribution.Route{fallback}
+	}
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.GroupID != groupID {
+			return []distribution.Route{fallback}
+		}
+		out = append(out, route)
+	}
+	return out
+}
+
+func (s *ShardStore) verifyExplicitGroupRoutesForRange(ctx context.Context, groupID uint64, routes []distribution.Route, start []byte, end []byte) error {
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return store.ErrNotSupported
+	}
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	for _, route := range routes {
+		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
+			return err
 		}
 	}
-	return fallback
+	return nil
 }
 
 func (s *ShardStore) routeAndGroupForKey(key []byte) (distribution.Route, *ShardGroup, bool) {

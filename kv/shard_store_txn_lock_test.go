@@ -478,7 +478,7 @@ func TestShardStorePhysicalLimitScanPreservesRouteProofDuringLockResolution(t *t
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
+		Version: 2,
 		Routes: []distribution.RouteDescriptor{{
 			RouteID:             1,
 			Start:               []byte("a"),

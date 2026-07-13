@@ -686,14 +686,14 @@ func (f *kvFSM) verifyTargetReadinessForRouteRange(ctx context.Context, routeSta
 		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
 			continue
 		}
-		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready, f.shardGroupID) {
+		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready, f.shardGroupID, snap.Version()) {
 			return errors.WithStack(ErrRouteCutoverPending)
 		}
 	}
 	return nil
 }
 
-func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState, groupID uint64) bool {
+func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState, groupID uint64, catalogVersion uint64) bool {
 	matched := false
 	for _, route := range routes {
 		if route.GroupID != groupID {
@@ -703,7 +703,7 @@ func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.Targe
 			continue
 		}
 		matched = true
-		if !routeSatisfiesTargetReadiness(route, ready) {
+		if !routeSatisfiesTargetReadiness(route, ready, catalogVersion) {
 			return false
 		}
 	}
