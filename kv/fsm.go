@@ -686,16 +686,19 @@ func (f *kvFSM) verifyTargetReadinessForRouteRange(ctx context.Context, routeSta
 		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
 			continue
 		}
-		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready) {
+		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready, f.shardGroupID) {
 			return errors.WithStack(ErrRouteCutoverPending)
 		}
 	}
 	return nil
 }
 
-func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState) bool {
+func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState, groupID uint64) bool {
 	matched := false
 	for _, route := range routes {
+		if route.GroupID != groupID {
+			continue
+		}
 		if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
 			continue
 		}
@@ -1366,7 +1369,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	// shouldClearAbortKey (lock-missing ⇒ nothing to do) and for the
 	// rollback-marker Put in appendRollbackRecord.
 
-	uniq, err := f.uniqueMutationsAboveWriteFloor(ctx, muts, abortTS)
+	uniq, err := f.uniqueAbortCleanupMutations(ctx, muts)
 	if err != nil {
 		return err
 	}
@@ -1395,6 +1398,17 @@ func (f *kvFSM) uniqueMutationsAboveWriteFloor(ctx context.Context, muts []*pb.M
 		return nil, err
 	}
 	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueAbortCleanupMutations(ctx context.Context, muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
 		return nil, err
 	}
 	return uniq, nil

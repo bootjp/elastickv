@@ -112,6 +112,39 @@ func TestFSMAllowsRawPointWriteWithClearedTargetReadinessProof(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMRejectsTargetReadinessProofFromAnotherGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             2,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 101)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -250,4 +283,40 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	}
 	err := fsm.handleTxnRequest(ctx, abort, 11)
 	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
+}
+
+func TestFSMAbortCleanupBypassesRetainedWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	startTS := uint64(10)
+	abortTS := uint64(11)
+	primaryKey := []byte("b")
+	require.NoError(t, fsm.store.PutAt(ctx, txnLockKey(primaryKey), encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		PrimaryKey:   primaryKey,
+		IsPrimaryKey: true,
+	}), startTS, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, txnIntentKey(primaryKey), encodeTxnIntent(txnIntent{
+		StartTS: startTS,
+		Op:      txnIntentOpPut,
+		Value:   []byte("v"),
+	}), startTS, 0))
+
+	abort := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_ABORT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: abortTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
+		},
+	}
+	require.NoError(t, fsm.handleTxnRequest(ctx, abort, abortTS))
+
+	_, lockErr := fsm.store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
+	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
 }
