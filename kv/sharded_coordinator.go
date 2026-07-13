@@ -700,11 +700,8 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
-	// DEL_PREFIX cannot be routed to a single shard because the prefix may
-	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
-	// operation to every shard group so each FSM scans locally.
-	if hasDelPrefixElem(reqs.Elems) {
-		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
+	if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
+		return resp, err
 	}
 
 	// Capture whether the caller supplied a non-zero StartTS BEFORE
@@ -742,6 +739,20 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	return c.dispatchNonTxn(ctx, reqs)
+}
+
+func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, bool, error) {
+	// DEL_PREFIX cannot be routed to a single shard because the prefix may
+	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
+	// operation to every shard group so each FSM scans locally.
+	if hasDelPrefixElem(reqs.Elems) {
+		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
+		return resp, true, err
+	}
+	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
+		return nil, true, err
+	}
+	return nil, false, nil
 }
 
 // dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
@@ -1017,6 +1028,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	if err := validateDelPrefixOnly(elems); err != nil {
 		return nil, err
 	}
+	if err := c.rejectWriteFencedDelPrefixes(elems); err != nil {
+		return nil, err
+	}
 
 	ts, err := c.allocateTimestamp(ctx, "allocate DEL_PREFIX broadcast ts")
 	if err != nil {
@@ -1033,6 +1047,41 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	}
 
 	return c.broadcastToAllGroups(ctx, requests)
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedPointElems(elems []*Elem[OP]) error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil || len(elem.Key) == 0 {
+			continue
+		}
+		route, ok := c.engine.GetRoute(routeKey(elem.Key))
+		if !ok || route.State != distribution.RouteStateWriteFenced {
+			continue
+		}
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", elem.Key, routeKey(elem.Key))
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		start, end := routePrefixRange(elem.Key)
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if route.State == distribution.RouteStateWriteFenced {
+				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
+			}
+		}
+	}
+	return nil
 }
 
 // broadcastToAllGroups sends the same set of requests to every shard group in

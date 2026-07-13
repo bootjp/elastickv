@@ -162,6 +162,9 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return nil, err
 	}
+	if err := s.rejectLiveSplitJobOverlap(ctx, snapshot, parent); err != nil {
+		return nil, err
+	}
 
 	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
 	if err != nil {
@@ -374,6 +377,69 @@ func validateSplitKey(parent distribution.RouteDescriptor, splitKey []byte) erro
 		return grpcStatusError(codes.InvalidArgument, errDistributionInvalidSplitKey.Error())
 	}
 	return nil
+}
+
+func (s *DistributionServer) rejectLiveSplitJobOverlap(ctx context.Context, snapshot distribution.CatalogSnapshot, parent distribution.RouteDescriptor) error {
+	jobs, err := s.catalog.ListSplitJobsAt(ctx, snapshot.ReadTS)
+	if err != nil {
+		return grpcStatusErrorf(codes.Internal, "load split jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if !splitJobIsLive(job) {
+			continue
+		}
+		for _, interval := range liveSplitJobIntervals(job, snapshot.Routes) {
+			if routeRangeIntersects(parent.Start, parent.End, interval.start, interval.end) {
+				return grpcStatusError(codes.Aborted, distribution.ErrSplitJobOverlap.Error())
+			}
+		}
+	}
+	return nil
+}
+
+func splitJobIsLive(job distribution.SplitJob) bool {
+	return job.Phase != distribution.SplitJobPhaseDone && job.Phase != distribution.SplitJobPhaseAbandoned
+}
+
+type routeInterval struct {
+	start []byte
+	end   []byte
+}
+
+const initialLiveSplitJobIntervalCapacity = 2
+
+func liveSplitJobIntervals(job distribution.SplitJob, routes []distribution.RouteDescriptor) []routeInterval {
+	out := make([]routeInterval, 0, initialLiveSplitJobIntervalCapacity)
+	for _, route := range routes {
+		switch {
+		case route.RouteID == job.SourceRouteID:
+			out = append(out, routeInterval{
+				start: distribution.CloneBytes(job.SplitKey),
+				end:   distribution.CloneBytes(route.End),
+			})
+		case route.ParentRouteID == job.SourceRouteID && routeRangeIntersects(route.Start, route.End, job.SplitKey, nil):
+			out = append(out, routeInterval{
+				start: distribution.CloneBytes(route.Start),
+				end:   distribution.CloneBytes(route.End),
+			})
+		case job.JobID != 0 && route.MigrationJobID == job.JobID:
+			out = append(out, routeInterval{
+				start: distribution.CloneBytes(route.Start),
+				end:   distribution.CloneBytes(route.End),
+			})
+		}
+	}
+	return out
+}
+
+func routeRangeIntersects(aStart, aEnd, bStart, bEnd []byte) bool {
+	if aEnd != nil && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if bEnd != nil && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
 }
 
 func splitCatalogRoutes(

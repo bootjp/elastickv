@@ -158,6 +158,15 @@ func (s RouteHistorySnapshot) Version() uint64 { return s.version }
 // scan from O(N) to "first non-covering gap" without changing the
 // resolution semantics).
 func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
+	r, ok := s.RouteOf(key)
+	if !ok {
+		return 0, false
+	}
+	return r.GroupID, true
+}
+
+// RouteOf returns the route that covered key at this snapshot's version.
+func (s RouteHistorySnapshot) RouteOf(key []byte) (Route, bool) {
 	for _, r := range s.routes {
 		if bytes.Compare(key, r.Start) < 0 {
 			break
@@ -165,9 +174,25 @@ func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
 		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
 			continue
 		}
-		return r.GroupID, true
+		return cloneRoute(r), true
 	}
-	return 0, false
+	return Route{}, false
+}
+
+// IntersectingRoutes returns every route whose range intersects [start, end)
+// in this snapshot. A nil end denotes +infinity.
+func (s RouteHistorySnapshot) IntersectingRoutes(start, end []byte) []Route {
+	out := make([]Route, 0)
+	for _, r := range s.routes {
+		if r.End != nil && bytes.Compare(r.End, start) <= 0 {
+			continue
+		}
+		if end != nil && bytes.Compare(r.Start, end) >= 0 {
+			continue
+		}
+		out = append(out, cloneRoute(r))
+	}
+	return out
 }
 
 // Current returns the route catalog snapshot at the engine's current
@@ -383,6 +408,17 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		})
 	}
 	return result
+}
+
+func cloneRoute(r Route) Route {
+	return Route{
+		RouteID: r.RouteID,
+		Start:   CloneBytes(r.Start),
+		End:     CloneBytes(r.End),
+		GroupID: r.GroupID,
+		State:   r.State,
+		Load:    r.Load,
+	}
 }
 
 func (e *Engine) routeIndex(key []byte) int {
