@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"strconv"
@@ -853,6 +854,19 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyCollectionBlobsFromTTLIndex(t *te
 	}
 }
 
+type timeoutScanStore struct {
+	store.MVCCStore
+	scans  int
+	starts [][]byte
+}
+
+func (s *timeoutScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scans++
+	s.starts = append(s.starts, bytes.Clone(start))
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 type recordingCompactorCoordinator struct {
 	stubAdapterCoordinator
 	labels []keyviz.Label
@@ -872,6 +886,56 @@ func TestDeltaCompactorStampsRedisKeyVizLabel(t *testing.T) {
 	_, err := c.coord.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{})
 	require.NoError(t, err)
 	require.Equal(t, []keyviz.Label{keyviz.LabelRedis}, rec.labels)
+}
+
+func TestDeltaCompactor_BackoffAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &timeoutScanStore{MVCCStore: base}
+	coord := newLocalAdapterCoordinator(st)
+	c := NewDeltaCompactor(
+		st,
+		coord,
+		WithDeltaCompactorTimeout(time.Millisecond),
+		WithDeltaCompactorTimeoutBackoff(time.Hour),
+	)
+
+	err := c.SyncOnce(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, st.scans, "timeout pass should run one scan before yielding")
+
+	require.NoError(t, c.SyncOnce(context.Background()))
+	require.Equal(t, 1, st.scans, "backoff pass should not scan again")
+}
+
+func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &timeoutScanStore{MVCCStore: base}
+	coord := newLocalAdapterCoordinator(st)
+	c := NewDeltaCompactor(
+		st,
+		coord,
+		WithDeltaCompactorTimeout(10*time.Millisecond),
+		WithDeltaCompactorTimeoutBackoff(0),
+	)
+
+	wantPrefixes := []string{
+		store.ListMetaDeltaPrefix,
+		store.HashMetaDeltaPrefix,
+		store.SetMetaDeltaPrefix,
+		store.ZSetMetaDeltaPrefix,
+		store.ListMetaDeltaPrefix,
+	}
+	for _, prefix := range wantPrefixes {
+		err := c.SyncOnce(context.Background())
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Len(t, st.starts, st.scans)
+		require.True(t, bytes.HasPrefix(st.starts[len(st.starts)-1], []byte(prefix)),
+			"scan should start with %q after timeout rotation; got %q", prefix, st.starts[len(st.starts)-1])
+	}
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {

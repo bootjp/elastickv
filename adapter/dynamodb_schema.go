@@ -73,39 +73,6 @@ type dynamoGlobalSecondaryIndex struct {
 	Projection dynamoGSIProjection `json:"projection"`
 }
 
-func (g *dynamoGlobalSecondaryIndex) UnmarshalJSON(b []byte) error {
-	type rawGSI struct {
-		KeySchema  *dynamoKeySchema     `json:"key_schema"`
-		Projection *dynamoGSIProjection `json:"projection"`
-		HashKey    string               `json:"hash_key"`
-		RangeKey   string               `json:"range_key"`
-	}
-
-	var raw rawGSI
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return errors.WithStack(err)
-	}
-
-	if raw.KeySchema != nil {
-		g.KeySchema = *raw.KeySchema
-	} else {
-		g.KeySchema = dynamoKeySchema{
-			HashKey:  raw.HashKey,
-			RangeKey: raw.RangeKey,
-		}
-	}
-
-	if raw.Projection != nil && strings.TrimSpace(raw.Projection.ProjectionType) != "" {
-		g.Projection = *raw.Projection
-	} else {
-		// Older schema snapshots stored only the key schema. Those GSIs behaved
-		// like ALL projections, so preserve that behavior when normalizing.
-		g.Projection = dynamoGSIProjection{ProjectionType: "ALL"}
-	}
-
-	return nil
-}
-
 type dynamoTableSchema struct {
 	TableName               string                                `json:"table_name"`
 	AttributeDefinitions    map[string]string                     `json:"attribute_definitions,omitempty"`

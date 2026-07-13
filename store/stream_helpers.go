@@ -108,15 +108,6 @@ func EncodeStreamID(ms, seq uint64) []byte {
 	return buf[:]
 }
 
-// DecodeStreamID parses a 16-byte big-endian ms||seq tuple. Returns false if
-// the slice length is wrong.
-func DecodeStreamID(b []byte) (ms, seq uint64, ok bool) {
-	if len(b) != StreamIDBytes {
-		return 0, 0, false
-	}
-	return binary.BigEndian.Uint64(b[0:8]), binary.BigEndian.Uint64(b[8:16]), true
-}
-
 // StreamEntryKey builds the per-entry key for a stream.
 func StreamEntryKey(userKey []byte, ms, seq uint64) []byte {
 	buf := make([]byte, 0, len(StreamEntryPrefix)+wideColKeyLenSize+len(userKey)+StreamIDBytes)
@@ -127,16 +118,6 @@ func StreamEntryKey(userKey []byte, ms, seq uint64) []byte {
 	buf = append(buf, userKey...)
 	buf = append(buf, EncodeStreamID(ms, seq)...)
 	return buf
-}
-
-// ExtractStreamEntryID extracts (ms, seq) from a stream entry key. Returns
-// false if the key is not a valid entry key for the given userKey.
-func ExtractStreamEntryID(entryKey, userKey []byte) (ms, seq uint64, ok bool) {
-	prefix := StreamEntryScanPrefix(userKey)
-	if !bytes.HasPrefix(entryKey, prefix) {
-		return 0, 0, false
-	}
-	return DecodeStreamID(entryKey[len(prefix):])
 }
 
 // IsStreamMetaKey reports whether the key is a stream metadata key.
