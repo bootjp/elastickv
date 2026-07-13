@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -249,6 +250,35 @@ func TestExportVersionsMinTSSkipHonorsScanBudget(t *testing.T) {
 	})
 }
 
+func TestExportVersionsMinTSPruneCursorSkipsWholeKey(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
+		require.NoError(t, st.PutAt(ctx, []byte("old"), value, 1, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("old"), value, 2, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("old"), value, 3, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("tail"), []byte("v20"), 20, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MinCommitTSExclusive: 10,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Empty(t, first.Versions)
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			Cursor:               first.NextCursor,
+			MinCommitTSExclusive: 10,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("tail"), CommitTS: 20, Value: []byte("v20")}}, second.Versions)
+	})
+}
+
 func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -306,6 +336,33 @@ func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T
 	})
 }
 
+func TestPebbleExportSkipsWriterRegistryRows(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-writer-registry-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	registry, err := WriterRegistryFor(st)
+	require.NoError(t, err)
+	require.NoError(t, registry.SetRegistryRow(
+		encryption.RegistryKey(1, 2),
+		encryption.EncodeRegistryValue(encryption.RegistryValue{
+			FullNodeID:          2,
+			FirstSeenLocalEpoch: 1,
+			LastSeenLocalEpoch:  1,
+		}),
+	))
+	require.NoError(t, st.PutAt(ctx, []byte("user"), []byte("value"), 10, 0))
+
+	res, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+	require.NoError(t, err)
+	require.True(t, res.Done)
+	require.Equal(t, []MVCCVersion{{Key: []byte("user"), CommitTS: 10, Value: []byte("value")}}, res.Versions)
+}
+
 func TestPebbleExportStopsAtEndKey(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-end-key-*")
@@ -325,8 +382,7 @@ func TestPebbleExportStopsAtEndKey(t *testing.T) {
 
 	result := newExportVersionsResult(10)
 	advance, done, err := ps.exportPebbleIteratorPosition(ctx, iter, ExportVersionsOptions{
-		StartKey: []byte("a"),
-		EndKey:   []byte("b"),
+		EndKey: []byte("b"),
 	}, exportCursorPosition{}, &result)
 	require.ErrorIs(t, err, errExportReachedEnd)
 	require.False(t, advance)
@@ -439,7 +495,7 @@ func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	require.Equal(t, []byte("persisted"), res.AckedCursor)
 }
 
-func TestPebbleSnapshotExcludesMigrationMetadata(t *testing.T) {
+func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	ctx := context.Background()
 	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
 	require.NoError(t, err)
@@ -474,7 +530,7 @@ func TestPebbleSnapshotExcludesMigrationMetadata(t *testing.T) {
 	require.Equal(t, []byte("v50"), val)
 	floor, err := dst.MigrationHLCFloor(ctx, 7)
 	require.NoError(t, err)
-	require.Zero(t, floor)
+	require.Equal(t, uint64(50), floor)
 
 	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
 		JobID:     7,
@@ -484,9 +540,8 @@ func TestPebbleSnapshotExcludesMigrationMetadata(t *testing.T) {
 		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
 	})
 	require.NoError(t, err)
-	require.False(t, res.Duplicate)
-	require.Equal(t, []byte("fresh"), res.AckedCursor)
-	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v60"), val)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("stale"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
 }

@@ -79,9 +79,6 @@ func writePebbleSnapshotEntries(snap *pebble.Snapshot, w io.Writer) error {
 	for iter.First(); iter.Valid(); iter.Next() {
 		k := iter.Key()
 		v := iter.Value()
-		if isMigrationMetadataKey(k) {
-			continue
-		}
 
 		if err := binary.Write(w, binary.LittleEndian, uint64(len(k))); err != nil {
 			_ = iter.Close()

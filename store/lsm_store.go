@@ -552,7 +552,8 @@ func isPebbleMetaKey(rawKey []byte) bool {
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaAppliedIndexBytes) ||
-		isMigrationMetadataKey(rawKey)
+		isMigrationMetadataKey(rawKey) ||
+		bytes.HasPrefix(rawKey, encryption.WriterRegistryPrefix)
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
@@ -2177,11 +2178,6 @@ func writeRestoreEntry(r io.Reader, batch *pebble.Batch, keyBuf []byte, kLen, vL
 	return errors.WithStack(deferred.Finish())
 }
 
-func discardRestoreEntryValue(r io.Reader, vLen int) error {
-	_, err := io.CopyN(io.Discard, r, int64(vLen))
-	return errors.WithStack(err)
-}
-
 func restoreBatchLoopStep(r io.Reader, db *pebble.DB, batch **pebble.Batch, keyBuf *[]byte) (bool, error) {
 	kLen, vLen, eof, err := readRestoreEntry(r, keyBuf)
 	if err != nil {
@@ -2189,9 +2185,6 @@ func restoreBatchLoopStep(r io.Reader, db *pebble.DB, batch **pebble.Batch, keyB
 	}
 	if eof {
 		return true, nil
-	}
-	if isMigrationMetadataKey((*keyBuf)[:kLen]) {
-		return false, discardRestoreEntryValue(r, vLen)
 	}
 	if err := flushSnapshotBatchIfNeeded(db, batch, kLen, vLen); err != nil {
 		return false, err

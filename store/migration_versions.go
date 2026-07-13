@@ -13,6 +13,7 @@ import (
 const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
+	exportCursorTagPrunedKey
 
 	migrationAckMetaKey      = "_migack"
 	migrationHLCFloorMetaKey = "_mighlc"
@@ -78,7 +79,7 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
 	tag := rest[0]
-	if tag != exportCursorTagEmitted && tag != exportCursorTagScanned {
+	if tag != exportCursorTagEmitted && tag != exportCursorTagScanned && tag != exportCursorTagPrunedKey {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
 	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
@@ -362,6 +363,9 @@ func exportMemoryIteratorKey(
 	result *ExportVersionsResult,
 ) (bool, error) {
 	versions, _ := value.([]VersionedValue)
+	if pos.hasKey && pos.tag == exportCursorTagPrunedKey && bytes.Equal(key, pos.key) {
+		return true, nil
+	}
 	cursorCommitTS := uint64(0)
 	if pos.hasKey && bytes.Equal(key, pos.key) {
 		cursorCommitTS = pos.commitTS
@@ -433,7 +437,7 @@ func exportMemoryVersionsForKey(
 			continue
 		}
 		if versions[i].TS <= opts.MinCommitTSExclusive {
-			if !finishMemoryExportPosition(opts, key, versions[i], exportCursorTagScanned, result) {
+			if !finishMemoryExportPosition(opts, key, versions[i], exportCursorTagPrunedKey, result) {
 				return false, nil
 			}
 			return true, nil

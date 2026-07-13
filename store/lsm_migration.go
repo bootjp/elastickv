@@ -106,7 +106,14 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 		return true, true, nil
 	}
 	userKey, commitTS := decodeKeyView(rawKey)
-	if userKey == nil || pebbleExportCursorEqual(pos, userKey, commitTS) {
+	if userKey == nil {
+		return true, true, nil
+	}
+	if pebbleExportCursorPrunedKey(pos, userKey, commitTS) {
+		advancePebbleExportPastCurrentUserKey(iter, userKey)
+		return false, true, nil
+	}
+	if pebbleExportCursorEqual(pos, userKey, commitTS) {
 		return true, true, nil
 	}
 	if skipped, err := s.skipPebbleExportKeyOutsideRange(iter, opts, userKey); skipped || err != nil {
@@ -143,7 +150,7 @@ func (s *pebbleStore) skipPebbleExportVersionBelowMinTS(
 ) (advance bool, done bool, err error) {
 	rawValue := iter.Value()
 	result.ScannedBytes += versionExportSize(userKey, len(rawValue))
-	result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+	result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagPrunedKey)
 	if finishExportIfLimited(opts, result) {
 		result.Done = false
 		return false, false, nil
@@ -163,7 +170,7 @@ func advancePebbleExportPastCurrentUserKey(iter *pebble.Iterator, userKey []byte
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
-	for prefixLen := range userKey {
+	for prefixLen := 1; prefixLen <= len(userKey); prefixLen++ {
 		prefix := userKey[:prefixLen]
 		if (startKey == nil || bytes.Compare(prefix, startKey) >= 0) && bytes.Compare(prefix, endKey) < 0 {
 			return false
@@ -174,6 +181,10 @@ func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
 
 func pebbleExportCursorEqual(pos exportCursorPosition, userKey []byte, commitTS uint64) bool {
 	return pos.hasKey && bytes.Equal(userKey, pos.key) && commitTS == pos.commitTS
+}
+
+func pebbleExportCursorPrunedKey(pos exportCursorPosition, userKey []byte, commitTS uint64) bool {
+	return pos.hasKey && pos.tag == exportCursorTagPrunedKey && bytes.Equal(userKey, pos.key) && commitTS == pos.commitTS
 }
 
 func (s *pebbleStore) exportPebbleVersion(
