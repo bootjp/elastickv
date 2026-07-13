@@ -146,12 +146,14 @@ type MigrationBracket struct {
 	ExcludeKnownInternal  bool
 	DrainOnly             bool
 	RequiresRouteKeyCheck bool
+	RequiresDecodedS3     bool
 }
 
 // PlanMigrationBrackets returns the full M2 migration plan, including the
 // drain-only transaction lock bracket. Data export callers should use
 // PlanExportBrackets, which omits drain-only control state.
 func PlanMigrationBrackets(routeStart, routeEnd []byte) ([]MigrationBracket, error) {
+	routeEnd = normalizeMigrationRouteEnd(routeEnd)
 	if err := ValidateMigrationRouteRange(routeStart, routeEnd); err != nil {
 		return nil, err
 	}
@@ -215,10 +217,24 @@ func (b MigrationBracket) ContainsRawKey(rawKey []byte) bool {
 	if len(b.End) > 0 && bytes.Compare(rawKey, b.End) >= 0 {
 		return false
 	}
+	if !b.containsFamilyShape(rawKey) {
+		return false
+	}
 	if b.ExcludeKnownInternal && IsMigrationKnownInternalKey(rawKey) {
 		return false
 	}
 	return !hasAnyPrefix(rawKey, b.ExcludePrefixes)
+}
+
+func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {
+	switch b.Family {
+	case MigrationFamilyListMetaDelta:
+		return store.ExtractListUserKeyFromDelta(rawKey) != nil
+	case MigrationFamilyListMeta:
+		return store.ExtractListUserKeyFromDelta(rawKey) == nil
+	default:
+		return true
+	}
 }
 
 // InitializeSplitJobPlan validates the source route and seeds the job's
@@ -312,7 +328,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyTxnMeta, prefix: migrationTxnMetaPrefix},
 		{family: MigrationFamilyListMetaDelta, prefix: store.ListMetaDeltaPrefix},
 		{family: MigrationFamilyListClaim, prefix: store.ListClaimPrefix},
-		{family: MigrationFamilyListMeta, prefix: store.ListMetaPrefix, excludePrefixes: []string{store.ListMetaDeltaPrefix}},
+		{family: MigrationFamilyListMeta, prefix: store.ListMetaPrefix},
 		{family: MigrationFamilyListItem, prefix: store.ListItemPrefix},
 		{family: MigrationFamilyRedisLegacy, prefix: migrationRedisPrefix},
 		{family: MigrationFamilyHash, prefix: migrationHashPrefix},
@@ -350,6 +366,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 	out := make([]MigrationBracket, 0, len(defs))
 	for _, def := range defs {
 		start := []byte(def.prefix)
+		requiresRouteKeyCheck, requiresDecodedS3 := migrationBracketRouteCheck(def.family)
 		out = append(out, MigrationBracket{
 			BracketID:             uint64(def.family),
 			Family:                def.family,
@@ -357,10 +374,27 @@ func migrationFamilyBrackets() []MigrationBracket {
 			End:                   prefixScanEnd(start),
 			ExcludePrefixes:       stringsToByteSlices(def.excludePrefixes),
 			DrainOnly:             def.drainOnly,
-			RequiresRouteKeyCheck: true,
+			RequiresRouteKeyCheck: requiresRouteKeyCheck,
+			RequiresDecodedS3:     requiresDecodedS3,
 		})
 	}
 	return out
+}
+
+func migrationBracketRouteCheck(family uint32) (requiresRouteKeyCheck bool, requiresDecodedS3 bool) {
+	switch family {
+	case MigrationFamilyS3BucketMeta, MigrationFamilyS3BucketGeneration:
+		return false, true
+	default:
+		return true, false
+	}
+}
+
+func normalizeMigrationRouteEnd(routeEnd []byte) []byte {
+	if len(routeEnd) == 0 {
+		return nil
+	}
+	return routeEnd
 }
 
 func stringsToByteSlices(in []string) [][]byte {

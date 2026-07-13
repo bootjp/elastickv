@@ -66,7 +66,13 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		bracket, ok := byFamily[family]
 		require.True(t, ok, "missing family %d", family)
 		require.Equal(t, uint64(family), bracket.BracketID)
-		require.True(t, bracket.RequiresRouteKeyCheck)
+		if family == MigrationFamilyS3BucketMeta || family == MigrationFamilyS3BucketGeneration {
+			require.False(t, bracket.RequiresRouteKeyCheck)
+			require.True(t, bracket.RequiresDecodedS3)
+		} else {
+			require.True(t, bracket.RequiresRouteKeyCheck)
+			require.False(t, bracket.RequiresDecodedS3)
+		}
 		if family == MigrationFamilyUser {
 			require.Equal(t, []byte("m"), bracket.Start)
 			require.Equal(t, []byte("z"), bracket.End)
@@ -94,6 +100,10 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	listDelta := store.ListMetaDeltaKey([]byte("list"), 1, 0)
 	require.True(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listDelta))
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listDelta))
+
+	listMetaWithDeltaLookingUserKey := store.ListMetaKey([]byte("d|list"))
+	require.True(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
+	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 
 	partitionedSQS := []byte(migrationSQSMsgDataPrefix + migrationSQSPartitionedSuffix + "queue|0|1|msg")
 	require.True(t, byFamily[MigrationFamilySQSPartitionedMessageData].ContainsRawKey(partitionedSQS))
@@ -123,6 +133,16 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	} {
 		require.False(t, user.ContainsRawKey(raw), "concrete internal key %q must be excluded from familyUser", raw)
 	}
+}
+
+func TestPlanMigrationBracketsNormalizesEmptyRouteEnd(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte{})
+	require.NoError(t, err)
+	user := bracketsByFamily(brackets)[MigrationFamilyUser]
+	require.Nil(t, user.End)
+	require.True(t, user.ContainsRawKey([]byte("z")))
 }
 
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
