@@ -240,35 +240,32 @@ property: peers respond in non-deterministic order, so picking on
 first arrival would let `Start`/`End` flap between polls for the
 same bucket. If two nodes disagree on `Start`/`End`
 for the same `BucketID`, that indicates a routing-catalog
-divergence the operator should investigate; we surface it as a
-warning in the per-node status payload but do not block the
-response.
+divergence the operator should investigate; the current wire
+contract does not emit a structured catalog-divergence warning, so
+operators must correlate the row identity with peer status and the
+route catalog when investigating that condition.
 
 ### 4.5 Time alignment
 
-All nodes use `keyvizStep` (default 1 s). The aggregator **bucket-
-aligns** column timestamps to the nearest `keyvizStep` boundary
-before pivoting, so two nodes whose flush goroutines fire fractions
-of a second apart still land on the same merged column. Without
-the alignment step a 50 ms NTP skew would split each window into
-two adjacent merged columns, halving the displayed traffic in each.
-
-In the rules below, `keyvizStep_ms` denotes the step duration in
-milliseconds — i.e. `time.Duration(--keyvizStep) / time.Millisecond`.
-The wire form already carries timestamps as `column_unix_ms` so
-millisecond-quantum arithmetic falls out naturally.
+All nodes use `keyvizStep` (default 1 s), but the implemented
+aggregator merges columns by the exact `column_unix_ms` value each
+node returned. `mergeKeyVizMatrices` builds the sorted union of the
+raw column timestamps and treats a missing source column as zero.
+It does **not** round or bucket-align timestamps to the
+`keyvizStep` boundary.
 
 Specifics:
 
-- Both sides round `column_unix_ms[i]` down to the nearest
-  multiple of `keyvizStep_ms` before merging.
+- Identical `column_unix_ms[i]` values from multiple nodes merge
+  into one column.
 - A column present in node A but absent in node B contributes
   only A's values for that bucket — B's missing column reads as
   zero (the merge-rule identity).
-- Drift larger than `keyvizStep / 2` between nodes is still an
-  operator problem (the heatmap should not paper over NTP issues
-  that big), but routine sub-step jitter no longer causes column
-  fragmentation. (Gemini round-1 PR #685.)
+- Sub-step scheduler jitter or clock skew can therefore appear as
+  adjacent columns rather than a single merged window. Operators
+  should keep node clocks synchronized and interpret adjacent
+  near-identical windows as a timing artifact when peer flush ticks
+  are offset.
 
 ## 5. Wire format
 
@@ -292,11 +289,9 @@ no breaking changes — old SPA versions keep working):
   // NEW fan-out metadata; absent when fan-out is disabled.
   "fanout": {
     "nodes": [
-      {"node": "10.0.0.1:8080", "ok": true,  "error": "", "warnings": []},
-      {"node": "10.0.0.2:8080", "ok": true,  "error": "",
-        "warnings": [{"code": "catalog_divergence", "bucket_id": "route:42",
-                      "detail": "start/end disagree with prior node"}]},
-      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded", "warnings": []}
+      {"node": "10.0.0.1:8080", "ok": true},
+      {"node": "10.0.0.2:8080", "ok": true},
+      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded"}
     ],
     "responded": 2,
     "expected": 3
@@ -304,16 +299,13 @@ no breaking changes — old SPA versions keep working):
 }
 ```
 
-`warnings` is a per-node array of structured non-fatal signals.
-Today the only emitter is `catalog_divergence` (§4.4 — `Start`/`End`
-disagree across nodes for the same `BucketID`). Adding a new
-warning code is a wire-format extension, not a breaking change:
-old SPAs render the entry as a generic warning until they teach
-themselves the new code. (Codex round-1 PR #685.)
+`FanoutNodeStatus` currently serializes only `node`, `ok`, and
+`error`. Future structured non-fatal signals such as catalog
+divergence would require an explicit wire extension.
 
-`conflict` is per row — a coarser signal than parent §9.1's
-per-cell flag. The cell-level flag will land with the
-`leaderTerm`-based merge.
+`conflict` is the row-level OR of `conflicts[]`. `conflicts[]` is
+parallel to `values[]` and marks the exact cell where the
+leader-term merge observed a disagreement.
 
 The field is **always present** on every row in the response — even
 when fan-out is disabled (single-node mode), `conflict` defaults to
@@ -330,10 +322,9 @@ identically false.
   §5).
 - A degraded-mode banner above the heatmap when `responded <
   expected`, listing which nodes failed and why.
-- `KeyVizRow.conflict` → cell hatching (an SVG overlay layered
-  over the canvas, only over rows whose `conflict === true`). The
-  hatch is per-row, not per-cell, until the wire format upgrade
-  lets us be precise.
+- `KeyVizRow.conflicts[]` → per-cell hatching (an SVG overlay
+  layered over the canvas). When an older server omits
+  `conflicts[]`, the SPA falls back to row-level `conflict`.
 - Header counter: "Cluster view (3 of 3 nodes)".
 
 This is small enough to land in the same PR as the server side or
@@ -357,18 +348,22 @@ this document.
   on peer requests and returns the merged `fanout` block when the
   operator configured peers.
 - `web/admin/src/api/client.ts` and `web/admin/src/pages/KeyViz.tsx`
-  carry the `fanout` response shape, degraded banner, conflict
-  hatching, and cluster-view counter in the SPA.
+  carry the `fanout` response shape, degraded banner, per-cell
+  conflict hatching, and cluster-view counter in the SPA.
 - `internal/admin/keyviz_fanout_test.go`,
-  `internal/admin/keyviz_handler_test.go`, and SPA tests cover the
-  server and UI behavior while preserving the default single-node
-  view when `--keyvizFanoutNodes` is unset.
+  `internal/admin/keyviz_handler_test.go`, and
+  `docs/design/2026_05_25_implemented_keyviz_per_cell_conflict.md`
+  cover the server-side fan-out, handler behavior, and Phase 2-C+
+  per-cell conflict wire contract. Current SPA unit coverage is
+  limited to adjacent parser/API infrastructure; it does not yet
+  exercise the degraded banner, cluster counter, or hatching
+  rendering paths.
 
-Phase 2-C+ remains future work: extend the matrix rows with
-`raftGroupID` and `leaderTerm`, replace §4.2's max-merge with the
-canonical `(bucketID, raftGroupID, leaderTerm, windowStart)` merge,
-and promote `conflict` from per-row to per-cell. That follow-up is
-explicitly outside this Phase 2-C implemented slice.
+Phase 2-C+ is also implemented: matrix rows carry `raft_group_ids`,
+`leader_terms`, and per-cell `conflicts`; write merging uses the
+canonical `(bucketID, raftGroupID, leaderTerm, column)` identity and
+falls back to the legacy max-merge when a peer omits the group/term
+identity.
 
 ## 8. Five-lens review checklist
 

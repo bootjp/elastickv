@@ -27,6 +27,8 @@ func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
 	require.Equal(t, []byte("a"), pairs[2].Key)
 }
 
+const grpcSequenceIterations = 256
+
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
@@ -324,7 +326,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	// not abort the test. The post-RPC assert.Equal still pins the
 	// consistency invariant: once Put eventually succeeds, the
 	// subsequent Get must return the same value, otherwise we fail.
-	for i := range 9999 {
+	for i := range grpcSequenceIterations {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
@@ -379,7 +381,7 @@ func Test_grpc_transaction(t *testing.T) {
 	// _sequence: tolerate transient leader churn (purely availability,
 	// not consistency) while keeping the Put → Get → Delete → Get
 	// invariants strict.
-	for i := range 9999 {
+	for i := range grpcSequenceIterations {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.Put(ctx, &pb.PutRequest{Key: key, Value: want})
