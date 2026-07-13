@@ -222,13 +222,6 @@ type RedisServer struct {
 	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
 
-	// standaloneSetDedup is kept for compatibility with older tests and
-	// deployments that toggled the former standalone SET sub-gate. SET now
-	// has the same collection-overwrite semantics on the dedup path as the
-	// legacy path, so onePhaseTxnDedup alone controls standalone SET/INCR/HSET
-	// routing.
-	standaloneSetDedup bool
-
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -243,15 +236,6 @@ type RedisServerOption func(*RedisServer)
 func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
 	return func(r *RedisServer) {
 		r.onePhaseTxnDedup = enabled
-	}
-}
-
-// WithStandaloneSetDedup is a compatibility no-op. Standalone SET follows
-// onePhaseTxnDedup now that SET-over-collection parity is implemented in
-// txnContext.applySet.
-func WithStandaloneSetDedup(enabled bool) RedisServerOption {
-	return func(r *RedisServer) {
-		r.standaloneSetDedup = enabled
 	}
 }
 
@@ -522,12 +506,10 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
 		// constructor option still trumps the env var.
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
-		// Compatibility field for the removed standalone SET sub-gate.
-		standaloneSetDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP_SET") == "1",
-		baseCtx:            baseCtx,
-		baseCancel:         baseCancel,
-		streamWaiters:      newKeyWaiterRegistry(),
-		zsetWaiters:        newKeyWaiterRegistry(),
+		baseCtx:          baseCtx,
+		baseCancel:       baseCancel,
+		streamWaiters:    newKeyWaiterRegistry(),
+		zsetWaiters:      newKeyWaiterRegistry(),
 	}
 	r.relay.Bind(r.publishLocal)
 

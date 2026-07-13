@@ -305,9 +305,18 @@ func computeScanCapHint(treeSize, limit int) int {
 	return capHint
 }
 
-func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) []*KVPair {
+func (s *mvccStore) collectScanResults(ctx context.Context, it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) ([]*KVPair, error) {
+	result, _, err := collectScanResultsWithPhysicalLimit(ctx, it, end, limit, 0, capHint, ts)
+	return result, err
+}
+
+func collectScanResultsWithPhysicalLimit(ctx context.Context, it *treemap.Iterator, end []byte, limit, physicalLimit, capHint int, ts uint64) ([]*KVPair, bool, error) {
 	result := make([]*KVPair, 0, capHint)
+	visited := 0
 	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, false, errors.WithStack(err)
+		}
 		k, keyOK := it.Key().([]byte)
 		if !keyOK {
 			continue
@@ -315,6 +324,10 @@ func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, 
 		if end != nil && bytes.Compare(k, end) >= 0 {
 			break
 		}
+		if physicalLimit > 0 && visited >= physicalLimit {
+			return result, true, nil
+		}
+		visited++
 		versions, _ := it.Value().([]VersionedValue)
 		val, visible := visibleValue(versions, ts)
 		if !visible {
@@ -325,12 +338,15 @@ func (s *mvccStore) collectScanResults(it *treemap.Iterator, end []byte, limit, 
 			Value: bytes.Clone(val),
 		})
 	}
-	return result
+	return result, false, nil
 }
 
-func (s *mvccStore) collectScanKeys(it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) [][]byte {
+func (s *mvccStore) collectScanKeys(ctx context.Context, it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) ([][]byte, error) {
 	result := make([][]byte, 0, capHint)
 	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
 		k, keyOK := it.Key().([]byte)
 		if !keyOK {
 			continue
@@ -344,12 +360,18 @@ func (s *mvccStore) collectScanKeys(it *treemap.Iterator, end []byte, limit, cap
 		}
 		result = append(result, bytes.Clone(k))
 	}
-	return result
+	return result, nil
 }
 
-func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+func (s *mvccStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return nil, ErrReadTSCompacted
 	}
@@ -363,12 +385,42 @@ func (s *mvccStore) ScanAt(_ context.Context, start []byte, end []byte, limit in
 	if !seekForwardIteratorStart(s.tree, &it, start) {
 		return make([]*KVPair, 0, capHint), nil
 	}
-	return s.collectScanResults(&it, end, limit, capHint, ts), nil
+	return s.collectScanResults(ctx, &it, end, limit, capHint, ts)
 }
 
-func (s *mvccStore) ScanKeysAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+func (s *mvccStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, false, ErrReadTSCompacted
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*KVPair{}, false, nil
+	}
+
+	capHint := computeScanCapHint(s.tree.Size(), visibleLimit)
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return make([]*KVPair, 0, capHint), false, nil
+	}
+	return collectScanResultsWithPhysicalLimit(ctx, &it, end, visibleLimit, physicalLimit, capHint, ts)
+}
+
+func (s *mvccStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return nil, ErrReadTSCompacted
 	}
@@ -382,7 +434,7 @@ func (s *mvccStore) ScanKeysAt(_ context.Context, start []byte, end []byte, limi
 	if !seekForwardIteratorStart(s.tree, &it, start) {
 		return make([][]byte, 0, capHint), nil
 	}
-	return s.collectScanKeys(&it, end, limit, capHint, ts), nil
+	return s.collectScanKeys(ctx, &it, end, limit, capHint, ts)
 }
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.
@@ -435,6 +487,38 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 	return result, nil
 }
 
+func (s *mvccStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, false, ErrReadTSCompacted
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*KVPair{}, false, nil
+	}
+
+	capHint := boundedScanResultCapacity(visibleLimit)
+	if size := s.tree.Size(); size < capHint {
+		capHint = size
+	}
+	if capHint < 0 {
+		capHint = 0
+	}
+	result := make([]*KVPair, 0, capHint)
+	it := s.tree.Iterator()
+	if !seekReverseIteratorStart(s.tree, &it, end) {
+		return result, false, nil
+	}
+	limitReached, err := collectReverseVisibleKVsWithPhysicalLimit(ctx, &it, start, visibleLimit, physicalLimit, ts, &result)
+	return result, limitReached, err
+}
+
 func seekReverseIteratorStart(tree *treemap.Map, it *treemap.Iterator, end []byte) bool {
 	if end == nil {
 		return it.Last()
@@ -467,16 +551,37 @@ func collectReverseVisibleKVs(
 	ts uint64,
 	result *[]*KVPair,
 ) {
+	_, _ = collectReverseVisibleKVsWithPhysicalLimit(context.Background(), it, start, limit, 0, ts, result)
+}
+
+func collectReverseVisibleKVsWithPhysicalLimit(
+	ctx context.Context,
+	it *treemap.Iterator,
+	start []byte,
+	limit int,
+	physicalLimit int,
+	ts uint64,
+	result *[]*KVPair,
+) (bool, error) {
+	visited := 0
 	for ok := true; ok && len(*result) < limit; ok = it.Prev() {
+		if err := ctx.Err(); err != nil {
+			return false, errors.WithStack(err)
+		}
 		k, keyOK := it.Key().([]byte)
 		if !keyOK {
 			continue
 		}
 		if start != nil && bytes.Compare(k, start) < 0 {
-			return
+			return false, nil
 		}
+		if physicalLimit > 0 && visited >= physicalLimit {
+			return true, nil
+		}
+		visited++
 		appendVisibleReverseKV(it, k, ts, result)
 	}
+	return false, nil
 }
 
 func appendVisibleReverseKV(it *treemap.Iterator, key []byte, ts uint64, result *[]*KVPair) {

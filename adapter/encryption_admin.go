@@ -29,7 +29,6 @@ import (
 // leader-gated through requireLeader / VerifyLeader.
 type EncryptionAdminServer struct {
 	sidecarPath        string
-	keystore           *encryption.Keystore
 	fullNodeID         uint64
 	buildSHA           string
 	latestAppliedIndex func() uint64
@@ -169,18 +168,6 @@ type EncryptionAdminServerOption func(*EncryptionAdminServer)
 func WithEncryptionAdminSidecarPath(path string) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.sidecarPath = path
-	}
-}
-
-// WithEncryptionAdminKeystore lets the server consult the in-memory
-// keystore for the §5.5 fallback paths. Stage 5 PR-A / PR-B do not
-// require it because ReadSidecar covers every field the read-only
-// RPCs need and RotateDEK relies on FSM-side validation rather
-// than a pre-check. Stage 7 (writer registry) will use it for the
-// in-memory counter fast-path.
-func WithEncryptionAdminKeystore(k *encryption.Keystore) EncryptionAdminServerOption {
-	return func(s *EncryptionAdminServer) {
-		s.keystore = k
 	}
 }
 

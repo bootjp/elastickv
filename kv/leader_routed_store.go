@@ -279,6 +279,10 @@ func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []
 	return keysFromKVs(kvs), nil
 }
 
+func (s *LeaderRoutedStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, false)
+}
+
 func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil
@@ -292,6 +296,35 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 		return kvs, errors.WithStack(err)
 	}
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, true)
+}
+
+func (s *LeaderRoutedStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, true)
+}
+
+func (s *LeaderRoutedStore) scanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {
+	if s == nil || s.local == nil {
+		return []*store.KVPair{}, false, nil
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*store.KVPair{}, false, nil
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		scanner, hasPhysicalLimit := s.local.(physicalLimitedStore)
+		if hasPhysicalLimit {
+			return scanPhysicalLimitLocal(ctx, scanner, start, end, visibleLimit, physicalLimit, max(ts, fenceTS), reverse)
+		}
+		if !reverse {
+			kvs, err := s.local.ScanAt(ctx, start, end, visibleLimit, max(ts, fenceTS))
+			return kvs, false, errors.WithStack(err)
+		}
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, visibleLimit, max(ts, fenceTS))
+		return kvs, false, errors.WithStack(err)
+	}
+	// RawScanAt cannot enforce physicalLimit, so report truncation and let
+	// callers fail closed instead of proxying an unbounded physical scan.
+	return nil, true, nil
 }
 
 func (s *LeaderRoutedStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {

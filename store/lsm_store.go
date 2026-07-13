@@ -1052,19 +1052,43 @@ func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	return nil, 0, false
 }
 
-func (s *pebbleStore) nextForwardScanUserKey(iter *pebble.Iterator, start []byte) ([]byte, uint64, bool) {
+func (s *pebbleStore) nextForwardScanUserKeyContext(ctx context.Context, iter *pebble.Iterator, start []byte) ([]byte, uint64, bool, error) {
 	for {
-		userKey, version, ok := nextScannableUserKey(iter)
-		if !ok {
-			return nil, 0, false
+		userKey, version, ok, err := nextScannableUserKeyContext(ctx, iter)
+		if err != nil || !ok {
+			return nil, 0, false, err
 		}
 		if !beforeScanStart(userKey, start) {
-			return userKey, version, true
+			return userKey, version, true, nil
 		}
 		if !s.skipToNextUserKey(iter, userKey) {
-			return nil, 0, false
+			return nil, 0, false, nil
 		}
 	}
+}
+
+func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]byte, uint64, bool, error) {
+	for iter.Valid() {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, false, errors.WithStack(err)
+		}
+		rawKey := iter.Key()
+		if isPebbleMetaKey(rawKey) {
+			if !iter.Next() {
+				return nil, 0, false, nil
+			}
+			continue
+		}
+		userKey, version := decodeKey(rawKey)
+		if userKey == nil {
+			if !iter.Next() {
+				return nil, 0, false, nil
+			}
+			continue
+		}
+		return userKey, version, true, nil
+	}
+	return nil, 0, false, nil
 }
 
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
@@ -1088,49 +1112,67 @@ func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	return nil, false
 }
 
-func (s *pebbleStore) collectScanResults(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+func (s *pebbleStore) collectScanResults(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	result, _, err := s.collectScanResultsWithPhysicalLimit(ctx, iter, start, end, limit, 0, ts)
+	return result, err
+}
+
+func (s *pebbleStore) collectScanResultsWithPhysicalLimit(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
 	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
+	visited := 0
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version, ok := s.nextForwardScanUserKey(iter, start)
-		if !ok {
-			break
-		}
-
-		if pastScanEnd(userKey, end) {
-			break
-		}
-
-		if !s.seekToVisibleVersion(iter, userKey, version, ts) {
-			continue
-		}
-
-		kv, err := s.processFoundValue(iter, userKey, ts)
+		userKey, version, ok, err := s.nextForwardScanUserKeyContext(ctx, iter, start)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if forwardScanDone(userKey, end, ok) {
+			break
+		}
+		if physicalLimit > 0 && visited >= physicalLimit {
+			return result, true, nil
+		}
+		visited++
+
+		kv, advance, err := s.collectForwardScanKV(iter, userKey, version, ts)
+		if err != nil {
+			return nil, false, err
 		}
 		if kv != nil {
 			result = append(result, kv)
 		}
-
-		if !s.skipToNextUserKey(iter, userKey) {
+		if !advance {
 			break
 		}
 	}
 
-	return result, nil
+	return result, false, nil
 }
 
-func (s *pebbleStore) collectScanKeys(iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([][]byte, error) {
+func forwardScanDone(userKey, end []byte, ok bool) bool {
+	return !ok || pastScanEnd(userKey, end)
+}
+
+func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, userKey []byte, version uint64, ts uint64) (*KVPair, bool, error) {
+	if !s.seekToVisibleVersion(iter, userKey, version, ts) {
+		return nil, true, nil
+	}
+	kv, err := s.processFoundValue(iter, userKey, ts)
+	if err != nil {
+		return nil, false, err
+	}
+	return kv, s.skipToNextUserKey(iter, userKey), nil
+}
+
+func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([][]byte, error) {
 	result := make([][]byte, 0, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
-		userKey, version, ok := s.nextForwardScanUserKey(iter, start)
-		if !ok {
-			break
+		userKey, version, ok, err := s.nextForwardScanUserKeyContext(ctx, iter, start)
+		if err != nil {
+			return nil, err
 		}
-
-		if pastScanEnd(userKey, end) {
+		if forwardScanDone(userKey, end, ok) {
 			break
 		}
 
@@ -1158,11 +1200,17 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 	if limit <= 0 {
 		return []*KVPair{}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	// Acquire dbMu.RLock before reading effectiveMinRetainedTS (which takes
 	// mtx.RLock) to preserve the global lock ordering: dbMu before mtx.
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
@@ -1176,18 +1224,52 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 	}
 	defer iter.Close()
 
-	return s.collectScanResults(iter, start, end, limit, ts)
+	return s.collectScanResults(ctx, iter, start, end, limit, ts)
+}
+
+func (s *pebbleStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*KVPair{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
+		return nil, false, ErrReadTSCompacted
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: encodeKey(start, math.MaxUint64),
+	})
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	return s.collectScanResultsWithPhysicalLimit(ctx, iter, start, end, visibleLimit, physicalLimit, ts)
 }
 
 func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
 	if limit <= 0 {
 		return [][]byte{}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	// Acquire dbMu.RLock before reading effectiveMinRetainedTS (which takes
 	// mtx.RLock) to preserve the global lock ordering: dbMu before mtx.
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
@@ -1201,7 +1283,7 @@ func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, 
 	}
 	defer iter.Close()
 
-	return s.collectScanKeys(iter, start, end, limit, ts)
+	return s.collectScanKeys(ctx, iter, start, end, limit, ts)
 }
 
 func (s *pebbleStore) collectReverseScanResults(
@@ -1211,24 +1293,41 @@ func (s *pebbleStore) collectReverseScanResults(
 	limit int,
 	ts uint64,
 ) ([]*KVPair, error) {
+	result, _, err := s.collectReverseScanResultsWithPhysicalLimit(iter, start, end, limit, 0, ts)
+	return result, err
+}
+
+func (s *pebbleStore) collectReverseScanResultsWithPhysicalLimit(
+	iter *pebble.Iterator,
+	start []byte,
+	end []byte,
+	limit int,
+	physicalLimit int,
+	ts uint64,
+) ([]*KVPair, bool, error) {
 	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
 
 	valid := seekReverseScanStart(iter, end)
+	visited := 0
 	for valid && len(result) < limit {
+		if physicalLimit > 0 && visited >= physicalLimit {
+			return result, true, nil
+		}
 		kv, nextValid, done, err := s.nextReverseScanKV(iter, start, ts)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		valid = nextValid
 		if done {
 			break
 		}
+		visited++
 		if kv != nil {
 			result = append(result, kv)
 		}
 	}
 
-	return result, nil
+	return result, false, nil
 }
 
 func seekReverseScanStart(iter *pebble.Iterator, end []byte) bool {
@@ -1293,6 +1392,38 @@ func (s *pebbleStore) ReverseScanAt(ctx context.Context, start []byte, end []byt
 	defer iter.Close()
 
 	return s.collectReverseScanResults(iter, start, end, limit, ts)
+}
+
+func (s *pebbleStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*KVPair{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
+		return nil, false, ErrReadTSCompacted
+	}
+
+	opts := &pebble.IterOptions{
+		LowerBound: encodeKey(start, math.MaxUint64),
+	}
+	if end != nil {
+		opts.UpperBound = encodeKey(end, math.MaxUint64)
+	}
+	iter, err := s.db.NewIter(opts)
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	return s.collectReverseScanResultsWithPhysicalLimit(iter, start, end, visibleLimit, physicalLimit, ts)
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
