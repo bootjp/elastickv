@@ -10,6 +10,7 @@ import (
 )
 
 func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
+	opts = normalizeExportVersionsOptions(opts)
 	pos, err := decodeExportCursor(opts.Cursor)
 	if err != nil {
 		return ExportVersionsResult{}, err
@@ -77,17 +78,11 @@ func (s *pebbleStore) runPebbleExportLoop(
 }
 
 func pebbleExportIterOptions(opts ExportVersionsOptions) *pebble.IterOptions {
-	iterOpts := &pebble.IterOptions{
-		LowerBound: encodeKey(opts.StartKey, math.MaxUint64),
-	}
-	if opts.EndKey != nil {
-		iterOpts.UpperBound = encodeKey(opts.EndKey, math.MaxUint64)
-	}
-	return iterOpts
+	return &pebble.IterOptions{}
 }
 
 func pebbleExportSeekKey(opts ExportVersionsOptions, pos exportCursorPosition) ([]byte, error) {
-	if len(pos.key) == 0 {
+	if !pos.hasKey {
 		return encodeKey(opts.StartKey, math.MaxUint64), nil
 	}
 	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
@@ -117,8 +112,13 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 	if userKey == nil || pebbleExportCursorEqual(pos, userKey, commitTS) {
 		return true, true, nil
 	}
+	if opts.StartKey != nil && bytes.Compare(userKey, opts.StartKey) < 0 {
+		_ = s.skipToNextUserKey(iter, userKey)
+		return false, true, nil
+	}
 	if opts.EndKey != nil && bytes.Compare(userKey, opts.EndKey) >= 0 {
-		return false, true, errExportReachedEnd
+		_ = s.skipToNextUserKey(iter, userKey)
+		return false, true, nil
 	}
 	if commitTS <= opts.MinCommitTSExclusive {
 		_ = s.skipToNextUserKey(iter, userKey)
@@ -129,7 +129,7 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 }
 
 func pebbleExportCursorEqual(pos exportCursorPosition, userKey []byte, commitTS uint64) bool {
-	return len(pos.key) > 0 && bytes.Equal(userKey, pos.key) && commitTS == pos.commitTS
+	return pos.hasKey && bytes.Equal(userKey, pos.key) && commitTS == pos.commitTS
 }
 
 func (s *pebbleStore) exportPebbleVersion(

@@ -13,17 +13,19 @@ const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
 
-	migrationAckPrefix        = "!migstage|ack|"
-	migrationHLCFloorPrefix   = "!migstage|hlc_floor|"
-	migrationUint64Bytes      = 8
-	migrationAckKeyIDBytes    = 2 * migrationUint64Bytes
-	exportVersionSizeOverhead = 24
+	migrationAckPrefix                 = "!migstage|ack|"
+	migrationHLCFloorPrefix            = "!migstage|hlc_floor|"
+	migrationUint64Bytes               = 8
+	migrationAckKeyIDBytes             = 2 * migrationUint64Bytes
+	exportVersionSizeOverhead          = 24
+	defaultSparseExportMaxScannedBytes = 1 << 20
 )
 
 type exportCursorPosition struct {
 	key      []byte
 	commitTS uint64
 	tag      byte
+	hasKey   bool
 }
 
 type migrationImportAck struct {
@@ -66,7 +68,14 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 	if tag != exportCursorTagEmitted && tag != exportCursorTagScanned {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
-	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag}, nil
+	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
+}
+
+func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
+	if opts.AcceptKey != nil && opts.MaxScannedBytes == 0 {
+		opts.MaxScannedBytes = defaultSparseExportMaxScannedBytes
+	}
+	return opts
 }
 
 func migrationAckKey(jobID, bracketID uint64) []byte {
@@ -168,6 +177,7 @@ func validateNextImportBatch(existing migrationImportAck, hasExisting bool, batc
 }
 
 func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
+	opts = normalizeExportVersionsOptions(opts)
 	pos, err := decodeExportCursor(opts.Cursor)
 	if err != nil {
 		return ExportVersionsResult{}, err
@@ -181,7 +191,7 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
-	if !s.seekMemoryExportStart(&it, opts.StartKey, pos.key) {
+	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
 		result.Done = true
 		return result, nil
 	}
@@ -231,9 +241,9 @@ func newExportVersionsResult(maxVersions int) ExportVersionsResult {
 	}
 }
 
-func (s *mvccStore) seekMemoryExportStart(it *treemap.Iterator, startKey, cursorKey []byte) bool {
-	if len(cursorKey) > 0 {
-		return seekForwardIteratorStart(s.tree, it, cursorKey)
+func (s *mvccStore) seekMemoryExportStart(it *treemap.Iterator, startKey []byte, pos exportCursorPosition) bool {
+	if pos.hasKey {
+		return seekForwardIteratorStart(s.tree, it, pos.key)
 	}
 	return seekForwardIteratorStart(s.tree, it, startKey)
 }
@@ -248,7 +258,7 @@ func exportMemoryIteratorKey(
 ) (bool, error) {
 	versions, _ := value.([]VersionedValue)
 	cursorCommitTS := uint64(0)
-	if len(pos.key) > 0 && bytes.Equal(key, pos.key) {
+	if pos.hasKey && bytes.Equal(key, pos.key) {
 		cursorCommitTS = pos.commitTS
 	}
 	return exportMemoryVersionsForKey(ctx, opts, cursorCommitTS, key, versions, result)

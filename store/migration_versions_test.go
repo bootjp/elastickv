@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -109,6 +110,92 @@ func TestExportVersionsSparseScanBudgetAdvancesRejectedRows(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, second.Done)
 		require.Equal(t, []MVCCVersion{{Key: []byte("keep"), CommitTS: 20, Value: []byte("b")}}, second.Versions)
+	})
+}
+
+func TestExportVersionsPreservesEmptyKeyCursor(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, nil, []byte("v10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, nil, []byte("v20"), 20, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 1})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Len(t, first.Versions, 1)
+		require.Empty(t, first.Versions[0].Key)
+		require.Equal(t, uint64(20), first.Versions[0].CommitTS)
+		require.Equal(t, []byte("v20"), first.Versions[0].Value)
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			Cursor:      first.NextCursor,
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Len(t, second.Versions, 1)
+		require.Empty(t, second.Versions[0].Key)
+		require.Equal(t, uint64(10), second.Versions[0].CommitTS)
+		require.Equal(t, []byte("v10"), second.Versions[0].Value)
+	})
+}
+
+func TestExportVersionsAppliesDefaultSparseScanBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
+		require.NoError(t, st.PutAt(ctx, []byte("drop"), value, 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("keep"), []byte("v"), 20, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxVersions: 10,
+			AcceptKey: func(key []byte) bool {
+				return bytes.Equal(key, []byte("keep"))
+			},
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Empty(t, first.Versions)
+		require.GreaterOrEqual(t, first.ScannedBytes, uint64(defaultSparseExportMaxScannedBytes))
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			Cursor:      first.NextCursor,
+			MaxVersions: 10,
+			AcceptKey: func(key []byte) bool {
+				return bytes.Equal(key, []byte("keep"))
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("keep"), CommitTS: 20, Value: []byte("v")}}, second.Versions)
+	})
+}
+
+func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a-value"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("aa"), []byte("aa-value"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("b-value"), 30, 0))
+
+		mid, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("aa"),
+			EndKey:      []byte("b"),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, mid.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("aa"), CommitTS: 20, Value: []byte("aa-value")}}, mid.Versions)
+
+		before, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			EndKey:      []byte("aa"),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, before.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("a"), CommitTS: 10, Value: []byte("a-value")}}, before.Versions)
 	})
 }
 

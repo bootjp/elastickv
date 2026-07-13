@@ -934,6 +934,8 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.tree = tree
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
+	s.migrationAcks = make(map[string]migrationImportAck)
+	s.migrationHLCFloors = make(map[uint64]uint64)
 	return nil
 }
 
