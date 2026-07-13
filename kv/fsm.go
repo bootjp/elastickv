@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -587,8 +588,60 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if len(prefix) == 0 {
 		return []byte(""), nil
 	}
+	if routeKeyspaceWideRawPrefix(prefix) {
+		return []byte(""), nil
+	}
 	start := routeKey(prefix)
 	return start, prefixScanEnd(start)
+}
+
+func routeKeyspaceWideRawPrefix(prefix []byte) bool {
+	if !rawPrefixMayContainRouteMappedKeys(prefix) {
+		return false
+	}
+	return bytes.Equal(routeKey(prefix), prefix)
+}
+
+func rawPrefixMayContainRouteMappedKeys(prefix []byte) bool {
+	for _, mappedPrefix := range routeMappedRawPrefixes {
+		if bytes.HasPrefix(prefix, mappedPrefix) || bytes.HasPrefix(mappedPrefix, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+var routeMappedRawPrefixes = [][]byte{
+	[]byte(redisInternalRoutePrefix),
+	[]byte(DynamoTableMetaPrefix),
+	[]byte(DynamoTableGenerationPrefix),
+	[]byte(DynamoItemPrefix),
+	[]byte(DynamoGSIPrefix),
+	[]byte(sqsInternalPrefix),
+	[]byte(store.ListMetaPrefix),
+	[]byte(store.ListItemPrefix),
+	[]byte(store.ListMetaDeltaPrefix),
+	[]byte(store.ListClaimPrefix),
+	[]byte(store.HashMetaPrefix),
+	[]byte(store.HashFieldPrefix),
+	[]byte(store.HashMetaDeltaPrefix),
+	[]byte(store.SetMetaPrefix),
+	[]byte(store.SetMemberPrefix),
+	[]byte(store.SetMetaDeltaPrefix),
+	[]byte(store.ZSetMetaPrefix),
+	[]byte(store.ZSetMemberPrefix),
+	[]byte(store.ZSetScorePrefix),
+	[]byte(store.ZSetMetaDeltaPrefix),
+	[]byte(store.StreamMetaPrefix),
+	[]byte(store.StreamEntryPrefix),
+	[]byte(s3keys.BucketMetaPrefix),
+	[]byte(s3keys.BucketGenerationPrefix),
+	[]byte(s3keys.ObjectManifestPrefix),
+	[]byte(s3keys.UploadMetaPrefix),
+	[]byte(s3keys.UploadPartPrefix),
+	[]byte(s3keys.BlobPrefix),
+	[]byte(s3keys.GCUploadPrefix),
+	[]byte(s3keys.RoutePrefix),
 }
 
 var ErrNotImplemented = errors.New("not implemented")

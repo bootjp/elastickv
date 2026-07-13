@@ -67,6 +67,23 @@ func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFencedFSM(t)
+	key := []byte("!redis|string|z")
+	require.NoError(t, fsm.store.PutAt(context.Background(), key, []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("!redis|")}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+
+	got, getErr := fsm.store.GetAt(context.Background(), key, ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
 func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	t.Parallel()
 

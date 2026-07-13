@@ -200,6 +200,42 @@ func TestShardedCoordinatorRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *te
 	require.Empty(t, g2Txn.requests)
 }
 
+func TestShardedCoordinatorRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
+		},
+	}))
+
+	for _, prefix := range [][]byte{
+		[]byte("!redis|"),
+		[]byte("!lst|"),
+	} {
+		t.Run(string(prefix), func(t *testing.T) {
+			t.Parallel()
+
+			g1Txn := &recordingTransactional{}
+			g2Txn := &recordingTransactional{}
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: g1Txn},
+				2: {Txn: g2Txn},
+			}, 1, NewHLC(), nil)
+
+			_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+				Elems: []*Elem[OP]{{Op: DelPrefix, Key: prefix}},
+			})
+			require.ErrorIs(t, err, ErrRouteWriteFenced)
+			require.Empty(t, g1Txn.requests)
+			require.Empty(t, g2Txn.requests)
+		})
+	}
+}
+
 // TestShardedCoordinator_DelPrefixRejectsTxn verifies that DEL_PREFIX inside
 // a transactional group is rejected.
 func TestShardedCoordinator_DelPrefixRejectsTxn(t *testing.T) {
