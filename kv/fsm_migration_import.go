@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -38,7 +39,7 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 		BracketID: req.GetBracketId(),
 		BatchSeq:  req.GetBatchSeq(),
 		Cursor:    req.GetCursor(),
-		Versions:  migrationStoreVersionsFromProto(req.GetVersions()),
+		Versions:  migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions()),
 	})
 	if err != nil {
 		return errors.WithStack(err)
@@ -64,14 +65,14 @@ func (f *kvFSM) migrationHLCFloorForApply(ctx context.Context, req *pb.ImportRan
 	return floor, nil
 }
 
-func migrationStoreVersionsFromProto(in []*pb.MVCCVersion) []store.MVCCVersion {
+func migrationStoreVersionsFromProto(jobID uint64, in []*pb.MVCCVersion) []store.MVCCVersion {
 	out := make([]store.MVCCVersion, 0, len(in))
 	for _, version := range in {
 		if version == nil {
 			continue
 		}
 		out = append(out, store.MVCCVersion{
-			Key:       bytes.Clone(version.GetKey()),
+			Key:       distribution.MigrationStagedDataKey(jobID, version.GetKey()),
 			CommitTS:  version.GetCommitTs(),
 			Tombstone: version.GetTombstone(),
 			Value:     bytes.Clone(version.GetValue()),

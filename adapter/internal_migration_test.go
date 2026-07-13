@@ -141,9 +141,12 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.Equal(t, []byte("cursor-1"), resp.GetAckedCursor())
 	require.Equal(t, uint64(1), proposer.calls)
 
-	got, err := st.GetAt(ctx, []byte("k"), 30)
+	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
+	got, err := st.GetAt(ctx, staged, 30)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), got)
+	_, err = st.GetAt(ctx, []byte("k"), 30)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	floor, err := st.MigrationHLCFloor(ctx, 7)
 	require.NoError(t, err)
 	require.Equal(t, uint64(30), floor)
