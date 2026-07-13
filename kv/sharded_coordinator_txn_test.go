@@ -246,6 +246,26 @@ func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.Equal(t, commitTS, commitMeta2.CommitTS)
 }
 
+func TestShardedCoordinatorDispatchTxn_RejectsMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, 100), map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  90,
+		CommitTS: 100,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("z"), Value: []byte("v")},
+		},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before preparing a floor-violating txn")
+}
+
 func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {
 	t.Parallel()
 

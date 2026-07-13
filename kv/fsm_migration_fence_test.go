@@ -22,6 +22,16 @@ func newWriteFencedFSM(t *testing.T) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
+func newWriteFloorFSM(t *testing.T) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+	})
+	return newComposed1FSM(t, engine, 1)
+}
+
 func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -111,4 +121,112 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	}
 	err := fsm.handleTxnRequest(ctx, abort, 11)
 	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
+}
+
+func TestFSMRejectsRawPointWriteAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+
+	err = fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("ok")}},
+	}, 101)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("ok"), got)
+}
+
+func TestFSMRejectsDelPrefixAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	require.NoError(t, fsm.store.PutAt(ctx, []byte("z"), []byte("v"), 10, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsOnePhaseTxnAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	req := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+		},
+	}
+	err := fsm.handleTxnRequest(ctx, req, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+
+	req.Mutations[0].Value = EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})
+	req.Mutations[1].Value = []byte("ok")
+	err = fsm.handleTxnRequest(ctx, req, 101)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("ok"), got)
+}
+
+func TestFSMRejectsCommitButNotPrepareAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}
+	require.NoError(t, fsm.handleTxnRequest(ctx, prepare, 90))
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+		},
+	}
+	err := fsm.handleTxnRequest(ctx, commit, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+
+	commit.Mutations[0].Value = EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})
+	commit.Mutations[1].Value = []byte("ignored")
+	err = fsm.handleTxnRequest(ctx, commit, 101)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
 }

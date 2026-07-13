@@ -1036,6 +1036,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	if err != nil {
 		return nil, err
 	}
+	if err := c.rejectWriteTimestampFloorDelPrefixes(elems, ts); err != nil {
+		return nil, err
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -1078,6 +1081,42 @@ func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) err
 		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
 			if route.State == distribution.RouteStateWriteFenced {
 				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[OP], commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil || len(elem.Key) == 0 {
+			continue
+		}
+		rkey := routeKey(elem.Key)
+		route, ok := c.engine.GetRoute(rkey)
+		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+			continue
+		}
+		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", elem.Key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefixes(elems []*Elem[OP], commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		start, end := routePrefixRange(elem.Key)
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+				return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", elem.Key, start, end, commitTS, route.MinWriteTSExclusive)
 			}
 		}
 	}
@@ -1139,6 +1178,9 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 
 	commitTS, err = c.resolveTxnCommitTS(ctx, startTS, commitTS)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.rejectWriteTimestampFloorPointElems(elems, commitTS); err != nil {
 		return nil, err
 	}
 
@@ -1984,6 +2026,9 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 		if err != nil {
 			return nil, err
 		}
+		if err := c.rejectWriteTimestampFloorMutations(grouped[gid], ts); err != nil {
+			return nil, err
+		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
@@ -1992,6 +2037,24 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 		})
 	}
 	return logs, nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		rkey := routeKey(mut.Key)
+		route, ok := c.engine.GetRoute(rkey)
+		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+			continue
+		}
+		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", mut.Key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {

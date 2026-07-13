@@ -121,6 +121,56 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		"same DEL_PREFIX element must use the same timestamp across shards")
 }
 
+func newMigrationFloorEngine(t *testing.T, floor uint64) *distribution.Engine {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 nil,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: floor,
+			},
+		},
+	}))
+	return engine
+}
+
+func TestShardedCoordinatorRejectsPointWriteAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("z"), Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before proposing a floor-violating point write")
+}
+
+func TestShardedCoordinatorRejectsDelPrefixAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("z")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before broadcasting a floor-violating prefix delete")
+}
+
 func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 

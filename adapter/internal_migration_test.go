@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -70,6 +71,17 @@ func (s *captureExportRangeVersionsStream) Send(resp *pb.ExportRangeVersionsResp
 	return nil
 }
 
+func testPrefixScanEnd(prefix []byte) []byte {
+	out := append([]byte(nil), prefix...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] != 0xFF {
+			out[i]++
+			return out[:i+1]
+		}
+	}
+	return nil
+}
+
 func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	t.Parallel()
 
@@ -112,6 +124,68 @@ func TestInternalExportRangeVersionsRejectsUnboundedExport(t *testing.T) {
 	}, stream)
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	for _, tc := range []struct {
+		name       string
+		family     uint32
+		prefix     string
+		keyFor     func(string) []byte
+		value      []byte
+		routeStart []byte
+		routeEnd   []byte
+	}{
+		{
+			name:       "bucket meta",
+			family:     distribution.MigrationFamilyS3BucketMeta,
+			prefix:     s3keys.BucketMetaPrefix,
+			keyFor:     s3keys.BucketMetaKey,
+			value:      []byte("meta"),
+			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
+			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+		},
+		{
+			name:       "bucket generation",
+			family:     distribution.MigrationFamilyS3BucketGeneration,
+			prefix:     s3keys.BucketGenerationPrefix,
+			keyFor:     s3keys.BucketGenerationKey,
+			value:      []byte("generation"),
+			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
+			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			inRouteKey := tc.keyFor("bucket-b")
+			outRouteKey := tc.keyFor("bucket-a")
+			require.NoError(t, st.PutAt(ctx, inRouteKey, tc.value, 10, 0))
+			require.NoError(t, st.PutAt(ctx, outRouteKey, []byte("skip"), 10, 0))
+
+			stream := &captureExportRangeVersionsStream{ctx: ctx}
+			err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+				MaxCommitTs:     20,
+				RouteStart:      tc.routeStart,
+				RouteEnd:        tc.routeEnd,
+				KeyFamily:       tc.family,
+				RangeStart:      []byte(tc.prefix),
+				RangeEnd:        testPrefixScanEnd([]byte(tc.prefix)),
+				MaxScannedBytes: 1 << 20,
+			}, stream)
+			require.NoError(t, err)
+			require.Len(t, stream.responses, 1)
+			require.Equal(t, []*pb.MVCCVersion{
+				{Key: inRouteKey, CommitTs: 10, Value: tc.value, KeyFamily: tc.family},
+			}, stream.responses[0].GetVersions())
+		})
+	}
 }
 
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {

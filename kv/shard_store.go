@@ -113,6 +113,9 @@ func routeHasStagedVisibility(route distribution.Route) bool {
 }
 
 func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	if err := ensureReadTSRetained(g.Store, ts); err != nil {
+		return nil, err
+	}
 	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, ts)
 	if err != nil {
 		return nil, err
@@ -135,14 +138,16 @@ func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGrou
 func latestMVCCVersionAt(ctx context.Context, st store.MVCCStore, key []byte, ts uint64) (store.MVCCVersion, bool, error) {
 	result, err := st.ExportVersions(ctx, store.ExportVersionsOptions{
 		StartKey:             key,
-		EndKey:               nextScanCursor(key),
+		EndKey:               prefixScanEnd(key),
 		MaxCommitTSInclusive: ts,
 		MaxVersions:          1,
 		MaxScannedBytes:      0,
 		MinCommitTSExclusive: 0,
 		MaxBytes:             0,
 		KeyFamily:            0,
-		AcceptKey:            nil,
+		AcceptKey: func(rawKey []byte) bool {
+			return bytes.Equal(rawKey, key)
+		},
 	})
 	if err != nil {
 		return store.MVCCVersion{}, false, errors.WithStack(err)
@@ -170,6 +175,18 @@ func newerMigrationVersion(a store.MVCCVersion, aOK bool, b store.MVCCVersion, b
 
 func migrationVersionVisible(version store.MVCCVersion, ts uint64) bool {
 	return !version.Tombstone && (version.ExpireAt == 0 || version.ExpireAt > ts)
+}
+
+func ensureReadTSRetained(st store.MVCCStore, ts uint64) error {
+	retention, ok := st.(store.RetentionController)
+	if !ok {
+		return nil
+	}
+	minRetainedTS := retention.MinRetainedTS()
+	if minRetainedTS != 0 && ts != 0 && ts != ^uint64(0) && ts < minRetainedTS {
+		return errors.WithStack(store.ErrReadTSCompacted)
+	}
+	return nil
 }
 
 func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -276,6 +293,9 @@ func (s *ShardStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end 
 		return []*store.KVPair{}, false, nil
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
+	if routesContainStagedVisibility(routes) {
+		return nil, true, nil
+	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
 		return kvs, false, err
@@ -316,6 +336,9 @@ func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byt
 		return []*store.KVPair{}, false, nil
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
+	if routesContainStagedVisibility(routes) {
+		return nil, true, nil
+	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
 		return kvs, false, err
@@ -346,6 +369,15 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	}
 
 	return routes, true
+}
+
+func routesContainStagedVisibility(routes []distribution.Route) bool {
+	for _, route := range routes {
+		if routeHasStagedVisibility(route) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
@@ -641,7 +673,10 @@ func (s *ShardStore) scanRouteAtLeader(
 	return s.resolveScanLocks(ctx, g, route, kvs, lockKVs, ts)
 }
 
-const stagedVisibilityExportPageSize = 1024
+const (
+	stagedVisibilityMaxCandidateWindow = 8192
+	stagedVisibilityWindowGrowthFactor = 2
+)
 
 func (s *ShardStore) scanRouteWithStagedVisibility(
 	ctx context.Context,
@@ -653,22 +688,126 @@ func (s *ShardStore) scanRouteWithStagedVisibility(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
-	live, err := collectLatestLogicalVersions(ctx, g.Store, start, end, start, end, ts, liveLogicalVersionKey)
-	if err != nil {
+	if err := ensureReadTSRetained(g.Store, ts); err != nil {
 		return nil, err
 	}
 	stagedStart, stagedEnd := stagedVisibilityScanBounds(route.MigrationJobID, start, end)
-	staged, err := collectLatestLogicalVersions(ctx, g.Store, stagedStart, stagedEnd, start, end, ts, stagedLogicalVersionKey)
-	if err != nil {
-		return nil, err
+	window := stagedVisibilityCandidateWindow(limit)
+	for {
+		liveKVs, err := scanVisibleCandidates(ctx, g.Store, start, end, window, ts, reverse)
+		if err != nil {
+			return nil, err
+		}
+		stagedKVs, err := scanVisibleCandidates(ctx, g.Store, stagedStart, stagedEnd, window, ts, reverse)
+		if err != nil {
+			return nil, err
+		}
+		versions, err := s.latestStagedVisibilityCandidates(ctx, g.Store, route, liveKVs, stagedKVs, ts)
+		if err != nil {
+			return nil, err
+		}
+		out := visibleLogicalKVs(versions, ts, reverse)
+		if len(out) >= limit {
+			clear(out[limit:])
+			return out[:limit], nil
+		}
+		if len(liveKVs) < window && len(stagedKVs) < window {
+			return out, nil
+		}
+		nextWindow := nextStagedVisibilityCandidateWindow(window)
+		if nextWindow == window {
+			return out, nil
+		}
+		window = nextWindow
 	}
-	merged := mergeLogicalVersionMaps(live, staged)
-	out := visibleLogicalKVs(merged, ts, reverse)
-	if len(out) > limit {
-		clear(out[limit:])
-		out = out[:limit]
+}
+
+func stagedVisibilityCandidateWindow(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > stagedVisibilityMaxCandidateWindow {
+		return stagedVisibilityMaxCandidateWindow
+	}
+	return limit
+}
+
+func nextStagedVisibilityCandidateWindow(window int) int {
+	if window >= stagedVisibilityMaxCandidateWindow {
+		return window
+	}
+	next := window * stagedVisibilityWindowGrowthFactor
+	if next < window || next > stagedVisibilityMaxCandidateWindow {
+		return stagedVisibilityMaxCandidateWindow
+	}
+	return next
+}
+
+func scanVisibleCandidates(ctx context.Context, st store.MVCCStore, start, end []byte, limit int, ts uint64, reverse bool) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	if reverse {
+		kvs, err := st.ReverseScanAt(ctx, start, end, limit, ts)
+		return kvs, errors.WithStack(err)
+	}
+	kvs, err := st.ScanAt(ctx, start, end, limit, ts)
+	return kvs, errors.WithStack(err)
+}
+
+func (s *ShardStore) latestStagedVisibilityCandidates(
+	ctx context.Context,
+	st store.MVCCStore,
+	route distribution.Route,
+	liveKVs []*store.KVPair,
+	stagedKVs []*store.KVPair,
+	ts uint64,
+) (map[string]store.MVCCVersion, error) {
+	keys := stagedVisibilityCandidateKeys(liveKVs, stagedKVs)
+	out := make(map[string]store.MVCCVersion, len(keys))
+	for _, key := range keys {
+		live, liveOK, err := latestMVCCVersionAt(ctx, st, key, ts)
+		if err != nil {
+			return nil, err
+		}
+		stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+		staged, stagedOK, err := latestMVCCVersionAt(ctx, st, stagedKey, ts)
+		if err != nil {
+			return nil, err
+		}
+		if stagedOK {
+			staged.Key = bytes.Clone(key)
+		}
+		if winner, ok := newerMigrationVersion(live, liveOK, staged, stagedOK); ok {
+			out[string(key)] = winner
+		}
 	}
 	return out, nil
+}
+
+func stagedVisibilityCandidateKeys(liveKVs []*store.KVPair, stagedKVs []*store.KVPair) [][]byte {
+	seen := make(map[string][]byte, len(liveKVs)+len(stagedKVs))
+	for _, kvp := range liveKVs {
+		if kvp == nil {
+			continue
+		}
+		seen[string(kvp.Key)] = bytes.Clone(kvp.Key)
+	}
+	for _, kvp := range stagedKVs {
+		if kvp == nil {
+			continue
+		}
+		_, rawKey, ok := distribution.MigrationStagedDataKeyParts(kvp.Key)
+		if !ok {
+			continue
+		}
+		seen[string(rawKey)] = bytes.Clone(rawKey)
+	}
+	out := make([][]byte, 0, len(seen))
+	for _, key := range seen {
+		out = append(out, key)
+	}
+	return out
 }
 
 func stagedVisibilityScanBounds(jobID uint64, start []byte, end []byte) ([]byte, []byte) {
@@ -682,83 +821,6 @@ func stagedVisibilityScanBounds(jobID uint64, start []byte, end []byte) ([]byte,
 		scanEnd = distribution.MigrationStagedDataKey(jobID, end)
 	}
 	return scanStart, scanEnd
-}
-
-type logicalVersionKeyFunc func([]byte) ([]byte, bool)
-
-func liveLogicalVersionKey(key []byte) ([]byte, bool) {
-	if distribution.IsMigrationStagedDataKey(key) {
-		return nil, false
-	}
-	return bytes.Clone(key), true
-}
-
-func stagedLogicalVersionKey(key []byte) ([]byte, bool) {
-	_, rawKey, ok := distribution.MigrationStagedDataKeyParts(key)
-	return rawKey, ok
-}
-
-func collectLatestLogicalVersions(
-	ctx context.Context,
-	st store.MVCCStore,
-	scanStart []byte,
-	scanEnd []byte,
-	logicalStart []byte,
-	logicalEnd []byte,
-	ts uint64,
-	logicalKey logicalVersionKeyFunc,
-) (map[string]store.MVCCVersion, error) {
-	out := make(map[string]store.MVCCVersion)
-	var cursor []byte
-	for {
-		result, err := st.ExportVersions(ctx, store.ExportVersionsOptions{
-			StartKey:             scanStart,
-			EndKey:               scanEnd,
-			MaxCommitTSInclusive: ts,
-			Cursor:               cursor,
-			MaxVersions:          stagedVisibilityExportPageSize,
-		})
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		for _, version := range result.Versions {
-			key, ok := logicalKey(version.Key)
-			if !ok || !keyInRange(key, logicalStart, logicalEnd) {
-				continue
-			}
-			version.Key = key
-			recordLatestLogicalVersion(out, version)
-		}
-		if result.Done {
-			return out, nil
-		}
-		if bytes.Equal(cursor, result.NextCursor) {
-			return nil, errors.New("staged visibility export cursor did not progress")
-		}
-		cursor = bytes.Clone(result.NextCursor)
-	}
-}
-
-func recordLatestLogicalVersion(out map[string]store.MVCCVersion, version store.MVCCVersion) {
-	key := string(version.Key)
-	if existing, ok := out[key]; ok && existing.CommitTS >= version.CommitTS {
-		return
-	}
-	out[key] = version
-}
-
-func mergeLogicalVersionMaps(live map[string]store.MVCCVersion, staged map[string]store.MVCCVersion) map[string]store.MVCCVersion {
-	out := make(map[string]store.MVCCVersion, len(live)+len(staged))
-	for key, version := range live {
-		out[key] = version
-	}
-	for key, stagedVersion := range staged {
-		liveVersion, liveOK := out[key]
-		if winner, ok := newerMigrationVersion(liveVersion, liveOK, stagedVersion, true); ok {
-			out[key] = winner
-		}
-	}
-	return out
 }
 
 func visibleLogicalKVs(versions map[string]store.MVCCVersion, ts uint64, reverse bool) []*store.KVPair {
@@ -780,13 +842,6 @@ func visibleLogicalKVs(versions map[string]store.MVCCVersion, ts uint64, reverse
 		return cmp < 0
 	})
 	return out
-}
-
-func keyInRange(key []byte, start []byte, end []byte) bool {
-	if start != nil && bytes.Compare(key, start) < 0 {
-		return false
-	}
-	return end == nil || bytes.Compare(key, end) < 0
 }
 
 func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int) ([]byte, []byte) {
@@ -905,33 +960,45 @@ func clampScanEnd(end []byte, routeEnd []byte) []byte {
 }
 
 func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.DeleteAt(ctx, key, commitTS))
 }
 
 func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
 }
@@ -1606,6 +1673,9 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 	if err != nil || group == nil {
 		return err
 	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
+		return err
+	}
 	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
@@ -1614,6 +1684,9 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	group, err := s.resolveSingleShardGroup(mutations)
 	if err != nil || group == nil {
+		return err
+	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
 		return err
 	}
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
@@ -1627,7 +1700,36 @@ func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*stor
 	if err != nil || group == nil {
 		return err
 	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
+		return err
+	}
 	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
+func ensureRouteWriteTimestampFloor(route distribution.Route, key []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, routeKey(key), commitTS, route.MinWriteTSExclusive)
+}
+
+func (s *ShardStore) ensureMutationWriteTimestampFloors(mutations []*store.KVPairMutation, commitTS uint64) error {
+	if commitTS == 0 {
+		return nil
+	}
+	for _, mut := range mutations {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		route, _, ok := s.routeAndGroupForKey(mut.Key)
+		if !ok {
+			return store.ErrNotSupported
+		}
+		if err := ensureRouteWriteTimestampFloor(route, mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolveSingleShardGroup returns the shard group that owns every
@@ -1656,6 +1758,9 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -1667,8 +1772,24 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 	return nil
 }
 
+func (s *ShardStore) ensurePrefixWriteTimestampFloors(prefix []byte, commitTS uint64) error {
+	if s == nil || s.engine == nil || commitTS == 0 {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive)
+		}
+	}
+	return nil
+}
+
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -1695,6 +1816,9 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue

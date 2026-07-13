@@ -33,6 +33,32 @@ func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
 }
 
+func newStagedVisibilityPebbleShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+				MinWriteTSExclusive:    100,
+			},
+		},
+	}))
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	group := &ShardGroup{Store: st}
+	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
+}
+
 func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	t.Parallel()
 
@@ -55,6 +81,37 @@ func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	require.NoError(t, group.Store.DeleteAt(ctx, stagedKey, 40))
 	_, err = st.GetAt(ctx, rawKey, 45)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreGetAt_MergesStagedVisibilityPebbleExactKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityPebbleShardStore(t)
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, []byte("live-old"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged-new"), 20, 0))
+
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-new"), got)
+}
+
+func TestShardStoreStagedVisibilityReadTSCompacted(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	retention, ok := group.Store.(store.RetentionController)
+	require.True(t, ok)
+	retention.SetMinRetainedTS(15)
+
+	_, err := st.GetAt(ctx, []byte("k"), 10)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
+	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 10)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
 func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
@@ -100,6 +157,34 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(40), ts)
+}
+
+func TestShardStorePhysicalLimitFailsClosedBeforeStagedVisibilityFallback(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	kvs, limitReached, err := st.ScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
+	require.NoError(t, err)
+	require.True(t, limitReached)
+	require.Nil(t, kvs)
+
+	kvs, limitReached, err = st.ReverseScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
+	require.NoError(t, err)
+	require.True(t, limitReached)
+	require.Nil(t, kvs)
+}
+
+func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	err := st.PutAt(ctx, []byte("k"), []byte("low"), 100, 0)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0))
 }
 
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
