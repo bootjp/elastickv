@@ -1297,6 +1297,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	if err != nil {
 		return nil, err
 	}
+	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
 	// carries the one-phase dedup probe key for a retry that reuses a failed
@@ -1311,6 +1312,27 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return &CoordinateResponse{}, nil
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex}, nil
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
+	if len(readKeys) == 0 {
+		return readKeys
+	}
+	var out [][]byte
+	for _, key := range readKeys {
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
 }
 
 type preparedGroup struct {
@@ -1929,8 +1951,25 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint
 					"preserve OCC read-set integrity", key)
 		}
 		grouped[gid] = append(grouped[gid], key)
+		if alias, ok := c.stagedVisibilityReadKeyAlias(gid, key); ok {
+			grouped[gid] = append(grouped[gid], alias)
+		}
 	}
 	return grouped, nil
+}
+
+func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte) ([]byte, bool) {
+	if c == nil || c.engine == nil || len(key) == 0 {
+		return nil, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return nil, false
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	if !ok || route.GroupID != gid || !routeHasStagedVisibility(route) {
+		return nil, false
+	}
+	return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
 }
 
 // validateReadOnlyShards checks read-write conflicts on shards that have
@@ -1982,7 +2021,7 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		return errors.WithStack(err)
 	}
 	for _, key := range keys {
-		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		ts, exists, err := c.latestCommitTSForReadKeyOnShard(ctx, gid, g, key)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1991,6 +2030,43 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {
+	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
+	if !ok {
+		return liveTS, liveExists, nil
+	}
+	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return maxStagedVisibilityLatestCommitTS(liveTS, liveExists, stagedTS, stagedExists), liveExists || stagedExists, nil
+}
+
+func (c *ShardedCoordinator) stagedVisibilityRouteForReadKey(gid uint64, key []byte) (distribution.Route, bool) {
+	if c == nil || c.engine == nil {
+		return distribution.Route{}, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return distribution.Route{}, false
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	return route, ok && route.GroupID == gid && routeHasStagedVisibility(route)
+}
+
+func maxStagedVisibilityLatestCommitTS(liveTS uint64, liveExists bool, stagedTS uint64, stagedExists bool) uint64 {
+	if !liveExists {
+		return stagedTS
+	}
+	if !stagedExists || liveTS > stagedTS {
+		return liveTS
+	}
+	return stagedTS
 }
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
@@ -2074,6 +2150,9 @@ func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs
 			return err
 		}
 		r.Ts = ts
+		if err := c.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -519,6 +519,14 @@ func (s *LeaderRoutedStore) ImportVersions(ctx context.Context, opts store.Impor
 	return result, errors.WithStack(err)
 }
 
+func (s *LeaderRoutedStore) ImportVersionsRaft(ctx context.Context, opts store.ImportVersionsOptions) (store.ImportVersionsResult, error) {
+	if s == nil || s.local == nil {
+		return store.ImportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	result, err := s.local.ImportVersionsRaft(ctx, opts)
+	return result, errors.WithStack(err)
+}
+
 func (s *LeaderRoutedStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {
 	if s == nil || s.local == nil {
 		return 0, errors.WithStack(store.ErrNotSupported)

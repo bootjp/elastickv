@@ -133,7 +133,17 @@ func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersion
 	if req.GetKeyFamily() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
 	}
+	if exportRangeVersionsRequestFullyUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires a raw or route bound"))
+	}
 	return nil
+}
+
+func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRangeStart()) == 0 &&
+		len(req.GetRangeEnd()) == 0 &&
+		len(req.GetRouteStart()) == 0 &&
+		len(req.GetRouteEnd()) == 0
 }
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
@@ -271,10 +281,10 @@ func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func
 			return false
 		}
 		routeKey := s3keys.RouteKey(bucket, 0, "")
-		if routeStart != nil && bytes.Compare(routeKey, routeStart) < 0 {
+		if len(routeStart) > 0 && bytes.Compare(routeKey, routeStart) < 0 {
 			return false
 		}
-		return routeEnd == nil || bytes.Compare(routeKey, routeEnd) < 0
+		return len(routeEnd) == 0 || bytes.Compare(routeKey, routeEnd) < 0
 	}
 }
 

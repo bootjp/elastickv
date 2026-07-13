@@ -43,6 +43,75 @@ func (s *recordingTransactional) Abort(_ context.Context, _ []*pb.Request) (*Tra
 	return &TransactionResponse{}, nil
 }
 
+func TestShardedCoordinatorValidateReadKeysOnShard_UsesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	st := store.NewMVCCStore()
+	readKey := []byte("k")
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, readKey), []byte("staged"), 20, 0))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Engine: stubLeaderEngine{}, Store: st},
+	}, 1, NewHLC(), nil)
+
+	err := coord.validateReadKeysOnShard(ctx, 1, [][]byte{readKey}, 10)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+}
+
+func TestShardedCoordinatorDispatchTxn_AddsStagedReadKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	readKey := []byte("k")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems:    []*Elem[OP]{{Op: Put, Key: []byte("m"), Value: []byte("write")}},
+		ReadKeys: [][]byte{readKey},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, [][]byte{
+		readKey,
+		distribution.MigrationStagedDataKey(9, readKey),
+	}, txn.requests[0].ReadKeys)
+}
+
 func cloneTxnRequest(req *pb.Request) *pb.Request {
 	if req == nil {
 		return nil

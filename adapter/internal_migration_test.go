@@ -124,6 +124,14 @@ func TestInternalExportRangeVersionsRejectsUnboundedExport(t *testing.T) {
 	}, stream)
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	stream = &captureExportRangeVersionsStream{ctx: context.Background()}
+	err = internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs: 20,
+		KeyFamily:   distribution.MigrationFamilyUser,
+	}, stream)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T) {
@@ -186,6 +194,35 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 			}, stream.responses[0].GetVersions())
 		})
 	}
+}
+
+func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	inRouteKey := s3keys.BucketMetaKey("bucket-z")
+	outRouteKey := s3keys.BucketMetaKey("bucket-a")
+	require.NoError(t, st.PutAt(ctx, inRouteKey, []byte("meta-z"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteKey, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      s3keys.RouteKey("bucket-z", 0, ""),
+		RouteEnd:        []byte{},
+		KeyFamily:       distribution.MigrationFamilyS3BucketMeta,
+		RangeStart:      []byte(s3keys.BucketMetaPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(s3keys.BucketMetaPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteKey, CommitTs: 10, Value: []byte("meta-z"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
+	}, stream.responses[0].GetVersions())
 }
 
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
