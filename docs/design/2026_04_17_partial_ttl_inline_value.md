@@ -1,11 +1,21 @@
 # Design: TTL Embedded in Data Values
 
+Status: partial. Redis string values now carry TTL inline via
+`adapter/redis_compat_types.go` (`encodeRedisStr` / `decodeRedisStr`) and
+`adapter/redis_expire_cmds.go` (`dispatchStringExpire`). The legacy
+`TTLBuffer` code has also been removed from the adapter. Collection anchors
+(`ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta`, stream, and HLL) still use the
+secondary `!redis|ttl|<key>` index, and full migration / legacy-read removal
+remain open.
+
 ## 1. Background and motivation
 
-### Current architecture
+### Original architecture and remaining collection path
 
 TTL is stored as a separate MVCC key `!redis|ttl|<userKey>` in the Raft-backed
-store.  Every key-existence check follows this path:
+store.  This is no longer the authoritative string path, but it remains the
+collection/HLL/stream path and explains why this design exists. Historically
+every key-existence check followed this path:
 
 ```
 keyTypeAt(key, readTS)
@@ -146,13 +156,13 @@ follows:
   should be run to rewrite every legacy value with the new envelope before
   Phase 2 (legacy-read removal) begins.
 
-### 3.3 Collection metadata encoding (future work)
+### 3.3 Collection metadata encoding (remaining work)
 
-> **Status in this PR:** only *string* values carry inline TTL today. Collection
-> anchors (`ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta`, stream, HLL) still
-> store TTL in the secondary `!redis|ttl|` index. The sections below describe
-> the intended Phase 4 design; they are not yet implemented and the adapter
-> deliberately keeps the legacy index in use for non-string types.
+Only *string* values carry inline TTL today. Collection anchors (`ListMeta`,
+`HashMeta`, `SetMeta`, `ZSetMeta`, stream, HLL) still store TTL in the
+secondary `!redis|ttl|` index. The sections below describe the intended
+collection design; they are not yet implemented and the adapter deliberately
+keeps the legacy index in use for non-string types.
 
 `ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta` are fixed-width binary structs.
 Each gains an `ExpireAt uint64` field (0 = no TTL):
@@ -250,7 +260,7 @@ timestamp is eliminated.
 
 ## 5. Backward compatibility and migration
 
-### Phase 0 — Dual-read fallback (deployed alongside old nodes)
+### Phase 0 — Dual-read fallback (implemented for strings)
 
 The read path tries to decode the new format first; if the magic/version prefix
 is absent it falls back to the legacy raw-byte format and reads
@@ -258,18 +268,18 @@ is absent it falls back to the legacy raw-byte format and reads
 
 This allows a rolling upgrade with no downtime.
 
-### Phase 1 — Background migration
+### Phase 1 — Background migration (remaining work)
 
 A one-time background job rewrites each string key to the new encoding and each
 collection metadata key to the new format.  During migration the dual-read
 fallback remains active.
 
-### Phase 2 — Remove legacy TTL read path
+### Phase 2 — Remove legacy TTL read path (remaining work)
 
 Once all nodes have migrated (cluster-level flag or store version check), the
 `!redis|ttl|<key>` lookup in `ttlAt()` is removed.
 
-### Phase 3 — Remove TTL buffer
+### Phase 3 — Remove TTL buffer (implemented)
 
 The `TTLBuffer`, `runTTLFlusher`, and `flushTTLBuffer` can be removed.  TTL
 writes are back in the same `IsTxn=true` transaction as data writes, so no
@@ -312,35 +322,36 @@ which writes the anchor key once (value + TTL atomically).  No conflict arises.
 
 ---
 
-## 8. Affected components
+## 8. Affected components and implementation status
 
 ```
 store/
-  list_helpers.go       ListMeta: add ExpireAt field; update marshal/unmarshal
-  hash_helpers.go       HashMeta: add ExpireAt field
-  set_helpers.go        SetMeta: add ExpireAt field
-  zset_helpers.go       ZSetMeta: add ExpireAt field
+  list_helpers.go       Remaining: add ExpireAt field; update marshal/unmarshal
+  hash_helpers.go       Remaining: add ExpireAt field
+  set_helpers.go        Remaining: add ExpireAt field
+  zset_helpers.go       Remaining: add ExpireAt field
 
 adapter/
-  redis_compat_types.go  encodeRedisStr / decodeRedisStr (new with TTL header)
-                         ttlAt(): read from decoded anchor, not !redis|ttl| key
-                         hasExpiredTTLAt(): inline TTL check from anchor
-  redis_compat_helpers.go  keyTypeAt(): single anchor read
-  redis_compat_commands.go  setExpire(): anchor read-modify-write
-  redis.go               remove TTLBuffer field, runTTLFlusher, flushTTLBuffer
-                         remove WithTTLFlushInterval option
-  redis_ttl_buffer.go    delete (Phase 3)
-  redis_lua_context.go   commit(): TTL back in data Raft entry; remove
-                         flushTTLForKeyToBuffer / flushTTLToBuffer
+  redis_compat_types.go     Implemented for strings: encode/decode inline TTL;
+                            ttlAt() trusts inline TTL for new-format strings.
+  redis_compat_helpers.go   Implemented for strings: readRedisStringAt decodes
+                            the value and TTL from the same anchor read.
+  redis_expire_cmds.go      Implemented for strings: EXPIRE read-modify-writes
+                            the string anchor and scan index in one txn.
+  redis_txn.go              Implemented for string replacement paths; non-string
+                            dirty TTL state still writes !redis|ttl| entries.
+  redis.go                  Implemented: TTLBuffer/flusher wiring removed.
+  redis_ttl_buffer.go       Implemented: file removed.
 ```
 
 ---
 
 ## 9. Implementation phases summary
 
-| Phase | Description | Risk |
-|---|---|---|
-| 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
-| 1 | Background migration of existing keys | Medium — requires careful compaction |
-| 2 | Remove legacy `!redis\|ttl\|` read path | Low — only after full migration |
-| 3 | Remove TTL buffer | Low — no longer needed post-migration |
+| Phase | Description | Status | Risk |
+|---|---|---|---|
+| 0 | Add dual-read fallback; new string writes use new encoding | Implemented for strings | Low — reads always fall back |
+| 1 | Background migration of existing keys | Remaining | Medium — requires careful compaction |
+| 2 | Remove legacy `!redis\|ttl\|` read path | Remaining | Low — only after full migration |
+| 3 | Remove TTL buffer | Implemented | Low — no longer needed post-migration |
+| 4 | Add inline TTL to collection/HLL/stream anchors | Remaining | Medium — touches multiple storage encodings |
