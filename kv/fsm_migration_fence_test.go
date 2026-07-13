@@ -39,6 +39,26 @@ func newWriteFloorFSM(t *testing.T) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
+func newTargetReadinessFSM(t *testing.T, route distribution.RouteDescriptor) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{route})
+	fsm := newComposed1FSM(t, engine, route.GroupID)
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
+	return fsm
+}
+
 func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -50,6 +70,46 @@ func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 
 	_, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMRejectsRawPointWriteWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMAllowsRawPointWriteWithClearedTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 101)
+	require.NoError(t, err)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
 }
 
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
@@ -64,6 +124,28 @@ func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 
 	got, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsDelPrefixWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	require.NoError(t, fsm.store.PutAt(context.Background(), []byte("b"), []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("b")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v"), got)
 }

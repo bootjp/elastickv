@@ -1036,6 +1036,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	if err != nil {
 		return nil, err
 	}
+	if err := c.rejectDelPrefixesBelowWriteFloor(elems, ts); err != nil {
+		return nil, err
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -1078,6 +1081,24 @@ func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) err
 		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
 			if route.State == distribution.RouteStateWriteFenced {
 				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectDelPrefixesBelowWriteFloor(elems []*Elem[OP], commitTS uint64) error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		start, end := routePrefixRange(elem.Key)
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+				return errors.Wrapf(err, "prefix %q route range [%q,%q)", elem.Key, start, end)
 			}
 		}
 	}

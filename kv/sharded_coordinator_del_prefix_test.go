@@ -173,6 +173,33 @@ func TestShardedCoordinatorRejectsDelPrefixIntersectingWriteFencedRoute(t *testi
 	require.Empty(t, g2Txn.requests)
 }
 
+func TestShardedCoordinatorRejectsDelPrefixBelowRouteFloorBeforeBroadcast(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("z")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+}
+
 func TestShardedCoordinatorRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 

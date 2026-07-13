@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -121,6 +122,13 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
+	// RouteOf returns the route descriptor that covered key at this
+	// snapshot's version. Used by apply-time target-readiness checks to
+	// prove staged/cleared descriptor state before mutating the store.
+	RouteOf(key []byte) (distribution.Route, bool)
+	// IntersectingRoutes returns the route descriptors that intersect
+	// [start, end) at this snapshot's version. A nil end denotes +infinity.
+	IntersectingRoutes(start, end []byte) []distribution.Route
 	// WriteFencedForKey reports whether key is currently inside a
 	// WriteFenced route in this snapshot.
 	WriteFencedForKey(key []byte) bool
@@ -536,6 +544,9 @@ func (f *kvFSM) verifyRawMutationCanApply(ctx context.Context, mut *pb.Mutation,
 	if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
 		return err
 	}
+	if err := f.verifyTargetReadinessForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+		return err
+	}
 	if err := f.verifyRouteWriteFloorForKey(mut.Key, commitTS); err != nil {
 		return err
 	}
@@ -560,6 +571,9 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
 	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
+		return err
+	}
+	if err := f.verifyTargetReadinessForPrefix(ctx, prefix); err != nil {
 		return err
 	}
 	if err := f.verifyRouteWriteFloorForPrefix(prefix, commitTS); err != nil {
@@ -624,6 +638,73 @@ func (f *kvFSM) verifyRouteWriteFloorForMutations(muts []*pb.Mutation, commitTS 
 		}
 	}
 	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForMutations(ctx context.Context, muts []*pb.Mutation) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := f.verifyTargetReadinessForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForPrefix(ctx context.Context, prefix []byte) error {
+	start, end := routePrefixRange(prefix)
+	return f.verifyTargetReadinessForRouteRange(ctx, start, end)
+}
+
+func (f *kvFSM) verifyTargetReadinessForRange(ctx context.Context, start []byte, end []byte) error {
+	routeStart, routeEnd := readinessRouteRange(start, end)
+	return f.verifyTargetReadinessForRouteRange(ctx, routeStart, routeEnd)
+}
+
+func (f *kvFSM) verifyTargetReadinessForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) error {
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(states) == 0 {
+		return nil
+	}
+
+	var (
+		snap  RouteSnapshot
+		proof bool
+	)
+	if f.routes != nil {
+		snap, proof = f.routes.Current()
+	}
+	for _, ready := range states {
+		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+			continue
+		}
+		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready) {
+			return errors.WithStack(ErrRouteCutoverPending)
+		}
+	}
+	return nil
+}
+
+func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState) bool {
+	matched := false
+	for _, route := range routes {
+		if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+			continue
+		}
+		matched = true
+		if !routeSatisfiesTargetReadiness(route, ready) {
+			return false
+		}
+	}
+	return matched
 }
 
 func (f *kvFSM) verifyRouteWriteFloorForKey(key []byte, commitTS uint64) error {
@@ -1026,14 +1107,8 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, startTS)
 	if err != nil {
-		return err
-	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
-		return err
-	}
-	if err := f.verifyRouteWriteFloorForMutations(uniq, startTS); err != nil {
 		return err
 	}
 	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
@@ -1102,7 +1177,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsNotFenced(muts, commitTS)
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1118,12 +1193,15 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	return nil
 }
 
-func (f *kvFSM) uniqueMutationsNotFenced(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+func (f *kvFSM) uniqueMutationsNotFenced(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return nil, err
 	}
 	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
+		return nil, err
+	}
+	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
 		return nil, err
 	}
 	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
@@ -1171,7 +1249,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	uniq, err := f.uniqueMutationsAboveWriteFloor(muts, commitTS)
+	uniq, err := f.uniqueMutationsAboveWriteFloor(ctx, muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1288,7 +1366,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	// shouldClearAbortKey (lock-missing ⇒ nothing to do) and for the
 	// rollback-marker Put in appendRollbackRecord.
 
-	uniq, err := f.uniqueMutationsAboveWriteFloor(muts, abortTS)
+	uniq, err := f.uniqueMutationsAboveWriteFloor(ctx, muts, abortTS)
 	if err != nil {
 		return err
 	}
@@ -1308,9 +1386,12 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, startTS, abortTS, f.pendingApplyIdx))
 }
 
-func (f *kvFSM) uniqueMutationsAboveWriteFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+func (f *kvFSM) uniqueMutationsAboveWriteFloor(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
 		return nil, err
 	}
 	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {

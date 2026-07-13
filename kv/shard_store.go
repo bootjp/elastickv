@@ -92,6 +92,9 @@ func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView)
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return nil, err
+	}
 	if !isTxnInternalKey(key) {
 		if err := s.maybeResolveTxnLock(ctx, g, key, ts); err != nil {
 			return nil, err
@@ -132,6 +135,11 @@ func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetS
 }
 
 func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) error {
+	routeStart, routeEnd := readinessRouteRange(start, end)
+	return s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd)
+}
+
+func (s *ShardStore) verifyTargetReadinessForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) error {
 	if g == nil || g.Store == nil {
 		return nil
 	}
@@ -143,7 +151,6 @@ func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *Shard
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	routeStart, routeEnd := readinessRouteRange(start, end)
 	for _, ready := range states {
 		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
 			continue
@@ -591,7 +598,7 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 		if routeHasStagedVisibility(route) {
 			return nil, true, nil
 		}
-		return s.scanRouteAtLeaderPhysicalLimit(ctx, g, start, end, visibleLimit, physicalLimit, ts, reverse)
+		return s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
 	}
 
 	// RawScanAt cannot enforce physicalLimit, so report truncation and let
@@ -666,6 +673,7 @@ func (s *ShardStore) scanRouteLocal(
 func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
 	ctx context.Context,
 	g *ShardGroup,
+	route distribution.Route,
 	start []byte,
 	end []byte,
 	visibleLimit int,
@@ -682,7 +690,7 @@ func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
 	if err != nil {
 		return nil, limitReached, err
 	}
-	resolved, err := s.resolveScanLocks(ctx, g, distribution.Route{}, kvs, lockKVs, ts)
+	resolved, err := s.resolveScanLocks(ctx, g, route, kvs, lockKVs, ts)
 	return resolved, limitReached, err
 }
 
@@ -1802,6 +1810,9 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -1815,6 +1826,9 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -1841,6 +1855,9 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -1857,6 +1874,26 @@ func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, ex
 		// groups MUST pass appliedIndex=0 to opt out.
 		if err := g.Store.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex); err != nil {
 			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte, commitTS uint64) error {
+	if s == nil || s.engine == nil {
+		return nil
+	}
+	routeStart, routeEnd := routePrefixRange(prefix)
+	for _, route := range s.engine.GetIntersectingRoutes(routeStart, routeEnd) {
+		g, ok := s.groupForID(route.GroupID)
+		if !ok || g == nil || g.Store == nil {
+			return store.ErrNotSupported
+		}
+		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
+			return err
+		}
+		if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+			return err
 		}
 	}
 	return nil
