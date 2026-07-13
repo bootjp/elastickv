@@ -11,6 +11,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type deletePrefixIndexRecordingStore struct {
+	store.MVCCStore
+
+	deletePrefixIndexes  []uint64
+	deletePrefixPrefixes [][]byte
+}
+
+func (s *deletePrefixIndexRecordingStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	s.deletePrefixIndexes = append(s.deletePrefixIndexes, appliedIndex)
+	s.deletePrefixPrefixes = append(s.deletePrefixPrefixes, append([]byte(nil), prefix...))
+	return s.MVCCStore.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex)
+}
+
+func (s *deletePrefixIndexRecordingStore) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
+	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, nil
+	}
+	return reader.MigrationTargetReadinessStates(ctx)
+}
+
+func (s *deletePrefixIndexRecordingStore) ApplyTargetStagedReadiness(ctx context.Context, state store.TargetStagedReadinessState) error {
+	writer, ok := s.MVCCStore.(store.MigrationTargetReadinessWriter)
+	if !ok {
+		return store.ErrNotSupported
+	}
+	return writer.ApplyTargetStagedReadiness(ctx, state)
+}
+
 func newWriteFencedFSM(t *testing.T) *kvFSM {
 	t.Helper()
 
@@ -208,6 +237,38 @@ func TestFSMDelPrefixTombstonesStagedVisibilityRows(t *testing.T) {
 
 	_, err = fsm.store.GetAt(ctx, stagedKey, 130)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestFSMDelPrefixAdvancesApplyIndexOnlyOnLiveDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	recording := &deletePrefixIndexRecordingStore{MVCCStore: fsm.store}
+	fsm.store = recording
+	fsm.SetApplyIndex(55)
+
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, fsm.store.PutAt(ctx, stagedKey, []byte("staged"), 110, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: rawKey}},
+	}, 120)
+	require.NoError(t, err)
+
+	require.Equal(t, []uint64{0, 55}, recording.deletePrefixIndexes)
+	require.Equal(t, stagedKey, recording.deletePrefixPrefixes[0])
+	require.Equal(t, rawKey, recording.deletePrefixPrefixes[1])
 }
 
 func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {

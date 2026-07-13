@@ -101,6 +101,25 @@ func TestShardStoreCommittedVersionAtChecksStagedVisibilityKey(t *testing.T) {
 	require.True(t, landed)
 }
 
+func TestShardStoreCommittedVersionAtChecksTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
+
+	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
+	require.False(t, landed)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T) {
 	t.Parallel()
 
@@ -594,6 +613,24 @@ func TestShardStoreDeletePrefixAtTombstonesStagedVisibilityRows(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	_, err = group.Store.GetAt(ctx, stagedKey, 140)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreDeletePrefixAtRaftAtAdvancesApplyIndexOnlyOnLiveDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	recording := &deletePrefixIndexRecordingStore{MVCCStore: group.Store}
+	group.Store = recording
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
+
+	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, rawKey, nil, 130, 88))
+
+	require.Equal(t, []uint64{0, 88}, recording.deletePrefixIndexes)
+	require.Equal(t, stagedKey, recording.deletePrefixPrefixes[0])
+	require.Equal(t, rawKey, recording.deletePrefixPrefixes[1])
 }
 
 func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {

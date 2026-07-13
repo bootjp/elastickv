@@ -308,6 +308,9 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 	if !ok || g.Store == nil {
 		return false, nil
 	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return false, err
+	}
 	// engineForGroup may be nil in test fixtures that wire ShardStore
 	// without raft; preserve the existing local-only fallback there.
 	engine := engineForGroup(g)
@@ -1962,7 +1965,7 @@ func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, ex
 			continue
 		}
 		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
-			return g.Store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, appliedIndex)
+			return g.Store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, 0)
 		}
 		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
 			return err

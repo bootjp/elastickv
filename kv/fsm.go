@@ -581,7 +581,7 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	}
 	routes := f.stagedVisibilityRoutesForPrefix(prefix)
 	deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
-		return f.store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, f.pendingApplyIdx)
+		return f.store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, 0)
 	}
 	if err := deleteStagedVisibilityPrefixes(routes, prefix, txnCommonPrefix, deleteStagedPrefix); err != nil {
 		return err
