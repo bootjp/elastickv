@@ -97,16 +97,16 @@ func TestPebbleCollectorMirrorsGaugesAndCounters(t *testing.T) {
 	err := testutil.GatherAndCompare(
 		registry.Gatherer(),
 		strings.NewReader(`
-# HELP elastickv_pebble_block_cache_hits_total Cumulative block cache hits reported by Pebble.
+# HELP elastickv_pebble_block_cache_hits_total Cumulative process-wide block cache hits reported by Pebble.
 # TYPE elastickv_pebble_block_cache_hits_total counter
-elastickv_pebble_block_cache_hits_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 150
-# HELP elastickv_pebble_block_cache_misses_total Cumulative block cache misses reported by Pebble.
+elastickv_pebble_block_cache_hits_total{node_address="10.0.0.1:50051",node_id="n1"} 150
+# HELP elastickv_pebble_block_cache_misses_total Cumulative process-wide block cache misses reported by Pebble.
 # TYPE elastickv_pebble_block_cache_misses_total counter
-elastickv_pebble_block_cache_misses_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 25
+elastickv_pebble_block_cache_misses_total{node_address="10.0.0.1:50051",node_id="n1"} 25
 
-# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by Pebble's block cache.
+# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by the process-wide Pebble block cache.
 # TYPE elastickv_pebble_block_cache_size_bytes gauge
-elastickv_pebble_block_cache_size_bytes{group="1",node_address="10.0.0.1:50051",node_id="n1"} 16384
+elastickv_pebble_block_cache_size_bytes{node_address="10.0.0.1:50051",node_id="n1"} 16384
 # HELP elastickv_pebble_compact_count_total Cumulative number of compactions completed by Pebble since the process started.
 # TYPE elastickv_pebble_compact_count_total counter
 elastickv_pebble_compact_count_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 15
@@ -171,9 +171,9 @@ func TestPebbleCollectorHandlesSourceReset(t *testing.T) {
 	err := testutil.GatherAndCompare(
 		registry.Gatherer(),
 		strings.NewReader(`
-# HELP elastickv_pebble_block_cache_hits_total Cumulative block cache hits reported by Pebble.
+# HELP elastickv_pebble_block_cache_hits_total Cumulative process-wide block cache hits reported by Pebble.
 # TYPE elastickv_pebble_block_cache_hits_total counter
-elastickv_pebble_block_cache_hits_total{group="7",node_address="10.0.0.1:50051",node_id="n1"} 110
+elastickv_pebble_block_cache_hits_total{node_address="10.0.0.1:50051",node_id="n1"} 110
 # HELP elastickv_pebble_compact_count_total Cumulative number of compactions completed by Pebble since the process started.
 # TYPE elastickv_pebble_compact_count_total counter
 elastickv_pebble_compact_count_total{group="7",node_address="10.0.0.1:50051",node_id="n1"} 12
@@ -225,12 +225,12 @@ func TestPebbleCollectorEmitsBlockCacheCapacity(t *testing.T) {
 	err := testutil.GatherAndCompare(
 		registry.Gatherer(),
 		strings.NewReader(`
-# HELP elastickv_pebble_block_cache_capacity_bytes Configured maximum size of Pebble's block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.
+# HELP elastickv_pebble_block_cache_capacity_bytes Configured maximum size of the process-wide Pebble block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.
 # TYPE elastickv_pebble_block_cache_capacity_bytes gauge
-elastickv_pebble_block_cache_capacity_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 2.68435456e+08
-# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by Pebble's block cache.
+elastickv_pebble_block_cache_capacity_bytes{node_address="10.0.0.1:50051",node_id="n1"} 2.68435456e+08
+# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by the process-wide Pebble block cache.
 # TYPE elastickv_pebble_block_cache_size_bytes gauge
-elastickv_pebble_block_cache_size_bytes{group="3",node_address="10.0.0.1:50051",node_id="n1"} 4096
+elastickv_pebble_block_cache_size_bytes{node_address="10.0.0.1:50051",node_id="n1"} 4096
 `),
 		"elastickv_pebble_block_cache_capacity_bytes",
 		"elastickv_pebble_block_cache_size_bytes",
@@ -238,11 +238,60 @@ elastickv_pebble_block_cache_size_bytes{group="3",node_address="10.0.0.1:50051",
 	require.NoError(t, err)
 }
 
+func TestPebbleCollectorEmitsSharedBlockCacheOnce(t *testing.T) {
+	registry := NewRegistry("n1", "10.0.0.1:50051")
+	collector := registry.PebbleCollector()
+	require.NotNil(t, collector)
+
+	src1 := &fakePebbleCapacitySource{capacity: 256 << 20}
+	src2 := &fakePebbleCapacitySource{capacity: 256 << 20}
+	src1.set(newFakeMetrics(
+		1, 2, 0, 0, 7,
+		1, 1024, 0,
+		8192, 100, 20,
+	))
+	src2.set(newFakeMetrics(
+		3, 4, 0, 0, 11,
+		2, 2048, 0,
+		8192, 100, 20,
+	))
+
+	collector.ObserveOnce([]PebbleSource{
+		{GroupID: 1, GroupIDStr: "1", Source: src1},
+		{GroupID: 2, GroupIDStr: "2", Source: src2},
+	})
+
+	err := testutil.GatherAndCompare(
+		registry.Gatherer(),
+		strings.NewReader(`
+# HELP elastickv_pebble_block_cache_capacity_bytes Configured maximum size of the process-wide Pebble block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.
+# TYPE elastickv_pebble_block_cache_capacity_bytes gauge
+elastickv_pebble_block_cache_capacity_bytes{node_address="10.0.0.1:50051",node_id="n1"} 2.68435456e+08
+# HELP elastickv_pebble_block_cache_hits_total Cumulative process-wide block cache hits reported by Pebble.
+# TYPE elastickv_pebble_block_cache_hits_total counter
+elastickv_pebble_block_cache_hits_total{node_address="10.0.0.1:50051",node_id="n1"} 100
+# HELP elastickv_pebble_block_cache_misses_total Cumulative process-wide block cache misses reported by Pebble.
+# TYPE elastickv_pebble_block_cache_misses_total counter
+elastickv_pebble_block_cache_misses_total{node_address="10.0.0.1:50051",node_id="n1"} 20
+# HELP elastickv_pebble_block_cache_size_bytes Current bytes in use by the process-wide Pebble block cache.
+# TYPE elastickv_pebble_block_cache_size_bytes gauge
+elastickv_pebble_block_cache_size_bytes{node_address="10.0.0.1:50051",node_id="n1"} 8192
+`),
+		"elastickv_pebble_block_cache_capacity_bytes",
+		"elastickv_pebble_block_cache_size_bytes",
+		"elastickv_pebble_block_cache_hits_total",
+		"elastickv_pebble_block_cache_misses_total",
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, testutil.CollectAndCount(registry.pebble.blockCacheSizeBytes))
+	require.Equal(t, 1, testutil.CollectAndCount(registry.pebble.blockCacheHitsTotal))
+}
+
 func TestPebbleCollectorSkipsCapacityWhenUnsupported(t *testing.T) {
 	// A PebbleMetricsSource that does NOT additionally implement
 	// PebbleCacheCapacitySource must not cause the capacity gauge to be
-	// populated for its group. This preserves backward compatibility
-	// with sources that pre-date the capacity interface.
+	// populated. This preserves backward compatibility with sources that
+	// pre-date the capacity interface.
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.PebbleCollector()
 	require.NotNil(t, collector)
