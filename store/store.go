@@ -119,7 +119,10 @@ type ImportVersionsResult struct {
 // PromoteVersionsOptions atomically copies staged MVCC versions to their
 // target keys and physically removes the staged versions.
 type PromoteVersionsOptions struct {
-	JobID           uint64
+	JobID uint64
+	// AppliedIndex is the optional Raft entry index to bundle with Pebble
+	// promotion batches as metaAppliedIndex. Zero leaves the meta key unchanged.
+	AppliedIndex    uint64
 	StartKey        []byte
 	EndKey          []byte
 	Cursor          []byte

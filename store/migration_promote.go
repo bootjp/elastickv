@@ -226,7 +226,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 		return PromoteVersionsResult{}, err
 	}
 	result, stateToWrite := finishPromotionResult(opts, state, exported, promoted)
-	return s.finishPebblePromotion(toPromote, opts.JobID, stateToWrite, result)
+	return s.finishPebblePromotion(toPromote, opts.JobID, stateToWrite, result, opts.AppliedIndex)
 }
 
 func (s *pebbleStore) finishPebblePromotion(
@@ -234,11 +234,12 @@ func (s *pebbleStore) finishPebblePromotion(
 	jobID uint64,
 	stateToWrite *PromotionState,
 	result PromoteVersionsResult,
+	appliedIndex uint64,
 ) (PromoteVersionsResult, error) {
 	if len(toPromote) == 0 && stateToWrite == nil {
 		return result, nil
 	}
-	if err := s.commitPebblePromoteVersions(toPromote, jobID, stateToWrite); err != nil {
+	if err := s.commitPebblePromoteVersions(toPromote, jobID, stateToWrite, appliedIndex); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	return result, nil
@@ -320,7 +321,7 @@ func (s *pebbleStore) readPebblePromotionState(jobID uint64) (PromotionState, bo
 	return state, true, nil
 }
 
-func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jobID uint64, state *PromotionState) error {
+func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jobID uint64, state *PromotionState, appliedIndex uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	targets := make([]MVCCVersion, 0, len(versions))
@@ -338,6 +339,11 @@ func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jo
 	if state != nil {
 		if err := batch.Set(migrationPromoteKey(jobID), encodePromotionState(*state), nil); err != nil {
 			return errors.WithStack(err)
+		}
+	}
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
 		}
 	}
 	if err := batch.Commit(s.directApplyWriteOpts()); err != nil {

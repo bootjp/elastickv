@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -94,6 +95,46 @@ func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	val, err := ps.GetAt(ctx, []byte("k1"), ts)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val)
+}
+
+func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+	prefix := []byte("stage|")
+
+	require.NoError(t, ps.PutAt(ctx, stage("k"), []byte("v10"), 10, 0))
+
+	const entryIdx uint64 = 77
+	result, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:        9,
+		AppliedIndex: entryIdx,
+		StartKey:     prefix,
+		EndKey:       PrefixScanEnd(prefix),
+		MaxVersions:  10,
+		TargetKey:    targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+	require.Equal(t, uint64(1), result.PromotedRows)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "PromoteVersions must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("k"), 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v10"), val)
+	_, err = ps.GetAt(ctx, stage("k"), 10)
+	require.ErrorIs(t, err, ErrKeyNotFound)
 }
 
 // TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey covers the

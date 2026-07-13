@@ -41,7 +41,7 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 	if !ok {
 		return errors.WithStack(store.ErrNotSupported)
 	}
-	result, err := promoter.PromoteVersions(ctx, migrationPromoteOptionsFromProto(req))
+	result, err := promoter.PromoteVersions(ctx, migrationPromoteOptionsFromProto(req, f.pendingApplyIdx))
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -51,7 +51,7 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 	return result
 }
 
-func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest) store.PromoteVersionsOptions {
+func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest, appliedIndex uint64) store.PromoteVersionsOptions {
 	maxVersions := int(req.GetMaxVersions())
 	if maxVersions <= 0 {
 		maxVersions = defaultMigrationPromoteMaxVersions
@@ -67,6 +67,7 @@ func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest) stor
 	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
 	return store.PromoteVersionsOptions{
 		JobID:           req.GetJobId(),
+		AppliedIndex:    appliedIndex,
 		StartKey:        prefix,
 		EndKey:          store.PrefixScanEnd(prefix),
 		Cursor:          req.GetCursor(),
