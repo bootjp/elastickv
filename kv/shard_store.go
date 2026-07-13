@@ -152,7 +152,7 @@ func (s *ShardStore) verifyTargetReadinessForRouteRange(ctx context.Context, g *
 		return errors.WithStack(err)
 	}
 	for _, ready := range states {
-		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+		if !targetReadinessAppliesToRoute(route, routeStart, routeEnd, ready) {
 			continue
 		}
 		if !routeSatisfiesTargetReadiness(route, ready) {
@@ -160,6 +160,16 @@ func (s *ShardStore) verifyTargetReadinessForRouteRange(ctx context.Context, g *
 		}
 	}
 	return nil
+}
+
+func targetReadinessAppliesToRoute(route distribution.Route, routeStart []byte, routeEnd []byte, ready store.TargetStagedReadinessState) bool {
+	if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	if route.RouteID != 0 && !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	return true
 }
 
 func readinessRouteRange(start []byte, end []byte) ([]byte, []byte) {
@@ -2104,7 +2114,7 @@ func (s *ShardStore) explicitGroupRouteForRange(groupID uint64, start []byte, en
 	if s == nil || s.engine == nil {
 		return fallback
 	}
-	routeStart, routeEnd := readinessRouteRange(start, end)
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
 	for _, route := range s.engine.GetIntersectingRoutes(routeStart, routeEnd) {
 		if route.GroupID == groupID {
 			return route

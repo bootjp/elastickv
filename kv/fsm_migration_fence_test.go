@@ -256,6 +256,46 @@ func TestFSMRejectsOnePhaseTxnBelowRouteFloor(t *testing.T) {
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
+func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    50,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("b"), LockTTLms: defaultTxnLockTTLms, CommitTS: 101}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 50)
+	require.NoError(t, err)
+}
+
+func TestFSMPrepareWithoutCommitTSUsesStartTSForRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    100,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("b"), LockTTLms: defaultTxnLockTTLms}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+}
+
 func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	t.Parallel()
 

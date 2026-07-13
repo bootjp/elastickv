@@ -1110,7 +1110,11 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, startTS)
+	floorTS := startTS
+	if meta.CommitTS != 0 {
+		floorTS = meta.CommitTS
+	}
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, floorTS)
 	if err != nil {
 		return err
 	}

@@ -273,6 +273,100 @@ func TestShardStoreS3ManifestScanChecksTargetReadinessInRouteSpace(t *testing.T)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreTargetReadinessSkipsNonOverlappingGuardForScannedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "a/")
+	end := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+	routeBoundary, _, ok := s3keys.ManifestScanRouteBounds(
+		s3keys.ObjectManifestScanStart("bucket-a", 1, "m/"),
+		end,
+	)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               routeStart,
+				End:                 routeBoundary,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID: 2,
+				Start:   routeBoundary,
+				End:     routeEnd,
+				GroupID: 1,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeBoundary,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	kvs, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
+
+func TestShardStoreExplicitGroupS3ManifestScanUsesRouteProofForReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	end := prefixScanEnd(start)
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               routeStart,
+			End:                 routeEnd,
+			GroupID:             42,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+}
+
 func TestShardStoreApplyMutationsRaftAtEnforcesRouteFloor(t *testing.T) {
 	t.Parallel()
 
