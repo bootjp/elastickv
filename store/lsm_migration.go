@@ -113,8 +113,7 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 		return false, true, err
 	}
 	if commitTS <= opts.MinCommitTSExclusive {
-		_ = s.skipToNextUserKey(iter, userKey)
-		return false, true, nil
+		return s.skipPebbleExportVersionBelowMinTS(iter, opts, userKey, commitTS, result)
 	}
 	done, err = s.exportPebbleVersion(iter, opts, userKey, commitTS, result)
 	return true, done, err
@@ -122,7 +121,7 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 
 func (s *pebbleStore) skipPebbleExportKeyOutsideRange(iter *pebble.Iterator, opts ExportVersionsOptions, userKey []byte) (bool, error) {
 	if opts.StartKey != nil && bytes.Compare(userKey, opts.StartKey) < 0 {
-		_ = s.skipToNextUserKey(iter, userKey)
+		advancePebbleExportPastCurrentUserKey(iter, userKey)
 		return true, nil
 	}
 	if opts.EndKey == nil || bytes.Compare(userKey, opts.EndKey) < 0 {
@@ -131,8 +130,36 @@ func (s *pebbleStore) skipPebbleExportKeyOutsideRange(iter *pebble.Iterator, opt
 	if pebbleExportCanStopAtEndKey(opts.StartKey, opts.EndKey, userKey) {
 		return true, errExportReachedEnd
 	}
-	_ = s.skipToNextUserKey(iter, userKey)
+	advancePebbleExportPastCurrentUserKey(iter, userKey)
 	return true, nil
+}
+
+func (s *pebbleStore) skipPebbleExportVersionBelowMinTS(
+	iter *pebble.Iterator,
+	opts ExportVersionsOptions,
+	userKey []byte,
+	commitTS uint64,
+	result *ExportVersionsResult,
+) (advance bool, done bool, err error) {
+	rawValue := iter.Value()
+	result.ScannedBytes += versionExportSize(userKey, len(rawValue))
+	result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+	if finishExportIfLimited(opts, result) {
+		result.Done = false
+		return false, false, nil
+	}
+	advancePebbleExportPastCurrentUserKey(iter, userKey)
+	return false, true, nil
+}
+
+func advancePebbleExportPastCurrentUserKey(iter *pebble.Iterator, userKey []byte) {
+	userKey = bytes.Clone(userKey)
+	for iter.Next() {
+		currentUserKey, _ := decodeKeyView(iter.Key())
+		if !bytes.Equal(currentUserKey, userKey) {
+			return
+		}
+	}
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {

@@ -109,10 +109,16 @@ func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosit
 }
 
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
-	if opts.AcceptKey != nil && opts.MaxScannedBytes == 0 {
+	if exportUsesSparseScanBudget(opts) && opts.MaxScannedBytes == 0 {
 		opts.MaxScannedBytes = defaultSparseExportMaxScannedBytes
 	}
 	return opts
+}
+
+func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
+	return opts.AcceptKey != nil ||
+		opts.MaxCommitTSInclusive != 0 ||
+		opts.MinCommitTSExclusive != 0
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {
@@ -407,9 +413,6 @@ func exportMemoryVersion(opts ExportVersionsOptions, cursorCommitTS uint64, key 
 	if shouldSkipMemoryVersion(cursorCommitTS, version) {
 		return true
 	}
-	if version.TS <= opts.MinCommitTSExclusive {
-		return false
-	}
 	tag := appendMemoryExportVersion(opts, key, version, result)
 	return finishMemoryExportPosition(opts, key, version, tag, result)
 }
@@ -425,6 +428,15 @@ func exportMemoryVersionsForKey(
 	for i := len(versions) - 1; i >= 0; i-- {
 		if err := ctx.Err(); err != nil {
 			return false, errors.WithStack(err)
+		}
+		if shouldSkipMemoryVersion(cursorCommitTS, versions[i]) {
+			continue
+		}
+		if versions[i].TS <= opts.MinCommitTSExclusive {
+			if !finishMemoryExportPosition(opts, key, versions[i], exportCursorTagScanned, result) {
+				return false, nil
+			}
+			return true, nil
 		}
 		if !exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result) {
 			return !finishExportIfLimited(opts, result), nil

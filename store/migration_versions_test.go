@@ -174,6 +174,81 @@ func TestExportVersionsAppliesDefaultSparseScanBudget(t *testing.T) {
 	})
 }
 
+func TestExportVersionsAppliesDefaultScanBudgetForTimestampFilter(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
+		require.NoError(t, st.PutAt(ctx, []byte("drop-new"), value, 30, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("keep-old"), []byte("v"), 10, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxCommitTSInclusive: 20,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Empty(t, first.Versions)
+		require.GreaterOrEqual(t, first.ScannedBytes, uint64(defaultSparseExportMaxScannedBytes))
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			Cursor:               first.NextCursor,
+			MaxCommitTSInclusive: 20,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("keep-old"), CommitTS: 10, Value: []byte("v")}}, second.Versions)
+	})
+}
+
+func TestExportVersionsMinTSPruneDoesNotSkipPrefixedKeys(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		prefixed := []byte{'a', 0xff, 0x00}
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("old"), 5, 0))
+		require.NoError(t, st.PutAt(ctx, prefixed, []byte("new"), 20, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("a"),
+			EndKey:               []byte("b"),
+			MinCommitTSExclusive: 10,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: prefixed, CommitTS: 20, Value: []byte("new")}}, res.Versions)
+	})
+}
+
+func TestExportVersionsMinTSSkipHonorsScanBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
+		require.NoError(t, st.PutAt(ctx, []byte("old"), value, 5, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("tail"), []byte("v"), 20, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MinCommitTSExclusive: 10,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Empty(t, first.Versions)
+		require.GreaterOrEqual(t, first.ScannedBytes, uint64(defaultSparseExportMaxScannedBytes))
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			Cursor:               first.NextCursor,
+			MinCommitTSExclusive: 10,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("tail"), CommitTS: 20, Value: []byte("v")}}, second.Versions)
+	})
+}
+
 func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
