@@ -431,7 +431,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 
 func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	if s == nil || s.readTracker == nil {
-		return nil
+		return &kv.ActiveTimestampToken{}
 	}
 	return s.readTracker.Pin(ts)
 }
@@ -665,10 +665,7 @@ func (s *DistributionServer) verifySplitMigrationCapability(ctx context.Context)
 		return grpcStatusError(codes.FailedPrecondition, errDistributionClusterNotReady.Error())
 	}
 	if err := s.migrationCapabilityGate(ctx); err != nil {
-		if status.Code(err) != codes.OK {
-			return err
-		}
-		return grpcStatusError(codes.FailedPrecondition, errDistributionClusterNotReady.Error())
+		return err
 	}
 	return nil
 }

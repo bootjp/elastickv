@@ -74,6 +74,24 @@ func TestWithCatalogReloadRetryPolicy_OverridesDefaults(t *testing.T) {
 	require.Equal(t, 5*time.Millisecond, s.reloadRetry.interval)
 }
 
+func TestDistributionServerPinReadTSWithoutTrackerReturnsReleasableToken(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil)
+	token := s.pinReadTS(10)
+	require.NotNil(t, token)
+	require.NotPanics(t, func() {
+		token.Release()
+	})
+
+	var nilServer *DistributionServer
+	nilToken := nilServer.pinReadTS(10)
+	require.NotNil(t, nilToken)
+	require.NotPanics(t, func() {
+		nilToken.Release()
+	})
+}
+
 func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
@@ -154,6 +172,34 @@ func TestDistributionServerStartSplitMigration_FailsClosedUntilCapabilityGate(t 
 	jobs, listErr := catalog.ListSplitJobs(ctx)
 	require.NoError(t, listErr)
 	require.Empty(t, jobs)
+}
+
+func TestDistributionServerStartSplitMigrationReturnsCapabilityGateError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			return status.Error(codes.Unavailable, "split migration capability not ready")
+		}),
+	)
+
+	_, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: 1,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "split migration capability not ready")
+	require.Zero(t, coordinator.dispatchCalls)
 }
 
 func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *testing.T) {
