@@ -209,6 +209,98 @@ func TestGRPCServer_RawScanAt_UsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanEnd)
 }
 
+type recordingRawReadFenceStore struct {
+	store.MVCCStore
+
+	routeVersion             uint64
+	getReadRouteVersion      uint64
+	latestReadRouteVersion   uint64
+	scanReadRouteVersion     uint64
+	scanReadRouteStart       []byte
+	scanReadRouteEnd         []byte
+	callerSuppliedGetSeen    uint64
+	callerSuppliedScanSeen   uint64
+	callerSuppliedLatestSeen uint64
+}
+
+func (s *recordingRawReadFenceStore) ReadRouteVersion() uint64 {
+	return s.routeVersion
+}
+
+func (s *recordingRawReadFenceStore) GetAtWithReadFence(_ context.Context, _ []byte, _ uint64, _ uint64, readRouteVersion uint64) ([]byte, error) {
+	s.getReadRouteVersion = readRouteVersion
+	if readRouteVersion == 99 {
+		s.callerSuppliedGetSeen = readRouteVersion
+	}
+	return []byte("v"), nil
+}
+
+func (s *recordingRawReadFenceStore) LatestCommitTSWithReadFence(_ context.Context, _ []byte, readRouteVersion uint64) (uint64, bool, error) {
+	s.latestReadRouteVersion = readRouteVersion
+	if readRouteVersion == 98 {
+		s.callerSuppliedLatestSeen = readRouteVersion
+	}
+	return 10, true, nil
+}
+
+func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, _ bool, _ uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	s.scanReadRouteVersion = readRouteVersion
+	s.scanReadRouteStart = append([]byte(nil), routeStart...)
+	s.scanReadRouteEnd = append([]byte(nil), routeEnd...)
+	if readRouteVersion == 97 {
+		s.callerSuppliedScanSeen = readRouteVersion
+	}
+	return []*store.KVPair{{Key: append([]byte(nil), start...), Value: []byte("v")}}, nil
+}
+
+func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+	require.NoError(t, err)
+	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k")})
+	require.NoError(t, err)
+	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{StartKey: []byte("a"), EndKey: []byte("z"), Limit: 10, Ts: 10})
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(55), st.getReadRouteVersion)
+	require.Equal(t, uint64(55), st.latestReadRouteVersion)
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+}
+
+func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10, ReadRouteVersion: 99})
+	require.NoError(t, err)
+	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), ReadRouteVersion: 98})
+	require.NoError(t, err)
+	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:         []byte("a"),
+		EndKey:           []byte("z"),
+		Limit:            10,
+		Ts:               10,
+		ReadRouteVersion: 97,
+		RouteStart:       []byte("m"),
+		RouteEnd:         []byte("z"),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(99), st.callerSuppliedGetSeen)
+	require.Equal(t, uint64(98), st.callerSuppliedLatestSeen)
+	require.Equal(t, uint64(97), st.callerSuppliedScanSeen)
+	require.Equal(t, []byte("m"), st.scanReadRouteStart)
+	require.Equal(t, []byte("z"), st.scanReadRouteEnd)
+}
+
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
 	t.Parallel()
 

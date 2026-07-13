@@ -46,6 +46,10 @@ type rawReadFenceScanner interface {
 	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
 }
 
+type rawReadFenceVersioner interface {
+	ReadRouteVersion() uint64
+}
+
 type GRPCServerOption func(*GRPCServer)
 
 type rawGroupGetter interface {
@@ -111,7 +115,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	var v []byte
 	var err error
 	if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
-		v, err = fenceGetter.GetAtWithReadFence(ctx, req.Key, readTS, req.GetGroupId(), req.GetReadRouteVersion())
+		v, err = fenceGetter.GetAtWithReadFence(ctx, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
 	} else if groupID := req.GetGroupId(); groupID != 0 {
 		groupGetter, ok := r.store.(rawGroupGetter)
 		if !ok {
@@ -155,7 +159,7 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	var exists bool
 	var err error
 	if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
-		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, req.GetReadRouteVersion())
+		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, r.readRouteVersion(req.GetReadRouteVersion()))
 	} else {
 		ts, exists, err = r.store.LatestCommitTS(ctx, key)
 	}
@@ -193,7 +197,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 
 func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([]*store.KVPair, error) {
 	if fenceScanner, ok := r.store.(rawReadFenceScanner); ok {
-		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), req.GetReadRouteVersion(), req.GetRouteStart(), req.GetRouteEnd())
+		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), req.GetRouteStart(), req.GetRouteEnd())
 		return res, errors.WithStack(err)
 	}
 	if groupID := req.GetGroupId(); groupID != 0 {
@@ -213,6 +217,17 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 	}
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	return res, errors.WithStack(err)
+}
+
+func (r *GRPCServer) readRouteVersion(requested uint64) uint64 {
+	if requested != 0 {
+		return requested
+	}
+	versioner, ok := r.store.(rawReadFenceVersioner)
+	if !ok {
+		return 0
+	}
+	return versioner.ReadRouteVersion()
 }
 
 func rawScanLimit(limit64 int64) (int, error) {

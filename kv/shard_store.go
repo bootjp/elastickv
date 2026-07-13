@@ -35,6 +35,13 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 	}
 }
 
+func (s *ShardStore) ReadRouteVersion() uint64 {
+	if s == nil || s.engine == nil {
+		return 0
+	}
+	return s.engine.Version()
+}
+
 func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	return s.GetAtWithReadFence(ctx, key, ts, 0, 0)
 }
@@ -218,7 +225,7 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 		return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false, true, readRouteVersion, routeStart, routeEnd)
 	}
 
-	routes, clampToRoutes := s.routesForScan(start, end)
+	routes, clampToRoutes := s.routesForFencedScan(start, end, routeStart, routeEnd)
 	out, err := s.scanRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, clampToRoutes, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, err
@@ -266,7 +273,7 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 		return []*store.KVPair{}, nil
 	}
 
-	routes, clampToRoutes := s.routesForScan(start, end)
+	routes, clampToRoutes := s.routesForFencedScan(start, end, routeStart, routeEnd)
 	out, err := s.reverseScanRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, clampToRoutes, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, err
@@ -312,6 +319,24 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	}
 
 	return routes, true
+}
+
+func (s *ShardStore) routesForFencedScan(start []byte, end []byte, routeStart []byte, routeEnd []byte) ([]distribution.Route, bool) {
+	if routeScanBoundsPresent(routeStart, routeEnd) {
+		return s.engine.GetIntersectingRoutes(routeStart, normalizedRouteScanEnd(routeEnd)), false
+	}
+	return s.routesForScan(start, end)
+}
+
+func routeScanBoundsPresent(routeStart []byte, routeEnd []byte) bool {
+	return routeStart != nil || routeEnd != nil
+}
+
+func normalizedRouteScanEnd(routeEnd []byte) []byte {
+	if len(routeEnd) == 0 {
+		return nil
+	}
+	return routeEnd
 }
 
 func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {

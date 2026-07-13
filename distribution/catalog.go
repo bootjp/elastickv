@@ -314,7 +314,7 @@ func (s *CatalogStore) Save(ctx context.Context, expectedVersion uint64, routes 
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	mutations, err := s.buildSaveMutations(ctx, plan)
+	mutations, err := s.buildSaveMutations(ctx, &plan)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
@@ -607,11 +607,16 @@ func (s *CatalogStore) prepareSave(ctx context.Context, expectedVersion uint64, 
 	}, nil
 }
 
-func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([]*store.KVPairMutation, error) {
+func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan *savePlan) ([]*store.KVPairMutation, error) {
+	if plan == nil {
+		return nil, errors.WithStack(ErrCatalogStoreRequired)
+	}
 	existingRoutes, err := s.routesAt(ctx, plan.readTS)
 	if err != nil {
 		return nil, err
 	}
+	plan.routes = mergeRouteDescriptorWriteFloors(existingRoutes, plan.routes)
+
 	nextRouteID, err := s.nextRouteIDAt(ctx, plan.readTS)
 	if err != nil {
 		return nil, err
@@ -643,6 +648,26 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 		Value: EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return mutations, nil
+}
+
+func mergeRouteDescriptorWriteFloors(existing []RouteDescriptor, desired []RouteDescriptor) []RouteDescriptor {
+	if len(existing) == 0 || len(desired) == 0 {
+		return desired
+	}
+	existingByID := make(map[uint64]RouteDescriptor, len(existing))
+	for _, route := range existing {
+		existingByID[route.RouteID] = route
+	}
+	for i := range desired {
+		existingRoute, ok := existingByID[desired[i].RouteID]
+		if !ok {
+			continue
+		}
+		if existingRoute.MinWriteTSExclusive > desired[i].MinWriteTSExclusive {
+			desired[i].MinWriteTSExclusive = existingRoute.MinWriteTSExclusive
+		}
+	}
+	return desired
 }
 
 func (s *CatalogStore) applySaveMutations(ctx context.Context, plan savePlan, mutations []*store.KVPairMutation) error {
