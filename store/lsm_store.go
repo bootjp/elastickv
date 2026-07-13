@@ -60,17 +60,17 @@ const (
 	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
 	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
 
-	// defaultPebbleCacheBytes is the default Pebble block-cache capacity per
-	// store. Pebble's built-in EnsureDefaults() supplies only 8 MiB, which
+	// defaultPebbleCacheBytes is the default process-wide Pebble block-cache
+	// capacity. Pebble's built-in EnsureDefaults() supplies only 8 MiB, which
 	// is far too small for our workloads: production observed a block-cache
 	// hit rate of 0.003% (1.8B misses vs 58k hits) because the working set
 	// evicted faster than it filled. 256 MiB is a conservative baseline per
-	// shard; operators can override via ELASTICKV_PEBBLE_CACHE_MB.
+	// node; operators can override via ELASTICKV_PEBBLE_CACHE_MB.
 	defaultPebbleCacheBytes int64 = 256 << 20
 
-	// pebbleCacheMBEnv is the env var operators use to override the per-store
-	// Pebble block-cache capacity. Units are MiB, integer only. Malformed or
-	// out-of-range values fall back to the default.
+	// pebbleCacheMBEnv is the env var operators use to override the
+	// process-wide Pebble block-cache capacity. Units are MiB, integer only.
+	// Malformed or out-of-range values fall back to the default.
 	pebbleCacheMBEnv = "ELASTICKV_PEBBLE_CACHE_MB"
 
 	// pebbleCacheMBMin / pebbleCacheMBMax define the accepted range for the
@@ -124,16 +124,17 @@ const (
 	conflictCheckLargeBatchThreshold     = 1024
 )
 
-// pebbleCacheBytes is the effective per-store Pebble block-cache capacity,
+// pebbleCacheBytes is the effective process-wide Pebble block-cache capacity,
 // resolved once at process start. Exposed as a package variable so tests can
-// swap it via setPebbleCacheBytesForTest; production code treats it as
+// swap it via setSmallPebbleCacheForTest; production code treats it as
 // read-only after init().
-//
-// TODO(perf/pebble): introduce a process-wide shared cache plumbed through
-// NewPebbleStore so all shards on a node share one LRU eviction pool rather
-// than each carrying an independent 256 MiB budget. That requires changing
-// NewPebbleStore's signature and is deferred to a follow-up PR.
 var pebbleCacheBytes = defaultPebbleCacheBytes
+
+var (
+	processPebbleCacheMu    sync.Mutex
+	processPebbleCache      *pebble.Cache
+	processPebbleCacheBytes int64
+)
 
 func init() {
 	pebbleCacheBytes = resolvePebbleCacheBytes(os.Getenv(pebbleCacheMBEnv))
@@ -288,20 +289,18 @@ func WithSSTIngestSnapshots(enabled bool) PebbleStoreOption {
 // defaultPebbleOptionsWithCache returns the standard Pebble options used
 // throughout the store (including restores) to ensure consistent behaviour
 // between a freshly opened and a restored/swapped-in database, along with
-// the owned *pebble.Cache handle.
+// the store-owned *pebble.Cache reference.
 //
 // FormatMajorVersion is pinned to ratchet v1-era DBs above pebble v2's
 // FormatMinSupported (FormatFlushableIngest) before the v2 upgrade lands.
 //
-// The returned options carry a freshly-allocated block cache sized from
-// pebbleCacheBytes. pebble.NewCache hands back a refcounted Cache with
-// ref=1; pebble.Open adds one reference, so the caller MUST Unref the
-// returned cache after the DB is closed (or after pebble.Open fails) to
-// fully release the memory. Callers that only need *pebble.Options should
-// still take the cache handle and defer its Unref to avoid leaking a
-// 256 MiB (default) allocation per call.
+// The returned options carry a process-wide shared block cache sized from
+// pebbleCacheBytes. The process holds one base reference; each call adds one
+// store/open reference and returns it to the caller. The caller MUST Unref the
+// returned cache after the DB is closed (or after pebble.Open fails), matching
+// the lifetime rules used by NewPebbleStore, Restore, and temp restore DBs.
 func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
-	cache := pebble.NewCache(pebbleCacheBytes)
+	cache := processPebbleCacheRef()
 	opts := &pebble.Options{
 		FS:                 vfs.Default,
 		FormatMajorVersion: pebble.FormatVirtualSSTables,
@@ -311,6 +310,22 @@ func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
 	// EnsureDefaults leaves Cache alone because we already set it.
 	opts.EnsureDefaults()
 	return opts, cache
+}
+
+func processPebbleCacheRef() *pebble.Cache {
+	processPebbleCacheMu.Lock()
+	defer processPebbleCacheMu.Unlock()
+
+	if processPebbleCache == nil || processPebbleCacheBytes != pebbleCacheBytes {
+		old := processPebbleCache
+		processPebbleCache = pebble.NewCache(pebbleCacheBytes)
+		processPebbleCacheBytes = pebbleCacheBytes
+		if old != nil {
+			old.Unref()
+		}
+	}
+	processPebbleCache.Ref()
+	return processPebbleCache
 }
 
 // NewPebbleStore creates a new Pebble-backed MVCC store.

@@ -109,10 +109,10 @@ Multi-region blockers:
 
 ### 2.3 Storage tier (Pebble)
 
-`store/lsm_store.go`: per-shard `pebble.Open`, default block cache
-`defaultPebbleCacheBytes = 256 MiB` **per store** (not shared).
-WAL sync via `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on
-FSM apply; `nosync` opt-in).
+`store/lsm_store.go`: per-shard `pebble.Open`, process-wide shared block cache
+`defaultPebbleCacheBytes = 256 MiB` **per node** (shared by all stores in the
+process). WAL sync via `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM
+apply; `nosync` opt-in).
 
 `store/mvcc_store.go`: encoded as `UserKey ++ 0x00 ++ inverted_TS`,
 `maxSnapshotVersionCount = 1 M`, `maxSnapshotValueSize = 256 MiB`.
@@ -136,8 +136,9 @@ Storage breakage at 1–10 TB/shard:
   is tens of minutes.
 - Pebble L0CompactionThreshold / LBaseMaxBytes / compaction
   concurrency are defaults; write-heavy shards hit stall thresholds.
-  256 MiB block cache per shard × N shards/node = N × 256 MiB
-  resident memory (shared-cache TODO not landed).
+  Shared block cache M1 has landed, so resident block-cache memory is capped per
+  process rather than N × 256 MiB. Shared memtable / compaction concurrency
+  budgeting and per-group cache fairness remain open.
 - MVCC retention 30 min + per-key 1 M version cap means a key
   written ≥ 555/s for 30 min trips the cap; compactor runs every
   5 min so read tail latency spikes during accumulation.
@@ -374,11 +375,11 @@ control-plane (`*_proposed_*` doc TBD).**
   work.
 - Streamed in parallel across the leader's outgoing transport.
 
-**M2 — Shared block cache + per-shard tuning (`*_proposed_*` doc
+**M2 — Shared block-cache follow-ups + per-shard tuning (`*_proposed_*` doc
 TBD).**
-- Land the existing shared-cache TODO: one `pebble.Cache` per node
-  shared across all shards' stores, sized as a per-node config
-  fraction of available RAM (default 25%).
+- M1 shared block cache has landed: one `pebble.Cache` per process is shared
+  across all shards' stores and sized by `ELASTICKV_PEBBLE_CACHE_MB`.
+- Add shared memtable / compaction concurrency budgets across stores.
 - Surface `L0CompactionThreshold`, `LBaseMaxBytes`,
   `MaxConcurrentCompactions` as per-shard config so a write-heavy
   shard can be tuned without touching the cluster default.

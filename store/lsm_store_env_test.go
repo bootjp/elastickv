@@ -7,15 +7,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setPebbleCacheBytesForTest swaps the package-level pebbleCacheBytes value
-// for the duration of a single test and restores it during t.Cleanup. The
-// real override happens in init() from ELASTICKV_PEBBLE_CACHE_MB; tests use
-// this helper to exercise specific cache sizes without relying on process
+// setSmallPebbleCacheForTest swaps the package-level pebbleCacheBytes value
+// to 16 MiB for the duration of a single test and restores it during
+// t.Cleanup. The real override happens in init() from
+// ELASTICKV_PEBBLE_CACHE_MB; tests use this helper without relying on process
 // env state.
-func setPebbleCacheBytesForTest(t *testing.T, n int64) {
+func setSmallPebbleCacheForTest(t *testing.T) {
 	t.Helper()
 	prev := pebbleCacheBytes
-	pebbleCacheBytes = n
+	pebbleCacheBytes = 16 << 20
 	t.Cleanup(func() { pebbleCacheBytes = prev })
 }
 
@@ -66,28 +66,61 @@ func TestPebbleCacheEnvOverride(t *testing.T) {
 	})
 }
 
-// TestSetPebbleCacheBytesForTestRestores verifies the helper reinstates the
+// TestSetSmallPebbleCacheForTestRestores verifies the helper reinstates the
 // previous value via t.Cleanup so tests that tweak pebbleCacheBytes do not
 // leak state to later tests in the package.
-func TestSetPebbleCacheBytesForTestRestores(t *testing.T) {
+func TestSetSmallPebbleCacheForTestRestores(t *testing.T) {
 	before := pebbleCacheBytes
 	t.Run("inner", func(t *testing.T) {
-		setPebbleCacheBytesForTest(t, 16<<20)
+		setSmallPebbleCacheForTest(t)
 		require.Equal(t, int64(16)<<20, pebbleCacheBytes)
 	})
 	require.Equal(t, before, pebbleCacheBytes)
 }
 
 // TestDefaultPebbleOptionsCarriesCache sanity-checks that the options
-// constructor wires a cache through at the configured size and that Unref
-// is safe to call after closing the DB (the primary lifecycle path).
+// constructor wires the process-shared cache through at the configured size
+// and that Unref is safe for each borrowed store/open reference.
 func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
-	setPebbleCacheBytesForTest(t, 16<<20)
+	setSmallPebbleCacheForTest(t)
 	opts, cache := defaultPebbleOptionsWithCache()
 	require.NotNil(t, cache)
 	require.Same(t, cache, opts.Cache)
 	require.Equal(t, int64(16)<<20, cache.MaxSize())
 	cache.Unref()
+}
+
+func TestDefaultPebbleOptionsSharesProcessCache(t *testing.T) {
+	setSmallPebbleCacheForTest(t)
+	opts1, cache1 := defaultPebbleOptionsWithCache()
+	defer cache1.Unref()
+	opts2, cache2 := defaultPebbleOptionsWithCache()
+	defer cache2.Unref()
+
+	require.Same(t, cache1, cache2)
+	require.Same(t, cache1, opts1.Cache)
+	require.Same(t, cache1, opts2.Cache)
+}
+
+func TestNewPebbleStoreSharesProcessCache(t *testing.T) {
+	setSmallPebbleCacheForTest(t)
+
+	s1, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer s1.Close()
+	ps1, ok := s1.(*pebbleStore)
+	require.True(t, ok)
+
+	s2, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer s2.Close()
+	ps2, ok := s2.(*pebbleStore)
+	require.True(t, ok)
+
+	require.NotNil(t, ps1.cache)
+	require.Same(t, ps1.cache, ps2.cache)
+	require.Equal(t, int64(16)<<20, ps1.BlockCacheCapacityBytes())
+	require.Equal(t, ps1.BlockCacheCapacityBytes(), ps2.BlockCacheCapacityBytes())
 }
 
 // newPebbleStoreWithFSMApplyWriteOptsForTest constructs a pebbleStore
