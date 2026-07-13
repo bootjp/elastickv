@@ -36,6 +36,7 @@ var (
 	ErrCatalogSplitJobConflict            = errors.New("catalog split job conflict")
 	ErrCatalogSplitJobTerminalRequired    = errors.New("catalog split job terminal state is required")
 	ErrSplitJobOverlap                    = errors.New("split job overlaps requested route")
+	ErrTooManyInFlightSplitJobs           = errors.New("too many in-flight split jobs")
 )
 
 // SplitJobPhase is the durable phase of a split migration job.
