@@ -42,10 +42,9 @@ rollout are correct by construction:
   state to migrate; the worst-case partial deploy is "node X
   reports `ok=false`", not data loss.
 
-This proposal scopes a **minimum-viable Phase 2-C** that ships the
-operator-visible value (cluster-wide
-heatmap, degraded-node banner) without requiring the full proto
-extension §9.1 calls for.
+This implemented design records both the static-node-list Phase 2-C
+fan-out and the Phase 2-C+ wire/merge extension that now carries
+per-cell Raft group and leader-term identity.
 
 ## 2. Scope
 
@@ -57,21 +56,19 @@ extension §9.1 calls for.
   every configured node's `/admin/api/v1/keyviz/matrix`, merges the
   responses, and returns one combined `KeyVizMatrix` plus a per-node
   status array.
-- Two merge rules, justified in §4:
+- Merge rules, justified in §4:
   - **Reads**: sum across nodes (each node serves distinct local
     follower reads).
-  - **Writes**: max across nodes, with a row-level `conflict=true`
-    flag raised when **two or more nodes report a non-zero value
-    for the same cell** in the row. Follower zeros against the
-    leader's non-zero value do **not** count as disagreement —
-    that is the steady-state shape of stable leadership. Correct
-    under stable leadership (the current leader is the sole
-    non-zero reporter; conflict stays false), conservative under a
-    leadership flip mid-window (both leaders report > 0 for the
-    same cell; max wins and conflict fires). The flag is row-level
-    for Phase 2-C and moves to per-cell when the proto extension
-    lands in Phase 2-C+ — see §4.2 and §5 for the wire-format
-    implication.
+  - **Writes**: when every non-zero cell has
+    `(raftGroupID, leaderTerm)` identity, collapse duplicates within
+    the same `(bucketID, raftGroupID, leaderTerm, column)` by taking
+    max, then sum across distinct terms for the same group/window.
+    A row-level `conflict=true` and per-cell `conflicts[j]=true`
+    fire only when distinct sources disagree within the same
+    `(bucketID, raftGroupID, leaderTerm, column)` identity. If any
+    non-zero source omits group/term identity, the cell falls back
+    to the Phase 2-C legacy max-merge so mixed-version peers never
+    over-count.
 - Degraded-mode response: when N nodes respond and M < N succeed,
   the response carries `{node, ok, error}` per node and the SPA
   shows a banner.
@@ -84,10 +81,10 @@ extension §9.1 calls for.
   Static `--keyvizFanoutNodes` is the contract for Phase 2-C; the
   cache + refresh-interval machinery lands when the cluster grows
   beyond a hand-configured size.
-- **Wire format extension with `raftGroupID` + `leaderTerm`**
-  (parent §9.1). The MVP merge uses `max` over writes; the
-  identity-based dedup §9.1 specifies will land in Phase 2-C+ when
-  we extend the proto + JSON schemas.
+- **Strict rejection of legacy peers without `raftGroupID` +
+  `leaderTerm`**. Mixed-version clusters remain supported: cells
+  with missing group/term identity use the legacy max-merge fallback
+  described in §4.2.
 - **Standalone `cmd/elastickv-admin` binary** (parent §3.1).
   Deferred indefinitely — we have not seen a use case the embedded
   in-node admin does not cover, and this design holds the
@@ -174,76 +171,73 @@ elastickv \
 
 ## 4. Merge rules
 
-The parent design §9.1 specifies the **canonical** merge rule:
+The parent design §9.1 specifies the canonical write merge rule:
 collapse write samples to one value per
 `(bucketID, raftGroupID, leaderTerm, windowStart)`, surface
-`conflict=true` when distinct sources disagree, sum across
-`leaderTerm` values for the same `(group, window)`. That rule
-requires `raftGroupID` + `leaderTerm` on every row — proto + JSON
-extensions we have not built yet.
-
-This MVP uses a **simpler, conservative substitute** that is
-correct in steady state and never silently overcounts under
-transitions:
+`conflict=true` when distinct sources disagree within the same
+identity, and sum across `leaderTerm` values for the same
+`(group, window)`. That is the implemented Phase 2-C+ contract.
+Peers that do not yet emit group/term identity are still accepted via
+the legacy max-merge fallback below.
 
 ### 4.1 Reads → sum across nodes
 
 Each node records the reads it served. A read served by node A is
 not also served by node B. Summation is exact.
 
-### 4.2 Writes → max across nodes + conflict flag
+### 4.2 Writes → group/term identity merge with legacy fallback
 
 Under stable leadership, exactly one node (the current leader for
-the route's group) records writes for any given window; other
-nodes report 0. `max` returns the leader's count; non-leader
-zeros do not perturb it **and do not raise the conflict flag**.
-The conflict predicate is "≥ 2 nodes report a value > 0 for the
-same cell", not "any two values differ" — a leader-says-5 vs.
-follower-says-0 split is the steady-state shape, not a conflict.
+the route's group) records writes for any given window; other nodes
+report 0. Zero-valued contributions are ignored by the write merge.
 
-Under a leadership flip mid-window, both the ex-leader and the
-new leader may report non-zero counts for the same
-`(bucketID, windowStart)`:
+For non-zero cells that carry both `raftGroupID` and `leaderTerm`,
+the aggregator:
 
-- If the ex-leader's local cache has not yet expired its
-  pre-transfer increment, both nodes report values > 0 for the
-  same cell. The conflict predicate fires.
-- `max` returns the larger count and surfaces `conflict=true` so
-  the SPA can hatch the cell.
-- This is **conservative** — it understates the true window
-  total (which is `ex_leader + new_leader`) by at most one
-  leader's pre-transfer slice. The design accepts this trade
-  in exchange for not overcounting; overcounting is the failure
-  mode operators react to badly because it produces phantom
-  hotspots.
+- Groups contributions by `(bucketID, raftGroupID, leaderTerm,
+  column_unix_ms)`.
+- Takes `max` within one group/term identity. Equal reports are a
+  duplicate observation of the same leader-term slice.
+- Sets `conflicts[j]=true` and the row-level `conflict=true` when
+  two sources report distinct non-zero values for the same
+  group/term identity. That is the suspicious case: one Raft group
+  should have at most one leader for a term.
+- Sums the resulting per-term values across distinct `leaderTerm`
+  values for the same group/window. A leadership flip inside the
+  requested window therefore preserves the ex-leader slice plus the
+  new-leader slice instead of under-counting with a simple max.
 
-The full §9.1 rule (sum across `leaderTerm`, dedupe within a
-term) recovers the missing slice but requires `leaderTerm` on
-the wire. We commit to landing it in Phase 2-C+ once the proto
-extension lands.
+If any non-zero source for a cell has `raftGroupID=0` or
+`leaderTerm=0`, the whole cell uses the legacy Phase 2-C fallback:
+take the max across sources, and mark a conflict only when two
+distinct non-zero values were observed. This preserves the
+mixed-version safety property: an old peer can omit the new identity
+fields without causing the aggregator to sum overlapping unknown
+windows.
 
 ### 4.3 Bytes counters
 
-`read_bytes` and `write_bytes` follow `reads` and `writes`
-respectively (sum and max). Same justification.
+`read_bytes` follows the read rule. `write_bytes` follows the write
+rule: group/term identity merge when the cell has identity, legacy
+max-merge fallback when it does not.
 
 ### 4.4 Row identity
 
 Two rows from different nodes belong to the same logical row when
-their `BucketID` matches. After the aggregator has collected **all**
-per-node responses (i.e. waited for every peer's deadline to
-resolve), `Start` / `End` / `Aggregate` / `RouteCount` / `RouteIDs`
-are taken from the **lowest-indexed node in `--keyvizFanoutNodes`
-whose response is non-empty for the row**. Selection by config-list
-position rather than wall-clock arrival order is the load-bearing
-property: peers respond in non-deterministic order, so picking on
-first arrival would let `Start`/`End` flap between polls for the
-same bucket. If two nodes disagree on `Start`/`End`
-for the same `BucketID`, that indicates a routing-catalog
-divergence the operator should investigate; the current wire
-contract does not emit a structured catalog-divergence warning, so
-operators must correlate the row identity with peer status and the
-route catalog when investigating that condition.
+their `BucketID` matches. The merge order is deterministic and
+local-first: `KeyVizFanout.Run` prepends the local matrix, then
+appends successful peers in `--keyvizFanoutNodes` order. `Start` /
+`End` / `Aggregate` / `RouteCount` / `RouteIDs` are copied from the
+first matrix in that order that contains the bucket. Selection by
+local-first configured order rather than wall-clock arrival order is
+the load-bearing property: peers respond in non-deterministic order,
+so picking on first arrival would let `Start`/`End` flap between
+polls for the same bucket. If two nodes disagree on `Start`/`End`
+for the same `BucketID`, that indicates a routing-catalog divergence
+the operator should investigate; the current wire contract does not
+emit a structured catalog-divergence warning, so operators must
+correlate the row identity with peer status and the route catalog
+when investigating that condition.
 
 ### 4.5 Time alignment
 
@@ -280,7 +274,10 @@ no breaking changes — old SPA versions keep working):
       "bucket_id": "route:42",
       ...,
       "values": [...],
-      "conflict": false      // NEW: true when MVP max-merge resolved disagreement
+      "raft_group_ids": [...],
+      "leader_terms": [...],
+      "conflicts": [false, true, ...],
+      "conflict": true       // present only when the row has a conflict
     }
   ],
   "series": "writes",
@@ -303,18 +300,17 @@ no breaking changes — old SPA versions keep working):
 `error`. Future structured non-fatal signals such as catalog
 divergence would require an explicit wire extension.
 
-`conflict` is the row-level OR of `conflicts[]`. `conflicts[]` is
-parallel to `values[]` and marks the exact cell where the
-leader-term merge observed a disagreement.
+`raft_group_ids[]`, `leader_terms[]`, and `conflicts[]` are parallel
+to `values[]`. `raft_group_ids[j]` and `leader_terms[j]` carry the
+identity used by the write merge for column `j`; zero means identity
+was not tracked and the legacy fallback was used for that cell.
 
-The field is **always present** on every row in the response — even
-when fan-out is disabled (single-node mode), `conflict` defaults to
-`false` and is emitted on the wire. This is wire-stable: an SPA
-that pattern-matches `"conflict" in row` rather than checking the
-value will not regress when the operator toggles
-`--keyvizFanoutNodes`. Only the fan-out aggregator ever sets
-`conflict = true`; in local-only mode the field's value is
-identically false.
+`conflicts[]` marks the exact cells where the write merge observed a
+disagreement. It is omitted when nil/no cell conflicted. `conflict`
+is the row-level OR of `conflicts[]`; because
+`KeyVizRow.Conflict` has `json:"conflict,omitempty"`, it is present
+only when true. Clients must treat an absent `conflict` field as
+false rather than relying on `"conflict" in row`.
 
 ## 6. SPA changes
 
