@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-C
 parent_design: docs/admin_ui_key_visualizer_design.md
 date: 2026-04-27
@@ -341,29 +341,34 @@ as an immediate follow-up; either way the wire format above is
 forwards-compatible so an old SPA against a fan-out server still
 renders correctly (it just ignores the new fields).
 
-## 7. Implementation plan
+## 7. Implementation status
 
-PR 1 (this proposal + a small slice):
+Phase 2-C is implemented as the static-node-list MVP described in
+this document.
 
-- Land this design doc.
-- Wire `--keyvizFanoutNodes` flag plumbing through `main.go` →
-  `internal/admin` → handler.
-- Add a fan-out aggregator with the §4 merge rules and a
-  table-driven test covering: stable-leader (max wins, no
-  conflict), mid-window flip (max wins, conflict=true), partial
-  failure (one node times out, response carries the failure).
-- Server-side only — SPA changes follow.
+- `main.go` exposes `--keyvizFanoutNodes` and
+  `--keyvizFanoutTimeout`, then threads the parsed fan-out config
+  into `prepareAdminFromFlags`.
+- `internal/admin/keyviz_fanout.go` implements the cluster fan-out
+  aggregator, anti-recursion header, cookie whitelist forwarding,
+  response-size cap, degraded peer status, and read/write merge
+  rules.
+- `internal/admin/keyviz_handler.go` suppresses recursive fan-out
+  on peer requests and returns the merged `fanout` block when the
+  operator configured peers.
+- `web/admin/src/api/client.ts` and `web/admin/src/pages/KeyViz.tsx`
+  carry the `fanout` response shape, degraded banner, conflict
+  hatching, and cluster-view counter in the SPA.
+- `internal/admin/keyviz_fanout_test.go`,
+  `internal/admin/keyviz_handler_test.go`, and SPA tests cover the
+  server and UI behavior while preserving the default single-node
+  view when `--keyvizFanoutNodes` is unset.
 
-PR 2:
-
-- SPA: degraded banner, conflict hatching, header counter.
-
-PR 3 (Phase 2-C+):
-
-- Extend proto + JSON with `raftGroupID` and `leaderTerm`.
-- Replace §4.2 max-merge with the canonical
-  `(bucketID, raftGroupID, leaderTerm, windowStart)` merge.
-- Promote `conflict` from per-row to per-cell.
+Phase 2-C+ remains future work: extend the matrix rows with
+`raftGroupID` and `leaderTerm`, replace §4.2's max-merge with the
+canonical `(bucketID, raftGroupID, leaderTerm, windowStart)` merge,
+and promote `conflict` from per-row to per-cell. That follow-up is
+explicitly outside this Phase 2-C implemented slice.
 
 ## 8. Five-lens review checklist
 
