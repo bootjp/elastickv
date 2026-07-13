@@ -135,6 +135,24 @@ func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v10"), val)
 	_, err = ps.GetAt(ctx, stage("k"), 10)
 	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	const retryEntryIdx uint64 = 78
+	retry, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:        9,
+		AppliedIndex: retryEntryIdx,
+		StartKey:     prefix,
+		EndKey:       PrefixScanEnd(prefix),
+		MaxVersions:  10,
+		TargetKey:    targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, retry.Done)
+	require.Equal(t, uint64(1), retry.TotalPromotedRows)
+
+	got, present, err = ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "completed PromoteVersions retry must persist metaAppliedIndex")
+	require.Equal(t, retryEntryIdx, got)
 }
 
 // TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey covers the

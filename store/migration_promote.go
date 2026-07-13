@@ -218,7 +218,8 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 		return PromoteVersionsResult{}, err
 	}
 	if opts.JobID != 0 && state.Done {
-		return PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows}, nil
+		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows}
+		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex)
 	}
 	opts.Cursor = cursor
 	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
@@ -236,7 +237,7 @@ func (s *pebbleStore) finishPebblePromotion(
 	result PromoteVersionsResult,
 	appliedIndex uint64,
 ) (PromoteVersionsResult, error) {
-	if len(toPromote) == 0 && stateToWrite == nil {
+	if len(toPromote) == 0 && stateToWrite == nil && appliedIndex == 0 {
 		return result, nil
 	}
 	if err := s.commitPebblePromoteVersions(toPromote, jobID, stateToWrite, appliedIndex); err != nil {

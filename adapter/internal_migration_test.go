@@ -153,6 +153,33 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
 }
 
+func TestInternalPromoteStagedVersionsRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration promote disabled for test")
+		}),
+	)
+
+	resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+		JobId:       7,
+		MaxVersions: 10,
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
+}
+
 func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	t.Parallel()
 
@@ -165,6 +192,7 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
 		WithInternalStore(st),
 		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
 	)
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("k"))

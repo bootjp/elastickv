@@ -3,6 +3,8 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"os"
+	"strings"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -34,12 +36,19 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationPromoteGate = gate
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
-		leader:             leader,
-		transactionManager: txm,
-		clock:              clock,
-		relay:              relay,
+		leader:               leader,
+		transactionManager:   txm,
+		clock:                clock,
+		relay:                relay,
+		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -48,13 +57,14 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
-	store              store.MVCCStore
-	migrationProposer  raftengine.Proposer
+	leader               raftengine.LeaderView
+	transactionManager   kv.Transactional
+	clock                *kv.HLC
+	tsAllocator          kv.TimestampAllocator
+	relay                *RedisPubSubRelay
+	store                store.MVCCStore
+	migrationProposer    raftengine.Proposer
+	migrationPromoteGate func(context.Context) error
 
 	pb.UnimplementedInternalServer
 }
@@ -192,6 +202,9 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
+	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+		return nil, err
+	}
 	result, err := i.proposeMigrationPromote(ctx, req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -205,6 +218,32 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 		PromotedRows:  result.PromotedRows,
 		MaxPromotedTs: result.MaxPromotedTS,
 	}, nil
+}
+
+func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
+	if i.migrationPromoteGate == nil {
+		return nil
+	}
+	if err := i.migrationPromoteGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func defaultMigrationPromoteGate(context.Context) error {
+	if migrationPromoteOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
+}
+
+func migrationPromoteOpcodeEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {

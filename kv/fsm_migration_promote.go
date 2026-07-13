@@ -16,6 +16,8 @@ const (
 	defaultMigrationPromoteMaxScannedBytes = defaultMigrationPromoteMaxBytes * 4
 )
 
+var ErrMigrationPromoteApply = errors.New("migration promote: FSM apply failed; halting apply")
+
 // MarshalMigrationPromoteCommand encodes a target-group staged-data promotion
 // chunk as a Raft FSM command.
 func MarshalMigrationPromoteCommand(req *pb.PromoteStagedVersionsRequest) ([]byte, error) {
@@ -35,15 +37,15 @@ func MarshalMigrationPromoteCommand(req *pb.PromoteStagedVersionsRequest) ([]byt
 func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 	req := &pb.PromoteStagedVersionsRequest{}
 	if err := proto.Unmarshal(data, req); err != nil {
-		return errors.WithStack(err)
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationPromoteApply), "kv/fsm: decode migration promote"))
 	}
 	promoter, ok := f.store.(store.MigrationPromoter)
 	if !ok {
-		return errors.WithStack(store.ErrNotSupported)
+		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationPromoteApply), "kv/fsm: migration promote store"))
 	}
 	result, err := promoter.PromoteVersions(ctx, migrationPromoteOptionsFromProto(req, f.pendingApplyIdx))
 	if err != nil {
-		return errors.WithStack(err)
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationPromoteApply), "kv/fsm: apply migration promote"))
 	}
 	if f.hlc != nil && result.MaxPromotedTS > 0 {
 		f.hlc.Observe(result.MaxPromotedTS)
