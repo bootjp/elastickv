@@ -195,6 +195,33 @@ func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
 	require.Equal(t, first, kvs[1].Key)
 }
 
+func TestShardStoreScanAtWithReadFence_DeduplicatesSameGroupSuppliedBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!raw|")
+	first := []byte("!raw|a")
+	second := []byte("!raw|b")
+	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, first, kvs[0].Key)
+	require.Equal(t, second, kvs[1].Key)
+}
+
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 

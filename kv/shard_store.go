@@ -341,12 +341,18 @@ func normalizedRouteScanEnd(routeEnd []byte) []byte {
 
 func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
+	seenGroups := make(map[uint64]struct{})
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
+		} else {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
 		}
 
 		kvs, err := s.scanRouteAtDirectionWithReadFence(ctx, route, scanStart, scanEnd, limit, ts, false, false, readRouteVersion, routeStart, routeEnd)

@@ -196,14 +196,14 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 }
 
 func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([]*store.KVPair, error) {
+	if req.GetGroupId() != 0 && req.GetReverse() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
+	}
 	if fenceScanner, ok := r.store.(rawReadFenceScanner); ok {
 		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), req.GetRouteStart(), req.GetRouteEnd())
 		return res, errors.WithStack(err)
 	}
 	if groupID := req.GetGroupId(); groupID != 0 {
-		if req.GetReverse() {
-			return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
-		}
 		groupScanner, ok := r.store.(rawGroupScanner)
 		if !ok {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw scan with explicit group requires a group-aware store"))

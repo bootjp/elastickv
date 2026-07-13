@@ -12,8 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
+	"google.golang.org/grpc/status"
 )
 
 func Test_value_can_be_deleted(t *testing.T) {
@@ -299,6 +301,26 @@ func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(97), st.callerSuppliedScanSeen)
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.Equal(t, []byte("z"), st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		GroupId:  42,
+		Reverse:  true,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Zero(t, st.scanReadRouteVersion)
 }
 
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
