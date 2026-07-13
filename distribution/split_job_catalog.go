@@ -260,7 +260,10 @@ func EncodeSplitJob(job SplitJob) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Wrapf(ErrCatalogInvalidSplitJobRecord, "marshal split job: %v", err)
 	}
-	out := make([]byte, 1+len(body))
+	if len(body) > math.MaxInt-1 {
+		return nil, errors.Wrap(ErrCatalogInvalidSplitJobRecord, "encoded split job exceeds maximum slice length")
+	}
+	out := make([]byte, len(body)+1)
 	out[0] = catalogJobCodecVersion
 	copy(out[1:], body)
 	return out, nil
