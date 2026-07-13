@@ -250,7 +250,7 @@ when investigating that condition.
 
 ### 4.5 Time alignment
 
-All nodes use `keyvizStep` (default 1 s), but the implemented
+All nodes use `keyvizStep` (default 60 s), but the implemented
 aggregator merges columns by the exact `column_unix_ms` value each
 node returned. `mergeKeyVizMatrices` builds the sorted union of the
 raw column timestamps and treats a missing source column as zero.
