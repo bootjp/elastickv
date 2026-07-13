@@ -135,7 +135,7 @@ func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetS
 }
 
 func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) error {
-	routeStart, routeEnd := readinessRouteRange(start, end)
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
 	return s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd)
 }
 
@@ -172,6 +172,13 @@ func readinessRouteRange(start []byte, end []byte) ([]byte, []byte) {
 		routeEnd = nextScanCursor(routeStart)
 	}
 	return routeStart, routeEnd
+}
+
+func readinessRouteRangeForScan(start []byte, end []byte) ([]byte, []byte) {
+	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
+		return routeStart, routeEnd
+	}
+	return readinessRouteRange(start, end)
 }
 
 func verifyRouteWriteFloor(route distribution.Route, commitTS uint64) error {

@@ -35,9 +35,7 @@ func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 
 func applyTargetReadiness(t *testing.T, group *ShardGroup) {
 	t.Helper()
-	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
-	require.True(t, ok)
-	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
 		JobID:                  9,
 		RouteStart:             []byte("a"),
 		RouteEnd:               []byte("z"),
@@ -45,7 +43,14 @@ func applyTargetReadiness(t *testing.T, group *ShardGroup) {
 		MigrationJobID:         9,
 		MinWriteTSExclusive:    100,
 		Armed:                  true,
-	}))
+	})
+}
+
+func applyTargetReadinessState(t *testing.T, group *ShardGroup, state store.TargetStagedReadinessState) {
+	t.Helper()
+	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
 }
 
 func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*ShardStore, *ShardGroup) {
@@ -224,6 +229,47 @@ func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
 	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
 
 	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreS3ManifestScanChecksTargetReadinessInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	end := prefixScanEnd(start)
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
+
+	_, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, _, err = st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
