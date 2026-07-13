@@ -148,6 +148,7 @@ func (s *pebbleStore) exportPebbleVersion(
 			return false, err
 		}
 		result.Versions = append(result.Versions, version)
+		result.ExportedBytes += versionExportSize(userKey, len(version.Value))
 		result.AcceptedRows++
 		tag = exportCursorTagEmitted
 	}
@@ -206,12 +207,8 @@ func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOpt
 	}
 
 	batchMax := importBatchMaxTS(opts.Versions)
-	newLastTS, err := s.commitPebbleImportBatch(opts, batchMax)
-	if err != nil {
+	if err := s.commitPebbleImportBatch(opts, batchMax); err != nil {
 		return ImportVersionsResult{}, errors.WithStack(err)
-	}
-	if batchMax > 0 {
-		s.lastCommitTS = newLastTS
 	}
 	s.log.InfoContext(ctx, "import_versions",
 		"job_id", opts.JobID,
@@ -243,27 +240,30 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 	return false, nil, nil
 }
 
-func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64) (uint64, error) {
+func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := s.applyImportVersionsBatch(batch, opts.Versions); err != nil {
-		return 0, err
+		return err
 	}
 	if err := batch.Set(migrationAckKey(opts.JobID, opts.BracketID), encodeMigrationImportAck(migrationImportAck{
 		batchSeq: opts.BatchSeq,
 		cursor:   opts.Cursor,
 	}), nil); err != nil {
-		return 0, errors.WithStack(err)
+		return errors.WithStack(err)
 	}
 	unlock, newLastTS, err := s.stageMigrationClockMetadataIfNeeded(batch, opts.JobID, batchMax)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer unlock()
 	if err := batch.Commit(s.directApplyWriteOpts()); err != nil {
-		return 0, errors.WithStack(err)
+		return errors.WithStack(err)
 	}
-	return newLastTS, nil
+	if batchMax > 0 {
+		s.lastCommitTS = newLastTS
+	}
+	return nil
 }
 
 func (s *pebbleStore) stageMigrationClockMetadataIfNeeded(batch *pebble.Batch, jobID, batchMax uint64) (func(), uint64, error) {

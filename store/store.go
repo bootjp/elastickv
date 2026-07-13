@@ -92,11 +92,12 @@ type ExportVersionsOptions struct {
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.
 type ExportVersionsResult struct {
-	Versions     []MVCCVersion
-	NextCursor   []byte
-	Done         bool
-	ScannedBytes uint64
-	AcceptedRows uint64
+	Versions      []MVCCVersion
+	NextCursor    []byte
+	Done          bool
+	ScannedBytes  uint64
+	ExportedBytes uint64
+	AcceptedRows  uint64
 }
 
 // ImportVersionsOptions applies one idempotent migration-import batch.

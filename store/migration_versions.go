@@ -256,7 +256,7 @@ func exportMemoryIteratorKey(
 
 func finishExportIfLimited(opts ExportVersionsOptions, result *ExportVersionsResult) bool {
 	return len(result.Versions) >= opts.MaxVersions ||
-		(opts.MaxBytes > 0 && exportedVersionsSize(result.Versions) >= opts.MaxBytes) ||
+		(opts.MaxBytes > 0 && result.ExportedBytes >= opts.MaxBytes) ||
 		(opts.MaxScannedBytes > 0 && result.ScannedBytes >= opts.MaxScannedBytes)
 }
 
@@ -275,6 +275,7 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 		KeyFamily: opts.KeyFamily,
 		ExpireAt:  version.ExpireAt,
 	})
+	result.ExportedBytes += versionExportSize(key, len(version.Value))
 	result.AcceptedRows++
 	return exportCursorTagEmitted
 }
@@ -324,14 +325,6 @@ func exportMemoryVersionsForKey(
 		}
 	}
 	return true, nil
-}
-
-func exportedVersionsSize(versions []MVCCVersion) uint64 {
-	var total uint64
-	for _, version := range versions {
-		total += versionExportSize(version.Key, len(version.Value))
-	}
-	return total
 }
 
 func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
