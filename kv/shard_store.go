@@ -1591,6 +1591,18 @@ func (s *ShardStore) Snapshot() (store.Snapshot, error) {
 	return nil, store.ErrNotSupported
 }
 
+func (s *ShardStore) ExportVersions(context.Context, store.ExportVersionsOptions) (store.ExportVersionsResult, error) {
+	return store.ExportVersionsResult{}, store.ErrNotSupported
+}
+
+func (s *ShardStore) ImportVersions(context.Context, store.ImportVersionsOptions) (store.ImportVersionsResult, error) {
+	return store.ImportVersionsResult{}, store.ErrNotSupported
+}
+
+func (s *ShardStore) MigrationHLCFloor(context.Context, uint64) (uint64, error) {
+	return 0, store.ErrNotSupported
+}
+
 func (s *ShardStore) Restore(_ io.Reader) error {
 	return store.ErrNotSupported
 }

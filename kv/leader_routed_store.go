@@ -503,6 +503,30 @@ func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {
 	return errors.WithStack(s.local.Compact(ctx, minTS))
 }
 
+func (s *LeaderRoutedStore) ExportVersions(ctx context.Context, opts store.ExportVersionsOptions) (store.ExportVersionsResult, error) {
+	if s == nil || s.local == nil {
+		return store.ExportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	result, err := s.local.ExportVersions(ctx, opts)
+	return result, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) ImportVersions(ctx context.Context, opts store.ImportVersionsOptions) (store.ImportVersionsResult, error) {
+	if s == nil || s.local == nil {
+		return store.ImportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	result, err := s.local.ImportVersions(ctx, opts)
+	return result, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {
+	if s == nil || s.local == nil {
+		return 0, errors.WithStack(store.ErrNotSupported)
+	}
+	floor, err := s.local.MigrationHLCFloor(ctx, jobID)
+	return floor, errors.WithStack(err)
+}
+
 func (s *LeaderRoutedStore) Snapshot() (store.Snapshot, error) {
 	if s == nil || s.local == nil {
 		return nil, errors.WithStack(store.ErrNotSupported)

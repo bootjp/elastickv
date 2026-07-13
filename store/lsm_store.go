@@ -551,7 +551,8 @@ func isPebbleMetaKey(rawKey []byte) bool {
 	return bytes.Equal(rawKey, metaLastCommitTSBytes) ||
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
-		bytes.Equal(rawKey, metaAppliedIndexBytes)
+		bytes.Equal(rawKey, metaAppliedIndexBytes) ||
+		isMigrationMetadataKey(rawKey)
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {

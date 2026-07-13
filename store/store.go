@@ -25,6 +25,8 @@ var ErrReadTSCompacted = errors.New("read timestamp has been compacted")
 var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
 var ErrValueTooLarge = errors.New("value too large")
+var ErrInvalidExportCursor = errors.New("invalid export cursor")
+var ErrImportBatchGap = errors.New("migration import batch gap")
 
 // validateValueSize returns ErrValueTooLarge when the value exceeds maxSnapshotValueSize.
 func validateValueSize(value []byte) error {
@@ -61,6 +63,56 @@ func (e *WriteConflictError) Unwrap() error {
 type KVPair struct {
 	Key   []byte
 	Value []byte
+}
+
+// MVCCVersion is a raw committed MVCC version for range migration.
+// Unlike scan results, it preserves tombstones and TTL expiry metadata.
+type MVCCVersion struct {
+	Key       []byte
+	CommitTS  uint64
+	Tombstone bool
+	Value     []byte
+	KeyFamily uint32
+	ExpireAt  uint64
+}
+
+// ExportVersionsOptions selects a raw MVCC-version export window.
+type ExportVersionsOptions struct {
+	StartKey             []byte
+	EndKey               []byte
+	MinCommitTSExclusive uint64
+	MaxCommitTSInclusive uint64
+	Cursor               []byte
+	MaxVersions          int
+	MaxBytes             uint64
+	MaxScannedBytes      uint64
+	KeyFamily            uint32
+	AcceptKey            func([]byte) bool
+}
+
+// ExportVersionsResult is one resumable chunk of raw MVCC versions.
+type ExportVersionsResult struct {
+	Versions     []MVCCVersion
+	NextCursor   []byte
+	Done         bool
+	ScannedBytes uint64
+	AcceptedRows uint64
+}
+
+// ImportVersionsOptions applies one idempotent migration-import batch.
+type ImportVersionsOptions struct {
+	JobID     uint64
+	BracketID uint64
+	BatchSeq  uint64
+	Versions  []MVCCVersion
+	Cursor    []byte
+}
+
+// ImportVersionsResult reports the cursor durably acknowledged by the target.
+type ImportVersionsResult struct {
+	AckedCursor   []byte
+	MaxImportedTS uint64
+	Duplicate     bool
 }
 
 // OpType describes a mutation kind.
@@ -207,6 +259,14 @@ type MVCCStore interface {
 	WriteConflictCountsByPrefix() map[string]uint64
 	// Compact removes versions older than minTS that are no longer needed.
 	Compact(ctx context.Context, minTS uint64) error
+	// ExportVersions exports raw committed MVCC versions for range migration.
+	ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error)
+	// ImportVersions applies a migration import batch idempotently by
+	// (jobID, bracketID, batchSeq), preserving tombstones and expireAt.
+	ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
+	// MigrationHLCFloor returns the full-HLC target-local migration floor
+	// persisted by ImportVersions for jobID.
+	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)
 	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error
