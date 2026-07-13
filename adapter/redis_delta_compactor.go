@@ -613,16 +613,23 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 
 // loadListBaseMeta reads the base list metadata key. Returns a zero ListMeta
 // if the key does not exist (all state may be in uncompacted delta keys).
-func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, error) {
+func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, []byte, error) {
 	raw, err := c.st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return store.ListMeta{}, nil
+			return store.ListMeta{}, nil, nil
 		}
-		return store.ListMeta{}, errors.WithStack(err)
+		return store.ListMeta{}, nil, errors.WithStack(err)
 	}
 	meta, err := store.UnmarshalListMeta(raw)
-	return meta, errors.WithStack(err)
+	return meta, raw, errors.WithStack(err)
+}
+
+func compactedMetaExpireAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64, raw []byte, inlineSize int, expireAt uint64) (uint64, error) {
+	if len(raw) == inlineSize {
+		return expireAt, nil
+	}
+	return legacyTTLMillisAt(ctx, st, userKey, readTS)
 }
 
 // sumListMetaDeltas aggregates HeadDelta and LenDelta across all delta KVPairs.
@@ -652,7 +659,11 @@ func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	// Read base metadata (may not exist if all state is in deltas).
-	baseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
+	baseMeta, rawBaseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	expireAt, err := compactedMetaExpireAt(ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt)
 	if err != nil {
 		return nil, err
 	}
@@ -665,7 +676,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	newMeta := store.ListMeta{
 		Head:     baseMeta.Head + headDelta,
 		Len:      baseMeta.Len + lenDelta,
-		ExpireAt: baseMeta.ExpireAt,
+		ExpireAt: expireAt,
 	}
 	if newMeta.Len < 0 {
 		c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
@@ -876,7 +887,7 @@ func foldSimpleLenDeltas(
 // It is used by Hash, Set, and ZSet compaction, which all carry only a LenDelta.
 func (c *DeltaCompactor) buildSimpleCompactElems(
 	ctx context.Context,
-	_ []byte,
+	userKey []byte,
 	deltaKVs []*store.KVPair,
 	readTS uint64,
 	metaKey []byte,
@@ -895,6 +906,10 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
+	}
+	expireAt, err = compactedMetaExpireAt(ctx, c.st, userKey, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt)
+	if err != nil {
+		return nil, err
 	}
 	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, expireAt, metaKey, unmarshalDelta, marshalBase)
 }
@@ -935,6 +950,10 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 		}
 		baseLen = m.Len
 		expireAt = m.ExpireAt
+	}
+	expireAt, err = compactedMetaExpireAt(ctx, r.store, key, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt)
+	if err != nil {
+		return nil, false, err
 	}
 	elems, err := foldSimpleLenDeltas(
 		deltaKVs, additionalDelta, baseLen, expireAt,

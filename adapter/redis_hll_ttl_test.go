@@ -1,10 +1,12 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -107,6 +109,34 @@ func TestRedisLegacyHLLTTLAtIgnoresStaleCollectionTTL(t *testing.T) {
 			require.False(t, expired)
 		})
 	}
+}
+
+func TestRedisSetWideMutationBaseCleansExpiredHLLAnchor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("hll:expired:set-recreate")
+	expiredAt := time.Now().Add(-time.Minute)
+	payload, err := encodeRedisHLL(redisSetValue{Members: []string{"stale"}}, &expiredAt)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 10, 0))
+
+	cleanup, migration, legacyBase, expiredRecreate, err := server.setWideMutationBase(ctx, key, 10, redisTypeNone)
+	require.NoError(t, err)
+	require.True(t, expiredRecreate)
+	require.Empty(t, migration)
+	require.Nil(t, legacyBase)
+
+	var deletesHLL bool
+	for _, elem := range cleanup {
+		if elem.Op == kv.Del && bytes.Equal(elem.Key, redisHLLKey(key)) {
+			deletesHLL = true
+			break
+		}
+	}
+	require.True(t, deletesHLL)
 }
 
 func TestRedisDispatchHLLExpireWritesInlineAnchorAndScanIndex(t *testing.T) {

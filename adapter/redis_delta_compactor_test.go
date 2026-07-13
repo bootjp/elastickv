@@ -740,6 +740,155 @@ func TestDeltaCompactor_TTLInlineMigratesTTLIndexedDeltaOnlyCollections(t *testi
 	}
 }
 
+func TestDeltaCompactor_PreservesLegacyTTLWhenCompactingDeltaOnlyCollections(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name     string
+		key      []byte
+		seed     func(*testing.T, store.MVCCStore, []byte) []byte
+		readMeta func(*testing.T, store.MVCCStore, []byte, uint64) (int64, uint64)
+	}{
+		{
+			name: "list",
+			key:  []byte("ttl:compact:delta-only:list"),
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) []byte {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("a"), 1, 0))
+				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 1), []byte("b"), 1, 0))
+				d1 := store.ListMetaDeltaKey(key, 2, 0)
+				d2 := store.ListMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, d1, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 2, 0))
+				require.NoError(t, st.PutAt(ctx, d2, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+				return d2
+			},
+			readMeta: func(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) (int64, uint64) {
+				t.Helper()
+				raw, err := st.GetAt(ctx, store.ListMetaKey(key), readTS)
+				require.NoError(t, err)
+				meta, err := store.UnmarshalListMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
+			name: "hash",
+			key:  []byte("ttl:compact:delta-only:hash"),
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) []byte {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("a")), []byte("1"), 1, 0))
+				require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("b")), []byte("2"), 1, 0))
+				d1 := store.HashMetaDeltaKey(key, 2, 0)
+				d2 := store.HashMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, d1, store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}), 2, 0))
+				require.NoError(t, st.PutAt(ctx, d2, store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}), 3, 0))
+				return d2
+			},
+			readMeta: func(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) (int64, uint64) {
+				t.Helper()
+				raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+				require.NoError(t, err)
+				meta, err := store.UnmarshalHashMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
+			name: "set",
+			key:  []byte("ttl:compact:delta-only:set"),
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) []byte {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.SetMemberKey(key, []byte("a")), []byte{}, 1, 0))
+				require.NoError(t, st.PutAt(ctx, store.SetMemberKey(key, []byte("b")), []byte{}, 1, 0))
+				d1 := store.SetMetaDeltaKey(key, 2, 0)
+				d2 := store.SetMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, d1, store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}), 2, 0))
+				require.NoError(t, st.PutAt(ctx, d2, store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}), 3, 0))
+				return d2
+			},
+			readMeta: func(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) (int64, uint64) {
+				t.Helper()
+				raw, err := st.GetAt(ctx, store.SetMetaKey(key), readTS)
+				require.NoError(t, err)
+				meta, err := store.UnmarshalSetMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
+			name: "zset",
+			key:  []byte("ttl:compact:delta-only:zset"),
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) []byte {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, []byte("a")), store.MarshalZSetScore(1), 1, 0))
+				require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, []byte("b")), store.MarshalZSetScore(2), 1, 0))
+				d1 := store.ZSetMetaDeltaKey(key, 2, 0)
+				d2 := store.ZSetMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, d1, store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}), 2, 0))
+				require.NoError(t, st.PutAt(ctx, d2, store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}), 3, 0))
+				return d2
+			},
+			readMeta: func(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) (int64, uint64) {
+				t.Helper()
+				raw, err := st.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+				require.NoError(t, err)
+				meta, err := store.UnmarshalZSetMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, c := newDeltaCompactorTestFixture(t)
+			lastDelta := tc.seed(t, st, tc.key)
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(tc.key), encodeRedisTTL(expireAt), 4, 0))
+
+			require.NoError(t, c.SyncOnce(ctx))
+
+			readTS := st.LastCommitTS()
+			n, ttlMs := tc.readMeta(t, st, tc.key, readTS)
+			require.Equal(t, int64(2), n)
+			require.Equal(t, redisExpireAtMillis(expireAt), ttlMs)
+			var err error
+			_, err = st.GetAt(ctx, lastDelta, readTS)
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
+}
+
+func TestRedisZSetInlineMetaCompactionPreservesLegacyTTL(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("ttl:compact:inline:zset")
+	expireAt := time.Now().Add(time.Hour)
+	for ts := uint64(1); ts <= store.MaxDeltaScanLimit; ts++ {
+		require.NoError(t, st.PutAt(ctx, store.ZSetMetaDeltaKey(key, ts, 0),
+			store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}), ts, 0))
+	}
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), uint64(store.MaxDeltaScanLimit+1), 0))
+
+	elems, compacted, err := server.zsetInlineMetaCompactionElems(ctx, key, st.LastCommitTS(), 1)
+	require.NoError(t, err)
+	require.True(t, compacted)
+
+	var meta store.ZSetMeta
+	for _, elem := range elems {
+		if elem.Op == kv.Put && bytes.Equal(elem.Key, store.ZSetMetaKey(key)) {
+			meta, err = store.UnmarshalZSetMeta(elem.Value)
+			require.NoError(t, err)
+			break
+		}
+	}
+	require.Equal(t, int64(store.MaxDeltaScanLimit+1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
 func TestDeltaCompactor_TTLInlineMigratesLegacyCollectionBlobsFromTTLIndex(t *testing.T) {
 	t.Parallel()
 
@@ -907,6 +1056,26 @@ func TestDeltaCompactor_BackoffAfterTimeout(t *testing.T) {
 
 	require.NoError(t, c.SyncOnce(context.Background()))
 	require.Equal(t, 1, st.scans, "backoff pass should not scan again")
+}
+
+func TestDeltaCompactor_TTLInlineStopsAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	st := &timeoutScanStore{MVCCStore: base}
+	coord := &stubAdapterCoordinator{leaderSet: true, leader: false}
+	c := NewDeltaCompactor(
+		st,
+		coord,
+		WithDeltaCompactorTimeout(time.Millisecond),
+		WithDeltaCompactorTimeoutBackoff(0),
+	)
+
+	err := c.SyncOnce(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, st.scans, "timeout pass should stop after the first ttl-inline scan")
+	require.Len(t, st.starts, 1)
+	require.True(t, bytes.HasPrefix(st.starts[0], []byte(redisStrPrefix)))
 }
 
 func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {

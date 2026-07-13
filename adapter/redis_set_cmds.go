@@ -365,6 +365,14 @@ func (r *RedisServer) setWideMutationBase(
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
+	hllCleanup, hllExpired, err := r.expiredHLLCleanupForSetCreate(ctx, key, readTS, typ)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	cleanupElems = append(cleanupElems, hllCleanup...)
+	if hllExpired {
+		return cleanupElems, nil, nil, true, nil
+	}
 	if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -378,6 +386,21 @@ func (r *RedisServer) setWideMutationBase(
 	// Extract legacy member names from migration ops so that applySetMemberMutations
 	// can treat them as already-existing (they are not yet visible at readTS).
 	return cleanupElems, migrationElems, buildLegacySetMemberBase(migrationElems, key), false, nil
+}
+
+func (r *RedisServer) expiredHLLCleanupForSetCreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+	if typ != redisTypeNone {
+		return nil, false, nil
+	}
+	ttl, found, err := r.hllTTLAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found || ttl == nil || ttl.After(time.Now()) {
+		return nil, false, nil
+	}
+	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+	return elems, true, err
 }
 
 func (r *RedisServer) rejectHLLPayloadForSetCreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) error {

@@ -369,7 +369,7 @@ func TestRedis_MultiExec_HSetRecreatesExpiredListAsHash(t *testing.T) {
 	require.ErrorContains(t, rdb.LRange(ctx, "multi:expired-list-hset", 0, -1).Err(), "WRONGTYPE")
 }
 
-func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
+func TestRedis_SAddRecreatesExpiredHLLPayload(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
@@ -385,11 +385,13 @@ func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
 		return err == nil && exists == 0
 	}, time.Second, 10*time.Millisecond)
 
-	err := rdb.SAdd(ctx, "set:expired-hll", "member").Err()
-	require.ErrorContains(t, err, "WRONGTYPE")
-	count, err := rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Int64()
+	added, err := rdb.SAdd(ctx, "set:expired-hll", "member").Result()
 	require.NoError(t, err)
-	require.Equal(t, int64(0), count)
+	require.Equal(t, int64(1), added)
+	members, err := rdb.SMembers(ctx, "set:expired-hll").Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"member"}, members)
+	require.ErrorContains(t, rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Err(), "WRONGTYPE")
 }
 
 func TestRedis_MultiExec_IncrRecreatesExpiredStringWithoutTTLIndex(t *testing.T) {

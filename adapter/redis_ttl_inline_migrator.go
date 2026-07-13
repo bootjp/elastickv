@@ -25,6 +25,9 @@ type ttlInlineMigrationHandler struct {
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
 	var combined error
 	for _, h := range c.ttlInlineMigrationHandlers() {
+		if ctx.Err() != nil {
+			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
+		}
 		if err := c.migrateTTLInlineHandler(ctx, h, readTS); err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}
