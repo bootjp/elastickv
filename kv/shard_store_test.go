@@ -33,7 +33,7 @@ func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
 }
 
-func applyTargetReadiness(t *testing.T, group *ShardGroup, floor uint64) {
+func applyTargetReadiness(t *testing.T, group *ShardGroup) {
 	t.Helper()
 	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
 	require.True(t, ok)
@@ -43,7 +43,7 @@ func applyTargetReadiness(t *testing.T, group *ShardGroup, floor uint64) {
 		RouteEnd:               []byte("z"),
 		ExpectedCutoverVersion: 2,
 		MigrationJobID:         9,
-		MinWriteTSExclusive:    floor,
+		MinWriteTSExclusive:    100,
 		Armed:                  true,
 	}))
 }
@@ -94,7 +94,7 @@ func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T
 		GroupID: 1,
 		State:   distribution.RouteStateActive,
 	})
-	applyTargetReadiness(t, group, 100)
+	applyTargetReadiness(t, group)
 
 	_, err := st.GetAt(ctx, []byte("k"), 120)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
@@ -103,12 +103,32 @@ func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreTargetReadinessNormalizesInternalKeyRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+
+	itemKey := store.ListItemKey([]byte("b"), 0)
+	require.NoError(t, group.Store.PutAt(ctx, itemKey, []byte("item"), 120, 0))
+
+	_, err := st.GetAt(ctx, itemKey, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestShardStoreTargetReadinessAcceptsStagedDescriptor(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	st, group := newStagedVisibilityShardStore(t)
-	applyTargetReadiness(t, group, 100)
+	applyTargetReadiness(t, group)
 	rawKey := []byte("k")
 	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 120, 0))
 
@@ -129,7 +149,7 @@ func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *tes
 		State:               distribution.RouteStateActive,
 		MinWriteTSExclusive: 100,
 	})
-	applyTargetReadiness(t, group, 100)
+	applyTargetReadiness(t, group)
 	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
 
 	got, err := st.GetAt(ctx, []byte("k"), 130)
@@ -158,6 +178,74 @@ func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *tes
 		Value: []byte("ok"),
 	}}, nil, 0, 101)
 	require.NoError(t, err)
+}
+
+func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             42,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 120, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("c"), []byte("scan"), 121, 0))
+
+	got, err := st.GetGroupAt(ctx, 42, []byte("b"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+}
+
+func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+
+	userKey := []byte("b")
+	start := store.ListItemKey(userKey, 0)
+	end := store.ListItemKey(userKey, 2)
+	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
+
+	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreApplyMutationsRaftAtEnforcesRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+
+	err := st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{{
+		Op:    store.OpTypePut,
+		Key:   []byte("b"),
+		Value: []byte("low"),
+	}}, nil, 0, 100, 7)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
 }
 
 func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {

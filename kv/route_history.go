@@ -74,3 +74,21 @@ func (s distributionRouteSnapshot) WriteFencedIntersects(start, end []byte) bool
 	}
 	return false
 }
+
+func (s distributionRouteSnapshot) WriteFloorForKey(key []byte) (uint64, bool) {
+	route, ok := s.snap.RouteOf(key)
+	if !ok || route.MinWriteTSExclusive == 0 {
+		return 0, false
+	}
+	return route.MinWriteTSExclusive, true
+}
+
+func (s distributionRouteSnapshot) WriteFloorIntersects(start, end []byte) (uint64, bool) {
+	var maxFloor uint64
+	for _, route := range s.snap.IntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive > maxFloor {
+			maxFloor = route.MinWriteTSExclusive
+		}
+	}
+	return maxFloor, maxFloor > 0
+}

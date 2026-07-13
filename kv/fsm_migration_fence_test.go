@@ -22,6 +22,23 @@ func newWriteFencedFSM(t *testing.T) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
+func newWriteFloorFSM(t *testing.T) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		},
+	})
+	return newComposed1FSM(t, engine, 1)
+}
+
 func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -67,6 +84,35 @@ func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMRejectsRawPointWriteBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMRejectsDelPrefixBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	require.NoError(t, fsm.store.PutAt(context.Background(), []byte("b"), []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("b")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
 func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 
@@ -82,6 +128,17 @@ func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	got, getErr := fsm.store.GetAt(context.Background(), key, ^uint64(0))
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsOnePhaseTxnBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), onePhaseReq(10, 100, 0, []byte("b"), []byte("v")), 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
 func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
