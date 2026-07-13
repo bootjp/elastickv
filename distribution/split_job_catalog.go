@@ -372,8 +372,8 @@ func (s *CatalogStore) ListSplitJobsAt(ctx context.Context, ts uint64) ([]SplitJ
 	return out, nil
 }
 
-// SaveSplitJob upserts a live split job and advances next_job_id when needed.
-func (s *CatalogStore) SaveSplitJob(ctx context.Context, job SplitJob) error {
+// CreateSplitJob creates a live split job and advances next_job_id when needed.
+func (s *CatalogStore) CreateSplitJob(ctx context.Context, job SplitJob) error {
 	if err := ensureCatalogStore(s); err != nil {
 		return err
 	}
@@ -382,28 +382,76 @@ func (s *CatalogStore) SaveSplitJob(ctx context.Context, job SplitJob) error {
 	if err != nil {
 		return err
 	}
-	mutations, readTS, err := s.buildSplitJobPutMutations(ctx, CatalogSplitJobKey(job.JobID), encoded, job.JobID)
+	readTS := s.store.LastCommitTS()
+	if err := s.expectNoSplitJobAt(ctx, job.JobID, readTS); err != nil {
+		return err
+	}
+	mutations, err := s.buildSplitJobPutMutations(ctx, readTS, CatalogSplitJobKey(job.JobID), encoded, job.JobID)
 	if err != nil {
 		return err
 	}
-	return s.applySplitJobMutations(ctx, readTS, mutations)
+	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations)
+}
+
+// SaveSplitJob updates a live split job if it still matches expected.
+func (s *CatalogStore) SaveSplitJob(ctx context.Context, expected SplitJob, job SplitJob) error {
+	if err := ensureCatalogStore(s); err != nil {
+		return err
+	}
+	if expected.JobID != job.JobID {
+		return errors.WithStack(ErrCatalogSplitJobKeyIDMismatch)
+	}
+	ctx = contextOrBackground(ctx)
+	expectedRaw, err := EncodeSplitJob(expected)
+	if err != nil {
+		return err
+	}
+	encoded, err := EncodeSplitJob(job)
+	if err != nil {
+		return err
+	}
+	readTS := s.store.LastCommitTS()
+	if err := s.expectLiveSplitJobAt(ctx, job.JobID, expectedRaw, readTS); err != nil {
+		return err
+	}
+	if _, found, err := s.historySplitJobAt(ctx, job.JobID, readTS); err != nil {
+		return err
+	} else if found {
+		return errors.WithStack(ErrCatalogSplitJobConflict)
+	}
+	mutations, err := s.buildSplitJobPutMutations(ctx, readTS, CatalogSplitJobKey(job.JobID), encoded, job.JobID)
+	if err != nil {
+		return err
+	}
+	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations)
 }
 
 // MoveSplitJobToHistory moves a terminal split job from live state to history.
-func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, job SplitJob) error {
+func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, expected SplitJob, job SplitJob) error {
 	if err := ensureCatalogStore(s); err != nil {
 		return err
 	}
-	if !job.Phase.terminal() || job.TerminalAtMs <= 0 {
-		return errors.WithStack(ErrCatalogSplitJobTerminalRequired)
+	if err := validateSplitJobHistoryMove(expected, job); err != nil {
+		return err
 	}
 	ctx = contextOrBackground(ctx)
+	expectedRaw, err := EncodeSplitJob(expected)
+	if err != nil {
+		return err
+	}
 	encoded, err := EncodeSplitJob(job)
 	if err != nil {
 		return err
 	}
+	readTS := s.store.LastCommitTS()
+	if applied, err := s.splitJobHistoryMoveApplied(ctx, job.JobID, readTS); err != nil || applied {
+		return err
+	}
+	if err := s.expectLiveSplitJobAt(ctx, job.JobID, expectedRaw, readTS); err != nil {
+		return err
+	}
 	historyKey := CatalogSplitJobHistoryKey(job.TerminalAtMs, job.JobID)
-	mutations, readTS, err := s.buildSplitJobPutMutations(ctx, historyKey, encoded, job.JobID)
+	mutations, err := s.buildSplitJobPutMutations(ctx, readTS, historyKey, encoded, job.JobID)
 	if err != nil {
 		return err
 	}
@@ -411,7 +459,31 @@ func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, job SplitJob) 
 		Op:  store.OpTypeDelete,
 		Key: CatalogSplitJobKey(job.JobID),
 	})
-	return s.applySplitJobMutations(ctx, readTS, mutations)
+	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations)
+}
+
+func validateSplitJobHistoryMove(expected SplitJob, job SplitJob) error {
+	if expected.JobID != job.JobID {
+		return errors.WithStack(ErrCatalogSplitJobKeyIDMismatch)
+	}
+	if !job.Phase.terminal() || job.TerminalAtMs <= 0 {
+		return errors.WithStack(ErrCatalogSplitJobTerminalRequired)
+	}
+	return nil
+}
+
+func (s *CatalogStore) splitJobHistoryMoveApplied(ctx context.Context, jobID uint64, ts uint64) (bool, error) {
+	if _, found, err := s.historySplitJobAt(ctx, jobID, ts); err != nil {
+		return false, err
+	} else if !found {
+		return false, nil
+	}
+	if _, liveFound, err := s.liveSplitJobAt(ctx, jobID, ts); err != nil {
+		return false, err
+	} else if liveFound {
+		return false, errors.WithStack(ErrCatalogSplitJobConflict)
+	}
+	return true, nil
 }
 
 // DeleteSplitJob deletes a live split job.
@@ -424,7 +496,7 @@ func (s *CatalogStore) DeleteSplitJob(ctx context.Context, jobID uint64) error {
 	}
 	ctx = contextOrBackground(ctx)
 	readTS := s.store.LastCommitTS()
-	return s.applySplitJobMutations(ctx, readTS, []*store.KVPairMutation{{
+	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(jobID)}, []*store.KVPairMutation{{
 		Op:  store.OpTypeDelete,
 		Key: CatalogSplitJobKey(jobID),
 	}})
@@ -622,18 +694,41 @@ func (s *CatalogStore) scanCatalogEntriesAt(ctx context.Context, prefix []byte, 
 	return out, nil
 }
 
-func (s *CatalogStore) buildSplitJobPutMutations(ctx context.Context, key []byte, encoded []byte, jobID uint64) ([]*store.KVPairMutation, uint64, error) {
-	if jobID == math.MaxUint64 {
-		return nil, 0, errors.WithStack(ErrCatalogSplitJobIDOverflow)
+func (s *CatalogStore) expectNoSplitJobAt(ctx context.Context, jobID uint64, ts uint64) error {
+	if _, found, err := s.liveSplitJobAt(ctx, jobID, ts); err != nil {
+		return err
+	} else if found {
+		return errors.WithStack(ErrCatalogSplitJobConflict)
 	}
-	readTS := s.store.LastCommitTS()
-	nextJobID, err := s.nextSplitJobIDAt(ctx, readTS)
+	if _, found, err := s.historySplitJobAt(ctx, jobID, ts); err != nil {
+		return err
+	} else if found {
+		return errors.WithStack(ErrCatalogSplitJobConflict)
+	}
+	return nil
+}
+
+func (s *CatalogStore) expectLiveSplitJobAt(ctx context.Context, jobID uint64, expectedRaw []byte, ts uint64) error {
+	raw, err := s.store.GetAt(ctx, CatalogSplitJobKey(jobID), ts)
 	if err != nil {
-		return nil, 0, err
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return errors.WithStack(ErrCatalogSplitJobConflict)
+		}
+		return errors.WithStack(err)
 	}
-	floor := jobID + 1
-	if nextJobID < floor {
-		nextJobID = floor
+	if !bytes.Equal(raw, expectedRaw) {
+		return errors.WithStack(ErrCatalogSplitJobConflict)
+	}
+	return nil
+}
+
+func (s *CatalogStore) buildSplitJobPutMutations(ctx context.Context, readTS uint64, key []byte, encoded []byte, jobID uint64) ([]*store.KVPairMutation, error) {
+	if jobID == math.MaxUint64 {
+		return nil, errors.WithStack(ErrCatalogSplitJobIDOverflow)
+	}
+	nextJobID, err := s.splitJobNextIDFloorAt(ctx, readTS, jobID)
+	if err != nil {
+		return nil, err
 	}
 
 	mutations := []*store.KVPairMutation{{
@@ -648,10 +743,33 @@ func (s *CatalogStore) buildSplitJobPutMutations(ctx context.Context, key []byte
 			Value: EncodeCatalogNextSplitJobID(nextJobID),
 		})
 	}
-	return mutations, readTS, nil
+	return mutations, nil
 }
 
-func (s *CatalogStore) applySplitJobMutations(ctx context.Context, readTS uint64, mutations []*store.KVPairMutation) error {
+func (s *CatalogStore) splitJobNextIDFloorAt(ctx context.Context, ts uint64, jobID uint64) (uint64, error) {
+	nextJobID, err := s.nextSplitJobIDAt(ctx, ts)
+	if err != nil {
+		return 0, err
+	}
+	jobs, err := s.ListSplitJobsAt(ctx, ts)
+	if err != nil {
+		return 0, err
+	}
+	floor, err := NextSplitJobIDFloor(jobs)
+	if err != nil {
+		return 0, err
+	}
+	if nextJobID < floor {
+		nextJobID = floor
+	}
+	floor = jobID + 1
+	if nextJobID < floor {
+		nextJobID = floor
+	}
+	return nextJobID, nil
+}
+
+func (s *CatalogStore) applySplitJobMutations(ctx context.Context, readTS uint64, readKeys [][]byte, mutations []*store.KVPairMutation) error {
 	minCommitTS := readTS + 1
 	if minCommitTS == 0 {
 		return errors.WithStack(ErrCatalogVersionOverflow)
@@ -660,7 +778,7 @@ func (s *CatalogStore) applySplitJobMutations(ctx context.Context, readTS uint64
 	if err != nil {
 		return err
 	}
-	if err := s.store.ApplyMutations(ctx, mutations, nil, readTS, commitTS); err != nil {
+	if err := s.store.ApplyMutations(ctx, mutations, readKeys, readTS, commitTS); err != nil {
 		if errors.Is(err, store.ErrWriteConflict) {
 			return errors.WithStack(ErrCatalogSplitJobConflict)
 		}

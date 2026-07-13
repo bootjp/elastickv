@@ -167,8 +167,8 @@ func TestCatalogStoreSaveAndLoadSplitJob(t *testing.T) {
 	ctx := context.Background()
 	job := sampleSplitJob(7)
 
-	if err := cs.SaveSplitJob(ctx, job); err != nil {
-		t.Fatalf("save split job: %v", err)
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
 	}
 	got, found, err := cs.SplitJob(ctx, job.JobID)
 	if err != nil {
@@ -188,6 +188,60 @@ func TestCatalogStoreSaveAndLoadSplitJob(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreCreateSplitJobRejectsExistingJob(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(7)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	if err := cs.CreateSplitJob(ctx, job); !errors.Is(err, ErrCatalogSplitJobConflict) {
+		t.Fatalf("expected ErrCatalogSplitJobConflict, got %v", err)
+	}
+}
+
+func TestCatalogStoreSaveSplitJobRejectsStaleExpectedJob(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(8)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	expected, found, err := cs.SplitJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("load split job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected split job to be found")
+	}
+
+	advanced := expected
+	advanced.Phase = SplitJobPhaseCutover
+	advanced.Cursor = []byte("advanced")
+	advanced.UpdatedAtMs++
+	if err := cs.SaveSplitJob(ctx, expected, advanced); err != nil {
+		t.Fatalf("save advanced split job: %v", err)
+	}
+
+	stale := expected
+	stale.Phase = SplitJobPhaseBackfill
+	stale.Cursor = []byte("stale")
+	stale.UpdatedAtMs++
+	if err := cs.SaveSplitJob(ctx, expected, stale); !errors.Is(err, ErrCatalogSplitJobConflict) {
+		t.Fatalf("expected ErrCatalogSplitJobConflict, got %v", err)
+	}
+	got, found, err := cs.SplitJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("reload split job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected split job to remain found")
+	}
+	assertSplitJobEqual(t, advanced, got)
+}
+
 func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
@@ -196,13 +250,13 @@ func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
 	history.Phase = SplitJobPhaseDone
 	history.TerminalAtMs = 1000
 
-	if err := cs.SaveSplitJob(ctx, live); err != nil {
-		t.Fatalf("save live split job: %v", err)
+	if err := cs.CreateSplitJob(ctx, live); err != nil {
+		t.Fatalf("create live split job: %v", err)
 	}
-	if err := cs.SaveSplitJob(ctx, history); err != nil {
-		t.Fatalf("save terminal split job: %v", err)
+	if err := cs.CreateSplitJob(ctx, history); err != nil {
+		t.Fatalf("create terminal split job: %v", err)
 	}
-	if err := cs.MoveSplitJobToHistory(ctx, history); err != nil {
+	if err := cs.MoveSplitJobToHistory(ctx, history, history); err != nil {
 		t.Fatalf("move split job to history: %v", err)
 	}
 
@@ -226,9 +280,74 @@ func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
 	assertSplitJobEqual(t, history, got)
 }
 
+func TestCatalogStoreMoveSplitJobToHistoryIsIdempotentByJobID(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(12)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	terminal := job
+	terminal.Phase = SplitJobPhaseDone
+	terminal.TerminalAtMs = 1000
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("move split job to history: %v", err)
+	}
+
+	retryTerminal := terminal
+	retryTerminal.TerminalAtMs = 2000
+	retryTerminal.LastError = "rebuilt terminal record"
+	if err := cs.MoveSplitJobToHistory(ctx, job, retryTerminal); err != nil {
+		t.Fatalf("retry move split job to history: %v", err)
+	}
+
+	jobs, err := cs.ListSplitJobs(ctx)
+	if err != nil {
+		t.Fatalf("list split jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected one history job, got %d", len(jobs))
+	}
+	assertSplitJobEqual(t, terminal, jobs[0])
+}
+
+func TestCatalogStoreMoveSplitJobToHistoryRejectsStaleExpectedJob(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(13)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	advanced := job
+	advanced.Phase = SplitJobPhaseFence
+	advanced.Cursor = []byte("advanced")
+	advanced.UpdatedAtMs++
+	if err := cs.SaveSplitJob(ctx, job, advanced); err != nil {
+		t.Fatalf("save advanced split job: %v", err)
+	}
+
+	terminal := job
+	terminal.Phase = SplitJobPhaseDone
+	terminal.TerminalAtMs = 1000
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); !errors.Is(err, ErrCatalogSplitJobConflict) {
+		t.Fatalf("expected ErrCatalogSplitJobConflict, got %v", err)
+	}
+	got, found, err := cs.SplitJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("reload split job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected split job to remain live")
+	}
+	assertSplitJobEqual(t, advanced, got)
+}
+
 func TestCatalogStoreMoveSplitJobToHistoryRejectsNonTerminal(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
-	if err := cs.MoveSplitJobToHistory(context.Background(), sampleSplitJob(1)); !errors.Is(err, ErrCatalogSplitJobTerminalRequired) {
+	job := sampleSplitJob(1)
+	if err := cs.MoveSplitJobToHistory(context.Background(), job, job); !errors.Is(err, ErrCatalogSplitJobTerminalRequired) {
 		t.Fatalf("expected ErrCatalogSplitJobTerminalRequired, got %v", err)
 	}
 }
@@ -237,8 +356,8 @@ func TestCatalogStoreDeleteSplitJob(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(3)
-	if err := cs.SaveSplitJob(ctx, job); err != nil {
-		t.Fatalf("save split job: %v", err)
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
 	}
 	if err := cs.DeleteSplitJob(ctx, job.JobID); err != nil {
 		t.Fatalf("delete split job: %v", err)
@@ -254,6 +373,42 @@ func TestCatalogStoreDeleteSplitJob(t *testing.T) {
 	}
 	if next != 4 {
 		t.Fatalf("expected next split job id to remain 4, got %d", next)
+	}
+}
+
+func TestCatalogStoreSaveSeedsNextSplitJobIDFromExistingJobsWhenMetaMissing(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	live := sampleSplitJob(50)
+	liveRaw, err := EncodeSplitJob(live)
+	if err != nil {
+		t.Fatalf("encode live split job: %v", err)
+	}
+	history := sampleSplitJob(80)
+	history.Phase = SplitJobPhaseAbandoned
+	history.TerminalAtMs = 5000
+	historyRaw, err := EncodeSplitJob(history)
+	if err != nil {
+		t.Fatalf("encode history split job: %v", err)
+	}
+	if err := st.PutAt(ctx, CatalogSplitJobKey(live.JobID), liveRaw, 7, 0); err != nil {
+		t.Fatalf("put live split job: %v", err)
+	}
+	if err := st.PutAt(ctx, CatalogSplitJobHistoryKey(history.TerminalAtMs, history.JobID), historyRaw, 8, 0); err != nil {
+		t.Fatalf("put history split job: %v", err)
+	}
+
+	if err := cs.CreateSplitJob(ctx, sampleSplitJob(10)); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	next, err := cs.NextSplitJobID(ctx)
+	if err != nil {
+		t.Fatalf("next split job id: %v", err)
+	}
+	if next != 81 {
+		t.Fatalf("expected next split job id 81, got %d", next)
 	}
 }
 
