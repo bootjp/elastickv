@@ -757,13 +757,16 @@ func toProtoRouteDescriptors(routes []distribution.RouteDescriptor) []*pb.RouteD
 
 func toProtoRouteDescriptor(route distribution.RouteDescriptor) *pb.RouteDescriptor {
 	return &pb.RouteDescriptor{
-		RouteId:       route.RouteID,
-		Start:         distribution.CloneBytes(route.Start),
-		End:           distribution.CloneBytes(route.End),
-		RaftGroupId:   route.GroupID,
-		State:         toProtoRouteState(route.State),
-		ParentRouteId: route.ParentRouteID,
-		SplitAtHlc:    route.SplitAtHLC,
+		RouteId:                route.RouteID,
+		Start:                  distribution.CloneBytes(route.Start),
+		End:                    distribution.CloneBytes(route.End),
+		RaftGroupId:            route.GroupID,
+		State:                  toProtoRouteState(route.State),
+		ParentRouteId:          route.ParentRouteID,
+		SplitAtHlc:             route.SplitAtHLC,
+		StagedVisibilityActive: route.StagedVisibilityActive,
+		MigrationJobId:         route.MigrationJobID,
+		MinWriteTsExclusive:    route.MinWriteTSExclusive,
 	}
 }
 

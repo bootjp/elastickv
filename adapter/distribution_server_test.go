@@ -97,16 +97,19 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore(), distribution.WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
-			RouteID:       2,
-			Start:         []byte("m"),
-			End:           nil,
-			GroupID:       2,
-			State:         distribution.RouteStateWriteFenced,
-			ParentRouteID: 1,
-			SplitAtHLC:    99,
+			RouteID:                2,
+			Start:                  []byte("m"),
+			End:                    nil,
+			GroupID:                2,
+			State:                  distribution.RouteStateWriteFenced,
+			ParentRouteID:          1,
+			SplitAtHLC:             77,
+			StagedVisibilityActive: true,
+			MigrationJobID:         42,
+			MinWriteTSExclusive:    99,
 		},
 		{
 			RouteID:       1,
@@ -133,7 +136,10 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	require.Equal(t, uint64(2), resp.Routes[1].RouteId)
 	require.Nil(t, resp.Routes[1].End)
 	require.Equal(t, pb.RouteState_ROUTE_STATE_WRITE_FENCED, resp.Routes[1].State)
-	require.Equal(t, uint64(99), resp.Routes[1].SplitAtHlc)
+	require.Equal(t, uint64(77), resp.Routes[1].SplitAtHlc)
+	require.True(t, resp.Routes[1].StagedVisibilityActive)
+	require.Equal(t, uint64(42), resp.Routes[1].MigrationJobId)
+	require.Equal(t, uint64(99), resp.Routes[1].MinWriteTsExclusive)
 }
 
 func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {

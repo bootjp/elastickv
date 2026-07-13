@@ -550,6 +550,378 @@ func (x *RelayPublishResponse) GetSubscribers() int64 {
 	return 0
 }
 
+type ExportRangeVersionsRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	RangeStart      []byte                 `protobuf:"bytes,1,opt,name=range_start,json=rangeStart,proto3" json:"range_start,omitempty"`
+	RangeEnd        []byte                 `protobuf:"bytes,2,opt,name=range_end,json=rangeEnd,proto3" json:"range_end,omitempty"`
+	MaxCommitTs     uint64                 `protobuf:"varint,3,opt,name=max_commit_ts,json=maxCommitTs,proto3" json:"max_commit_ts,omitempty"`
+	MinCommitTs     uint64                 `protobuf:"varint,4,opt,name=min_commit_ts,json=minCommitTs,proto3" json:"min_commit_ts,omitempty"`
+	Cursor          []byte                 `protobuf:"bytes,5,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	ChunkBytes      uint32                 `protobuf:"varint,6,opt,name=chunk_bytes,json=chunkBytes,proto3" json:"chunk_bytes,omitempty"`
+	RouteStart      []byte                 `protobuf:"bytes,7,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd        []byte                 `protobuf:"bytes,8,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	MaxScannedBytes uint64                 `protobuf:"varint,9,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ExportRangeVersionsRequest) Reset() {
+	*x = ExportRangeVersionsRequest{}
+	mi := &file_internal_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportRangeVersionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportRangeVersionsRequest) ProtoMessage() {}
+
+func (x *ExportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportRangeVersionsRequest.ProtoReflect.Descriptor instead.
+func (*ExportRangeVersionsRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ExportRangeVersionsRequest) GetRangeStart() []byte {
+	if x != nil {
+		return x.RangeStart
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsRequest) GetRangeEnd() []byte {
+	if x != nil {
+		return x.RangeEnd
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsRequest) GetMaxCommitTs() uint64 {
+	if x != nil {
+		return x.MaxCommitTs
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetMinCommitTs() uint64 {
+	if x != nil {
+		return x.MinCommitTs
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsRequest) GetChunkBytes() uint32 {
+	if x != nil {
+		return x.ChunkBytes
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsRequest) GetMaxScannedBytes() uint64 {
+	if x != nil {
+		return x.MaxScannedBytes
+	}
+	return 0
+}
+
+type ExportRangeVersionsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Versions      []*MVCCVersion         `protobuf:"bytes,1,rep,name=versions,proto3" json:"versions,omitempty"`
+	NextCursor    []byte                 `protobuf:"bytes,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	Done          bool                   `protobuf:"varint,3,opt,name=done,proto3" json:"done,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportRangeVersionsResponse) Reset() {
+	*x = ExportRangeVersionsResponse{}
+	mi := &file_internal_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportRangeVersionsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportRangeVersionsResponse) ProtoMessage() {}
+
+func (x *ExportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportRangeVersionsResponse.ProtoReflect.Descriptor instead.
+func (*ExportRangeVersionsResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ExportRangeVersionsResponse) GetVersions() []*MVCCVersion {
+	if x != nil {
+		return x.Versions
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsResponse) GetNextCursor() []byte {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsResponse) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+type MVCCVersion struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	CommitTs      uint64                 `protobuf:"varint,2,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
+	Tombstone     bool                   `protobuf:"varint,3,opt,name=tombstone,proto3" json:"tombstone,omitempty"`
+	Value         []byte                 `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
+	KeyFamily     uint32                 `protobuf:"varint,5,opt,name=key_family,json=keyFamily,proto3" json:"key_family,omitempty"`
+	ExpireAt      uint64                 `protobuf:"varint,6,opt,name=expire_at,json=expireAt,proto3" json:"expire_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MVCCVersion) Reset() {
+	*x = MVCCVersion{}
+	mi := &file_internal_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MVCCVersion) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MVCCVersion) ProtoMessage() {}
+
+func (x *MVCCVersion) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MVCCVersion.ProtoReflect.Descriptor instead.
+func (*MVCCVersion) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *MVCCVersion) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *MVCCVersion) GetCommitTs() uint64 {
+	if x != nil {
+		return x.CommitTs
+	}
+	return 0
+}
+
+func (x *MVCCVersion) GetTombstone() bool {
+	if x != nil {
+		return x.Tombstone
+	}
+	return false
+}
+
+func (x *MVCCVersion) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *MVCCVersion) GetKeyFamily() uint32 {
+	if x != nil {
+		return x.KeyFamily
+	}
+	return 0
+}
+
+func (x *MVCCVersion) GetExpireAt() uint64 {
+	if x != nil {
+		return x.ExpireAt
+	}
+	return 0
+}
+
+type ImportRangeVersionsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Versions      []*MVCCVersion         `protobuf:"bytes,2,rep,name=versions,proto3" json:"versions,omitempty"`
+	Cursor        []byte                 `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	BracketId     uint64                 `protobuf:"varint,4,opt,name=bracket_id,json=bracketId,proto3" json:"bracket_id,omitempty"`
+	BatchSeq      uint64                 `protobuf:"varint,5,opt,name=batch_seq,json=batchSeq,proto3" json:"batch_seq,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImportRangeVersionsRequest) Reset() {
+	*x = ImportRangeVersionsRequest{}
+	mi := &file_internal_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImportRangeVersionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImportRangeVersionsRequest) ProtoMessage() {}
+
+func (x *ImportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImportRangeVersionsRequest.ProtoReflect.Descriptor instead.
+func (*ImportRangeVersionsRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ImportRangeVersionsRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *ImportRangeVersionsRequest) GetVersions() []*MVCCVersion {
+	if x != nil {
+		return x.Versions
+	}
+	return nil
+}
+
+func (x *ImportRangeVersionsRequest) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *ImportRangeVersionsRequest) GetBracketId() uint64 {
+	if x != nil {
+		return x.BracketId
+	}
+	return 0
+}
+
+func (x *ImportRangeVersionsRequest) GetBatchSeq() uint64 {
+	if x != nil {
+		return x.BatchSeq
+	}
+	return 0
+}
+
+type ImportRangeVersionsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AckedCursor   []byte                 `protobuf:"bytes,1,opt,name=acked_cursor,json=ackedCursor,proto3" json:"acked_cursor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImportRangeVersionsResponse) Reset() {
+	*x = ImportRangeVersionsResponse{}
+	mi := &file_internal_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImportRangeVersionsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImportRangeVersionsResponse) ProtoMessage() {}
+
+func (x *ImportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImportRangeVersionsResponse.ProtoReflect.Descriptor instead.
+func (*ImportRangeVersionsResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
+	if x != nil {
+		return x.AckedCursor
+	}
+	return nil
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -580,7 +952,42 @@ const file_internal_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
 	"\x14RelayPublishResponse\x12 \n" +
-	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers*&\n" +
+	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xc5\x02\n" +
+	"\x1aExportRangeVersionsRequest\x12\x1f\n" +
+	"\vrange_start\x18\x01 \x01(\fR\n" +
+	"rangeStart\x12\x1b\n" +
+	"\trange_end\x18\x02 \x01(\fR\brangeEnd\x12\"\n" +
+	"\rmax_commit_ts\x18\x03 \x01(\x04R\vmaxCommitTs\x12\"\n" +
+	"\rmin_commit_ts\x18\x04 \x01(\x04R\vminCommitTs\x12\x16\n" +
+	"\x06cursor\x18\x05 \x01(\fR\x06cursor\x12\x1f\n" +
+	"\vchunk_bytes\x18\x06 \x01(\rR\n" +
+	"chunkBytes\x12\x1f\n" +
+	"\vroute_start\x18\a \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\b \x01(\fR\brouteEnd\x12*\n" +
+	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\"|\n" +
+	"\x1bExportRangeVersionsResponse\x12(\n" +
+	"\bversions\x18\x01 \x03(\v2\f.MVCCVersionR\bversions\x12\x1f\n" +
+	"\vnext_cursor\x18\x02 \x01(\fR\n" +
+	"nextCursor\x12\x12\n" +
+	"\x04done\x18\x03 \x01(\bR\x04done\"\xac\x01\n" +
+	"\vMVCCVersion\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1b\n" +
+	"\tcommit_ts\x18\x02 \x01(\x04R\bcommitTs\x12\x1c\n" +
+	"\ttombstone\x18\x03 \x01(\bR\ttombstone\x12\x14\n" +
+	"\x05value\x18\x04 \x01(\fR\x05value\x12\x1d\n" +
+	"\n" +
+	"key_family\x18\x05 \x01(\rR\tkeyFamily\x12\x1b\n" +
+	"\texpire_at\x18\x06 \x01(\x04R\bexpireAt\"\xb1\x01\n" +
+	"\x1aImportRangeVersionsRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12(\n" +
+	"\bversions\x18\x02 \x03(\v2\f.MVCCVersionR\bversions\x12\x16\n" +
+	"\x06cursor\x18\x03 \x01(\fR\x06cursor\x12\x1d\n" +
+	"\n" +
+	"bracket_id\x18\x04 \x01(\x04R\tbracketId\x12\x1b\n" +
+	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"@\n" +
+	"\x1bImportRangeVersionsResponse\x12!\n" +
+	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -591,10 +998,12 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032y\n" +
+	"\x05ABORT\x10\x032\xa3\x02\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12=\n" +
-	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
+	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
+	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -609,33 +1018,44 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                      // 0: Op
-	(Phase)(0),                   // 1: Phase
-	(*Mutation)(nil),             // 2: Mutation
-	(*Request)(nil),              // 3: Request
-	(*RaftCommand)(nil),          // 4: RaftCommand
-	(*ForwardRequest)(nil),       // 5: ForwardRequest
-	(*ForwardResponse)(nil),      // 6: ForwardResponse
-	(*RelayPublishRequest)(nil),  // 7: RelayPublishRequest
-	(*RelayPublishResponse)(nil), // 8: RelayPublishResponse
+	(Op)(0),                             // 0: Op
+	(Phase)(0),                          // 1: Phase
+	(*Mutation)(nil),                    // 2: Mutation
+	(*Request)(nil),                     // 3: Request
+	(*RaftCommand)(nil),                 // 4: RaftCommand
+	(*ForwardRequest)(nil),              // 5: ForwardRequest
+	(*ForwardResponse)(nil),             // 6: ForwardResponse
+	(*RelayPublishRequest)(nil),         // 7: RelayPublishRequest
+	(*RelayPublishResponse)(nil),        // 8: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),  // 9: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil), // 10: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                 // 11: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),  // 12: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil), // 13: ImportRangeVersionsResponse
 }
 var file_internal_proto_depIdxs = []int32{
-	0, // 0: Mutation.op:type_name -> Op
-	1, // 1: Request.phase:type_name -> Phase
-	2, // 2: Request.mutations:type_name -> Mutation
-	3, // 3: RaftCommand.requests:type_name -> Request
-	3, // 4: ForwardRequest.requests:type_name -> Request
-	5, // 5: Internal.Forward:input_type -> ForwardRequest
-	7, // 6: Internal.RelayPublish:input_type -> RelayPublishRequest
-	6, // 7: Internal.Forward:output_type -> ForwardResponse
-	8, // 8: Internal.RelayPublish:output_type -> RelayPublishResponse
-	7, // [7:9] is the sub-list for method output_type
-	5, // [5:7] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	0,  // 0: Mutation.op:type_name -> Op
+	1,  // 1: Request.phase:type_name -> Phase
+	2,  // 2: Request.mutations:type_name -> Mutation
+	3,  // 3: RaftCommand.requests:type_name -> Request
+	3,  // 4: ForwardRequest.requests:type_name -> Request
+	11, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
+	11, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
+	5,  // 7: Internal.Forward:input_type -> ForwardRequest
+	7,  // 8: Internal.RelayPublish:input_type -> RelayPublishRequest
+	9,  // 9: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	12, // 10: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	6,  // 11: Internal.Forward:output_type -> ForwardResponse
+	8,  // 12: Internal.RelayPublish:output_type -> RelayPublishResponse
+	10, // 13: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	13, // 14: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	11, // [11:15] is the sub-list for method output_type
+	7,  // [7:11] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -649,7 +1069,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   7,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
