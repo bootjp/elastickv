@@ -70,6 +70,25 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag}, nil
 }
 
+// ValidateExportCursorForRange verifies that an export cursor decodes and
+// resumes inside the supplied key interval.
+func ValidateExportCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
+	if len(pos.key) == 0 {
+		return nil
+	}
+	if startKey != nil && bytes.Compare(pos.key, startKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if endKey != nil && bytes.Compare(pos.key, endKey) >= 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return nil
+}
+
 func migrationAckKey(jobID, bracketID uint64) []byte {
 	key := make([]byte, len(migrationAckPrefix)+migrationAckKeyIDBytes)
 	copy(key, migrationAckPrefix)

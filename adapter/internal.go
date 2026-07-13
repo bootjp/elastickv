@@ -216,6 +216,9 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
 		return nil, err
 	}
+	if err := validatePromoteStagedVersionsRequest(req); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	result, err := i.proposeMigrationPromote(ctx, req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -237,6 +240,17 @@ func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
 	}
 	if err := i.migrationPromoteGate(ctx); err != nil {
 		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
+	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
+	if err := store.ValidateExportCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
+		if errors.Is(err, store.ErrInvalidExportCursor) {
+			return errors.WithStack(status.Error(codes.InvalidArgument, store.ErrInvalidExportCursor.Error()))
+		}
+		return errors.WithStack(status.Errorf(codes.Internal, "validate promote cursor: %v", err))
 	}
 	return nil
 }

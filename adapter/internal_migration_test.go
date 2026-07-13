@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -69,6 +70,15 @@ func (s *captureExportRangeVersionsStream) Context() context.Context {
 func (s *captureExportRangeVersionsStream) Send(resp *pb.ExportRangeVersionsResponse) error {
 	s.responses = append(s.responses, resp)
 	return nil
+}
+
+func encodeTestExportCursor(key []byte, commitTS uint64, tag byte) []byte {
+	var out []byte
+	out = binary.AppendUvarint(out, uint64(len(key)))
+	out = append(out, key...)
+	out = binary.AppendUvarint(out, commitTS)
+	out = append(out, tag)
+	return out
 }
 
 func testPrefixScanEnd(prefix []byte) []byte {
@@ -289,6 +299,48 @@ func TestInternalPromoteStagedVersionsRejectsWhenOpcodeGateClosed(t *testing.T) 
 	require.Error(t, err)
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.Equal(t, uint64(0), proposer.calls)
+}
+
+func TestInternalPromoteStagedVersionsRejectsInvalidCursorBeforePropose(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		cursor []byte
+	}{
+		{name: "malformed cursor", cursor: []byte{0xff}},
+		{
+			name:   "cursor outside job staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(8, []byte("k")), 30, 0),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			clock := kv.NewHLC()
+			proposer := &applyingMigrationProposer{
+				fsm: kv.NewKvFSMWithHLC(st, clock),
+			}
+			internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+				WithInternalStore(st),
+				WithInternalMigrationProposer(proposer),
+				WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+			)
+
+			resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+				JobId:       7,
+				Cursor:      tc.cursor,
+				MaxVersions: 10,
+			})
+			require.Nil(t, resp)
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, store.ErrInvalidExportCursor.Error())
+			require.Equal(t, uint64(0), proposer.calls)
+		})
+	}
 }
 
 func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
