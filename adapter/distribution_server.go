@@ -692,22 +692,28 @@ func splitCatalogRoutes(
 ) (distribution.RouteDescriptor, distribution.RouteDescriptor) {
 	// parent and splitKey are already cloned before this point and are immutable here.
 	left := distribution.RouteDescriptor{
-		RouteID:       leftID,
-		Start:         parent.Start,
-		End:           splitKey,
-		GroupID:       parent.GroupID,
-		State:         parent.State,
-		ParentRouteID: parent.RouteID,
-		SplitAtHLC:    splitAtHLC,
+		RouteID:                leftID,
+		Start:                  parent.Start,
+		End:                    splitKey,
+		GroupID:                parent.GroupID,
+		State:                  parent.State,
+		ParentRouteID:          parent.RouteID,
+		SplitAtHLC:             splitAtHLC,
+		StagedVisibilityActive: parent.StagedVisibilityActive,
+		MigrationJobID:         parent.MigrationJobID,
+		MinWriteTSExclusive:    parent.MinWriteTSExclusive,
 	}
 	right := distribution.RouteDescriptor{
-		RouteID:       rightID,
-		Start:         splitKey,
-		End:           parent.End,
-		GroupID:       parent.GroupID,
-		State:         parent.State,
-		ParentRouteID: parent.RouteID,
-		SplitAtHLC:    splitAtHLC,
+		RouteID:                rightID,
+		Start:                  splitKey,
+		End:                    parent.End,
+		GroupID:                parent.GroupID,
+		State:                  parent.State,
+		ParentRouteID:          parent.RouteID,
+		SplitAtHLC:             splitAtHLC,
+		StagedVisibilityActive: parent.StagedVisibilityActive,
+		MigrationJobID:         parent.MigrationJobID,
+		MinWriteTSExclusive:    parent.MinWriteTSExclusive,
 	}
 	return left, right
 }

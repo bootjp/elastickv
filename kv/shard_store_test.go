@@ -177,6 +177,50 @@ func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		getResp: &pb.RawGetResponse{
+			Exists: true,
+			Value:  []byte("remote-v"),
+		},
+		scanResp: &pb.RawScanAtResponse{},
+		latestResp: &pb.RawLatestCommitTSResponse{
+			Ts:     42,
+			Exists: true,
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {
+			Store:  store.NewMVCCStore(),
+			Engine: &stubFollowerEngine{leaderAddr: addr},
+		},
+	})
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	_, err := st.GetAtWithReadFence(ctx, []byte("k"), 10, 0, 77)
+	require.NoError(t, err)
+	_, _, err = st.LatestCommitTSWithReadFence(ctx, []byte("k"), 78)
+	require.NoError(t, err)
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 79, []byte("a"), []byte("m"))
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
+	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(79), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
+	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
+}
+
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 
