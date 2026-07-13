@@ -303,6 +303,58 @@ func TestDistributionServerStartSplitMigration_RejectsUnknownTargetGroup(t *test
 	require.Zero(t, coordinator.dispatchCalls)
 }
 
+func TestDistributionServerStartSplitMigration_RejectsNonActiveSourceRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		state distribution.RouteState
+	}{
+		{name: "write_fenced", state: distribution.RouteStateWriteFenced},
+		{name: "migrating_source", state: distribution.RouteStateMigratingSource},
+		{name: "migrating_target", state: distribution.RouteStateMigratingTarget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+				RouteID:       1,
+				Start:         []byte("a"),
+				End:           []byte("m"),
+				GroupID:       1,
+				State:         tc.state,
+				ParentRouteID: 0,
+			}})
+			require.NoError(t, err)
+
+			coordinator := newDistributionCoordinatorStub(baseStore, true)
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(coordinator),
+				WithDistributionKnownRaftGroups(1, 2),
+				WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+			)
+
+			_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               []byte("g"),
+				TargetGroupId:          2,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, errDistributionSourceRouteNotActive.Error())
+			require.Zero(t, coordinator.dispatchCalls)
+
+			jobs, listErr := catalog.ListSplitJobs(ctx)
+			require.NoError(t, listErr)
+			require.Empty(t, jobs)
+		})
+	}
+}
+
 func TestDistributionServerStartSplitMigration_RejectsSecondLiveJob(t *testing.T) {
 	t.Parallel()
 

@@ -118,6 +118,7 @@ var (
 	errDistributionClusterNotReady        = errors.New("cluster is not ready for split migration")
 	errDistributionRaftGroupsNotKnown     = errors.New("distribution raft groups are not configured")
 	errDistributionUnknownTargetGroup     = errors.New("unknown target group")
+	errDistributionSourceRouteNotActive   = errors.New("source route is not active")
 )
 
 // NewDistributionServer creates a new server.
@@ -267,6 +268,9 @@ func (s *DistributionServer) startSplitMigrationParent(
 	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
 	if !found {
 		return distribution.RouteDescriptor{}, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
+	}
+	if parent.State != distribution.RouteStateActive {
+		return distribution.RouteDescriptor{}, grpcStatusError(codes.FailedPrecondition, errDistributionSourceRouteNotActive.Error())
 	}
 	splitKey := distribution.CloneBytes(req.GetSplitKey())
 	if err := validateSplitKey(parent, splitKey); err != nil {
