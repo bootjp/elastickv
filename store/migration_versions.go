@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"sort"
 
 	"github.com/cockroachdb/errors"
 	"github.com/emirpasic/gods/maps/treemap"
@@ -13,12 +14,19 @@ const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
 
+	migrationAckMetaKey      = "_migack"
+	migrationHLCFloorMetaKey = "_mighlc"
+	migrationMetadataVersion = 1
+
 	migrationAckPrefix                 = "!migstage|ack|"
-	migrationHLCFloorPrefix            = "!migstage|hlc_floor|"
 	migrationUint64Bytes               = 8
-	migrationAckKeyIDBytes             = 2 * migrationUint64Bytes
 	exportVersionSizeOverhead          = 24
 	defaultSparseExportMaxScannedBytes = 1 << 20
+)
+
+var (
+	migrationAckMetaKeyBytes      = []byte(migrationAckMetaKey)
+	migrationHLCFloorMetaKeyBytes = []byte(migrationHLCFloorMetaKey)
 )
 
 type exportCursorPosition struct {
@@ -26,6 +34,11 @@ type exportCursorPosition struct {
 	commitTS uint64
 	tag      byte
 	hasKey   bool
+}
+
+type migrationAckID struct {
+	jobID     uint64
+	bracketID uint64
 }
 
 type migrationImportAck struct {
@@ -71,6 +84,30 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
 }
 
+func decodeExportCursorForOptions(opts ExportVersionsOptions) (exportCursorPosition, error) {
+	pos, err := decodeExportCursor(opts.Cursor)
+	if err != nil {
+		return exportCursorPosition{}, err
+	}
+	if err := validateExportCursorRange(opts, pos); err != nil {
+		return exportCursorPosition{}, err
+	}
+	return pos, nil
+}
+
+func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosition) error {
+	if !pos.hasKey {
+		return nil
+	}
+	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if opts.EndKey != nil && bytes.Compare(pos.key, opts.EndKey) >= 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return nil
+}
+
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
 	if opts.AcceptKey != nil && opts.MaxScannedBytes == 0 {
 		opts.MaxScannedBytes = defaultSparseExportMaxScannedBytes
@@ -78,49 +115,111 @@ func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOp
 	return opts
 }
 
-func migrationAckKey(jobID, bracketID uint64) []byte {
-	key := make([]byte, len(migrationAckPrefix)+migrationAckKeyIDBytes)
-	copy(key, migrationAckPrefix)
-	binary.BigEndian.PutUint64(key[len(migrationAckPrefix):], jobID)
-	binary.BigEndian.PutUint64(key[len(migrationAckPrefix)+migrationUint64Bytes:], bracketID)
-	return key
-}
-
-func migrationHLCFloorKey(jobID uint64) []byte {
-	key := make([]byte, len(migrationHLCFloorPrefix)+migrationUint64Bytes)
-	copy(key, migrationHLCFloorPrefix)
-	binary.BigEndian.PutUint64(key[len(migrationHLCFloorPrefix):], jobID)
-	return key
-}
-
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return (len(rawKey) == len(migrationAckPrefix)+migrationAckKeyIDBytes && bytes.HasPrefix(rawKey, []byte(migrationAckPrefix))) ||
-		(len(rawKey) == len(migrationHLCFloorPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationHLCFloorPrefix)))
+	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes)
 }
 
-func encodeMigrationImportAck(ack migrationImportAck) []byte {
-	buf := make([]byte, 0, migrationUint64Bytes+binary.MaxVarintLen64+len(ack.cursor))
-	buf = binary.BigEndian.AppendUint64(buf, ack.batchSeq)
-	buf = binary.AppendUvarint(buf, lenAsUint64(len(ack.cursor)))
-	buf = append(buf, ack.cursor...)
+func encodeMigrationImportAcks(acks map[migrationAckID]migrationImportAck) []byte {
+	ids := make([]migrationAckID, 0, len(acks))
+	for id := range acks {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if ids[i].jobID != ids[j].jobID {
+			return ids[i].jobID < ids[j].jobID
+		}
+		return ids[i].bracketID < ids[j].bracketID
+	})
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(ids)*(3*migrationUint64Bytes+binary.MaxVarintLen64))
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(ids)))
+	for _, id := range ids {
+		ack := acks[id]
+		buf = binary.BigEndian.AppendUint64(buf, id.jobID)
+		buf = binary.BigEndian.AppendUint64(buf, id.bracketID)
+		buf = binary.BigEndian.AppendUint64(buf, ack.batchSeq)
+		buf = binary.AppendUvarint(buf, lenAsUint64(len(ack.cursor)))
+		buf = append(buf, ack.cursor...)
+	}
 	return buf
 }
 
-func decodeMigrationImportAck(data []byte) (migrationImportAck, bool) {
-	if len(data) < migrationUint64Bytes {
-		return migrationImportAck{}, false
+func decodeMigrationImportAcks(data []byte) (map[migrationAckID]migrationImportAck, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
 	}
-	ack := migrationImportAck{batchSeq: binary.BigEndian.Uint64(data[:migrationUint64Bytes])}
-	cursorLen, n := binary.Uvarint(data[migrationUint64Bytes:])
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
 	if n <= 0 {
-		return migrationImportAck{}, false
+		return nil, false
 	}
-	rest := data[migrationUint64Bytes+n:]
-	if cursorLen != lenAsUint64(len(rest)) {
-		return migrationImportAck{}, false
+	rest = rest[n:]
+	acks := make(map[migrationAckID]migrationImportAck)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < 3*migrationUint64Bytes {
+			return nil, false
+		}
+		id := migrationAckID{
+			jobID:     binary.BigEndian.Uint64(rest[:migrationUint64Bytes]),
+			bracketID: binary.BigEndian.Uint64(rest[migrationUint64Bytes : 2*migrationUint64Bytes]),
+		}
+		ack := migrationImportAck{batchSeq: binary.BigEndian.Uint64(rest[2*migrationUint64Bytes : 3*migrationUint64Bytes])}
+		rest = rest[3*migrationUint64Bytes:]
+		cursorLen, n := binary.Uvarint(rest)
+		if n <= 0 {
+			return nil, false
+		}
+		rest = rest[n:]
+		if cursorLen > lenAsUint64(len(rest)) {
+			return nil, false
+		}
+		ack.cursor = bytes.Clone(rest[:cursorLen])
+		rest = rest[cursorLen:]
+		acks[id] = ack
 	}
-	ack.cursor = bytes.Clone(rest)
-	return ack, true
+	return acks, len(rest) == 0
+}
+
+func encodeMigrationHLCFloors(floors map[uint64]uint64) []byte {
+	jobIDs := make([]uint64, 0, len(floors))
+	for jobID := range floors {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(jobIDs)*2*migrationUint64Bytes)
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(jobIDs)))
+	for _, jobID := range jobIDs {
+		buf = binary.BigEndian.AppendUint64(buf, jobID)
+		buf = binary.BigEndian.AppendUint64(buf, floors[jobID])
+	}
+	return buf
+}
+
+func decodeMigrationHLCFloors(data []byte) (map[uint64]uint64, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
+	}
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return nil, false
+	}
+	rest = rest[n:]
+	floors := make(map[uint64]uint64)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < 2*migrationUint64Bytes {
+			return nil, false
+		}
+		jobID := binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		floor := binary.BigEndian.Uint64(rest[migrationUint64Bytes : 2*migrationUint64Bytes])
+		rest = rest[2*migrationUint64Bytes:]
+		floors[jobID] = floor
+	}
+	return floors, len(rest) == 0
 }
 
 func validateImportVersion(version MVCCVersion) error {
@@ -178,7 +277,7 @@ func validateNextImportBatch(existing migrationImportAck, hasExisting bool, batc
 
 func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
 	opts = normalizeExportVersionsOptions(opts)
-	pos, err := decodeExportCursor(opts.Cursor)
+	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
 		return ExportVersionsResult{}, err
 	}
@@ -341,8 +440,8 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	key := string(migrationAckKey(opts.JobID, opts.BracketID))
-	existing, hasExisting := s.migrationAcks[key]
+	id := migrationAckID{jobID: opts.JobID, bracketID: opts.BracketID}
+	existing, hasExisting := s.migrationAcks[id]
 	duplicate, err := validateNextImportBatch(existing, hasExisting, opts.BatchSeq)
 	if err != nil {
 		return ImportVersionsResult{}, err
@@ -371,7 +470,7 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	if batchMax > s.migrationHLCFloors[opts.JobID] {
 		s.migrationHLCFloors[opts.JobID] = batchMax
 	}
-	s.migrationAcks[key] = migrationImportAck{batchSeq: opts.BatchSeq, cursor: bytes.Clone(opts.Cursor)}
+	s.migrationAcks[id] = migrationImportAck{batchSeq: opts.BatchSeq, cursor: bytes.Clone(opts.Cursor)}
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
 }
 

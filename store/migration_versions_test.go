@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"math"
 	"os"
 	"testing"
 
@@ -199,6 +200,66 @@ func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
 	})
 }
 
+func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a20"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("b30"), 30, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("b"),
+			EndKey:      []byte("c"),
+			Cursor:      encodeExportCursor([]byte("a"), 20, exportCursorTagEmitted),
+			MaxVersions: 10,
+		})
+		require.ErrorIs(t, err, ErrInvalidExportCursor)
+		require.Empty(t, res.Versions)
+	})
+}
+
+func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		key := append([]byte(migrationAckPrefix), bytes.Repeat([]byte{0x7}, migrationUint64Bytes)...)
+		require.NoError(t, st.PutAt(ctx, key, []byte("value"), 10, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: key, CommitTS: 10, Value: []byte("value")}}, res.Versions)
+	})
+}
+
+func TestPebbleExportStopsAtEndKey(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-end-key-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok)
+	require.NoError(t, ps.PutAt(ctx, []byte("b"), []byte("later"), 10, 0))
+
+	iter, err := ps.db.NewIter(nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, iter.Close()) }()
+	require.True(t, iter.SeekGE(encodeKey([]byte("b"), math.MaxUint64)))
+
+	result := newExportVersionsResult(10)
+	advance, done, err := ps.exportPebbleIteratorPosition(ctx, iter, ExportVersionsOptions{
+		StartKey: []byte("a"),
+		EndKey:   []byte("b"),
+	}, exportCursorPosition{}, &result)
+	require.ErrorIs(t, err, errExportReachedEnd)
+	require.False(t, advance)
+	require.True(t, done)
+	require.Empty(t, result.Versions)
+	require.Zero(t, result.ScannedBytes)
+}
+
 func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -301,4 +362,56 @@ func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Duplicate)
 	require.Equal(t, []byte("persisted"), res.AckedCursor)
+}
+
+func TestPebbleSnapshotExcludesMigrationMetadata(t *testing.T) {
+	ctx := context.Background()
+	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(srcDir)) })
+	src, err := NewPebbleStore(srcDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, src.Close()) })
+
+	_, err = src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("stale"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
+	require.NoError(t, snap.Close())
+
+	dstDir, err := os.MkdirTemp("", "migration-snapshot-dst-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
+	dst, err := NewPebbleStore(dstDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dst.Close()) })
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Zero(t, floor)
+
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("fresh"), res.AckedCursor)
+	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v60"), val)
 }

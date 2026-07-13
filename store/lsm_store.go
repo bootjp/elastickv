@@ -994,6 +994,7 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 }
 
 func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
+	userKey = bytes.Clone(userKey)
 	if !iter.SeekGE(encodeKey(userKey, 0)) {
 		return false
 	}
@@ -2176,6 +2177,41 @@ func writeRestoreEntry(r io.Reader, batch *pebble.Batch, keyBuf []byte, kLen, vL
 	return errors.WithStack(deferred.Finish())
 }
 
+func discardRestoreEntryValue(r io.Reader, vLen int) error {
+	_, err := io.CopyN(io.Discard, r, int64(vLen))
+	return errors.WithStack(err)
+}
+
+func restoreBatchLoopStep(r io.Reader, db *pebble.DB, batch **pebble.Batch, keyBuf *[]byte) (bool, error) {
+	kLen, vLen, eof, err := readRestoreEntry(r, keyBuf)
+	if err != nil {
+		return false, err
+	}
+	if eof {
+		return true, nil
+	}
+	if isMigrationMetadataKey((*keyBuf)[:kLen]) {
+		return false, discardRestoreEntryValue(r, vLen)
+	}
+	if err := flushSnapshotBatchIfNeeded(db, batch, kLen, vLen); err != nil {
+		return false, err
+	}
+	if err := writeRestoreEntry(r, *batch, *keyBuf, kLen, vLen); err != nil {
+		return false, err
+	}
+	if snapshotBatchShouldFlush(*batch) {
+		return false, flushSnapshotBatch(db, batch, pebble.NoSync)
+	}
+	return false, nil
+}
+
+func flushSnapshotBatchIfNeeded(db *pebble.DB, batch **pebble.Batch, kLen, vLen int) error {
+	if !(*batch).Empty() && (*batch).Len()+kLen+vLen >= snapshotBatchByteLimit {
+		return flushSnapshotBatch(db, batch, pebble.NoSync)
+	}
+	return nil
+}
+
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
 // them into db using batched commits. It is used for both the direct and the
 // temp-dir atomic native Pebble restore paths.
@@ -2184,32 +2220,13 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	var keyBuf []byte // reused across entries to reduce per-entry allocations
 
 	for {
-		kLen, vLen, eof, err := readRestoreEntry(r, &keyBuf)
+		done, err := restoreBatchLoopStep(r, db, &batch, &keyBuf)
+		if done {
+			break
+		}
 		if err != nil {
 			_ = batch.Close()
 			return err
-		}
-		if eof {
-			break
-		}
-
-		// Flush before adding when the batch is non-empty and the anticipated
-		// entry size would push the batch over the byte limit.
-		if !batch.Empty() && batch.Len()+kLen+vLen >= snapshotBatchByteLimit {
-			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
-				return err
-			}
-		}
-
-		if err := writeRestoreEntry(r, batch, keyBuf, kLen, vLen); err != nil {
-			_ = batch.Close()
-			return err
-		}
-
-		if snapshotBatchShouldFlush(batch) {
-			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
-				return err
-			}
 		}
 	}
 	return commitSnapshotBatch(batch, pebble.Sync)

@@ -11,7 +11,7 @@ import (
 
 func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
 	opts = normalizeExportVersionsOptions(opts)
-	pos, err := decodeExportCursor(opts.Cursor)
+	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
 		return ExportVersionsResult{}, err
 	}
@@ -85,11 +85,8 @@ func pebbleExportSeekKey(opts ExportVersionsOptions, pos exportCursorPosition) (
 	if !pos.hasKey {
 		return encodeKey(opts.StartKey, math.MaxUint64), nil
 	}
-	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
-		return nil, errors.WithStack(ErrInvalidExportCursor)
-	}
-	if opts.EndKey != nil && bytes.Compare(pos.key, opts.EndKey) >= 0 {
-		return nil, errors.WithStack(ErrInvalidExportCursor)
+	if err := validateExportCursorRange(opts, pos); err != nil {
+		return nil, err
 	}
 	return encodeKey(pos.key, pos.commitTS), nil
 }
@@ -112,13 +109,8 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 	if userKey == nil || pebbleExportCursorEqual(pos, userKey, commitTS) {
 		return true, true, nil
 	}
-	if opts.StartKey != nil && bytes.Compare(userKey, opts.StartKey) < 0 {
-		_ = s.skipToNextUserKey(iter, userKey)
-		return false, true, nil
-	}
-	if opts.EndKey != nil && bytes.Compare(userKey, opts.EndKey) >= 0 {
-		_ = s.skipToNextUserKey(iter, userKey)
-		return false, true, nil
+	if skipped, err := s.skipPebbleExportKeyOutsideRange(iter, opts, userKey); skipped || err != nil {
+		return false, true, err
 	}
 	if commitTS <= opts.MinCommitTSExclusive {
 		_ = s.skipToNextUserKey(iter, userKey)
@@ -126,6 +118,31 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 	}
 	done, err = s.exportPebbleVersion(iter, opts, userKey, commitTS, result)
 	return true, done, err
+}
+
+func (s *pebbleStore) skipPebbleExportKeyOutsideRange(iter *pebble.Iterator, opts ExportVersionsOptions, userKey []byte) (bool, error) {
+	if opts.StartKey != nil && bytes.Compare(userKey, opts.StartKey) < 0 {
+		_ = s.skipToNextUserKey(iter, userKey)
+		return true, nil
+	}
+	if opts.EndKey == nil || bytes.Compare(userKey, opts.EndKey) < 0 {
+		return false, nil
+	}
+	if pebbleExportCanStopAtEndKey(opts.StartKey, opts.EndKey, userKey) {
+		return true, errExportReachedEnd
+	}
+	_ = s.skipToNextUserKey(iter, userKey)
+	return true, nil
+}
+
+func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
+	for prefixLen := range userKey {
+		prefix := userKey[:prefixLen]
+		if (startKey == nil || bytes.Compare(prefix, startKey) >= 0) && bytes.Compare(prefix, endKey) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func pebbleExportCursorEqual(pos exportCursorPosition, userKey []byte, commitTS uint64) bool {
@@ -246,11 +263,11 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 	if err := s.applyImportVersionsBatch(batch, opts.Versions); err != nil {
 		return err
 	}
-	if err := batch.Set(migrationAckKey(opts.JobID, opts.BracketID), encodeMigrationImportAck(migrationImportAck{
+	if err := s.stageMigrationImportAck(batch, opts.JobID, opts.BracketID, migrationImportAck{
 		batchSeq: opts.BatchSeq,
 		cursor:   opts.Cursor,
-	}), nil); err != nil {
-		return errors.WithStack(err)
+	}); err != nil {
+		return err
 	}
 	unlock, newLastTS, err := s.stageMigrationClockMetadataIfNeeded(batch, opts.JobID, batchMax)
 	if err != nil {
@@ -264,6 +281,18 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 		s.lastCommitTS = newLastTS
 	}
 	return nil
+}
+
+func (s *pebbleStore) stageMigrationImportAck(batch *pebble.Batch, jobID, bracketID uint64, ack migrationImportAck) error {
+	acks, err := s.readMigrationImportAcks()
+	if err != nil {
+		return err
+	}
+	acks[migrationAckID{jobID: jobID, bracketID: bracketID}] = migrationImportAck{
+		batchSeq: ack.batchSeq,
+		cursor:   bytes.Clone(ack.cursor),
+	}
+	return errors.WithStack(batch.Set(migrationAckMetaKeyBytes, encodeMigrationImportAcks(acks), nil))
 }
 
 func (s *pebbleStore) stageMigrationClockMetadataIfNeeded(batch *pebble.Batch, jobID, batchMax uint64) (func(), uint64, error) {
@@ -310,32 +339,67 @@ func (s *pebbleStore) stageMigrationClockMetadata(batch *pebble.Batch, jobID, ba
 		return nil, 0, err
 	}
 	if batchMax > floor {
-		if err := setPebbleUint64InBatch(batch, migrationHLCFloorKey(jobID), batchMax); err != nil {
+		floors, err := s.readMigrationHLCFloors()
+		if err != nil {
 			unlock()
 			return nil, 0, err
+		}
+		floors[jobID] = batchMax
+		if err := batch.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(floors), nil); err != nil {
+			unlock()
+			return nil, 0, errors.WithStack(err)
 		}
 	}
 	return unlock, newLastTS, nil
 }
 
 func (s *pebbleStore) readMigrationImportAck(jobID, bracketID uint64) (migrationImportAck, bool, error) {
-	val, closer, err := s.db.Get(migrationAckKey(jobID, bracketID))
+	acks, err := s.readMigrationImportAcks()
+	if err != nil {
+		return migrationImportAck{}, false, err
+	}
+	ack, ok := acks[migrationAckID{jobID: jobID, bracketID: bracketID}]
+	return ack, ok, nil
+}
+
+func (s *pebbleStore) readMigrationImportAcks() (map[migrationAckID]migrationImportAck, error) {
+	val, closer, err := s.db.Get(migrationAckMetaKeyBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return migrationImportAck{}, false, nil
+			return make(map[migrationAckID]migrationImportAck), nil
 		}
-		return migrationImportAck{}, false, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	defer func() { _ = closer.Close() }()
-	ack, ok := decodeMigrationImportAck(val)
+	acks, ok := decodeMigrationImportAcks(val)
 	if !ok {
-		return migrationImportAck{}, false, errors.New("corrupt migration import ack")
+		return nil, errors.New("corrupt migration import ack metadata")
 	}
-	return ack, true, nil
+	return acks, nil
 }
 
 func (s *pebbleStore) readMigrationHLCFloorLocked(jobID uint64) (uint64, error) {
-	return readPebbleUint64(s.db, migrationHLCFloorKey(jobID))
+	floors, err := s.readMigrationHLCFloors()
+	if err != nil {
+		return 0, err
+	}
+	return floors[jobID], nil
+}
+
+func (s *pebbleStore) readMigrationHLCFloors() (map[uint64]uint64, error) {
+	val, closer, err := s.db.Get(migrationHLCFloorMetaKeyBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return make(map[uint64]uint64), nil
+		}
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	floors, ok := decodeMigrationHLCFloors(val)
+	if !ok {
+		return nil, errors.New("corrupt migration HLC floor metadata")
+	}
+	return floors, nil
 }
 
 func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {
