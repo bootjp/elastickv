@@ -1039,6 +1039,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	if err := c.rejectDelPrefixesBelowWriteFloor(elems, ts); err != nil {
 		return nil, err
 	}
+	if err := c.rejectDelPrefixesWithoutTargetReadinessProof(ctx, elems, ts); err != nil {
+		return nil, err
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -1082,6 +1085,22 @@ func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) err
 			if route.State == distribution.RouteStateWriteFenced {
 				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
 			}
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectDelPrefixesWithoutTargetReadinessProof(ctx context.Context, elems []*Elem[OP], commitTS uint64) error {
+	shards, ok := c.store.(*ShardStore)
+	if !ok || shards == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		if _, err := shards.verifyPrefixDeleteRoutes(ctx, elem.Key, commitTS); err != nil {
+			return errors.Wrapf(err, "prefix %q", elem.Key)
 		}
 	}
 	return nil

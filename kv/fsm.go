@@ -579,11 +579,37 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	if err := f.verifyRouteWriteFloorForPrefix(prefix, commitTS); err != nil {
 		return err
 	}
+	routes := f.stagedVisibilityRoutesForPrefix(prefix)
+	deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+		return f.store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, f.pendingApplyIdx)
+	}
+	if err := deleteStagedVisibilityPrefixes(routes, prefix, txnCommonPrefix, deleteStagedPrefix); err != nil {
+		return err
+	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
+}
+
+func (f *kvFSM) stagedVisibilityRoutesForPrefix(prefix []byte) []distribution.Route {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	routes := snap.IntersectingRoutes(start, end)
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.GroupID == f.shardGroupID && routeHasStagedVisibility(route) {
+			out = append(out, route)
+		}
+	}
+	return out
 }
 
 func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation) error {

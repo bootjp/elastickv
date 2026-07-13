@@ -304,7 +304,7 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 // pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
 // for codex P1 #796.
 func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return false, nil
 	}
@@ -312,11 +312,7 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 	// without raft; preserve the existing local-only fallback there.
 	engine := engineForGroup(g)
 	if engine == nil {
-		exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
-		if err != nil {
-			return false, errors.WithStack(err)
-		}
-		return exists, nil
+		return committedVersionAtForRoute(ctx, g.Store, route, key, commitTS)
 	}
 	if !isLinearizableRaftLeader(ctx, engine) && !tryEngineLinearizableFence(ctx, engine) {
 		// Not the linearizable leader for this group AND the ReadIndex
@@ -326,7 +322,19 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 		// serialization.
 		return false, nil
 	}
-	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	return committedVersionAtForRoute(ctx, g.Store, route, key, commitTS)
+}
+
+func committedVersionAtForRoute(ctx context.Context, st store.MVCCStore, route distribution.Route, key []byte, commitTS uint64) (bool, error) {
+	exists, err := st.CommittedVersionAt(ctx, key, commitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if exists || !routeHasStagedVisibility(route) {
+		return exists, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+	exists, err = st.CommittedVersionAt(ctx, stagedKey, commitTS)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
@@ -399,7 +407,55 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 	if err := s.verifyExplicitGroupRoutesForRange(ctx, groupID, routes, start, end); err != nil {
 		return nil, err
 	}
-	return s.scanRouteAtDirection(ctx, routes[0], start, end, limit, ts, false, true)
+	return s.scanExplicitGroupRoutesAt(ctx, routes, start, end, limit, ts)
+}
+
+func (s *ShardStore) scanExplicitGroupRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if len(routes) == 1 {
+		return s.scanRouteAtDirection(ctx, routes[0], start, end, limit, ts, false, true)
+	}
+	out := make([]*store.KVPair, 0, limit)
+	rawRouteBounds := rawScanBoundsMatchRouteKeyspace(start, end)
+	for _, route := range routes {
+		scanStart, scanEnd := start, end
+		if rawRouteBounds {
+			scanStart = clampScanStart(start, route.Start)
+			scanEnd = clampScanEnd(end, route.End)
+		}
+		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit-len(out), ts, false, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, kvp := range kvs {
+			if !kvBelongsToRoute(kvp, route) {
+				continue
+			}
+			out = append(out, kvp)
+			if len(out) == limit {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
+func rawScanBoundsMatchRouteKeyspace(start []byte, end []byte) bool {
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	if !bytes.Equal(routeStart, start) {
+		return false
+	}
+	if end == nil {
+		return routeEnd == nil
+	}
+	return bytes.Equal(routeEnd, end)
+}
+
+func kvBelongsToRoute(kvp *store.KVPair, route distribution.Route) bool {
+	if kvp == nil || route.RouteID == 0 {
+		return true
+	}
+	key := routeKey(kvp.Key)
+	return routeRangeIntersects(key, nextScanCursor(key), route.Start, route.End)
 }
 
 func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
@@ -1838,12 +1894,19 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
 		return err
 	}
-	for _, g := range s.groups {
+	for groupID, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
+		}
+		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+			return g.Store.DeletePrefixAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS)
+		}
+		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
+			return err
 		}
 		if err := g.Store.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS); err != nil {
 			return errors.WithStack(err)
@@ -1854,12 +1917,19 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
 		return err
 	}
-	for _, g := range s.groups {
+	for groupID, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
+		}
+		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+			return g.Store.DeletePrefixAtRaft(ctx, stagedPrefix, stagedExcludePrefix, commitTS)
+		}
+		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
+			return err
 		}
 		if err := g.Store.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS); err != nil {
 			return errors.WithStack(err)
@@ -1883,12 +1953,19 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	if err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS); err != nil {
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
 		return err
 	}
-	for _, g := range s.groups {
+	for groupID, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
+		}
+		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+			return g.Store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, appliedIndex)
+		}
+		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
+			return err
 		}
 		// Pass appliedIndex through to every group. In the
 		// single-group call-path (the production raft-apply case)
@@ -1907,25 +1984,57 @@ func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, ex
 	return nil
 }
 
-func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte, commitTS uint64) error {
+func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte, commitTS uint64) ([]distribution.Route, error) {
 	if s == nil || s.engine == nil {
-		return nil
+		return nil, nil
 	}
 	routeStart, routeEnd := routePrefixRange(prefix)
 	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
 	if len(routes) == 0 {
-		return errors.WithStack(ErrRouteCutoverPending)
+		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
 	for _, route := range routes {
 		g, ok := s.groupForID(route.GroupID)
 		if !ok || g == nil || g.Store == nil {
-			return store.ErrNotSupported
+			return nil, store.ErrNotSupported
 		}
 		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
-			return err
+			return nil, err
 		}
 		if err := verifyRouteWriteFloor(route, commitTS); err != nil {
-			return err
+			return nil, err
+		}
+	}
+	return routes, nil
+}
+
+func routesForGroupID(routes []distribution.Route, groupID uint64) []distribution.Route {
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.GroupID == groupID {
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func deleteStagedVisibilityPrefixes(routes []distribution.Route, prefix []byte, excludePrefix []byte, deletePrefix func([]byte, []byte) error) error {
+	seen := make(map[uint64]struct{})
+	for _, route := range routes {
+		if !routeHasStagedVisibility(route) {
+			continue
+		}
+		if _, ok := seen[route.MigrationJobID]; ok {
+			continue
+		}
+		seen[route.MigrationJobID] = struct{}{}
+		stagedPrefix := distribution.MigrationStagedDataKey(route.MigrationJobID, prefix)
+		var stagedExcludePrefix []byte
+		if len(excludePrefix) > 0 {
+			stagedExcludePrefix = distribution.MigrationStagedDataKey(route.MigrationJobID, excludePrefix)
+		}
+		if err := deletePrefix(stagedPrefix, stagedExcludePrefix); err != nil {
+			return errors.WithStack(err)
 		}
 	}
 	return nil

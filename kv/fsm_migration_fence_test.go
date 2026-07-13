@@ -183,6 +183,33 @@ func TestFSMRejectsDelPrefixWithoutTargetReadinessProof(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMDelPrefixTombstonesStagedVisibilityRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, fsm.store.PutAt(ctx, stagedKey, []byte("staged"), 110, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: rawKey}},
+	}, 120)
+	require.NoError(t, err)
+
+	_, err = fsm.store.GetAt(ctx, stagedKey, 130)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 
