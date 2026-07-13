@@ -224,6 +224,7 @@ func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *
 		distribution.NewEngine(),
 		catalog,
 		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
 		WithSplitMigrationCapabilityGate(func(context.Context) error {
 			gateCalls++
 			return nil
@@ -241,6 +242,12 @@ func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *
 	require.Equal(t, uint64(1), resp.JobId)
 	require.Equal(t, 1, gateCalls)
 	require.Equal(t, 1, coordinator.dispatchCalls)
+	require.ElementsMatch(t, []string{
+		string(distribution.CatalogSplitJobKey(1)),
+		string(distribution.CatalogNextSplitJobIDKey()),
+		string(distribution.CatalogVersionKey()),
+		string(distribution.CatalogRouteKey(1)),
+	}, byteSliceStrings(coordinator.lastReadKeys))
 
 	jobs, err := catalog.ListSplitJobs(ctx)
 	require.NoError(t, err)
@@ -257,6 +264,43 @@ func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *
 	next, err := catalog.NextSplitJobID(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), next)
+}
+
+func TestDistributionServerStartSplitMigration_RejectsUnknownTargetGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 0,
+	}})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+	)
+
+	_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          3,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionUnknownTargetGroup.Error())
+	require.Zero(t, coordinator.dispatchCalls)
 }
 
 func TestDistributionServerStartSplitMigration_RejectsSecondLiveJob(t *testing.T) {
@@ -299,6 +343,7 @@ func TestDistributionServerStartSplitMigration_RejectsSecondLiveJob(t *testing.T
 		distribution.NewEngine(),
 		catalog,
 		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2, 3, 4),
 		WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
 	)
 
@@ -349,6 +394,7 @@ func TestDistributionServerStartSplitMigration_RejectsReservedMigrationRange(t *
 				distribution.NewEngine(),
 				catalog,
 				WithDistributionCoordinator(coordinator),
+				WithDistributionKnownRaftGroups(1, 2),
 				WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
 			)
 
@@ -1237,12 +1283,21 @@ func splitJobIDs(jobs []*pb.SplitJob) []uint64 {
 	return ids
 }
 
+func byteSliceStrings(in [][]byte) []string {
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		out = append(out, string(item))
+	}
+	return out
+}
+
 type distributionCoordinatorStub struct {
 	store           store.MVCCStore
 	leader          bool
 	dispatchErr     error
 	nextTS          uint64
 	lastStartTS     uint64
+	lastReadKeys    [][]byte
 	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
 	asyncApplyDone  chan error
 	asyncApplyDelay time.Duration
@@ -1266,6 +1321,7 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	}
 	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
 	s.lastStartTS = startTS
+	s.lastReadKeys = cloneByteSlices(reqs.ReadKeys)
 
 	mutations, err := coordinatorStubMutations(reqs.Elems)
 	if err != nil {

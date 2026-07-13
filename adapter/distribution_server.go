@@ -28,6 +28,7 @@ type DistributionServer struct {
 	coordinator             kv.Coordinator
 	readTracker             *kv.ActiveTimestampTracker
 	migrationCapabilityGate SplitMigrationCapabilityGate
+	knownRaftGroups         map[uint64]struct{}
 	reloadRetry             struct {
 		attempts int
 		interval time.Duration
@@ -59,6 +60,21 @@ func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) 
 func WithSplitMigrationCapabilityGate(gate SplitMigrationCapabilityGate) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.migrationCapabilityGate = gate
+	}
+}
+
+// WithDistributionKnownRaftGroups configures the Raft group IDs this node can
+// route migration work to.
+func WithDistributionKnownRaftGroups(groupIDs ...uint64) DistributionServerOption {
+	return func(s *DistributionServer) {
+		groups := make(map[uint64]struct{}, len(groupIDs))
+		for _, groupID := range groupIDs {
+			if groupID == 0 {
+				continue
+			}
+			groups[groupID] = struct{}{}
+		}
+		s.knownRaftGroups = groups
 	}
 }
 
@@ -100,6 +116,8 @@ var (
 	errDistributionEngineNotConfigured    = errors.New("distribution engine is not configured")
 	errDistributionCatalogVersionNotFound = errors.New("route catalog version not found")
 	errDistributionClusterNotReady        = errors.New("cluster is not ready for split migration")
+	errDistributionRaftGroupsNotKnown     = errors.New("distribution raft groups are not configured")
+	errDistributionUnknownTargetGroup     = errors.New("unknown target group")
 )
 
 // NewDistributionServer creates a new server.
@@ -259,6 +277,9 @@ func (s *DistributionServer) startSplitMigrationParent(
 	}
 	if parent.GroupID == req.GetTargetGroupId() {
 		return distribution.RouteDescriptor{}, grpcStatusError(codes.InvalidArgument, "target group must differ from source route group")
+	}
+	if err := s.verifyKnownTargetGroup(req.GetTargetGroupId()); err != nil {
+		return distribution.RouteDescriptor{}, err
 	}
 	if err := s.rejectLiveSplitJob(ctx, snapshot, parent); err != nil {
 		return distribution.RouteDescriptor{}, err
@@ -628,6 +649,16 @@ func (s *DistributionServer) updateSplitJobViaCoordinator(
 	return nil
 }
 
+func (s *DistributionServer) verifyKnownTargetGroup(groupID uint64) error {
+	if len(s.knownRaftGroups) == 0 {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionRaftGroupsNotKnown.Error())
+	}
+	if _, ok := s.knownRaftGroups[groupID]; !ok {
+		return grpcStatusError(codes.InvalidArgument, errDistributionUnknownTargetGroup.Error())
+	}
+	return nil
+}
+
 func (s *DistributionServer) createSplitJobViaCoordinator(ctx context.Context, readTS uint64, job distribution.SplitJob) error {
 	if job.JobID == math.MaxUint64 {
 		return splitJobCatalogStatusError(distribution.ErrCatalogSplitJobIDOverflow)
@@ -651,9 +682,14 @@ func (s *DistributionServer) createSplitJobViaCoordinator(ctx context.Context, r
 				Value: distribution.EncodeCatalogNextSplitJobID(job.JobID + 1),
 			},
 		},
-		IsTxn:    true,
-		StartTS:  readTS,
-		ReadKeys: [][]byte{jobKey, nextIDKey},
+		IsTxn:   true,
+		StartTS: readTS,
+		ReadKeys: [][]byte{
+			jobKey,
+			nextIDKey,
+			distribution.CatalogVersionKey(),
+			distribution.CatalogRouteKey(job.SourceRouteID),
+		},
 	}); err != nil {
 		return splitJobCoordinatorStatusError(err)
 	}

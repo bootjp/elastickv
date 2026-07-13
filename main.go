@@ -503,6 +503,7 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
@@ -653,6 +654,15 @@ func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
 		return nil
 	}
 	return append([]raftengine.Server(nil), in...)
+}
+
+func shardGroupIDs(groups map[uint64]*kv.ShardGroup) []uint64 {
+	ids := make([]uint64, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 type runtimeConfig struct {
@@ -1830,6 +1840,7 @@ func startupRotationGatedMethod(fullMethod string) bool {
 	case pb.Internal_Forward_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
+		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
 		pb.RaftAdmin_AddLearner_FullMethodName,
 		pb.RaftAdmin_PromoteLearner_FullMethodName,
