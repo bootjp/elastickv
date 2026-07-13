@@ -2,10 +2,12 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -189,6 +191,57 @@ func TestDistributionServerSplitJobRPCs_ReadAndListCatalogJobs(t *testing.T) {
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
+func TestDistributionServerListSplitJobs_PaginatesNewestHistory(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	for jobID, terminalAtMs := uint64(1), int64(1001); jobID <= 205; jobID, terminalAtMs = jobID+1, terminalAtMs+1 {
+		job := sampleDistributionSplitJob(jobID)
+		job.Phase = distribution.SplitJobPhaseDone
+		job.TerminalAtMs = terminalAtMs
+		job.UpdatedAtMs = job.TerminalAtMs
+		require.NoError(t, catalog.CreateSplitJob(ctx, job))
+		require.NoError(t, catalog.MoveSplitJobToHistory(ctx, job, job))
+	}
+
+	s := NewDistributionServer(distribution.NewEngine(), catalog)
+	first, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{})
+	require.NoError(t, err)
+	require.Len(t, first.Jobs, listSplitJobsDefaultPageSize)
+	require.NotEmpty(t, first.NextPageCursor)
+	require.Equal(t, uint64(205), first.Jobs[0].JobId)
+	require.Equal(t, uint64(6), first.Jobs[len(first.Jobs)-1].JobId)
+
+	second, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: first.NextPageCursor})
+	require.NoError(t, err)
+	require.Empty(t, second.NextPageCursor)
+	require.Equal(t, []uint64{5, 4, 3, 2, 1}, splitJobIDs(second.Jobs))
+}
+
+func TestDistributionServerListSplitJobs_RejectsInvalidCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	job := sampleDistributionSplitJob(1)
+	job.Phase = distribution.SplitJobPhaseDone
+	job.TerminalAtMs = 1000
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+	require.NoError(t, catalog.MoveSplitJobToHistory(ctx, job, job))
+
+	s := NewDistributionServer(distribution.NewEngine(), catalog)
+	_, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: []byte("bad")})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	missing := sampleDistributionSplitJob(999)
+	missing.TerminalAtMs = 9999
+	_, err = s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: encodeSplitJobListCursor(missing)})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
 func TestDistributionServerRetrySplitJob_UsesCoordinatorCAS(t *testing.T) {
 	t.Parallel()
 
@@ -213,6 +266,43 @@ func TestDistributionServerRetrySplitJob_UsesCoordinatorCAS(t *testing.T) {
 	require.Equal(t, distribution.SplitJobPhaseFence, got.Phase)
 	require.Equal(t, distribution.SplitJobPhaseNone, got.RetryPhase)
 	require.Empty(t, got.LastError)
+}
+
+func TestDistributionServerRetrySplitJob_MapsDispatchLeadershipLoss(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "leader not found", err: kv.ErrLeaderNotFound},
+		{name: "raft not leader", err: raftengine.ErrNotLeader},
+		{name: "leadership lost", err: raftengine.ErrLeadershipLost},
+		{name: "transfer in progress", err: raftengine.ErrLeadershipTransferInProgress},
+		{name: "wrapped grpc detail", err: errors.New("rpc error: code = Unknown desc = raft engine: leadership lost")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			job := sampleDistributionSplitJob(15)
+			job.Phase = distribution.SplitJobPhaseFailed
+			job.RetryPhase = distribution.SplitJobPhaseFence
+			require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+			coordinator := newDistributionCoordinatorStub(baseStore, true)
+			coordinator.dispatchErr = tc.err
+			s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+			_, err := s.RetrySplitJob(ctx, &pb.RetrySplitJobRequest{JobId: job.JobID})
+			require.Error(t, err)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, errDistributionNotLeader.Error())
+			require.Equal(t, 1, coordinator.dispatchCalls)
+		})
+	}
 }
 
 func TestDistributionServerAbandonSplitJob_RecordsAbandoningViaCoordinator(t *testing.T) {
@@ -925,9 +1015,18 @@ func sampleDistributionSplitJob(jobID uint64) distribution.SplitJob {
 	}
 }
 
+func splitJobIDs(jobs []*pb.SplitJob) []uint64 {
+	ids := make([]uint64, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.GetJobId())
+	}
+	return ids
+}
+
 type distributionCoordinatorStub struct {
 	store           store.MVCCStore
 	leader          bool
+	dispatchErr     error
 	nextTS          uint64
 	lastStartTS     uint64
 	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
@@ -948,6 +1047,9 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
+	if s.dispatchErr != nil {
+		return nil, s.dispatchErr
+	}
 	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
 	s.lastStartTS = startTS
 

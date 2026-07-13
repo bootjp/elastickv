@@ -3,12 +3,15 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -62,8 +65,13 @@ func WithCatalogReloadRetryPolicy(attempts int, interval time.Duration) Distribu
 }
 
 const (
-	childRouteCount      = 2
-	splitMutationOpCount = childRouteCount + 3
+	childRouteCount                = 2
+	splitMutationOpCount           = childRouteCount + 3
+	listSplitJobsDefaultPageSize   = 200
+	splitJobListCursorVersion      = byte(1)
+	splitJobListCursorTerminalOff  = 1
+	splitJobListCursorJobIDOff     = splitJobListCursorTerminalOff + 8
+	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
 )
 
 var (
@@ -220,12 +228,9 @@ func (s *DistributionServer) ListSplitJobs(ctx context.Context, req *pb.ListSpli
 	if err != nil {
 		return nil, splitJobCatalogStatusError(err)
 	}
-	resp := &pb.ListSplitJobsResponse{}
-	for _, job := range jobs {
-		if !splitJobPassesListFilter(job, req.GetSinceTerminalAtMs(), phaseFilter) {
-			continue
-		}
-		resp.Jobs = append(resp.Jobs, distribution.SplitJobToProto(job))
+	resp, err := splitJobListPage(jobs, req, phaseFilter)
+	if err != nil {
+		return nil, err
 	}
 	return resp, nil
 }
@@ -508,7 +513,7 @@ func (s *DistributionServer) updateSplitJobViaCoordinator(
 	if err != nil {
 		return splitJobCatalogStatusError(err)
 	}
-	if splitJobsEqualByEncoding(expected, next) {
+	if distribution.SplitJobsEquivalent(expected, next) {
 		return nil
 	}
 	encoded, err := distribution.EncodeSplitJob(next)
@@ -655,12 +660,6 @@ func validSplitJobPhaseFilter(phase string) bool {
 	return false
 }
 
-func splitJobsEqualByEncoding(left, right distribution.SplitJob) bool {
-	leftRaw, leftErr := distribution.EncodeSplitJob(left)
-	rightRaw, rightErr := distribution.EncodeSplitJob(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
-}
-
 func splitJobCatalogStatusError(err error) error {
 	switch {
 	case errors.Is(err, distribution.ErrCatalogSplitJobIDRequired):
@@ -681,11 +680,137 @@ func splitJobCoordinatorStatusError(err error) error {
 	switch {
 	case errors.Is(err, store.ErrWriteConflict):
 		return grpcStatusError(codes.Aborted, distribution.ErrCatalogSplitJobConflict.Error())
-	case errors.Is(err, kv.ErrLeaderNotFound):
+	case splitJobCoordinatorLeadershipError(err):
 		return grpcStatusError(codes.FailedPrecondition, errDistributionNotLeader.Error())
 	default:
 		return grpcStatusErrorf(codes.Internal, "commit split job mutation: %v", err)
 	}
+}
+
+func splitJobListPage(jobs []distribution.SplitJob, req *pb.ListSplitJobsRequest, phaseFilter string) (*pb.ListSplitJobsResponse, error) {
+	filtered := make([]distribution.SplitJob, 0, len(jobs))
+	for _, job := range jobs {
+		if splitJobPassesListFilter(job, req.GetSinceTerminalAtMs(), phaseFilter) {
+			filtered = append(filtered, job)
+		}
+	}
+	sortSplitJobsForList(filtered)
+
+	start, err := splitJobListStartIndex(filtered, req.GetPageCursor())
+	if err != nil {
+		return nil, err
+	}
+	end := start + listSplitJobsDefaultPageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+
+	resp := &pb.ListSplitJobsResponse{
+		Jobs: make([]*pb.SplitJob, 0, end-start),
+	}
+	for _, job := range filtered[start:end] {
+		resp.Jobs = append(resp.Jobs, distribution.SplitJobToProto(job))
+	}
+	if end < len(filtered) {
+		resp.NextPageCursor = encodeSplitJobListCursor(filtered[end-1])
+	}
+	return resp, nil
+}
+
+func sortSplitJobsForList(jobs []distribution.SplitJob) {
+	sort.Slice(jobs, func(i, j int) bool {
+		left, right := jobs[i], jobs[j]
+		leftLive := left.TerminalAtMs <= 0
+		rightLive := right.TerminalAtMs <= 0
+		if leftLive != rightLive {
+			return leftLive
+		}
+		if leftLive {
+			if left.UpdatedAtMs != right.UpdatedAtMs {
+				return left.UpdatedAtMs > right.UpdatedAtMs
+			}
+			return left.JobID > right.JobID
+		}
+		if left.TerminalAtMs != right.TerminalAtMs {
+			return left.TerminalAtMs > right.TerminalAtMs
+		}
+		return left.JobID > right.JobID
+	})
+}
+
+func splitJobListStartIndex(jobs []distribution.SplitJob, cursor []byte) (int, error) {
+	if len(cursor) == 0 {
+		return 0, nil
+	}
+	terminalAtMs, jobID, err := decodeSplitJobListCursor(cursor)
+	if err != nil {
+		return 0, err
+	}
+	for i, job := range jobs {
+		if job.JobID == jobID && splitJobListCursorTerminalAtMs(job) == terminalAtMs {
+			return i + 1, nil
+		}
+	}
+	return 0, grpcStatusError(codes.InvalidArgument, "split job page cursor does not match the filtered result set")
+}
+
+func encodeSplitJobListCursor(job distribution.SplitJob) []byte {
+	cursor := make([]byte, splitJobListCursorEncodedBytes)
+	cursor[0] = splitJobListCursorVersion
+	binary.BigEndian.PutUint64(
+		cursor[splitJobListCursorTerminalOff:splitJobListCursorJobIDOff],
+		splitJobListCursorTerminalAtMs(job),
+	)
+	binary.BigEndian.PutUint64(cursor[splitJobListCursorJobIDOff:], job.JobID)
+	return cursor
+}
+
+func decodeSplitJobListCursor(cursor []byte) (uint64, uint64, error) {
+	if len(cursor) != splitJobListCursorEncodedBytes || cursor[0] != splitJobListCursorVersion {
+		return 0, 0, grpcStatusError(codes.InvalidArgument, "invalid split job page cursor")
+	}
+	terminalAtMs := binary.BigEndian.Uint64(cursor[splitJobListCursorTerminalOff:splitJobListCursorJobIDOff])
+	jobID := binary.BigEndian.Uint64(cursor[splitJobListCursorJobIDOff:])
+	if jobID == 0 {
+		return 0, 0, grpcStatusError(codes.InvalidArgument, "invalid split job page cursor")
+	}
+	return terminalAtMs, jobID, nil
+}
+
+func splitJobListCursorTerminalAtMs(job distribution.SplitJob) uint64 {
+	if job.TerminalAtMs <= 0 {
+		return 0
+	}
+	return uint64(job.TerminalAtMs)
+}
+
+func splitJobCoordinatorLeadershipError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		return true
+	}
+	return hasSplitJobLeaderErrorSuffix(err.Error())
+}
+
+var splitJobLeaderErrorPhrases = []string{
+	"not leader",
+	"leader not found",
+	"leadership lost",
+	"leadership transfer in progress",
+}
+
+func hasSplitJobLeaderErrorSuffix(msg string) bool {
+	for _, phrase := range splitJobLeaderErrorPhrases {
+		if len(msg) >= len(phrase) && strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func splitCatalogRoutes(

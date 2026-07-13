@@ -70,7 +70,7 @@ func (s *CatalogStore) BeginSplitJobAbandon(ctx context.Context, jobID uint64, n
 	if err != nil {
 		return SplitJob{}, err
 	}
-	if splitJobsEquivalent(expected, next) {
+	if SplitJobsEquivalent(expected, next) {
 		return next, nil
 	}
 	return next, s.SaveSplitJob(ctx, expected, next)
@@ -135,7 +135,9 @@ func splitJobAbandonRetryPhaseAllowed(phase SplitJobPhase) bool {
 	return false
 }
 
-func splitJobsEquivalent(left, right SplitJob) bool {
+// SplitJobsEquivalent reports whether two split jobs encode to the same
+// durable catalog value.
+func SplitJobsEquivalent(left, right SplitJob) bool {
 	leftRaw, leftErr := EncodeSplitJob(left)
 	rightRaw, rightErr := EncodeSplitJob(right)
 	if leftErr != nil || rightErr != nil {
