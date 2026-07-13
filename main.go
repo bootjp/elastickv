@@ -2093,7 +2093,10 @@ func startRaftServers(
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			internalTimestampOptions(coordinate)...,
+			append(
+				internalTimestampOptions(coordinate),
+				adapter.WithInternalStore(rt.store),
+			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		if adminServer != nil {

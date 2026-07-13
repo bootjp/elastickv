@@ -641,7 +641,13 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		}
 		pb.RegisterRawKVServer(s, gs)
 		pb.RegisterTransactionalKVServer(s, gs)
-		pb.RegisterInternalServer(s, NewInternalWithEngine(trx, result.Engine, coordinator.Clock(), relay))
+		pb.RegisterInternalServer(s, NewInternalWithEngine(
+			trx,
+			result.Engine,
+			coordinator.Clock(),
+			relay,
+			WithInternalStore(st),
+		))
 		internalraftadmin.RegisterOperationalServices(opsCtx, s, result.Engine, []string{"Example"})
 
 		grpcAdders = append(grpcAdders, port.grpcAddress)

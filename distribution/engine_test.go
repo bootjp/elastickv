@@ -169,7 +169,16 @@ func TestEngineApplySnapshot_ReplacesRoutesAndVersion(t *testing.T) {
 		Version: 1,
 		Routes: []RouteDescriptor{
 			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
-			{RouteID: 11, Start: []byte("m"), End: nil, GroupID: 2, State: RouteStateWriteFenced},
+			{
+				RouteID:                11,
+				Start:                  []byte("m"),
+				End:                    nil,
+				GroupID:                2,
+				State:                  RouteStateWriteFenced,
+				StagedVisibilityActive: true,
+				MigrationJobID:         42,
+				MinWriteTSExclusive:    99,
+			},
 		},
 	})
 	if err != nil {
@@ -189,6 +198,19 @@ func TestEngineApplySnapshot_ReplacesRoutesAndVersion(t *testing.T) {
 	}
 	if stats[1].RouteID != 11 || stats[1].State != RouteStateWriteFenced {
 		t.Fatalf("unexpected second route metadata: %+v", stats[1])
+	}
+	assertStagedRouteMetadata(t, stats[1])
+	route, ok := e.GetRoute([]byte("m"))
+	if !ok {
+		t.Fatalf("expected route for m")
+	}
+	assertStagedRouteMetadata(t, route)
+}
+
+func assertStagedRouteMetadata(t *testing.T, route Route) {
+	t.Helper()
+	if !route.StagedVisibilityActive || route.MigrationJobID != 42 || route.MinWriteTSExclusive != 99 {
+		t.Fatalf("staged route metadata was not preserved: %+v", route)
 	}
 }
 

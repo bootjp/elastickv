@@ -762,7 +762,13 @@ func startBoundGRPCServer(
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
-	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
+	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
+		trx,
+		rt.engine,
+		coordinate.Clock(),
+		relay,
+		adapter.WithInternalStore(rt.store),
+	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)
 	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})

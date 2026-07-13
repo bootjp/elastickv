@@ -25,6 +25,13 @@ type Route struct {
 	GroupID uint64
 	// State tracks control-plane state for this route.
 	State RouteState
+	// StagedVisibilityActive makes migrated versions visible through the
+	// staged/live merge path after cross-group CUTOVER.
+	StagedVisibilityActive bool
+	// MigrationJobID identifies the migration job that owns staged visibility.
+	MigrationJobID uint64
+	// MinWriteTSExclusive is the post-migration write timestamp floor.
+	MinWriteTSExclusive uint64
 	// Load tracks the number of accesses served by this range.
 	Load uint64
 }
@@ -365,14 +372,7 @@ func (e *Engine) Stats() []Route {
 	defer e.mu.RUnlock()
 	stats := make([]Route, len(e.routes))
 	for i, r := range e.routes {
-		stats[i] = Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
-		}
+		stats[i] = cloneRoute(r)
 	}
 	return stats
 }
@@ -398,26 +398,22 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 			break
 		}
 		// Route intersects with scan range
-		result = append(result, Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
-		})
+		result = append(result, cloneRoute(*r))
 	}
 	return result
 }
 
 func cloneRoute(r Route) Route {
 	return Route{
-		RouteID: r.RouteID,
-		Start:   CloneBytes(r.Start),
-		End:     CloneBytes(r.End),
-		GroupID: r.GroupID,
-		State:   r.State,
-		Load:    r.Load,
+		RouteID:                r.RouteID,
+		Start:                  CloneBytes(r.Start),
+		End:                    CloneBytes(r.End),
+		GroupID:                r.GroupID,
+		State:                  r.State,
+		StagedVisibilityActive: r.StagedVisibilityActive,
+		MigrationJobID:         r.MigrationJobID,
+		MinWriteTSExclusive:    r.MinWriteTSExclusive,
+		Load:                   r.Load,
 	}
 }
 
@@ -454,12 +450,15 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		}
 		seen[rd.RouteID] = struct{}{}
 		out[i] = Route{
-			RouteID: rd.RouteID,
-			Start:   CloneBytes(rd.Start),
-			End:     CloneBytes(rd.End),
-			GroupID: rd.GroupID,
-			State:   rd.State,
-			Load:    0,
+			RouteID:                rd.RouteID,
+			Start:                  CloneBytes(rd.Start),
+			End:                    CloneBytes(rd.End),
+			GroupID:                rd.GroupID,
+			State:                  rd.State,
+			StagedVisibilityActive: rd.StagedVisibilityActive,
+			MigrationJobID:         rd.MigrationJobID,
+			MinWriteTSExclusive:    rd.MinWriteTSExclusive,
+			Load:                   0,
 		}
 	}
 
