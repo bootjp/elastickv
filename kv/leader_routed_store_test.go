@@ -88,32 +88,39 @@ type fakeRawKVServer struct {
 	getResp    *pb.RawGetResponse
 	scanResp   *pb.RawScanAtResponse
 	latestResp *pb.RawLatestCommitTSResponse
+
+	lastGetReq    *pb.RawGetRequest
+	lastScanReq   *pb.RawScanAtRequest
+	lastLatestReq *pb.RawLatestCommitTSRequest
 }
 
-func (f *fakeRawKVServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+func (f *fakeRawKVServer) RawGet(_ context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getCalls++
+	f.lastGetReq = req
 	if f.getResp != nil {
 		return f.getResp, nil
 	}
 	return &pb.RawGetResponse{}, nil
 }
 
-func (f *fakeRawKVServer) RawScanAt(context.Context, *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+func (f *fakeRawKVServer) RawScanAt(_ context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.scanCalls++
+	f.lastScanReq = req
 	if f.scanResp != nil {
 		return f.scanResp, nil
 	}
 	return &pb.RawScanAtResponse{}, nil
 }
 
-func (f *fakeRawKVServer) RawLatestCommitTS(context.Context, *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+func (f *fakeRawKVServer) RawLatestCommitTS(_ context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.latestCalls++
+	f.lastLatestReq = req
 	if f.latestResp != nil {
 		return f.latestResp, nil
 	}
@@ -244,6 +251,48 @@ func TestLeaderRoutedStore_ProxiesReadsWhenFollower(t *testing.T) {
 	require.Equal(t, 1, fake.getCalls)
 	require.Equal(t, 1, fake.scanCalls)
 	require.Equal(t, 1, fake.latestCalls)
+}
+
+func TestLeaderRoutedStore_ForwardsReadFenceStamps(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		getResp: &pb.RawGetResponse{
+			Exists: true,
+			Value:  []byte("remote-v"),
+		},
+		scanResp: &pb.RawScanAtResponse{},
+		latestResp: &pb.RawLatestCommitTSResponse{
+			Ts:     42,
+			Exists: true,
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	coord := &stubLeaderCoordinator{
+		isLeader: false,
+		leader:   addr,
+		clock:    NewHLC(),
+	}
+	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	_, err := s.GetAtWithReadFence(ctx, []byte("k"), 10, 0, 77)
+	require.NoError(t, err)
+	_, _, err = s.LatestCommitTSWithReadFence(ctx, []byte("k"), 78)
+	require.NoError(t, err)
+	_, err = s.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 79, []byte("a"), []byte("m"))
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
+	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(79), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
+	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
 }
 
 func TestLeaderRoutedStore_ReturnsLeaderNotFoundWhenNoLeaderAddr(t *testing.T) {
