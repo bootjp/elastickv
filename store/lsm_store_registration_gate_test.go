@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"testing"
@@ -133,6 +134,49 @@ func TestRegistrationGate_FSMApplyPathNeverGated(t *testing.T) {
 		t.Fatalf("ApplyMutationsRaft must not be gated, got: %v", err)
 	}
 	mustGet(t, f.mvcc, []byte("raft"), 150, "applied")
+}
+
+func TestRegistrationGate_PromoteVersionsNeverGated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	registered := true
+	f := newRegGateStore(t, &registered)
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+
+	if err := f.mvcc.PutAt(ctx, stage("promote"), []byte("value"), 100, 0); err != nil {
+		t.Fatalf("seed staged PutAt: %v", err)
+	}
+	registered = false
+	if err := f.mvcc.PutAt(ctx, []byte("direct"), []byte("blocked"), 110, 0); !errors.Is(err, ErrWriterNotRegistered) {
+		t.Fatalf("direct PutAt pre-registration: got %v, want ErrWriterNotRegistered", err)
+	}
+	promoter, ok := f.mvcc.(MigrationPromoter)
+	if !ok {
+		t.Fatalf("expected MigrationPromoter, got %T", f.mvcc)
+	}
+
+	result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    []byte("stage|"),
+		EndKey:      PrefixScanEnd([]byte("stage|")),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	if err != nil {
+		t.Fatalf("PromoteVersions pre-registration: %v", err)
+	}
+	if !result.Done || result.PromotedRows != 1 {
+		t.Fatalf("PromoteVersions result = %+v, want done with one promoted row", result)
+	}
+	mustGet(t, f.mvcc, []byte("promote"), 150, "value")
+	if _, err := f.mvcc.GetAt(ctx, stage("promote"), 150); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("staged version after promotion: got %v, want ErrKeyNotFound", err)
+	}
 }
 
 // TestRegistrationGate_NotEncryptingIsUngated confirms the gate is only

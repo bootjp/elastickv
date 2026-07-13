@@ -329,7 +329,9 @@ func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jo
 	for _, version := range versions {
 		targets = append(targets, version.target)
 	}
-	if err := s.applyImportVersionsBatch(batch, targets); err != nil {
+	// Promotion is replayed from the Raft FSM, so it must not fail closed on
+	// this node's local writer-registration state.
+	if err := s.applyImportVersionsBatch(batch, targets, false); err != nil {
 		return err
 	}
 	for _, version := range versions {

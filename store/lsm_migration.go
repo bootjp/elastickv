@@ -247,7 +247,9 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := s.applyImportVersionsBatch(batch, opts.Versions); err != nil {
+	// Keep the existing import registration-gate behavior; promotion opts out
+	// at its call site because it replays committed Raft entries.
+	if err := s.applyImportVersionsBatch(batch, opts.Versions, true); err != nil {
 		return err
 	}
 	if err := batch.Set(migrationAckKey(opts.JobID, opts.BracketID), encodeMigrationImportAck(migrationImportAck{
@@ -277,14 +279,14 @@ func (s *pebbleStore) stageMigrationClockMetadataIfNeeded(batch *pebble.Batch, j
 	return s.stageMigrationClockMetadata(batch, jobID, batchMax)
 }
 
-func (s *pebbleStore) applyImportVersionsBatch(batch *pebble.Batch, versions []MVCCVersion) error {
+func (s *pebbleStore) applyImportVersionsBatch(batch *pebble.Batch, versions []MVCCVersion, gateRegistration bool) error {
 	for _, version := range versions {
 		k := encodeKey(version.Key, version.CommitTS)
 		var encoded []byte
 		if version.Tombstone {
 			encoded = encodeValue(nil, true, 0, encStateCleartext)
 		} else {
-			body, encState, err := s.encryptForKey(k, version.Value, version.ExpireAt, true)
+			body, encState, err := s.encryptForKey(k, version.Value, version.ExpireAt, gateRegistration)
 			if err != nil {
 				return err
 			}
