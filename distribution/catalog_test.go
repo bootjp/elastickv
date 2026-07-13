@@ -133,7 +133,7 @@ func TestRouteDescriptorCodecV2RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
-	if raw[0] != catalogRouteCodecVersion {
+	if raw[0] != catalogRouteCodecVersionV2 {
 		t.Fatalf("M2 route encoded version = %d, want v2", raw[0])
 	}
 
@@ -158,7 +158,7 @@ func TestRouteDescriptorCodecV2RoundTripNilEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
-	if raw[0] != catalogRouteCodecVersion {
+	if raw[0] != catalogRouteCodecVersionV2 {
 		t.Fatalf("M2 nil-end route encoded version = %d, want v2", raw[0])
 	}
 

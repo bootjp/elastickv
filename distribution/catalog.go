@@ -23,7 +23,8 @@ const (
 	catalogVersionCodecVersion  byte = 1
 	catalogRouteCodecVersionMin byte = 1
 	catalogRouteCodecVersionV1  byte = 1
-	catalogRouteCodecVersion    byte = 2
+	catalogRouteCodecVersionV2  byte = 2
+	catalogRouteCodecVersion    byte = catalogRouteCodecVersionV2
 	catalogRouteV2TailSize           = 1 + catalogUint64Bytes + catalogUint64Bytes
 
 	catalogScanPageSize          = 256
@@ -180,7 +181,7 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 	out := make([]byte, 0, routeDescriptorEncodedSize(route))
 	version := catalogRouteCodecVersionV1
 	if routeDescriptorRequiresV2(route) {
-		version = catalogRouteCodecVersion
+		version = catalogRouteCodecVersionV2
 	}
 	out = append(out, version)
 	out = appendU64(out, route.RouteID)
@@ -198,7 +199,7 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 		out = append(out, route.End...)
 	}
 
-	if version == catalogRouteCodecVersion {
+	if version == catalogRouteCodecVersionV2 {
 		out = appendRouteDescriptorV2Tail(out, route)
 	}
 	return out, nil
@@ -763,7 +764,7 @@ func decodeRouteDescriptorTail(version byte, r *bytes.Reader, route *RouteDescri
 			return errors.WithStack(ErrCatalogInvalidRouteRecord)
 		}
 		return nil
-	case catalogRouteCodecVersion:
+	case catalogRouteCodecVersionV2:
 		return decodeRouteDescriptorV2Tail(r, route)
 	default:
 		return errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", version)
