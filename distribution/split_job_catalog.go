@@ -206,7 +206,7 @@ func CatalogSplitJobHistoryKey(terminalAtMs int64, jobID uint64) []byte {
 		terminalAtMs = 0
 	}
 	off := len(catalogSplitJobHistoryPrefix)
-	putCatalogInt64BE(key[off:], terminalAtMs)
+	binary.BigEndian.PutUint64(key[off:], uint64(terminalAtMs)) //nolint:gosec // terminalAtMs is clamped non-negative above.
 	binary.BigEndian.PutUint64(key[off+catalogUint64Bytes:], jobID)
 	return key
 }
@@ -487,14 +487,6 @@ func validateSplitJobBracketProgress(progress []SplitJobBracketProgress) error {
 		}
 	}
 	return nil
-}
-
-func putCatalogInt64BE(dst []byte, v int64) {
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.BigEndian, v); err != nil {
-		panic(err)
-	}
-	copy(dst, buf.Bytes())
 }
 
 func (s *CatalogStore) nextSplitJobIDAt(ctx context.Context, ts uint64) (uint64, error) {
