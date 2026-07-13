@@ -844,6 +844,11 @@ func CloneSplitJob(job SplitJob) SplitJob {
 	}
 }
 
+// SplitJobToProto converts a catalog SplitJob into its wire representation.
+func SplitJobToProto(job SplitJob) *pb.SplitJob {
+	return splitJobToProto(job)
+}
+
 func splitJobToProto(job SplitJob) *pb.SplitJob {
 	job = CloneSplitJob(job)
 	return &pb.SplitJob{

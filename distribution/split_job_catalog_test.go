@@ -242,6 +242,98 @@ func TestCatalogStoreSaveSplitJobRejectsStaleExpectedJob(t *testing.T) {
 	assertSplitJobEqual(t, advanced, got)
 }
 
+func TestCatalogStoreRetrySplitJobUsesDurableRetryPhase(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(18)
+	job.Phase = SplitJobPhaseFailed
+	job.RetryPhase = SplitJobPhaseDeltaCopy
+	job.LastError = "transient"
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	retried, err := cs.RetrySplitJob(ctx, job.JobID, 1200)
+	if err != nil {
+		t.Fatalf("retry split job: %v", err)
+	}
+	if retried.Phase != SplitJobPhaseDeltaCopy || retried.RetryPhase != SplitJobPhaseNone {
+		t.Fatalf("unexpected retry transition: %+v", retried)
+	}
+	if retried.AbandonFromPhase != SplitJobPhaseNone || retried.LastError != "" || retried.UpdatedAtMs != 1200 {
+		t.Fatalf("unexpected retry witness cleanup: %+v", retried)
+	}
+	got, found, err := cs.SplitJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("load retried split job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected retried split job")
+	}
+	assertSplitJobEqual(t, retried, got)
+}
+
+func TestCatalogStoreRetrySplitJobRejectsMissingRetryWitness(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(19)
+	job.Phase = SplitJobPhaseFailed
+	job.RetryPhase = SplitJobPhaseNone
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	if _, err := cs.RetrySplitJob(ctx, job.JobID, 1200); !errors.Is(err, ErrCatalogSplitJobCannotRetry) {
+		t.Fatalf("expected ErrCatalogSplitJobCannotRetry, got %v", err)
+	}
+}
+
+func TestCatalogStoreBeginSplitJobAbandonRecordsPreCutoverPhase(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(20)
+	job.Phase = SplitJobPhaseFailed
+	job.RetryPhase = SplitJobPhaseFence
+	job.AbandonFromPhase = SplitJobPhaseNone
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	abandoning, err := cs.BeginSplitJobAbandon(ctx, job.JobID, 1300)
+	if err != nil {
+		t.Fatalf("begin split job abandon: %v", err)
+	}
+	if abandoning.Phase != SplitJobPhaseAbandoning ||
+		abandoning.RetryPhase != SplitJobPhaseNone ||
+		abandoning.AbandonFromPhase != SplitJobPhaseFence ||
+		abandoning.UpdatedAtMs != 1300 {
+		t.Fatalf("unexpected abandon transition: %+v", abandoning)
+	}
+	got, found, err := cs.SplitJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatalf("load abandoning split job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected abandoning split job")
+	}
+	assertSplitJobEqual(t, abandoning, got)
+}
+
+func TestCatalogStoreBeginSplitJobAbandonRejectsPostCutoverPhases(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(21)
+	job.Phase = SplitJobPhaseCleanup
+	job.RetryPhase = SplitJobPhaseNone
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	if _, err := cs.BeginSplitJobAbandon(ctx, job.JobID, 1300); !errors.Is(err, ErrCatalogSplitJobCannotAbandon) {
+		t.Fatalf("expected ErrCatalogSplitJobCannotAbandon, got %v", err)
+	}
+}
+
 func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
