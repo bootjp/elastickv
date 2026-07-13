@@ -2,14 +2,20 @@ package fuseadapter
 
 import (
 	"context"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
-const defaultReaddirLimit = 128
+const (
+	defaultReaddirLimit             = 128
+	defaultHandleKeepaliveInterval  = time.Minute
+	disabledHandleKeepaliveInterval = 0
+)
 
 // Core is the filesystem backend surface required by the FUSE adapter.
 type Core interface {
@@ -33,12 +39,22 @@ type Core interface {
 }
 
 type Adapter struct {
-	core         Core
-	clientID     []byte
-	readdirLimit int
+	core              Core
+	clientID          []byte
+	readdirLimit      int
+	keepaliveInterval time.Duration
+	keepaliveCancel   context.CancelFunc
+	closeOnce         sync.Once
+	handlesMu         sync.Mutex
+	handles           map[openHandleKey]struct{}
 }
 
 type Option func(*Adapter)
+
+type openHandleKey struct {
+	inode uint64
+	fh    uint64
+}
 
 var errnoMappings = []struct {
 	err   error
@@ -65,16 +81,36 @@ func WithReaddirLimit(limit int) Option {
 	}
 }
 
+func WithHandleKeepaliveInterval(interval time.Duration) Option {
+	return func(a *Adapter) {
+		a.keepaliveInterval = interval
+	}
+}
+
 func New(core Core, clientID []byte, opts ...Option) *Adapter {
 	a := &Adapter{
-		core:         core,
-		clientID:     append([]byte(nil), clientID...),
-		readdirLimit: defaultReaddirLimit,
+		core:              core,
+		clientID:          append([]byte(nil), clientID...),
+		readdirLimit:      defaultReaddirLimit,
+		keepaliveInterval: defaultHandleKeepaliveInterval,
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
+	if a.keepaliveInterval > disabledHandleKeepaliveInterval {
+		ctx, cancel := context.WithCancel(context.Background())
+		a.keepaliveCancel = cancel
+		go a.keepOpenHandlesAlive(ctx)
+	}
 	return a
+}
+
+func (a *Adapter) Close() {
+	a.closeOnce.Do(func() {
+		if a.keepaliveCancel != nil {
+			a.keepaliveCancel()
+		}
+	})
 }
 
 func Errno(err error) syscall.Errno {
@@ -115,6 +151,9 @@ func (a *Adapter) SetAttr(
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
 	fh, err := a.core.Open(ctx, inode, a.clientID)
+	if err == nil {
+		a.trackOpenHandle(inode, fh)
+	}
 	return fh, Errno(err)
 }
 
@@ -149,7 +188,9 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 }
 
 func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
-	return Errno(a.core.Release(ctx, inode, fh, a.clientID))
+	err := a.core.Release(ctx, inode, fh, a.clientID)
+	a.untrackOpenHandle(inode, fh)
+	return Errno(err)
 }
 
 func (a *Adapter) Create(
@@ -160,6 +201,9 @@ func (a *Adapter) Create(
 ) (filesystem.CreateResult, syscall.Errno) {
 	opts.ClientID = append([]byte(nil), a.clientID...)
 	result, err := a.core.Create(ctx, parent, name, opts)
+	if err == nil {
+		a.trackOpenHandle(result.Inode, result.FH)
+	}
 	return result, Errno(err)
 }
 
@@ -203,6 +247,62 @@ func (a *Adapter) StatFS(ctx context.Context, inode uint64) (filesystem.StatFS, 
 
 func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
 	return Errno(a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID))
+}
+
+func (a *Adapter) trackOpenHandle(inode uint64, fh uint64) {
+	if fh == 0 {
+		return
+	}
+	a.handlesMu.Lock()
+	defer a.handlesMu.Unlock()
+	if a.handles == nil {
+		a.handles = make(map[openHandleKey]struct{})
+	}
+	a.handles[openHandleKey{inode: inode, fh: fh}] = struct{}{}
+}
+
+func (a *Adapter) untrackOpenHandle(inode uint64, fh uint64) {
+	if fh == 0 {
+		return
+	}
+	a.handlesMu.Lock()
+	defer a.handlesMu.Unlock()
+	delete(a.handles, openHandleKey{inode: inode, fh: fh})
+}
+
+func (a *Adapter) openHandleSnapshot() []openHandleKey {
+	a.handlesMu.Lock()
+	defer a.handlesMu.Unlock()
+	if len(a.handles) == 0 {
+		return nil
+	}
+	handles := make([]openHandleKey, 0, len(a.handles))
+	for handle := range a.handles {
+		handles = append(handles, handle)
+	}
+	return handles
+}
+
+func (a *Adapter) keepOpenHandlesAlive(ctx context.Context) {
+	ticker := time.NewTicker(a.keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.refreshTrackedOpenHandles(ctx)
+		}
+	}
+}
+
+func (a *Adapter) refreshTrackedOpenHandles(ctx context.Context) {
+	for _, handle := range a.openHandleSnapshot() {
+		err := a.core.RefreshOpenHandleLease(ctx, handle.inode, handle.fh, a.clientID)
+		if errors.Is(err, filesystem.ErrNotFound) {
+			a.untrackOpenHandle(handle.inode, handle.fh)
+		}
+	}
 }
 
 func (*Adapter) Link(context.Context) syscall.Errno {

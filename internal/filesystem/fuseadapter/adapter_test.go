@@ -5,6 +5,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/store"
@@ -53,6 +54,7 @@ func TestAdapterLookupResolvesThenStatsInode(t *testing.T) {
 		},
 	}
 	adapter := New(core, []byte("client-a"))
+	t.Cleanup(adapter.Close)
 
 	stat, errno := adapter.Lookup(ctx, filesystem.RootInode, []byte("name"))
 	require.Zero(t, errno)
@@ -68,6 +70,7 @@ func TestAdapterCreateAndReleaseUseClientID(t *testing.T) {
 		createResult: filesystem.CreateResult{Inode: 7, FH: 9},
 	}
 	adapter := New(core, []byte("fuse-session"))
+	t.Cleanup(adapter.Close)
 
 	result, errno := adapter.Create(ctx, filesystem.RootInode, []byte("file"), filesystem.CreateOptions{
 		Mode: 0o644,
@@ -93,6 +96,7 @@ func TestAdapterUsesConfiguredReaddirLimit(t *testing.T) {
 		},
 	}
 	adapter := New(core, []byte("client-a"), WithReaddirLimit(4))
+	t.Cleanup(adapter.Close)
 
 	result, errno := adapter.Readdir(ctx, filesystem.RootInode, "cookie")
 	require.Zero(t, errno)
@@ -106,6 +110,7 @@ func TestAdapterRefreshesHandleLeaseBeforeRead(t *testing.T) {
 	ctx := context.Background()
 	core := &fakeCore{readData: []byte("payload")}
 	adapter := New(core, []byte("fuse-session"))
+	t.Cleanup(adapter.Close)
 
 	data, errno := adapter.Read(ctx, 7, 9, 0, 16)
 	require.Zero(t, errno)
@@ -120,6 +125,7 @@ func TestAdapterStopsReadWhenLeaseRefreshFails(t *testing.T) {
 	ctx := context.Background()
 	core := &fakeCore{refreshErr: filesystem.ErrNotFound}
 	adapter := New(core, []byte("fuse-session"))
+	t.Cleanup(adapter.Close)
 
 	data, errno := adapter.Read(ctx, 7, 9, 0, 16)
 	require.Equal(t, syscall.ENOENT, errno)
@@ -129,11 +135,43 @@ func TestAdapterStopsReadWhenLeaseRefreshFails(t *testing.T) {
 
 func TestUnsupportedOperationsReturnExplicitErrno(t *testing.T) {
 	adapter := New(&fakeCore{}, []byte("client-a"))
+	t.Cleanup(adapter.Close)
 
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.Link(context.Background()))
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.Symlink(context.Background()))
 	require.Equal(t, syscall.ENOSYS, adapter.Readlink(context.Background()))
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.FileLock(context.Background()))
+}
+
+func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{
+		openFH:    9,
+		refreshCh: make(chan openHandleRefresh, 4),
+	}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(10*time.Millisecond))
+	t.Cleanup(adapter.Close)
+
+	fh, errno := adapter.Open(ctx, 7)
+	require.Zero(t, errno)
+	require.EqualValues(t, 9, fh)
+	require.EqualValues(t, 7, core.openInode)
+	require.Equal(t, []byte("fuse-session"), core.openClientID)
+
+	select {
+	case got := <-core.refreshCh:
+		require.EqualValues(t, 7, got.inode)
+		require.EqualValues(t, 9, got.fh)
+		require.Equal(t, []byte("fuse-session"), got.clientID)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for open handle keepalive")
+	}
+}
+
+type openHandleRefresh struct {
+	inode    uint64
+	fh       uint64
+	clientID []byte
 }
 
 type fakeCore struct {
@@ -155,10 +193,16 @@ type fakeCore struct {
 	releaseClientID []byte
 	releaseErr      error
 
+	openInode    uint64
+	openClientID []byte
+	openFH       uint64
+	openErr      error
+
 	refreshInode    uint64
 	refreshFH       uint64
 	refreshClientID []byte
 	refreshErr      error
+	refreshCh       chan openHandleRefresh
 
 	readCalled bool
 	readData   []byte
@@ -191,8 +235,10 @@ func (*fakeCore) SetAttr(
 	return filesystem.Stat{}, nil
 }
 
-func (*fakeCore) Open(context.Context, uint64, []byte) (uint64, error) {
-	return 0, nil
+func (f *fakeCore) Open(_ context.Context, inode uint64, clientID []byte) (uint64, error) {
+	f.openInode = inode
+	f.openClientID = append([]byte(nil), clientID...)
+	return f.openFH, f.openErr
 }
 
 func (f *fakeCore) Read(context.Context, uint64, uint64, uint64, uint64) ([]byte, error) {
@@ -223,6 +269,16 @@ func (f *fakeCore) RefreshOpenHandleLease(_ context.Context, inode uint64, fh ui
 	f.refreshInode = inode
 	f.refreshFH = fh
 	f.refreshClientID = append([]byte(nil), clientID...)
+	if f.refreshCh != nil {
+		select {
+		case f.refreshCh <- openHandleRefresh{
+			inode:    inode,
+			fh:       fh,
+			clientID: append([]byte(nil), clientID...),
+		}:
+		default:
+		}
+	}
 	return f.refreshErr
 }
 

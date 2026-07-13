@@ -514,8 +514,12 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 	if err != nil {
 		return err
 	}
-	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+	meta, err := s.inodeAt(ctx, inode, ts)
+	if err != nil {
 		return err
+	}
+	if meta.Orphaned || meta.Nlink == 0 {
+		return ErrNotFound
 	}
 	refKey := fskeys.RefKey(inode, clientID, fh)
 	if _, err := s.store.GetAt(ctx, refKey, ts); err == nil {

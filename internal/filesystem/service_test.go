@@ -596,6 +596,28 @@ func TestServiceUnlinkOpenFileKeepsInodeReadable(t *testing.T) {
 	require.Equal(t, []byte("payload"), got)
 }
 
+func TestServiceOpenRejectsOrphanedInode(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+	_, err = svc.Open(ctx, file.Inode, []byte("client-b"))
+	require.ErrorIs(t, err, ErrNotFound)
+
+	got, err := svc.Read(ctx, file.Inode, file.FH, 0, 16)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), got)
+}
+
 func TestServiceUnlinkFencesObservedOpenRef(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
