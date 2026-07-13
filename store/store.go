@@ -311,6 +311,9 @@ type MVCCStore interface {
 	// ImportVersions applies a migration import batch idempotently by
 	// (jobID, bracketID, batchSeq), preserving tombstones and expireAt.
 	ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
+	// ImportVersionsRaft is the raft-apply variant of ImportVersions. It
+	// preserves the same idempotency contract while using the FSM write path.
+	ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
 	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)

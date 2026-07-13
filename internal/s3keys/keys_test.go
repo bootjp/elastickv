@@ -18,6 +18,25 @@ func TestBucketMetaKey_RoundTripsZeroByteSegments(t *testing.T) {
 	require.Equal(t, bucket, parsed)
 }
 
+func TestBucketGenerationKey_RoundTripsZeroByteSegments(t *testing.T) {
+	t.Parallel()
+
+	bucket := string([]byte{'b', 'u', 0x00, 'c', 'k', 'e', 't'})
+	key := BucketGenerationKey(bucket)
+
+	parsed, ok := ParseBucketGenerationKey(key)
+	require.True(t, ok)
+	require.Equal(t, bucket, parsed)
+}
+
+func TestParseBucketGenerationKey_RejectsNonGenerationKey(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := ParseBucketGenerationKey(BucketMetaKey("bucket"))
+	require.False(t, ok)
+	require.Empty(t, parsed)
+}
+
 func TestObjectManifestKey_RoundTripsZeroByteSegments(t *testing.T) {
 	t.Parallel()
 

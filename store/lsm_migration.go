@@ -196,6 +196,14 @@ func (s *pebbleStore) decodeExportedPebbleVersion(iter *pebble.Iterator, userKey
 }
 
 func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.importVersionsWithOpts(ctx, opts, s.directApplyWriteOpts(), true)
+}
+
+func (s *pebbleStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.importVersionsWithOpts(ctx, opts, s.raftApplyWriteOpts(), false)
+}
+
+func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVersionsOptions, writeOpts *pebble.WriteOptions, gateRegistration bool) (ImportVersionsResult, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -211,7 +219,7 @@ func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOpt
 	}
 
 	batchMax := importBatchMaxTS(opts.Versions)
-	if err := s.commitPebbleImportBatch(opts, batchMax); err != nil {
+	if err := s.commitPebbleImportBatch(opts, batchMax, writeOpts, gateRegistration); err != nil {
 		return ImportVersionsResult{}, errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "import_versions",
@@ -244,12 +252,10 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 	return false, nil, nil
 }
 
-func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64) error {
+func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	// Keep the existing import registration-gate behavior; promotion opts out
-	// at its call site because it replays committed Raft entries.
-	if err := s.applyImportVersionsBatch(batch, opts.Versions, true); err != nil {
+	if err := s.applyImportVersionsBatch(batch, opts.Versions, gateRegistration); err != nil {
 		return err
 	}
 	if err := batch.Set(migrationAckKey(opts.JobID, opts.BracketID), encodeMigrationImportAck(migrationImportAck{
@@ -263,7 +269,7 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 		return err
 	}
 	defer unlock()
-	if err := batch.Commit(s.directApplyWriteOpts()); err != nil {
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	if batchMax > 0 {

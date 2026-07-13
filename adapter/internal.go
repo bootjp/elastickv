@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -142,7 +143,17 @@ func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersion
 	if req.GetKeyFamily() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
 	}
+	if exportRangeVersionsRequestFullyUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires a raw or route bound"))
+	}
 	return nil
+}
+
+func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRangeStart()) == 0 &&
+		len(req.GetRangeEnd()) == 0 &&
+		len(req.GetRouteStart()) == 0 &&
+		len(req.GetRouteEnd()) == 0
 }
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
@@ -341,6 +352,9 @@ func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.Export
 
 func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
 	routeFilter := kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+	if migrationFamilyRequiresDecodedS3(req.GetKeyFamily()) {
+		routeFilter = decodedS3BucketRouteFilter(req.GetKeyFamily(), req.GetRouteStart(), req.GetRouteEnd())
+	}
 	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
 	bracket := distribution.MigrationBracket{
 		Family:               req.GetKeyFamily(),
@@ -351,6 +365,36 @@ func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool
 	}
 	return func(rawKey []byte) bool {
 		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
+	}
+}
+
+func migrationFamilyRequiresDecodedS3(family uint32) bool {
+	return family == distribution.MigrationFamilyS3BucketMeta ||
+		family == distribution.MigrationFamilyS3BucketGeneration
+}
+
+func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
+	return func(rawKey []byte) bool {
+		bucket, ok := decodedS3BucketName(family, rawKey)
+		if !ok {
+			return false
+		}
+		routeKey := s3keys.RouteKey(bucket, 0, "")
+		if len(routeStart) > 0 && bytes.Compare(routeKey, routeStart) < 0 {
+			return false
+		}
+		return len(routeEnd) == 0 || bytes.Compare(routeKey, routeEnd) < 0
+	}
+}
+
+func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
+	switch family {
+	case distribution.MigrationFamilyS3BucketMeta:
+		return s3keys.ParseBucketMetaKey(rawKey)
+	case distribution.MigrationFamilyS3BucketGeneration:
+		return s3keys.ParseBucketGenerationKey(rawKey)
+	default:
+		return "", false
 	}
 }
 

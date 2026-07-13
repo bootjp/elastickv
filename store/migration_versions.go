@@ -374,6 +374,10 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
 }
 
+func (s *mvccStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.ImportVersions(ctx, opts)
+}
+
 func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()

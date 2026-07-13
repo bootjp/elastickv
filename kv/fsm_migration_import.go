@@ -34,7 +34,7 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 	if err := proto.Unmarshal(data, req); err != nil {
 		return errors.WithStack(err)
 	}
-	result, err := f.store.ImportVersions(ctx, store.ImportVersionsOptions{
+	result, err := f.store.ImportVersionsRaft(ctx, store.ImportVersionsOptions{
 		JobID:     req.GetJobId(),
 		BracketID: req.GetBracketId(),
 		BatchSeq:  req.GetBatchSeq(),

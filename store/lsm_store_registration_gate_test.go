@@ -97,6 +97,30 @@ func TestRegistrationGate_DirectPathFailsClosedBeforeRegistration(t *testing.T) 
 		mustGet(t, f.mvcc, []byte("a"), 250, "1")
 	})
 
+	t.Run("ImportVersions", func(t *testing.T) {
+		t.Parallel()
+		registered := false
+		f := newRegGateStore(t, &registered)
+		opts := ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 1,
+			BatchSeq:  1,
+			Cursor:    []byte("cursor"),
+			Versions: []MVCCVersion{
+				{Key: []byte("import"), CommitTS: 100, Value: []byte("v")},
+			},
+		}
+		_, err := f.mvcc.ImportVersions(ctx, opts)
+		if !errors.Is(err, ErrWriterNotRegistered) {
+			t.Fatalf("ImportVersions pre-registration: got %v, want ErrWriterNotRegistered", err)
+		}
+		registered = true
+		if _, err := f.mvcc.ImportVersions(ctx, opts); err != nil {
+			t.Fatalf("ImportVersions post-registration: %v", err)
+		}
+		mustGet(t, f.mvcc, []byte("import"), 150, "v")
+	})
+
 	t.Run("ExpireAt", func(t *testing.T) {
 		t.Parallel()
 		// ExpireAt re-encrypts the latest value, so seed a value first
@@ -134,6 +158,20 @@ func TestRegistrationGate_FSMApplyPathNeverGated(t *testing.T) {
 		t.Fatalf("ApplyMutationsRaft must not be gated, got: %v", err)
 	}
 	mustGet(t, f.mvcc, []byte("raft"), 150, "applied")
+
+	_, err := f.mvcc.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:     2,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor"),
+		Versions: []MVCCVersion{
+			{Key: []byte("raft-import"), CommitTS: 200, Value: []byte("imported")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ImportVersionsRaft must not be gated, got: %v", err)
+	}
+	mustGet(t, f.mvcc, []byte("raft-import"), 250, "imported")
 }
 
 func TestRegistrationGate_PromoteVersionsNeverGated(t *testing.T) {
