@@ -121,7 +121,7 @@ func ListClaimScanPrefix(userKey []byte) []byte {
 
 // IsListMetaDeltaKey reports whether the key is a list metadata delta key.
 func IsListMetaDeltaKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix))
+	return ExtractListUserKeyFromDelta(key) != nil
 }
 
 // IsListClaimKey reports whether the key is a list claim key.
@@ -131,15 +131,20 @@ func IsListClaimKey(key []byte) bool {
 
 // ExtractListUserKeyFromDelta extracts the logical user key from a list delta key.
 func ExtractListUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
+	if !bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
+		return nil
+	}
+	trimmed := key[len(ListMetaDeltaPrefix):]
 	if len(trimmed) < wideColKeyLenSize+deltaKeyTSSize+deltaKeySeqSize {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
+	wantLen := uint64(wideColKeyLenSize) + uint64(ukLen) + uint64(deltaKeyTSSize+deltaKeySeqSize)
+	if uint64(len(trimmed)) != wantLen {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	userEnd := wideColKeyLenSize + int(ukLen) //nolint:gosec // exact length check above bounds ukLen to len(trimmed)
+	return trimmed[wideColKeyLenSize:userEnd]
 }
 
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.

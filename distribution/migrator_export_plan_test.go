@@ -145,6 +145,86 @@ func TestPlanMigrationBracketsNormalizesEmptyRouteEnd(t *testing.T) {
 	require.True(t, user.ContainsRawKey([]byte("z")))
 }
 
+func TestSplitJobPlanNormalizesEmptySourceRouteEnd(t *testing.T) {
+	t.Parallel()
+
+	source := RouteDescriptor{
+		RouteID: 9,
+		Start:   []byte("a"),
+		End:     []byte{},
+		GroupID: 3,
+		State:   RouteStateActive,
+	}
+	job := SplitJob{
+		JobID:         1,
+		SourceRouteID: source.RouteID,
+		SplitKey:      []byte("m"),
+		TargetGroupID: source.GroupID,
+		Phase:         SplitJobPhasePlanned,
+	}
+
+	planned, err := InitializeSplitJobPlan(job, source, 1000)
+	require.NoError(t, err)
+	for _, progress := range planned.BracketProgress {
+		if progress.Family != MigrationFamilyUser {
+			continue
+		}
+		require.False(t, progress.Done)
+		return
+	}
+	require.Fail(t, "missing user bracket progress")
+}
+
+func TestMigrationBracketContainsRoutedKeyForS3BucketAuxiliaryState(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	byFamily := bracketsByFamily(brackets)
+
+	routeStart := s3keys.RouteKey("bucket-b", 7, "a")
+	routeEnd := s3keys.RouteKey("bucket-b", 7, "z")
+	for _, tc := range []struct {
+		name   string
+		family uint32
+		key    []byte
+		want   bool
+	}{
+		{name: "meta same bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), want: true},
+		{name: "generation same bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), want: true},
+		{name: "meta different bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-c"), want: false},
+		{name: "generation different bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-c"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := byFamily[tc.family].ContainsRoutedKey(tc.key, routeStart, routeEnd, s3keys.ExtractRouteKey)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestMigrationBracketContainsRoutedKeyUsesObjectRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	manifest := bracketsByFamily(brackets)[MigrationFamilyS3ObjectManifest]
+
+	key := s3keys.ObjectManifestKey("bucket-b", 7, "m")
+	require.True(t, manifest.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+		s3keys.ExtractRouteKey,
+	))
+	require.False(t, manifest.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-c", 1, "a"),
+		nil,
+		s3keys.ExtractRouteKey,
+	))
+}
+
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	t.Parallel()
 
