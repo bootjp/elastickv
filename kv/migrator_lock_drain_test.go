@@ -43,3 +43,14 @@ func TestPendingTxnLocksInRouteFiltersLocksByRouteKey(t *testing.T) {
 	require.True(t, pending[0].IsPrimaryKey)
 	require.Equal(t, txnLockKey(itemKey), pending[0].LockKey)
 }
+
+func TestPendingTxnLocksInRouteHonorsCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	pending, err := PendingTxnLocksInRoute(ctx, store.NewMVCCStore(), nil, nil, ^uint64(0), 10)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, pending)
+}

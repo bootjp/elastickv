@@ -38,7 +38,7 @@ func PendingTxnLocksInRoute(ctx context.Context, st store.MVCCStore, routeStart,
 	out := make([]TxnLockDrainEntry, 0, min(limit, lockPageLimit))
 
 	for {
-		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
+		lockKVs, nextCursor, done, err := scanTxnLockDrainPage(ctx, st, cursor, end, ts)
 		if err != nil {
 			return nil, err
 		}
@@ -60,6 +60,13 @@ func PendingTxnLocksInRoute(ctx context.Context, st store.MVCCStore, routeStart,
 		}
 		cursor = nextCursor
 	}
+}
+
+func scanTxnLockDrainPage(ctx context.Context, st store.MVCCStore, cursor, end []byte, ts uint64) ([]*store.KVPair, []byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+	return scanTxnLockPageAt(ctx, st, cursor, end, ts)
 }
 
 func txnLockDrainEntry(kvp *store.KVPair, filter func([]byte) bool) (TxnLockDrainEntry, bool, error) {

@@ -188,7 +188,7 @@ func (s RouteHistorySnapshot) IntersectingRoutes(start, end []byte) []Route {
 			continue
 		}
 		if end != nil && bytes.Compare(r.Start, end) >= 0 {
-			continue
+			break
 		}
 		out = append(out, cloneRoute(r))
 	}
@@ -395,7 +395,7 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		}
 		// Route starts at or after scan ends: end != nil && rStart >= end
 		if end != nil && bytes.Compare(r.Start, end) >= 0 {
-			continue
+			break
 		}
 		// Route intersects with scan range
 		result = append(result, Route{
