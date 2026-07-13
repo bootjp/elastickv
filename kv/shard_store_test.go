@@ -10,6 +10,98 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+				MinWriteTSExclusive:    100,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
+}
+
+func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, []byte("live-old"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged-new"), 20, 0))
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-new"), got)
+
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, []byte("live-new"), 30, 0))
+	got, err = st.GetAt(ctx, rawKey, 35)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live-new"), got)
+
+	require.NoError(t, group.Store.DeleteAt(ctx, stagedKey, 40))
+	_, err = st.GetAt(ctx, rawKey, 45)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("c"), []byte("live-c"), 30, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-b"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("d")), []byte("staged-d"), 15, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("e")), []byte("staged-e"), 40, 0))
+	require.NoError(t, group.Store.DeleteAt(ctx, []byte("d"), 25))
+
+	kvs, err := st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 50)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("staged-b")},
+		{Key: []byte("c"), Value: []byte("live-c")},
+		{Key: []byte("e"), Value: []byte("staged-e")},
+	}, kvs)
+
+	kvs, err = st.ReverseScanAt(ctx, []byte("a"), []byte("z"), 10, 50)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("e"), Value: []byte("staged-e")},
+		{Key: []byte("c"), Value: []byte("live-c")},
+		{Key: []byte("b"), Value: []byte("staged-b")},
+	}, kvs)
+
+	ts, exists, err := st.LatestCommitTS(ctx, []byte("b"))
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(20), ts)
+
+	ts, exists, err = st.LatestCommitTS(ctx, []byte("d"))
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(25), ts)
+
+	ts, exists, err = st.LatestCommitTS(ctx, []byte("e"))
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(40), ts)
+}
+
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 
