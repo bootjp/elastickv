@@ -172,6 +172,36 @@ func TestFillForwardedTxnCommitTS_StampsCommitTSValueOffset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, startTS+1, commitTS)
 	require.Equal(t, commitTS, binary.BigEndian.Uint64(value[4:12]))
+	require.Zero(t, reqs[0].Mutations[1].CommitTsValueOffset)
+}
+
+func TestFillForwardedTxnCommitTS_PrepareAllowsAlreadyStampedOffsets(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	value := make([]byte, 16)
+	mut := &pb.Mutation{
+		Op:                  pb.Op_PUT,
+		Key:                 []byte("k"),
+		Value:               value,
+		CommitTsValueOffset: 4,
+	}
+	require.NoError(t, kv.StampMutationCommitTS([]*pb.Mutation{mut}, 42))
+
+	reqs := []*pb.Request{
+		{
+			IsTxn:     true,
+			Phase:     pb.Phase_PREPARE,
+			Ts:        10,
+			Mutations: []*pb.Mutation{mut},
+		},
+	}
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, 10)
+	require.NoError(t, err)
+	require.Zero(t, commitTS)
+	require.Equal(t, uint64(42), binary.BigEndian.Uint64(value[4:12]))
+	require.Zero(t, mut.CommitTsValueOffset)
 }
 
 func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {

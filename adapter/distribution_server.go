@@ -230,14 +230,18 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	resp, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		Elems:   ops,
 		IsTxn:   true,
 		StartTS: readTS,
-	}); err != nil {
+	})
+	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
-	return s.loadCatalogSnapshotAtLeastVersion(ctx, nextVersion)
+	if resp == nil || resp.CommitTS == 0 {
+		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "split commit timestamp missing")
+	}
+	return s.loadCatalogSnapshotAtVersion(ctx, resp.CommitTS, nextVersion)
 }
 
 func buildCatalogSplitOps(
@@ -314,9 +318,10 @@ func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribut
 	return snapshot, nil
 }
 
-func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
+func (s *DistributionServer) loadCatalogSnapshotAtVersion(
 	ctx context.Context,
-	minVersion uint64,
+	readTS uint64,
+	wantVersion uint64,
 ) (distribution.CatalogSnapshot, error) {
 	attempts := s.reloadRetry.attempts
 	if attempts <= 0 {
@@ -329,11 +334,11 @@ func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
 
 	var last distribution.CatalogSnapshot
 	for attempt := 0; attempt < attempts; attempt++ {
-		snapshot, err := s.catalog.Snapshot(ctx)
+		snapshot, err := s.catalog.SnapshotAt(ctx, readTS)
 		if err != nil {
 			return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "reload route catalog: %v", err)
 		}
-		if snapshot.Version >= minVersion {
+		if snapshot.Version == wantVersion {
 			return snapshot, nil
 		}
 		last = snapshot
@@ -346,9 +351,10 @@ func (s *DistributionServer) loadCatalogSnapshotAtLeastVersion(
 	}
 	return distribution.CatalogSnapshot{}, grpcStatusErrorf(
 		codes.Internal,
-		"catalog split committed but local snapshot is stale: got %d, want at least %d",
+		"catalog split committed but local snapshot is stale at %d: got %d, want %d",
+		readTS,
 		last.Version,
-		minVersion,
+		wantVersion,
 	)
 }
 
@@ -485,6 +491,7 @@ func toProtoRouteDescriptor(route distribution.RouteDescriptor) *pb.RouteDescrip
 		RaftGroupId:   route.GroupID,
 		State:         toProtoRouteState(route.State),
 		ParentRouteId: route.ParentRouteID,
+		SplitAtHlc:    route.SplitAtHLC,
 	}
 }
 

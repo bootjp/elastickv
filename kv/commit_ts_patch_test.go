@@ -20,6 +20,7 @@ func TestStampMutationCommitTS(t *testing.T) {
 
 	require.NoError(t, StampMutationCommitTS(muts, 42))
 	require.Equal(t, uint64(42), binary.BigEndian.Uint64(value[4:12]))
+	require.Zero(t, muts[0].CommitTsValueOffset)
 }
 
 func TestStampMutationCommitTSRejectsInvalidPatch(t *testing.T) {

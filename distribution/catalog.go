@@ -237,18 +237,26 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	if err := ensureCatalogStore(s); err != nil {
 		return CatalogSnapshot{}, err
 	}
+	return s.SnapshotAt(ctx, s.store.LastCommitTS())
+}
+
+// SnapshotAt reads a consistent route catalog snapshot at a specific MVCC
+// timestamp.
+func (s *CatalogStore) SnapshotAt(ctx context.Context, ts uint64) (CatalogSnapshot, error) {
+	if err := ensureCatalogStore(s); err != nil {
+		return CatalogSnapshot{}, err
+	}
 	ctx = contextOrBackground(ctx)
 
-	readTS := s.store.LastCommitTS()
-	version, err := s.versionAt(ctx, readTS)
+	version, err := s.versionAt(ctx, ts)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	routes, err := s.routesAt(ctx, readTS)
+	routes, err := s.routesAt(ctx, ts)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: readTS}, nil
+	return CatalogSnapshot{Version: version, Routes: routes, ReadTS: ts}, nil
 }
 
 // Version reads only the durable catalog version at the latest commit

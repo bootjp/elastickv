@@ -86,6 +86,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 			GroupID:       2,
 			State:         distribution.RouteStateWriteFenced,
 			ParentRouteID: 1,
+			SplitAtHLC:    99,
 		},
 		{
 			RouteID:       1,
@@ -112,6 +113,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	require.Equal(t, uint64(2), resp.Routes[1].RouteId)
 	require.Nil(t, resp.Routes[1].End)
 	require.Equal(t, pb.RouteState_ROUTE_STATE_WRITE_FENCED, resp.Routes[1].State)
+	require.Equal(t, uint64(99), resp.Routes[1].SplitAtHlc)
 }
 
 func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
@@ -175,6 +177,8 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, []byte("m"), resp.Right.End)
 	require.Equal(t, uint64(1), resp.Right.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Right.ParentRouteId)
+	require.NotZero(t, resp.Left.SplitAtHlc)
+	require.Equal(t, resp.Left.SplitAtHlc, resp.Right.SplitAtHlc)
 
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
@@ -186,6 +190,7 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
 	require.NotZero(t, snapshot.Routes[0].SplitAtHLC)
 	require.Equal(t, snapshot.Routes[0].SplitAtHLC, snapshot.Routes[1].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, resp.Left.SplitAtHlc)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))
@@ -319,6 +324,8 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.True(t, found)
 	require.Equal(t, coordinator.lastCommitTS, left.SplitAtHLC)
 	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -395,7 +402,7 @@ func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
 	require.Equal(t, uint64(6), second.Right.RouteId)
 }
 
-func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing.T) {
+func TestDistributionServerSplitRange_ReturnsExactCommittedSplitVersion(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -434,8 +441,20 @@ func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing
 		SplitKey:               []byte("g"),
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), resp.CatalogVersion)
-	require.Equal(t, uint64(3), engine.Version())
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+	require.Equal(t, uint64(2), engine.Version())
+	require.Equal(t, uint64(3), resp.Left.RouteId)
+	require.Equal(t, uint64(4), resp.Right.RouteId)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	committed, err := catalog.SnapshotAt(ctx, coordinator.lastCommitTS)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), committed.Version)
+
+	latest, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), latest.Version)
 }
 
 func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {

@@ -28,6 +28,7 @@ func StampMutationCommitTS(muts []*pb.Mutation, commitTS uint64) error {
 			return errors.WithStack(ErrInvalidRequest)
 		}
 		binary.BigEndian.PutUint64(mut.Value[offset:offset+commitTSPatchLen], commitTS)
+		mut.CommitTsValueOffset = 0
 	}
 	return nil
 }

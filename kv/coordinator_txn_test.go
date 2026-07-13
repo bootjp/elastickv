@@ -140,6 +140,7 @@ func TestCoordinateDispatchTxn_StampsCommitTSValueOffsetWithoutMutatingElem(t *t
 
 	got := tx.reqs[0][0].Mutations[1].Value
 	require.Equal(t, commitTS, binary.BigEndian.Uint64(got[4:12]))
+	require.Zero(t, tx.reqs[0][0].Mutations[1].CommitTsValueOffset)
 	require.Zero(t, binary.BigEndian.Uint64(value[4:12]))
 }
 
