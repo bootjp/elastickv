@@ -540,6 +540,15 @@ type ExportRangeVersionsRequest struct {
 	RouteStart      []byte                 `protobuf:"bytes,7,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
 	RouteEnd        []byte                 `protobuf:"bytes,8,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
 	MaxScannedBytes uint64                 `protobuf:"varint,9,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	// Migration bracket family tag copied into exported MVCCVersion.key_family.
+	// Zero is invalid on the RPC path: callers must pass the bracket family they
+	// are exporting so target promotion can keep family-specific metadata.
+	KeyFamily uint32 `protobuf:"varint,10,opt,name=key_family,json=keyFamily,proto3" json:"key_family,omitempty"`
+	// Applies the user-bracket exclusion list for known internal families.
+	ExcludeKnownInternal bool `protobuf:"varint,11,opt,name=exclude_known_internal,json=excludeKnownInternal,proto3" json:"exclude_known_internal,omitempty"`
+	// Bracket-local raw-prefix exclusions, e.g. non-partitioned SQS brackets
+	// excluding their partitioned subprefixes.
+	ExcludePrefixes [][]byte `protobuf:"bytes,12,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -635,6 +644,27 @@ func (x *ExportRangeVersionsRequest) GetMaxScannedBytes() uint64 {
 		return x.MaxScannedBytes
 	}
 	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetKeyFamily() uint32 {
+	if x != nil {
+		return x.KeyFamily
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetExcludeKnownInternal() bool {
+	if x != nil {
+		return x.ExcludeKnownInternal
+	}
+	return false
+}
+
+func (x *ExportRangeVersionsRequest) GetExcludePrefixes() [][]byte {
+	if x != nil {
+		return x.ExcludePrefixes
+	}
+	return nil
 }
 
 type ExportRangeVersionsResponse struct {
@@ -929,7 +959,7 @@ const file_internal_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
 	"\x14RelayPublishResponse\x12 \n" +
-	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xc5\x02\n" +
+	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xc5\x03\n" +
 	"\x1aExportRangeVersionsRequest\x12\x1f\n" +
 	"\vrange_start\x18\x01 \x01(\fR\n" +
 	"rangeStart\x12\x1b\n" +
@@ -942,7 +972,12 @@ const file_internal_proto_rawDesc = "" +
 	"\vroute_start\x18\a \x01(\fR\n" +
 	"routeStart\x12\x1b\n" +
 	"\troute_end\x18\b \x01(\fR\brouteEnd\x12*\n" +
-	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\"|\n" +
+	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\x12\x1d\n" +
+	"\n" +
+	"key_family\x18\n" +
+	" \x01(\rR\tkeyFamily\x124\n" +
+	"\x16exclude_known_internal\x18\v \x01(\bR\x14excludeKnownInternal\x12)\n" +
+	"\x10exclude_prefixes\x18\f \x03(\fR\x0fexcludePrefixes\"|\n" +
 	"\x1bExportRangeVersionsResponse\x12(\n" +
 	"\bversions\x18\x01 \x03(\v2\f.MVCCVersionR\bversions\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\fR\n" +

@@ -647,6 +647,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			coordinator.Clock(),
 			relay,
 			WithInternalStore(st),
+			WithInternalMigrationProposer(result.Engine),
 		))
 		internalraftadmin.RegisterOperationalServices(opsCtx, s, result.Engine, []string{"Example"})
 

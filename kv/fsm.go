@@ -310,11 +310,10 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
-	if resp, handled := f.applyReservedOpcode(data); handled {
+	ctx := context.TODO()
+	if resp, handled := f.applyReservedOpcode(ctx, data); handled {
 		return resp
 	}
-
-	ctx := context.TODO()
 
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
@@ -356,13 +355,15 @@ func (f *kvFSM) Apply(data []byte) any {
 // opcode with ErrEncryptionApply, which the engine's HaltApply seam
 // recognises as a halt — same fail-closed shape as the Stage 3
 // raft-envelope unwrap path.
-func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
+func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool) {
 	if len(data) == 0 {
 		return nil, false
 	}
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeMigrationImport:
+		return f.applyMigrationImport(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -394,6 +395,10 @@ const (
 	// These entries do not touch the MVCC store; they only advance the shared HLC
 	// physicalCeiling so the logical counter can continue to increment in memory.
 	raftEncodeHLCLease byte = 0x02
+	// raftEncodeMigrationImport carries a target-group range-migration import
+	// batch. Every target voter applies the raw MVCC versions, import ack, and
+	// migration HLC floor before the RPC handler returns success.
+	raftEncodeMigrationImport byte = 0x09
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {

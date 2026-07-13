@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -27,6 +28,12 @@ func WithInternalStore(st store.MVCCStore) InternalOption {
 	}
 }
 
+func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.migrationProposer = proposer
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -47,6 +54,7 @@ type Internal struct {
 	tsAllocator        kv.TimestampAllocator
 	relay              *RedisPubSubRelay
 	store              store.MVCCStore
+	migrationProposer  raftengine.Proposer
 
 	pb.UnimplementedInternalServer
 }
@@ -102,20 +110,40 @@ func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) 
 }
 
 func (i *Internal) ExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
+	if err := i.validateExportRangeVersionsRequest(req); err != nil {
+		return err
+	}
+	if err := i.verifyInternalLeader(stream.Context()); err != nil {
+		return err
+	}
+	return i.streamExportRangeVersions(req, stream)
+}
+
+func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersionsRequest) error {
 	if req == nil {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "export range versions request is nil"))
 	}
 	if i.store == nil {
 		return errors.WithStack(status.Error(codes.FailedPrecondition, "migration export store is not configured"))
 	}
-	if err := i.verifyInternalLeader(stream.Context()); err != nil {
-		return err
+	if req.GetMaxCommitTs() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export max_commit_ts is required"))
 	}
+	if req.GetKeyFamily() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
+	}
+	return nil
+}
+
+func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
 	opts := exportRangeVersionsOptions(req)
 	for {
 		result, err := i.store.ExportVersions(stream.Context(), opts)
 		if err != nil {
 			return errors.WithStack(err)
+		}
+		if !result.Done && bytes.Equal(opts.Cursor, result.NextCursor) {
+			return errors.WithStack(status.Error(codes.Internal, "migration export cursor did not progress"))
 		}
 		if err := stream.Send(&pb.ExportRangeVersionsResponse{
 			Versions:   protoMVCCVersionsFromStore(result.Versions),
@@ -135,29 +163,23 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if req == nil {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "import range versions request is nil"))
 	}
-	if i.store == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import store is not configured"))
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import proposer is not configured"))
 	}
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
-	result, err := i.store.ImportVersions(ctx, store.ImportVersionsOptions{
-		JobID:     req.GetJobId(),
-		BracketID: req.GetBracketId(),
-		BatchSeq:  req.GetBatchSeq(),
-		Cursor:    req.GetCursor(),
-		Versions:  storeMVCCVersionsFromProto(req.GetVersions()),
-	})
+	result, err := i.proposeMigrationImport(ctx, req)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if i.clock != nil && result.MaxImportedTS > 0 {
+		i.clock.Observe(result.MaxImportedTS)
 	}
 	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor}, nil
 }
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
-	if i.leader == nil {
-		return nil
-	}
 	if i.leader.State() != raftengine.StateLeader {
 		return errors.WithStack(ErrNotLeader)
 	}
@@ -165,6 +187,33 @@ func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 		return errors.WithStack(ErrNotLeader)
 	}
 	return nil
+}
+
+func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRangeVersionsRequest) (store.ImportVersionsResult, error) {
+	cmd, err := kv.MarshalMigrationImportCommand(req)
+	if err != nil {
+		return store.ImportVersionsResult{}, errors.WithStack(err)
+	}
+	result, err := i.migrationProposer.Propose(ctx, cmd)
+	if err != nil {
+		return store.ImportVersionsResult{}, errors.WithStack(err)
+	}
+	if result == nil {
+		return store.ImportVersionsResult{}, errors.New("migration import proposal returned nil result")
+	}
+	switch resp := result.Response.(type) {
+	case store.ImportVersionsResult:
+		return resp, nil
+	case *store.ImportVersionsResult:
+		if resp == nil {
+			return store.ImportVersionsResult{}, errors.New("migration import apply returned nil result")
+		}
+		return *resp, nil
+	case error:
+		return store.ImportVersionsResult{}, errors.WithStack(resp)
+	default:
+		return store.ImportVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration import apply response type %T", resp))
+	}
 }
 
 func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
@@ -185,9 +234,36 @@ func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.Export
 		MaxVersions:          defaultMigrationExportMaxVersions,
 		MaxBytes:             chunkBytes,
 		MaxScannedBytes:      maxScannedBytes,
-		AcceptKey:            kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd()),
+		KeyFamily:            req.GetKeyFamily(),
+		AcceptKey:            migrationExportFilter(req),
 	}
 	return opts
+}
+
+func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	routeFilter := kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
+	bracket := distribution.MigrationBracket{
+		Family:               req.GetKeyFamily(),
+		Start:                bytes.Clone(req.GetRangeStart()),
+		End:                  bytes.Clone(req.GetRangeEnd()),
+		ExcludeKnownInternal: excludeKnownInternal,
+		ExcludePrefixes:      cloneByteSlices(req.GetExcludePrefixes()),
+	}
+	return func(rawKey []byte) bool {
+		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
+	}
+}
+
+func cloneByteSlices(in [][]byte) [][]byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([][]byte, len(in))
+	for i := range in {
+		out[i] = bytes.Clone(in[i])
+	}
+	return out
 }
 
 func protoMVCCVersionsFromStore(in []store.MVCCVersion) []*pb.MVCCVersion {
@@ -200,24 +276,6 @@ func protoMVCCVersionsFromStore(in []store.MVCCVersion) []*pb.MVCCVersion {
 			Value:     bytes.Clone(version.Value),
 			KeyFamily: version.KeyFamily,
 			ExpireAt:  version.ExpireAt,
-		})
-	}
-	return out
-}
-
-func storeMVCCVersionsFromProto(in []*pb.MVCCVersion) []store.MVCCVersion {
-	out := make([]store.MVCCVersion, 0, len(in))
-	for _, version := range in {
-		if version == nil {
-			continue
-		}
-		out = append(out, store.MVCCVersion{
-			Key:       bytes.Clone(version.GetKey()),
-			CommitTS:  version.GetCommitTs(),
-			Tombstone: version.GetTombstone(),
-			Value:     bytes.Clone(version.GetValue()),
-			KeyFamily: version.GetKeyFamily(),
-			ExpireAt:  version.GetExpireAt(),
 		})
 	}
 	return out

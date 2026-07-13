@@ -768,6 +768,7 @@ func startBoundGRPCServer(
 		coordinate.Clock(),
 		relay,
 		adapter.WithInternalStore(rt.store),
+		adapter.WithInternalMigrationProposer(rt.engine),
 	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)

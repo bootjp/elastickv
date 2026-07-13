@@ -91,6 +91,15 @@ message ExportRangeVersionsRequest {
   bytes route_start = 7;
   bytes route_end = 8;
   uint64 max_scanned_bytes = 9;
+  // Migration bracket family tag copied into exported MVCCVersion.key_family.
+  // Zero is invalid on the RPC path: callers must pass the bracket family they
+  // are exporting so target promotion can keep family-specific metadata.
+  uint32 key_family = 10;
+  // Applies the user-bracket exclusion list for known internal families.
+  bool exclude_known_internal = 11;
+  // Bracket-local raw-prefix exclusions, e.g. non-partitioned SQS brackets
+  // excluding their partitioned subprefixes.
+  repeated bytes exclude_prefixes = 12;
 }
 
 message ExportRangeVersionsResponse {

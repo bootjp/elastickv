@@ -2096,6 +2096,7 @@ func startRaftServers(
 			append(
 				internalTimestampOptions(coordinate),
 				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
