@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -178,6 +179,103 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 		floor, err = st.MigrationHLCFloor(ctx, 1)
 		require.NoError(t, err)
 		require.Equal(t, uint64(30), floor)
+	})
+}
+
+func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		promoter, ok := st.(MigrationPromoter)
+		require.True(t, ok)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+
+		stage := func(raw string) []byte {
+			return append([]byte("stage|"), []byte(raw)...)
+		}
+		targetKey := func(staged []byte) ([]byte, bool) {
+			return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+		}
+		prefix := []byte("stage|")
+
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("old"), 5, 0))
+		require.NoError(t, st.PutAt(ctx, stage("k"), []byte("v10"), 10, 0))
+		require.NoError(t, st.PutWithTTLAt(ctx, stage("k"), []byte("v20"), 20, 55))
+		require.NoError(t, st.DeleteAt(ctx, stage("k"), 30))
+		require.NoError(t, st.PutAt(ctx, stage("z"), []byte("z15"), 15, 0))
+
+		first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 2,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Equal(t, uint64(2), first.PromotedRows)
+		require.Equal(t, uint64(2), first.TotalPromotedRows)
+		require.Equal(t, uint64(30), first.MaxPromotedTS)
+		require.NotEmpty(t, first.NextCursor)
+		state, ok, err := stateReader.MigrationPromotionState(ctx, 99)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.False(t, state.Done)
+		require.Equal(t, first.NextCursor, state.Cursor)
+		require.Equal(t, uint64(2), state.PromotedRows)
+
+		got, err := st.GetAt(ctx, []byte("k"), 25)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v20"), got)
+		_, err = st.GetAt(ctx, []byte("k"), 35)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+
+		stagedLeft, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{
+			{Key: stage("k"), CommitTS: 10, Value: []byte("v10")},
+			{Key: stage("z"), CommitTS: 15, Value: []byte("z15")},
+		}, stagedLeft.Versions)
+
+		second, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Empty(t, second.NextCursor)
+		require.Equal(t, uint64(2), second.PromotedRows)
+		require.Equal(t, uint64(4), second.TotalPromotedRows)
+		require.Equal(t, uint64(15), second.MaxPromotedTS)
+		state, ok, err = stateReader.MigrationPromotionState(ctx, 99)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Empty(t, state.Cursor)
+		require.Equal(t, uint64(4), state.PromotedRows)
+
+		got, err = st.GetAt(ctx, []byte("k"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v10"), got)
+		got, err = st.GetAt(ctx, []byte("z"), 15)
+		require.NoError(t, err)
+		require.Equal(t, []byte("z15"), got)
+
+		stagedLeft, err = st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, stagedLeft.Done)
+		require.Empty(t, stagedLeft.Versions)
 	})
 }
 

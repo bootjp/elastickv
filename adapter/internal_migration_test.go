@@ -152,3 +152,38 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.Equal(t, uint64(30), floor)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
 }
+
+func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+	)
+
+	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
+	require.NoError(t, st.PutAt(ctx, staged, []byte("v"), 30, 0))
+
+	resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+		JobId:       7,
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.GetDone())
+	require.Equal(t, uint64(1), resp.GetPromotedRows())
+	require.Equal(t, uint64(30), resp.GetMaxPromotedTs())
+	require.Equal(t, uint64(1), proposer.calls)
+
+	got, err := st.GetAt(ctx, []byte("k"), 30)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+	_, err = st.GetAt(ctx, staged, 30)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}

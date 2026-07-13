@@ -60,13 +60,14 @@ func byteSliceComparator(a, b any) int {
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
 // deterministic iteration order and range scans.
 type mvccStore struct {
-	tree               *treemap.Map // key []byte -> []VersionedValue
-	mtx                sync.RWMutex
-	log                *slog.Logger
-	lastCommitTS       uint64
-	minRetainedTS      uint64
-	migrationAcks      map[string]migrationImportAck
-	migrationHLCFloors map[uint64]uint64
+	tree                *treemap.Map // key []byte -> []VersionedValue
+	mtx                 sync.RWMutex
+	log                 *slog.Logger
+	lastCommitTS        uint64
+	minRetainedTS       uint64
+	migrationAcks       map[string]migrationImportAck
+	migrationHLCFloors  map[uint64]uint64
+	migrationPromotions map[uint64]PromotionState
 	// writeConflicts mirrors the per-(kind, key_prefix) counter from
 	// the pebble-backed store so the in-memory implementation shows up
 	// in the same Prometheus series (even if the counts are usually
@@ -113,9 +114,10 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		migrationAcks:      make(map[string]migrationImportAck),
-		migrationHLCFloors: make(map[uint64]uint64),
-		writeConflicts:     newWriteConflictCounter(),
+		migrationAcks:       make(map[string]migrationImportAck),
+		migrationHLCFloors:  make(map[uint64]uint64),
+		migrationPromotions: make(map[uint64]PromotionState),
+		writeConflicts:      newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
 		opt(s)

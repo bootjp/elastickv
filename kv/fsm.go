@@ -364,6 +364,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyHLCLease(data[1:]), true
 	case data[0] == raftEncodeMigrationImport:
 		return f.applyMigrationImport(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationPromote:
+		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -399,6 +401,10 @@ const (
 	// batch. Every target voter applies the raw MVCC versions, import ack, and
 	// migration HLC floor before the RPC handler returns success.
 	raftEncodeMigrationImport byte = 0x09
+	// raftEncodeMigrationPromote carries a target-group range-migration staged
+	// data promotion chunk. Every target voter atomically copies staged MVCC
+	// versions into the live keyspace and removes the promoted staged rows.
+	raftEncodeMigrationPromote byte = 0x0b
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {

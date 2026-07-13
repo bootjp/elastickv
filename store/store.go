@@ -116,6 +116,49 @@ type ImportVersionsResult struct {
 	Duplicate     bool
 }
 
+// PromoteVersionsOptions atomically copies staged MVCC versions to their
+// target keys and physically removes the staged versions.
+type PromoteVersionsOptions struct {
+	JobID           uint64
+	StartKey        []byte
+	EndKey          []byte
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	TargetKey       func(stagedKey []byte) ([]byte, bool)
+}
+
+// PromoteVersionsResult reports one resumable staged-version promotion chunk.
+type PromoteVersionsResult struct {
+	NextCursor        []byte
+	Done              bool
+	PromotedRows      uint64
+	TotalPromotedRows uint64
+	PromotedBytes     uint64
+	MaxPromotedTS     uint64
+	ScannedBytes      uint64
+}
+
+// PromotionState is the target-local durable cursor for staged data promotion.
+type PromotionState struct {
+	Cursor       []byte
+	Done         bool
+	PromotedRows uint64
+	LastError    string
+}
+
+// MigrationPromoter is implemented by stores that can promote staged range
+// migration data into the live keyspace.
+type MigrationPromoter interface {
+	PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error)
+}
+
+// MigrationPromotionStateReader reads target-local staged promotion state.
+type MigrationPromotionStateReader interface {
+	MigrationPromotionState(ctx context.Context, jobID uint64) (PromotionState, bool, error)
+}
+
 // OpType describes a mutation kind.
 type OpType int
 
