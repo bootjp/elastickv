@@ -181,12 +181,13 @@ func (x *RawPutResponse) GetSuccess() bool {
 }
 
 type RawGetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Ts            uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                          // optional read timestamp; if zero, server uses current HLC
-	GroupId       uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Ts               uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                                                       // optional read timestamp; if zero, server uses current HLC
+	GroupId          uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for non-range-owned keyspaces
+	ReadRouteVersion uint64                 `protobuf:"varint,5,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RawGetRequest) Reset() {
@@ -236,6 +237,13 @@ func (x *RawGetRequest) GetTs() uint64 {
 func (x *RawGetRequest) GetGroupId() uint64 {
 	if x != nil {
 		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawGetRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
 	}
 	return 0
 }
@@ -397,10 +405,11 @@ func (x *RawDeleteResponse) GetSuccess() bool {
 }
 
 type RawLatestCommitTSRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	ReadRouteVersion uint64                 `protobuf:"varint,2,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -438,6 +447,13 @@ func (x *RawLatestCommitTSRequest) GetKey() []byte {
 		return x.Key
 	}
 	return nil
+}
+
+func (x *RawLatestCommitTSRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
+	}
+	return 0
 }
 
 type RawLatestCommitTSResponse struct {
@@ -493,15 +509,18 @@ func (x *RawLatestCommitTSResponse) GetExists() bool {
 }
 
 type RawScanAtRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StartKey      []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
-	EndKey        []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
-	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
-	Ts            uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
-	Reverse       bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
-	GroupId       uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	StartKey         []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
+	EndKey           []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
+	Limit            int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
+	Ts               uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
+	Reverse          bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
+	GroupId          uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for non-range-owned keyspaces
+	ReadRouteVersion uint64                 `protobuf:"varint,7,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	RouteStart       []byte                 `protobuf:"bytes,8,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`                      // route-key-normalized inclusive start, when already known
+	RouteEnd         []byte                 `protobuf:"bytes,9,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`                            // route-key-normalized exclusive end; empty means +infinity
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RawScanAtRequest) Reset() {
@@ -574,6 +593,27 @@ func (x *RawScanAtRequest) GetGroupId() uint64 {
 		return x.GroupId
 	}
 	return 0
+}
+
+func (x *RawScanAtRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
+	}
+	return 0
+}
+
+func (x *RawScanAtRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *RawScanAtRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
 }
 
 type RawKVPair struct {
@@ -2261,11 +2301,12 @@ const file_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"L\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"z\n" +
 	"\rRawGetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12\x19\n" +
-	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\"b\n" +
+	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\x12,\n" +
+	"\x12read_route_version\x18\x05 \x01(\x04R\x10readRouteVersion\"b\n" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
@@ -2274,19 +2315,24 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\",\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"Z\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
+	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xa3\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x8f\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x03R\x05limit\x12\x0e\n" +
 	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
 	"\areverse\x18\x05 \x01(\bR\areverse\x12\x19\n" +
-	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\"3\n" +
+	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\x12,\n" +
+	"\x12read_route_version\x18\a \x01(\x04R\x10readRouteVersion\x12\x1f\n" +
+	"\vroute_start\x18\b \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\t \x01(\fR\brouteEnd\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +

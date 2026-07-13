@@ -7,6 +7,8 @@ service Internal {
   // for internal leader redirect only
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
   rpc RelayPublish(RelayPublishRequest) returns (RelayPublishResponse) {}
+  rpc ExportRangeVersions(ExportRangeVersionsRequest) returns (stream ExportRangeVersionsResponse) {}
+  rpc ImportRangeVersions(ImportRangeVersionsRequest) returns (ImportRangeVersionsResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -77,4 +79,43 @@ message RelayPublishRequest {
 
 message RelayPublishResponse {
   int64 subscribers = 1;
+}
+
+message ExportRangeVersionsRequest {
+  bytes range_start = 1;
+  bytes range_end = 2;
+  uint64 max_commit_ts = 3;
+  uint64 min_commit_ts = 4;
+  bytes cursor = 5;
+  uint32 chunk_bytes = 6;
+  bytes route_start = 7;
+  bytes route_end = 8;
+  uint64 max_scanned_bytes = 9;
+}
+
+message ExportRangeVersionsResponse {
+  repeated MVCCVersion versions = 1;
+  bytes next_cursor = 2;
+  bool done = 3;
+}
+
+message MVCCVersion {
+  bytes key = 1;
+  uint64 commit_ts = 2;
+  bool tombstone = 3;
+  bytes value = 4;
+  uint32 key_family = 5;
+  uint64 expire_at = 6;
+}
+
+message ImportRangeVersionsRequest {
+  uint64 job_id = 1;
+  repeated MVCCVersion versions = 2;
+  bytes cursor = 3;
+  uint64 bracket_id = 4;
+  uint64 batch_seq = 5;
+}
+
+message ImportRangeVersionsResponse {
+  bytes acked_cursor = 1;
 }

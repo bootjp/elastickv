@@ -63,6 +63,9 @@ func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
+	if raw[0] != catalogRouteCodecVersionV1 {
+		t.Fatalf("zero-M2 route encoded version = %d, want v1", raw[0])
+	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
 		t.Fatalf("decode route: %v", err)
@@ -82,6 +85,9 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 	raw, err := EncodeRouteDescriptor(route)
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
+	}
+	if raw[0] != catalogRouteCodecVersionV1 {
+		t.Fatalf("zero-M2 nil-end route encoded version = %d, want v1", raw[0])
 	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
@@ -111,7 +117,103 @@ func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
-func TestRouteDescriptorCodecAcceptsForwardVersionTail(t *testing.T) {
+func TestRouteDescriptorCodecV2RoundTrip(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                1,
+		State:                  RouteStateActive,
+		ParentRouteID:          0,
+		StagedVisibilityActive: true,
+		MigrationJobID:         42,
+		MinWriteTSExclusive:    99,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	if raw[0] != catalogRouteCodecVersion {
+		t.Fatalf("M2 route encoded version = %d, want v2", raw[0])
+	}
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode v2 route: %v", err)
+	}
+	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecV2RoundTripNilEnd(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("m"),
+		End:                 nil,
+		GroupID:             1,
+		State:               RouteStateActive,
+		ParentRouteID:       0,
+		MinWriteTSExclusive: 123,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	if raw[0] != catalogRouteCodecVersion {
+		t.Fatalf("M2 nil-end route encoded version = %d, want v2", raw[0])
+	}
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode v2 nil-end route: %v", err)
+	}
+	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecRejectsV2TrailingBytes(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                1,
+		State:                  RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         42,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw = append(raw, 0xff)
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
+func TestRouteDescriptorCodecRejectsTruncatedV2Tail(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    nil,
+		GroupID:                1,
+		State:                  RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         42,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw = raw[:len(raw)-1]
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
+func TestRouteDescriptorCodecRejectsUnknownVersion(t *testing.T) {
 	route := RouteDescriptor{
 		RouteID:       1,
 		Start:         []byte("a"),
@@ -125,36 +227,11 @@ func TestRouteDescriptorCodecAcceptsForwardVersionTail(t *testing.T) {
 		t.Fatalf("encode route: %v", err)
 	}
 	raw[0] = catalogRouteCodecVersion + 1
-	raw = append(raw, bytes.Repeat([]byte{0xee}, catalogUint64Bytes)...)
 
-	got, err := DecodeRouteDescriptor(raw)
-	if err != nil {
-		t.Fatalf("decode forward route: %v", err)
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
 	}
-	assertRouteEqual(t, route, got)
-}
-
-func TestRouteDescriptorCodecAcceptsForwardVersionTailWithNilEnd(t *testing.T) {
-	route := RouteDescriptor{
-		RouteID:       1,
-		Start:         []byte("m"),
-		End:           nil,
-		GroupID:       1,
-		State:         RouteStateActive,
-		ParentRouteID: 0,
-	}
-	raw, err := EncodeRouteDescriptor(route)
-	if err != nil {
-		t.Fatalf("encode route: %v", err)
-	}
-	raw[0] = catalogRouteCodecVersion + 1
-	raw = append(raw, bytes.Repeat([]byte{0xee}, catalogUint64Bytes)...)
-
-	got, err := DecodeRouteDescriptor(raw)
-	if err != nil {
-		t.Fatalf("decode forward route: %v", err)
-	}
-	assertRouteEqual(t, route, got)
 }
 
 func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
@@ -175,6 +252,40 @@ func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
 	_, err = DecodeRouteDescriptor(raw)
 	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
 		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
+func TestRouteDescriptorHelpersIncludeMigrationFields(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                1,
+		State:                  RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         42,
+		MinWriteTSExclusive:    99,
+	}
+	cloned := CloneRouteDescriptor(route)
+	assertRouteEqual(t, route, cloned)
+
+	withoutFloor := cloned
+	withoutFloor.MinWriteTSExclusive = 0
+	if routeDescriptorEqual(route, withoutFloor) {
+		t.Fatal("routeDescriptorEqual must compare MinWriteTSExclusive")
+	}
+
+	withoutJob := cloned
+	withoutJob.MigrationJobID = 100
+	if routeDescriptorEqual(route, withoutJob) {
+		t.Fatal("routeDescriptorEqual must compare MigrationJobID")
+	}
+
+	withoutStaged := cloned
+	withoutStaged.StagedVisibilityActive = false
+	withoutStaged.MigrationJobID = 0
+	if routeDescriptorEqual(route, withoutStaged) {
+		t.Fatal("routeDescriptorEqual must compare StagedVisibilityActive")
 	}
 }
 
@@ -641,6 +752,15 @@ func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	}
 	if want.ParentRouteID != got.ParentRouteID {
 		t.Fatalf("parent route id mismatch: want %d, got %d", want.ParentRouteID, got.ParentRouteID)
+	}
+	if want.StagedVisibilityActive != got.StagedVisibilityActive {
+		t.Fatalf("staged visibility mismatch: want %v, got %v", want.StagedVisibilityActive, got.StagedVisibilityActive)
+	}
+	if want.MigrationJobID != got.MigrationJobID {
+		t.Fatalf("migration job id mismatch: want %d, got %d", want.MigrationJobID, got.MigrationJobID)
+	}
+	if want.MinWriteTSExclusive != got.MinWriteTSExclusive {
+		t.Fatalf("min write ts mismatch: want %d, got %d", want.MinWriteTSExclusive, got.MinWriteTSExclusive)
 	}
 	if want.State != got.State {
 		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)

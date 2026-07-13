@@ -22,7 +22,9 @@ const (
 
 	catalogVersionCodecVersion  byte = 1
 	catalogRouteCodecVersionMin byte = 1
-	catalogRouteCodecVersion    byte = 1
+	catalogRouteCodecVersionV1  byte = 1
+	catalogRouteCodecVersion    byte = 2
+	catalogRouteV2TailSize           = 1 + catalogUint64Bytes + catalogUint64Bytes
 
 	catalogScanPageSize          = 256
 	catalogSaveMetaMutationCount = 2
@@ -70,12 +72,15 @@ func (s RouteState) valid() bool {
 
 // RouteDescriptor is the durable representation of a route.
 type RouteDescriptor struct {
-	RouteID       uint64
-	Start         []byte
-	End           []byte
-	GroupID       uint64
-	State         RouteState
-	ParentRouteID uint64
+	RouteID                uint64
+	Start                  []byte
+	End                    []byte
+	GroupID                uint64
+	State                  RouteState
+	ParentRouteID          uint64
+	StagedVisibilityActive bool
+	MigrationJobID         uint64
+	MinWriteTSExclusive    uint64
 }
 
 // CatalogSnapshot is a point-in-time snapshot of the route catalog.
@@ -173,7 +178,11 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 	}
 
 	out := make([]byte, 0, routeDescriptorEncodedSize(route))
-	out = append(out, catalogRouteCodecVersion)
+	version := catalogRouteCodecVersionV1
+	if routeDescriptorRequiresV2(route) {
+		version = catalogRouteCodecVersion
+	}
+	out = append(out, version)
 	out = appendU64(out, route.RouteID)
 	out = appendU64(out, route.GroupID)
 	out = append(out, byte(route.State))
@@ -183,13 +192,15 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 
 	if route.End == nil {
 		out = append(out, 0)
-		return out, nil
+	} else {
+		out = append(out, 1)
+		out = appendU64(out, uint64(len(route.End)))
+		out = append(out, route.End...)
 	}
 
-	out = append(out, 1)
-	out = appendU64(out, uint64(len(route.End)))
-	out = append(out, route.End...)
-
+	if version == catalogRouteCodecVersion {
+		out = appendRouteDescriptorV2Tail(out, route)
+	}
 	return out, nil
 }
 
@@ -199,7 +210,7 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	version := raw[0]
-	if version < catalogRouteCodecVersionMin {
+	if version < catalogRouteCodecVersionMin || version > catalogRouteCodecVersion {
 		return RouteDescriptor{}, errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", raw[0])
 	}
 
@@ -212,8 +223,8 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if err != nil {
 		return RouteDescriptor{}, err
 	}
-	if version == catalogRouteCodecVersion && r.Len() != 0 {
-		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
+	if err := decodeRouteDescriptorTail(version, r, &route); err != nil {
+		return RouteDescriptor{}, err
 	}
 	if err := validateRouteDescriptor(route); err != nil {
 		return RouteDescriptor{}, err
@@ -363,18 +374,27 @@ func validateRouteDescriptor(route RouteDescriptor) error {
 	if route.End != nil && bytes.Compare(route.Start, route.End) >= 0 {
 		return errors.WithStack(ErrCatalogInvalidRouteRange)
 	}
+	if route.StagedVisibilityActive && route.MigrationJobID == 0 {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	if !route.StagedVisibilityActive && route.MigrationJobID != 0 {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
 	return nil
 }
 
 // CloneRouteDescriptor returns a deep copy of route.
 func CloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 	return RouteDescriptor{
-		RouteID:       route.RouteID,
-		Start:         CloneBytes(route.Start),
-		End:           CloneBytes(route.End),
-		GroupID:       route.GroupID,
-		State:         route.State,
-		ParentRouteID: route.ParentRouteID,
+		RouteID:                route.RouteID,
+		Start:                  CloneBytes(route.Start),
+		End:                    CloneBytes(route.End),
+		GroupID:                route.GroupID,
+		State:                  route.State,
+		ParentRouteID:          route.ParentRouteID,
+		StagedVisibilityActive: route.StagedVisibilityActive,
+		MigrationJobID:         route.MigrationJobID,
+		MinWriteTSExclusive:    route.MinWriteTSExclusive,
 	}
 }
 
@@ -698,7 +718,10 @@ func routeDescriptorEqual(left, right RouteDescriptor) bool {
 		bytes.Equal(left.End, right.End) &&
 		left.GroupID == right.GroupID &&
 		left.State == right.State &&
-		left.ParentRouteID == right.ParentRouteID
+		left.ParentRouteID == right.ParentRouteID &&
+		left.StagedVisibilityActive == right.StagedVisibilityActive &&
+		left.MigrationJobID == right.MigrationJobID &&
+		left.MinWriteTSExclusive == right.MinWriteTSExclusive
 }
 
 func appendU64(dst []byte, v uint64) []byte {
@@ -712,7 +735,64 @@ func routeDescriptorEncodedSize(route RouteDescriptor) int {
 	if route.End != nil {
 		size += catalogUint64Bytes + len(route.End)
 	}
+	if routeDescriptorRequiresV2(route) {
+		size += catalogRouteV2TailSize
+	}
 	return size
+}
+
+func routeDescriptorRequiresV2(route RouteDescriptor) bool {
+	return route.StagedVisibilityActive || route.MigrationJobID != 0 || route.MinWriteTSExclusive != 0
+}
+
+func appendRouteDescriptorV2Tail(out []byte, route RouteDescriptor) []byte {
+	if route.StagedVisibilityActive {
+		out = append(out, 1)
+	} else {
+		out = append(out, 0)
+	}
+	out = appendU64(out, route.MigrationJobID)
+	out = appendU64(out, route.MinWriteTSExclusive)
+	return out
+}
+
+func decodeRouteDescriptorTail(version byte, r *bytes.Reader, route *RouteDescriptor) error {
+	switch version {
+	case catalogRouteCodecVersionV1:
+		if r.Len() != 0 {
+			return errors.WithStack(ErrCatalogInvalidRouteRecord)
+		}
+		return nil
+	case catalogRouteCodecVersion:
+		return decodeRouteDescriptorV2Tail(r, route)
+	default:
+		return errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", version)
+	}
+}
+
+func decodeRouteDescriptorV2Tail(r *bytes.Reader, route *RouteDescriptor) error {
+	if r.Len() != catalogRouteV2TailSize {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	stagedRaw, err := r.ReadByte()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	switch stagedRaw {
+	case 0:
+		route.StagedVisibilityActive = false
+	case 1:
+		route.StagedVisibilityActive = true
+	default:
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	if err := binary.Read(r, binary.BigEndian, &route.MigrationJobID); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &route.MinWriteTSExclusive); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func decodeRouteDescriptorHeader(r *bytes.Reader) (RouteDescriptor, error) {

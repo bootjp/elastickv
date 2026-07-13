@@ -45,6 +45,7 @@ message RawGetRequest {
   bytes key = 1;
   uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
   uint64 group_id = 4; // optional explicit Raft group for non-range-owned keyspaces
+  uint64 read_route_version = 5; // stamped by server-side routing for migration read fences
 }
 
 message RawGetResponse {
@@ -64,6 +65,7 @@ message RawDeleteResponse {
 
 message RawLatestCommitTSRequest {
   bytes key = 1;
+  uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
 }
 
 message RawLatestCommitTSResponse {
@@ -78,6 +80,9 @@ message RawScanAtRequest {
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
   bool reverse = 5;
   uint64 group_id = 6; // optional explicit Raft group for non-range-owned keyspaces
+  uint64 read_route_version = 7; // stamped by server-side routing for migration read fences
+  bytes route_start = 8; // route-key-normalized inclusive start, when already known
+  bytes route_end = 9; // route-key-normalized exclusive end; empty means +infinity
 }
 
 message RawKVPair {
