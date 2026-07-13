@@ -33,6 +33,32 @@ func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
 }
 
+func applyTargetReadiness(t *testing.T, group *ShardGroup, floor uint64) {
+	t.Helper()
+	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    floor,
+		Armed:                  true,
+	}))
+}
+
+func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*ShardStore, *ShardGroup) {
+	t.Helper()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes:  []distribution.RouteDescriptor{route},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	return NewShardStore(engine, map[uint64]*ShardGroup{route.GroupID: group}), group
+}
+
 func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	t.Parallel()
 
@@ -55,6 +81,83 @@ func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	require.NoError(t, group.Store.DeleteAt(ctx, stagedKey, 40))
 	_, err = st.GetAt(ctx, rawKey, 45)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group, 100)
+
+	_, err := st.GetAt(ctx, []byte("k"), 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("v"), 120, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessAcceptsStagedDescriptor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	applyTargetReadiness(t, group, 100)
+	rawKey := []byte("k")
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 120, 0))
+
+	got, err := st.GetAt(ctx, rawKey, 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged"), got)
+}
+
+func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	applyTargetReadiness(t, group, 100)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
+
+	got, err := st.GetAt(ctx, []byte("k"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("low"), 100, 0)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.ExpireAt(ctx, []byte("k"), 200, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
+		Op:    store.OpTypePut,
+		Key:   []byte("n"),
+		Value: []byte("low"),
+	}}, nil, 0, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0)
+	require.NoError(t, err)
+
+	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
+		Op:    store.OpTypePut,
+		Key:   []byte("n"),
+		Value: []byte("ok"),
+	}}, nil, 0, 101)
+	require.NoError(t, err)
 }
 
 func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {

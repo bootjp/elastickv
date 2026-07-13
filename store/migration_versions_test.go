@@ -279,6 +279,85 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 	})
 }
 
+func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+		reader, ok := st.(MigrationTargetReadinessReader)
+		require.True(t, ok)
+
+		state := TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+			Armed:                  true,
+		}
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{state}, states)
+
+		states[0].RouteStart[0] = 'x'
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []byte("a"), states[0].RouteStart)
+
+		updated := state
+		updated.MinWriteTSExclusive = 101
+		updated.RouteStart = []byte("b")
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, updated))
+
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{updated}, states)
+
+		exported, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("!"),
+			EndKey:      []byte("~"),
+			MaxVersions: 100,
+		})
+		require.NoError(t, err)
+		require.Empty(t, exported.Versions)
+	})
+}
+
+func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
+}
+
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-import-persist-*")

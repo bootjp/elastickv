@@ -26,6 +26,8 @@ type ShardStore struct {
 }
 
 var ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+var ErrRouteCutoverPending = errors.New("route cutover pending")
+var ErrRouteWriteBelowFloor = errors.New("route write timestamp is below route floor")
 
 // NewShardStore creates a sharded MVCC store wrapper.
 func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *ShardStore {
@@ -98,6 +100,9 @@ func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, route distr
 }
 
 func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return nil, err
+	}
 	if routeHasStagedVisibility(route) {
 		return s.getAtWithStagedVisibility(ctx, g, route, key, ts)
 	}
@@ -110,6 +115,59 @@ func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, route distri
 
 func routeHasStagedVisibility(route distribution.Route) bool {
 	return route.StagedVisibilityActive && route.MigrationJobID != 0
+}
+
+func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetStagedReadinessState) bool {
+	if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	if route.MinWriteTSExclusive < ready.MinWriteTSExclusive {
+		return false
+	}
+	if route.StagedVisibilityActive {
+		return route.MigrationJobID == ready.MigrationJobID
+	}
+	return route.MigrationJobID == 0
+}
+
+func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) error {
+	if g == nil || g.Store == nil {
+		return nil
+	}
+	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for _, ready := range states {
+		if !ready.Armed || !routeRangeIntersects(start, end, ready.RouteStart, ready.RouteEnd) {
+			continue
+		}
+		if !routeSatisfiesTargetReadiness(route, ready) {
+			return errors.WithStack(ErrRouteCutoverPending)
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteFloor(route distribution.Route, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d", commitTS, route.MinWriteTSExclusive)
+}
+
+func routeRangeIntersects(aStart, aEnd, bStart, bEnd []byte) bool {
+	if aEnd != nil && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if bEnd != nil && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
 }
 
 func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
@@ -574,6 +632,9 @@ func (s *ShardStore) scanRouteLocal(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, start, end); err != nil {
+		return nil, err
+	}
 	if routeHasStagedVisibility(route) {
 		return s.scanRouteWithStagedVisibility(ctx, g, route, start, end, limit, ts, reverse)
 	}
@@ -618,6 +679,9 @@ func (s *ShardStore) scanRouteAtLeader(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, start, end); err != nil {
+		return nil, err
+	}
 	var (
 		kvs []*store.KVPair
 		err error
@@ -905,33 +969,57 @@ func clampScanEnd(end []byte, routeEnd []byte) []byte {
 }
 
 func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.DeleteAt(ctx, key, commitTS))
 }
 
 func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
 }
@@ -967,6 +1055,9 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 }
 
 func (s *ShardStore) localLatestCommitTS(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte) (uint64, bool, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return 0, false, err
+	}
 	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
@@ -1606,7 +1697,39 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 	if err != nil || group == nil {
 		return err
 	}
+	if err := s.verifyMutationRoutes(ctx, mutations, readKeys, commitTS); err != nil {
+		return err
+	}
 	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
+}
+
+func (s *ShardStore) verifyMutationRoutes(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, commitTS uint64) error {
+	for _, mut := range mutations {
+		if err := s.verifyMutationWriteRoute(ctx, mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	for _, key := range readKeys {
+		route, g, ok := s.routeAndGroupForKey(key)
+		if !ok || g == nil || g.Store == nil {
+			return store.ErrNotSupported
+		}
+		if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ShardStore) verifyMutationWriteRoute(ctx context.Context, key []byte, commitTS uint64) error {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
+		return store.ErrNotSupported
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	return verifyRouteWriteFloor(route, commitTS)
 }
 
 // ApplyMutationsRaft is the raft-apply variant; see store.MVCCStore for the

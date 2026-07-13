@@ -182,19 +182,20 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 //     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
 //     metaAppliedIndex below a concurrent per-Apply value.
 //  4. mtx           – guards the in-memory metadata fields
-//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
+//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS, migrationReadinessCache).
 type pebbleStore struct {
-	db                   *pebble.DB
-	cache                *pebble.Cache // owns one ref; Unref on Close / reopen.
-	dbMu                 sync.RWMutex  // guards s.db pointer – see lock ordering above
-	log                  *slog.Logger
-	lastCommitTS         uint64
-	minRetainedTS        uint64
-	pendingMinRetainedTS uint64
-	mtx                  sync.RWMutex
-	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
-	maintenanceMu        sync.Mutex
-	dir                  string
+	db                      *pebble.DB
+	cache                   *pebble.Cache // owns one ref; Unref on Close / reopen.
+	dbMu                    sync.RWMutex  // guards s.db pointer – see lock ordering above
+	log                     *slog.Logger
+	lastCommitTS            uint64
+	minRetainedTS           uint64
+	pendingMinRetainedTS    uint64
+	migrationReadinessCache []TargetStagedReadinessState
+	mtx                     sync.RWMutex
+	applyMu                 sync.Mutex // serializes ApplyMutations: conflict check → commit
+	maintenanceMu           sync.Mutex
+	dir                     string
 	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
@@ -340,9 +341,15 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
+	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	if err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 
 	return s, nil
 }
@@ -2583,9 +2590,15 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 		cleanupOnSwapFail()
 		return err
 	}
+	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	if err != nil {
+		cleanupOnSwapFail()
+		return err
+	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 	return nil
 }
 

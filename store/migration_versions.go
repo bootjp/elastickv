@@ -16,6 +16,7 @@ const (
 	migrationAckPrefix        = "!migstage|ack|"
 	migrationHLCFloorPrefix   = "!migstage|hlc_floor|"
 	migrationPromotePrefix    = "!migstage|promote|"
+	migrationReadyPrefix      = "!migstage|ready|"
 	migrationUint64Bytes      = 8
 	migrationAckKeyIDBytes    = 2 * migrationUint64Bytes
 	exportVersionSizeOverhead = 24
@@ -92,10 +93,18 @@ func migrationPromoteKey(jobID uint64) []byte {
 	return key
 }
 
+func migrationReadyKey(jobID uint64) []byte {
+	key := make([]byte, len(migrationReadyPrefix)+migrationUint64Bytes)
+	copy(key, migrationReadyPrefix)
+	binary.BigEndian.PutUint64(key[len(migrationReadyPrefix):], jobID)
+	return key
+}
+
 func isMigrationMetadataKey(rawKey []byte) bool {
 	return (len(rawKey) == len(migrationAckPrefix)+migrationAckKeyIDBytes && bytes.HasPrefix(rawKey, []byte(migrationAckPrefix))) ||
 		(len(rawKey) == len(migrationHLCFloorPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationHLCFloorPrefix))) ||
-		(len(rawKey) == len(migrationPromotePrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationPromotePrefix)))
+		(len(rawKey) == len(migrationPromotePrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationPromotePrefix))) ||
+		(len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix)))
 }
 
 func encodeMigrationImportAck(ack migrationImportAck) []byte {
