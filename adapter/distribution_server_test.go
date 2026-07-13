@@ -129,6 +129,130 @@ func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
 	require.ErrorContains(t, err, errDistributionCatalogNotConfigured.Error())
 }
 
+func TestDistributionServerGetRouteOwnership_UsesExactVersionSnapshot(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    nil,
+				GroupID:                2,
+				State:                  distribution.RouteStateMigratingTarget,
+				StagedVisibilityActive: true,
+				MigrationJobID:         44,
+				MinWriteTSExclusive:    55,
+			},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("t"),
+		CatalogVersion: 7,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.Equal(t, uint64(7), resp.CatalogVersion)
+	require.Equal(t, uint64(2), resp.Route.RouteId)
+	require.Equal(t, uint64(2), resp.Route.RaftGroupId)
+	require.Equal(t, pb.RouteState_ROUTE_STATE_MIGRATING_TARGET, resp.Route.State)
+	require.True(t, resp.Route.StagedVisibilityActive)
+	require.Equal(t, uint64(44), resp.Route.MigrationJobId)
+	require.Equal(t, uint64(55), resp.Route.MinWriteTsExclusive)
+
+	miss, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("0"),
+		CatalogVersion: 7,
+	})
+	require.NoError(t, err)
+	require.False(t, miss.Found)
+	require.Equal(t, uint64(7), miss.CatalogVersion)
+	require.Nil(t, miss.Route)
+}
+
+func TestDistributionServerGetIntersectingRoutes_UsesExactVersionSnapshot(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("g"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("g"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateWriteFenced},
+			{RouteID: 3, Start: []byte("m"), End: nil, GroupID: 3, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("f"),
+		End:            []byte("z"),
+		CatalogVersion: 9,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), resp.CatalogVersion)
+	require.Len(t, resp.Routes, 3)
+	require.Equal(t, []uint64{1, 2, 3}, []uint64{resp.Routes[0].RouteId, resp.Routes[1].RouteId, resp.Routes[2].RouteId})
+
+	rightOpen, err := s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("m"),
+		End:            nil,
+		CatalogVersion: 9,
+	})
+	require.NoError(t, err)
+	require.Len(t, rightOpen.Routes, 1)
+	require.Equal(t, uint64(3), rightOpen.Routes[0].RouteId)
+}
+
+func TestDistributionServerOwnershipRPCs_RejectUnknownCatalogVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	_, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: 2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCatalogVersionNotFound.Error())
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte(""),
+		CatalogVersion: 2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCatalogVersionNotFound.Error())
+}
+
+func TestDistributionServerOwnershipRPCs_RequireEngine(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(nil, nil)
+	_, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{CatalogVersion: 1})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionEngineNotConfigured.Error())
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{CatalogVersion: 1})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionEngineNotConfigured.Error())
+}
+
 func TestDistributionServerSplitRange_Success(t *testing.T) {
 	t.Parallel()
 
