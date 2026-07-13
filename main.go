@@ -836,7 +836,8 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 }
 
 func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsFifoQueueRouting) error {
-	for queue, routing := range partitionMap {
+	for _, queue := range slices.Sorted(maps.Keys(partitionMap)) {
+		routing := partitionMap[queue]
 		for partition, group := range routing.groups {
 			if group == strconv.FormatUint(dedicatedTSORaftGroupID, 10) {
 				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,

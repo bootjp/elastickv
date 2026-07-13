@@ -35,10 +35,13 @@ Implemented:
    changing the legacy HLC default.
 8. `groupID = 0` is reserved for the dedicated TSO group in runtime config:
    shard ranges cannot route user data to it, the default data group skips it,
-   and `--tsoEnabled` pins timestamp issuance leadership to group 0 when that
-   group is present. Existing `--raftGroups` / `--raftGroupPeers` bootstrap the
-   group as a compatibility bridge, and the all-led-group HLC renewal loop keeps
-   its ceiling warm alongside data groups.
+   and SQS FIFO partition maps cannot route queue partitions to it. Existing
+   `--raftGroups` / `--raftGroupPeers` bootstrap the group as a compatibility
+   bridge, and the all-led-group HLC renewal loop keeps its ceiling warm
+   alongside data groups. The current `--tsoEnabled` bridge still issues
+   timestamps from the locally led data shard through `LocalTSOAllocator`;
+   pinning timestamp issuance to group 0 remains deferred until the TSO-leader
+   redirect path exists.
 
 Remaining:
 
@@ -628,7 +631,7 @@ least as large as the maximum shard ceiling.
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and drives timestamp-leader selection; the minimal `TSOStateMachine` remains open | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; TSO-leader-only timestamp issuance and the minimal `TSOStateMachine` remain open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---

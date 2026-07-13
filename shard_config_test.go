@@ -317,6 +317,18 @@ func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
 	require.Contains(t, err.Error(), "partition 1")
 }
 
+func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroupDeterministically(t *testing.T) {
+	t.Parallel()
+
+	_, err := buildSQSFifoPartitionMap(
+		[]groupSpec{{id: 0}, {id: 1}},
+		"zeta.fifo:1=0;alpha.fifo:1=0",
+	)
+	require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	require.Contains(t, err.Error(), "alpha.fifo")
+	require.NotContains(t, err.Error(), "zeta.fifo")
+}
+
 func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
