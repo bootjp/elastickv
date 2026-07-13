@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -347,6 +349,40 @@ func TestHasSecondaryWrite(t *testing.T) {
 	}
 }
 
+func TestNewDualWriter_UsesConfiguredSecondaryConcurrency(t *testing.T) {
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		newMockBackend("secondary"),
+		ProxyConfig{
+			Mode:                       ModeDualWrite,
+			SecondaryWriteConcurrency:  2,
+			SecondaryScriptConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	assert.Equal(t, 2, cap(d.writeSem))
+	assert.Equal(t, 1, cap(d.scriptSem))
+}
+
+func TestNewDualWriter_DefaultSecondaryConcurrency(t *testing.T) {
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		newMockBackend("secondary"),
+		ProxyConfig{Mode: ModeDualWrite},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	assert.Equal(t, maxWriteGoroutines, cap(d.writeSem))
+	assert.Equal(t, maxScriptWriteGoroutines, cap(d.scriptSem))
+}
+
 func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -625,6 +661,33 @@ func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	d.Close()      // wait for all goroutines to finish
 }
 
+func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), logger)
+
+	blocker := make(chan struct{})
+	d.goAsync(func() {
+		<-blocker
+	})
+
+	for range 3 {
+		d.goAsync(func() { t.Error("should not run") })
+	}
+
+	assert.InDelta(t, 3, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.Equal(t, 1, strings.Count(logs.String(), "async goroutine limit reached"))
+
+	close(blocker)
+	d.Close()
+}
+
 func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -811,6 +874,14 @@ func TestDefaultBackendOptions(t *testing.T) {
 	opts := DefaultBackendOptions()
 	assert.Equal(t, 128, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
+}
+
+func TestDefaultElasticKVBackendOptions(t *testing.T) {
+	opts := DefaultElasticKVBackendOptions()
+	assert.Equal(t, 4, opts.PoolSize)
+	assert.Equal(t, 5*time.Second, opts.DialTimeout)
+	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
+	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
 }
 
 func TestNewRedisBackend_UsesRESP2(t *testing.T) {

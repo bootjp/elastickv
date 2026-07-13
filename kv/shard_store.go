@@ -206,6 +206,18 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 	return out, nil
 }
 
+func (s *ShardStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*store.KVPair{}, false, nil
+	}
+	routes, clampToRoutes := s.routesForForwardScan(start, end)
+	if len(routes) != 1 || clampToRoutes {
+		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
+	}
+	return s.scanRouteAtDirectionPhysicalLimit(ctx, routes[0], start, end, visibleLimit, physicalLimit, ts, false)
+}
+
 // ScanGroupAt scans a range on the explicitly selected Raft group.
 // It is for keyspaces whose owner is resolved outside the byte-range
 // engine (for example SQS HT-FIFO's (queue, partition) resolver).
@@ -232,6 +244,18 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*store.KVPair{}, false, nil
+	}
+	routes, clampToRoutes := s.routesForReverseScan(start, end)
+	if len(routes) != 1 || clampToRoutes {
+		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
+	}
+	return s.scanRouteAtDirectionPhysicalLimit(ctx, routes[0], start, end, visibleLimit, physicalLimit, ts, true)
 }
 
 func (s *ShardStore) routesForForwardScan(start []byte, end []byte) ([]distribution.Route, bool) {
@@ -438,6 +462,83 @@ func (s *ShardStore) scanRouteAtDirection(
 	return filterTxnInternalKVs(kvs), nil
 }
 
+type physicalLimitedStore interface {
+	ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
+	ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
+}
+
+func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	visibleLimit int,
+	physicalLimit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, bool, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, false, nil
+	}
+
+	if engineForGroup(g) == nil {
+		kvs, limitReached, err := scanLocalPhysicalLimit(ctx, g.Store, start, end, visibleLimit, physicalLimit, ts, reverse)
+		if err != nil {
+			return nil, limitReached, errors.WithStack(err)
+		}
+		return filterTxnInternalKVs(kvs), limitReached, nil
+	}
+
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
+		return s.scanRouteAtLeaderPhysicalLimit(ctx, g, start, end, visibleLimit, physicalLimit, ts, reverse)
+	}
+
+	// RawScanAt cannot enforce physicalLimit, so report truncation and let
+	// callers fail closed instead of proxying an unbounded physical scan.
+	return nil, true, nil
+}
+
+func scanLocalPhysicalLimit(
+	ctx context.Context,
+	st store.MVCCStore,
+	start []byte,
+	end []byte,
+	visibleLimit int,
+	physicalLimit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, bool, error) {
+	scanner, ok := st.(physicalLimitedStore)
+	if !ok {
+		if reverse {
+			kvs, err := st.ReverseScanAt(ctx, start, end, visibleLimit, ts)
+			return kvs, false, errors.WithStack(err)
+		}
+		kvs, err := st.ScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, errors.WithStack(err)
+	}
+	return scanPhysicalLimitLocal(ctx, scanner, start, end, visibleLimit, physicalLimit, ts, reverse)
+}
+
+func scanPhysicalLimitLocal(
+	ctx context.Context,
+	scanner physicalLimitedStore,
+	start []byte,
+	end []byte,
+	visibleLimit int,
+	physicalLimit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, bool, error) {
+	if reverse {
+		kvs, limitReached, err := scanner.ReverseScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+		return kvs, limitReached, errors.WithStack(err)
+	}
+	kvs, limitReached, err := scanner.ScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+	return kvs, limitReached, errors.WithStack(err)
+}
+
 func (s *ShardStore) scanRouteLocal(
 	ctx context.Context,
 	g *ShardGroup,
@@ -453,6 +554,29 @@ func (s *ShardStore) scanRouteLocal(
 	}
 	kvs, err := g.Store.ScanAt(ctx, start, end, limit, ts)
 	return kvs, errors.WithStack(err)
+}
+
+func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	visibleLimit int,
+	physicalLimit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, bool, error) {
+	kvs, limitReached, err := scanLocalPhysicalLimit(ctx, g.Store, start, end, visibleLimit, physicalLimit, ts, reverse)
+	if err != nil {
+		return nil, limitReached, errors.WithStack(err)
+	}
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, visibleLimit)
+	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, visibleLimit)
+	if err != nil {
+		return nil, limitReached, err
+	}
+	resolved, err := s.resolveScanLocks(ctx, g, kvs, lockKVs, ts)
+	return resolved, limitReached, err
 }
 
 func (s *ShardStore) scanRouteAtLeader(

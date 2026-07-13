@@ -231,8 +231,9 @@ during the reconnect window, matching the previous drop semantics.
 | 2. Receiver handler | `GRPCTransport.SendStream` | Implemented |
 | 3. Stream open/close/reconnect | `streamFor`, `peerStream` lifecycle, peer removal cleanup | Implemented |
 | 4. Sender: swap unary → stream in `dispatchRegular` | Streaming default with unary fallback | Implemented |
-| 5. Backward-compat fallback | Empty-stream probe plus `codes.Unimplemented` cache | Implemented |
-| 6. Tests | Server handler, streaming dispatch, legacy-peer fallback | Implemented |
+| 5. Operational kill switch | `ELASTICKV_RAFT_SEND_STREAM=false` forces unary `Send` without unregistering `SendStream` | Implemented |
+| 6. Backward-compat fallback | Empty-stream probe plus `codes.Unimplemented` cache | Implemented |
+| 7. Tests | Server handler, streaming dispatch, legacy-peer fallback, kill switch | Implemented |
 
 ---
 
@@ -245,6 +246,7 @@ Because `SendStream` is additive, the rollout is zero-downtime by design:
 | **Deploy new server binary** | All nodes register both `Send` (unary) and `SendStream`. Existing peers that have not yet upgraded continue to use `Send` — no behaviour change. |
 | **Gradual upgrade** | As each peer is upgraded, the sender's empty-stream probe detects `SendStream` availability and opens a stream. Unary `Send` remains the fallback for un-upgraded peers. |
 | **Full cutover** | Once all peers run the new binary, every peer-to-peer path uses streaming. The unary `Send` handler is kept indefinitely for backward compatibility. |
+| **Emergency rollback** | Set `ELASTICKV_RAFT_SEND_STREAM=false` on every node and restart. The node still serves `SendStream` for upgraded peers, but its own outbound regular Raft messages use unary `Send`. |
 
 No dual-write or blue/green deployment is required: the `codes.Unimplemented` probe
 (§3.5) makes the switch per-peer and per-connection atomically.
