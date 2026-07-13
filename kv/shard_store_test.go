@@ -182,6 +182,40 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 	}, kvs)
 }
 
+func TestShardStoreExplicitGroupReads_FailClosedWhenRouteMovedToStagedGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("b"), []byte("old-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-target"), 20, 0))
+
+	_, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
+	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
+
+	_, err = st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 25)
+	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
+}
+
 func TestShardStoreScanAt_ContinuesStagedVisibilityAfterCandidateWindow(t *testing.T) {
 	t.Parallel()
 
@@ -218,6 +252,43 @@ func TestShardStoreApplyMutations_ValidatesStagedReadKeys(t *testing.T) {
 		{Op: store.OpTypePut, Key: []byte("m"), Value: []byte("write")},
 	}, [][]byte{readKey}, 10, 101)
 	require.ErrorIs(t, err, store.ErrWriteConflict)
+}
+
+func TestShardStoreApplyMutations_ValidatesStagedWriteKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	writeKey := []byte("k")
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, writeKey), []byte("staged"), 20, 0))
+
+	apply := []struct {
+		name string
+		fn   func(context.Context, []*store.KVPairMutation, [][]byte, uint64, uint64) error
+	}{
+		{
+			name: "direct",
+			fn:   st.ApplyMutations,
+		},
+		{
+			name: "raft",
+			fn:   st.ApplyMutationsRaft,
+		},
+		{
+			name: "raft_at",
+			fn: func(ctx context.Context, muts []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+				return st.ApplyMutationsRaftAt(ctx, muts, readKeys, startTS, commitTS, 1)
+			},
+		},
+	}
+	for _, tc := range apply {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.fn(ctx, []*store.KVPairMutation{
+				{Op: store.OpTypePut, Key: writeKey, Value: []byte("write")},
+			}, nil, 10, 101)
+			require.ErrorIs(t, err, store.ErrWriteConflict)
+		})
+	}
 }
 
 func TestShardStorePhysicalLimitFailsClosedBeforeStagedVisibilityFallback(t *testing.T) {

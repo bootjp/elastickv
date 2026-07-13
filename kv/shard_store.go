@@ -122,8 +122,13 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
-	if route, ok := s.engine.GetRoute(routeKey(key)); ok && route.GroupID == groupID {
-		return route, nil
+	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
+		if route.GroupID == groupID {
+			return route, nil
+		}
+		if routeHasStagedVisibility(route) {
+			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+		}
 	}
 	if s.groupHasStagedVisibility(groupID) {
 		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
@@ -443,6 +448,10 @@ func (s *ShardStore) routesForExplicitGroupScan(groupID uint64, start []byte, en
 	for _, route := range routes {
 		if route.GroupID == groupID {
 			matched = append(matched, route)
+			continue
+		}
+		if routeHasStagedVisibility(route) {
+			return nil, false, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d range=[%q,%q)", groupID, start, end)
 		}
 	}
 	if len(matched) > 0 {
@@ -1841,6 +1850,7 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
@@ -1855,6 +1865,7 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
@@ -1870,6 +1881,7 @@ func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*stor
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
 }
 
@@ -1900,24 +1912,35 @@ func (s *ShardStore) ensureMutationWriteTimestampFloors(mutations []*store.KVPai
 }
 
 func (s *ShardStore) readKeysWithStagedVisibilityAliases(group *ShardGroup, readKeys [][]byte) [][]byte {
-	if len(readKeys) == 0 || s == nil || s.engine == nil || group == nil {
+	if len(readKeys) == 0 {
 		return readKeys
 	}
-	var out [][]byte
 	for _, key := range readKeys {
-		alias, ok := s.stagedVisibilityReadKeyAlias(group, key)
-		if !ok {
+		readKeys = s.appendStagedVisibilityAlias(group, readKeys, key)
+	}
+	return readKeys
+}
+
+func (s *ShardStore) readKeysWithStagedVisibilityMutationAliases(group *ShardGroup, readKeys [][]byte, mutations []*store.KVPairMutation) [][]byte {
+	for _, mut := range mutations {
+		if mut == nil {
 			continue
 		}
-		if out == nil {
-			out = append([][]byte(nil), readKeys...)
-		}
-		out = append(out, alias)
+		readKeys = s.appendStagedVisibilityAlias(group, readKeys, mut.Key)
 	}
-	if out == nil {
+	return readKeys
+}
+
+func (s *ShardStore) appendStagedVisibilityAlias(group *ShardGroup, readKeys [][]byte, key []byte) [][]byte {
+	if s == nil || s.engine == nil || group == nil {
 		return readKeys
 	}
-	return out
+	alias, ok := s.stagedVisibilityReadKeyAlias(group, key)
+	if !ok {
+		return readKeys
+	}
+	out := append([][]byte(nil), readKeys...)
+	return append(out, alias)
 }
 
 func (s *ShardStore) stagedVisibilityReadKeyAlias(group *ShardGroup, key []byte) ([]byte, bool) {
