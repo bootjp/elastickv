@@ -67,8 +67,10 @@ per-cell Raft group and leader-term identity.
     fire only when distinct sources disagree within the same
     `(bucketID, raftGroupID, leaderTerm, column)` identity. If any
     non-zero source omits group/term identity, the cell falls back
-    to the Phase 2-C legacy max-merge so mixed-version peers never
-    over-count.
+    to the Phase 2-C legacy max-merge. Mixed-version peers are
+    therefore safe against over-counting, but they do not receive
+    exact per-term summation until every non-zero contributor sends
+    both identity arrays.
 - Degraded-mode response: when N nodes respond and M < N succeed,
   the response carries `{node, ok, error}` per node and the SPA
   shows a banner.
@@ -120,15 +122,18 @@ elastickv \
   - **Anything else** is treated as a peer. A reverse-proxy or
     DNS-aliased entry that names the same node by a different host
     will not match — the fan-out makes a loopback HTTP call to
-    itself. This is harmless (it degrades to one extra round-trip
-    per request) but wasteful; operators should prefer the literal
-    `--adminAddress` value in the flag.
+    itself and merges the returned local matrix in addition to the
+    implicit local matrix. That self-alias configuration is
+    unsupported because it can double-count reads and read bytes.
+    Operators must list the literal `--adminAddress` value for self
+    entries until hostname canonicalization or self-node
+    deduplication is implemented.
 - Empty (or unset) flag → fan-out disabled, current behaviour.
 - Each entry is a host:port. TLS is out of scope for Phase 2-C
   (intra-cluster admin traffic is assumed to ride a private
-  network); the HTTP client uses `http://`. A follow-up will
-  introduce `--keyvizFanoutTLS` once the rest of the admin path
-  has TLS too.
+  network); the implemented HTTP client uses `http://`.
+  `--keyvizFanoutTLS` is not part of this implementation and
+  belongs with a broader admin-path TLS design.
 - **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
   the inbound user's cookies (`admin_session` + `admin_csrf` only)
   on every peer call. The peer's `SessionAuth` middleware verifies
@@ -159,15 +164,11 @@ elastickv \
     admin session would be replayed there.
   - Per-call timeout: 2 s default, override via
     `--keyvizFanoutTimeout`.
-- **Auth (Phase 2-C+)**: a follow-up replaces cookie forwarding
-  with a short-lived **inter-node** token derived from
-  `ELASTICKV_ADMIN_SESSION_SIGNING_KEY`. Pre-shared, NOT a replay
-  of the browser cookie — re-using the cookie couples browser
-  session TTL to inter-node call validity, and a compromised
-  browser session gains peer-call authority. The follow-up
-  decouples the two paths so the inter-node call survives a
-  browser-session expiry and a compromised cookie doesn't extend
-  laterally.
+- **Auth beyond Phase 2-C**: short-lived **inter-node** tokens
+  derived from `ELASTICKV_ADMIN_SESSION_SIGNING_KEY` remain
+  unimplemented. The shipped implementation forwards only the
+  whitelisted browser cookies described above, so browser session
+  TTL and peer-call validity remain coupled.
 
 ## 4. Merge rules
 
@@ -206,6 +207,12 @@ the aggregator:
   values for the same group/window. A leadership flip inside the
   requested window therefore preserves the ex-leader slice plus the
   new-leader slice instead of under-counting with a simple max.
+- Emits a single wire identity for the merged cell, not a list of
+  all contributing terms. `leader_terms[j]` is the term selected by
+  `resolveWrite()` from the largest per-term contribution for that
+  cell; `raft_group_ids[j]` is the matching group. This identity is
+  descriptive metadata for the merged value, while the value itself
+  is still the sum across all distinct terms.
 
 If any non-zero source for a cell has `raftGroupID=0` or
 `leaderTerm=0`, the whole cell uses the legacy Phase 2-C fallback:
@@ -213,7 +220,9 @@ take the max across sources, and mark a conflict only when two
 distinct non-zero values were observed. This preserves the
 mixed-version safety property: an old peer can omit the new identity
 fields without causing the aggregator to sum overlapping unknown
-windows.
+windows. In this fallback path `resolveWrite()` reports the identity
+from the max contributor when that contributor had identity, or
+`(0, 0)` when the max value came from an unknown-identity source.
 
 ### 4.3 Bytes counters
 
@@ -296,14 +305,16 @@ no breaking changes — old SPA versions keep working):
 }
 ```
 
-`FanoutNodeStatus` currently serializes only `node`, `ok`, and
-`error`. Future structured non-fatal signals such as catalog
-divergence would require an explicit wire extension.
+`FanoutNodeStatus` serializes only `node`, `ok`, and `error`.
+Structured non-fatal signals such as catalog divergence are not part
+of the implemented wire shape and require an explicit extension.
 
 `raft_group_ids[]`, `leader_terms[]`, and `conflicts[]` are parallel
 to `values[]`. `raft_group_ids[j]` and `leader_terms[j]` carry the
-identity used by the write merge for column `j`; zero means identity
-was not tracked and the legacy fallback was used for that cell.
+identity selected by `resolveWrite()` for column `j`: the
+max-contributing `(group, term)` under the group/term merge, or the
+fallback max contributor when the legacy path was used. Zero means
+identity was not tracked for that selected contributor.
 
 `conflicts[]` marks the exact cells where the write merge observed a
 disagreement. It is omitted when nil/no cell conflicted. `conflict`
@@ -314,19 +325,18 @@ false rather than relying on `"conflict" in row`.
 
 ## 6. SPA changes
 
-- New `Fanout` block in the API client (TypeScript shape mirroring
-  §5).
-- A degraded-mode banner above the heatmap when `responded <
+- The API client includes the `Fanout` block from §5.
+- The heatmap shows a degraded-mode banner when `responded <
   expected`, listing which nodes failed and why.
-- `KeyVizRow.conflicts[]` → per-cell hatching (an SVG overlay
-  layered over the canvas). When an older server omits
-  `conflicts[]`, the SPA falls back to row-level `conflict`.
-- Header counter: "Cluster view (3 of 3 nodes)".
+- `KeyVizRow.conflicts[]` drives per-cell hatching. When an older
+  server omits `conflicts[]`, the SPA falls back to row-level
+  `conflict`.
+- The header counter shows the cluster-view size, for example
+  "Cluster view (3 of 3 nodes)".
 
-This is small enough to land in the same PR as the server side or
-as an immediate follow-up; either way the wire format above is
-forwards-compatible so an old SPA against a fan-out server still
-renders correctly (it just ignores the new fields).
+The implemented wire format is forwards-compatible: an old SPA
+against a fan-out server still renders correctly because it ignores
+unknown fields.
 
 ## 7. Implementation status
 
@@ -364,10 +374,13 @@ identity.
 ## 8. Five-lens review checklist
 
 1. **Data loss** — Fan-out is read-only against the existing
-   sampler. The conservative max-merge can under-count during a
-   leadership flip; this is preferable to over-counting (which
-   would invent traffic) and the conflict flag tells operators
-   when the data is soft.
+   sampler. With group/term identity present, writes max-merge
+   duplicate observations within one
+   `(bucketID, raftGroupID, leaderTerm, column)` identity and sum
+   across distinct terms, so a leadership flip keeps both term
+   slices. If identity is missing on any non-zero source, the cell
+   deliberately falls back to the legacy max-merge to avoid
+   over-counting mixed-version or unknown-identity windows.
 2. **Concurrency / distributed** — Per-node calls are issued in
    parallel with the configured per-call timeout (default 2 s,
    override via `--keyvizFanoutTimeout` per §3). The aggregator
@@ -401,11 +414,12 @@ identity.
    partial data is accepted. Operators who actually want >64 MiB
    peer responses should override via a future flag; for now the
    conservative default is the correct trade. (Gemini PR #685.)
-4. **Data consistency** — Merge rules are conservative under
-   leadership transitions (under-count + conflict flag, never
-   over-count). Reads are exact in steady state and during
-   transitions. The §9.1 canonical rule is preserved as a Phase
-   2-C+ contract once we extend the wire format.
+4. **Data consistency** — Reads are summed across nodes. Writes use
+   the implemented Phase 2-C+ group/term identity merge when every
+   non-zero source supplies identity, with `conflicts[]` marking
+   disagreement inside one identity. Legacy peers without identity
+   keep the max-merge fallback, which can under-count but avoids
+   inventing traffic.
 5. **Test coverage** — `internal/admin/keyviz_fanout_test.go`
    table-driven across the §7 PR-1 scenarios (stable-leader,
    leadership-flip, partial failure) plus url-builder variants,
