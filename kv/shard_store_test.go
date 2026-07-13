@@ -216,6 +216,74 @@ func TestShardStoreExplicitGroupReads_FailClosedWhenRouteMovedToStagedGroup(t *t
 	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
 }
 
+func TestShardStoreExplicitGroupScan_NormalizesRouteMappedBoundsForStagedRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  sqsGlobalRouteKey,
+				End:                    prefixScanEnd(sqsGlobalRouteKey),
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	start := []byte("!sqs|msg|vis|p|")
+	end := prefixScanEnd(start)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("!sqs|msg|vis|p|orders|1"), []byte("old-source"), 10, 0))
+
+	_, err := st.ScanGroupAt(ctx, 1, start, end, 10, 25)
+	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
+}
+
+func TestShardStoreExplicitGroupRead_IgnoresUnrelatedStagedRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("b"), []byte("explicit-group"), 10, 0))
+
+	got, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("explicit-group"), got)
+
+	kvs, err := st.ScanGroupAt(ctx, 1, []byte("b"), []byte("c"), 10, 25)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: []byte("b"), Value: []byte("explicit-group")}}, kvs)
+}
+
 func TestShardStoreScanAt_ContinuesStagedVisibilityAfterCandidateWindow(t *testing.T) {
 	t.Parallel()
 
@@ -238,6 +306,23 @@ func TestShardStoreScanAt_ContinuesStagedVisibilityAfterCandidateWindow(t *testi
 	require.Len(t, kvs, limit)
 	require.Equal(t, []byte(fmt.Sprintf("k%05d", limit-1)), kvs[0].Key)
 	require.Equal(t, []byte("k00000"), kvs[limit-1].Key)
+}
+
+func TestStagedVisibilityCandidateBoundary_UsesSafeFrontier(t *testing.T) {
+	t.Parallel()
+
+	live := []*store.KVPair{{Key: []byte("a")}, {Key: []byte("c")}}
+	staged := []*store.KVPair{
+		{Key: distribution.MigrationStagedDataKey(9, []byte("b"))},
+		{Key: distribution.MigrationStagedDataKey(9, []byte("z"))},
+	}
+	boundary, ok := stagedVisibilityCandidateBoundary(live, staged, false, false, false)
+	require.True(t, ok)
+	require.Equal(t, []byte("c"), boundary)
+
+	boundary, ok = stagedVisibilityCandidateBoundary(live, staged, false, false, true)
+	require.True(t, ok)
+	require.Equal(t, []byte("b"), boundary)
 }
 
 func TestShardStoreApplyMutations_ValidatesStagedReadKeys(t *testing.T) {
@@ -400,6 +485,26 @@ func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	require.Len(t, kvs, 1)
 	require.Equal(t, key, kvs[0].Key)
 	require.Equal(t, []byte("msg-2"), kvs[0].Value)
+}
+
+func TestShardStoreScanGroupAt_DoesNotClampRouteMappedRawBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 42)
+	groups := map[uint64]*ShardGroup{
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	start := []byte("!sqs|msg|vis|p|")
+	key := []byte("!sqs|msg|vis|p|orders|partition-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("msg-2"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("msg-2")}}, kvs)
 }
 
 func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
