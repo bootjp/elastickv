@@ -325,6 +325,9 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 		// serialization.
 		return false, nil
 	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return false, err
+	}
 	return committedVersionAtForRoute(ctx, g.Store, route, key, commitTS)
 }
 

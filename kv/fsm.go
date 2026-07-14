@@ -678,6 +678,30 @@ func (f *kvFSM) verifyTargetReadinessForMutations(ctx context.Context, muts []*p
 	return nil
 }
 
+func (f *kvFSM) verifyTargetReadinessForReadKeys(ctx context.Context, keys [][]byte) error {
+	for _, key := range keys {
+		if isTxnInternalKey(key) {
+			continue
+		}
+		if err := f.verifyTargetReadinessForRange(ctx, key, nextScanCursor(key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForTxnFootprint(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, primaryKey []byte) error {
+	if len(primaryKey) != 0 && !isTxnInternalKey(primaryKey) {
+		if err := f.verifyTargetReadinessForRange(ctx, primaryKey, nextScanCursor(primaryKey)); err != nil {
+			return err
+		}
+	}
+	if err := f.verifyTargetReadinessForReadKeys(ctx, readKeys); err != nil {
+		return err
+	}
+	return f.verifyTargetReadinessForMutations(ctx, muts)
+}
+
 func (f *kvFSM) verifyTargetReadinessForPrefix(ctx context.Context, prefix []byte) error {
 	start, end := routePrefixRange(prefix)
 	return f.verifyTargetReadinessForRouteRange(ctx, start, end)
@@ -1140,6 +1164,9 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if meta.CommitTS != 0 {
 		floorTS = meta.CommitTS
 	}
+	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, meta.PrimaryKey); err != nil {
+		return err
+	}
 	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, floorTS)
 	if err != nil {
 		return err
@@ -1202,7 +1229,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// applying this log entry. The retention-window > max-retry-latency
 	// invariant prevents the rare case where a real never-landed retry
 	// arrives with PrevCommitTS below pebble's compacted floor.
-	dedup, err := f.dedupProbeOnePhase(ctx, meta)
+	dedup, err := f.dedupProbeOnePhase(ctx, meta, muts, r.ReadKeys)
 	if err != nil {
 		return err
 	}
@@ -1243,15 +1270,19 @@ func (f *kvFSM) uniqueMutationsNotFenced(ctx context.Context, muts []*pb.Mutatio
 	return uniq, nil
 }
 
-// dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
-// because the entry is a retry whose prior attempt already landed. Extracted
-// to keep handleOnePhaseTxnRequest under the cyclop budget; the determinism
-// rationale lives at the call site.
+// dedupProbeOnePhase first fail-closes the target readiness footprint, then
+// decides whether handleOnePhaseTxnRequest should no-op because the entry is a
+// retry whose prior attempt already landed. Extracted to keep
+// handleOnePhaseTxnRequest under the cyclop budget; the determinism rationale
+// lives at the call site.
 //
 // Returns (true, nil) → the entry must no-op (prior attempt landed).
 // Returns (false, nil) → fall through to normal apply.
 // Returns (false, err) → propagate err; apply must not proceed.
-func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, error) {
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, muts []*pb.Mutation, readKeys [][]byte) (bool, error) {
+	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, readKeys, meta.PrimaryKey); err != nil {
+		return false, err
+	}
 	if meta.PrevCommitTS == 0 {
 		return false, nil
 	}

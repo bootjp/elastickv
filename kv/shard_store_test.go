@@ -2,9 +2,11 @@ package kv
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -64,6 +66,49 @@ func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*
 	return NewShardStore(engine, map[uint64]*ShardGroup{route.GroupID: group}), group
 }
 
+type readinessFenceEngine struct {
+	onLinearizableRead func()
+}
+
+func (e *readinessFenceEngine) State() raftengine.State {
+	return raftengine.StateFollower
+}
+
+func (e *readinessFenceEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "leader"}
+}
+
+func (e *readinessFenceEngine) VerifyLeader(context.Context) error {
+	return nil
+}
+
+func (e *readinessFenceEngine) LinearizableRead(context.Context) (uint64, error) {
+	if e.onLinearizableRead != nil {
+		e.onLinearizableRead()
+	}
+	return 1, nil
+}
+
+func (e *readinessFenceEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, errors.New("unexpected propose")
+}
+
+func (e *readinessFenceEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, errors.New("unexpected propose admin")
+}
+
+func (e *readinessFenceEngine) Status() raftengine.Status {
+	return raftengine.Status{State: e.State()}
+}
+
+func (e *readinessFenceEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+
+func (e *readinessFenceEngine) Close() error {
+	return nil
+}
+
 func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	t.Parallel()
 
@@ -113,6 +158,27 @@ func TestShardStoreCommittedVersionAtChecksTargetReadiness(t *testing.T) {
 		State:   distribution.RouteStateActive,
 	})
 	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
+
+	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
+	require.False(t, landed)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreCommittedVersionAtRechecksTargetReadinessAfterFence(t *testing.T) {
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	group.Engine = &readinessFenceEngine{
+		onLinearizableRead: func() {
+			applyTargetReadiness(t, group)
+		},
+	}
 	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
 
 	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
