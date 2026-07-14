@@ -37,18 +37,26 @@ func RouteKeyFilterForGroup(rangeStart, rangeEnd []byte, sourceGroupID uint64, r
 }
 
 func s3BucketAuxiliaryRouteInRange(rawKey, routeStart, routeEnd []byte) bool {
-	bucket, ok := s3keys.ParseBucketMetaKey(rawKey)
-	if !ok {
-		bucket, ok = s3keys.ParseBucketGenerationKey(rawKey)
-	}
+	bucketRouteStart, bucketRouteEnd, ok := s3BucketAuxiliaryRouteRange(rawKey)
 	if !ok {
 		return false
 	}
 	if keyInMigrationRouteRange(rawKey, routeStart, routeEnd) {
 		return true
 	}
+	return migrationRouteRangesIntersect(routeStart, routeEnd, bucketRouteStart, bucketRouteEnd)
+}
+
+func s3BucketAuxiliaryRouteRange(rawKey []byte) ([]byte, []byte, bool) {
+	bucket, ok := s3keys.ParseBucketMetaKey(rawKey)
+	if !ok {
+		bucket, ok = s3keys.ParseBucketGenerationKey(rawKey)
+	}
+	if !ok {
+		return nil, nil, false
+	}
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return migrationRouteRangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+	return bucketRouteStart, prefixScanEnd(bucketRouteStart), true
 }
 
 func keyInMigrationRouteRange(key, routeStart, routeEnd []byte) bool {

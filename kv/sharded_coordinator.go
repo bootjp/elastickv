@@ -1060,11 +1060,26 @@ func (c *ShardedCoordinator) rejectWriteFencedPointElems(elems []*Elem[OP]) erro
 		if elem == nil || len(elem.Key) == 0 {
 			continue
 		}
-		route, ok := c.engine.GetRoute(routeKey(elem.Key))
-		if !ok || route.State != distribution.RouteStateWriteFenced {
-			continue
+		if err := c.rejectWriteFencedPointKey(elem.Key); err != nil {
+			return err
 		}
-		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", elem.Key, routeKey(elem.Key))
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
+	rkey := routeKey(key)
+	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
+	}
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if route.State == distribution.RouteStateWriteFenced {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+		}
 	}
 	return nil
 }
