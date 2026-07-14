@@ -500,9 +500,8 @@ func run() error {
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
 	startMemoryWatchdog(runCtx, eg, cancel)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	splitMigrationGate := newSplitMigrationCapabilityGate(
-		splitMigrationCapabilityPeerSourceForRuntime(defaultRuntime),
+		splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
 		splitMigrationCapabilityProbeTimeout,
 		nil,
 	)
@@ -513,7 +512,9 @@ func run() error {
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
 		adapter.WithSplitMigrationCapabilityGate(splitMigrationGate),
+		adapter.WithSplitJobRunnerReady(),
 	)
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
@@ -682,17 +683,35 @@ type splitMigrationCapabilityPeerSource func(context.Context) ([]splitMigrationC
 
 type splitMigrationCapabilityProbe func(context.Context, string) error
 
-func splitMigrationCapabilityPeerSourceForRuntime(rt *raftGroupRuntime) splitMigrationCapabilityPeerSource {
+func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) splitMigrationCapabilityPeerSource {
 	return func(ctx context.Context) ([]splitMigrationCapabilityPeer, error) {
-		engine := rt.snapshotEngine()
-		if engine == nil {
-			return nil, errors.New("default raft group engine is not configured")
+		if len(runtimes) == 0 {
+			return nil, errors.New("raft group runtimes are not configured")
 		}
-		cfg, err := engine.Configuration(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "default raft group configuration")
+		peers := make([]splitMigrationCapabilityPeer, 0)
+		seen := make(map[string]struct{})
+		for _, rt := range runtimes {
+			if rt == nil {
+				return nil, errors.New("raft group runtime is not configured")
+			}
+			engine := rt.snapshotEngine()
+			if engine == nil {
+				return nil, errors.Errorf("raft group %d engine is not configured", rt.spec.id)
+			}
+			cfg, err := engine.Configuration(ctx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "raft group %d configuration", rt.spec.id)
+			}
+			for _, peer := range splitMigrationCapabilityPeersFromConfiguration(cfg) {
+				key := peer.ID + "\x00" + peer.Address
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				peers = append(peers, peer)
+			}
 		}
-		return splitMigrationCapabilityPeersFromConfiguration(cfg), nil
+		return peers, nil
 	}
 }
 
@@ -704,9 +723,6 @@ func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration
 	peers := make([]splitMigrationCapabilityPeer, 0, len(servers))
 	seen := make(map[string]struct{}, len(servers))
 	for _, server := range servers {
-		if server.Suffrage == etcdraftengine.SuffrageLearner {
-			continue
-		}
 		key := server.ID + "\x00" + server.Address
 		if _, ok := seen[key]; ok {
 			continue

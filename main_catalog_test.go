@@ -143,7 +143,7 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerSourceErrors(t *testing.
 	require.ErrorContains(t, err, "peers are not available")
 }
 
-func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentVoters(t *testing.T) {
+func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *testing.T) {
 	t.Parallel()
 
 	cfg := raftengine.Configuration{Servers: []raftengine.Server{
@@ -155,8 +155,38 @@ func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentVoters(t *test
 
 	require.Equal(t, []splitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
+		{ID: "n2", Address: "10.0.0.12:50051"},
 		{ID: "n3", Address: "10.0.0.13:50051"},
 	}, splitMigrationCapabilityPeersFromConfiguration(cfg))
+}
+
+func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing.T) {
+	t.Parallel()
+
+	runtimes := []*raftGroupRuntime{
+		{
+			spec: groupSpec{id: 1},
+			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+				{Suffrage: "learner", ID: "n2", Address: "10.0.0.12:50051"},
+			}}},
+		},
+		{
+			spec: groupSpec{id: 2},
+			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+				{Suffrage: "voter", ID: "n3", Address: "10.0.0.13:50051"},
+			}}},
+		},
+	}
+
+	peers, err := splitMigrationCapabilityPeerSourceForRuntimes(runtimes)(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []splitMigrationCapabilityPeer{
+		{ID: "n1", Address: "10.0.0.11:50051"},
+		{ID: "n2", Address: "10.0.0.12:50051"},
+		{ID: "n3", Address: "10.0.0.13:50051"},
+	}, peers)
 }
 
 func staticSplitMigrationCapabilityPeerSource(peers []splitMigrationCapabilityPeer) splitMigrationCapabilityPeerSource {
@@ -165,4 +195,44 @@ func staticSplitMigrationCapabilityPeerSource(peers []splitMigrationCapabilityPe
 		copy(out, peers)
 		return out, nil
 	}
+}
+
+type capabilityConfigEngine struct {
+	cfg raftengine.Configuration
+}
+
+func (e capabilityConfigEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, nil
+}
+
+func (e capabilityConfigEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, nil
+}
+
+func (e capabilityConfigEngine) State() raftengine.State {
+	return raftengine.StateFollower
+}
+
+func (e capabilityConfigEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{}
+}
+
+func (e capabilityConfigEngine) VerifyLeader(context.Context) error {
+	return nil
+}
+
+func (e capabilityConfigEngine) LinearizableRead(context.Context) (uint64, error) {
+	return 0, nil
+}
+
+func (e capabilityConfigEngine) Status() raftengine.Status {
+	return raftengine.Status{}
+}
+
+func (e capabilityConfigEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return e.cfg, nil
+}
+
+func (e capabilityConfigEngine) Close() error {
+	return nil
 }

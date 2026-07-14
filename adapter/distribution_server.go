@@ -108,7 +108,7 @@ const (
 	splitJobListCursorTerminalOff  = 1
 	splitJobListCursorJobIDOff     = splitJobListCursorTerminalOff + 8
 	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
-	splitMigrationCapabilityV2     = "split_migration_v2"
+	splitMigrationCapabilityV2     = "cap_migration_v2"
 )
 
 var (
