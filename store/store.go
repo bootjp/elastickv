@@ -82,12 +82,14 @@ type ExportVersionsOptions struct {
 	EndKey               []byte
 	MinCommitTSExclusive uint64
 	MaxCommitTSInclusive uint64
-	Cursor               []byte
-	MaxVersions          int
-	MaxBytes             uint64
-	MaxScannedBytes      uint64
-	KeyFamily            uint32
-	AcceptKey            func([]byte) bool
+	// ReadTS asks export to enforce the same retention watermark as GetAt/ScanAt.
+	ReadTS          uint64
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptKey       func([]byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.

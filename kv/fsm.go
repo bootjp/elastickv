@@ -1464,15 +1464,8 @@ func (f *kvFSM) uniqueMutationsAboveWriteFloor(ctx context.Context, muts []*pb.M
 	return uniq, nil
 }
 
-func (f *kvFSM) uniqueAbortCleanupMutations(ctx context.Context, muts []*pb.Mutation) ([]*pb.Mutation, error) {
-	uniq, err := uniqueMutations(muts)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
-		return nil, err
-	}
-	return uniq, nil
+func (f *kvFSM) uniqueAbortCleanupMutations(_ context.Context, muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	return uniqueMutations(muts)
 }
 
 func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

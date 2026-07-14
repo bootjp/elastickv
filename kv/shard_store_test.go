@@ -67,10 +67,14 @@ func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*
 }
 
 type readinessFenceEngine struct {
+	state              raftengine.State
 	onLinearizableRead func()
 }
 
 func (e *readinessFenceEngine) State() raftengine.State {
+	if e.state != "" {
+		return e.state
+	}
 	return raftengine.StateFollower
 }
 
@@ -308,6 +312,49 @@ func TestShardStoreTargetReadinessRejectsClearedDescriptorBeforeCutoverVersion(t
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreTargetReadinessUsesSingleCatalogSnapshotProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	staleRoute, ok := engine.GetRoute([]byte("b"))
+	require.True(t, ok)
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-old"), 80, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-new"), 120, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	got, err := shards.localGetAt(ctx, group, staleRoute, []byte("b"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-new"), got)
+}
+
 func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
 	t.Parallel()
 
@@ -427,6 +474,31 @@ func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
 		State:   distribution.RouteStateActive,
 	})
 	applyTargetReadiness(t, group)
+
+	userKey := []byte("b")
+	start := store.ListItemKey(userKey, 0)
+	end := store.ListItemKey(userKey, 2)
+	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
+
+	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStorePhysicalLimitScanRechecksTargetReadinessAfterFence(t *testing.T) {
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	group.Engine = &readinessFenceEngine{
+		state: raftengine.StateLeader,
+		onLinearizableRead: func() {
+			applyTargetReadiness(t, group)
+		},
+	}
 
 	userKey := []byte("b")
 	start := store.ListItemKey(userKey, 0)
@@ -742,6 +814,23 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(40), ts)
+}
+
+func TestShardStoreStagedVisibilityPreservesCompactionErrors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	retention, ok := group.Store.(store.RetentionController)
+	require.True(t, ok)
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged"), 10, 0))
+	retention.SetMinRetainedTS(20)
+
+	_, err := st.GetAt(ctx, []byte("b"), 15)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
+
+	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 15)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {

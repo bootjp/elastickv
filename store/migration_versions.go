@@ -196,7 +196,14 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := s.checkExportReadTSLocked(opts); err != nil {
+		return ExportVersionsResult{}, err
+	}
 
+	return s.exportVersionsLocked(ctx, opts, pos)
+}
+
+func (s *mvccStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
 	if !s.seekMemoryExportStart(&it, opts.StartKey, pos.key) {
@@ -225,6 +232,13 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 	result.Done = true
 	result.NextCursor = nil
 	return result, nil
+}
+
+func (s *mvccStore) checkExportReadTSLocked(opts ExportVersionsOptions) error {
+	if readTSCompacted(opts.ReadTS, s.minRetainedTS) {
+		return ErrReadTSCompacted
+	}
+	return nil
 }
 
 var errExportReachedEnd = errors.New("export reached end")

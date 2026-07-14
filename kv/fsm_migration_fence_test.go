@@ -543,3 +543,45 @@ func TestFSMAbortCleanupBypassesRetainedWriteFloor(t *testing.T) {
 	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
 	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
 }
+
+func TestFSMAbortCleanupBypassesTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	startTS := uint64(10)
+	abortTS := uint64(11)
+	primaryKey := []byte("b")
+	require.NoError(t, fsm.store.PutAt(ctx, txnLockKey(primaryKey), encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		PrimaryKey:   primaryKey,
+		IsPrimaryKey: true,
+	}), startTS, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, txnIntentKey(primaryKey), encodeTxnIntent(txnIntent{
+		StartTS: startTS,
+		Op:      txnIntentOpPut,
+		Value:   []byte("v"),
+	}), startTS, 0))
+
+	abort := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_ABORT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: abortTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
+		},
+	}
+	require.NoError(t, fsm.handleTxnRequest(ctx, abort, abortTS))
+
+	_, lockErr := fsm.store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
+	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
+}

@@ -53,6 +53,34 @@ func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
 	})
 }
 
+func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
+		retention, ok := st.(RetentionController)
+		require.True(t, ok)
+		retention.SetMinRetainedTS(20)
+
+		_, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			ReadTS:               15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Versions, 1)
+	})
+}
+
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
