@@ -1808,13 +1808,14 @@ func (e *Engine) tryReceivePriorityStep() (raftpb.Message, bool) {
 	}
 }
 
-// dispatchReport is posted by the dispatch workers when a transport send
-// to a peer fails; the engine goroutine drains these and informs etcd/raft
-// via rawNode so follower Progress leaves StateReplicate / StateSnapshot on
-// unreachable peers and does not silently stall.
+// dispatchReport is posted by the dispatch workers after a transport send
+// completes or fails; the engine goroutine drains these and informs etcd/raft
+// via rawNode so follower Progress leaves StateReplicate / StateSnapshot and
+// does not silently stall.
 type dispatchReport struct {
-	to      uint64
-	msgType raftpb.MessageType
+	to             uint64
+	msgType        raftpb.MessageType
+	snapshotFinish bool
 }
 
 func (e *Engine) handleDispatchReport(report dispatchReport) {
@@ -1827,19 +1828,23 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 	// peer from StateReplicate to StateProbe so the next heartbeat response
 	// drives a fresh sendAppend attempt.
 	if report.msgType == raftpb.MsgSnap {
-		e.rawNode.ReportSnapshot(report.to, etcdraft.SnapshotFailure)
+		status := etcdraft.SnapshotFailure
+		if report.snapshotFinish {
+			status = etcdraft.SnapshotFinish
+		}
+		e.rawNode.ReportSnapshot(report.to, status)
 		return
 	}
 	e.rawNode.ReportUnreachable(report.to)
 }
 
-// postDispatchReport delivers a dispatch failure to the event loop without
-// blocking the caller. Dispatch workers use it for transport failures, and the
-// event loop uses it for local queue drops before transport. If the channel is
-// full (unlikely — the buffer is sized to MaxInflightMsg), the report is
-// dropped and logged; this is acceptable because raft will retry on the next
-// tick and we only need eventual consistency between transport state and
-// Progress state.
+// postDispatchReport delivers a dispatch outcome to the event loop without
+// blocking the caller. Dispatch workers use it for transport completion or
+// failures, and the event loop uses it for local queue drops before transport.
+// If the channel is full (unlikely — the buffer is sized to MaxInflightMsg),
+// the report is dropped and logged; this is acceptable because raft will retry
+// on the next tick and we only need eventual consistency between transport
+// state and Progress state.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -4423,7 +4428,11 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
+	if dispatchErr == nil {
+		e.reportSuccessfulDispatch(req.msg)
+		return
+	}
+	if errors.Is(dispatchErr, ctx.Err()) {
 		return
 	}
 	code := dispatchErrorCodeOf(dispatchErr)
@@ -4443,6 +4452,17 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	// Progress stuck and never retries sendAppend/sendSnap for the peer,
 	// leaving the follower indefinitely stale even after heartbeats resume.
 	e.postDispatchReport(dispatchReport{to: req.msg.GetTo(), msgType: req.msg.GetType()})
+}
+
+func (e *Engine) reportSuccessfulDispatch(msg raftpb.Message) {
+	if msg.GetType() != raftpb.MsgSnap {
+		return
+	}
+	e.postDispatchReport(dispatchReport{
+		to:             msg.GetTo(),
+		msgType:        msg.GetType(),
+		snapshotFinish: true,
+	})
 }
 
 func (e *Engine) stopDispatchWorkers() {

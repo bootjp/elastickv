@@ -33,6 +33,39 @@ func TestPostDispatchReport_DeliversWhenChannelHasSpace(t *testing.T) {
 	}
 }
 
+func TestReportSuccessfulDispatchReportsSnapshotFinish(t *testing.T) {
+	t.Parallel()
+	e := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+
+	e.reportSuccessfulDispatch(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)})
+
+	select {
+	case got := <-e.dispatchReportCh:
+		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgSnap, snapshotFinish: true}, got)
+	default:
+		t.Fatal("expected successful MsgSnap dispatch to report SnapshotFinish input")
+	}
+}
+
+func TestReportSuccessfulDispatchIgnoresRegularMessage(t *testing.T) {
+	t.Parallel()
+	e := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+
+	e.reportSuccessfulDispatch(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)})
+
+	select {
+	case got := <-e.dispatchReportCh:
+		t.Fatalf("unexpected dispatch report for regular message: %+v", got)
+	default:
+	}
+}
+
 // TestPostDispatchReport_DropsWhenChannelFull asserts the non-blocking
 // contract: dispatch workers must not stall because the event loop is busy.
 // The worst case is an eventually-consistent gap that raft will fix on the

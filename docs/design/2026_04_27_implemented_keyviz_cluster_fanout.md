@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-C
 parent_design: docs/admin_ui_key_visualizer_design.md
 date: 2026-04-27
@@ -46,6 +46,15 @@ This proposal scopes a **minimum-viable Phase 2-C** that ships the
 operator-visible value (cluster-wide
 heatmap, degraded-node banner) without requiring the full proto
 extension §9.1 calls for.
+
+## 1.1 Implementation status
+
+Implemented in `internal/admin/keyviz_fanout.go`,
+`internal/admin/keyviz_handler.go`, `web/admin/src/pages/KeyViz.tsx`,
+and `main.go`'s `--keyvizFanoutNodes` / `--keyvizFanoutTimeout`
+flags. Tests cover fan-out merge and degraded-node handling in
+`internal/admin/keyviz_fanout_test.go` and the admin KeyViz UI
+suite.
 
 ## 2. Scope
 

@@ -587,7 +587,7 @@ from PR #694: Claude bot critical, Gemini high.)
 The fan-out aggregator's per-cell merge key gains the label:
 
 - Phase 2-C (current): `(bucketID, raftGroupID, leaderTerm,
-  windowStart)` per design `2026_04_27_proposed_keyviz_cluster_fanout.md`
+  windowStart)` per design `2026_04_27_implemented_keyviz_cluster_fanout.md`
   §4.
 - With labels: same tuple — but `bucketID` itself now carries the
   label via the §5 composite (`route:1:dynamo`). The merge key
