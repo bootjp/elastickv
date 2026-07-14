@@ -323,8 +323,14 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 		{
 			name:      "s3 bucket cleanup prefix",
 			prefix:    s3keys.ObjectManifestPrefixForBucket("bucket", 2),
-			wantStart: []byte(""),
-			wantEnd:   nil,
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
+		},
+		{
+			name:      "s3 bucket cleanup route prefix",
+			prefix:    s3keys.RoutePrefixForBucket("bucket", 2),
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

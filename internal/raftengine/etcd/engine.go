@@ -71,8 +71,8 @@ const (
 	priorityStepBurstLimit = 64
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
-	// leader-transfer, and their corresponding response messages
-	// (MsgHeartbeatResp, MsgReadIndexResp, MsgVoteResp, MsgPreVoteResp).
+	// leader-transfer, and their corresponding response messages except for
+	// MsgHeartbeatResp, which uses its own coalescing response lane.
 	// MsgAppResp is intentionally kept in the normal channel: followers — the
 	// only senders of MsgAppResp — do not send MsgApp, so there is no
 	// head-of-line blocking risk there.
@@ -84,8 +84,15 @@ const (
 	// upside is that a ~5 s transient pause (election-timeout scale)
 	// no longer drops heartbeats and forces the peers' lease to expire.
 	defaultHeartbeatBufPerPeer = 512
+	// defaultHeartbeatRespBufPerPeer sizes the dedicated follower-to-leader
+	// heartbeat response lane. When a follower is receiving a large snapshot,
+	// the leader may continue to send heartbeats while the follower's outbound
+	// transport is slow. Heartbeat responses are superseded by newer heartbeat
+	// responses for the same peer, so enqueueDispatchMessage coalesces this lane
+	// instead of reporting a dropped raft message and starving the leader lease.
+	defaultHeartbeatRespBufPerPeer = 128
 	// defaultSnapshotLaneBufPerPeer sizes the per-peer MsgSnap lane when the
-	// 4-lane dispatcher mode is enabled (see ELASTICKV_RAFT_DISPATCHER_LANES).
+	// opt-in multi-lane dispatcher is enabled (see ELASTICKV_RAFT_DISPATCHER_LANES).
 	// MsgSnap is rare and bulky; 4 is enough to absorb a retry or two without
 	// holding up MsgApp replication behind a multi-MiB payload.
 	defaultSnapshotLaneBufPerPeer = 4
@@ -93,11 +100,11 @@ const (
 	// types not classified as heartbeat/replication/snapshot (e.g. surprise
 	// locally-addressed control types). Small buffer: traffic volume is tiny.
 	defaultOtherLaneBufPerPeer = 16
-	// dispatcherLanesEnvVar toggles the 4-lane dispatcher (heartbeat /
-	// replication / snapshot / other). When unset or "0", the legacy
-	// 2-lane layout (heartbeat + normal) is used. Opt-in by design: the
-	// raft hot path is high blast radius and a regression here can cause
-	// cluster-wide elections.
+	// dispatcherLanesEnvVar toggles the multi-lane dispatcher (heartbeat /
+	// heartbeatResp / replication / snapshot / other). When unset or "0", the
+	// legacy 3-lane layout (heartbeat + heartbeatResp + normal) is used.
+	// Opt-in by design: the raft hot path is high blast radius and a regression
+	// here can cause cluster-wide elections.
 	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
 	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
 	// snapshot once the applied index has advanced this many entries past
@@ -328,7 +335,7 @@ type Engine struct {
 	dispatchReportCh  chan dispatchReport
 	peerDispatchers   map[uint64]*peerQueues
 	perPeerQueueSize  int
-	// dispatcherLanesEnabled toggles the 4-lane dispatcher layout. Captured
+	// dispatcherLanesEnabled toggles the opt-in multi-lane dispatcher layout. Captured
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
 	dispatcherLanesEnabled bool
@@ -568,22 +575,23 @@ type dispatchRequest struct {
 // peerQueues holds separate dispatch channels per peer so that heartbeats
 // are never blocked behind large log-entry RPCs.
 //
-// Legacy 2-lane layout (default): heartbeat + normal.
+// Legacy 3-lane layout (default): heartbeat + heartbeatResp + normal.
 //
-// 4-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
-// replication (MsgApp/MsgAppResp) + snapshot (MsgSnap) + other. Each lane
-// gets its own goroutine so a bulky MsgSnap transfer cannot stall MsgApp
-// replication and vice versa. Per-peer ordering within a given message type
-// is preserved because a single peer's MsgApp stream all share one lane and
-// one worker.
+// 5-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
+// heartbeatResp + replication (MsgApp/MsgAppResp) + snapshot (MsgSnap) +
+// other. Each lane gets its own goroutine so a bulky MsgSnap transfer cannot
+// stall MsgApp replication and vice versa. Per-peer ordering within a given
+// message type is preserved because a single peer's MsgApp stream all share
+// one lane and one worker.
 type peerQueues struct {
-	normal      chan dispatchRequest
-	heartbeat   chan dispatchRequest
-	replication chan dispatchRequest // 4-lane mode only; nil otherwise
-	snapshot    chan dispatchRequest // 4-lane mode only; nil otherwise
-	other       chan dispatchRequest // 4-lane mode only; nil otherwise
-	ctx         context.Context
-	cancel      context.CancelFunc
+	normal        chan dispatchRequest
+	heartbeat     chan dispatchRequest
+	heartbeatResp chan dispatchRequest
+	replication   chan dispatchRequest // 5-lane mode only; nil otherwise
+	snapshot      chan dispatchRequest // 5-lane mode only; nil otherwise
+	other         chan dispatchRequest // 5-lane mode only; nil otherwise
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 type preparedOpenState struct {
@@ -2370,6 +2378,9 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	// is already full. The len/cap check is safe here because this function is
 	// only ever called from the single engine event-loop goroutine.
 	if len(ch) >= cap(ch) {
+		if msg.GetType() == raftpb.MsgHeartbeatResp && coalesceHeartbeatResp(ch, msg) {
+			return nil
+		}
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
@@ -2384,12 +2395,61 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
+func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
+	if ch == nil || cap(ch) == 0 {
+		return false
+	}
+	stale, ok := tryReceiveDispatchRequest(ch)
+	if !ok {
+		return false
+	}
+	if stale.msg.GetType() != raftpb.MsgHeartbeatResp {
+		restoreDispatchRequest(ch, stale)
+		return false
+	}
+	closeDispatchRequest(stale)
+	return tryEnqueueDispatchRequest(ch, prepareDispatchRequest(msg))
+}
+
+func tryReceiveDispatchRequest(ch chan dispatchRequest) (dispatchRequest, bool) {
+	select {
+	case req := <-ch:
+		return req, true
+	default:
+		return dispatchRequest{}, false
+	}
+}
+
+func restoreDispatchRequest(ch chan dispatchRequest, req dispatchRequest) {
+	select {
+	case ch <- req:
+	default:
+		closeDispatchRequest(req)
+	}
+}
+
+func tryEnqueueDispatchRequest(ch chan dispatchRequest, req dispatchRequest) bool {
+	select {
+	case ch <- req:
+		return true
+	default:
+		closeDispatchRequest(req)
+		return false
+	}
+}
+
+func closeDispatchRequest(req dispatchRequest) {
+	if err := req.Close(); err != nil {
+		slog.Error("etcd raft dispatch: failed to close request", "err", err)
+	}
+}
+
 // isPriorityMsg returns true for small, low-frequency control messages that
 // must not be queued behind large MsgApp payloads in the normal channel.
 // MsgAppResp is intentionally excluded: it is sent by followers, which never
 // send MsgApp, so it faces no head-of-line blocking in the normal channel.
-// Keeping it out of the priority queue preserves the low-frequency invariant
-// that justifies defaultHeartbeatBufPerPeer = 64.
+// Keeping MsgHeartbeatResp on its own coalescing lane preserves the
+// low-frequency invariant that justifies defaultHeartbeatBufPerPeer.
 func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
 		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
@@ -2399,11 +2459,15 @@ func isPriorityMsg(t raftpb.MessageType) bool {
 }
 
 // selectDispatchLane picks the per-peer channel for msgType. In the legacy
-// 2-lane layout it returns pd.heartbeat for priority control traffic and
-// pd.normal for everything else. In the 4-lane layout it additionally
-// partitions the non-heartbeat traffic so that MsgApp/MsgAppResp and MsgSnap
-// do not share a goroutine and cannot block each other.
+// layout it returns pd.heartbeatResp for MsgHeartbeatResp, pd.heartbeat for
+// other priority control traffic, and pd.normal for everything else. In the
+// opt-in multi-lane layout it additionally partitions the non-heartbeat traffic
+// so that MsgApp/MsgAppResp and MsgSnap do not share a goroutine and cannot
+// block each other.
 func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) chan dispatchRequest {
+	if msgType == raftpb.MsgHeartbeatResp && pd.heartbeatResp != nil {
+		return pd.heartbeatResp
+	}
 	// Priority control traffic (heartbeats, votes, read-index, timeout-now)
 	// always rides the heartbeat lane in both layouts so it keeps its
 	// low-latency treatment and is never stuck behind MsgApp payloads.
@@ -4296,24 +4360,26 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
-		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
-		ctx:       ctx,
-		cancel:    cancel,
+		heartbeat:     make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		heartbeatResp: make(chan dispatchRequest, defaultHeartbeatRespBufPerPeer),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	var workers []chan dispatchRequest
 	if e.dispatcherLanesEnabled {
-		// 4-lane layout: split MsgApp/MsgAppResp (replication), MsgSnap
-		// (snapshot), and misc (other) onto independent goroutines so a
-		// bulky snapshot transfer cannot stall replication. Each channel
-		// still serves a single peer, so within-type ordering (the raft
-		// invariant we care about for MsgApp) is preserved.
+		// 5-lane layout: split MsgHeartbeatResp, MsgApp/MsgAppResp
+		// (replication), MsgSnap (snapshot), and misc (other) onto independent
+		// goroutines so a bulky snapshot transfer cannot stall replication or
+		// follower heartbeat responses. Each channel still serves a single
+		// peer, so within-type ordering (the raft invariant we care about for
+		// MsgApp) is preserved.
 		pd.replication = make(chan dispatchRequest, size)
 		pd.snapshot = make(chan dispatchRequest, defaultSnapshotLaneBufPerPeer)
 		pd.other = make(chan dispatchRequest, defaultOtherLaneBufPerPeer)
-		workers = []chan dispatchRequest{pd.heartbeat, pd.replication, pd.snapshot, pd.other}
+		workers = []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.replication, pd.snapshot, pd.other}
 	} else {
 		pd.normal = make(chan dispatchRequest, size)
-		workers = []chan dispatchRequest{pd.normal, pd.heartbeat}
+		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.heartbeatResp}
 	}
 	e.peerDispatchers[nodeID] = pd
 	e.dispatchWG.Add(len(workers))
@@ -4370,7 +4436,7 @@ func snapshotEveryFromEnv() uint64 {
 	return n
 }
 
-// dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has
+// dispatcherLanesEnabledFromEnv returns true when the multi-lane dispatcher has
 // been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. The value
 // is parsed with strconv.ParseBool, which accepts the standard tokens
 // (1, t, T, TRUE, true, True enable; 0, f, F, FALSE, false, False disable).
@@ -4385,10 +4451,10 @@ func dispatcherLanesEnabledFromEnv() bool {
 }
 
 // closePeerLanes closes every non-nil dispatch channel on pd so that the
-// drain loops in runDispatchWorker exit. It is safe to call with either the
-// 2-lane or 4-lane layout because unused lanes are nil.
+// drain loops in runDispatchWorker exit. It is safe to call with any dispatch
+// layout because unused lanes are nil.
 func closePeerLanes(pd *peerQueues) {
-	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.normal, pd.replication, pd.snapshot, pd.other} {
+	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
 		if ch != nil {
 			close(ch)
 		}

@@ -540,6 +540,9 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if len(prefix) == 0 {
 		return []byte(""), nil
 	}
+	if start, ok := s3keys.BucketGenerationRoutePrefixForCleanupPrefix(prefix); ok {
+		return start, prefixScanEnd(start)
+	}
 	if routeKeyspaceWideRawPrefix(prefix) {
 		return []byte(""), nil
 	}

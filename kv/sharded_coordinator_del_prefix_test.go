@@ -267,6 +267,46 @@ func TestShardedCoordinatorRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t
 	}
 }
 
+func TestShardedCoordinatorAllowsS3BucketDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	const (
+		activeBucket = "bucket-a"
+		fencedBucket = "bucket-b"
+		generation   = uint64(7)
+	)
+	activeStart := s3keys.RoutePrefixForBucketAnyGeneration(activeBucket)
+	activeEnd := prefixScanEnd(activeStart)
+	fencedStart := s3keys.RoutePrefixForBucketAnyGeneration(fencedBucket)
+	fencedEnd := prefixScanEnd(fencedStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: activeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: activeStart, End: activeEnd, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 3, Start: activeEnd, End: fencedStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 4, Start: fencedStart, End: fencedEnd, GroupID: 2, State: distribution.RouteStateWriteFenced},
+			{RouteID: 5, Start: fencedEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: s3keys.ObjectManifestPrefixForBucket(activeBucket, generation)}},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, g1Txn.requests)
+	require.NotEmpty(t, g2Txn.requests, "DEL_PREFIX still broadcasts to every group after the narrow fence precheck passes")
+}
+
 // TestShardedCoordinator_DelPrefixRejectsTxn verifies that DEL_PREFIX inside
 // a transactional group is rejected.
 func TestShardedCoordinator_DelPrefixRejectsTxn(t *testing.T) {
