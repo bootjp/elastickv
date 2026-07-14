@@ -351,10 +351,15 @@ type Engine struct {
 	snapshotStopCh chan struct{}
 	closeCh        chan struct{}
 	doneCh         chan struct{}
-	startedCh      chan struct{}
+	// openCh is closed when run starts and callers may bind public/raft
+	// listeners. startedCh remains the stronger gate for processing inbound
+	// raft messages after the startup Ready drain has completed.
+	openCh    chan struct{}
+	startedCh chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
+	openOnce     sync.Once
 	startOnce    sync.Once
 	closeOnce    sync.Once
 	dispatchOnce sync.Once
@@ -656,6 +661,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		dispatchReportCh: make(chan dispatchReport, inboundQueueCap),
 		closeCh:          make(chan struct{}),
 		doneCh:           make(chan struct{}),
+		openCh:           make(chan struct{}),
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
 		config:           configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
@@ -1685,6 +1691,7 @@ func (e *Engine) run() {
 	ticker := time.NewTicker(e.tickInterval)
 	defer ticker.Stop()
 
+	e.markOpen()
 	if err := e.startup(); err != nil {
 		e.fail(err)
 		return
@@ -3582,9 +3589,19 @@ func (e *Engine) markStarted() {
 	e.startOnce.Do(func() { close(e.startedCh) })
 }
 
+func (e *Engine) markOpen() {
+	if e.openCh == nil {
+		return
+	}
+	e.openOnce.Do(func() { close(e.openCh) })
+}
+
 func (e *Engine) openReady(waitForLeader bool) <-chan struct{} {
 	if waitForLeader {
 		return e.leaderReady
+	}
+	if e.openCh != nil {
+		return e.openCh
 	}
 	return e.startedCh
 }

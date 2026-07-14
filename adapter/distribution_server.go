@@ -410,11 +410,9 @@ func splitJobReadFenceKeys(jobs []distribution.SplitJob) [][]byte {
 	readKeys := make([][]byte, 0, len(jobs)+1)
 	readKeys = append(readKeys, distribution.CatalogNextSplitJobIDKey())
 	for _, job := range jobs {
-		if job.TerminalAtMs > 0 {
-			readKeys = append(readKeys, distribution.CatalogSplitJobHistoryKey(job.TerminalAtMs, job.JobID))
-			continue
+		if splitJobIsLive(job) {
+			readKeys = append(readKeys, distribution.CatalogSplitJobKey(job.JobID))
 		}
-		readKeys = append(readKeys, distribution.CatalogSplitJobKey(job.JobID))
 	}
 	return readKeys
 }

@@ -98,11 +98,33 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 }
 
 func TestSnapshotSpoolDefaultReserveTracksPayloadCap(t *testing.T) {
+	const spoolCap = int64(4096)
+	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
+
+	spool, err := newReceiveSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	require.Equal(t, spoolCap, spool.maxSize)
+	require.Equal(t, spoolCap, spool.minFreeBytes)
+}
+
+func TestSnapshotSpoolMaterializeDoesNotReserveDiskHeadroom(t *testing.T) {
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "1024")
+	originalAvailable := snapshotSpoolAvailableBytes
+	snapshotSpoolAvailableBytes = func(string) (int64, error) {
+		return 0, nil
+	}
+	t.Cleanup(func() { snapshotSpoolAvailableBytes = originalAvailable })
+
 	spool, err := newSnapshotSpool(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = spool.Close() })
 
-	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.minFreeBytes)
+	n, err := spool.Write([]byte("x"))
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Equal(t, int64(1), spool.size)
 }
 
 func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
@@ -113,7 +135,7 @@ func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
 	}
 	t.Cleanup(func() { snapshotSpoolAvailableBytes = originalAvailable })
 
-	spool, err := newSnapshotSpool(t.TempDir())
+	spool, err := newReceiveSnapshotSpool(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = spool.Close() })
 

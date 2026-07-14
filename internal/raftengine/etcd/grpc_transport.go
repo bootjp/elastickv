@@ -1231,7 +1231,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	if err != nil {
 		return raftpb.Message{}, err
 	}
-	spool, err := newSnapshotSpool(spoolPlacement)
+	spool, err := newReceiveSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
 	}

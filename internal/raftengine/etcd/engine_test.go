@@ -108,6 +108,12 @@ type blockingSnapshotStateMachine struct {
 	release chan struct{}
 }
 
+type blockingApplyStateMachine struct {
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+}
+
 type blockingSnapshot struct {
 	started chan struct{}
 	release chan struct{}
@@ -139,6 +145,21 @@ func (s *testSnapshot) Close() error {
 
 func (s *blockingSnapshotStateMachine) Apply(data []byte) any {
 	return string(data)
+}
+
+func (s *blockingApplyStateMachine) Apply(data []byte) any {
+	s.startOnce.Do(func() { close(s.started) })
+	<-s.release
+	return string(data)
+}
+
+func (s *blockingApplyStateMachine) Snapshot() (Snapshot, error) {
+	return &testSnapshot{}, nil
+}
+
+func (s *blockingApplyStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 func (s *blockingSnapshotStateMachine) Snapshot() (Snapshot, error) {
@@ -1407,6 +1428,75 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	})
 
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+}
+
+func TestOpenMultiNodeReturnsBeforeCommittedTailDrain(t *testing.T) {
+	dir := t.TempDir()
+	peers := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}
+	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
+		HardState: testHardState(2, 2),
+		Snapshot:  raftTestSnapshot(1, 1, []uint64{1, 2}, mustEncodeSnapshotData(t, nil)),
+		Entries: []raftpb.Entry{{
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Term:  uint64Ptr(2),
+			Index: uint64Ptr(2),
+			Data:  encodeProposalEnvelope(1, []byte("tail")),
+		}},
+	}))
+
+	fsm := &blockingApplyStateMachine{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	type openResult struct {
+		engine *Engine
+		err    error
+	}
+	done := make(chan openResult, 1)
+	go func() {
+		engine, err := Open(context.Background(), OpenConfig{
+			NodeID:       1,
+			LocalID:      "n1",
+			LocalAddress: "127.0.0.1:7001",
+			DataDir:      dir,
+			Peers:        peers,
+			StateMachine: fsm,
+		})
+		done <- openResult{engine: engine, err: err}
+	}()
+
+	var result openResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("multi-node Open blocked on committed tail drain before returning")
+	}
+	require.NoError(t, result.err)
+	require.NotNil(t, result.engine)
+	defer func() {
+		require.NoError(t, result.engine.Close())
+	}()
+
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("startup committed tail was not being applied")
+	}
+	select {
+	case <-result.engine.startedCh:
+		t.Fatal("engine marked started before startup committed tail drain completed")
+	default:
+	}
+
+	close(fsm.release)
+	select {
+	case <-result.engine.startedCh:
+	case <-time.After(time.Second):
+		t.Fatal("engine did not mark started after committed tail drain completed")
+	}
 }
 
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {

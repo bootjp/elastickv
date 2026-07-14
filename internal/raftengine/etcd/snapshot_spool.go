@@ -31,14 +31,6 @@ const defaultMaxSnapshotPayloadBytes int64 = 16 << 30 // 16 GiB
 
 const maxSnapshotPayloadBytesEnvVar = "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES"
 
-// Keep one full max-size snapshot worth of headroom after receive-side spooling.
-// Applying a token snapshot restores the FSM from the completed .fsm into a new
-// local store directory, so a node can transiently need old snapshot + incoming
-// .fsm + restored store bytes. A small reserve lets the spool complete and only
-// fails later in restore, which can leave the host near-full until startup
-// orphan cleanup runs.
-const defaultSnapshotSpoolMinFreeBytes = defaultMaxSnapshotPayloadBytes
-
 const snapshotSpoolMinFreeBytesEnvVar = "ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES"
 
 // resolveMaxSnapshotPayloadBytes evaluates the env override once per spool
@@ -59,16 +51,16 @@ func resolveMaxSnapshotPayloadBytes() int64 {
 	return n
 }
 
-func resolveSnapshotSpoolMinFreeBytes() int64 {
+func resolveSnapshotSpoolMinFreeBytes(defaultBytes int64) int64 {
 	v := strings.TrimSpace(os.Getenv(snapshotSpoolMinFreeBytesEnvVar))
 	if v == "" {
-		return defaultSnapshotSpoolMinFreeBytes
+		return defaultBytes
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
 		slog.Warn("invalid ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES; using default",
-			"value", v, "default_bytes", defaultSnapshotSpoolMinFreeBytes)
-		return defaultSnapshotSpoolMinFreeBytes
+			"value", v, "default_bytes", defaultBytes)
+		return defaultBytes
 	}
 	return n
 }
@@ -97,6 +89,19 @@ type snapshotSpool struct {
 }
 
 func newSnapshotSpool(dir string) (*snapshotSpool, error) {
+	return newSnapshotSpoolWithLimits(dir, resolveMaxSnapshotPayloadBytes(), 0)
+}
+
+func newReceiveSnapshotSpool(dir string) (*snapshotSpool, error) {
+	maxSize := resolveMaxSnapshotPayloadBytes()
+	// Keep one full max-size snapshot worth of headroom after receive-side
+	// spooling. Applying a token snapshot restores the FSM from the completed
+	// .fsm into a new local store directory, so a node can transiently need old
+	// snapshot + incoming .fsm + restored store bytes.
+	return newSnapshotSpoolWithLimits(dir, maxSize, resolveSnapshotSpoolMinFreeBytes(maxSize))
+}
+
+func newSnapshotSpoolWithLimits(dir string, maxSize, minFreeBytes int64) (*snapshotSpool, error) {
 	file, err := os.CreateTemp(dir, snapshotSpoolPattern)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -104,8 +109,8 @@ func newSnapshotSpool(dir string) (*snapshotSpool, error) {
 	return &snapshotSpool{
 		file:         file,
 		path:         file.Name(),
-		maxSize:      resolveMaxSnapshotPayloadBytes(),
-		minFreeBytes: resolveSnapshotSpoolMinFreeBytes(),
+		maxSize:      maxSize,
+		minFreeBytes: minFreeBytes,
 	}, nil
 }
 
@@ -130,7 +135,7 @@ func (s *snapshotSpool) Write(p []byte) (int, error) {
 }
 
 func (s *snapshotSpool) checkDiskHeadroom(writeBytes int) error {
-	if writeBytes <= 0 {
+	if writeBytes <= 0 || s.minFreeBytes <= 0 {
 		return nil
 	}
 	available, err := snapshotSpoolAvailableBytes(filepath.Dir(s.path))

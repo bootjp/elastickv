@@ -343,6 +343,33 @@ func TestDistributionServerSplitRange_AllowsDisjointRouteWhileSplitJobLive(t *te
 	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogSplitJobKey(10))
 }
 
+func TestSplitJobReadFenceKeysExcludesTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	readKeys := splitJobReadFenceKeys([]distribution.SplitJob{
+		{
+			JobID: 10,
+			Phase: distribution.SplitJobPhaseBackfill,
+		},
+		{
+			JobID:        11,
+			Phase:        distribution.SplitJobPhaseDone,
+			TerminalAtMs: 1000,
+		},
+		{
+			JobID:        12,
+			Phase:        distribution.SplitJobPhaseAbandoned,
+			TerminalAtMs: 1001,
+		},
+	})
+
+	require.Len(t, readKeys, 2)
+	requireReadKeysContain(t, readKeys, distribution.CatalogNextSplitJobIDKey())
+	requireReadKeysContain(t, readKeys, distribution.CatalogSplitJobKey(10))
+	requireReadKeysNotContain(t, readKeys, distribution.CatalogSplitJobHistoryKey(1000, 11))
+	requireReadKeysNotContain(t, readKeys, distribution.CatalogSplitJobHistoryKey(1001, 12))
+}
+
 func TestDistributionServerSplitRange_ConflictsWhenSplitJobCreatedAfterOverlapScan(t *testing.T) {
 	t.Parallel()
 
@@ -822,6 +849,15 @@ func requireReadKeysContain(t *testing.T, readKeys [][]byte, want []byte) {
 		}
 	}
 	t.Fatalf("expected read keys to contain %q, got %q", want, readKeys)
+}
+
+func requireReadKeysNotContain(t *testing.T, readKeys [][]byte, want []byte) {
+	t.Helper()
+	for _, key := range readKeys {
+		if bytes.Equal(key, want) {
+			t.Fatalf("expected read keys not to contain %q, got %q", want, readKeys)
+		}
+	}
 }
 
 func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
