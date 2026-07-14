@@ -1110,12 +1110,26 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[O
 		if elem == nil || len(elem.Key) == 0 {
 			continue
 		}
-		rkey := routeKey(elem.Key)
-		route, ok := c.engine.GetRoute(rkey)
-		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-			continue
+		if err := c.rejectWriteTimestampFloorPointKey(elem.Key, commitTS); err != nil {
+			return err
 		}
-		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", elem.Key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
+	rkey := routeKey(key)
+	if route, ok := c.engine.GetRoute(rkey); ok && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
+	}
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
+		}
 	}
 	return nil
 }
@@ -1933,7 +1947,7 @@ func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 // catalog RouteID for !sqs|route|global. Partition-aware keyviz
 // is a Phase 3.D follow-up.
 func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
-	gid, ok := c.router.ResolveGroup(key)
+	gid, routeID, ok := c.resolveGroupAndRouteForKey(key)
 	if !ok {
 		return 0, nil, false
 	}
@@ -1941,19 +1955,46 @@ func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGrou
 	if !ok {
 		return 0, nil, false
 	}
-	var routeID uint64
-	if route, found := c.engine.GetRoute(routeKey(key)); found {
-		routeID = route.RouteID
-	}
 	return routeID, g, true
 }
 
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
-	gid, ok := c.router.ResolveGroup(key)
+	gid, _, ok := c.resolveGroupAndRouteForKey(key)
 	if !ok {
 		return 0
 	}
 	return gid
+}
+
+func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uint64, bool) {
+	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+		return route.GroupID, route.RouteID, true
+	}
+	gid, ok := c.router.ResolveGroup(key)
+	if !ok {
+		return 0, 0, false
+	}
+	var routeID uint64
+	if route, found := c.engine.GetRoute(routeKey(key)); found {
+		routeID = route.RouteID
+	}
+	return gid, routeID, true
+}
+
+func (c *ShardedCoordinator) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (distribution.Route, bool) {
+	if c == nil || c.engine == nil {
+		return distribution.Route{}, false
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if routeHasStagedVisibility(route) {
+			return route, true
+		}
+	}
+	return distribution.Route{}, false
 }
 
 // EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
@@ -1987,7 +2028,7 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint
 	}
 	grouped := make(map[uint64][][]byte)
 	for _, key := range readKeys {
-		gid, ok := c.router.ResolveGroup(key)
+		gid, _, ok := c.resolveGroupAndRouteForKey(key)
 		if !ok || gid == 0 {
 			return nil, errors.Wrapf(ErrInvalidRequest,
 				"no route for txn read key %q — recognised-but-"+
@@ -2036,6 +2077,12 @@ func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte
 	}
 	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
 		return nil, false
+	}
+	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+		if route.GroupID != gid {
+			return nil, false
+		}
+		return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
 	}
 	route, ok := c.engine.GetRoute(routeKey(key))
 	if !ok || route.GroupID != gid || !routeHasStagedVisibility(route) {
@@ -2195,12 +2242,9 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutat
 		if mut == nil || len(mut.Key) == 0 {
 			continue
 		}
-		rkey := routeKey(mut.Key)
-		route, ok := c.engine.GetRoute(rkey)
-		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-			continue
+		if err := c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS); err != nil {
+			return err
 		}
-		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", mut.Key, rkey, commitTS, route.MinWriteTSExclusive)
 	}
 	return nil
 }
@@ -2297,16 +2341,9 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		gid, ok := c.router.ResolveGroup(mut.Key)
+		gid, routeID, ok := c.resolveGroupAndRouteForKey(mut.Key)
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
-		}
-		// Engine RouteID for keyviz observation; partition-resolved
-		// keys observe under the !sqs|route|global RouteID until
-		// partition-aware keyviz lands.
-		var routeID uint64
-		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
-			routeID = route.RouteID
 		}
 		c.observeMutation(routeID, mut, label)
 		grouped[gid] = append(grouped[gid], mut)

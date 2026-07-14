@@ -140,6 +140,12 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
+	if route, ok := s.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+		if route.GroupID == groupID {
+			return route, nil
+		}
+		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+	}
 	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
 		if route.GroupID == groupID {
 			return route, nil
@@ -1457,9 +1463,12 @@ func (s *ShardStore) scanRouteAtLeaderRouteFilter(
 		kvs []*store.KVPair
 		err error
 	)
-	if reverse {
+	switch {
+	case routeHasStagedVisibility(route):
+		kvs, err = s.scanRouteWithStagedVisibility(ctx, g, route, start, end, limit, ts, reverse)
+	case reverse:
 		kvs, err = g.Store.ReverseScanAt(ctx, start, end, limit, ts)
-	} else {
+	default:
 		kvs, err = g.Store.ScanAt(ctx, start, end, limit, ts)
 	}
 	if err != nil {
@@ -1622,6 +1631,9 @@ func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commit
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
 	}
+	if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); err != nil {
+		return err
+	}
 	return errors.WithStack(g.Store.PutAt(ctx, key, value, commitTS, expireAt))
 }
 
@@ -1631,6 +1643,9 @@ func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) 
 		return store.ErrNotSupported
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
+	}
+	if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); err != nil {
 		return err
 	}
 	return errors.WithStack(g.Store.DeleteAt(ctx, key, commitTS))
@@ -1644,6 +1659,9 @@ func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte,
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
 	}
+	if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); err != nil {
+		return err
+	}
 	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
 }
 
@@ -1653,6 +1671,9 @@ func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, 
 		return store.ErrNotSupported
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
+	}
+	if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); err != nil {
 		return err
 	}
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
@@ -2434,6 +2455,25 @@ func (s *ShardStore) ensureMutationWriteTimestampFloors(mutations []*store.KVPai
 		if err := ensureRouteWriteTimestampFloor(route, mut.Key, commitTS); err != nil {
 			return err
 		}
+		if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ShardStore) ensureS3BucketAuxiliaryWriteTimestampFloor(key []byte, commitTS uint64) error {
+	if s == nil || s.engine == nil || commitTS == 0 {
+		return nil
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
+	}
+	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
+		}
 	}
 	return nil
 }
@@ -2778,12 +2818,32 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 }
 
 func (s *ShardStore) routeAndGroupForKey(key []byte) (distribution.Route, *ShardGroup, bool) {
+	if route, ok := s.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+		g, ok := s.groups[route.GroupID]
+		return route, g, ok
+	}
 	route, ok := s.engine.GetRoute(routeKey(key))
 	if !ok {
 		return distribution.Route{}, nil, false
 	}
 	g, ok := s.groups[route.GroupID]
 	return route, g, ok
+}
+
+func (s *ShardStore) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (distribution.Route, bool) {
+	if s == nil || s.engine == nil {
+		return distribution.Route{}, false
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
+		if routeHasStagedVisibility(route) {
+			return route, true
+		}
+	}
+	return distribution.Route{}, false
 }
 
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
