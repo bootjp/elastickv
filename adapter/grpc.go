@@ -200,7 +200,8 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
 	}
 	if fenceScanner, ok := r.store.(rawReadFenceScanner); ok {
-		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), req.GetRouteStart(), req.GetRouteEnd())
+		routeStart, routeEnd := rawScanRouteBounds(req)
+		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), routeStart, routeEnd)
 		return res, errors.WithStack(err)
 	}
 	if groupID := req.GetGroupId(); groupID != 0 {
@@ -217,6 +218,23 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 	}
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	return res, errors.WithStack(err)
+}
+
+func rawScanRouteBounds(req *pb.RawScanAtRequest) ([]byte, []byte) {
+	if req == nil {
+		return nil, nil
+	}
+	routeStart := req.GetRouteStart()
+	routeEnd := req.GetRouteEnd()
+	if req.GetRouteBoundsPresent() {
+		if routeStart == nil {
+			routeStart = []byte{}
+		}
+		if routeEnd == nil {
+			routeEnd = []byte{}
+		}
+	}
+	return routeStart, routeEnd
 }
 
 func (r *GRPCServer) readRouteVersion(requested uint64) uint64 {

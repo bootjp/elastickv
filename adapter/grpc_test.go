@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
 	"google.golang.org/grpc/status"
+	goproto "google.golang.org/protobuf/proto"
 )
 
 func Test_value_can_be_deleted(t *testing.T) {
@@ -220,6 +221,7 @@ type recordingRawReadFenceStore struct {
 	scanReadRouteVersion     uint64
 	scanReadRouteStart       []byte
 	scanReadRouteEnd         []byte
+	scanRouteBoundsPresent   bool
 	callerSuppliedGetSeen    uint64
 	callerSuppliedScanSeen   uint64
 	callerSuppliedLatestSeen uint64
@@ -247,12 +249,20 @@ func (s *recordingRawReadFenceStore) LatestCommitTSWithReadFence(_ context.Conte
 
 func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, _ bool, _ uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	s.scanReadRouteVersion = readRouteVersion
-	s.scanReadRouteStart = append([]byte(nil), routeStart...)
-	s.scanReadRouteEnd = append([]byte(nil), routeEnd...)
+	s.scanReadRouteStart = cloneTestBytes(routeStart)
+	s.scanReadRouteEnd = cloneTestBytes(routeEnd)
+	s.scanRouteBoundsPresent = routeStart != nil || routeEnd != nil
 	if readRouteVersion == 97 {
 		s.callerSuppliedScanSeen = readRouteVersion
 	}
 	return []*store.KVPair{{Key: append([]byte(nil), start...), Value: []byte("v")}}, nil
+}
+
+func cloneTestBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte{}, b...)
 }
 
 func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
@@ -301,6 +311,41 @@ func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(97), st.callerSuppliedScanSeen)
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.Equal(t, []byte("z"), st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_PreservesFullRangeRouteBoundsPresence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	wire, err := goproto.Marshal(&pb.RawScanAtRequest{
+		StartKey:           []byte("!redis|meta|"),
+		EndKey:             []byte("!redis|meta}"),
+		Limit:              10,
+		Ts:                 10,
+		ReadRouteVersion:   97,
+		RouteStart:         []byte{},
+		RouteEnd:           []byte{},
+		RouteBoundsPresent: true,
+	})
+	require.NoError(t, err)
+
+	var decoded pb.RawScanAtRequest
+	require.NoError(t, goproto.Unmarshal(wire, &decoded))
+	require.True(t, decoded.GetRouteBoundsPresent())
+	require.Nil(t, decoded.RouteStart)
+	require.Nil(t, decoded.RouteEnd)
+
+	_, err = s.RawScanAt(ctx, &decoded)
+	require.NoError(t, err)
+	require.Equal(t, uint64(97), st.scanReadRouteVersion)
+	require.True(t, st.scanRouteBoundsPresent)
+	require.NotNil(t, st.scanReadRouteStart)
+	require.NotNil(t, st.scanReadRouteEnd)
+	require.Empty(t, st.scanReadRouteStart)
+	require.Empty(t, st.scanReadRouteEnd)
 }
 
 func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {

@@ -509,18 +509,19 @@ func (x *RawLatestCommitTSResponse) GetExists() bool {
 }
 
 type RawScanAtRequest struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	StartKey         []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
-	EndKey           []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
-	Limit            int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
-	Ts               uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
-	Reverse          bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
-	GroupId          uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for non-range-owned keyspaces
-	ReadRouteVersion uint64                 `protobuf:"varint,7,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
-	RouteStart       []byte                 `protobuf:"bytes,8,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`                      // route-key-normalized inclusive start, when already known
-	RouteEnd         []byte                 `protobuf:"bytes,9,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`                            // route-key-normalized exclusive end; empty means +infinity
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	StartKey           []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
+	EndKey             []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
+	Limit              int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
+	Ts                 uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
+	Reverse            bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
+	GroupId            uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                                     // optional explicit Raft group for non-range-owned keyspaces
+	ReadRouteVersion   uint64                 `protobuf:"varint,7,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"`        // stamped by server-side routing for migration read fences
+	RouteStart         []byte                 `protobuf:"bytes,8,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`                             // route-key-normalized inclusive start, when already known
+	RouteEnd           []byte                 `protobuf:"bytes,9,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`                                   // route-key-normalized exclusive end; empty means +infinity
+	RouteBoundsPresent bool                   `protobuf:"varint,10,opt,name=route_bounds_present,json=routeBoundsPresent,proto3" json:"route_bounds_present,omitempty"` // true when route_start/route_end were supplied, including ["", +infinity)
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RawScanAtRequest) Reset() {
@@ -614,6 +615,13 @@ func (x *RawScanAtRequest) GetRouteEnd() []byte {
 		return x.RouteEnd
 	}
 	return nil
+}
+
+func (x *RawScanAtRequest) GetRouteBoundsPresent() bool {
+	if x != nil {
+		return x.RouteBoundsPresent
+	}
+	return false
 }
 
 type RawKVPair struct {
@@ -2321,7 +2329,7 @@ const file_service_proto_rawDesc = "" +
 	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\x8f\x02\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xc1\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
@@ -2332,7 +2340,9 @@ const file_service_proto_rawDesc = "" +
 	"\x12read_route_version\x18\a \x01(\x04R\x10readRouteVersion\x12\x1f\n" +
 	"\vroute_start\x18\b \x01(\fR\n" +
 	"routeStart\x12\x1b\n" +
-	"\troute_end\x18\t \x01(\fR\brouteEnd\"3\n" +
+	"\troute_end\x18\t \x01(\fR\brouteEnd\x120\n" +
+	"\x14route_bounds_present\x18\n" +
+	" \x01(\bR\x12routeBoundsPresent\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +

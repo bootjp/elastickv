@@ -153,12 +153,21 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.NoError(t, err)
 
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
 	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
 	require.Equal(t, uint64(79), fake.lastScanReq.GetReadRouteVersion())
 	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
 	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 80, []byte{}, []byte{})
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(80), fake.lastScanReq.GetReadRouteVersion())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
 }
 
 func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
@@ -176,9 +185,9 @@ func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
 	}
 	st := NewShardStore(engine, groups)
 
-	rawPrefix := []byte("!raw|")
-	first := []byte("!raw|a")
-	second := []byte("!raw|b")
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|x")
+	second := []byte("!redis|meta|y")
 	require.NoError(t, groups[2].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
 	require.NoError(t, groups[2].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
 
@@ -209,9 +218,9 @@ func TestShardStoreScanAtWithReadFence_DeduplicatesSameGroupSuppliedBounds(t *te
 	}
 	st := NewShardStore(engine, groups)
 
-	rawPrefix := []byte("!raw|")
-	first := []byte("!raw|a")
-	second := []byte("!raw|b")
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|a")
+	second := []byte("!redis|meta|b")
 	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
 
@@ -220,6 +229,37 @@ func TestShardStoreScanAtWithReadFence_DeduplicatesSameGroupSuppliedBounds(t *te
 	require.Len(t, kvs, 2)
 	require.Equal(t, first, kvs[0].Key)
 	require.Equal(t, second, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersSuppliedBoundsByRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, 7, []byte{}, []byte("m"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, left, kvs[0].Key)
 }
 
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
