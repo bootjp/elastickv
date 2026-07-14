@@ -2414,20 +2414,30 @@ func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
 	if ch == nil || cap(ch) == 0 {
 		return false
 	}
-	stale, ok := tryReceiveDispatchRequest(ch)
-	if !ok {
+	n := len(ch)
+	if n == 0 {
 		return false
 	}
-	if stale.msg.GetType() != raftpb.MsgHeartbeatResp {
-		restoreDispatchRequest(ch, stale)
-		return false
+
+	drained := make([]dispatchRequest, 0, n)
+	replaced := false
+	for i := 0; i < n; i++ {
+		req, ok := tryReceiveDispatchRequest(ch)
+		if !ok {
+			break
+		}
+		if !replaced && req.msg.GetType() == raftpb.MsgHeartbeatResp && len(req.msg.GetContext()) == 0 {
+			closeDispatchRequest(req)
+			drained = append(drained, prepareDispatchRequest(msg))
+			replaced = true
+			continue
+		}
+		drained = append(drained, req)
 	}
-	if len(stale.msg.GetContext()) != 0 {
-		restoreDispatchRequest(ch, stale)
-		return false
+	for _, req := range drained {
+		restoreDispatchRequest(ch, req)
 	}
-	closeDispatchRequest(stale)
-	return tryEnqueueDispatchRequest(ch, prepareDispatchRequest(msg))
+	return replaced
 }
 
 func tryReceiveDispatchRequest(ch chan dispatchRequest) (dispatchRequest, bool) {
@@ -2444,16 +2454,6 @@ func restoreDispatchRequest(ch chan dispatchRequest, req dispatchRequest) {
 	case ch <- req:
 	default:
 		closeDispatchRequest(req)
-	}
-}
-
-func tryEnqueueDispatchRequest(ch chan dispatchRequest, req dispatchRequest) bool {
-	select {
-	case ch <- req:
-		return true
-	default:
-		closeDispatchRequest(req)
-		return false
 	}
 }
 

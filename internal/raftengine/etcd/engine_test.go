@@ -1453,6 +1453,50 @@ func TestEnqueueDispatchMessagePreservesReadIndexHeartbeatResponses(t *testing.T
 	require.Equal(t, []byte("read-index"), req.msg.Context)
 }
 
+func TestEnqueueDispatchMessageCoalescesPlainHeartbeatBehindReadIndex(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 3),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index"),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(10),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(11),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(99),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 3)
+	req := <-pd.heartbeatResp
+	require.Equal(t, []byte("read-index"), req.msg.Context)
+	req = <-pd.heartbeatResp
+	require.Equal(t, uint64(99), req.msg.GetIndex())
+	req = <-pd.heartbeatResp
+	require.Equal(t, uint64(11), req.msg.GetIndex())
+}
+
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(5, 2, []uint64{1}, nil)
