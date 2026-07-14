@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	defaultPoolSize     = 128
-	defaultDialTimeout  = 5 * time.Second
-	defaultReadTimeout  = 3 * time.Second
-	defaultWriteTimeout = 3 * time.Second
-	blockingReadGrace   = 10 * time.Second
-	respProtocolV2      = 2
+	defaultPoolSize          = 128
+	defaultElasticKVPoolSize = 4
+	defaultDialTimeout       = 5 * time.Second
+	defaultReadTimeout       = 3 * time.Second
+	defaultWriteTimeout      = 3 * time.Second
+	blockingReadGrace        = 10 * time.Second
+	respProtocolV2           = 2
 )
 
 // Backend abstracts a Redis-protocol endpoint (real Redis or ElasticKV).
@@ -48,6 +49,16 @@ func DefaultBackendOptions() BackendOptions {
 		ReadTimeout:  defaultReadTimeout,
 		WriteTimeout: defaultWriteTimeout,
 	}
+}
+
+// DefaultElasticKVBackendOptions returns defaults for proxy backends that
+// connect to ElasticKV's Redis adapter. ElasticKV limits concurrent Redis
+// connections per peer by default, so keep the pool below that cap unless the
+// operator also raises ELASTICKV_REDIS_PER_PEER_CONNECTIONS on the cluster.
+func DefaultElasticKVBackendOptions() BackendOptions {
+	opts := DefaultBackendOptions()
+	opts.PoolSize = defaultElasticKVPoolSize
+	return opts
 }
 
 // PubSubBackend is an optional interface for backends that support

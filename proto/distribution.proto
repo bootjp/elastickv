@@ -45,6 +45,80 @@ message RouteDescriptor {
   uint64 split_at_hlc = 7;
 }
 
+enum SplitJobPhase {
+  SPLIT_JOB_PHASE_NONE = 0;
+  SPLIT_JOB_PHASE_PLANNED = 1;
+  SPLIT_JOB_PHASE_BACKFILL = 2;
+  SPLIT_JOB_PHASE_FENCE = 3;
+  SPLIT_JOB_PHASE_DELTA_COPY = 4;
+  SPLIT_JOB_PHASE_CUTOVER = 5;
+  SPLIT_JOB_PHASE_CLEANUP = 6;
+  SPLIT_JOB_PHASE_DONE = 7;
+  SPLIT_JOB_PHASE_FAILED = 8;
+  SPLIT_JOB_PHASE_ABANDONING = 9;
+  SPLIT_JOB_PHASE_ABANDONED = 10;
+}
+
+enum SplitJobBarrierState {
+  SPLIT_JOB_BARRIER_STATE_NONE = 0;
+  SPLIT_JOB_BARRIER_STATE_ARMING = 1;
+  SPLIT_JOB_BARRIER_STATE_ARMED = 2;
+  SPLIT_JOB_BARRIER_STATE_CLEARING = 3;
+}
+
+enum SplitJobExportPhase {
+  SPLIT_JOB_EXPORT_PHASE_NONE = 0;
+  SPLIT_JOB_EXPORT_PHASE_BACKFILL = 1;
+  SPLIT_JOB_EXPORT_PHASE_DELTA_COPY = 2;
+}
+
+message SplitJobBracketProgress {
+  uint64 bracket_id = 1;
+  uint32 family = 2;
+  SplitJobExportPhase export_phase = 3;
+  bytes cursor = 4;
+  bool done = 5;
+  uint64 scanned_bytes = 6;
+  uint64 accepted_rows = 7;
+  uint64 last_acked_batch_seq = 8;
+}
+
+message SplitJob {
+  uint64 job_id = 1;
+  uint64 source_route_id = 2;
+  bytes split_key = 3;
+  uint64 target_group_id = 4;
+  SplitJobPhase phase = 5;
+  SplitJobPhase retry_phase = 6;
+  SplitJobPhase abandon_from_phase = 7;
+  uint64 snapshot_ts = 8;
+  uint64 snapshot_min_admitted_ts = 9;
+  bool write_tracker_armed = 10;
+  uint64 delta_floor = 11;
+  bool post_fence_drain_completed = 12;
+  uint64 fence_ts = 13;
+  uint64 cutover_version = 14;
+  SplitJobBarrierState cutover_read_fence_state = 15;
+  SplitJobBarrierState target_staged_readiness_state = 16;
+  bytes source_cutover_read_fence_ack_cursor = 17;
+  bytes target_staged_readiness_ack_cursor = 18;
+  bytes cursor = 19;
+  uint64 max_imported_ts = 20;
+  bool target_promotion_done = 21;
+  uint64 promotion_completed_ts = 22;
+  uint64 fence_catalog_version = 23;
+  bytes fence_ack_cursor = 24;
+  bytes source_cutover_ack_cursor = 25;
+  bytes source_read_drain_cursor = 26;
+  bytes target_cleared_descriptor_ack_cursor = 27;
+  repeated SplitJobBracketProgress bracket_progress = 28;
+  uint64 source_retention_pin_ts = 29;
+  string last_error = 30;
+  int64 started_at_ms = 31;
+  int64 updated_at_ms = 32;
+  int64 terminal_at_ms = 33;
+}
+
 message ListRoutesRequest {}
 
 message ListRoutesResponse {
