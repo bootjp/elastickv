@@ -482,6 +482,9 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	// DEL_PREFIX mutations are handled by the store's DeletePrefixAt which
 	// scans and writes tombstones locally. A DEL_PREFIX request must be the
 	// sole mutation in a request (enforced by the coordinator's toRawRequest).
@@ -720,6 +723,9 @@ func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	if err := f.verifyComposed1(r); err != nil {
 		return err
 	}
@@ -815,6 +821,82 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 		return nil
 	}
 	return f.verifyOwnerFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+}
+
+func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
+	if requestBypassesWriteFence(r) {
+		return nil
+	}
+	observedVer := r.GetObservedRouteVersion()
+	if !f.writeFenceHistoryReady(observedVer) {
+		return nil
+	}
+	observedSnap, ok := f.routes.SnapshotAt(observedVer)
+	if !ok {
+		return errors.WithStack(ErrComposed1VersionGCd)
+	}
+	if err := verifyWriteFenceFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
+		return err
+	}
+
+	currentSnap, ok := f.routes.Current()
+	if !ok || currentSnap.Version() == observedSnap.Version() {
+		return nil
+	}
+	return verifyWriteFenceFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+}
+
+func requestBypassesWriteFence(r *pb.Request) bool {
+	if !r.GetIsTxn() {
+		return false
+	}
+	switch r.GetPhase() {
+	case pb.Phase_COMMIT, pb.Phase_ABORT:
+		return true
+	case pb.Phase_NONE, pb.Phase_PREPARE:
+		return false
+	}
+	return false
+}
+
+func (f *kvFSM) writeFenceHistoryReady(observedVer uint64) bool {
+	return f.routes != nil && f.shardGroupID != 0 && observedVer != 0
+}
+
+func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, snapVer uint64, phase string) error {
+	for _, mut := range mutations {
+		if mut == nil {
+			continue
+		}
+		if isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if mut.GetOp() == pb.Op_DEL_PREFIX {
+			start, end := routePrefixRange(mut.Key)
+			if snap.WriteFencedIntersects(start, end) {
+				return errors.Wrapf(ErrRouteWriteFenced,
+					"%s-version v=%d: prefix %q route range [%q,%q)",
+					phase, snapVer, mut.Key, start, end)
+			}
+			continue
+		}
+		if len(mut.Key) == 0 {
+			continue
+		}
+		rKey := routeKey(mut.Key)
+		if snap.WriteFencedForKey(rKey) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q routeKey %q",
+				phase, snapVer, mut.Key, rKey)
+		}
+		start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key)
+		if ok && snap.WriteFencedIntersects(start, end) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q route range [%q,%q)",
+				phase, snapVer, mut.Key, start, end)
+		}
+	}
+	return nil
 }
 
 // verifyOwnerFromSnapshot is the shared per-mutation owner-check

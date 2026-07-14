@@ -700,6 +700,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
+	c.maybeAutoPinRawObservedRouteVersion(reqs)
 	if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
 		return resp, err
 	}
@@ -746,7 +747,7 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
+		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems, reqs.ObservedRouteVersion)
 		return resp, true, err
 	}
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
@@ -829,6 +830,16 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 // cyclomatic complexity in the cyclop budget.
 func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP], callerSuppliedStartTS bool) {
 	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
+		return
+	}
+	if c.anyResolverClaimedKey(reqs.Elems) {
+		return
+	}
+	reqs.ObservedRouteVersion = c.engine.Version()
+}
+
+func (c *ShardedCoordinator) maybeAutoPinRawObservedRouteVersion(reqs *OperationGroup[OP]) {
+	if c.engine == nil || reqs == nil || reqs.IsTxn || reqs.ObservedRouteVersion != 0 {
 		return
 	}
 	if c.anyResolverClaimedKey(reqs.Elems) {
@@ -1021,7 +1032,7 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 // to every shard group. Each element becomes a separate pb.Request (the FSM's
 // extractDelPrefix processes only the first DEL_PREFIX mutation per request).
 // All requests are batched into a single Commit call per shard group.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP], observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
 	}
@@ -1039,10 +1050,11 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: []*pb.Mutation{elemToMutation(elem)},
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            []*pb.Mutation{elemToMutation(elem)},
+			ObservedRouteVersion: observedRouteVersion,
 		})
 	}
 
@@ -2013,10 +2025,11 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 			return nil, err
 		}
 		logs = append(logs, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: grouped[gid],
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            grouped[gid],
+			ObservedRouteVersion: reqs.ObservedRouteVersion,
 		})
 	}
 	return logs, nil

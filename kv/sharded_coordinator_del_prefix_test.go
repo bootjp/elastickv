@@ -122,6 +122,52 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		"same DEL_PREFIX element must use the same timestamp across shards")
 }
 
+func TestShardedCoordinator_DelPrefixCarriesObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("user:")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, uint64(7), txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_RawWriteCarriesObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, uint64(9), txn.requests[0].GetObservedRouteVersion())
+}
+
 func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 

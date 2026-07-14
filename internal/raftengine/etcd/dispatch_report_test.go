@@ -50,6 +50,63 @@ func TestReportSuccessfulDispatchReportsSnapshotFinish(t *testing.T) {
 	}
 }
 
+func TestReportSuccessfulDispatchWaitsForSnapshotFinishSlot(t *testing.T) {
+	t.Parallel()
+	e := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	blockingReport := dispatchReport{to: 1, msgType: raftpb.MsgApp}
+	e.dispatchReportCh <- blockingReport
+
+	done := make(chan struct{})
+	go func() {
+		e.reportSuccessfulDispatch(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("snapshot finish report returned while dispatchReportCh was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	require.Equal(t, blockingReport, <-e.dispatchReportCh)
+	select {
+	case <-done:
+	case <-time.After(testDispatchReportTimeout):
+		t.Fatal("snapshot finish report did not complete after dispatchReportCh had space")
+	}
+	select {
+	case got := <-e.dispatchReportCh:
+		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgSnap, snapshotFinish: true}, got)
+	default:
+		t.Fatal("expected reliable successful MsgSnap dispatch report")
+	}
+}
+
+func TestReportSuccessfulDispatchAbortsOnCloseWhenReportFull(t *testing.T) {
+	t.Parallel()
+	e := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	e.dispatchReportCh <- dispatchReport{to: 1, msgType: raftpb.MsgApp}
+	close(e.closeCh)
+
+	done := make(chan struct{})
+	go func() {
+		e.reportSuccessfulDispatch(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(testDispatchReportTimeout):
+		t.Fatal("snapshot finish report did not abort when closeCh was signalled")
+	}
+}
+
 func TestReportSuccessfulDispatchIgnoresRegularMessage(t *testing.T) {
 	t.Parallel()
 	e := &Engine{

@@ -1145,12 +1145,13 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 // The returned Request is structurally identical to the pre-stamping
 // shape the leader's stampRawTimestamps already handles for Ts == 0
 // (see adapter/internal.go).
-func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
+func (c *Coordinate) toRawRequest(req *Elem[OP], observedRouteVersion uint64) *pb.Request {
 	switch req.Op {
 	case Put:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -1162,8 +1163,9 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 	case Del:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
@@ -1174,8 +1176,9 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 	case DelPrefix:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL_PREFIX,
@@ -1238,7 +1241,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toRawRequest(req))
+			requests = append(requests, c.toRawRequest(req, reqs.ObservedRouteVersion))
 		}
 		return requests, nil
 	}

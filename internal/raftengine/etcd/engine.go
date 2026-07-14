@@ -1868,7 +1868,8 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 // If the channel is full (unlikely — the buffer is sized to MaxInflightMsg),
 // the report is dropped and logged; this is acceptable because raft will retry
 // on the next tick and we only need eventual consistency between transport
-// state and Progress state.
+// state and Progress state. Successful MsgSnap reports are the exception; see
+// postReliableDispatchReport.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -1878,6 +1879,20 @@ func (e *Engine) postDispatchReport(report dispatchReport) {
 			"to", report.to,
 			"type", report.msgType.String(),
 		)
+	}
+}
+
+// postReliableDispatchReport delivers a dispatch outcome that must not be
+// dropped. SnapshotFinish is not eventually consistent with ordinary
+// unreachable reports: if it is lost, raft can keep the follower's Progress in
+// StateSnapshot after the follower accepted the snapshot.
+func (e *Engine) postReliableDispatchReport(report dispatchReport) {
+	if e.dispatchReportCh == nil {
+		return
+	}
+	select {
+	case e.dispatchReportCh <- report:
+	case <-e.closeCh:
 	}
 }
 
@@ -4523,7 +4538,7 @@ func (e *Engine) reportSuccessfulDispatch(msg raftpb.Message) {
 	if msg.GetType() != raftpb.MsgSnap {
 		return
 	}
-	e.postDispatchReport(dispatchReport{
+	e.postReliableDispatchReport(dispatchReport{
 		to:             msg.GetTo(),
 		msgType:        msg.GetType(),
 		snapshotFinish: true,
