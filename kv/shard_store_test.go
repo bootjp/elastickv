@@ -273,6 +273,36 @@ func TestShardStoreScanAtWithReadFence_FiltersSuppliedBoundsByRouteKey(t *testin
 	require.Equal(t, left, kvs[0].Key)
 }
 
+func TestShardStoreScanAtWithReadFence_FiltersByEachRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), []byte("z"), 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|b")
+	staleRightOnLeftGroup := []byte("!redis|meta|x")
+	right := []byte("!redis|meta|y")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, staleRightOnLeftGroup, []byte("stale"), 2, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, right, []byte("right"), 3, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 3, false, 0, 7, []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, left, kvs[0].Key)
+	require.Equal(t, right, kvs[1].Key)
+}
+
 func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *testing.T) {
 	t.Parallel()
 
@@ -295,7 +325,11 @@ func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *t
 	_, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, 7, nil, nil)
 	require.ErrorIs(t, err, store.ErrNotSupported)
 
-	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, 7, []byte("m"), nil)
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, 7, []byte("m"), nil)
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, right, kvs[0].Key)
@@ -561,6 +595,19 @@ func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
 	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("d"), 2)
 	require.Equal(t, []byte("a"), lockStart)
 	require.Equal(t, nextScanCursor([]byte("c")), lockEnd)
+}
+
+func TestScanLockBoundsForKVsDirection_ReverseUsesReturnedWindow(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("z"), Value: []byte("vz")},
+		{Key: []byte("y"), Value: []byte("vy")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte("a"), []byte("zz"), 2, true)
+	require.Equal(t, []byte("y"), lockStart)
+	require.Equal(t, []byte("zz"), lockEnd)
 }
 
 func TestScanLockBoundsForKVs_PreservesOriginalStart(t *testing.T) {

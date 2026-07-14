@@ -76,7 +76,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore(), distribution.WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
 			RouteID:                2,
@@ -134,7 +134,7 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 
 	ctx := context.Background()
 	baseStore := store.NewMVCCStore()
-	catalog := distribution.NewCatalogStore(baseStore)
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
 			RouteID:             1,
@@ -537,7 +537,7 @@ func TestBuildCatalogSplitOps_UsesSurgicalSplitMutations(t *testing.T) {
 		ParentRouteID: 1,
 	}
 
-	ops, err := buildCatalogSplitOps(1, left, right, 2, 5)
+	ops, err := buildCatalogSplitOps(1, left, right, 2, 5, false)
 	require.NoError(t, err)
 	require.Len(t, ops, 5)
 	require.Equal(t, kv.Del, ops[0].Op)
