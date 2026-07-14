@@ -828,21 +828,27 @@ func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
 		return nil
 	}
 	observedVer := r.GetObservedRouteVersion()
-	if !f.writeFenceHistoryReady(observedVer) {
+	if !f.writeFenceHistoryReady() {
 		return nil
 	}
-	observedSnap, ok := f.routes.SnapshotAt(observedVer)
+	currentSnap, ok := f.routes.Current()
 	if !ok {
-		return errors.WithStack(ErrComposed1VersionGCd)
-	}
-	if err := verifyWriteFenceFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
-		return err
+		return nil
 	}
 
-	currentSnap, ok := f.routes.Current()
-	if !ok || currentSnap.Version() == observedSnap.Version() {
-		return nil
+	if observedVer != 0 {
+		observedSnap, ok := f.routes.SnapshotAt(observedVer)
+		if !ok {
+			return errors.WithStack(ErrComposed1VersionGCd)
+		}
+		if err := verifyWriteFenceFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
+			return err
+		}
+		if currentSnap.Version() == observedSnap.Version() {
+			return nil
+		}
 	}
+
 	return verifyWriteFenceFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
 }
 
@@ -859,8 +865,8 @@ func requestBypassesWriteFence(r *pb.Request) bool {
 	return false
 }
 
-func (f *kvFSM) writeFenceHistoryReady(observedVer uint64) bool {
-	return f.routes != nil && f.shardGroupID != 0 && observedVer != 0
+func (f *kvFSM) writeFenceHistoryReady() bool {
+	return f.routes != nil && f.shardGroupID != 0
 }
 
 func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, snapVer uint64, phase string) error {

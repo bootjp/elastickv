@@ -1108,6 +1108,10 @@ func isRetryableTransactWriteError(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
 }
 
+func isIgnorableTransactRaceError(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+}
+
 func shouldPreserveTransactWriteAttempt(err error) bool {
 	return isRetryableTransactWriteError(err) && !errors.Is(err, kv.ErrRouteWriteFenced)
 }

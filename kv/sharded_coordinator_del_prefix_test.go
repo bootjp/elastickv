@@ -122,7 +122,7 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		"same DEL_PREFIX element must use the same timestamp across shards")
 }
 
-func TestShardedCoordinator_DelPrefixCarriesObservedRouteVersion(t *testing.T) {
+func TestShardedCoordinator_DelPrefixDoesNotAutoPinObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -142,10 +142,10 @@ func TestShardedCoordinator_DelPrefixCarriesObservedRouteVersion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, txn.requests, 1)
-	require.Equal(t, uint64(7), txn.requests[0].GetObservedRouteVersion())
+	require.Zero(t, txn.requests[0].GetObservedRouteVersion())
 }
 
-func TestShardedCoordinator_RawWriteCarriesObservedRouteVersion(t *testing.T) {
+func TestShardedCoordinator_RawWriteDoesNotAutoPinObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -165,7 +165,61 @@ func TestShardedCoordinator_RawWriteCarriesObservedRouteVersion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, txn.requests, 1)
-	require.Equal(t, uint64(9), txn.requests[0].GetObservedRouteVersion())
+	require.Zero(t, txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_RetriesRawWriteWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems:                []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 2)
+	require.Equal(t, uint64(3), txn.requests[0].GetObservedRouteVersion())
+	require.Equal(t, uint64(9), txn.requests[1].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_RetriesDelPrefixWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 2,
+		Elems:                []*Elem[OP]{{Op: DelPrefix, Key: []byte("user:")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 2)
+	require.Equal(t, uint64(2), txn.requests[0].GetObservedRouteVersion())
+	require.Equal(t, uint64(7), txn.requests[1].GetObservedRouteVersion())
 }
 
 func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {

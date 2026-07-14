@@ -1292,7 +1292,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		Elems:    elems,
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return nil
 		}
 		return errors.WithStack(err)

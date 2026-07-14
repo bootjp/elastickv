@@ -700,11 +700,6 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
-	c.maybeAutoPinRawObservedRouteVersion(reqs)
-	if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
-		return resp, err
-	}
-
 	// Capture whether the caller supplied a non-zero StartTS BEFORE
 	// the coordinator-allocates-on-zero branch below mutates the
 	// field.  A caller-supplied StartTS names a specific snapshot
@@ -736,10 +731,13 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
+		if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
+			return resp, err
+		}
 		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
-	return c.dispatchNonTxn(ctx, reqs)
+	return c.dispatchRawWithComposed1Retry(ctx, reqs)
 }
 
 func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, bool, error) {
@@ -815,31 +813,22 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 //     gate spuriously rejects resolver-routed commits even when
 //     the resolver picked the correct gid.  Skip the auto-pin
 //     for any resolver-recognised key; the request flows with
-//     ObservedRouteVersion=0 and the M3 gate short-circuits —
-//     restoring the pre-auto-pin behaviour for resolver-routed
-//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
-//     6a458a28, PR #900).
+//     ObservedRouteVersion=0 and the Composed-1 owner gate
+//     short-circuits — restoring the pre-auto-pin behaviour for
+//     resolver-routed txns.  Resolver-aware M3 is M5+ work (PR #900).
 //
 // The non-auto-pin case (request flows with ObservedRouteVersion=0,
-// M3 gate short-circuits) is the safe non-regressing posture for
-// non-migrated callers — the gate cannot retroactively pin reads
-// it was not present for.  Adapters that want M3 protection must
-// migrate to pin at BeginTxn per §4.1.
+// Composed-1 owner gate short-circuits) is the safe non-regressing
+// posture for non-migrated callers — the owner gate cannot
+// retroactively pin reads it was not present for.  The write-fence
+// gate still checks the current route snapshot at apply time.
+// Adapters that want full M3 owner protection must migrate to pin at
+// BeginTxn per §4.1.
 //
 // Extracted from dispatchTxnWithComposed1Retry to keep its
 // cyclomatic complexity in the cyclop budget.
 func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP], callerSuppliedStartTS bool) {
 	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
-		return
-	}
-	if c.anyResolverClaimedKey(reqs.Elems) {
-		return
-	}
-	reqs.ObservedRouteVersion = c.engine.Version()
-}
-
-func (c *ShardedCoordinator) maybeAutoPinRawObservedRouteVersion(reqs *OperationGroup[OP]) {
-	if c.engine == nil || reqs == nil || reqs.IsTxn || reqs.ObservedRouteVersion != 0 {
 		return
 	}
 	if c.anyResolverClaimedKey(reqs.Elems) {
@@ -1004,6 +993,23 @@ func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *Operation
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+}
+
+func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
+		if !handled {
+			resp, err = c.dispatchNonTxn(ctx, reqs)
+		}
+		if err == nil {
+			return resp, nil
+		}
+		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+			return resp, err
+		}
+		reqs.ObservedRouteVersion = c.engine.Version()
+	}
+	return nil, errors.WithStack(ErrInvalidRequest)
 }
 
 // hasDelPrefixElem returns true if any element is a DelPrefix operation.
