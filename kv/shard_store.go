@@ -207,8 +207,14 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 }
 
 func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
 	if reverse {
 		if groupID != 0 {
+			if routeScanBoundsPresent(routeStart, routeEnd) {
+				return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true, readRouteVersion, routeStart, routeEnd)
+			}
 			return nil, errors.WithStack(store.ErrNotSupported)
 		}
 		return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, readRouteVersion, routeStart, routeEnd)
@@ -300,6 +306,9 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
+	if routes, ok := s.routesForLegacyListDeltaScan(start, end); ok {
+		return routes, false
+	}
 	// For internal wide-column keys, shard routing is based on the logical
 	// user key rather than the raw key prefix.
 	if userKey := scanRouteUserKey(start); userKey != nil {
@@ -321,6 +330,26 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	return routes, true
 }
 
+func (s *ShardStore) routesForLegacyListDeltaScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	logicalUserKey := store.ExtractLegacyListUserKeyFromDeltaScanPrefix(start)
+	if logicalUserKey == nil {
+		return nil, false
+	}
+	routes := make([]distribution.Route, 0)
+	if route, ok := s.engine.GetRoute(logicalUserKey); ok {
+		routes = append(routes, route)
+	}
+	storedStart := store.ExtractListUserKey(start)
+	if storedStart != nil {
+		var storedEnd []byte
+		if len(end) > 0 {
+			storedEnd = store.ExtractListUserKey(end)
+		}
+		routes = append(routes, s.engine.GetIntersectingRoutes(storedStart, storedEnd)...)
+	}
+	return routes, true
+}
+
 func scanRouteUserKey(start []byte) []byte {
 	for _, extract := range scanRouteUserKeyExtractors {
 		if userKey := extract(start); userKey != nil {
@@ -332,7 +361,6 @@ func scanRouteUserKey(start []byte) []byte {
 
 var scanRouteUserKeyExtractors = []func([]byte) []byte{
 	store.ExtractListUserKeyFromDeltaScanPrefix,
-	store.ExtractLegacyListUserKeyFromDeltaScanPrefix,
 	store.ExtractListUserKey,
 	store.ExtractListUserKeyFromClaimScanPrefix,
 	store.ExtractHashUserKeyFromField,
@@ -368,13 +396,14 @@ func normalizedRouteScanEnd(routeEnd []byte) []byte {
 func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	seenGroups := make(map[uint64]struct{})
+	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
-		} else {
+		} else if !routeFilterPresent {
 			if _, seen := seenGroups[route.GroupID]; seen {
 				continue
 			}
@@ -412,6 +441,7 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	seenGroups := make(map[uint64]struct{})
+	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
 		if clampToRoutes {
@@ -431,11 +461,14 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 		// Fetch up to limit from every route and merge+sort descending so the
 		// result honours the ReverseScanAt contract.
 		// De-duplicate by GroupID: after a range split both halves share the same
-		// GroupID (same backing shard store), so only scan each group once.
-		if _, seen := seenGroups[route.GroupID]; seen {
-			continue
+		// GroupID (same backing shard store), so only scan each group once unless
+		// route filters make each descriptor's logical interval distinct.
+		if !routeFilterPresent {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
 		}
-		seenGroups[route.GroupID] = struct{}{}
 		kvs, err := s.scanRouteAtDirectionWithReadFence(ctx, route, start, end, limit, ts, true, false, readRouteVersion, routeStart, routeEnd)
 		if err != nil {
 			return nil, err
@@ -515,16 +548,21 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
 	routeStart []byte,
 	routeEnd []byte,
 ) ([]*store.KVPair, error) {
+	filterStart, filterEnd, empty := routeScanBoundsForRoute(route, routeStart, routeEnd)
+	if empty {
+		return []*store.KVPair{}, nil
+	}
 	out := make([]*store.KVPair, 0, min(limit, routeFilteredScanBatchMin))
 	scanStart := start
 	scanEnd := end
 	for len(out) < limit {
-		batchLimit := routeFilteredScanBatchLimit(limit - len(out))
-		kvs, cursorKVs, err := s.scanRouteAtDirectionWithReadFenceRouteFilterPage(ctx, route, scanStart, scanEnd, batchLimit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
+		remaining := limit - len(out)
+		batchLimit := routeFilteredScanBatchLimit(remaining)
+		kvs, cursorKVs, err := s.scanRouteAtDirectionWithReadFenceRouteFilterPage(ctx, route, scanStart, scanEnd, batchLimit, remaining, ts, reverse, explicitGroup, readRouteVersion, filterStart, filterEnd)
 		if err != nil {
 			return nil, err
 		}
-		out = appendRouteFilteredKVs(out, kvs, limit, routeStart, routeEnd)
+		out = appendRouteFilteredKVs(out, kvs, limit, filterStart, filterEnd)
 		if routeFilteredScanDone(cursorKVs, batchLimit, len(out), limit) {
 			break
 		}
@@ -537,12 +575,28 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
 	return out, nil
 }
 
+func routeScanBoundsForRoute(route distribution.Route, routeStart []byte, routeEnd []byte) ([]byte, []byte, bool) {
+	start := routeStart
+	if len(route.Start) > 0 && (len(start) == 0 || bytes.Compare(route.Start, start) > 0) {
+		start = route.Start
+	}
+	end := routeEnd
+	if len(route.End) > 0 && (len(end) == 0 || bytes.Compare(route.End, end) < 0) {
+		end = route.End
+	}
+	if len(start) > 0 && len(end) > 0 && bytes.Compare(start, end) >= 0 {
+		return start, end, true
+	}
+	return start, end, false
+}
+
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	ctx context.Context,
 	route distribution.Route,
 	start []byte,
 	end []byte,
 	limit int,
+	visibleLimit int,
 	ts uint64,
 	reverse bool,
 	explicitGroup bool,
@@ -564,7 +618,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		return s.scanRouteAtLeaderRouteFilter(ctx, g, start, end, limit, ts, reverse, routeStart, routeEnd)
+		return s.scanRouteAtLeaderRouteFilter(ctx, g, start, end, limit, visibleLimit, ts, reverse, routeStart, routeEnd)
 	}
 
 	groupID := proxyScanGroupID(route, explicitGroup, routeStart, routeEnd)
@@ -666,6 +720,42 @@ func appendRouteFilteredKVs(out []*store.KVPair, kvs []*store.KVPair, limit int,
 		out = append(out, kvp)
 	}
 	return out
+}
+
+func scanRouteFilteredLockBounds(kvs []*store.KVPair, filteredKVs []*store.KVPair, scanStart []byte, scanEnd []byte, pageLimit int, visibleLimit int, reverse bool) ([]byte, []byte) {
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(filteredKVs, scanStart, scanEnd, visibleLimit, reverse)
+	pageStart, pageEnd := scanLockBoundsForKVsDirection(kvs, scanStart, scanEnd, pageLimit, reverse)
+	return intersectScanBounds(lockStart, lockEnd, pageStart, pageEnd)
+}
+
+func intersectScanBounds(aStart []byte, aEnd []byte, bStart []byte, bEnd []byte) ([]byte, []byte) {
+	return maxScanStart(aStart, bStart), minScanEnd(aEnd, bEnd)
+}
+
+func maxScanStart(a []byte, b []byte) []byte {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	if bytes.Compare(a, b) >= 0 {
+		return a
+	}
+	return b
+}
+
+func minScanEnd(a []byte, b []byte) []byte {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	if bytes.Compare(a, b) <= 0 {
+		return a
+	}
+	return b
 }
 
 func routeKeyInScanBounds(key []byte, routeStart []byte, routeEnd []byte) bool {
@@ -787,7 +877,7 @@ func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
 	if err != nil {
 		return nil, limitReached, errors.WithStack(err)
 	}
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, visibleLimit)
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, start, end, visibleLimit, reverse)
 	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, visibleLimit)
 	if err != nil {
 		return nil, limitReached, err
@@ -831,6 +921,7 @@ func (s *ShardStore) scanRouteAtLeaderRouteFilter(
 	start []byte,
 	end []byte,
 	limit int,
+	visibleLimit int,
 	ts uint64,
 	reverse bool,
 	routeStart []byte,
@@ -848,9 +939,9 @@ func (s *ShardStore) scanRouteAtLeaderRouteFilter(
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, limit)
 	filteredKVs := filterRouteScanKVs(kvs, routeStart, routeEnd)
-	lockKVs, err := scanTxnLockRangeAtWithRouteFilter(ctx, g, lockStart, lockEnd, ts, limit, routeStart, routeEnd)
+	lockStart, lockEnd := scanRouteFilteredLockBounds(kvs, filteredKVs, start, end, limit, visibleLimit, reverse)
+	lockKVs, err := scanTxnLockRangeAtWithRouteFilter(ctx, g, lockStart, lockEnd, ts, visibleLimit, routeStart, routeEnd)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -873,11 +964,21 @@ func filterRouteScanKVs(kvs []*store.KVPair, routeStart []byte, routeEnd []byte)
 }
 
 func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int) ([]byte, []byte) {
+	return scanLockBoundsForKVsDirection(kvs, scanStart, scanEnd, limit, false)
+}
+
+func scanLockBoundsForKVsDirection(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int, reverse bool) ([]byte, []byte) {
 	if countNonInternalKVs(kvs) < limit {
 		return scanStart, scanEnd
 	}
-	_, lastUserKey, ok := observedScanUserBounds(kvs)
+	firstUserKey, lastUserKey, ok := observedScanUserBounds(kvs)
 	if !ok {
+		return scanStart, scanEnd
+	}
+	if reverse {
+		if len(scanStart) == 0 || bytes.Compare(firstUserKey, scanStart) > 0 {
+			scanStart = firstUserKey
+		}
 		return scanStart, scanEnd
 	}
 	bound := nextScanCursor(lastUserKey)

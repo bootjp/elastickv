@@ -468,9 +468,16 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	rawKVs := kvs
 	kvs = filterDeltaKVs(rawKVs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
+	var lastAcceptedKey []byte
+	if len(kvs) > 0 {
+		lastAcceptedKey = kvs[len(kvs)-1].Key
+	}
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
-	if truncated && len(lastScannedKey) == 0 && len(kvs) == 0 && len(rawKVs) > 0 {
-		lastScannedKey = rawKVs[len(rawKVs)-1].Key
+	if truncated && len(rawKVs) > 0 {
+		if len(kvs) == 0 ||
+			(!bytes.Equal(lastScannedKey, lastAcceptedKey) && rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey)) {
+			lastScannedKey = rawKVs[len(rawKVs)-1].Key
+		}
 	}
 
 	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
@@ -483,6 +490,18 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 
 	c.advanceCursor(h.typeName, lastScannedKey, truncated)
 	return nil
+}
+
+func rawPageHasRejectedTailAfter(rawKVs []*store.KVPair, acceptedKey []byte) bool {
+	if len(rawKVs) == 0 || len(acceptedKey) == 0 {
+		return false
+	}
+	for i := len(rawKVs) - 1; i >= 0; i-- {
+		if rawKVs[i] != nil && bytes.Equal(rawKVs[i].Key, acceptedKey) {
+			return i < len(rawKVs)-1
+		}
+	}
+	return false
 }
 
 // groupByUserKey groups KVPairs by their user key, returning both the map and

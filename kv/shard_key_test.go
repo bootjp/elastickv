@@ -46,6 +46,27 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 	}
 }
 
+func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.HashMetaDeltaKey(userKey, 10, 0),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.SetMetaDeltaKey(userKey, 11, 0),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 12, 0),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.5, []byte("member")),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
+	}
+}
+
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	t.Parallel()
 

@@ -394,6 +394,35 @@ func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredRawRows(t *testing.T
 	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt([]byte("compactor-collision"), deltaCompactorTickScanLimit, 0)), got)
 }
 
+func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredTailAfterBacktrack(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("compactor-tail")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	acceptedKey := legacyListMetaDeltaKey(userKey, 1)
+	require.NoError(t, st.PutAt(ctx, acceptedKey, delta, 1, 0))
+
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(2); i <= deltaCompactorTickScanLimit; i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(userKey, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), meta, i, 0))
+	}
+
+	h := c.legacyListHandler()
+	readTS := st.LastCommitTS()
+	require.NoError(t, c.compactHandler(ctx, h, readTS))
+
+	c.cursorMu.Lock()
+	got := bytes.Clone(c.cursors[h.typeName])
+	c.cursorMu.Unlock()
+	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt(userKey, deltaCompactorTickScanLimit, 0)), got)
+	_, err = st.GetAt(ctx, acceptedKey, readTS)
+	require.NoError(t, err)
+}
+
 // TestDeltaCompactor_UrgentCompactionTriggeredByChannel verifies that a request
 // queued via TriggerUrgentCompaction is processed by the Run loop, compacting
 // the targeted key without waiting for the next regular tick.

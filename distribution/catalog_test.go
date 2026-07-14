@@ -668,7 +668,7 @@ func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
 
 func TestCatalogStoreSaveKeepsMinWriteTSExclusiveMonotone(t *testing.T) {
 	st := store.NewMVCCStore()
-	cs := NewCatalogStore(st)
+	cs := NewCatalogStore(st, WithCatalogRouteDescriptorV2Writes(true))
 	ctx := context.Background()
 
 	first, err := cs.Save(ctx, 0, []RouteDescriptor{
@@ -697,6 +697,19 @@ func TestCatalogStoreSaveKeepsMinWriteTSExclusiveMonotone(t *testing.T) {
 	}
 	if snapshot.Routes[0].MinWriteTSExclusive != 80 {
 		t.Fatalf("expected durable floor 80, got %d", snapshot.Routes[0].MinWriteTSExclusive)
+	}
+}
+
+func TestCatalogStoreSaveRejectsRouteDescriptorV2WritesWhenDisabled(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	_, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive, MinWriteTSExclusive: 80},
+	})
+	if !errors.Is(err, ErrCatalogRouteV2WriteDisabled) {
+		t.Fatalf("expected ErrCatalogRouteV2WriteDisabled, got %v", err)
 	}
 }
 

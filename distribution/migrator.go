@@ -51,6 +51,7 @@ const (
 	MigrationFamilyS3UploadPart
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
+	MigrationFamilyLegacyListMetaDelta
 )
 
 const (
@@ -105,6 +106,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(migrationTxnSuccessPrefix),
 	[]byte(migrationTxnMetaPrefix),
 	[]byte(store.ListMetaDeltaPrefix),
+	[]byte(store.LegacyListMetaDeltaPrefix),
 	[]byte(store.ListClaimPrefix),
 	[]byte(store.ListMetaPrefix),
 	[]byte(store.ListItemPrefix),
@@ -237,6 +239,9 @@ func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte,
 	if b.RequiresDecodedS3 {
 		return b.containsDecodedS3Route(rawKey, routeStart, routeEnd)
 	}
+	if b.Family == MigrationFamilyLegacyListMetaDelta {
+		return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd)
+	}
 	if !b.RequiresRouteKeyCheck {
 		return true
 	}
@@ -250,8 +255,11 @@ func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {
 	switch b.Family {
 	case MigrationFamilyListMetaDelta:
 		return store.ExtractListUserKeyFromDelta(rawKey) != nil
+	case MigrationFamilyLegacyListMetaDelta:
+		return store.ExtractLegacyListUserKeyFromDelta(rawKey) != nil
 	case MigrationFamilyListMeta:
-		return store.ExtractListUserKeyFromDelta(rawKey) == nil
+		return store.ExtractListUserKeyFromDelta(rawKey) == nil &&
+			store.ExtractLegacyListUserKeyFromDelta(rawKey) == nil
 	default:
 		return true
 	}
@@ -380,6 +388,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyTxnSuccess, prefix: migrationTxnSuccessPrefix},
 		{family: MigrationFamilyTxnMeta, prefix: migrationTxnMetaPrefix},
 		{family: MigrationFamilyListMetaDelta, prefix: store.ListMetaDeltaPrefix},
+		{family: MigrationFamilyLegacyListMetaDelta, prefix: store.LegacyListMetaDeltaPrefix},
 		{family: MigrationFamilyListClaim, prefix: store.ListClaimPrefix},
 		{family: MigrationFamilyListMeta, prefix: store.ListMetaPrefix},
 		{family: MigrationFamilyListItem, prefix: store.ListItemPrefix},

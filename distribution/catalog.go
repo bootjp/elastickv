@@ -46,6 +46,7 @@ var (
 	ErrCatalogInvalidRouteState    = errors.New("catalog route state is invalid")
 	ErrCatalogInvalidRouteKey      = errors.New("catalog route key is invalid")
 	ErrCatalogRouteKeyIDMismatch   = errors.New("catalog route key and record route id mismatch")
+	ErrCatalogRouteV2WriteDisabled = errors.New("catalog route descriptor v2 writes are disabled")
 )
 
 // RouteState describes the control-plane state of a route.
@@ -93,12 +94,31 @@ type CatalogSnapshot struct {
 
 // CatalogStore provides persistence helpers for route catalog state.
 type CatalogStore struct {
-	store store.MVCCStore
+	store                        store.MVCCStore
+	allowRouteDescriptorV2Writes bool
+}
+
+type CatalogStoreOption func(*CatalogStore)
+
+func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.allowRouteDescriptorV2Writes = enabled
+	}
 }
 
 // NewCatalogStore creates a route catalog persistence helper.
-func NewCatalogStore(st store.MVCCStore) *CatalogStore {
-	return &CatalogStore{store: st}
+func NewCatalogStore(st store.MVCCStore, opts ...CatalogStoreOption) *CatalogStore {
+	s := &CatalogStore{store: st}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
+}
+
+func (s *CatalogStore) AllowsRouteDescriptorV2Writes() bool {
+	return s != nil && s.allowRouteDescriptorV2Writes
 }
 
 // CatalogVersionKey returns the reserved key used for catalog version storage.
@@ -203,6 +223,13 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 		out = appendRouteDescriptorV2Tail(out, route)
 	}
 	return out, nil
+}
+
+func EncodeRouteDescriptorForCatalogWrite(route RouteDescriptor, allowV2 bool) ([]byte, error) {
+	if routeDescriptorRequiresV2(route) && !allowV2 {
+		return nil, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
+	}
+	return EncodeRouteDescriptor(route)
 }
 
 // DecodeRouteDescriptor deserializes a route descriptor record.
@@ -633,7 +660,7 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan *savePlan) (
 
 	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+catalogSaveMetaMutationCount)
 	mutations = appendDeleteRouteMutations(mutations, existingRoutes, plan.routes)
-	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes)
+	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes, s.allowRouteDescriptorV2Writes)
 	if err != nil {
 		return nil, err
 	}
@@ -715,7 +742,7 @@ func appendDeleteRouteMutations(out []*store.KVPairMutation, existing []RouteDes
 	return out
 }
 
-func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor) ([]*store.KVPairMutation, error) {
+func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor, allowRouteDescriptorV2Writes bool) ([]*store.KVPairMutation, error) {
 	existingByID := make(map[uint64]RouteDescriptor, len(existing))
 	for _, route := range existing {
 		existingByID[route.RouteID] = route
@@ -725,7 +752,7 @@ func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDes
 		if existingRoute, ok := existingByID[route.RouteID]; ok && routeDescriptorEqual(existingRoute, route) {
 			continue
 		}
-		encoded, err := EncodeRouteDescriptor(route)
+		encoded, err := EncodeRouteDescriptorForCatalogWrite(route, allowRouteDescriptorV2Writes)
 		if err != nil {
 			return nil, err
 		}

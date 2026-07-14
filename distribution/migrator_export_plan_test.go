@@ -29,6 +29,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilyListMeta:                        store.ListMetaPrefix,
 		MigrationFamilyListItem:                        store.ListItemPrefix,
 		MigrationFamilyListMetaDelta:                   store.ListMetaDeltaPrefix,
+		MigrationFamilyLegacyListMetaDelta:             store.LegacyListMetaDeltaPrefix,
 		MigrationFamilyListClaim:                       store.ListClaimPrefix,
 		MigrationFamilyRedisLegacy:                     migrationRedisPrefix,
 		MigrationFamilyHash:                            migrationHashPrefix,
@@ -101,10 +102,17 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	listDelta := store.ListMetaDeltaKey([]byte("list"), 1, 0)
 	require.True(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listDelta))
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listDelta))
+	require.False(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(listDelta))
+
+	legacyListDelta := legacyListMetaDeltaKey([]byte("legacy-list"), 2, 0)
+	require.True(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(legacyListDelta))
+	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(legacyListDelta))
+	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(legacyListDelta))
 
 	listMetaWithDeltaLookingUserKey := store.ListMetaKey(deltaLookingListMetaUserKey([]byte("list"), 2, 0))
-	require.True(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
+	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
+	require.True(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 
 	partitionedSQS := []byte(migrationSQSMsgDataPrefix + migrationSQSPartitionedSuffix + "queue|0|1|msg")
 	require.True(t, byFamily[MigrationFamilySQSPartitionedMessageData].ContainsRawKey(partitionedSQS))
@@ -265,6 +273,28 @@ func TestMigrationBracketContainsRoutedKeyAcceptsEmptyLogicalRouteKey(t *testing
 	))
 }
 
+func TestMigrationBracketContainsRoutedKeyUsesLegacyListDeltaUserKey(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("a"), []byte("z"))
+	require.NoError(t, err)
+	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
+	raw := legacyListMetaDeltaKey([]byte("target-list"), 10, 0)
+
+	require.True(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("target"),
+		[]byte("target-list\x00"),
+		store.ExtractListUserKey,
+	))
+	require.False(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("zzz"),
+		nil,
+		store.ExtractListUserKey,
+	))
+}
+
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	t.Parallel()
 
@@ -381,6 +411,16 @@ func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn u
 	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
 	key = append(key, lenPrefix[:]...)
 	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], commitTS)
 	key = append(key, ts[:]...)

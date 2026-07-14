@@ -172,6 +172,29 @@ func TestProbeListTypeIgnoresLegacyDeltaPrefixCollision(t *testing.T) {
 	require.False(t, found)
 }
 
+func TestProbeListTypePagesPastLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type-page")
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	deltaTS := uint64(store.MaxDeltaScanLimit + 1)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	typ, found, err := srv.probeListType(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, redisTypeList, typ)
+}
+
 func TestDeleteListElemsFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	t.Parallel()
 

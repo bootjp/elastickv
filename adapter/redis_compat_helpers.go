@@ -281,19 +281,29 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 
 func (r *RedisServer) listMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, readTS uint64) (bool, error) {
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit, readTS)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
 	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
 		return len(deltaKVs) > 0, nil
 	}
-	for _, pair := range deltaKVs {
-		if legacyListDeltaPairForUserKey(pair, key) {
-			return true, nil
+	cursor := deltaPrefix
+	for {
+		deltaKVs, err := r.store.ScanAt(ctx, cursor, deltaEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
 		}
+		for _, pair := range deltaKVs {
+			if legacyListDeltaPairForUserKey(pair, key) {
+				return true, nil
+			}
+		}
+		if len(deltaKVs) < store.MaxDeltaScanLimit {
+			return false, nil
+		}
+		cursor = append(bytes.Clone(deltaKVs[len(deltaKVs)-1].Key), 0)
 	}
-	return false, nil
 }
 
 // probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
