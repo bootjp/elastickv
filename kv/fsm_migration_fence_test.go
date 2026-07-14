@@ -7,8 +7,6 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
-	"github.com/bootjp/elastickv/store"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,20 +39,21 @@ func newS3BucketAuxiliaryWriteFencedFSM(t *testing.T, bucket string) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
-func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
+func TestFSMAppliesRawPointWriteDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
 	}, 10)
-	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.NoError(t, err)
 
-	_, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
-	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
 }
 
-func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
+func TestFSMAppliesS3BucketAuxiliaryPointWriteDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -68,14 +67,15 @@ func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
 		err := fsm.handleRawRequest(ctx, &pb.Request{
 			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
 		}, 10)
-		require.ErrorIs(t, err, ErrRouteWriteFenced)
+		require.NoError(t, err)
 
-		_, getErr := fsm.store.GetAt(ctx, key, ^uint64(0))
-		require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+		got, getErr := fsm.store.GetAt(ctx, key, ^uint64(0))
+		require.NoError(t, getErr)
+		require.Equal(t, []byte("v"), got)
 	}
 }
 
-func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
+func TestFSMAppliesDelPrefixDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
@@ -84,14 +84,13 @@ func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
 	}, 10)
-	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.NoError(t, err)
 
-	got, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
+	require.Error(t, getErr)
 }
 
-func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
+func TestFSMAppliesFullRangeDelPrefixDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
@@ -100,14 +99,13 @@ func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: nil}},
 	}, 10)
-	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.NoError(t, err)
 
-	got, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
+	require.Error(t, getErr)
 }
 
-func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
+func TestFSMAppliesBroadInternalDelPrefixDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
@@ -117,14 +115,13 @@ func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("!redis|")}},
 	}, 10)
-	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.NoError(t, err)
 
-	got, getErr := fsm.store.GetAt(context.Background(), key, ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
+	_, getErr := fsm.store.GetAt(context.Background(), key, ^uint64(0))
+	require.Error(t, getErr)
 }
 
-func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
+func TestFSMAppliesPrepareAndAbortDespiteLocalWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -138,7 +135,7 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
 		},
 	}
-	require.ErrorIs(t, fsm.handleTxnRequest(ctx, prepare, 10), ErrRouteWriteFenced)
+	require.NoError(t, fsm.handleTxnRequest(ctx, prepare, 10))
 
 	abort := &pb.Request{
 		IsTxn: true,
@@ -150,5 +147,5 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 		},
 	}
 	err := fsm.handleTxnRequest(ctx, abort, 11)
-	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
+	require.NotErrorIs(t, err, ErrRouteWriteFenced, "ABORT must keep the narrow cleanup lane open")
 }

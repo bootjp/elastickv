@@ -497,9 +497,6 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		if isTxnInternalKey(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
-			return err
-		}
 		if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 			return err
 		}
@@ -532,59 +529,11 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
-		return err
-	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
-}
-
-func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation) error {
-	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
-			continue
-		}
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
-	if f.routes == nil {
-		return nil
-	}
-	snap, ok := f.routes.Current()
-	if !ok {
-		return nil
-	}
-	rkey := routeKey(key)
-	if snap.WriteFencedForKey(rkey) {
-		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
-	}
-	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok && snap.WriteFencedIntersects(start, end) {
-		return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
-	}
-	return nil
-}
-
-func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
-	if f.routes == nil {
-		return nil
-	}
-	snap, ok := f.routes.Current()
-	if !ok {
-		return nil
-	}
-	start, end := routePrefixRange(prefix)
-	if !snap.WriteFencedIntersects(start, end) {
-		return nil
-	}
-	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
 }
 
 func routePrefixRange(prefix []byte) ([]byte, []byte) {
@@ -959,9 +908,6 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
-		return err
-	}
 	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1028,7 +974,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsNotFenced(muts)
+	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
 	}
@@ -1042,17 +988,6 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	}
 	f.notifyApplyObservers(commitTS, uniq)
 	return nil
-}
-
-func (f *kvFSM) uniqueMutationsNotFenced(muts []*pb.Mutation) ([]*pb.Mutation, error) {
-	uniq, err := uniqueMutations(muts)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
-		return nil, err
-	}
-	return uniq, nil
 }
 
 // dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op

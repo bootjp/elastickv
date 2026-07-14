@@ -1430,7 +1430,7 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
 }
 
-func TestOpenMultiNodeReturnsBeforeCommittedTailDrain(t *testing.T) {
+func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1468,30 +1468,35 @@ func TestOpenMultiNodeReturnsBeforeCommittedTailDrain(t *testing.T) {
 		done <- openResult{engine: engine, err: err}
 	}()
 
+	select {
+	case <-fsm.started:
+	case <-time.After(time.Second):
+		t.Fatal("startup committed tail was not being applied")
+	}
+
+	select {
+	case result := <-done:
+		if result.engine != nil {
+			require.NoError(t, result.engine.Close())
+		}
+		require.NoError(t, result.err)
+		t.Fatal("multi-node Open returned before committed tail drain completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(fsm.release)
+
 	var result openResult
 	select {
 	case result = <-done:
 	case <-time.After(time.Second):
-		t.Fatal("multi-node Open blocked on committed tail drain before returning")
+		t.Fatal("multi-node Open did not return after committed tail drain completed")
 	}
 	require.NoError(t, result.err)
 	require.NotNil(t, result.engine)
 	defer func() {
 		require.NoError(t, result.engine.Close())
 	}()
-
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("startup committed tail was not being applied")
-	}
-	select {
-	case <-result.engine.startedCh:
-		t.Fatal("engine marked started before startup committed tail drain completed")
-	default:
-	}
-
-	close(fsm.release)
 	select {
 	case <-result.engine.startedCh:
 	case <-time.After(time.Second):
