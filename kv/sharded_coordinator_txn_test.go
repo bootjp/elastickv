@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -545,6 +546,30 @@ func TestGroupReadKeysByShardID_FailsClosedOnUnroutable(t *testing.T) {
 			"would drop the key from OCC validation and break SSI")
 	require.Nil(t, grouped)
 	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToStagedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	grouped, err := coord.groupReadKeysByShardID([][]byte{key})
+	require.NoError(t, err)
+	require.Empty(t, grouped[1])
+	require.Equal(t, [][]byte{
+		key,
+		distribution.MigrationStagedDataKey(9, key),
+	}, grouped[2])
 }
 
 // ---------------------------------------------------------------------------

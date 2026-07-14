@@ -181,6 +181,9 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if req == nil {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "import range versions request is nil"))
 	}
+	if err := validateImportRangeVersionsRequest(req); err != nil {
+		return nil, err
+	}
 	if i.migrationProposer == nil {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import proposer is not configured"))
 	}
@@ -195,6 +198,16 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 		i.clock.Observe(result.MaxImportedTS)
 	}
 	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor}, nil
+}
+
+func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) error {
+	if req.GetJobId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions job_id is required"))
+	}
+	if req.GetBracketId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions bracket_id is required"))
+	}
+	return nil
 }
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
@@ -282,13 +295,22 @@ func migrationFamilyRequiresDecodedS3(family uint32) bool {
 }
 
 func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
+	allowRawRouteMatch := !s3BucketRouteBounds(routeStart, routeEnd)
 	return func(rawKey []byte) bool {
 		bucket, ok := decodedS3BucketName(family, rawKey)
 		if !ok {
 			return false
 		}
+		if allowRawRouteMatch && kv.RouteKeyFilter(routeStart, routeEnd)(rawKey) {
+			return true
+		}
 		return decodedS3BucketRouteIntersects(bucket, routeStart, routeEnd)
 	}
+}
+
+func s3BucketRouteBounds(routeStart, routeEnd []byte) bool {
+	return bytes.HasPrefix(routeStart, []byte(s3keys.RoutePrefix)) ||
+		bytes.HasPrefix(routeEnd, []byte(s3keys.RoutePrefix))
 }
 
 func decodedS3BucketRouteIntersects(bucket string, routeStart, routeEnd []byte) bool {
@@ -438,11 +460,11 @@ func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commi
 	}
 	routes := i.routeEngine.Stats()
 	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 {
+		if mut == nil || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
 			continue
 		}
 		for _, route := range routes {
-			if routeWriteTimestampFloorApplies(route, mut.Key, commitTS) {
+			if routeWriteTimestampFloorApplies(route, mut, commitTS) {
 				return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
 			}
 		}
@@ -450,11 +472,15 @@ func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commi
 	return nil
 }
 
-func routeWriteTimestampFloorApplies(route distribution.Route, key []byte, commitTS uint64) bool {
+func routeWriteTimestampFloorApplies(route distribution.Route, mut *pb.Mutation, commitTS uint64) bool {
 	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
 		return false
 	}
-	return kv.RouteKeyFilter(route.Start, route.End)(key)
+	if mut.GetOp() == pb.Op_DEL_PREFIX {
+		start, end := kv.RoutePrefixRange(mut.GetKey())
+		return rangesIntersect(route.Start, route.End, start, end)
+	}
+	return kv.RouteKeyFilter(route.Start, route.End)(mut.GetKey())
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) error {

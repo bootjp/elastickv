@@ -624,6 +624,11 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	return start, prefixScanEnd(start)
 }
 
+// RoutePrefixRange maps a raw key prefix to the routed key range it may touch.
+func RoutePrefixRange(prefix []byte) ([]byte, []byte) {
+	return routePrefixRange(prefix)
+}
+
 func routeKeyspaceWideRawPrefix(prefix []byte) bool {
 	if !rawPrefixMayContainRouteMappedKeys(prefix) {
 		return false

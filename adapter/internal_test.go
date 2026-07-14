@@ -230,6 +230,41 @@ func TestStampRawTimestampsRejectsPreStampedRouteWriteFloor(t *testing.T) {
 	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
 }
 
+func TestStampRawTimestampsRejectsPreStampedDelPrefixRouteWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 []byte("m"),
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 0,
+			},
+			{
+				RouteID:             2,
+				Start:               []byte("m"),
+				End:                 nil,
+				GroupID:             2,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+		},
+	}))
+	i := &Internal{routeEngine: engine}
+	reqs := []*pb.Request{{
+		Ts:        100,
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: nil}},
+	}}
+
+	err := i.stampRawTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
+}
+
 func TestStampTxnTimestampsRejectsRouteWriteFloor(t *testing.T) {
 	t.Parallel()
 

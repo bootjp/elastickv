@@ -277,6 +277,33 @@ func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteInter
 	}
 }
 
+func TestInternalExportRangeVersionsPreservesS3BucketRawRouteMatches(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	key := s3keys.BucketMetaKey("bucket-raw")
+	require.NoError(t, st.PutAt(ctx, key, []byte("meta"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte("!s3|"),
+		RouteEnd:        nil,
+		KeyFamily:       distribution.MigrationFamilyS3BucketMeta,
+		RangeStart:      []byte(s3keys.BucketMetaPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(s3keys.BucketMetaPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: key, CommitTs: 10, Value: []byte("meta"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
+	}, stream.responses[0].GetVersions())
+}
+
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	t.Parallel()
 
@@ -314,4 +341,26 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(30), floor)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}
+
+func TestInternalImportRangeVersionsRejectsMissingIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalMigrationProposer(&applyingMigrationProposer{}),
+	)
+
+	_, err := internal.ImportRangeVersions(context.Background(), &pb.ImportRangeVersionsRequest{
+		BracketId: 1,
+		BatchSeq:  1,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	_, err = internal.ImportRangeVersions(context.Background(), &pb.ImportRangeVersionsRequest{
+		JobId:    1,
+		BatchSeq: 1,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
