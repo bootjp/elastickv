@@ -1455,7 +1455,7 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 			if len(pending) == 0 {
 				return
 			}
-			if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+			if err := s.dispatchS3CleanupBatch(ctx, pending); err != nil {
 				slog.ErrorContext(ctx, "cleanupPartBlobsAsync: coordinator dispatch failed",
 					"bucket", bucket,
 					"object_key", objectKey,
@@ -1519,7 +1519,7 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 		for _, kvp := range kvs {
 			pending = append(pending, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
 		}
-		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+		if err := s.dispatchS3CleanupBatch(ctx, pending); err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: dispatch failed",
 				"bucket", bucket, "generation", generation,
 				"object_key", objectKey, "upload_id", uploadID, "err", err)
@@ -1527,6 +1527,13 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 		}
 		cursor = nextScanCursor(kvs[len(kvs)-1].Key)
 	}
+}
+
+func (s *S3Server) dispatchS3CleanupBatch(ctx context.Context, elems []*kv.Elem[kv.OP]) error {
+	return s.retryS3Mutation(ctx, func() error {
+		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: elems})
+		return errors.WithStack(err)
+	})
 }
 
 func parseS3MaxParts(raw string) int {

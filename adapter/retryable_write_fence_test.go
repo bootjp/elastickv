@@ -13,4 +13,5 @@ func TestWriteFenceErrorsAreAdapterRetryable(t *testing.T) {
 	require.True(t, isRetryableRedisTxnErr(kv.ErrRouteWriteFenced))
 	require.True(t, isRetryableS3MutationErr(kv.ErrRouteWriteFenced))
 	require.True(t, isRetryableTransactWriteError(kv.ErrRouteWriteFenced))
+	require.False(t, shouldPreserveTransactWriteAttempt(kv.ErrRouteWriteFenced))
 }

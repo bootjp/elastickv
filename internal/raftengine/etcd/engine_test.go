@@ -1393,7 +1393,37 @@ func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
 	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.GetMetadata().GetConfState().GetVoters())
 }
 
-func TestEnqueueDispatchMessageCoalescesHeartbeatResponses(t *testing.T) {
+func TestEnqueueDispatchMessageCoalescesPlainHeartbeatResponses(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:   uint64Ptr(2),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("new"),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 1)
+	req := <-pd.heartbeatResp
+	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
+	require.Equal(t, []byte("new"), req.msg.Context)
+}
+
+func TestEnqueueDispatchMessagePreservesReadIndexHeartbeatResponses(t *testing.T) {
 	t.Parallel()
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, 1),
@@ -1408,20 +1438,19 @@ func TestEnqueueDispatchMessageCoalescesHeartbeatResponses(t *testing.T) {
 	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
 		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
 		To:      uint64Ptr(2),
-		Context: []byte("old"),
+		Context: []byte("read-index"),
 	})
 
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
-		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
-		To:      uint64Ptr(2),
-		Context: []byte("new"),
+		Type: messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:   uint64Ptr(2),
 	}))
 
-	require.Zero(t, engine.DispatchDropCount())
+	require.Equal(t, uint64(1), engine.DispatchDropCount())
 	require.Len(t, pd.heartbeatResp, 1)
 	req := <-pd.heartbeatResp
 	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
-	require.Equal(t, []byte("new"), req.msg.Context)
+	require.Equal(t, []byte("read-index"), req.msg.Context)
 }
 
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {

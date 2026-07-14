@@ -2422,6 +2422,10 @@ func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
 		restoreDispatchRequest(ch, stale)
 		return false
 	}
+	if len(stale.msg.GetContext()) != 0 {
+		restoreDispatchRequest(ch, stale)
+		return false
+	}
 	closeDispatchRequest(stale)
 	return tryEnqueueDispatchRequest(ch, prepareDispatchRequest(msg))
 }
