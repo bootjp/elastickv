@@ -40,7 +40,7 @@ func listItemKey(userKey string, seq int64) []byte {
 }
 
 // listMetaDeltaKey mirrors store.ListMetaDeltaKey:
-// !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>.
+// !lst|delta|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>.
 // The shape is irrelevant to the encoder (it skips deltas), but we
 // build a well-formed key here so the dispatcher integration test
 // would exercise the same byte sequence the live store emits.
@@ -275,10 +275,9 @@ func TestRedisDB_ListBinaryItemUsesBase64Envelope(t *testing.T) {
 }
 
 // TestRedisDB_ListHandleListMetaSkipsDeltaKey pins that the
-// !lst|meta|d|... family is silently skipped by HandleListMeta. Without
+// !lst|delta|... family is silently skipped by HandleListMeta. Without
 // this, parsing the delta's userKeyLen prefix as the start of a
-// userKey would corrupt the lists map. Mirrors the hash delta-key
-// guard (Codex P1 round 14 PR #725).
+// userKey would corrupt the lists map. Mirrors the hash delta-key guard.
 func TestRedisDB_ListHandleListMetaSkipsDeltaKey(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
@@ -353,7 +352,7 @@ func TestRedisDB_ListRejectsMalformedMetaValueLength(t *testing.T) {
 // firing the declared-vs-observed length mismatch warning (because
 // metaSeen=false means we have no "declared" baseline to compare
 // against). Mirrors the items-as-source-of-truth contract that
-// makes the !lst|meta|d| delta family safe to skip.
+// makes the !lst|delta| delta family safe to skip.
 func TestRedisDB_ListItemsWithoutMetaStillEmitsFile(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)

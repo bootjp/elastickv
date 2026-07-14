@@ -11,8 +11,8 @@ import (
 // Delta/Claim key constants.
 const (
 	// ListMetaDeltaPrefix is the prefix for all list metadata delta keys.
-	// Layout: !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>
-	ListMetaDeltaPrefix = "!lst|meta|d|"
+	// Layout: !lst|delta|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>
+	ListMetaDeltaPrefix = "!lst|delta|"
 
 	// ListClaimPrefix is the prefix for list claim keys used by POP operations.
 	// Layout: !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)>

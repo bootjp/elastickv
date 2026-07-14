@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -101,7 +102,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	require.True(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listDelta))
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listDelta))
 
-	listMetaWithDeltaLookingUserKey := store.ListMetaKey([]byte("d|list"))
+	listMetaWithDeltaLookingUserKey := store.ListMetaKey(deltaLookingListMetaUserKey([]byte("list"), 2, 0))
 	require.True(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 
@@ -355,4 +356,19 @@ func bracketsByFamily(brackets []MigrationBracket) map[uint32]MigrationBracket {
 		out[bracket.Family] = bracket
 	}
 	return out
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }

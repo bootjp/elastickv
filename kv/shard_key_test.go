@@ -124,6 +124,18 @@ func TestRouteKey_NormalizesCollectionMigrationFamilies(t *testing.T) {
 	}
 }
 
+func TestRouteKey_ListMetaKeyThatLooksLikeDeltaRoutesByRealListKey(t *testing.T) {
+	t.Parallel()
+
+	fakeUserKey := []byte("fake:user")
+	userKey := deltaLookingListMetaUserKey(fakeUserKey, 42, 7)
+	baseMeta := store.ListMetaKey(userKey)
+	deltaKey := store.ListMetaDeltaKey(userKey, 10, 1)
+
+	require.Equal(t, userKey, routeKey(baseMeta), "base list metadata must not decode as a delta for %q", fakeUserKey)
+	require.Equal(t, userKey, routeKey(deltaKey), "real list deltas must still route by the logical list key")
+}
+
 func TestRouteKey_MalformedWideColumnKeysFallBackToRaw(t *testing.T) {
 	t.Parallel()
 
@@ -154,6 +166,21 @@ func malformedWideColumnKey(prefix string, suffixLen int) []byte {
 	key = append(key, lenPrefix[:]...)
 	key = append(key, make([]byte, suffixLen)...)
 	return key
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }
 
 func TestRouteKey_NormalizesTxnSuccessMarkerByLockedKey(t *testing.T) {
