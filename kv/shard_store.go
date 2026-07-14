@@ -271,8 +271,8 @@ func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkR
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
 	if useFilesystemChunkRoutes {
-		if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
-			return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), false
+		if routes, ok := s.routesForFilesystemChunkScan(start, end); ok {
+			return routes, false
 		}
 	}
 	// Reverse raw-scan proxying cannot pass an explicit group ID to the remote
@@ -303,6 +303,25 @@ func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkR
 	}
 
 	return routes, true
+}
+
+func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]distribution.Route, bool) {
+	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+		return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), true
+	}
+	if end != nil {
+		return nil, false
+	}
+	// Unbounded raw scans can continue from the chunk keyspace into later
+	// filesystem keys, so include both raw and virtual chunk route groups
+	// rather than narrowing the scan to chunks only.
+	routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, prefixScanEnd(fskeys.ChunkAllPrefix()))
+	if !ok {
+		return nil, false
+	}
+	routes := s.engine.GetIntersectingRoutes(start, end)
+	routes = append(routes, s.engine.GetIntersectingRoutes(routeStart, routeEnd)...)
+	return dedupeRoutesByGroup(routes), true
 }
 
 func dedupeRoutesByGroup(routes []distribution.Route) []distribution.Route {

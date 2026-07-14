@@ -314,7 +314,7 @@ func (*Adapter) Symlink(context.Context) syscall.Errno {
 }
 
 func (*Adapter) Readlink(context.Context) syscall.Errno {
-	return syscall.ENOSYS
+	return syscall.EOPNOTSUPP
 }
 
 func (*Adapter) FileLock(context.Context) syscall.Errno {

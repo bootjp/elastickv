@@ -139,7 +139,7 @@ func TestUnsupportedOperationsReturnExplicitErrno(t *testing.T) {
 
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.Link(context.Background()))
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.Symlink(context.Background()))
-	require.Equal(t, syscall.ENOSYS, adapter.Readlink(context.Background()))
+	require.Equal(t, syscall.EOPNOTSUPP, adapter.Readlink(context.Background()))
 	require.Equal(t, syscall.EOPNOTSUPP, adapter.FileLock(context.Background()))
 }
 

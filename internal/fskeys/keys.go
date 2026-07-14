@@ -145,7 +145,7 @@ func ChunkScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
 
 func chunkScanRouteEnd(start []byte, end []byte, routeStart []byte) ([]byte, bool) {
 	if end == nil {
-		return prefixEnd(chunkRoutePrefixBytes), true
+		return nil, false
 	}
 	if bytes.Equal(end, prefixEnd(chunkPrefixBytes)) {
 		return prefixEnd(chunkRoutePrefixBytes), true

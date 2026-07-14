@@ -304,7 +304,7 @@ func TestShardStoreScanAt_RoutesFilesystemChunkCrossFileCarriedPrefixEnd(t *test
 	require.Equal(t, kB, kvs[1].Key)
 }
 
-func TestShardStoreScanAt_RoutesUnboundedFilesystemChunkScanByChunkRouteKey(t *testing.T) {
+func TestShardStoreScanAt_UnboundedFilesystemChunkScanIncludesRawKeys(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -324,13 +324,16 @@ func TestShardStoreScanAt_RoutesUnboundedFilesystemChunkScanByChunkRouteKey(t *t
 
 	k0 := fskeys.ChunkKey(home, inode, 0)
 	k1 := fskeys.ChunkKey(home, inode, 1)
+	inodeKey := fskeys.InodeKey(99)
 	require.NoError(t, st.PutAt(ctx, k0, []byte("c0"), 1, 0))
 	require.NoError(t, st.PutAt(ctx, k1, []byte("c1"), 2, 0))
+	require.NoError(t, st.PutAt(ctx, inodeKey, []byte("inode"), 3, 0))
 
 	kvs, err := st.ScanAt(ctx, nextScanCursor(k0), nil, 10, ^uint64(0))
 	require.NoError(t, err)
-	require.Len(t, kvs, 1)
+	require.Len(t, kvs, 2)
 	require.Equal(t, k1, kvs[0].Key)
+	require.Equal(t, inodeKey, kvs[1].Key)
 }
 
 func TestShardStoreScanAt_DeduplicatesFilesystemChunkRoutesByGroup(t *testing.T) {

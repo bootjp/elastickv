@@ -137,14 +137,12 @@ func TestChunkScanRouteBounds_AllChunks(t *testing.T) {
 	require.Equal(t, prefixEnd([]byte(chunkRoutePrefix)), routeEnd)
 }
 
-func TestChunkScanRouteBoundsUnboundedScanUsesChunkRoutes(t *testing.T) {
+func TestChunkScanRouteBoundsUnboundedScanFallsBackToRawRoutes(t *testing.T) {
 	t.Parallel()
 
 	start := scanCursorAfterForTest(ChunkKey(11, 22, 7))
-	routeStart, routeEnd, ok := ChunkScanRouteBounds(start, nil)
-	require.True(t, ok)
-	require.Equal(t, ChunkRouteKey(11, 22), routeStart)
-	require.Equal(t, prefixEnd([]byte(chunkRoutePrefix)), routeEnd)
+	_, _, ok := ChunkScanRouteBounds(start, nil)
+	require.False(t, ok)
 }
 
 func TestRefFenceKeyIsPerInode(t *testing.T) {
