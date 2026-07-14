@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,6 +41,27 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 		[]byte("!redis|txn-wide-zset|user:key"),
 	} {
 		require.Equal(t, userKey, routeKey(raw))
+	}
+}
+
+func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.HashMetaDeltaKey(userKey, 10, 0),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.SetMetaDeltaKey(userKey, 11, 0),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 12, 0),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.5, []byte("member")),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
 	}
 }
 

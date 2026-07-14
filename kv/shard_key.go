@@ -64,6 +64,9 @@ func normalizeRouteKey(key []byte) []byte {
 	if user := redisRouteKey(key); user != nil {
 		return user
 	}
+	if user := redisWideColumnRouteKey(key); user != nil {
+		return user
+	}
 	if table := dynamoRouteKey(key); table != nil {
 		return table
 	}
@@ -77,6 +80,57 @@ func normalizeRouteKey(key []byte) []byte {
 		return user
 	}
 	return key
+}
+
+func redisWideColumnRouteKey(key []byte) []byte {
+	if user := redisHashRouteKey(key); user != nil {
+		return user
+	}
+	if user := redisSetRouteKey(key); user != nil {
+		return user
+	}
+	return redisZSetRouteKey(key)
+}
+
+func redisHashRouteKey(key []byte) []byte {
+	switch {
+	case store.IsHashMetaDeltaKey(key):
+		return store.ExtractHashUserKeyFromDelta(key)
+	case store.IsHashMetaKey(key):
+		return store.ExtractHashUserKeyFromMeta(key)
+	case store.IsHashFieldKey(key):
+		return store.ExtractHashUserKeyFromField(key)
+	default:
+		return nil
+	}
+}
+
+func redisSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsSetMetaDeltaKey(key):
+		return store.ExtractSetUserKeyFromDelta(key)
+	case store.IsSetMetaKey(key):
+		return store.ExtractSetUserKeyFromMeta(key)
+	case store.IsSetMemberKey(key):
+		return store.ExtractSetUserKeyFromMember(key)
+	default:
+		return nil
+	}
+}
+
+func redisZSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsZSetMetaDeltaKey(key):
+		return store.ExtractZSetUserKeyFromDelta(key)
+	case store.IsZSetMetaKey(key):
+		return store.ExtractZSetUserKeyFromMeta(key)
+	case store.IsZSetMemberKey(key):
+		return store.ExtractZSetUserKeyFromMember(key)
+	case store.IsZSetScoreKey(key):
+		return store.ExtractZSetUserKeyFromScore(key)
+	default:
+		return nil
+	}
 }
 
 func redisRouteKey(key []byte) []byte {
