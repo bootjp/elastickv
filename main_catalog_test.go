@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -81,7 +82,7 @@ func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 		{ID: "n2", Address: "10.0.0.12:50051"},
 	}
 	var probed []string
-	gate := newSplitMigrationCapabilityGate(peers, time.Second, func(_ context.Context, address string) error {
+	gate := newSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
 		probed = append(probed, address)
 		return nil
 	})
@@ -111,7 +112,7 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerMissingCapability(t *tes
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 	}
-	gate := newSplitMigrationCapabilityGate(peers, time.Second, func(_ context.Context, address string) error {
+	gate := newSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
 		if address == "10.0.0.12:50051" {
 			return status.Error(codes.Unimplemented, "method not found")
 		}
@@ -125,24 +126,43 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerMissingCapability(t *tes
 	require.ErrorContains(t, err, "method not found")
 }
 
-func TestSplitMigrationCapabilityPeersUseDefaultGroupAdminSeed(t *testing.T) {
+func TestSplitMigrationCapabilityGateFailsClosedWhenPeerSourceErrors(t *testing.T) {
 	t.Parallel()
 
-	cfg := raftBootstrapConfig{
-		groupServers: map[uint64][]raftengine.Server{
-			1: {
-				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
-				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
-			},
-			2: {
-				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50052"},
-				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50052"},
-			},
-		},
-	}
+	errPeerSourceUnavailable := errors.New("configuration unavailable")
+	gate := newSplitMigrationCapabilityGate(func(context.Context) ([]splitMigrationCapabilityPeer, error) {
+		return nil, errPeerSourceUnavailable
+	}, time.Second, func(context.Context, string) error {
+		t.Fatal("probe must not run when peer source fails")
+		return nil
+	})
+
+	err := gate(context.Background())
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "peers are not available")
+}
+
+func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentVoters(t *testing.T) {
+	t.Parallel()
+
+	cfg := raftengine.Configuration{Servers: []raftengine.Server{
+		{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+		{Suffrage: "learner", ID: "n2", Address: "10.0.0.12:50051"},
+		{Suffrage: "", ID: "n3", Address: "10.0.0.13:50051"},
+		{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+	}}
 
 	require.Equal(t, []splitMigrationCapabilityPeer{
-		{ID: "n1", Address: "10.0.0.11:50052"},
-		{ID: "n2", Address: "10.0.0.12:50052"},
-	}, splitMigrationCapabilityPeers(cfg, 2))
+		{ID: "n1", Address: "10.0.0.11:50051"},
+		{ID: "n3", Address: "10.0.0.13:50051"},
+	}, splitMigrationCapabilityPeersFromConfiguration(cfg))
+}
+
+func staticSplitMigrationCapabilityPeerSource(peers []splitMigrationCapabilityPeer) splitMigrationCapabilityPeerSource {
+	return func(context.Context) ([]splitMigrationCapabilityPeer, error) {
+		out := make([]splitMigrationCapabilityPeer, len(peers))
+		copy(out, peers)
+		return out, nil
+	}
 }

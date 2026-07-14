@@ -28,6 +28,7 @@ type DistributionServer struct {
 	coordinator             kv.Coordinator
 	readTracker             *kv.ActiveTimestampTracker
 	migrationCapabilityGate SplitMigrationCapabilityGate
+	splitJobRunnerReady     bool
 	knownRaftGroups         map[uint64]struct{}
 	reloadRetry             struct {
 		attempts int
@@ -60,6 +61,14 @@ func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) 
 func WithSplitMigrationCapabilityGate(gate SplitMigrationCapabilityGate) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.migrationCapabilityGate = gate
+	}
+}
+
+// WithSplitJobRunnerReady opens the split migration capability probe once this
+// node can advance planned split jobs.
+func WithSplitJobRunnerReady() DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitJobRunnerReady = true
 	}
 }
 
@@ -215,10 +224,14 @@ func (s *DistributionServer) GetIntersectingRoutes(ctx context.Context, req *pb.
 }
 
 func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.StartSplitMigrationRequest) (*pb.StartSplitMigrationResponse, error) {
+	if err := s.verifyStartSplitMigrationPreflight(ctx, req); err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.verifyStartSplitMigrationReady(ctx, req); err != nil {
+	if err := s.verifyStartSplitMigrationCatalogReady(ctx); err != nil {
 		return nil, err
 	}
 	snapshot, err := s.loadCatalogSnapshot(ctx)
@@ -246,23 +259,33 @@ func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.St
 }
 
 func (s *DistributionServer) GetSplitMigrationCapability(context.Context, *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
+	if !s.splitJobRunnerReady {
+		return &pb.GetSplitMigrationCapabilityResponse{}, nil
+	}
 	return &pb.GetSplitMigrationCapabilityResponse{
 		MigrationCapable: true,
 		Capabilities:     []string{splitMigrationCapabilityV2},
 	}, nil
 }
 
-func (s *DistributionServer) verifyStartSplitMigrationReady(ctx context.Context, req *pb.StartSplitMigrationRequest) error {
+func (s *DistributionServer) verifyStartSplitMigrationPreflight(ctx context.Context, req *pb.StartSplitMigrationRequest) error {
 	if req.GetTargetGroupId() == 0 {
 		return grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobTargetGroupRequired.Error())
 	}
+	if err := s.verifyStartSplitMigrationCatalogReady(ctx); err != nil {
+		return err
+	}
+	return s.verifySplitMigrationCapability(ctx)
+}
+
+func (s *DistributionServer) verifyStartSplitMigrationCatalogReady(ctx context.Context) error {
 	if err := s.verifyCatalogLeader(ctx); err != nil {
 		return err
 	}
 	if s.catalog == nil {
 		return grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
 	}
-	return s.verifySplitMigrationCapability(ctx)
+	return nil
 }
 
 func (s *DistributionServer) startSplitMigrationParent(

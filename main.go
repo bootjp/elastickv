@@ -500,8 +500,9 @@ func run() error {
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
 	startMemoryWatchdog(runCtx, eg, cancel)
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	splitMigrationGate := newSplitMigrationCapabilityGate(
-		splitMigrationCapabilityPeers(bootstrapCfg, cfg.defaultGroup),
+		splitMigrationCapabilityPeerSourceForRuntime(defaultRuntime),
 		splitMigrationCapabilityProbeTimeout,
 		nil,
 	)
@@ -529,7 +530,6 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
 		*encryptionRotateOnStartup,
@@ -678,16 +678,35 @@ type splitMigrationCapabilityPeer struct {
 	Address string
 }
 
+type splitMigrationCapabilityPeerSource func(context.Context) ([]splitMigrationCapabilityPeer, error)
+
 type splitMigrationCapabilityProbe func(context.Context, string) error
 
-func splitMigrationCapabilityPeers(cfg raftBootstrapConfig, defaultGroup uint64) []splitMigrationCapabilityPeer {
-	servers := cfg.adminSeed(defaultGroup)
+func splitMigrationCapabilityPeerSourceForRuntime(rt *raftGroupRuntime) splitMigrationCapabilityPeerSource {
+	return func(ctx context.Context) ([]splitMigrationCapabilityPeer, error) {
+		engine := rt.snapshotEngine()
+		if engine == nil {
+			return nil, errors.New("default raft group engine is not configured")
+		}
+		cfg, err := engine.Configuration(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "default raft group configuration")
+		}
+		return splitMigrationCapabilityPeersFromConfiguration(cfg), nil
+	}
+}
+
+func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration) []splitMigrationCapabilityPeer {
+	servers := cfg.Servers
 	if len(servers) == 0 {
 		return nil
 	}
 	peers := make([]splitMigrationCapabilityPeer, 0, len(servers))
 	seen := make(map[string]struct{}, len(servers))
 	for _, server := range servers {
+		if server.Suffrage == etcdraftengine.SuffrageLearner {
+			continue
+		}
 		key := server.ID + "\x00" + server.Address
 		if _, ok := seen[key]; ok {
 			continue
@@ -705,11 +724,18 @@ func splitMigrationCapabilityPeers(cfg raftBootstrapConfig, defaultGroup uint64)
 	return peers
 }
 
-func newSplitMigrationCapabilityGate(peers []splitMigrationCapabilityPeer, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
+func newSplitMigrationCapabilityGate(source splitMigrationCapabilityPeerSource, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
 	if probe == nil {
 		probe = probeSplitMigrationCapabilityPeer
 	}
 	return func(ctx context.Context) error {
+		if source == nil {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		peers, err := source(ctx)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "split migration capability peers are not available: %v", err)
+		}
 		if len(peers) == 0 {
 			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
 		}

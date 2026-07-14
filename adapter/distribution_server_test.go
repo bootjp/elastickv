@@ -149,10 +149,20 @@ func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
 	require.ErrorContains(t, err, errDistributionCatalogNotConfigured.Error())
 }
 
-func TestDistributionServerGetSplitMigrationCapabilityReportsReady(t *testing.T) {
+func TestDistributionServerGetSplitMigrationCapabilityReportsNotReadyUntilRunnerReady(t *testing.T) {
 	t.Parallel()
 
 	s := NewDistributionServer(distribution.NewEngine(), nil)
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.False(t, resp.GetMigrationCapable())
+	require.NotContains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
+func TestDistributionServerGetSplitMigrationCapabilityReportsReadyWhenRunnerReady(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil, WithSplitJobRunnerReady())
 	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
 	require.NoError(t, err)
 	require.True(t, resp.GetMigrationCapable())
@@ -210,6 +220,69 @@ func TestDistributionServerStartSplitMigrationReturnsCapabilityGateError(t *test
 	require.Equal(t, codes.Unavailable, status.Code(err))
 	require.ErrorContains(t, err, "split migration capability not ready")
 	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerStartSplitMigrationCapabilityGateRunsOutsideCatalogLock(t *testing.T) {
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 0,
+	}})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	gateEntered := make(chan struct{})
+	releaseGate := make(chan struct{})
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			close(gateEntered)
+			<-releaseGate
+			return status.Error(codes.Unavailable, "split migration capability not ready")
+		}),
+	)
+
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+			ExpectedCatalogVersion: saved.Version,
+			RouteId:                1,
+			SplitKey:               []byte("g"),
+			TargetGroupId:          2,
+		})
+		startDone <- err
+	}()
+	<-gateEntered
+
+	splitDone := make(chan error, 1)
+	go func() {
+		_, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+			ExpectedCatalogVersion: saved.Version,
+			RouteId:                1,
+			SplitKey:               []byte("g"),
+		})
+		splitDone <- err
+	}()
+	select {
+	case err := <-splitDone:
+		require.NoError(t, err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SplitRange blocked behind StartSplitMigration capability gate")
+	}
+
+	close(releaseGate)
+	err = <-startDone
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
 }
 
 func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *testing.T) {
