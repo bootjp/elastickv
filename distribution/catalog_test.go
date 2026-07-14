@@ -666,6 +666,53 @@ func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreSaveKeepsMinWriteTSExclusiveMonotone(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st, WithCatalogRouteDescriptorV2Writes(true))
+	ctx := context.Background()
+
+	first, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive, MinWriteTSExclusive: 80},
+	})
+	if err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	second, err := cs.Save(ctx, first.Version, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 2, State: RouteStateActive, MinWriteTSExclusive: 10},
+	})
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if second.Routes[0].GroupID != 2 {
+		t.Fatalf("expected rewritten group 2, got %d", second.Routes[0].GroupID)
+	}
+	if second.Routes[0].MinWriteTSExclusive != 80 {
+		t.Fatalf("expected returned floor 80, got %d", second.Routes[0].MinWriteTSExclusive)
+	}
+
+	snapshot, err := cs.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snapshot.Routes[0].MinWriteTSExclusive != 80 {
+		t.Fatalf("expected durable floor 80, got %d", snapshot.Routes[0].MinWriteTSExclusive)
+	}
+}
+
+func TestCatalogStoreSaveRejectsRouteDescriptorV2WritesWhenDisabled(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	_, err := cs.Save(ctx, 0, []RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive, MinWriteTSExclusive: 80},
+	})
+	if !errors.Is(err, ErrCatalogRouteV2WriteDisabled) {
+		t.Fatalf("expected ErrCatalogRouteV2WriteDisabled, got %v", err)
+	}
+}
+
 func TestCatalogStoreSaveRejectsVersionOverflow(t *testing.T) {
 	st := store.NewMVCCStore()
 	ctx := context.Background()
@@ -722,7 +769,7 @@ func TestCatalogStoreApplySaveMutations_UsesMonotonicCommitTS(t *testing.T) {
 		t.Fatalf("advance LastCommitTS: %v", err)
 	}
 
-	mutations, err := cs.buildSaveMutations(ctx, plan)
+	mutations, err := cs.buildSaveMutations(ctx, &plan)
 	if err != nil {
 		t.Fatalf("buildSaveMutations: %v", err)
 	}

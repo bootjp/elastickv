@@ -3,9 +3,12 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"os"
+	"strings"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -34,12 +37,25 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationPromoteGate = gate
+	}
+}
+
+func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
+	return func(i *Internal) {
+		i.routeEngine = engine
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
-		leader:             leader,
-		transactionManager: txm,
-		clock:              clock,
-		relay:              relay,
+		leader:               leader,
+		transactionManager:   txm,
+		clock:                clock,
+		relay:                relay,
+		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -48,13 +64,15 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
-	store              store.MVCCStore
-	migrationProposer  raftengine.Proposer
+	leader               raftengine.LeaderView
+	transactionManager   kv.Transactional
+	clock                *kv.HLC
+	tsAllocator          kv.TimestampAllocator
+	relay                *RedisPubSubRelay
+	store                store.MVCCStore
+	migrationProposer    raftengine.Proposer
+	migrationPromoteGate func(context.Context) error
+	routeEngine          *distribution.Engine
 
 	pb.UnimplementedInternalServer
 }
@@ -132,7 +150,17 @@ func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersion
 	if req.GetKeyFamily() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
 	}
+	if exportRangeVersionsRequestFullyUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires a raw or route bound"))
+	}
 	return nil
+}
+
+func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRangeStart()) == 0 &&
+		len(req.GetRangeEnd()) == 0 &&
+		len(req.GetRouteStart()) == 0 &&
+		len(req.GetRouteEnd()) == 0
 }
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
@@ -163,6 +191,9 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if req == nil {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "import range versions request is nil"))
 	}
+	if err := validateImportRangeVersionsRequest(req); err != nil {
+		return nil, err
+	}
 	if i.migrationProposer == nil {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import proposer is not configured"))
 	}
@@ -179,6 +210,16 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor}, nil
 }
 
+func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) error {
+	if req.GetJobId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions job_id is required"))
+	}
+	if req.GetBracketId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions bracket_id is required"))
+	}
+	return nil
+}
+
 func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteStagedVersionsRequest) (*pb.PromoteStagedVersionsResponse, error) {
 	if req == nil {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions request is nil"))
@@ -191,6 +232,12 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	}
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
+	}
+	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+		return nil, err
+	}
+	if err := validatePromoteStagedVersionsRequest(req); err != nil {
+		return nil, errors.WithStack(err)
 	}
 	result, err := i.proposeMigrationPromote(ctx, req)
 	if err != nil {
@@ -205,6 +252,65 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 		PromotedRows:  result.PromotedRows,
 		MaxPromotedTs: result.MaxPromotedTS,
 	}, nil
+}
+
+func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
+	if req == nil {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness request is nil"))
+	}
+	if req.GetJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness job_id is required"))
+	}
+	if req.GetMigrationJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.TargetStagedReadinessResponse{}, nil
+}
+
+func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
+	if i.migrationPromoteGate == nil {
+		return nil
+	}
+	if err := i.migrationPromoteGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
+	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
+	if err := store.ValidatePromotionCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
+		if errors.Is(err, store.ErrInvalidExportCursor) {
+			return errors.WithStack(status.Error(codes.InvalidArgument, store.ErrInvalidExportCursor.Error()))
+		}
+		return errors.WithStack(status.Errorf(codes.Internal, "validate promote cursor: %v", err))
+	}
+	return nil
+}
+
+func defaultMigrationPromoteGate(context.Context) error {
+	if migrationPromoteOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
+}
+
+func migrationPromoteOpcodeEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
@@ -265,6 +371,24 @@ func (i *Internal) proposeMigrationPromote(ctx context.Context, req *pb.PromoteS
 	}
 }
 
+func (i *Internal) proposeTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) error {
+	cmd, err := kv.MarshalTargetStagedReadinessCommand(req)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "target staged readiness")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if resp == nil {
+		return nil
+	}
+	if err, ok := resp.(error); ok {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(errors.Newf("unexpected target readiness apply response type %T", resp))
+}
+
 func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, label string) (any, error) {
 	result, err := i.migrationProposer.Propose(ctx, cmd)
 	if err != nil {
@@ -302,6 +426,9 @@ func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.Export
 
 func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
 	routeFilter := kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+	if migrationFamilyRequiresDecodedS3(req.GetKeyFamily()) {
+		routeFilter = decodedS3BucketRouteFilter(req.GetKeyFamily(), req.GetRouteStart(), req.GetRouteEnd())
+	}
 	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
 	bracket := distribution.MigrationBracket{
 		Family:               req.GetKeyFamily(),
@@ -312,6 +439,56 @@ func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool
 	}
 	return func(rawKey []byte) bool {
 		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
+	}
+}
+
+func migrationFamilyRequiresDecodedS3(family uint32) bool {
+	return family == distribution.MigrationFamilyS3BucketMeta ||
+		family == distribution.MigrationFamilyS3BucketGeneration
+}
+
+func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
+	allowRawRouteMatch := !s3BucketRouteBounds(routeStart, routeEnd)
+	return func(rawKey []byte) bool {
+		bucket, ok := decodedS3BucketName(family, rawKey)
+		if !ok {
+			return false
+		}
+		if allowRawRouteMatch && kv.RouteKeyFilter(routeStart, routeEnd)(rawKey) {
+			return true
+		}
+		return decodedS3BucketRouteIntersects(bucket, routeStart, routeEnd)
+	}
+}
+
+func s3BucketRouteBounds(routeStart, routeEnd []byte) bool {
+	return bytes.HasPrefix(routeStart, []byte(s3keys.RoutePrefix)) ||
+		bytes.HasPrefix(routeEnd, []byte(s3keys.RoutePrefix))
+}
+
+func decodedS3BucketRouteIntersects(bucket string, routeStart, routeEnd []byte) bool {
+	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+}
+
+func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
+	if len(aEnd) > 0 && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if len(bEnd) > 0 && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
+}
+
+func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
+	switch family {
+	case distribution.MigrationFamilyS3BucketMeta:
+		return s3keys.ParseBucketMetaKey(rawKey)
+	case distribution.MigrationFamilyS3BucketGeneration:
+		return s3keys.ParseBucketGenerationKey(rawKey)
+	default:
+		return "", false
 	}
 }
 
@@ -416,16 +593,47 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts != 0 {
-			continue
+		if r.Ts == 0 {
+			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
+			if err != nil {
+				return err
+			}
+			r.Ts = ts
 		}
-		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
-		if err != nil {
+		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
 			return err
 		}
-		r.Ts = ts
 	}
 	return nil
+}
+
+func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
+	if i == nil || i.routeEngine == nil || commitTS == 0 {
+		return nil
+	}
+	routes := i.routeEngine.Stats()
+	for _, mut := range muts {
+		if mut == nil || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
+			continue
+		}
+		for _, route := range routes {
+			if routeWriteTimestampFloorApplies(route, mut, commitTS) {
+				return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
+			}
+		}
+	}
+	return nil
+}
+
+func routeWriteTimestampFloorApplies(route distribution.Route, mut *pb.Mutation, commitTS uint64) bool {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return false
+	}
+	if mut.GetOp() == pb.Op_DEL_PREFIX {
+		start, end := kv.RoutePrefixRange(mut.GetKey())
+		return rangesIntersect(route.Start, route.End, start, end)
+	}
+	return kv.RouteKeyFilter(route.Start, route.End)(mut.GetKey())
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) error {
@@ -448,7 +656,10 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) e
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS); err != nil {
+		return err
+	}
+	return i.rejectWriteTimestampFloorTxnRequests(reqs)
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -512,6 +723,34 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		item.m.Value = kv.EncodeTxnMeta(item.meta)
 	}
 	return nil
+}
+
+func (i *Internal) rejectWriteTimestampFloorTxnRequests(reqs []*pb.Request) error {
+	for _, r := range reqs {
+		commitTS, ok := forwardedTxnRequestCommitTS(r)
+		if !ok {
+			continue
+		}
+		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forwardedTxnRequestCommitTS(r *pb.Request) (uint64, bool) {
+	if r == nil || (r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE) {
+		return 0, false
+	}
+	m, ok := forwardedTxnMetaMutation(r, []byte(kv.TxnMetaPrefix))
+	if !ok {
+		return 0, false
+	}
+	meta, err := kv.DecodeTxnMeta(m.Value)
+	if err != nil || meta.CommitTS == 0 {
+		return 0, false
+	}
+	return meta.CommitTS, true
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

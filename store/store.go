@@ -15,6 +15,10 @@ import (
 // single definition due to the store→kv import cycle.
 var txnInternalKeyPrefix = []byte("!txn|")
 
+// txnLockKeyPrefix must match kv's txn lock namespace. Migration exports skip
+// these in-flight lock records so a target range never imports a stale lock.
+var txnLockKeyPrefix = []byte("!txn|lock|")
+
 var ErrKeyNotFound = errors.New("not found")
 var ErrUnknownOp = errors.New("unknown op")
 var ErrNotSupported = errors.New("not supported")
@@ -82,12 +86,14 @@ type ExportVersionsOptions struct {
 	EndKey               []byte
 	MinCommitTSExclusive uint64
 	MaxCommitTSInclusive uint64
-	Cursor               []byte
-	MaxVersions          int
-	MaxBytes             uint64
-	MaxScannedBytes      uint64
-	KeyFamily            uint32
-	AcceptKey            func([]byte) bool
+	// ReadTS asks export to enforce the same retention watermark as GetAt/ScanAt.
+	ReadTS          uint64
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptKey       func([]byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.
@@ -119,7 +125,10 @@ type ImportVersionsResult struct {
 // PromoteVersionsOptions atomically copies staged MVCC versions to their
 // target keys and physically removes the staged versions.
 type PromoteVersionsOptions struct {
-	JobID           uint64
+	JobID uint64
+	// AppliedIndex is the optional Raft entry index to bundle with Pebble
+	// promotion batches as metaAppliedIndex. Zero leaves the meta key unchanged.
+	AppliedIndex    uint64
 	StartKey        []byte
 	EndKey          []byte
 	Cursor          []byte
@@ -332,6 +341,9 @@ type MVCCStore interface {
 	// ImportVersions applies a migration import batch idempotently by
 	// (jobID, bracketID, batchSeq), preserving tombstones and expireAt.
 	ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
+	// ImportVersionsRaft is the raft-apply variant of ImportVersions. It
+	// preserves the same idempotency contract while using the FSM write path.
+	ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
 	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)

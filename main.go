@@ -1636,6 +1636,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		shardStore:         in.shardStore,
 		coordinate:         adapterCoordinate,
 		distServer:         in.distServer,
+		routeEngine:        in.cfg.engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
 		redisAddress:       *redisAddr,
@@ -1973,9 +1974,12 @@ func (g *startupPublicKVGate) blocked() bool {
 func startupRotationGatedMethod(fullMethod string) bool {
 	switch fullMethod {
 	case pb.Internal_Forward_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_AbandonSplitJob_FullMethodName,
+		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
 		pb.RaftAdmin_AddLearner_FullMethodName,
 		pb.RaftAdmin_PromoteLearner_FullMethodName,
@@ -2199,6 +2203,7 @@ func startRaftServers(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
@@ -2243,6 +2248,7 @@ func startRaftServers(
 				internalTimestampOptions(coordinate),
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalRouteEngine(routeEngine),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
@@ -2585,6 +2591,7 @@ type runtimeServerRunner struct {
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
+	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
 	adminGRPCOpts                   adminGRPCInterceptors
 	redisAddress                    string
@@ -2698,6 +2705,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardStore,
 		r.coordinate,
 		r.distServer,
+		r.routeEngine,
 		r.pubsubRelay,
 		func(groupID uint64) kv.ProposalObserver {
 			return r.metricsRegistry.RaftProposalObserver(groupID)

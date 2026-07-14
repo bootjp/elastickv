@@ -559,7 +559,34 @@ func isPebbleMetaKey(rawKey []byte) bool {
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaAppliedIndexBytes) ||
-		isMigrationMetadataKey(rawKey)
+		isMigrationMetadataKey(rawKey) ||
+		isPebbleWriterRegistryKey(rawKey)
+}
+
+func isPebbleWriterRegistryKey(rawKey []byte) bool {
+	if !couldBePebbleWriterRegistryKey(rawKey) {
+		return false
+	}
+	_, _, err := encryption.DecodeRegistryKey(rawKey)
+	return err == nil
+}
+
+func couldBePebbleWriterRegistryKey(rawKey []byte) bool {
+	const writerRegistrySuffixSize = 4 + 1 + 2
+	prefix := encryption.WriterRegistryPrefix
+	return len(rawKey) == len(prefix)+writerRegistrySuffixSize &&
+		bytes.HasPrefix(rawKey, prefix) &&
+		rawKey[len(prefix)+4] == '|'
+}
+
+var errMVCCMetadataKeyCollision = errors.New("store: mvcc encoded key collides with reserved pebble metadata key")
+
+func encodePebbleUserVersionKey(key []byte, commitTS uint64) ([]byte, error) {
+	encoded := encodeKey(key, commitTS)
+	if isPebbleMetaKey(encoded) {
+		return nil, errors.WithStack(errMVCCMetadataKeyCollision)
+	}
+	return encoded, nil
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
@@ -883,26 +910,32 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 // values, in which case the visibility checks below are operating
 // on authenticated bytes.
 func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
-	k := iter.Key()
-	userKey, _ := decodeKeyView(k)
-	if !bytes.Equal(userKey, key) {
-		return nil, ErrKeyNotFound
+	for ; iter.Valid(); iter.Next() {
+		k := iter.Key()
+		if isPebbleMetaKey(k) {
+			continue
+		}
+		userKey, _ := decodeKeyView(k)
+		if !bytes.Equal(userKey, key) {
+			return nil, ErrKeyNotFound
+		}
+		sv, err := decodeValue(iter.Value())
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		plain, err := s.decryptForKey(k, sv, sv.Value)
+		if err != nil {
+			return nil, err
+		}
+		if sv.Tombstone {
+			return nil, ErrKeyNotFound
+		}
+		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
+			return nil, ErrKeyNotFound
+		}
+		return plain, nil
 	}
-	sv, err := decodeValue(iter.Value())
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	plain, err := s.decryptForKey(k, sv, sv.Value)
-	if err != nil {
-		return nil, err
-	}
-	if sv.Tombstone {
-		return nil, ErrKeyNotFound
-	}
-	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
-		return nil, ErrKeyNotFound
-	}
-	return plain, nil
+	return nil, ErrKeyNotFound
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -949,7 +982,11 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	_, closer, err := s.db.Get(encodeKey(key, commitTS))
+	encoded := encodeKey(key, commitTS)
+	if isPebbleMetaKey(encoded) {
+		return false, nil
+	}
+	_, closer, err := s.db.Get(encoded)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return false, nil
@@ -1001,6 +1038,7 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 }
 
 func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
+	userKey = bytes.Clone(userKey)
 	if !iter.SeekGE(encodeKey(userKey, 0)) {
 		return false
 	}
@@ -1337,11 +1375,14 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	if err := validateValueSize(value); err != nil {
 		return err
 	}
+	k, err := encodePebbleUserVersionKey(key, commitTS)
+	if err != nil {
+		return err
+	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	commitTS = s.alignCommitTS(commitTS)
 
-	k := encodeKey(key, commitTS)
 	// gateRegistration=true: PutAt is a direct (non-raft) write path.
 	body, encState, err := s.encryptForKey(k, value, expireAt, true)
 	if err != nil {
@@ -1357,11 +1398,14 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 }
 
 func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
+	k, err := encodePebbleUserVersionKey(key, commitTS)
+	if err != nil {
+		return err
+	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	commitTS = s.alignCommitTS(commitTS)
 
-	k := encodeKey(key, commitTS)
 	v := encodeValue(nil, true, 0, encStateCleartext)
 
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
@@ -1376,6 +1420,10 @@ func (s *pebbleStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte
 }
 
 func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
+	k, err := encodePebbleUserVersionKey(key, commitTS)
+	if err != nil {
+		return err
+	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1386,8 +1434,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 		return err
 	}
 
-	commitTS = s.alignCommitTS(commitTS)
-	k := encodeKey(key, commitTS)
+	s.alignCommitTS(commitTS)
 	// gateRegistration=true: ExpireAt is a direct (non-raft) write path
 	// that calls encryptForKey directly (it does not delegate to PutAt).
 	body, encState, err := s.encryptForKey(k, val, expireAt, true)
@@ -1414,12 +1461,16 @@ func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, boo
 	}
 	defer iter.Close()
 
-	if iter.First() {
+	for ok := iter.First(); ok; ok = iter.Next() {
 		k := iter.Key()
+		if isPebbleMetaKey(k) {
+			continue
+		}
 		userKey, version := decodeKeyView(k)
 		if bytes.Equal(userKey, key) {
 			return version, true, nil
 		}
+		return 0, false, nil
 	}
 	return 0, false, nil
 }
@@ -1483,7 +1534,10 @@ func (s *pebbleStore) WriteConflictCount() uint64 {
 
 func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64, gateRegistration bool) error {
 	for _, mut := range mutations {
-		k := encodeKey(mut.Key, commitTS)
+		k, err := encodePebbleUserVersionKey(mut.Key, commitTS)
+		if err != nil {
+			return err
+		}
 		var v []byte
 
 		switch mut.Op {
@@ -1751,8 +1805,8 @@ func (s *pebbleStore) scanDeletePrefix(iter *pebble.Iterator, batch *pebble.Batc
 			return err
 		}
 		if needsTombstone {
-			if err := batch.Set(encodeKey(userKey, commitTS), tombstoneVal, nil); err != nil {
-				return errors.WithStack(err)
+			if err := setDeletePrefixTombstone(batch, userKey, commitTS, tombstoneVal); err != nil {
+				return err
 			}
 		}
 		if !s.skipToNextUserKey(iter, userKey) {
@@ -1760,6 +1814,14 @@ func (s *pebbleStore) scanDeletePrefix(iter *pebble.Iterator, batch *pebble.Batc
 		}
 	}
 	return nil
+}
+
+func setDeletePrefixTombstone(batch *pebble.Batch, userKey []byte, commitTS uint64, tombstoneVal []byte) error {
+	k, err := encodePebbleUserVersionKey(userKey, commitTS)
+	if err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Set(k, tombstoneVal, nil))
 }
 
 type deletePrefixAction int
@@ -2158,8 +2220,12 @@ func flushSnapshotBatch(db *pebble.DB, batch **pebble.Batch, opts *pebble.WriteO
 }
 
 func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version VersionedValue) error {
-	deferred := batch.SetDeferred(encodedKeyLen(key), encodedValueLen(len(version.Value)))
-	fillEncodedKey(deferred.Key, key, version.TS)
+	encodedKey, err := encodePebbleUserVersionKey(key, version.TS)
+	if err != nil {
+		return err
+	}
+	deferred := batch.SetDeferred(len(encodedKey), encodedValueLen(len(version.Value)))
+	copy(deferred.Key, encodedKey)
 	// MVCC snapshot format v2 does not carry encryption_state — Stage 8 of
 	// the encryption rollout (per docs/design/2026_04_29_proposed...) bumps
 	// the format to v3 to round-trip encrypted entries through this path.
@@ -2183,6 +2249,33 @@ func writeRestoreEntry(r io.Reader, batch *pebble.Batch, keyBuf []byte, kLen, vL
 	return errors.WithStack(deferred.Finish())
 }
 
+func restoreBatchLoopStep(r io.Reader, db *pebble.DB, batch **pebble.Batch, keyBuf *[]byte) (bool, error) {
+	kLen, vLen, eof, err := readRestoreEntry(r, keyBuf)
+	if err != nil {
+		return false, err
+	}
+	if eof {
+		return true, nil
+	}
+	if err := flushSnapshotBatchIfNeeded(db, batch, kLen, vLen); err != nil {
+		return false, err
+	}
+	if err := writeRestoreEntry(r, *batch, *keyBuf, kLen, vLen); err != nil {
+		return false, err
+	}
+	if snapshotBatchShouldFlush(*batch) {
+		return false, flushSnapshotBatch(db, batch, pebble.NoSync)
+	}
+	return false, nil
+}
+
+func flushSnapshotBatchIfNeeded(db *pebble.DB, batch **pebble.Batch, kLen, vLen int) error {
+	if !(*batch).Empty() && (*batch).Len()+kLen+vLen >= snapshotBatchByteLimit {
+		return flushSnapshotBatch(db, batch, pebble.NoSync)
+	}
+	return nil
+}
+
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
 // them into db using batched commits. It is used for both the direct and the
 // temp-dir atomic native Pebble restore paths.
@@ -2191,32 +2284,13 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	var keyBuf []byte // reused across entries to reduce per-entry allocations
 
 	for {
-		kLen, vLen, eof, err := readRestoreEntry(r, &keyBuf)
+		done, err := restoreBatchLoopStep(r, db, &batch, &keyBuf)
+		if done {
+			break
+		}
 		if err != nil {
 			_ = batch.Close()
 			return err
-		}
-		if eof {
-			break
-		}
-
-		// Flush before adding when the batch is non-empty and the anticipated
-		// entry size would push the batch over the byte limit.
-		if !batch.Empty() && batch.Len()+kLen+vLen >= snapshotBatchByteLimit {
-			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
-				return err
-			}
-		}
-
-		if err := writeRestoreEntry(r, batch, keyBuf, kLen, vLen); err != nil {
-			_ = batch.Close()
-			return err
-		}
-
-		if snapshotBatchShouldFlush(batch) {
-			if err := flushSnapshotBatch(db, &batch, pebble.NoSync); err != nil {
-				return err
-			}
 		}
 	}
 	return commitSnapshotBatch(batch, pebble.Sync)
@@ -2273,6 +2347,7 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 	s.lastCommitTS = 0
 	s.minRetainedTS = 0
 	s.pendingMinRetainedTS = 0
+	s.migrationReadinessCache = nil
 	if setErr := writePebbleUint64(s.db, metaLastCommitTSBytes, 0, pebble.NoSync); setErr != nil {
 		return errors.WithStack(setErr)
 	}
@@ -2443,22 +2518,34 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, error) {
-	expectedChecksum, err := readMVCCSnapshotHeader(r)
+func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, []TargetStagedReadinessState, error) {
+	expectedChecksum, version, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, 0, 0, nil, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
 	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, 0, 0, nil, err
 	}
-	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, nil
+	readinessStates, err := readMVCCSnapshotReadinessStates(body, version)
+	if err != nil {
+		return nil, nil, 0, 0, 0, nil, err
+	}
+	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64) (string, error) {
+func writeStreamingMVCCRestoreTempDB(
+	dir string,
+	body io.Reader,
+	hash hash.Hash32,
+	expectedChecksum uint32,
+	lastCommitTS uint64,
+	minRetainedTS uint64,
+	readinessStates []TargetStagedReadinessState,
+) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
@@ -2478,6 +2565,10 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 		_ = os.RemoveAll(tmpDir)
 	}
 
+	if err := writePebbleTargetReadinessStates(tmpDB, readinessStates); err != nil {
+		cleanupTmp()
+		return "", err
+	}
 	if err := writeMVCCEntriesToDB(body, tmpDB); err != nil {
 		cleanupTmp()
 		return "", err
@@ -2497,13 +2588,22 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 	return tmpDir, nil
 }
 
+func writePebbleTargetReadinessStates(db *pebble.DB, states []TargetStagedReadinessState) error {
+	for _, state := range states {
+		if err := db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), pebble.NoSync); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, err := readStreamingMVCCRestoreHeader(r)
+	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates)
 	if err != nil {
 		return err
 	}

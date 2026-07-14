@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName               = "/Internal/Forward"
-	Internal_RelayPublish_FullMethodName          = "/Internal/RelayPublish"
-	Internal_ExportRangeVersions_FullMethodName   = "/Internal/ExportRangeVersions"
-	Internal_ImportRangeVersions_FullMethodName   = "/Internal/ImportRangeVersions"
-	Internal_PromoteStagedVersions_FullMethodName = "/Internal/PromoteStagedVersions"
+	Internal_Forward_FullMethodName                    = "/Internal/Forward"
+	Internal_RelayPublish_FullMethodName               = "/Internal/RelayPublish"
+	Internal_ExportRangeVersions_FullMethodName        = "/Internal/ExportRangeVersions"
+	Internal_ImportRangeVersions_FullMethodName        = "/Internal/ImportRangeVersions"
+	Internal_PromoteStagedVersions_FullMethodName      = "/Internal/PromoteStagedVersions"
+	Internal_ApplyTargetStagedReadiness_FullMethodName = "/Internal/ApplyTargetStagedReadiness"
 )
 
 // InternalClient is the client API for Internal service.
@@ -36,6 +37,7 @@ type InternalClient interface {
 	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
 	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
 	PromoteStagedVersions(ctx context.Context, in *PromoteStagedVersionsRequest, opts ...grpc.CallOption) (*PromoteStagedVersionsResponse, error)
+	ApplyTargetStagedReadiness(ctx context.Context, in *TargetStagedReadinessRequest, opts ...grpc.CallOption) (*TargetStagedReadinessResponse, error)
 }
 
 type internalClient struct {
@@ -105,6 +107,16 @@ func (c *internalClient) PromoteStagedVersions(ctx context.Context, in *PromoteS
 	return out, nil
 }
 
+func (c *internalClient) ApplyTargetStagedReadiness(ctx context.Context, in *TargetStagedReadinessRequest, opts ...grpc.CallOption) (*TargetStagedReadinessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TargetStagedReadinessResponse)
+	err := c.cc.Invoke(ctx, Internal_ApplyTargetStagedReadiness_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility.
@@ -115,6 +127,7 @@ type InternalServer interface {
 	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
 	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
 	PromoteStagedVersions(context.Context, *PromoteStagedVersionsRequest) (*PromoteStagedVersionsResponse, error)
+	ApplyTargetStagedReadiness(context.Context, *TargetStagedReadinessRequest) (*TargetStagedReadinessResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -139,6 +152,9 @@ func (UnimplementedInternalServer) ImportRangeVersions(context.Context, *ImportR
 }
 func (UnimplementedInternalServer) PromoteStagedVersions(context.Context, *PromoteStagedVersionsRequest) (*PromoteStagedVersionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PromoteStagedVersions not implemented")
+}
+func (UnimplementedInternalServer) ApplyTargetStagedReadiness(context.Context, *TargetStagedReadinessRequest) (*TargetStagedReadinessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyTargetStagedReadiness not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -244,6 +260,24 @@ func _Internal_PromoteStagedVersions_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ApplyTargetStagedReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TargetStagedReadinessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ApplyTargetStagedReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ApplyTargetStagedReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ApplyTargetStagedReadiness(ctx, req.(*TargetStagedReadinessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -266,6 +300,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PromoteStagedVersions",
 			Handler:    _Internal_PromoteStagedVersions_Handler,
+		},
+		{
+			MethodName: "ApplyTargetStagedReadiness",
+			Handler:    _Internal_ApplyTargetStagedReadiness_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

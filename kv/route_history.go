@@ -61,6 +61,14 @@ func (s distributionRouteSnapshot) OwnerOf(key []byte) (uint64, bool) {
 	return s.snap.OwnerOf(key)
 }
 
+func (s distributionRouteSnapshot) RouteOf(key []byte) (distribution.Route, bool) {
+	return s.snap.RouteOf(key)
+}
+
+func (s distributionRouteSnapshot) IntersectingRoutes(start, end []byte) []distribution.Route {
+	return s.snap.IntersectingRoutes(start, end)
+}
+
 func (s distributionRouteSnapshot) WriteFencedForKey(key []byte) bool {
 	route, ok := s.snap.RouteOf(key)
 	return ok && route.State == distribution.RouteStateWriteFenced
@@ -73,4 +81,22 @@ func (s distributionRouteSnapshot) WriteFencedIntersects(start, end []byte) bool
 		}
 	}
 	return false
+}
+
+func (s distributionRouteSnapshot) WriteFloorForKey(key []byte) (uint64, bool) {
+	route, ok := s.snap.RouteOf(key)
+	if !ok || route.MinWriteTSExclusive == 0 {
+		return 0, false
+	}
+	return route.MinWriteTSExclusive, true
+}
+
+func (s distributionRouteSnapshot) WriteFloorIntersects(start, end []byte) (uint64, bool) {
+	var maxFloor uint64
+	for _, route := range s.snap.IntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive > maxFloor {
+			maxFloor = route.MinWriteTSExclusive
+		}
+	}
+	return maxFloor, maxFloor > 0
 }

@@ -18,6 +18,25 @@ func TestBucketMetaKey_RoundTripsZeroByteSegments(t *testing.T) {
 	require.Equal(t, bucket, parsed)
 }
 
+func TestBucketGenerationKey_RoundTripsZeroByteSegments(t *testing.T) {
+	t.Parallel()
+
+	bucket := string([]byte{'b', 'u', 0x00, 'c', 'k', 'e', 't'})
+	key := BucketGenerationKey(bucket)
+
+	parsed, ok := ParseBucketGenerationKey(key)
+	require.True(t, ok)
+	require.Equal(t, bucket, parsed)
+}
+
+func TestParseBucketGenerationKey_RejectsNonGenerationKey(t *testing.T) {
+	t.Parallel()
+
+	parsed, ok := ParseBucketGenerationKey(BucketMetaKey("bucket"))
+	require.False(t, ok)
+	require.Empty(t, parsed)
+}
+
 func TestObjectManifestKey_RoundTripsZeroByteSegments(t *testing.T) {
 	t.Parallel()
 
@@ -50,6 +69,17 @@ func TestExtractRouteKey_ObjectScopedKeys(t *testing.T) {
 	for _, key := range keys {
 		require.Equal(t, want, ExtractRouteKey(key))
 	}
+}
+
+func TestRoutePrefixForBucketAnyGeneration(t *testing.T) {
+	t.Parallel()
+
+	bucket := string([]byte{'b', 0x00, 'k'})
+	prefix := RoutePrefixForBucketAnyGeneration(bucket)
+
+	require.True(t, bytes.HasPrefix(RouteKey(bucket, 1, "a"), prefix))
+	require.True(t, bytes.HasPrefix(RouteKey(bucket, 2, "b"), prefix))
+	require.False(t, bytes.HasPrefix(RouteKey("other", 1, "a"), prefix))
 }
 
 func TestManifestScanRouteBounds(t *testing.T) {

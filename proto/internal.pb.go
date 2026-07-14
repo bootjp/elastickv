@@ -1075,6 +1075,134 @@ func (x *PromoteStagedVersionsResponse) GetMaxPromotedTs() uint64 {
 	return 0
 }
 
+type TargetStagedReadinessRequest struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	JobId                  uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	RouteStart             []byte                 `protobuf:"bytes,2,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd               []byte                 `protobuf:"bytes,3,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExpectedCutoverVersion uint64                 `protobuf:"varint,4,opt,name=expected_cutover_version,json=expectedCutoverVersion,proto3" json:"expected_cutover_version,omitempty"`
+	MigrationJobId         uint64                 `protobuf:"varint,5,opt,name=migration_job_id,json=migrationJobId,proto3" json:"migration_job_id,omitempty"`
+	MinWriteTsExclusive    uint64                 `protobuf:"varint,6,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	Armed                  bool                   `protobuf:"varint,7,opt,name=armed,proto3" json:"armed,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *TargetStagedReadinessRequest) Reset() {
+	*x = TargetStagedReadinessRequest{}
+	mi := &file_internal_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetStagedReadinessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetStagedReadinessRequest) ProtoMessage() {}
+
+func (x *TargetStagedReadinessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetStagedReadinessRequest.ProtoReflect.Descriptor instead.
+func (*TargetStagedReadinessRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *TargetStagedReadinessRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetExpectedCutoverVersion() uint64 {
+	if x != nil {
+		return x.ExpectedCutoverVersion
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetMigrationJobId() uint64 {
+	if x != nil {
+		return x.MigrationJobId
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetMinWriteTsExclusive() uint64 {
+	if x != nil {
+		return x.MinWriteTsExclusive
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetArmed() bool {
+	if x != nil {
+		return x.Armed
+	}
+	return false
+}
+
+type TargetStagedReadinessResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TargetStagedReadinessResponse) Reset() {
+	*x = TargetStagedReadinessResponse{}
+	mi := &file_internal_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetStagedReadinessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetStagedReadinessResponse) ProtoMessage() {}
+
+func (x *TargetStagedReadinessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetStagedReadinessResponse.ProtoReflect.Descriptor instead.
+func (*TargetStagedReadinessResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{15}
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -1155,7 +1283,17 @@ const file_internal_proto_rawDesc = "" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
 	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
-	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs*&\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xa2\x02\n" +
+	"\x1cTargetStagedReadinessRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x1f\n" +
+	"\vroute_start\x18\x02 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x03 \x01(\fR\brouteEnd\x128\n" +
+	"\x18expected_cutover_version\x18\x04 \x01(\x04R\x16expectedCutoverVersion\x12(\n" +
+	"\x10migration_job_id\x18\x05 \x01(\x04R\x0emigrationJobId\x123\n" +
+	"\x16min_write_ts_exclusive\x18\x06 \x01(\x04R\x13minWriteTsExclusive\x12\x14\n" +
+	"\x05armed\x18\a \x01(\bR\x05armed\"\x1f\n" +
+	"\x1dTargetStagedReadinessResponse*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -1166,13 +1304,14 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xfd\x02\n" +
+	"\x05ABORT\x10\x032\xdc\x03\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
-	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00\x12]\n" +
+	"\x1aApplyTargetStagedReadiness\x12\x1d.TargetStagedReadinessRequest\x1a\x1e.TargetStagedReadinessResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -1187,7 +1326,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                               // 0: Op
 	(Phase)(0),                            // 1: Phase
@@ -1205,6 +1344,8 @@ var file_internal_proto_goTypes = []any{
 	(*ImportRangeVersionsResponse)(nil),   // 13: ImportRangeVersionsResponse
 	(*PromoteStagedVersionsRequest)(nil),  // 14: PromoteStagedVersionsRequest
 	(*PromoteStagedVersionsResponse)(nil), // 15: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),  // 16: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil), // 17: TargetStagedReadinessResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -1219,13 +1360,15 @@ var file_internal_proto_depIdxs = []int32{
 	9,  // 9: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
 	12, // 10: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
 	14, // 11: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	6,  // 12: Internal.Forward:output_type -> ForwardResponse
-	8,  // 13: Internal.RelayPublish:output_type -> RelayPublishResponse
-	10, // 14: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	13, // 15: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	15, // 16: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	12, // [12:17] is the sub-list for method output_type
-	7,  // [7:12] is the sub-list for method input_type
+	16, // 12: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	6,  // 13: Internal.Forward:output_type -> ForwardResponse
+	8,  // 14: Internal.RelayPublish:output_type -> RelayPublishResponse
+	10, // 15: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	13, // 16: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	15, // 17: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	17, // 18: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	13, // [13:19] is the sub-list for method output_type
+	7,  // [7:13] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
@@ -1242,7 +1385,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   14,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

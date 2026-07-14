@@ -63,7 +63,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionCommitsRouteAndJobTogether(t
 	t.Parallel()
 
 	ctx := context.Background()
-	cs := NewCatalogStore(store.NewMVCCStore())
+	cs := NewCatalogStore(store.NewMVCCStore(), WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := cs.Save(ctx, 0, promotionCompleteTestRoutes())
 	require.NoError(t, err)
 	job := promotionCompleteTestJob()
@@ -96,7 +96,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionIsIdempotentAfterClearedDesc
 	t.Parallel()
 
 	ctx := context.Background()
-	cs := NewCatalogStore(store.NewMVCCStore())
+	cs := NewCatalogStore(store.NewMVCCStore(), WithCatalogRouteDescriptorV2Writes(true))
 	routes := promotionCompleteTestRoutes()
 	routes[1].StagedVisibilityActive = false
 	routes[1].MigrationJobID = 0
@@ -122,7 +122,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionRejectsStaleInputs(t *testin
 	t.Parallel()
 
 	ctx := context.Background()
-	cs := NewCatalogStore(store.NewMVCCStore())
+	cs := NewCatalogStore(store.NewMVCCStore(), WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := cs.Save(ctx, 0, promotionCompleteTestRoutes())
 	require.NoError(t, err)
 	job := promotionCompleteTestJob()

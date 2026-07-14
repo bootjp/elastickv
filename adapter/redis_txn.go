@@ -351,18 +351,25 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// truncation: if >MaxDeltaScanLimit deltas exist the transaction cannot
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if len(deltaKVs) > store.MaxDeltaScanLimit {
-		return nil, ErrDeltaScanTruncated
-	}
-	existingDeltas := make([][]byte, 0, len(deltaKVs))
-	for _, kv := range deltaKVs {
-		existingDeltas = append(existingDeltas, kv.Key)
+	var existingDeltas [][]byte
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
+			ctx,
+			t.server.store,
+			deltaPrefix,
+			store.MaxDeltaScanLimit,
+			t.startTS,
+			listTxnDeltaFilter(key, deltaPrefix),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if truncated {
+			return nil, ErrDeltaScanTruncated
+		}
+		for _, kv := range deltaKVs {
+			existingDeltas = append(existingDeltas, kv.Key)
+		}
 	}
 
 	st := &listTxnState{
@@ -388,6 +395,15 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	}
 
 	return st, nil
+}
+
+func listTxnDeltaFilter(key []byte, deltaPrefix []byte) func(*store.KVPair) bool {
+	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return nil
+	}
+	return func(pair *store.KVPair) bool {
+		return legacyListDeltaPairForUserKey(pair, key)
+	}
 }
 
 func (t *txnContext) loadHashStateForFields(key []byte, fields [][]byte) (*hashTxnState, error) {

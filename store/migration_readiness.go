@@ -52,11 +52,11 @@ func (s *pebbleStore) ApplyTargetStagedReadiness(_ context.Context, state Target
 	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	if err := s.db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), s.directApplyWriteOpts()); err != nil {
 		return errors.WithStack(err)
 	}
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
 	return nil
 }
@@ -79,6 +79,9 @@ func (s *pebbleStore) loadPebbleTargetReadinessStatesFromDB() ([]TargetStagedRea
 
 	var out []TargetStagedReadinessState
 	for valid := iter.First(); valid; valid = iter.Next() {
+		if !isTargetReadinessRecordKey(iter.Key()) {
+			continue
+		}
 		state, ok := decodeTargetStagedReadinessState(iter.Value())
 		if !ok {
 			return nil, errors.New("corrupt target staged readiness state")
@@ -90,6 +93,11 @@ func (s *pebbleStore) loadPebbleTargetReadinessStatesFromDB() ([]TargetStagedRea
 	}
 	sortTargetStagedReadinessStates(out)
 	return out, nil
+}
+
+func isTargetReadinessRecordKey(rawKey []byte) bool {
+	return len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes &&
+		bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix))
 }
 
 func encodeTargetStagedReadinessState(state TargetStagedReadinessState) []byte {
