@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"sort"
 
 	"github.com/cockroachdb/errors"
 	"github.com/emirpasic/gods/maps/treemap"
@@ -12,19 +13,36 @@ import (
 const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
+	exportCursorTagPrunedKey
+	exportCursorTagSkippedKey
 
-	migrationAckPrefix        = "!migstage|ack|"
-	migrationHLCFloorPrefix   = "!migstage|hlc_floor|"
-	migrationPromotePrefix    = "!migstage|promote|"
-	migrationUint64Bytes      = 8
-	migrationAckKeyIDBytes    = 2 * migrationUint64Bytes
-	exportVersionSizeOverhead = 24
+	migrationAckMetaKey      = "_migack"
+	migrationHLCFloorMetaKey = "_mighlc"
+	migrationPromoteMetaKey  = "_migpromote"
+	migrationMetadataVersion = 1
+
+	migrationAckPrefix                 = "!migstage|ack|"
+	migrationUint64Bytes               = 8
+	exportVersionSizeOverhead          = 24
+	defaultSparseExportMaxScannedBytes = 1 << 20
+)
+
+var (
+	migrationAckMetaKeyBytes      = []byte(migrationAckMetaKey)
+	migrationHLCFloorMetaKeyBytes = []byte(migrationHLCFloorMetaKey)
+	migrationPromoteMetaKeyBytes  = []byte(migrationPromoteMetaKey)
 )
 
 type exportCursorPosition struct {
 	key      []byte
 	commitTS uint64
 	tag      byte
+	hasKey   bool
+}
+
+type migrationAckID struct {
+	jobID     uint64
+	bracketID uint64
 }
 
 type migrationImportAck struct {
@@ -64,63 +82,277 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
 	tag := rest[0]
-	if tag != exportCursorTagEmitted && tag != exportCursorTagScanned {
+	if tag != exportCursorTagEmitted &&
+		tag != exportCursorTagScanned &&
+		tag != exportCursorTagPrunedKey &&
+		tag != exportCursorTagSkippedKey {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
-	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag}, nil
+	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
 }
 
-func migrationAckKey(jobID, bracketID uint64) []byte {
-	key := make([]byte, len(migrationAckPrefix)+migrationAckKeyIDBytes)
-	copy(key, migrationAckPrefix)
-	binary.BigEndian.PutUint64(key[len(migrationAckPrefix):], jobID)
-	binary.BigEndian.PutUint64(key[len(migrationAckPrefix)+migrationUint64Bytes:], bracketID)
-	return key
+// ValidateExportCursorForRange verifies that an export cursor decodes and
+// resumes inside the supplied key interval. Skipped-key cursors are accepted
+// only when they describe a key outside the interval.
+func ValidateExportCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
 }
 
-func migrationHLCFloorKey(jobID uint64) []byte {
-	key := make([]byte, len(migrationHLCFloorPrefix)+migrationUint64Bytes)
-	copy(key, migrationHLCFloorPrefix)
-	binary.BigEndian.PutUint64(key[len(migrationHLCFloorPrefix):], jobID)
-	return key
+// ValidatePromotionCursorForRange verifies a promotion cursor before it is
+// proposed to Raft. Promotion scans emit only accepted positions, so callers
+// must not resume from sparse-scan-only cursor tags.
+func ValidatePromotionCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag != exportCursorTagEmitted {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
 }
 
-func migrationPromoteKey(jobID uint64) []byte {
-	key := make([]byte, len(migrationPromotePrefix)+migrationUint64Bytes)
-	copy(key, migrationPromotePrefix)
-	binary.BigEndian.PutUint64(key[len(migrationPromotePrefix):], jobID)
-	return key
+func validateExportCursorPositionForRange(pos exportCursorPosition, startKey, endKey []byte) error {
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag == exportCursorTagSkippedKey {
+		opts := ExportVersionsOptions{StartKey: startKey, EndKey: endKey}
+		if !exportSkippedCursorOutsideRange(opts, pos.key) {
+			return errors.WithStack(ErrInvalidExportCursor)
+		}
+		return nil
+	}
+	if startKey != nil && bytes.Compare(pos.key, startKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if endKey != nil && bytes.Compare(pos.key, endKey) >= 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return nil
+}
+
+func decodeExportCursorForOptions(opts ExportVersionsOptions) (exportCursorPosition, error) {
+	pos, err := decodeExportCursor(opts.Cursor)
+	if err != nil {
+		return exportCursorPosition{}, err
+	}
+	if err := validateExportCursorRange(opts, pos); err != nil {
+		return exportCursorPosition{}, err
+	}
+	return pos, nil
+}
+
+func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosition) error {
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag == exportCursorTagSkippedKey {
+		if !exportSkippedCursorOutsideRange(opts, pos.key) {
+			return errors.WithStack(ErrInvalidExportCursor)
+		}
+		return nil
+	}
+	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if opts.EndKey != nil && bytes.Compare(pos.key, opts.EndKey) >= 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return nil
+}
+
+func exportSkippedCursorOutsideRange(opts ExportVersionsOptions, key []byte) bool {
+	return (opts.StartKey != nil && bytes.Compare(key, opts.StartKey) < 0) ||
+		(opts.EndKey != nil && bytes.Compare(key, opts.EndKey) >= 0)
+}
+
+func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
+	if opts.EndKey != nil && len(opts.EndKey) == 0 {
+		opts.EndKey = nil
+	}
+	if exportUsesSparseScanBudget(opts) && opts.MaxScannedBytes == 0 {
+		opts.MaxScannedBytes = defaultSparseExportMaxScannedBytes
+	}
+	return opts
+}
+
+func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
+	return opts.AcceptKey != nil ||
+		opts.MaxCommitTSInclusive != 0 ||
+		opts.MinCommitTSExclusive != 0 ||
+		opts.StartKey != nil ||
+		opts.EndKey != nil
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return (len(rawKey) == len(migrationAckPrefix)+migrationAckKeyIDBytes && bytes.HasPrefix(rawKey, []byte(migrationAckPrefix))) ||
-		(len(rawKey) == len(migrationHLCFloorPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationHLCFloorPrefix))) ||
-		(len(rawKey) == len(migrationPromotePrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationPromotePrefix)))
+	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes)
 }
 
-func encodeMigrationImportAck(ack migrationImportAck) []byte {
-	buf := make([]byte, 0, migrationUint64Bytes+binary.MaxVarintLen64+len(ack.cursor))
-	buf = binary.BigEndian.AppendUint64(buf, ack.batchSeq)
-	buf = binary.AppendUvarint(buf, lenAsUint64(len(ack.cursor)))
-	buf = append(buf, ack.cursor...)
+func encodeMigrationImportAcks(acks map[migrationAckID]migrationImportAck) []byte {
+	ids := make([]migrationAckID, 0, len(acks))
+	for id := range acks {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if ids[i].jobID != ids[j].jobID {
+			return ids[i].jobID < ids[j].jobID
+		}
+		return ids[i].bracketID < ids[j].bracketID
+	})
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(ids)*(3*migrationUint64Bytes+binary.MaxVarintLen64))
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(ids)))
+	for _, id := range ids {
+		ack := acks[id]
+		buf = binary.BigEndian.AppendUint64(buf, id.jobID)
+		buf = binary.BigEndian.AppendUint64(buf, id.bracketID)
+		buf = binary.BigEndian.AppendUint64(buf, ack.batchSeq)
+		buf = binary.AppendUvarint(buf, lenAsUint64(len(ack.cursor)))
+		buf = append(buf, ack.cursor...)
+	}
 	return buf
 }
 
-func decodeMigrationImportAck(data []byte) (migrationImportAck, bool) {
-	if len(data) < migrationUint64Bytes {
-		return migrationImportAck{}, false
+func decodeMigrationImportAcks(data []byte) (map[migrationAckID]migrationImportAck, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
 	}
-	ack := migrationImportAck{batchSeq: binary.BigEndian.Uint64(data[:migrationUint64Bytes])}
-	cursorLen, n := binary.Uvarint(data[migrationUint64Bytes:])
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
 	if n <= 0 {
-		return migrationImportAck{}, false
+		return nil, false
 	}
-	rest := data[migrationUint64Bytes+n:]
-	if cursorLen != lenAsUint64(len(rest)) {
-		return migrationImportAck{}, false
+	rest = rest[n:]
+	acks := make(map[migrationAckID]migrationImportAck)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < 3*migrationUint64Bytes {
+			return nil, false
+		}
+		id := migrationAckID{
+			jobID:     binary.BigEndian.Uint64(rest[:migrationUint64Bytes]),
+			bracketID: binary.BigEndian.Uint64(rest[migrationUint64Bytes : 2*migrationUint64Bytes]),
+		}
+		ack := migrationImportAck{batchSeq: binary.BigEndian.Uint64(rest[2*migrationUint64Bytes : 3*migrationUint64Bytes])}
+		rest = rest[3*migrationUint64Bytes:]
+		cursorLen, n := binary.Uvarint(rest)
+		if n <= 0 {
+			return nil, false
+		}
+		rest = rest[n:]
+		if cursorLen > lenAsUint64(len(rest)) {
+			return nil, false
+		}
+		ack.cursor = bytes.Clone(rest[:cursorLen])
+		rest = rest[cursorLen:]
+		acks[id] = ack
 	}
-	ack.cursor = bytes.Clone(rest)
-	return ack, true
+	return acks, len(rest) == 0
+}
+
+func encodeMigrationHLCFloors(floors map[uint64]uint64) []byte {
+	jobIDs := make([]uint64, 0, len(floors))
+	for jobID := range floors {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(jobIDs)*2*migrationUint64Bytes)
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(jobIDs)))
+	for _, jobID := range jobIDs {
+		buf = binary.BigEndian.AppendUint64(buf, jobID)
+		buf = binary.BigEndian.AppendUint64(buf, floors[jobID])
+	}
+	return buf
+}
+
+func decodeMigrationHLCFloors(data []byte) (map[uint64]uint64, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
+	}
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return nil, false
+	}
+	rest = rest[n:]
+	floors := make(map[uint64]uint64)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < 2*migrationUint64Bytes {
+			return nil, false
+		}
+		jobID := binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		floor := binary.BigEndian.Uint64(rest[migrationUint64Bytes : 2*migrationUint64Bytes])
+		rest = rest[2*migrationUint64Bytes:]
+		floors[jobID] = floor
+	}
+	return floors, len(rest) == 0
+}
+
+func encodeMigrationPromotionStates(states map[uint64]PromotionState) []byte {
+	jobIDs := make([]uint64, 0, len(states))
+	for jobID := range states {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(jobIDs)*(migrationUint64Bytes+binary.MaxVarintLen64))
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(jobIDs)))
+	for _, jobID := range jobIDs {
+		encoded := encodePromotionState(states[jobID])
+		buf = binary.BigEndian.AppendUint64(buf, jobID)
+		buf = binary.AppendUvarint(buf, lenAsUint64(len(encoded)))
+		buf = append(buf, encoded...)
+	}
+	return buf
+}
+
+func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
+	}
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return nil, false
+	}
+	rest = rest[n:]
+	states := make(map[uint64]PromotionState)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < migrationUint64Bytes {
+			return nil, false
+		}
+		jobID := binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		rest = rest[migrationUint64Bytes:]
+		stateLen, n := binary.Uvarint(rest)
+		if n <= 0 {
+			return nil, false
+		}
+		rest = rest[n:]
+		if stateLen > lenAsUint64(len(rest)) {
+			return nil, false
+		}
+		stateEnd := int(stateLen) //nolint:gosec // bounded by len(rest) above.
+		state, ok := decodePromotionState(rest[:stateEnd])
+		if !ok {
+			return nil, false
+		}
+		states[jobID] = state
+		rest = rest[stateEnd:]
+	}
+	return states, len(rest) == 0
 }
 
 func validateImportVersion(version MVCCVersion) error {
@@ -177,7 +409,8 @@ func validateNextImportBatch(existing migrationImportAck, hasExisting bool, batc
 }
 
 func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
-	pos, err := decodeExportCursor(opts.Cursor)
+	opts = normalizeExportVersionsOptions(opts)
+	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
 		return ExportVersionsResult{}, err
 	}
@@ -190,7 +423,7 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
-	if !s.seekMemoryExportStart(&it, opts.StartKey, pos.key) {
+	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
 		result.Done = true
 		return result, nil
 	}
@@ -240,9 +473,9 @@ func newExportVersionsResult(maxVersions int) ExportVersionsResult {
 	}
 }
 
-func (s *mvccStore) seekMemoryExportStart(it *treemap.Iterator, startKey, cursorKey []byte) bool {
-	if len(cursorKey) > 0 {
-		return seekForwardIteratorStart(s.tree, it, cursorKey)
+func (s *mvccStore) seekMemoryExportStart(it *treemap.Iterator, startKey []byte, pos exportCursorPosition) bool {
+	if pos.hasKey {
+		return seekForwardIteratorStart(s.tree, it, pos.key)
 	}
 	return seekForwardIteratorStart(s.tree, it, startKey)
 }
@@ -256,8 +489,11 @@ func exportMemoryIteratorKey(
 	result *ExportVersionsResult,
 ) (bool, error) {
 	versions, _ := value.([]VersionedValue)
+	if pos.hasKey && pos.tag == exportCursorTagPrunedKey && bytes.Equal(key, pos.key) {
+		return true, nil
+	}
 	cursorCommitTS := uint64(0)
-	if len(pos.key) > 0 && bytes.Equal(key, pos.key) {
+	if pos.hasKey && bytes.Equal(key, pos.key) {
 		cursorCommitTS = pos.commitTS
 	}
 	return exportMemoryVersionsForKey(ctx, opts, cursorCommitTS, key, versions, result)
@@ -270,6 +506,9 @@ func finishExportIfLimited(opts ExportVersionsOptions, result *ExportVersionsRes
 }
 
 func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version VersionedValue, result *ExportVersionsResult) byte {
+	if shouldSkipMigrationExportKey(key) {
+		return exportCursorTagScanned
+	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
 		return exportCursorTagScanned
 	}
@@ -287,6 +526,10 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 	result.ExportedBytes += versionExportSize(key, len(version.Value))
 	result.AcceptedRows++
 	return exportCursorTagEmitted
+}
+
+func shouldSkipMigrationExportKey(key []byte) bool {
+	return bytes.HasPrefix(key, txnLockKeyPrefix)
 }
 
 func finishMemoryExportPosition(opts ExportVersionsOptions, key []byte, version VersionedValue, tag byte, result *ExportVersionsResult) bool {
@@ -307,9 +550,6 @@ func exportMemoryVersion(opts ExportVersionsOptions, cursorCommitTS uint64, key 
 	if shouldSkipMemoryVersion(cursorCommitTS, version) {
 		return true
 	}
-	if version.TS <= opts.MinCommitTSExclusive {
-		return false
-	}
 	tag := appendMemoryExportVersion(opts, key, version, result)
 	return finishMemoryExportPosition(opts, key, version, tag, result)
 }
@@ -326,6 +566,15 @@ func exportMemoryVersionsForKey(
 		if err := ctx.Err(); err != nil {
 			return false, errors.WithStack(err)
 		}
+		if shouldSkipMemoryVersion(cursorCommitTS, versions[i]) {
+			continue
+		}
+		if versions[i].TS <= opts.MinCommitTSExclusive {
+			if !finishMemoryExportPosition(opts, key, versions[i], exportCursorTagPrunedKey, result) {
+				return false, nil
+			}
+			return true, nil
+		}
 		if !exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result) {
 			return !finishExportIfLimited(opts, result), nil
 		}
@@ -340,8 +589,8 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	key := string(migrationAckKey(opts.JobID, opts.BracketID))
-	existing, hasExisting := s.migrationAcks[key]
+	id := migrationAckID{jobID: opts.JobID, bracketID: opts.BracketID}
+	existing, hasExisting := s.migrationAcks[id]
 	duplicate, err := validateNextImportBatch(existing, hasExisting, opts.BatchSeq)
 	if err != nil {
 		return ImportVersionsResult{}, err
@@ -370,8 +619,12 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	if batchMax > s.migrationHLCFloors[opts.JobID] {
 		s.migrationHLCFloors[opts.JobID] = batchMax
 	}
-	s.migrationAcks[key] = migrationImportAck{batchSeq: opts.BatchSeq, cursor: bytes.Clone(opts.Cursor)}
+	s.migrationAcks[id] = migrationImportAck{batchSeq: opts.BatchSeq, cursor: bytes.Clone(opts.Cursor)}
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
+}
+
+func (s *mvccStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.ImportVersions(ctx, opts)
 }
 
 func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {

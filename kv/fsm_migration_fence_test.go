@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -22,6 +23,34 @@ func newWriteFencedFSM(t *testing.T) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
+func newWriteFloorFSM(t *testing.T) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+	})
+	return newComposed1FSM(t, engine, 1)
+}
+
+func s3BucketAuxiliaryFenceRoutes(bucket string, rawGroupID, fencedGroupID uint64) []distribution.RouteDescriptor {
+	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	end := prefixScanEnd(start)
+	return []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: start, GroupID: rawGroupID, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: start, End: end, GroupID: fencedGroupID, State: distribution.RouteStateWriteFenced},
+		{RouteID: 3, Start: end, End: nil, GroupID: rawGroupID, State: distribution.RouteStateActive},
+	}
+}
+
+func newS3BucketAuxiliaryWriteFencedFSM(t *testing.T, bucket string) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, s3BucketAuxiliaryFenceRoutes(bucket, 1, 1))
+	return newComposed1FSM(t, engine, 1)
+}
+
 func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -33,6 +62,27 @@ func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 
 	_, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	fsm := newS3BucketAuxiliaryWriteFencedFSM(t, bucket)
+
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		err := fsm.handleRawRequest(ctx, &pb.Request{
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
+		}, 10)
+		require.ErrorIs(t, err, ErrRouteWriteFenced)
+
+		_, getErr := fsm.store.GetAt(ctx, key, ^uint64(0))
+		require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+	}
 }
 
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
@@ -111,4 +161,87 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	}
 	err := fsm.handleTxnRequest(ctx, abort, 11)
 	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
+}
+
+func TestFSMAllowsRawPointWriteAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("replayed")}},
+	}, 100)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("replayed"), got)
+}
+
+func TestFSMAllowsDelPrefixAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	require.NoError(t, fsm.store.PutAt(ctx, []byte("z"), []byte("v"), 10, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
+	}, 100)
+	require.NoError(t, err)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMAllowsOnePhaseTxnAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	req := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+		},
+	}
+	err := fsm.handleTxnRequest(ctx, req, 100)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("low"), got)
+}
+
+func TestFSMAllowsCommitAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newWriteFloorFSM(t)
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}
+	require.NoError(t, fsm.handleTxnRequest(ctx, prepare, 90))
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    90,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+		},
+	}
+	err := fsm.handleTxnRequest(ctx, commit, 100)
+	require.NoError(t, err)
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
 }

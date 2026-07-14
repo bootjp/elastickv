@@ -80,6 +80,17 @@ func ParseBucketMetaKey(key []byte) (string, bool) {
 	return string(segment), true
 }
 
+func ParseBucketGenerationKey(key []byte) (string, bool) {
+	if !bytes.HasPrefix(key, bucketGenerationPrefixBytes) {
+		return "", false
+	}
+	segment, next, ok := decodeSegment(key, len(bucketGenerationPrefixBytes))
+	if !ok || next != len(key) {
+		return "", false
+	}
+	return string(segment), true
+}
+
 func ObjectManifestKey(bucket string, generation uint64, object string) []byte {
 	return buildObjectKey(objectManifestPrefixBytes, bucket, generation, object, "", 0, 0)
 }
@@ -225,6 +236,13 @@ func GCUploadPrefixForBucket(bucket string, generation uint64) []byte {
 
 func RoutePrefixForBucket(bucket string, generation uint64) []byte {
 	return bucketScopedPrefix(routePrefixBytes, bucket, generation)
+}
+
+func RoutePrefixForBucketAnyGeneration(bucket string) []byte {
+	out := make([]byte, 0, len(RoutePrefix)+len(bucket)+segmentEscapeOverhead)
+	out = append(out, routePrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	return out
 }
 
 func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {

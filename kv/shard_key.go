@@ -149,14 +149,13 @@ func dynamoRouteTableKey(tableSegment []byte) []byte {
 }
 
 func listRouteKey(key []byte) []byte {
-	switch {
-	case store.IsListMetaDeltaKey(key):
-		return store.ExtractListUserKeyFromDelta(key)
-	case store.IsListClaimKey(key):
-		return store.ExtractListUserKeyFromClaim(key)
-	default:
-		return nil
+	if userKey := store.ExtractListUserKeyFromDelta(key); userKey != nil {
+		return userKey
 	}
+	if userKey := store.ExtractListUserKeyFromClaim(key); userKey != nil {
+		return userKey
+	}
+	return nil
 }
 
 func hashRouteKey(key []byte) []byte {

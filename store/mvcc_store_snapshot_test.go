@@ -56,6 +56,95 @@ func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 	require.ErrorIs(t, st.Restore(bytes.NewReader(raw)), ErrInvalidChecksum)
 }
 
+func TestMVCCStore_RestoreClearsMigrationMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+	promoter, ok := any(st).(MigrationPromoter)
+	require.True(t, ok)
+	stateReader, ok := any(st).(MigrationPromotionStateReader)
+	require.True(t, ok)
+
+	prefix := []byte("stage|")
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, prefix), bytes.HasPrefix(staged, prefix)
+	}
+
+	require.NoError(t, st.PutAt(ctx, []byte("base"), []byte("v1"), 10, 0))
+
+	snap, err := st.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("stale"),
+		Versions:  []MVCCVersion{{Key: []byte("imported"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	floor, err := st.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+
+	require.NoError(t, st.PutAt(ctx, stage("stale"), []byte("old"), 70, 0))
+	promoted, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       7,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, promoted.Done)
+	state, ok, err := stateReader.MigrationPromotionState(ctx, 7)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, state.Done)
+
+	require.NoError(t, st.Restore(bytes.NewReader(raw)))
+	floor, err = st.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Zero(t, floor)
+	_, ok, err = stateReader.MigrationPromotionState(ctx, 7)
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, err = st.GetAt(ctx, []byte("imported"), 50)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	require.NoError(t, st.PutAt(ctx, stage("fresh"), []byte("new"), 80, 0))
+	promoted, err = promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       7,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, promoted.Done)
+	require.Equal(t, uint64(1), promoted.PromotedRows)
+	got, err := st.GetAt(ctx, []byte("fresh"), 80)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), got)
+
+	res, err := st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("imported"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("fresh"), res.AckedCursor)
+}
+
 func TestMVCCStore_ApplyMutations_WriteConflict(t *testing.T) {
 	t.Parallel()
 

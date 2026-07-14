@@ -7,6 +7,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,4 +67,12 @@ func TestApplyMigrationPromoteMovesStagedVersions(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Empty(t, left.Versions)
+}
+
+func TestApplyMigrationPromoteMalformedPayloadHalts(t *testing.T) {
+	t.Parallel()
+
+	fsm := &kvFSM{store: store.NewMVCCStore()}
+	err := haltApplyOf(fsm.Apply([]byte{raftEncodeMigrationPromote, 0xff, 0xff}))
+	require.True(t, errors.Is(err, ErrMigrationPromoteApply), "got %v", err)
 }
