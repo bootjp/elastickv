@@ -110,6 +110,9 @@ func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosit
 }
 
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
+	if opts.EndKey != nil && len(opts.EndKey) == 0 {
+		opts.EndKey = nil
+	}
 	if exportUsesSparseScanBudget(opts) && opts.MaxScannedBytes == 0 {
 		opts.MaxScannedBytes = defaultSparseExportMaxScannedBytes
 	}

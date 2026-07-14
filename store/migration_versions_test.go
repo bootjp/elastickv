@@ -305,6 +305,63 @@ func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
 	})
 }
 
+func TestExportVersionsEmptyEndKeyIsUnbounded(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m-value"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("z-value"), 20, 0))
+
+		first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte{},
+			MaxVersions: 1,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 10, Value: []byte("m-value")}}, first.Versions)
+		require.NotEmpty(t, first.NextCursor)
+
+		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte{},
+			Cursor:      first.NextCursor,
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Empty(t, second.NextCursor)
+		require.Equal(t, []MVCCVersion{{Key: []byte("z"), CommitTS: 20, Value: []byte("z-value")}}, second.Versions)
+	})
+}
+
+func TestPebbleExportDoesNotStopBeforeTrailingEmptyKey(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-trailing-empty-key-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a-value"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("b-value"), 20, 0))
+	require.NoError(t, st.PutAt(ctx, nil, []byte("empty-value"), 30, 0))
+
+	res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:      []byte("aa"),
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, res.Done)
+	require.Len(t, res.Versions, 2)
+	require.Equal(t, []byte("a"), res.Versions[0].Key)
+	require.Equal(t, uint64(10), res.Versions[0].CommitTS)
+	require.Equal(t, []byte("a-value"), res.Versions[0].Value)
+	require.Empty(t, res.Versions[1].Key)
+	require.Equal(t, uint64(30), res.Versions[1].CommitTS)
+	require.Equal(t, []byte("empty-value"), res.Versions[1].Value)
+}
+
 func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -392,7 +449,49 @@ func TestPebbleExportSkipsWriterRegistryRowsWithoutUserVersions(t *testing.T) {
 	require.Zero(t, res.AcceptedRows)
 }
 
-func TestPebbleExportStopsAtEndKey(t *testing.T) {
+func TestPebbleExportDoesNotDropWriterRegistryPrefixUserKey(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-writer-registry-user-key-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	registryKey := encryption.RegistryKey(1, 2)
+	registry, err := WriterRegistryFor(st)
+	require.NoError(t, err)
+	require.NoError(t, registry.SetRegistryRow(
+		registryKey,
+		encryption.EncodeRegistryValue(encryption.RegistryValue{
+			FullNodeID:          2,
+			FirstSeenLocalEpoch: 1,
+			LastSeenLocalEpoch:  1,
+		}),
+	))
+	require.NoError(t, st.PutAt(ctx, registryKey, []byte("user-value"), 10, 0))
+
+	res, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+	require.NoError(t, err)
+	require.True(t, res.Done)
+	require.Equal(t, []MVCCVersion{{Key: registryKey, CommitTS: 10, Value: []byte("user-value")}}, res.Versions)
+}
+
+func TestPebbleExportAuthenticatesEncryptedTombstoneHeader(t *testing.T) {
+	ctx := context.Background()
+	f := newEncryptedStoreFixture(t, 81)
+	require.NoError(t, f.mvcc.PutAt(ctx, []byte("tampered-export"), []byte("payload"), 100, 0))
+	f.tamperPebbleValue(t, []byte("tampered-export"), 100, func(raw []byte) []byte {
+		raw[0] |= tombstoneMask
+		return raw
+	})
+
+	res, err := f.mvcc.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+	require.ErrorIs(t, err, ErrEncryptedReadIntegrity)
+	require.Empty(t, res.Versions)
+}
+
+func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-end-key-*")
 	require.NoError(t, err)
@@ -411,7 +510,8 @@ func TestPebbleExportStopsAtEndKey(t *testing.T) {
 
 	result := newExportVersionsResult(10)
 	advance, done, err := ps.exportPebbleIteratorPosition(ctx, iter, ExportVersionsOptions{
-		EndKey: []byte("b"),
+		StartKey: []byte("a"),
+		EndKey:   []byte("b"),
 	}, exportCursorPosition{}, &result)
 	require.ErrorIs(t, err, errExportReachedEnd)
 	require.False(t, advance)

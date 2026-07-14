@@ -5,7 +5,6 @@ import (
 	"context"
 	"math"
 
-	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -128,7 +127,7 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 }
 
 func isPebbleExportMetadataKey(rawKey []byte) bool {
-	return isPebbleMetaKey(rawKey) || bytes.HasPrefix(rawKey, encryption.WriterRegistryPrefix)
+	return isPebbleMetaKey(rawKey)
 }
 
 func (s *pebbleStore) skipPebbleExportKeyOutsideRange(iter *pebble.Iterator, opts ExportVersionsOptions, userKey []byte) (bool, error) {
@@ -175,9 +174,12 @@ func advancePebbleExportPastCurrentUserKey(iter *pebble.Iterator, userKey []byte
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
+	if len(startKey) == 0 {
+		return false
+	}
 	for prefixLen := 1; prefixLen <= len(userKey); prefixLen++ {
 		prefix := userKey[:prefixLen]
-		if (startKey == nil || bytes.Compare(prefix, startKey) >= 0) && bytes.Compare(prefix, endKey) < 0 {
+		if bytes.Compare(prefix, startKey) >= 0 && bytes.Compare(prefix, endKey) < 0 {
 			return false
 		}
 	}
@@ -232,14 +234,12 @@ func (s *pebbleStore) decodeExportedPebbleVersion(iter *pebble.Iterator, userKey
 	if err != nil {
 		return MVCCVersion{}, errors.WithStack(err)
 	}
-	var value []byte
+	value, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	if err != nil {
+		return MVCCVersion{}, err
+	}
 	if sv.Tombstone {
 		value = nil
-	} else {
-		value, err = s.decryptForKey(iter.Key(), sv, sv.Value)
-		if err != nil {
-			return MVCCVersion{}, err
-		}
 	}
 	return MVCCVersion{
 		Key:       bytes.Clone(userKey),
