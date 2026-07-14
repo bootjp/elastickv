@@ -92,13 +92,42 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 }
 
 // ValidateExportCursorForRange verifies that an export cursor decodes and
-// resumes inside the supplied key interval.
+// resumes inside the supplied key interval. Skipped-key cursors are accepted
+// only when they describe a key outside the interval.
 func ValidateExportCursorForRange(cursor, startKey, endKey []byte) error {
 	pos, err := decodeExportCursor(cursor)
 	if err != nil {
 		return err
 	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
+}
+
+// ValidatePromotionCursorForRange verifies a promotion cursor before it is
+// proposed to Raft. Promotion scans emit only accepted positions, so callers
+// must not resume from sparse-scan-only cursor tags.
+func ValidatePromotionCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
 	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag != exportCursorTagEmitted {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
+}
+
+func validateExportCursorPositionForRange(pos exportCursorPosition, startKey, endKey []byte) error {
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag == exportCursorTagSkippedKey {
+		opts := ExportVersionsOptions{StartKey: startKey, EndKey: endKey}
+		if !exportSkippedCursorOutsideRange(opts, pos.key) {
+			return errors.WithStack(ErrInvalidExportCursor)
+		}
 		return nil
 	}
 	if startKey != nil && bytes.Compare(pos.key, startKey) < 0 {

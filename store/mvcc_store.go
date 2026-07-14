@@ -938,6 +938,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.minRetainedTS = minRetainedTS
 	s.migrationAcks = make(map[migrationAckID]migrationImportAck)
 	s.migrationHLCFloors = make(map[uint64]uint64)
+	s.migrationPromotions = make(map[uint64]PromotionState)
 	return nil
 }
 

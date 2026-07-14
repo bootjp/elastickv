@@ -405,6 +405,54 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 	})
 }
 
+func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateExportCursorForRange(
+		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.ErrorIs(t, err, ErrInvalidExportCursor)
+
+	err = ValidateExportCursorForRange(
+		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.NoError(t, err)
+}
+
+func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte("stage|")
+	key := []byte("stage|k")
+	for _, tc := range []struct {
+		name    string
+		cursor  []byte
+		wantErr bool
+	}{
+		{name: "empty cursor"},
+		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
+		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
+		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
+		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
+		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrInvalidExportCursor)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

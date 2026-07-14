@@ -253,7 +253,7 @@ func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
 
 func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
 	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
-	if err := store.ValidateExportCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
+	if err := store.ValidatePromotionCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
 		if errors.Is(err, store.ErrInvalidExportCursor) {
 			return errors.WithStack(status.Error(codes.InvalidArgument, store.ErrInvalidExportCursor.Error()))
 		}

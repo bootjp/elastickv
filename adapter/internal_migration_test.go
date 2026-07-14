@@ -60,6 +60,13 @@ type captureExportRangeVersionsStream struct {
 	responses []*pb.ExportRangeVersionsResponse
 }
 
+const (
+	testExportCursorTagEmitted byte = iota
+	testExportCursorTagScanned
+	testExportCursorTagPrunedKey
+	testExportCursorTagSkippedKey
+)
+
 func (s *captureExportRangeVersionsStream) Context() context.Context {
 	if s.ctx != nil {
 		return s.ctx
@@ -312,7 +319,19 @@ func TestInternalPromoteStagedVersionsRejectsInvalidCursorBeforePropose(t *testi
 		{name: "malformed cursor", cursor: []byte{0xff}},
 		{
 			name:   "cursor outside job staged prefix",
-			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(8, []byte("k")), 30, 0),
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(8, []byte("k")), 30, testExportCursorTagEmitted),
+		},
+		{
+			name:   "scanned cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 31, testExportCursorTagScanned),
+		},
+		{
+			name:   "pruned-key cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 32, testExportCursorTagPrunedKey),
+		},
+		{
+			name:   "skipped-key cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 33, testExportCursorTagSkippedKey),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
