@@ -831,7 +831,36 @@ func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index
 	if !ok {
 		return false
 	}
-	return verifyFSMSnapshotFileWithToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C, true) == nil
+	// Prewrite cleanup runs on the snapshot receive hot path before gRPC starts
+	// draining payload chunks. Only do a footer/token check here; full-payload
+	// CRC remains in the actual restore/open paths.
+	return fsmSnapshotFooterMatchesToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C) == nil
+}
+
+func fsmSnapshotFooterMatchesToken(path string, tokenCRC uint32) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return statFSMFileError(err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if info.Size() < fsmMinFileSize {
+		return errors.Wrapf(ErrFSMSnapshotTooSmall,
+			"file too small: %d bytes (minimum %d)", info.Size(), fsmMinFileSize)
+	}
+	footer, err := readFSMFooter(f, info.Size())
+	if err != nil {
+		return err
+	}
+	if footer != tokenCRC {
+		return errors.Wrapf(ErrFSMSnapshotTokenCRC,
+			"path=%s footer=%08x token=%08x", path, footer, tokenCRC)
+	}
+	return nil
 }
 
 func snapshotTokenFromSnapFile(snapDir, snapName string, term, index uint64) (snapshotToken, bool) {

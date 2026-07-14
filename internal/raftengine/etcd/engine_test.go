@@ -1748,6 +1748,40 @@ func TestWaitStartedTimeoutDoesNotCloseEngine(t *testing.T) {
 	}
 }
 
+func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
+	engine := &Engine{
+		doneCh:  make(chan struct{}),
+		closeCh: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type result struct {
+		engine *Engine
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		opened, err := waitForOpen(ctx, engine, false)
+		resultCh <- result{engine: opened, err: err}
+	}()
+
+	select {
+	case <-engine.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("canceled multi-node Open must close the engine before returning")
+	}
+	close(engine.doneCh)
+
+	select {
+	case got := <-resultCh:
+		require.Nil(t, got.engine)
+		require.ErrorIs(t, got.err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("waitForOpen did not return after Close completed")
+	}
+}
+
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)

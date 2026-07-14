@@ -1109,6 +1109,8 @@ func isRetryableTransactWriteError(err error) bool {
 }
 
 func isIgnorableTransactRaceError(err error) bool {
+	// Route fences reject before applying the write. They must be retried or
+	// propagated, not swallowed as "another worker already completed it".
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
 }
 

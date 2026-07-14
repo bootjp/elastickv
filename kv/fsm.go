@@ -886,9 +886,6 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, 
 			}
 			continue
 		}
-		if len(mut.Key) == 0 {
-			continue
-		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {
 			return errors.Wrapf(ErrRouteWriteFenced,

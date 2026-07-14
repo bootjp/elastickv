@@ -446,6 +446,30 @@ func TestPrepareFSMSnapshotWriteKeepsTokenMatchingFallbackPair(t *testing.T) {
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
 }
 
+func TestPrewriteRestorableCheckUsesSnapshotFooterOnly(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	crc, path := writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc)
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte("X"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.True(t, fsmSnapshotPairRestorable(
+		snapDir,
+		fsmSnapDir,
+		"0000000000000001-0000000000000064.snap",
+		1,
+		100,
+	))
+	require.ErrorIs(t, verifyFSMSnapshotFile(path, crc), ErrFSMSnapshotFileCRC)
+}
+
 func TestPrepareFSMSnapshotWriteKeepsWALValidAndRestorableFallbacksWhenWALValidCandidateIsBroken(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()

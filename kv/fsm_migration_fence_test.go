@@ -21,6 +21,17 @@ func newWriteFencedFSM(t *testing.T) *kvFSM {
 	return newComposed1FSM(t, engine, 1)
 }
 
+func newFirstRouteWriteFencedFSM(t *testing.T) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateWriteFenced},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	return newComposed1FSM(t, engine, 1)
+}
+
 func s3BucketAuxiliaryFenceRoutes(bucket string, rawGroupID, fencedGroupID uint64) []distribution.RouteDescriptor {
 	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
 	end := prefixScanEnd(start)
@@ -45,6 +56,16 @@ func TestFSMRejectsCurrentWriteFencedRawPointWrite(t *testing.T) {
 	fsm := newWriteFencedFSM(t)
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMRejectsCurrentWriteFencedEmptyRawPointWrite(t *testing.T) {
+	t.Parallel()
+
+	fsm := newFirstRouteWriteFencedFSM(t)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(""), Value: []byte("v")}},
 	}, 10)
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
@@ -76,6 +97,31 @@ func TestFSMRejectsCurrentWriteFenceAfterObservedActiveRawPointWrite(t *testing.
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		ObservedRouteVersion: 1,
 		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMRejectsCurrentWriteFencedUnpinnedPrepare(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1, State: distribution.RouteStateWriteFenced},
+	})
+
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
 	}, 10)
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
