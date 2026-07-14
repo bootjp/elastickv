@@ -355,6 +355,92 @@ func TestShardStoreTargetReadinessUsesSingleCatalogSnapshotProof(t *testing.T) {
 	require.Equal(t, []byte("staged-new"), got)
 }
 
+func TestShardStoreDeletePrefixAtUsesReadinessProofRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("a"),
+			End:     []byte("z"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 80, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	err := shards.DeletePrefixAt(ctx, []byte("b"), nil, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("live"), got)
+}
+
+func TestShardStoreDeletePrefixAtUsesReadinessProofRouteForStagedCleanup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	stagedKey := distribution.MigrationStagedDataKey(9, []byte("b"))
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	require.NoError(t, shards.DeletePrefixAt(ctx, []byte("b"), nil, 130))
+
+	_, err := group.Store.GetAt(ctx, stagedKey, 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = shards.GetAt(ctx, []byte("b"), 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
 	t.Parallel()
 

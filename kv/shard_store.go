@@ -152,33 +152,41 @@ func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *Shard
 }
 
 func (s *ShardStore) targetReadyRouteForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) (distribution.Route, error) {
+	routes, err := s.targetReadyRoutesForRouteRange(ctx, g, route, routeStart, routeEnd)
+	if err != nil {
+		return route, err
+	}
+	if len(routes) == 1 {
+		return routes[0], nil
+	}
+	return route, nil
+}
+
+func (s *ShardStore) targetReadyRoutesForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
 	if g == nil || g.Store == nil {
-		return route, nil
+		return []distribution.Route{route}, nil
 	}
 	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
 	if !ok {
-		return route, nil
+		return []distribution.Route{route}, nil
 	}
 	states, err := reader.MigrationTargetReadinessStates(ctx)
 	if err != nil {
-		return route, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	applicable := targetReadinessApplicableStates(states, route, routeStart, routeEnd)
 	if len(applicable) == 0 {
-		return route, nil
+		return []distribution.Route{route}, nil
 	}
 
 	proofRoutes, catalogVersion, ok := s.readinessProofRoutes(route, routeStart, routeEnd)
 	if !ok {
-		return route, errors.WithStack(ErrRouteCutoverPending)
+		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
 	if !readinessProofSatisfiesStates(applicable, proofRoutes, route.GroupID, catalogVersion) {
-		return route, errors.WithStack(ErrRouteCutoverPending)
+		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
-	if len(proofRoutes) == 1 {
-		return proofRoutes[0], nil
-	}
-	return route, nil
+	return proofRoutes, nil
 }
 
 func targetReadinessApplicableStates(
@@ -2111,19 +2119,32 @@ func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte
 	if len(routes) == 0 {
 		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
+	verified := make([]distribution.Route, 0, len(routes))
 	for _, route := range routes {
 		g, ok := s.groupForID(route.GroupID)
 		if !ok || g == nil || g.Store == nil {
 			return nil, store.ErrNotSupported
 		}
-		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
+		proofRoutes, err := s.verifyPrefixDeleteRoute(ctx, g, route, routeStart, routeEnd, commitTS)
+		if err != nil {
 			return nil, err
 		}
-		if err := verifyRouteWriteFloor(route, commitTS); err != nil {
+		verified = append(verified, proofRoutes...)
+	}
+	return verified, nil
+}
+
+func (s *ShardStore) verifyPrefixDeleteRoute(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte, commitTS uint64) ([]distribution.Route, error) {
+	proofRoutes, err := s.targetReadyRoutesForRouteRange(ctx, g, route, routeStart, routeEnd)
+	if err != nil {
+		return nil, err
+	}
+	for _, proofRoute := range proofRoutes {
+		if err := verifyRouteWriteFloor(proofRoute, commitTS); err != nil {
 			return nil, err
 		}
 	}
-	return routes, nil
+	return proofRoutes, nil
 }
 
 func routesForGroupID(routes []distribution.Route, groupID uint64) []distribution.Route {

@@ -207,6 +207,28 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	}, nil
 }
 
+func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
+	if req == nil {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness request is nil"))
+	}
+	if req.GetJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness job_id is required"))
+	}
+	if req.GetMigrationJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.TargetStagedReadinessResponse{}, nil
+}
+
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 	if i.leader.State() != raftengine.StateLeader {
 		return errors.WithStack(ErrNotLeader)
@@ -263,6 +285,24 @@ func (i *Internal) proposeMigrationPromote(ctx context.Context, req *pb.PromoteS
 	default:
 		return store.PromoteVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration promote apply response type %T", resp))
 	}
+}
+
+func (i *Internal) proposeTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) error {
+	cmd, err := kv.MarshalTargetStagedReadinessCommand(req)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "target staged readiness")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if resp == nil {
+		return nil
+	}
+	if err, ok := resp.(error); ok {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(errors.Newf("unexpected target readiness apply response type %T", resp))
 }
 
 func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, label string) (any, error) {

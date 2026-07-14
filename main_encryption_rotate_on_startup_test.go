@@ -419,6 +419,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.RawKV_RawGet_FullMethodName,
 		pb.TransactionalKV_Get_FullMethodName,
 		pb.Internal_Forward_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
