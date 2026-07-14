@@ -507,6 +507,11 @@ func (s *LeaderRoutedStore) ExportVersions(ctx context.Context, opts store.Expor
 	if s == nil || s.local == nil {
 		return store.ExportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
 	}
+	if s.coordinator != nil {
+		if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
+			return store.ExportVersionsResult{}, errors.WithStack(err)
+		}
+	}
 	result, err := s.local.ExportVersions(ctx, opts)
 	return result, errors.WithStack(err)
 }
