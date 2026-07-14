@@ -124,10 +124,11 @@ func (s *mvccStore) promotionStateAndCursorLocked(opts PromoteVersionsOptions) (
 	if opts.JobID == 0 {
 		return PromotionState{}, opts.Cursor
 	}
-	state := clonePromotionState(s.migrationPromotions[opts.JobID])
-	if len(state.Cursor) == 0 {
-		return state, opts.Cursor
+	state, ok := s.migrationPromotions[opts.JobID]
+	if !ok {
+		return PromotionState{}, nil
 	}
+	state = clonePromotionState(state)
 	return state, state.Cursor
 }
 
@@ -318,8 +319,8 @@ func (s *pebbleStore) pebblePromotionStateAndCursor(opts PromoteVersionsOptions)
 	if err != nil {
 		return PromotionState{}, nil, err
 	}
-	if !ok || len(state.Cursor) == 0 {
-		return state, opts.Cursor, nil
+	if !ok {
+		return PromotionState{}, nil, nil
 	}
 	return state, state.Cursor, nil
 }

@@ -934,6 +934,62 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 	})
 }
 
+func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		promoter, ok := st.(MigrationPromoter)
+		require.True(t, ok)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+
+		stage := func(raw string) []byte {
+			return append([]byte("stage|"), []byte(raw)...)
+		}
+		targetKey := func(staged []byte) ([]byte, bool) {
+			return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+		}
+		prefix := []byte("stage|")
+
+		require.NoError(t, st.PutAt(ctx, stage("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, stage("z"), []byte("z20"), 20, 0))
+		staleCursor := encodeExportCursor(stage("m"), 1, exportCursorTagEmitted)
+
+		result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       202,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			Cursor:      staleCursor,
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, result.Done)
+		require.Equal(t, uint64(2), result.PromotedRows)
+		require.Equal(t, uint64(2), result.TotalPromotedRows)
+
+		state, ok, err := stateReader.MigrationPromotionState(ctx, 202)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Equal(t, uint64(2), state.PromotedRows)
+
+		got, err := st.GetAt(ctx, []byte("a"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("a10"), got)
+		got, err = st.GetAt(ctx, []byte("z"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("z20"), got)
+		stagedLeft, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, stagedLeft.Done)
+		require.Empty(t, stagedLeft.Versions)
+	})
+}
+
 func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
