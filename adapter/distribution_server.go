@@ -225,7 +225,7 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	}
 	nextRouteID := right.RouteID + 1
 
-	ops, err := buildCatalogSplitOps(parentID, left, right, nextVersion, nextRouteID)
+	ops, err := buildCatalogSplitOps(parentID, left, right, nextVersion, nextRouteID, s.catalog.AllowsRouteDescriptorV2Writes())
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
@@ -245,6 +245,7 @@ func buildCatalogSplitOps(
 	right distribution.RouteDescriptor,
 	nextVersion uint64,
 	nextRouteID uint64,
+	allowRouteDescriptorV2Writes bool,
 ) ([]*kv.Elem[kv.OP], error) {
 	// SplitRange mutates the catalog surgically: delete one parent route, add two
 	// children, bump the version, and advance the next-route-id counter.
@@ -254,7 +255,7 @@ func buildCatalogSplitOps(
 		Key: distribution.CatalogRouteKey(parentID),
 	})
 	for _, route := range []distribution.RouteDescriptor{left, right} {
-		encoded, err := distribution.EncodeRouteDescriptor(route)
+		encoded, err := distribution.EncodeRouteDescriptorForCatalogWrite(route, allowRouteDescriptorV2Writes)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -450,20 +451,26 @@ func splitCatalogRoutes(
 ) (distribution.RouteDescriptor, distribution.RouteDescriptor) {
 	// parent and splitKey are already cloned before this point and are immutable here.
 	left := distribution.RouteDescriptor{
-		RouteID:       leftID,
-		Start:         parent.Start,
-		End:           splitKey,
-		GroupID:       parent.GroupID,
-		State:         parent.State,
-		ParentRouteID: parent.RouteID,
+		RouteID:                leftID,
+		Start:                  parent.Start,
+		End:                    splitKey,
+		GroupID:                parent.GroupID,
+		State:                  parent.State,
+		ParentRouteID:          parent.RouteID,
+		StagedVisibilityActive: parent.StagedVisibilityActive,
+		MigrationJobID:         parent.MigrationJobID,
+		MinWriteTSExclusive:    parent.MinWriteTSExclusive,
 	}
 	right := distribution.RouteDescriptor{
-		RouteID:       rightID,
-		Start:         splitKey,
-		End:           parent.End,
-		GroupID:       parent.GroupID,
-		State:         parent.State,
-		ParentRouteID: parent.RouteID,
+		RouteID:                rightID,
+		Start:                  splitKey,
+		End:                    parent.End,
+		GroupID:                parent.GroupID,
+		State:                  parent.State,
+		ParentRouteID:          parent.RouteID,
+		StagedVisibilityActive: parent.StagedVisibilityActive,
+		MigrationJobID:         parent.MigrationJobID,
+		MinWriteTSExclusive:    parent.MinWriteTSExclusive,
 	}
 	return left, right
 }

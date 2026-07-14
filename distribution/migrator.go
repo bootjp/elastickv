@@ -51,6 +51,7 @@ const (
 	MigrationFamilyS3UploadPart
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
+	MigrationFamilyLegacyListMetaDelta
 )
 
 const (
@@ -105,6 +106,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(migrationTxnSuccessPrefix),
 	[]byte(migrationTxnMetaPrefix),
 	[]byte(store.ListMetaDeltaPrefix),
+	[]byte(store.LegacyListMetaDeltaPrefix),
 	[]byte(store.ListClaimPrefix),
 	[]byte(store.ListMetaPrefix),
 	[]byte(store.ListItemPrefix),
@@ -226,15 +228,74 @@ func (b MigrationBracket) ContainsRawKey(rawKey []byte) bool {
 	return !hasAnyPrefix(rawKey, b.ExcludePrefixes)
 }
 
+// ContainsRoutedKey applies both the bracket's raw family interval and its
+// route ownership predicate. S3 bucket-level auxiliary rows do not encode an
+// object route key, so they are matched by bucket route-prefix intersection.
+func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte, routeKey func([]byte) []byte) bool {
+	if !b.ContainsRawKey(rawKey) {
+		return false
+	}
+	routeEnd = normalizeMigrationRouteEnd(routeEnd)
+	if b.RequiresDecodedS3 {
+		return b.containsDecodedS3Route(rawKey, routeStart, routeEnd)
+	}
+	if b.Family == MigrationFamilyLegacyListMetaDelta {
+		return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd)
+	}
+	if !b.RequiresRouteKeyCheck {
+		return true
+	}
+	if routeKey == nil {
+		return false
+	}
+	return routeKeyInRange(routeKey(rawKey), routeStart, routeEnd)
+}
+
 func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {
 	switch b.Family {
 	case MigrationFamilyListMetaDelta:
 		return store.ExtractListUserKeyFromDelta(rawKey) != nil
+	case MigrationFamilyLegacyListMetaDelta:
+		return store.ExtractLegacyListUserKeyFromDelta(rawKey) != nil
 	case MigrationFamilyListMeta:
-		return store.ExtractListUserKeyFromDelta(rawKey) == nil
+		return store.ExtractListUserKeyFromDelta(rawKey) == nil &&
+			store.ExtractLegacyListUserKeyFromDelta(rawKey) == nil
 	default:
 		return true
 	}
+}
+
+func (b MigrationBracket) containsDecodedS3Route(rawKey, routeStart, routeEnd []byte) bool {
+	bucket, ok := b.decodedS3Bucket(rawKey)
+	if !ok {
+		return false
+	}
+	if routeKeyInRange(rawKey, routeStart, routeEnd) {
+		return true
+	}
+	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+}
+
+func (b MigrationBracket) decodedS3Bucket(rawKey []byte) (string, bool) {
+	switch b.Family {
+	case MigrationFamilyS3BucketMeta:
+		return s3keys.ParseBucketMetaKey(rawKey)
+	case MigrationFamilyS3BucketGeneration:
+		return s3keys.ParseBucketGenerationKey(rawKey)
+	default:
+		return "", false
+	}
+}
+
+func routeKeyInRange(routeKey, routeStart, routeEnd []byte) bool {
+	if routeKey == nil {
+		return false
+	}
+	if bytes.Compare(routeKey, routeStart) < 0 {
+		return false
+	}
+	return len(routeEnd) == 0 || bytes.Compare(routeKey, routeEnd) < 0
 }
 
 // InitializeSplitJobPlan validates the source route and seeds the job's
@@ -244,7 +305,7 @@ func InitializeSplitJobPlan(job SplitJob, source RouteDescriptor, nowMs int64) (
 		return SplitJob{}, err
 	}
 	routeStart := CloneBytes(job.SplitKey)
-	routeEnd := CloneBytes(source.End)
+	routeEnd := CloneBytes(normalizeMigrationRouteEnd(source.End))
 	brackets, err := PlanExportBrackets(routeStart, routeEnd)
 	if err != nil {
 		return SplitJob{}, err
@@ -327,6 +388,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyTxnSuccess, prefix: migrationTxnSuccessPrefix},
 		{family: MigrationFamilyTxnMeta, prefix: migrationTxnMetaPrefix},
 		{family: MigrationFamilyListMetaDelta, prefix: store.ListMetaDeltaPrefix},
+		{family: MigrationFamilyLegacyListMetaDelta, prefix: store.LegacyListMetaDeltaPrefix},
 		{family: MigrationFamilyListClaim, prefix: store.ListClaimPrefix},
 		{family: MigrationFamilyListMeta, prefix: store.ListMetaPrefix},
 		{family: MigrationFamilyListItem, prefix: store.ListItemPrefix},

@@ -86,6 +86,61 @@ func TestNewEngineWithDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestEngineApplySnapshot_PreservesMigrationRouteFields(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{
+				RouteID:                7,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                2,
+				State:                  RouteStateMigratingTarget,
+				StagedVisibilityActive: true,
+				MigrationJobID:         42,
+				MinWriteTSExclusive:    99,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	route, ok := e.GetRoute([]byte("m"))
+	if !ok {
+		t.Fatal("expected route")
+	}
+	requireMigrationRouteFields(t, "GetRoute", route)
+
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat route, got %d", len(stats))
+	}
+	requireMigrationRouteFields(t, "Stats", stats[0])
+
+	intersections := e.GetIntersectingRoutes([]byte("b"), []byte("c"))
+	if len(intersections) != 1 {
+		t.Fatalf("expected 1 intersecting route, got %d", len(intersections))
+	}
+	requireMigrationRouteFields(t, "GetIntersectingRoutes", intersections[0])
+}
+
+func requireMigrationRouteFields(t *testing.T, label string, route Route) {
+	t.Helper()
+	if !route.StagedVisibilityActive {
+		t.Fatalf("%s lost staged visibility: %+v", label, route)
+	}
+	if route.MigrationJobID != 42 {
+		t.Fatalf("%s lost migration job id: %+v", label, route)
+	}
+	if route.MinWriteTSExclusive != 99 {
+		t.Fatalf("%s lost min write ts: %+v", label, route)
+	}
+}
+
 func TestEngineGetIntersectingRoutes(t *testing.T) {
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)

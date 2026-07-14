@@ -41,6 +41,32 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 	}
 }
 
+func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	server, st := newRedisStorageMigrationTestServer(t)
+	ctx := context.Background()
+	key := []byte("txn-legacy-list-delete")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	collidingMetaKey := store.ListMetaKey(deltaLookingListMetaUserKey(key))
+	require.NoError(t, st.PutAt(ctx, collidingMetaKey, collidingMeta, 2, 0))
+
+	deltaKey := legacyListMetaDeltaKey(key, 3)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, deltaKey, delta, 3, 0))
+
+	txn := newRedisTxnTestContext(server)
+	txn.startTS = 4
+	stState, err := txn.loadListState(key)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{deltaKey}, stState.existingDeltas)
+}
+
 func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 	for _, elem := range elems {
 		if elem != nil && string(elem.Key) == string(want) {

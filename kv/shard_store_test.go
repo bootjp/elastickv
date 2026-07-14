@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/s3keys"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -71,6 +72,82 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
+func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("x") // routes to group 2; raw !lst|* prefixes route to group 1.
+	for _, tc := range []struct {
+		name          string
+		key           []byte
+		scanStart     []byte
+		legacyRouting bool
+	}{
+		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTwoRouteShardStoreForScanTest()
+			deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+			if tc.legacyRouting {
+				require.NoError(t, st.groups[1].Store.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			} else {
+				require.NoError(t, st.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			}
+
+			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
+func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		key       []byte
+		scanStart []byte
+	}{
+		{name: "hash field", key: store.HashFieldKey([]byte("x"), []byte("f")), scanStart: store.HashFieldScanPrefix([]byte("x"))},
+		{name: "hash delta", key: store.HashMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.HashMetaDeltaScanPrefix([]byte("x"))},
+		{name: "set member", key: store.SetMemberKey([]byte("x"), []byte("m")), scanStart: store.SetMemberScanPrefix([]byte("x"))},
+		{name: "set delta", key: store.SetMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.SetMetaDeltaScanPrefix([]byte("x"))},
+		{name: "zset member", key: store.ZSetMemberKey([]byte("x"), []byte("m")), scanStart: store.ZSetMemberScanPrefix([]byte("x"))},
+		{name: "zset score", key: store.ZSetScoreKey([]byte("x"), 1.5, []byte("m")), scanStart: store.ZSetScoreScanPrefix([]byte("x"))},
+		{name: "zset delta", key: store.ZSetMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.ZSetMetaDeltaScanPrefix([]byte("x"))},
+		{name: "stream meta", key: store.StreamMetaKey([]byte("x")), scanStart: store.StreamMetaKey([]byte("x"))},
+		{name: "stream entry", key: store.StreamEntryKey([]byte("x"), 10, 0), scanStart: store.StreamEntryScanPrefix([]byte("x"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTwoRouteShardStoreForScanTest()
+			require.NoError(t, st.PutAt(ctx, tc.key, []byte("v"), 1, 0))
+
+			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
+func newTwoRouteShardStoreForScanTest() *ShardStore {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	return NewShardStore(engine, groups)
+}
+
 func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 
@@ -114,6 +191,267 @@ func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
 
 	_, err = st.GetAt(ctx, key, 7)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		getResp: &pb.RawGetResponse{
+			Exists: true,
+			Value:  []byte("remote-v"),
+		},
+		scanResp: &pb.RawScanAtResponse{},
+		latestResp: &pb.RawLatestCommitTSResponse{
+			Ts:     42,
+			Exists: true,
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {
+			Store:  store.NewMVCCStore(),
+			Engine: &stubFollowerEngine{leaderAddr: addr},
+		},
+	})
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	_, err := st.GetAtWithReadFence(ctx, []byte("k"), 10, 0, 77)
+	require.NoError(t, err)
+	_, _, err = st.LatestCommitTSWithReadFence(ctx, []byte("k"), 78)
+	require.NoError(t, err)
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 79, []byte("a"), []byte("m"))
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
+	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(79), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
+	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 80, []byte{}, []byte{})
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(80), fake.lastScanReq.GetReadRouteVersion())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 81, nil, nil)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(0), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(81), fake.lastScanReq.GetReadRouteVersion())
+	require.False(t, fake.lastScanReq.GetRouteBoundsPresent())
+}
+
+func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|x")
+	second := []byte("!redis|meta|y")
+	require.NoError(t, groups[2].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, first, kvs[0].Key)
+	require.Equal(t, second, kvs[1].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, true, 0, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, second, kvs[0].Key)
+	require.Equal(t, first, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_ScansSameGroupSuppliedBoundsAcrossRouteIntervals(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|a")
+	second := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, first, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, first, kvs[0].Key)
+	require.Equal(t, second, kvs[1].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, true, 0, 7, []byte("a"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, second, kvs[0].Key)
+	require.Equal(t, first, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersWideRedisKeysByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!hs|")
+	left := store.HashFieldKey([]byte("alpha"), []byte("f"))
+	right := store.HashFieldKey([]byte("zulu"), []byte("f"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, 7, []byte{}, []byte("m"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, left, kvs[0].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersSuppliedBoundsByRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, 7, []byte{}, []byte("m"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, left, kvs[0].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersByEachRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), []byte("z"), 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|b")
+	staleRightOnLeftGroup := []byte("!redis|meta|x")
+	right := []byte("!redis|meta|y")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, staleRightOnLeftGroup, []byte("stale"), 2, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, right, []byte("right"), 3, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 3, false, 0, 7, []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, left, kvs[0].Key)
+	require.Equal(t, right, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	_, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, 7, nil, nil)
+	require.ErrorIs(t, err, store.ErrNotSupported)
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, 7, []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
@@ -375,6 +713,19 @@ func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
 	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("d"), 2)
 	require.Equal(t, []byte("a"), lockStart)
 	require.Equal(t, nextScanCursor([]byte("c")), lockEnd)
+}
+
+func TestScanLockBoundsForKVsDirection_ReverseUsesReturnedWindow(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("z"), Value: []byte("vz")},
+		{Key: []byte("y"), Value: []byte("vy")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte("a"), []byte("zz"), 2, true)
+	require.Equal(t, []byte("y"), lockStart)
+	require.Equal(t, []byte("zz"), lockEnd)
 }
 
 func TestScanLockBoundsForKVs_PreservesOriginalStart(t *testing.T) {

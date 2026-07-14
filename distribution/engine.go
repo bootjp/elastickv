@@ -25,6 +25,12 @@ type Route struct {
 	GroupID uint64
 	// State tracks control-plane state for this route.
 	State RouteState
+	// StagedVisibilityActive allows serving reads to merge staged migration rows.
+	StagedVisibilityActive bool
+	// MigrationJobID identifies the active staged migration job.
+	MigrationJobID uint64
+	// MinWriteTSExclusive rejects writes at or below the migration cutover floor.
+	MinWriteTSExclusive uint64
 	// Load tracks the number of accesses served by this range.
 	Load uint64
 }
@@ -366,12 +372,15 @@ func (e *Engine) Stats() []Route {
 	stats := make([]Route, len(e.routes))
 	for i, r := range e.routes {
 		stats[i] = Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
+			RouteID:                r.RouteID,
+			Start:                  CloneBytes(r.Start),
+			End:                    CloneBytes(r.End),
+			GroupID:                r.GroupID,
+			State:                  r.State,
+			StagedVisibilityActive: r.StagedVisibilityActive,
+			MigrationJobID:         r.MigrationJobID,
+			MinWriteTSExclusive:    r.MinWriteTSExclusive,
+			Load:                   r.Load,
 		}
 	}
 	return stats
@@ -399,12 +408,15 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		}
 		// Route intersects with scan range
 		result = append(result, Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
+			RouteID:                r.RouteID,
+			Start:                  CloneBytes(r.Start),
+			End:                    CloneBytes(r.End),
+			GroupID:                r.GroupID,
+			State:                  r.State,
+			StagedVisibilityActive: r.StagedVisibilityActive,
+			MigrationJobID:         r.MigrationJobID,
+			MinWriteTSExclusive:    r.MinWriteTSExclusive,
+			Load:                   r.Load,
 		})
 	}
 	return result
@@ -454,12 +466,15 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		}
 		seen[rd.RouteID] = struct{}{}
 		out[i] = Route{
-			RouteID: rd.RouteID,
-			Start:   CloneBytes(rd.Start),
-			End:     CloneBytes(rd.End),
-			GroupID: rd.GroupID,
-			State:   rd.State,
-			Load:    0,
+			RouteID:                rd.RouteID,
+			Start:                  CloneBytes(rd.Start),
+			End:                    CloneBytes(rd.End),
+			GroupID:                rd.GroupID,
+			State:                  rd.State,
+			StagedVisibilityActive: rd.StagedVisibilityActive,
+			MigrationJobID:         rd.MigrationJobID,
+			MinWriteTSExclusive:    rd.MinWriteTSExclusive,
+			Load:                   0,
 		}
 	}
 

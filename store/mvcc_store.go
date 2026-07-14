@@ -65,7 +65,7 @@ type mvccStore struct {
 	log                *slog.Logger
 	lastCommitTS       uint64
 	minRetainedTS      uint64
-	migrationAcks      map[string]migrationImportAck
+	migrationAcks      map[migrationAckID]migrationImportAck
 	migrationHLCFloors map[uint64]uint64
 	// writeConflicts mirrors the per-(kind, key_prefix) counter from
 	// the pebble-backed store so the in-memory implementation shows up
@@ -113,7 +113,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		migrationAcks:      make(map[string]migrationImportAck),
+		migrationAcks:      make(map[migrationAckID]migrationImportAck),
 		migrationHLCFloors: make(map[uint64]uint64),
 		writeConflicts:     newWriteConflictCounter(),
 	}
@@ -934,6 +934,8 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.tree = tree
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
+	s.migrationAcks = make(map[migrationAckID]migrationImportAck)
+	s.migrationHLCFloors = make(map[uint64]uint64)
 	return nil
 }
 

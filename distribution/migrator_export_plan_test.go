@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -28,6 +29,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilyListMeta:                        store.ListMetaPrefix,
 		MigrationFamilyListItem:                        store.ListItemPrefix,
 		MigrationFamilyListMetaDelta:                   store.ListMetaDeltaPrefix,
+		MigrationFamilyLegacyListMetaDelta:             store.LegacyListMetaDeltaPrefix,
 		MigrationFamilyListClaim:                       store.ListClaimPrefix,
 		MigrationFamilyRedisLegacy:                     migrationRedisPrefix,
 		MigrationFamilyHash:                            migrationHashPrefix,
@@ -100,10 +102,17 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	listDelta := store.ListMetaDeltaKey([]byte("list"), 1, 0)
 	require.True(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listDelta))
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listDelta))
+	require.False(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(listDelta))
 
-	listMetaWithDeltaLookingUserKey := store.ListMetaKey([]byte("d|list"))
-	require.True(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
+	legacyListDelta := legacyListMetaDeltaKey([]byte("legacy-list"), 2, 0)
+	require.True(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(legacyListDelta))
+	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(legacyListDelta))
+	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(legacyListDelta))
+
+	listMetaWithDeltaLookingUserKey := store.ListMetaKey(deltaLookingListMetaUserKey([]byte("list"), 2, 0))
+	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
+	require.True(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(listMetaWithDeltaLookingUserKey))
 
 	partitionedSQS := []byte(migrationSQSMsgDataPrefix + migrationSQSPartitionedSuffix + "queue|0|1|msg")
 	require.True(t, byFamily[MigrationFamilySQSPartitionedMessageData].ContainsRawKey(partitionedSQS))
@@ -143,6 +152,147 @@ func TestPlanMigrationBracketsNormalizesEmptyRouteEnd(t *testing.T) {
 	user := bracketsByFamily(brackets)[MigrationFamilyUser]
 	require.Nil(t, user.End)
 	require.True(t, user.ContainsRawKey([]byte("z")))
+}
+
+func TestSplitJobPlanNormalizesEmptySourceRouteEnd(t *testing.T) {
+	t.Parallel()
+
+	source := RouteDescriptor{
+		RouteID: 9,
+		Start:   []byte("a"),
+		End:     []byte{},
+		GroupID: 3,
+		State:   RouteStateActive,
+	}
+	job := SplitJob{
+		JobID:         1,
+		SourceRouteID: source.RouteID,
+		SplitKey:      []byte("m"),
+		TargetGroupID: source.GroupID,
+		Phase:         SplitJobPhasePlanned,
+	}
+
+	planned, err := InitializeSplitJobPlan(job, source, 1000)
+	require.NoError(t, err)
+	for _, progress := range planned.BracketProgress {
+		if progress.Family != MigrationFamilyUser {
+			continue
+		}
+		require.False(t, progress.Done)
+		return
+	}
+	require.Fail(t, "missing user bracket progress")
+}
+
+func TestMigrationBracketContainsRoutedKeyForS3BucketAuxiliaryState(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	byFamily := bracketsByFamily(brackets)
+
+	routeStart := s3keys.RouteKey("bucket-b", 7, "a")
+	routeEnd := s3keys.RouteKey("bucket-b", 7, "z")
+	for _, tc := range []struct {
+		name   string
+		family uint32
+		key    []byte
+		want   bool
+	}{
+		{name: "meta same bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), want: true},
+		{name: "generation same bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), want: true},
+		{name: "meta different bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-c"), want: false},
+		{name: "generation different bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-c"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := byFamily[tc.family].ContainsRoutedKey(tc.key, routeStart, routeEnd, s3keys.ExtractRouteKey)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestMigrationBracketContainsRoutedKeyForS3BucketRawRoute(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	byFamily := bracketsByFamily(brackets)
+	routeStart := []byte("!s3|")
+
+	require.True(t, byFamily[MigrationFamilyS3BucketMeta].ContainsRoutedKey(
+		s3keys.BucketMetaKey("bucket-b"), routeStart, nil, s3keys.ExtractRouteKey,
+	))
+	require.True(t, byFamily[MigrationFamilyS3BucketGeneration].ContainsRoutedKey(
+		s3keys.BucketGenerationKey("bucket-b"), routeStart, nil, s3keys.ExtractRouteKey,
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyUsesObjectRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	manifest := bracketsByFamily(brackets)[MigrationFamilyS3ObjectManifest]
+
+	key := s3keys.ObjectManifestKey("bucket-b", 7, "m")
+	require.True(t, manifest.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+		s3keys.ExtractRouteKey,
+	))
+	require.False(t, manifest.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-c", 1, "a"),
+		nil,
+		s3keys.ExtractRouteKey,
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyAcceptsEmptyLogicalRouteKey(t *testing.T) {
+	t.Parallel()
+
+	routeEnd := []byte{0x01}
+	brackets, err := PlanMigrationBrackets(nil, routeEnd)
+	require.NoError(t, err)
+	hash := bracketsByFamily(brackets)[MigrationFamilyHash]
+	rawKey := store.HashMetaKey(nil)
+
+	require.True(t, hash.ContainsRoutedKey(
+		rawKey,
+		nil,
+		routeEnd,
+		store.ExtractHashUserKeyFromMeta,
+	))
+	require.False(t, hash.ContainsRoutedKey(
+		rawKey,
+		nil,
+		routeEnd,
+		func([]byte) []byte { return nil },
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyUsesLegacyListDeltaUserKey(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("a"), []byte("z"))
+	require.NoError(t, err)
+	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
+	raw := legacyListMetaDeltaKey([]byte("target-list"), 10, 0)
+
+	require.True(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("target"),
+		[]byte("target-list\x00"),
+		store.ExtractListUserKey,
+	))
+	require.False(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("zzz"),
+		nil,
+		store.ExtractListUserKey,
+	))
 }
 
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
@@ -252,4 +402,29 @@ func bracketsByFamily(brackets []MigrationBracket) map[uint32]MigrationBracket {
 		out[bracket.Family] = bracket
 	}
 	return out
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }

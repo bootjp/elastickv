@@ -71,6 +71,10 @@ func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) string {
 }
 
 func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	return s.proxyRawGetWithReadFence(ctx, key, ts, 0)
+}
+
+func (s *LeaderRoutedStore) proxyRawGetWithReadFence(ctx context.Context, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
 	addr := s.leaderAddrForKey(key)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
@@ -82,7 +86,7 @@ func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint
 	}
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
+	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, ReadRouteVersion: readRouteVersion})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -94,7 +98,26 @@ func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint
 	return resp.Value, nil
 }
 
+func (s *LeaderRoutedStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	if s == nil || s.local == nil {
+		return nil, store.ErrKeyNotFound
+	}
+	if groupID != 0 {
+		return nil, store.ErrNotSupported
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, key)
+	if ok {
+		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
+		return val, errors.WithStack(err)
+	}
+	return s.proxyRawGetWithReadFence(ctx, key, ts, readRouteVersion)
+}
+
 func (s *LeaderRoutedStore) proxyRawLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	return s.proxyRawLatestCommitTSWithReadFence(ctx, key, 0)
+}
+
+func (s *LeaderRoutedStore) proxyRawLatestCommitTSWithReadFence(ctx context.Context, key []byte, readRouteVersion uint64) (uint64, bool, error) {
 	addr := s.leaderAddrForKey(key)
 	if addr == "" {
 		return 0, false, errors.WithStack(ErrLeaderNotFound)
@@ -106,11 +129,22 @@ func (s *LeaderRoutedStore) proxyRawLatestCommitTS(ctx context.Context, key []by
 	}
 
 	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key})
+	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key, ReadRouteVersion: readRouteVersion})
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
 	return resp.Ts, resp.Exists, nil
+}
+
+func (s *LeaderRoutedStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte, readRouteVersion uint64) (uint64, bool, error) {
+	if s == nil || s.local == nil {
+		return 0, false, nil
+	}
+	if s.leaderOKForKey(ctx, key) {
+		ts, exists, err := s.local.LatestCommitTS(ctx, key)
+		return ts, exists, errors.WithStack(err)
+	}
+	return s.proxyRawLatestCommitTSWithReadFence(ctx, key, readRouteVersion)
 }
 
 func (s *LeaderRoutedStore) proxyRawScanAt(
@@ -120,6 +154,20 @@ func (s *LeaderRoutedStore) proxyRawScanAt(
 	limit int,
 	ts uint64,
 	reverse bool,
+) ([]*store.KVPair, error) {
+	return s.proxyRawScanAtWithReadFence(ctx, start, end, limit, ts, reverse, 0, nil, nil)
+}
+
+func (s *LeaderRoutedStore) proxyRawScanAtWithReadFence(
+	ctx context.Context,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
 ) ([]*store.KVPair, error) {
 	addr := s.leaderAddrForKey(start)
 	if addr == "" {
@@ -133,11 +181,15 @@ func (s *LeaderRoutedStore) proxyRawScanAt(
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey: start,
-		EndKey:   end,
-		Limit:    int64(limit),
-		Ts:       ts,
-		Reverse:  reverse,
+		StartKey:           start,
+		EndKey:             end,
+		Limit:              int64(limit),
+		Ts:                 ts,
+		Reverse:            reverse,
+		ReadRouteVersion:   readRouteVersion,
+		RouteStart:         bytes.Clone(routeStart),
+		RouteEnd:           bytes.Clone(routeEnd),
+		RouteBoundsPresent: routeScanBoundsPresent(routeStart, routeEnd),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -149,6 +201,63 @@ func (s *LeaderRoutedStore) proxyRawScanAt(
 			Key:   bytes.Clone(kvp.Key),
 			Value: bytes.Clone(kvp.Value),
 		})
+	}
+	return out, nil
+}
+
+func (s *LeaderRoutedStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if s == nil || s.local == nil {
+		return []*store.KVPair{}, nil
+	}
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	if groupID != 0 {
+		return nil, store.ErrNotSupported
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if !ok {
+		return s.proxyRawScanAtWithReadFence(ctx, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
+	}
+	readTS := max(ts, fenceTS)
+	if routeScanBoundsPresent(routeStart, routeEnd) {
+		return s.scanLocalRouteFilteredAt(ctx, start, end, limit, readTS, reverse, routeStart, routeEnd)
+	}
+	if reverse {
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, readTS)
+		return kvs, errors.WithStack(err)
+	}
+	kvs, err := s.local.ScanAt(ctx, start, end, limit, readTS)
+	return kvs, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) scanLocalRouteFilteredAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, min(limit, routeFilteredScanBatchMin))
+	scanStart := start
+	scanEnd := end
+	for len(out) < limit {
+		batchLimit := routeFilteredScanBatchLimit(limit - len(out))
+		var (
+			kvs []*store.KVPair
+			err error
+		)
+		if reverse {
+			kvs, err = s.local.ReverseScanAt(ctx, scanStart, scanEnd, batchLimit, ts)
+		} else {
+			kvs, err = s.local.ScanAt(ctx, scanStart, scanEnd, batchLimit, ts)
+		}
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = appendRouteFilteredKVs(out, kvs, limit, routeStart, routeEnd)
+		if routeFilteredScanDone(kvs, batchLimit, len(out), limit) {
+			break
+		}
+		var done bool
+		scanStart, scanEnd, done = nextRouteFilteredScanWindow(kvs, scanStart, scanEnd, reverse)
+		if done {
+			break
+		}
 	}
 	return out, nil
 }
@@ -506,6 +615,11 @@ func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {
 func (s *LeaderRoutedStore) ExportVersions(ctx context.Context, opts store.ExportVersionsOptions) (store.ExportVersionsResult, error) {
 	if s == nil || s.local == nil {
 		return store.ExportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	if s.coordinator != nil {
+		if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
+			return store.ExportVersionsResult{}, errors.WithStack(err)
+		}
 	}
 	result, err := s.local.ExportVersions(ctx, opts)
 	return result, errors.WithStack(err)
