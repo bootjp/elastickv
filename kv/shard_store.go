@@ -122,25 +122,15 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
-	if route, ok := s.engine.GetRoute(routeKey(key)); ok && route.GroupID == groupID {
-		return route, nil
-	}
-	if s.groupHasStagedVisibility(groupID) {
-		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
-	}
-	return fallback, nil
-}
-
-func (s *ShardStore) groupHasStagedVisibility(groupID uint64) bool {
-	if s == nil || s.engine == nil {
-		return false
-	}
-	for _, route := range s.engine.Stats() {
-		if route.GroupID == groupID && routeHasStagedVisibility(route) {
-			return true
+	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
+		if route.GroupID == groupID {
+			return route, nil
+		}
+		if routeHasStagedVisibility(route) {
+			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
 		}
 	}
-	return false
+	return fallback, nil
 }
 
 func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
@@ -438,20 +428,41 @@ func (s *ShardStore) routesForExplicitGroupScan(groupID uint64, start []byte, en
 	if s == nil || s.engine == nil {
 		return fallback, false, nil
 	}
-	routes := s.engine.GetIntersectingRoutes(start, end)
+	routeStart, routeEnd, routeMapped := explicitGroupScanRouteBounds(start, end)
+	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
 	matched := make([]distribution.Route, 0, len(routes))
 	for _, route := range routes {
 		if route.GroupID == groupID {
 			matched = append(matched, route)
+			continue
+		}
+		if routeHasStagedVisibility(route) {
+			return nil, false, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d range=[%q,%q)", groupID, start, end)
 		}
 	}
 	if len(matched) > 0 {
-		return matched, true, nil
-	}
-	if s.groupHasStagedVisibility(groupID) {
-		return nil, false, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d range=[%q,%q)", groupID, start, end)
+		return matched, !routeMapped, nil
 	}
 	return fallback, false, nil
+}
+
+func explicitGroupScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
+	routeStart := routeKey(start)
+	if len(start) == 0 {
+		routeStart = []byte("")
+	}
+	routeEnd := end
+	routeMapped := !bytes.Equal(routeStart, start)
+	if end != nil {
+		normalizedEnd := routeKey(end)
+		if !bytes.Equal(normalizedEnd, end) {
+			routeMapped = true
+		}
+	}
+	if routeMapped && len(routeStart) != 0 {
+		routeEnd = prefixScanEnd(routeStart)
+	}
+	return routeStart, routeEnd, routeMapped
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
@@ -817,8 +828,11 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 			return nil, nil, false, err
 		}
 		out := visibleLogicalKVs(versions, ts, reverse)
-		boundary, hasBoundary := stagedVisibilityCandidateBoundary(liveKVs, stagedKVs, reverse)
-		exhausted := len(liveKVs) < window && len(stagedKVs) < window
+		liveExhausted := len(liveKVs) < window
+		stagedExhausted := len(stagedKVs) < window
+		boundary, hasBoundary := stagedVisibilityCandidateBoundary(liveKVs, stagedKVs, liveExhausted, stagedExhausted, reverse)
+		exhausted := liveExhausted && stagedExhausted
+		out = stagedVisibilityKVsWithinPageBoundary(out, boundary, hasBoundary, exhausted, reverse)
 		if len(out) >= limit {
 			clear(out[limit:])
 			return out[:limit], boundary, !exhausted && hasBoundary, nil
@@ -834,22 +848,84 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 	}
 }
 
-func stagedVisibilityCandidateBoundary(liveKVs []*store.KVPair, stagedKVs []*store.KVPair, reverse bool) ([]byte, bool) {
-	boundary := stagedVisibilityBoundary{reverse: reverse}
+func stagedVisibilityKVsWithinPageBoundary(kvs []*store.KVPair, boundary []byte, hasBoundary bool, exhausted bool, reverse bool) []*store.KVPair {
+	if exhausted || !hasBoundary {
+		return kvs
+	}
+	return stagedVisibilityKVsWithinBoundary(kvs, boundary, reverse)
+}
+
+func stagedVisibilityKVsWithinBoundary(kvs []*store.KVPair, boundary []byte, reverse bool) []*store.KVPair {
+	if len(boundary) == 0 {
+		return kvs
+	}
+	n := 0
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		cmp := bytes.Compare(kvp.Key, boundary)
+		if (!reverse && cmp <= 0) || (reverse && cmp >= 0) {
+			kvs[n] = kvp
+			n++
+		}
+	}
+	clear(kvs[n:])
+	return kvs[:n]
+}
+
+func stagedVisibilityCandidateBoundary(liveKVs []*store.KVPair, stagedKVs []*store.KVPair, liveExhausted bool, stagedExhausted bool, reverse bool) ([]byte, bool) {
+	liveBoundary := stagedVisibilityBoundary{reverse: reverse}
 	for _, kvp := range liveKVs {
 		if kvp == nil {
 			continue
 		}
-		boundary.visit(kvp.Key)
+		liveBoundary.visit(kvp.Key)
 	}
+	stagedBoundary := stagedVisibilityBoundary{reverse: reverse}
 	for _, kvp := range stagedKVs {
 		rawKey, stagedOK := stagedVisibilityRawCandidateKey(kvp)
 		if !stagedOK {
 			continue
 		}
-		boundary.visit(rawKey)
+		stagedBoundary.visit(rawKey)
 	}
-	return boundary.key, boundary.ok
+	return mergeStagedVisibilityBoundaries(liveBoundary, stagedBoundary, liveExhausted, stagedExhausted, reverse)
+}
+
+func mergeStagedVisibilityBoundaries(live stagedVisibilityBoundary, staged stagedVisibilityBoundary, liveExhausted bool, stagedExhausted bool, reverse bool) ([]byte, bool) {
+	if !live.ok {
+		return staged.key, staged.ok
+	}
+	if !staged.ok {
+		return live.key, live.ok
+	}
+	if !liveExhausted && !stagedExhausted {
+		return nearerStagedVisibilityBoundary(live.key, staged.key, reverse), true
+	}
+	if liveExhausted && stagedExhausted {
+		return fartherStagedVisibilityBoundary(live.key, staged.key, reverse), true
+	}
+	if liveExhausted {
+		return staged.key, true
+	}
+	return live.key, true
+}
+
+func nearerStagedVisibilityBoundary(a []byte, b []byte, reverse bool) []byte {
+	cmp := bytes.Compare(a, b)
+	if (!reverse && cmp <= 0) || (reverse && cmp >= 0) {
+		return a
+	}
+	return b
+}
+
+func fartherStagedVisibilityBoundary(a []byte, b []byte, reverse bool) []byte {
+	cmp := bytes.Compare(a, b)
+	if (!reverse && cmp >= 0) || (reverse && cmp <= 0) {
+		return a
+	}
+	return b
 }
 
 type stagedVisibilityBoundary struct {
@@ -1841,6 +1917,7 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
 }
 
@@ -1855,6 +1932,7 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
@@ -1870,6 +1948,7 @@ func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*stor
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
 }
 
@@ -1900,24 +1979,35 @@ func (s *ShardStore) ensureMutationWriteTimestampFloors(mutations []*store.KVPai
 }
 
 func (s *ShardStore) readKeysWithStagedVisibilityAliases(group *ShardGroup, readKeys [][]byte) [][]byte {
-	if len(readKeys) == 0 || s == nil || s.engine == nil || group == nil {
+	if len(readKeys) == 0 {
 		return readKeys
 	}
-	var out [][]byte
 	for _, key := range readKeys {
-		alias, ok := s.stagedVisibilityReadKeyAlias(group, key)
-		if !ok {
+		readKeys = s.appendStagedVisibilityAlias(group, readKeys, key)
+	}
+	return readKeys
+}
+
+func (s *ShardStore) readKeysWithStagedVisibilityMutationAliases(group *ShardGroup, readKeys [][]byte, mutations []*store.KVPairMutation) [][]byte {
+	for _, mut := range mutations {
+		if mut == nil {
 			continue
 		}
-		if out == nil {
-			out = append([][]byte(nil), readKeys...)
-		}
-		out = append(out, alias)
+		readKeys = s.appendStagedVisibilityAlias(group, readKeys, mut.Key)
 	}
-	if out == nil {
+	return readKeys
+}
+
+func (s *ShardStore) appendStagedVisibilityAlias(group *ShardGroup, readKeys [][]byte, key []byte) [][]byte {
+	if s == nil || s.engine == nil || group == nil {
 		return readKeys
 	}
-	return out
+	alias, ok := s.stagedVisibilityReadKeyAlias(group, key)
+	if !ok {
+		return readKeys
+	}
+	out := append([][]byte(nil), readKeys...)
+	return append(out, alias)
 }
 
 func (s *ShardStore) stagedVisibilityReadKeyAlias(group *ShardGroup, key []byte) ([]byte, bool) {

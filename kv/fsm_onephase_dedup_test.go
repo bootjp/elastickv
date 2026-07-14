@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -65,6 +66,37 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLanded(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(20), latest, "newest version must remain attempt 1's at 20")
+}
+
+func TestOnePhaseDedup_NoOpsWhenPriorAttemptLandedAsStagedVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+	}})
+	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
+	fsm, ok := fsmIface.(*kvFSM)
+	require.True(t, ok)
+
+	key := []byte("list-item")
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
+
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(30, 40, 20, key, []byte("v"))))
+
+	at40, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.False(t, at40, "retry must not write a live version when the prior attempt is staged")
+	stagedAt20, err := st.CommittedVersionAt(ctx, distribution.MigrationStagedDataKey(9, key), 20)
+	require.NoError(t, err)
+	require.True(t, stagedAt20)
 }
 
 // TestOnePhaseDedup_AppliesWhenPriorAttemptDidNotLand covers the truncated /

@@ -1223,6 +1223,10 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		return nil, err
 	}
+	groupedReadKeys = c.groupedReadKeysWithStagedVisibilityMutationAliases(groupedReadKeys, grouped)
+	if groupedReadKeyCount(groupedReadKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion)
 	if err != nil {
 		return nil, err
@@ -1298,6 +1302,10 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return nil, err
 	}
 	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
+	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, elems)
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
 	// carries the one-phase dedup probe key for a retry that reuses a failed
@@ -1321,6 +1329,27 @@ func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uin
 	var out [][]byte
 	for _, key := range readKeys {
 		alias, ok := c.stagedVisibilityReadKeyAlias(gid, key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, elems []*Elem[OP]) [][]byte {
+	var out [][]byte
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, elem.Key)
 		if !ok {
 			continue
 		}
@@ -1956,6 +1985,34 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint
 		}
 	}
 	return grouped, nil
+}
+
+func (c *ShardedCoordinator) groupedReadKeysWithStagedVisibilityMutationAliases(groupedReadKeys map[uint64][][]byte, groupedMutations map[uint64][]*pb.Mutation) map[uint64][][]byte {
+	out := groupedReadKeys
+	for gid, muts := range groupedMutations {
+		for _, mut := range muts {
+			if mut == nil {
+				continue
+			}
+			alias, ok := c.stagedVisibilityReadKeyAlias(gid, mut.Key)
+			if !ok {
+				continue
+			}
+			if out == nil {
+				out = make(map[uint64][][]byte)
+			}
+			out[gid] = append(out[gid], alias)
+		}
+	}
+	return out
+}
+
+func groupedReadKeyCount(grouped map[uint64][][]byte) int {
+	var count int
+	for _, keys := range grouped {
+		count += len(keys)
+	}
+	return count
 }
 
 func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte) ([]byte, bool) {

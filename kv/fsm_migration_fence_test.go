@@ -123,29 +123,21 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
 }
 
-func TestFSMRejectsRawPointWriteAtMigrationTimestampFloor(t *testing.T) {
+func TestFSMAllowsRawPointWriteAtMigrationTimestampFloorDuringReplay(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
 	err := fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")}},
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("replayed")}},
 	}, 100)
-	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
-
-	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
-
-	err = fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("ok")}},
-	}, 101)
 	require.NoError(t, err)
 	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
 	require.NoError(t, getErr)
-	require.Equal(t, []byte("ok"), got)
+	require.Equal(t, []byte("replayed"), got)
 }
 
-func TestFSMRejectsDelPrefixAtMigrationTimestampFloor(t *testing.T) {
+func TestFSMAllowsDelPrefixAtMigrationTimestampFloorDuringReplay(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -155,14 +147,13 @@ func TestFSMRejectsDelPrefixAtMigrationTimestampFloor(t *testing.T) {
 	err := fsm.handleRawRequest(ctx, &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
 	}, 100)
-	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.NoError(t, err)
 
-	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
+	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
-func TestFSMRejectsOnePhaseTxnAtMigrationTimestampFloor(t *testing.T) {
+func TestFSMAllowsOnePhaseTxnAtMigrationTimestampFloorDuringReplay(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -177,21 +168,13 @@ func TestFSMRejectsOnePhaseTxnAtMigrationTimestampFloor(t *testing.T) {
 		},
 	}
 	err := fsm.handleTxnRequest(ctx, req, 100)
-	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
-
-	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
-
-	req.Mutations[0].Value = EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})
-	req.Mutations[1].Value = []byte("ok")
-	err = fsm.handleTxnRequest(ctx, req, 101)
 	require.NoError(t, err)
 	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
 	require.NoError(t, getErr)
-	require.Equal(t, []byte("ok"), got)
+	require.Equal(t, []byte("low"), got)
 }
 
-func TestFSMRejectsCommitButNotPrepareAtMigrationTimestampFloor(t *testing.T) {
+func TestFSMAllowsCommitAtMigrationTimestampFloorDuringReplay(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -217,14 +200,6 @@ func TestFSMRejectsCommitButNotPrepareAtMigrationTimestampFloor(t *testing.T) {
 		},
 	}
 	err := fsm.handleTxnRequest(ctx, commit, 100)
-	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
-
-	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
-
-	commit.Mutations[0].Value = EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})
-	commit.Mutations[1].Value = []byte("ignored")
-	err = fsm.handleTxnRequest(ctx, commit, 101)
 	require.NoError(t, err)
 	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
 	require.NoError(t, getErr)

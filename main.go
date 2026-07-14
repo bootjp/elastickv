@@ -1491,6 +1491,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		shardStore:         in.shardStore,
 		coordinate:         adapterCoordinate,
 		distServer:         in.distServer,
+		routeEngine:        in.cfg.engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
 		redisAddress:       *redisAddr,
@@ -2053,6 +2054,7 @@ func startRaftServers(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
@@ -2097,6 +2099,7 @@ func startRaftServers(
 				internalTimestampOptions(coordinate),
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalRouteEngine(routeEngine),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
@@ -2439,6 +2442,7 @@ type runtimeServerRunner struct {
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
+	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
 	adminGRPCOpts                   adminGRPCInterceptors
 	redisAddress                    string
@@ -2552,6 +2556,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardStore,
 		r.coordinate,
 		r.distServer,
+		r.routeEngine,
 		r.pubsubRelay,
 		func(groupID uint64) kv.ProposalObserver {
 			return r.metricsRegistry.RaftProposalObserver(groupID)

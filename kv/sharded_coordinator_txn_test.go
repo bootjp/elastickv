@@ -109,7 +109,90 @@ func TestShardedCoordinatorDispatchTxn_AddsStagedReadKeyAlias(t *testing.T) {
 	require.Equal(t, [][]byte{
 		readKey,
 		distribution.MigrationStagedDataKey(9, readKey),
+		distribution.MigrationStagedDataKey(9, []byte("m")),
 	}, txn.requests[0].ReadKeys)
+}
+
+func TestShardedCoordinatorDispatchTxn_AddsStagedWriteKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	writeKey := []byte("k")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems:    []*Elem[OP]{{Op: Put, Key: writeKey, Value: []byte("write")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, writeKey),
+	}, txn.requests[0].ReadKeys)
+}
+
+func TestShardedCoordinatorPrewrite_AddsStagedWriteKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("m"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	writeKey := []byte("b")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: writeKey, Value: []byte("write-b")},
+			{Op: Put, Key: []byte("x"), Value: []byte("write-x")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, g1Txn.requests)
+	require.NotEmpty(t, g2Txn.requests)
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, writeKey),
+	}, g1Txn.requests[0].ReadKeys)
+	require.Empty(t, g2Txn.requests[0].ReadKeys)
 }
 
 func cloneTxnRequest(req *pb.Request) *pb.Request {

@@ -4,10 +4,17 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
+
+type fixedInternalTimestampAllocator uint64
+
+func (a fixedInternalTimestampAllocator) Next(context.Context) (uint64, error) {
+	return uint64(a), nil
+}
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {
 	t.Parallel()
@@ -169,4 +176,31 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	meta, err := kv.DecodeTxnMeta(commit.Mutations[0].Value)
 	require.NoError(t, err)
 	require.Greater(t, meta.CommitTS, uint64(9))
+}
+
+func TestStampRawTimestampsRejectsRouteWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte(""),
+			End:                 nil,
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	i := &Internal{
+		tsAllocator: fixedInternalTimestampAllocator(100),
+		routeEngine: engine,
+	}
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+
+	err := i.stampRawTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
 }
