@@ -29,6 +29,58 @@ func TestGroupDataDir(t *testing.T) {
 	})
 }
 
+func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.T) {
+	baseDir := t.TempDir()
+	raftID := "n1"
+	legacyDir := filepath.Join(baseDir, raftID)
+	require.NoError(t, os.MkdirAll(legacyDir, raftDirPerm))
+	legacyMarker := filepath.Join(legacyDir, "legacy.marker")
+	require.NoError(t, os.WriteFile(legacyMarker, []byte("keep"), 0o600))
+
+	groups := []groupSpec{
+		{id: dedicatedTSORaftGroupID, address: "127.0.0.1:17000"},
+		{id: 1, address: "127.0.0.1:17001"},
+	}
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	require.NoError(t, err)
+
+	runtimes, shardGroups, err := buildShardGroups(
+		raftID,
+		baseDir,
+		groups,
+		true,
+		true,
+		raftBootstrapConfig{},
+		factory,
+		nil,
+		kv.NewHLC(),
+		nil,
+		nil,
+		"",
+		encryptionWriteWiring{},
+		engine,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+	})
+	require.Contains(t, shardGroups, uint64(dedicatedTSORaftGroupID))
+	require.Contains(t, shardGroups, uint64(1))
+	require.DirExists(t, filepath.Join(legacyDir, "fsm.db"))
+	require.DirExists(t, filepath.Join(legacyDir, "group-0", "fsm.db"))
+	if _, err := os.Stat(filepath.Join(legacyDir, "group-1")); !os.IsNotExist(err) {
+		require.NoError(t, err)
+		t.Fatalf("group 1 should stay in legacy dir, but group-1 dir exists")
+	}
+	got, err := os.ReadFile(legacyMarker)
+	require.NoError(t, err)
+	require.Equal(t, []byte("keep"), got)
+}
+
 func TestParseRaftEngineType(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		engineType, err := parseRaftEngineType("")

@@ -508,6 +508,14 @@ func dataGroupIDs(groups []groupSpec) []uint64 {
 	return slices.Compact(ids)
 }
 
+func dataGroupsNeedMultiDirs(groups []groupSpec) bool {
+	return len(dataGroupIDs(groups)) > 1
+}
+
+func effectiveMultiDataDirs(groups []groupSpec, requested bool) bool {
+	return requested && dataGroupsNeedMultiDirs(groups)
+}
+
 func validateShardRanges(ranges []rangeSpec, groups []groupSpec) error {
 	ids := map[uint64]struct{}{}
 	for _, g := range groups {

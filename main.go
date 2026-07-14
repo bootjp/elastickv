@@ -714,7 +714,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGrou
 		leaderDynamo:        leaderDynamo,
 		leaderSQS:           leaderSQS,
 		sqsFifoPartitionMap: sqsFifoPartitionMap,
-		multi:               len(dataGroupIDs(groups)) > 1,
+		multi:               dataGroupsNeedMultiDirs(groups),
 	}, nil
 }
 
@@ -1053,6 +1053,7 @@ func buildShardGroups(
 	// NewApplier install a private per-applier cache, silently
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
+	multi = effectiveMultiDataDirs(groups, multi)
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
