@@ -209,6 +209,9 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	if reverse {
 		if groupID != 0 {
+			if routeScanBoundsPresent(routeStart, routeEnd) {
+				return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true, readRouteVersion, routeStart, routeEnd)
+			}
 			return nil, errors.WithStack(store.ErrNotSupported)
 		}
 		return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, readRouteVersion, routeStart, routeEnd)
