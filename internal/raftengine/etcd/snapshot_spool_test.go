@@ -22,6 +22,7 @@ func TestSnapshotSpool_DefaultCapAcceptsRealisticFSM(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: writes 1.5 GiB to a temp file")
 	}
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "0")
 	dir := t.TempDir()
 	spool, err := newSnapshotSpool(dir)
 	require.NoError(t, err)
@@ -66,6 +67,7 @@ func TestSnapshotSpool_DefaultCapAcceptsRealisticFSM(t *testing.T) {
 func TestSnapshotSpool_OverrideViaEnv(t *testing.T) {
 	const spoolCap = int64(4096)
 	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "0")
 
 	spool, err := newSnapshotSpool(t.TempDir())
 	require.NoError(t, err)
@@ -93,6 +95,14 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = spool.Close() })
 	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.maxSize)
+}
+
+func TestSnapshotSpoolDefaultReserveTracksPayloadCap(t *testing.T) {
+	spool, err := newSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.minFreeBytes)
 }
 
 func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {

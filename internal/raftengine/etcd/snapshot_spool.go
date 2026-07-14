@@ -31,7 +31,13 @@ const defaultMaxSnapshotPayloadBytes int64 = 16 << 30 // 16 GiB
 
 const maxSnapshotPayloadBytesEnvVar = "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES"
 
-const defaultSnapshotSpoolMinFreeBytes int64 = 2 << 30 // 2 GiB
+// Keep one full max-size snapshot worth of headroom after receive-side spooling.
+// Applying a token snapshot restores the FSM from the completed .fsm into a new
+// local store directory, so a node can transiently need old snapshot + incoming
+// .fsm + restored store bytes. A small reserve lets the spool complete and only
+// fails later in restore, which can leave the host near-full until startup
+// orphan cleanup runs.
+const defaultSnapshotSpoolMinFreeBytes = defaultMaxSnapshotPayloadBytes
 
 const snapshotSpoolMinFreeBytesEnvVar = "ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES"
 
