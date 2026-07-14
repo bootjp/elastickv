@@ -95,6 +95,29 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.maxSize)
 }
 
+func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "1024")
+	originalAvailable := snapshotSpoolAvailableBytes
+	snapshotSpoolAvailableBytes = func(string) (int64, error) {
+		return 1024, nil
+	}
+	t.Cleanup(func() { snapshotSpoolAvailableBytes = originalAvailable })
+
+	spool, err := newSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	n, err := spool.Write([]byte("x"))
+	require.Zero(t, n)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errSnapshotSpoolDiskHeadroom), "got %v", err)
+	require.Zero(t, spool.size)
+
+	info, statErr := spool.file.Stat()
+	require.NoError(t, statErr)
+	require.Zero(t, info.Size(), "headroom rejection must happen before writing bytes")
+}
+
 // TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop pins the gemini-medium
 // review on PR #747: after a successful FinalizeAsFSMFile, the deferred
 // caller-side spool.Close() must NOT attempt to remove the renamed file
