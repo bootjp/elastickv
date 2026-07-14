@@ -264,6 +264,9 @@ func (s *pebbleStore) exportPebbleVersion(
 }
 
 func shouldExportPebbleVersion(opts ExportVersionsOptions, userKey []byte, commitTS uint64) bool {
+	if shouldSkipMigrationExportKey(userKey) {
+		return false
+	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(userKey) {
 		return false
 	}

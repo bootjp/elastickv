@@ -56,6 +56,20 @@ func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
 	})
 }
 
+func TestExportVersionsExcludesTxnLocks(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		lockKey := append(bytes.Clone(txnLockKeyPrefix), []byte("user")...)
+		require.NoError(t, st.PutAt(ctx, lockKey, []byte("lock"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("user"), []byte("value"), 20, 0))
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+		require.NoError(t, err)
+		require.True(t, result.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("user"), CommitTS: 20, Value: []byte("value")}}, result.Versions)
+	})
+}
+
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

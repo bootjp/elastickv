@@ -400,6 +400,9 @@ func finishExportIfLimited(opts ExportVersionsOptions, result *ExportVersionsRes
 }
 
 func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version VersionedValue, result *ExportVersionsResult) byte {
+	if shouldSkipMigrationExportKey(key) {
+		return exportCursorTagScanned
+	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
 		return exportCursorTagScanned
 	}
@@ -417,6 +420,10 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 	result.ExportedBytes += versionExportSize(key, len(version.Value))
 	result.AcceptedRows++
 	return exportCursorTagEmitted
+}
+
+func shouldSkipMigrationExportKey(key []byte) bool {
+	return bytes.HasPrefix(key, txnLockKeyPrefix)
 }
 
 func finishMemoryExportPosition(opts ExportVersionsOptions, key []byte, version VersionedValue, tag byte, result *ExportVersionsResult) bool {
