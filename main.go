@@ -512,7 +512,6 @@ func run() error {
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
 		adapter.WithSplitMigrationCapabilityGate(splitMigrationGate),
-		adapter.WithSplitJobRunnerReady(),
 	)
 	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
@@ -702,7 +701,11 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 			if err != nil {
 				return nil, errors.Wrapf(err, "raft group %d configuration", rt.spec.id)
 			}
-			for _, peer := range splitMigrationCapabilityPeersFromConfiguration(cfg) {
+			groupPeers := splitMigrationCapabilityPeersFromConfiguration(cfg)
+			if len(groupPeers) == 0 {
+				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.spec.id)
+			}
+			for _, peer := range groupPeers {
 				key := peer.ID + "\x00" + peer.Address
 				if _, ok := seen[key]; ok {
 					continue
@@ -790,6 +793,9 @@ func probeSplitMigrationCapabilityPeer(ctx context.Context, address string) erro
 	}
 	if resp == nil || !resp.GetMigrationCapable() {
 		return errors.New("peer does not advertise split migration capability")
+	}
+	if !slices.Contains(resp.GetCapabilities(), adapter.SplitMigrationCapabilityV2) {
+		return errors.Errorf("peer does not advertise %s", adapter.SplitMigrationCapabilityV2)
 	}
 	return nil
 }

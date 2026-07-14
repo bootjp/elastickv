@@ -108,7 +108,8 @@ const (
 	splitJobListCursorTerminalOff  = 1
 	splitJobListCursorJobIDOff     = splitJobListCursorTerminalOff + 8
 	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
-	splitMigrationCapabilityV2     = "cap_migration_v2"
+	SplitMigrationCapabilityV2     = "cap_migration_v2"
+	splitMigrationCapabilityV2     = SplitMigrationCapabilityV2
 )
 
 var (
@@ -238,8 +239,7 @@ func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.St
 	if err != nil {
 		return nil, err
 	}
-	readPin := s.pinReadTS(snapshot.ReadTS)
-	defer readPin.Release()
+	defer releaseReadPin(s.pinReadTS(snapshot.ReadTS))
 
 	parent, err := s.startSplitMigrationParent(ctx, snapshot, req)
 	if err != nil {
@@ -445,8 +445,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
-	readPin := s.pinReadTS(snapshot.ReadTS)
-	defer readPin.Release()
+	defer releaseReadPin(s.pinReadTS(snapshot.ReadTS))
 	if err := validateExpectedCatalogVersion(snapshot.Version, req.GetExpectedCatalogVersion()); err != nil {
 		return nil, err
 	}
@@ -490,6 +489,13 @@ func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 		return &kv.ActiveTimestampToken{}
 	}
 	return s.readTracker.Pin(ts)
+}
+
+func releaseReadPin(token *kv.ActiveTimestampToken) {
+	if token == nil {
+		return
+	}
+	token.Release()
 }
 
 func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {

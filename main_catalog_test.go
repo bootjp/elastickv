@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -189,12 +193,88 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing
 	}, peers)
 }
 
+func TestSplitMigrationCapabilityPeerSourceForRuntimesFailsClosedOnEmptyGroup(t *testing.T) {
+	t.Parallel()
+
+	runtimes := []*raftGroupRuntime{
+		{
+			spec: groupSpec{id: 1},
+			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+			}}},
+		},
+		{
+			spec:   groupSpec{id: 2},
+			engine: capabilityConfigEngine{cfg: raftengine.Configuration{}},
+		},
+	}
+
+	peers, err := splitMigrationCapabilityPeerSourceForRuntimes(runtimes)(context.Background())
+	require.Error(t, err)
+	require.Nil(t, peers)
+	require.ErrorContains(t, err, "raft group 2")
+	require.ErrorContains(t, err, "no split migration capability peers")
+}
+
+func TestProbeSplitMigrationCapabilityPeerRequiresDocumentedToken(t *testing.T) {
+	t.Parallel()
+
+	addr := startSplitMigrationCapabilityTestServer(t, &pb.GetSplitMigrationCapabilityResponse{
+		MigrationCapable: true,
+		Capabilities:     []string{"split_migration_v2"},
+	})
+
+	err := probeSplitMigrationCapabilityPeer(context.Background(), addr)
+	require.Error(t, err)
+	require.ErrorContains(t, err, adapter.SplitMigrationCapabilityV2)
+}
+
+func TestProbeSplitMigrationCapabilityPeerAcceptsDocumentedToken(t *testing.T) {
+	t.Parallel()
+
+	addr := startSplitMigrationCapabilityTestServer(t, &pb.GetSplitMigrationCapabilityResponse{
+		MigrationCapable: true,
+		Capabilities:     []string{adapter.SplitMigrationCapabilityV2},
+	})
+
+	require.NoError(t, probeSplitMigrationCapabilityPeer(context.Background(), addr))
+}
+
 func staticSplitMigrationCapabilityPeerSource(peers []splitMigrationCapabilityPeer) splitMigrationCapabilityPeerSource {
 	return func(context.Context) ([]splitMigrationCapabilityPeer, error) {
 		out := make([]splitMigrationCapabilityPeer, len(peers))
 		copy(out, peers)
 		return out, nil
 	}
+}
+
+type splitMigrationCapabilityTestServer struct {
+	pb.UnimplementedDistributionServer
+	resp *pb.GetSplitMigrationCapabilityResponse
+}
+
+func (s *splitMigrationCapabilityTestServer) GetSplitMigrationCapability(context.Context, *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
+	return s.resp, nil
+}
+
+func startSplitMigrationCapabilityTestServer(t *testing.T, resp *pb.GetSplitMigrationCapabilityResponse) string {
+	t.Helper()
+
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	grpcServer := grpc.NewServer()
+	pb.RegisterDistributionServer(grpcServer, &splitMigrationCapabilityTestServer{resp: resp})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = grpcServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		<-done
+	})
+	return listener.Addr().String()
 }
 
 type capabilityConfigEngine struct {
