@@ -541,16 +541,20 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 		return s.scanRouteAtLeaderRouteFilter(ctx, g, start, end, limit, ts, reverse, routeStart, routeEnd)
 	}
 
-	var groupID uint64
-	if explicitGroup {
-		groupID = route.GroupID
-	}
+	groupID := proxyScanGroupID(route, explicitGroup, routeStart, routeEnd)
 	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, nil, err
 	}
 	filtered := filterTxnInternalKVs(kvs)
 	return filtered, kvs, nil
+}
+
+func proxyScanGroupID(route distribution.Route, explicitGroup bool, routeStart []byte, routeEnd []byte) uint64 {
+	if explicitGroup || routeScanBoundsPresent(routeStart, routeEnd) {
+		return route.GroupID
+	}
+	return 0
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
@@ -583,10 +587,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
-	var groupID uint64
-	if explicitGroup {
-		groupID = route.GroupID
-	}
+	groupID := proxyScanGroupID(route, explicitGroup, routeStart, routeEnd)
 	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, err

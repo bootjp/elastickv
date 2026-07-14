@@ -156,6 +156,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
 	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
 	require.Equal(t, uint64(79), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
 	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
 	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
 	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
@@ -165,9 +166,19 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.NoError(t, err)
 
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
 	require.Equal(t, uint64(80), fake.lastScanReq.GetReadRouteVersion())
 	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 81, nil, nil)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(0), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(81), fake.lastScanReq.GetReadRouteVersion())
+	require.False(t, fake.lastScanReq.GetRouteBoundsPresent())
 }
 
 func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
