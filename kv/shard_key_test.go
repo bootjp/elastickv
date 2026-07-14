@@ -1,10 +1,13 @@
 package kv
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -94,4 +97,214 @@ func TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute(t *testing.T) {
 	require.Equal(t, want, routeKey(currentGSIKey))
 	require.Equal(t, want, routeKey(sourceGSIKey),
 		"migration source generation GSI key must route to the same table group as the current generation")
+}
+
+func TestRouteKey_NormalizesCollectionMigrationFamilies(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("redis:user|with|separators")
+	cases := [][]byte{
+		store.ListMetaDeltaKey(userKey, 10, 1),
+		store.ListClaimKey(userKey, -2),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.HashMetaDeltaKey(userKey, 11, 2),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.SetMetaDeltaKey(userKey, 12, 3),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.25, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 13, 4),
+		store.StreamMetaKey(userKey),
+		store.StreamEntryKey(userKey, 14, 5),
+	}
+
+	for _, raw := range cases {
+		require.Equal(t, userKey, routeKey(raw), "raw key %q must route by its logical user key", raw)
+	}
+}
+
+func TestRouteKey_ListMetaKeyThatLooksLikeNewDeltaRoutesByRealListKey(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte(store.ListMetaDeltaPrefix + "fake:user")
+	baseMeta := store.ListMetaKey(userKey)
+	deltaKey := store.ListMetaDeltaKey(userKey, 10, 1)
+
+	require.Equal(t, userKey, routeKey(baseMeta), "base list metadata must not decode as a new delta")
+	require.Equal(t, userKey, routeKey(deltaKey), "real list deltas must still route by the logical list key")
+}
+
+func TestRouteKey_LegacyListDeltaRoutesByDecodedUserKey(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("legacy:list")
+	require.Equal(t, userKey, routeKey(legacyListMetaDeltaKey(userKey, 42, 7)))
+}
+
+func TestRouteKey_MalformedWideColumnKeysFallBackToRaw(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		malformedWideColumnKey(store.ListClaimPrefix, 8),
+		malformedWideColumnKey(store.HashMetaPrefix, 0),
+		malformedWideColumnKey(store.HashFieldPrefix, 0),
+		malformedWideColumnKey(store.HashMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.SetMetaPrefix, 0),
+		malformedWideColumnKey(store.SetMemberPrefix, 0),
+		malformedWideColumnKey(store.SetMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.ZSetMetaPrefix, 0),
+		malformedWideColumnKey(store.ZSetMemberPrefix, 0),
+		malformedWideColumnKey(store.ZSetScorePrefix, 8),
+		malformedWideColumnKey(store.ZSetMetaDeltaPrefix, 12),
+	} {
+		require.NotPanics(t, func() {
+			require.Equal(t, raw, routeKey(raw), "malformed key %q must not decode to a logical route", raw)
+		})
+	}
+}
+
+func malformedWideColumnKey(prefix string, suffixLen int) []byte {
+	key := make([]byte, 0, len(prefix)+4+suffixLen)
+	key = append(key, prefix...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], ^uint32(0))
+	key = append(key, lenPrefix[:]...)
+	key = append(key, make([]byte, suffixLen)...)
+	return key
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func TestRouteKey_NormalizesTxnSuccessMarkerByLockedKey(t *testing.T) {
+	t.Parallel()
+
+	lockedKey := []byte("secondary|key\x00with|separators")
+	primaryKey := []byte("primary|key\x00with|separators")
+	marker := TxnSuccessMarkerKey(lockedKey, 100, 200, primaryKey)
+
+	require.Equal(t, lockedKey, routeKey(marker))
+
+	malformed := append([]byte(nil), marker...)
+	malformed[len(txnSuccessPrefixBytes)] = 2
+	require.Equal(t, malformed, routeKey(malformed), "malformed success markers must fall back to their raw key")
+}
+
+func TestRouteKey_SQSDecoderIsConcreteOnly(t *testing.T) {
+	t.Parallel()
+
+	want := []byte(sqsRoutePrefix + "global")
+	for _, raw := range [][]byte{
+		[]byte(sqsQueueMetaPrefix + "queue"),
+		[]byte(sqsQueueGenPrefix + "queue"),
+		[]byte(sqsQueueSeqPrefix + "queue"),
+		[]byte(sqsQueueTombstonePrefix + "queue"),
+		[]byte(sqsMsgDataPrefix + "queue|1|msg"),
+		[]byte(sqsMsgVisPrefix + "queue|1|msg"),
+		[]byte(sqsMsgDedupPrefix + "queue|1|dedup"),
+		[]byte(sqsMsgGroupPrefix + "queue|1|group"),
+		[]byte(sqsMsgByAgePrefix + "queue|1|ts"),
+		[]byte(sqsMsgDataPrefix + sqsPartitionMarker + "queue|0|1|msg"),
+		[]byte(sqsMsgVisPrefix + sqsPartitionMarker + "queue|0|1|msg"),
+		[]byte(sqsMsgDedupPrefix + sqsPartitionMarker + "queue|0|1|dedup"),
+		[]byte(sqsMsgGroupPrefix + sqsPartitionMarker + "queue|0|1|group"),
+		[]byte(sqsMsgByAgePrefix + sqsPartitionMarker + "queue|0|1|ts"),
+	} {
+		require.Equal(t, want, routeKey(raw), "concrete SQS key %q must use the SQS route", raw)
+	}
+
+	rawUser := []byte("!sqs|foo")
+	require.Equal(t, rawUser, routeKey(rawUser), "adapter-looking raw user key must stay on its raw route")
+}
+
+func TestRouteKey_S3DecoderIsConcreteOnly(t *testing.T) {
+	t.Parallel()
+
+	manifest := s3keys.ObjectManifestKey("bucket", 2, "obj")
+	require.Equal(t, s3keys.RouteKey("bucket", 2, "obj"), routeKey(manifest))
+
+	rawUser := []byte("!s3|foo")
+	require.Equal(t, rawUser, routeKey(rawUser), "adapter-looking raw user key must stay on its raw route")
+}
+
+func TestRouteKeyFilterTreatsNilAndEmptyEndAsInfinity(t *testing.T) {
+	t.Parallel()
+
+	start := []byte("m")
+	for _, tc := range []struct {
+		name string
+		end  []byte
+	}{
+		{name: "nil"},
+		{name: "empty", end: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			filter := RouteKeyFilter(start, tc.end)
+			require.False(t, filter([]byte("a")))
+			require.True(t, filter([]byte("m")))
+			require.True(t, filter([]byte("z")))
+		})
+	}
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter(
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+	)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+	require.True(t, filter(s3keys.ObjectManifestKey("bucket-b", 7, "m")))
+	require.False(t, filter(s3keys.BucketMetaKey("bucket-c")))
+	require.False(t, filter(s3keys.BucketGenerationKey("bucket-c")))
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryRawRoute(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter([]byte("!s3|"), nil)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+}
+
+func TestRouteKeyFilterForGroupUsesPartitionResolver(t *testing.T) {
+	t.Parallel()
+
+	partitionedKey := []byte(sqsMsgDataPrefix + sqsPartitionMarker + "orders|partition-0|message")
+	resolver := &migrationFilterPartitionResolver{
+		groups: map[string]uint64{string(partitionedKey): 42},
+	}
+
+	require.True(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 7, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(
+		[]byte(sqsMsgDataPrefix+sqsPartitionMarker+"orders|unknown-partition"),
+	))
+}
+
+type migrationFilterPartitionResolver struct {
+	groups map[string]uint64
+}
+
+func (r *migrationFilterPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
+	gid, ok := r.groups[string(key)]
+	return gid, ok
+}
+
+func (r *migrationFilterPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(sqsMsgDataPrefix+sqsPartitionMarker))
 }

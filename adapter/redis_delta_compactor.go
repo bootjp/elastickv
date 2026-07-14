@@ -259,6 +259,10 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 	if len(kvs) == 0 {
 		return 0, true
 	}
+	kvs = filterDeltaKVs(kvs, h.acceptDeltaKV)
+	if len(kvs) == 0 {
+		return 0, true
+	}
 
 	elems, err := h.buildElems(ctx, req.userKey, kvs, readTS)
 	if err != nil {
@@ -397,6 +401,7 @@ type collectionDeltaHandler struct {
 	typeName       string
 	prefix         []byte
 	extractUserKey func(key []byte) []byte
+	acceptDeltaKV  func(*store.KVPair) bool
 	// deltaKeyPrefixFn returns the prefix that covers all delta keys for a single
 	// user key. Used by compactUrgentKey to perform a targeted single-key scan.
 	deltaKeyPrefixFn func(userKey []byte) []byte
@@ -407,6 +412,7 @@ type collectionDeltaHandler struct {
 func (c *DeltaCompactor) allHandlers() []collectionDeltaHandler {
 	return []collectionDeltaHandler{
 		c.listHandler(),
+		c.legacyListHandler(),
 		c.hashHandler(),
 		c.setHandler(),
 		c.zsetHandler(),
@@ -466,6 +472,7 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		return err
 	}
 
+	kvs = filterDeltaKVs(kvs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
 
@@ -483,6 +490,19 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 
 // groupByUserKey groups KVPairs by their user key, returning both the map and
 // the unique user keys in lexicographic (scan) order.
+func filterDeltaKVs(kvs []*store.KVPair, accept func(*store.KVPair) bool) []*store.KVPair {
+	if accept == nil || len(kvs) == 0 {
+		return kvs
+	}
+	out := kvs[:0]
+	for _, pair := range kvs {
+		if accept(pair) {
+			out = append(out, pair)
+		}
+	}
+	return out
+}
+
 func (c *DeltaCompactor) groupByUserKey(kvs []*store.KVPair, extractUserKey func([]byte) []byte) (map[string][]*store.KVPair, []string) {
 	byKey := make(map[string][]*store.KVPair)
 	var ukOrder []string
@@ -628,9 +648,25 @@ func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 		typeName:         "list",
 		prefix:           []byte(store.ListMetaDeltaPrefix),
 		extractUserKey:   store.ExtractListUserKeyFromDelta,
+		acceptDeltaKV:    isListMetaDeltaKV,
 		deltaKeyPrefixFn: store.ListMetaDeltaScanPrefix,
 		buildElems:       c.buildListCompactElems,
 	}
+}
+
+func (c *DeltaCompactor) legacyListHandler() collectionDeltaHandler {
+	return collectionDeltaHandler{
+		typeName:         "list-legacy",
+		prefix:           []byte(store.LegacyListMetaDeltaPrefix),
+		extractUserKey:   store.ExtractLegacyListUserKeyFromDelta,
+		acceptDeltaKV:    isListMetaDeltaKV,
+		deltaKeyPrefixFn: store.LegacyListMetaDeltaScanPrefix,
+		buildElems:       c.buildListCompactElems,
+	}
+}
+
+func isListMetaDeltaKV(pair *store.KVPair) bool {
+	return pair != nil && store.IsListMetaDeltaValue(pair.Value)
 }
 
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

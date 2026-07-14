@@ -92,6 +92,7 @@ func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
 
 	wantPrefixes := []string{
 		store.ListMetaDeltaPrefix,
+		store.LegacyListMetaDeltaPrefix,
 		store.HashMetaDeltaPrefix,
 		store.SetMetaDeltaPrefix,
 		store.ZSetMetaDeltaPrefix,
@@ -144,6 +145,42 @@ func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {
 	for _, dk := range [][]byte{d1Key, d2Key, d3Key} {
 		_, getErr := st.GetAt(ctx, dk, readTS)
 		require.ErrorIs(t, getErr, store.ErrKeyNotFound, "delta key should be deleted after compaction: %s", dk)
+	}
+}
+
+func TestDeltaCompactor_LegacyListDeltaFoldedIntoBaseMeta(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("legacy-list")
+
+	baseMeta := store.ListMeta{Head: 5, Len: 2}
+	baseMeta.Tail = baseMeta.Head + baseMeta.Len
+	metaBytes, err := store.MarshalListMeta(baseMeta)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), metaBytes, 1, 0))
+
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 2})
+	d1Key := legacyListMetaDeltaKey(userKey, 10)
+	d2Key := legacyListMetaDeltaKey(userKey, 11)
+	require.NoError(t, st.PutAt(ctx, d1Key, delta, 10, 0))
+	require.NoError(t, st.PutAt(ctx, d2Key, delta, 11, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	require.NoError(t, err)
+	got, err := store.UnmarshalListMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), got.Head)
+	require.Equal(t, int64(6), got.Len)
+	require.Equal(t, int64(9), got.Tail)
+
+	for _, dk := range [][]byte{d1Key, d2Key} {
+		_, getErr := st.GetAt(ctx, dk, readTS)
+		require.ErrorIs(t, getErr, store.ErrKeyNotFound, "legacy delta key should be deleted after compaction: %s", dk)
 	}
 }
 
