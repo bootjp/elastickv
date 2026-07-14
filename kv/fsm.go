@@ -1102,7 +1102,37 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, err
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
+	if landed {
+		return true, nil
+	}
+	route, ok := f.currentStagedVisibilityRouteForKey(meta.PrimaryKey)
+	if !ok {
+		return false, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, meta.PrimaryKey)
+	landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
 	return landed, nil
+}
+
+func (f *kvFSM) currentStagedVisibilityRouteForKey(key []byte) (distribution.Route, bool) {
+	if f == nil || f.routes == nil || len(key) == 0 {
+		return distribution.Route{}, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return distribution.Route{}, false
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return distribution.Route{}, false
+	}
+	route, ok := snap.RouteOf(routeKey(key))
+	if !ok || route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
+		return distribution.Route{}, false
+	}
+	return route, true
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {

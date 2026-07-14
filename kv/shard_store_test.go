@@ -308,6 +308,28 @@ func TestShardStoreScanAt_ContinuesStagedVisibilityAfterCandidateWindow(t *testi
 	require.Equal(t, []byte("k00000"), kvs[limit-1].Key)
 }
 
+func TestShardStoreScanAtRestrictsStagedVisibilityToSafeFrontier(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	limit := stagedVisibilityMaxCandidateWindow + 1
+	for i := range limit {
+		key := []byte(fmt.Sprintf("k%05d", i))
+		require.NoError(t, group.Store.PutAt(ctx, key, []byte(fmt.Sprintf("live%05d", i)), 10, 0))
+	}
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("x-staged")), []byte("staged"), 10, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte("a"), []byte("z"), limit, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, limit)
+	require.Equal(t, []byte("k00000"), kvs[0].Key)
+	require.Equal(t, []byte(fmt.Sprintf("k%05d", limit-1)), kvs[limit-1].Key)
+	for _, kvp := range kvs {
+		require.NotEqual(t, []byte("x-staged"), kvp.Key)
+	}
+}
+
 func TestStagedVisibilityCandidateBoundary_UsesSafeFrontier(t *testing.T) {
 	t.Parallel()
 

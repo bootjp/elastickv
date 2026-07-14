@@ -35,6 +35,12 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
+	return func(i *Internal) {
+		i.routeEngine = engine
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -56,6 +62,7 @@ type Internal struct {
 	relay              *RedisPubSubRelay
 	store              store.MVCCStore
 	migrationProposer  raftengine.Proposer
+	routeEngine        *distribution.Engine
 
 	pb.UnimplementedInternalServer
 }
@@ -408,8 +415,36 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 			return err
 		}
 		r.Ts = ts
+		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
+	if i == nil || i.routeEngine == nil || commitTS == 0 {
+		return nil
+	}
+	routes := i.routeEngine.Stats()
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		for _, route := range routes {
+			if routeWriteTimestampFloorApplies(route, mut.Key, commitTS) {
+				return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
+			}
+		}
+	}
+	return nil
+}
+
+func routeWriteTimestampFloorApplies(route distribution.Route, key []byte, commitTS uint64) bool {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return false
+	}
+	return kv.RouteKeyFilter(route.Start, route.End)(key)
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) error {

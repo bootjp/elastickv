@@ -832,6 +832,7 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 		stagedExhausted := len(stagedKVs) < window
 		boundary, hasBoundary := stagedVisibilityCandidateBoundary(liveKVs, stagedKVs, liveExhausted, stagedExhausted, reverse)
 		exhausted := liveExhausted && stagedExhausted
+		out = stagedVisibilityKVsWithinPageBoundary(out, boundary, hasBoundary, exhausted, reverse)
 		if len(out) >= limit {
 			clear(out[limit:])
 			return out[:limit], boundary, !exhausted && hasBoundary, nil
@@ -845,6 +846,32 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 		}
 		window = nextWindow
 	}
+}
+
+func stagedVisibilityKVsWithinPageBoundary(kvs []*store.KVPair, boundary []byte, hasBoundary bool, exhausted bool, reverse bool) []*store.KVPair {
+	if exhausted || !hasBoundary {
+		return kvs
+	}
+	return stagedVisibilityKVsWithinBoundary(kvs, boundary, reverse)
+}
+
+func stagedVisibilityKVsWithinBoundary(kvs []*store.KVPair, boundary []byte, reverse bool) []*store.KVPair {
+	if len(boundary) == 0 {
+		return kvs
+	}
+	n := 0
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		cmp := bytes.Compare(kvp.Key, boundary)
+		if (!reverse && cmp <= 0) || (reverse && cmp >= 0) {
+			kvs[n] = kvp
+			n++
+		}
+	}
+	clear(kvs[n:])
+	return kvs[:n]
 }
 
 func stagedVisibilityCandidateBoundary(liveKVs []*store.KVPair, stagedKVs []*store.KVPair, liveExhausted bool, stagedExhausted bool, reverse bool) ([]byte, bool) {
