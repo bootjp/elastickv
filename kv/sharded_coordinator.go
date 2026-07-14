@@ -2159,6 +2159,9 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		return errors.WithStack(err)
 	}
 	for _, key := range keys {
+		if err := c.verifyTargetReadinessForReadKeyOnShard(ctx, gid, g, key); err != nil {
+			return err
+		}
 		ts, exists, err := c.latestCommitTSForReadKeyOnShard(ctx, gid, g, key)
 		if err != nil {
 			return errors.WithStack(err)
@@ -2168,6 +2171,43 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) error {
+	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(states) == 0 {
+		return nil
+	}
+	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
+	routes, catalogVersion, proof := c.currentShardRoutesForRouteRange(gid, routeStart, routeEnd)
+	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, gid, catalogVersion, proof) {
+		return nil
+	}
+	return errors.WithStack(ErrRouteCutoverPending)
+}
+
+func (c *ShardedCoordinator) currentShardRoutesForRouteRange(gid uint64, routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	if c == nil || c.engine == nil {
+		return nil, 0, false
+	}
+	snap, ok := c.engine.Current()
+	if !ok {
+		return nil, 0, false
+	}
+	routes := make([]distribution.Route, 0)
+	for _, route := range snap.IntersectingRoutes(routeStart, routeEnd) {
+		if route.GroupID == gid {
+			routes = append(routes, route)
+		}
+	}
+	return routes, snap.Version(), true
 }
 
 func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {
