@@ -162,8 +162,8 @@ func TestDeltaCompactor_LegacyListDeltaFoldedIntoBaseMeta(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), metaBytes, 1, 0))
 
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 2})
-	d1Key := legacyListMetaDeltaKey(userKey, 10, 0)
-	d2Key := legacyListMetaDeltaKey(userKey, 11, 0)
+	d1Key := legacyListMetaDeltaKey(userKey, 10)
+	d2Key := legacyListMetaDeltaKey(userKey, 11)
 	require.NoError(t, st.PutAt(ctx, d1Key, delta, 10, 0))
 	require.NoError(t, st.PutAt(ctx, d2Key, delta, 11, 0))
 

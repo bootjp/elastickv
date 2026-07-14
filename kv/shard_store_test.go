@@ -75,17 +75,27 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	st := newTwoRouteShardStoreForScanTest()
-	userKey := []byte("x") // routes to group 2; raw !lst|delta| prefix would route to group 1.
-	deltaKey := store.ListMetaDeltaKey(userKey, 10, 1)
-	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	require.NoError(t, st.PutAt(ctx, deltaKey, deltaValue, 1, 0))
+	userKey := []byte("x") // routes to group 2; raw !lst|* prefixes route to group 1.
+	for _, tc := range []struct {
+		name      string
+		key       []byte
+		scanStart []byte
+	}{
+		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTwoRouteShardStoreForScanTest()
+			deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+			require.NoError(t, st.PutAt(ctx, tc.key, deltaValue, 1, 0))
 
-	start := store.ListMetaDeltaScanPrefix(userKey)
-	kvs, err := st.ScanAt(ctx, start, store.PrefixScanEnd(start), 10, ^uint64(0))
-	require.NoError(t, err)
-	require.Len(t, kvs, 1)
-	require.Equal(t, deltaKey, kvs[0].Key)
+			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
 }
 
 func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
@@ -104,6 +114,8 @@ func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
 		{name: "zset member", key: store.ZSetMemberKey([]byte("x"), []byte("m")), scanStart: store.ZSetMemberScanPrefix([]byte("x"))},
 		{name: "zset score", key: store.ZSetScoreKey([]byte("x"), 1.5, []byte("m")), scanStart: store.ZSetScoreScanPrefix([]byte("x"))},
 		{name: "zset delta", key: store.ZSetMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.ZSetMetaDeltaScanPrefix([]byte("x"))},
+		{name: "stream meta", key: store.StreamMetaKey([]byte("x")), scanStart: store.StreamMetaKey([]byte("x"))},
+		{name: "stream entry", key: store.StreamEntryKey([]byte("x"), 10, 0), scanStart: store.StreamEntryScanPrefix([]byte("x"))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

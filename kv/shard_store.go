@@ -291,9 +291,9 @@ func scanRouteUserKey(start []byte) []byte {
 }
 
 var scanRouteUserKeyExtractors = []func([]byte) []byte{
-	store.ExtractListUserKey,
 	store.ExtractListUserKeyFromDeltaScanPrefix,
 	store.ExtractLegacyListUserKeyFromDeltaScanPrefix,
+	store.ExtractListUserKey,
 	store.ExtractListUserKeyFromClaimScanPrefix,
 	store.ExtractHashUserKeyFromField,
 	store.ExtractHashUserKeyFromDeltaScanPrefix,
@@ -303,6 +303,8 @@ var scanRouteUserKeyExtractors = []func([]byte) []byte{
 	store.ExtractZSetUserKeyFromScore,
 	store.ExtractZSetUserKeyFromScoreScanPrefix,
 	store.ExtractZSetUserKeyFromDeltaScanPrefix,
+	store.ExtractStreamUserKeyFromMeta,
+	store.ExtractStreamUserKeyFromEntryScanPrefix,
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
