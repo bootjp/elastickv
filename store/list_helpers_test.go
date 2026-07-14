@@ -46,6 +46,23 @@ func TestListMetaDeltaPrefixDoesNotOverlapBaseMetaKeys(t *testing.T) {
 	require.Equal(t, userKey, ExtractListUserKeyFromDelta(deltaKey))
 }
 
+func TestLegacyListMetaDeltaHelpersScanOldPrefixWithoutReclassifyingNewDelta(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("list")
+	legacyPrefix := LegacyListMetaDeltaScanPrefix(userKey)
+	legacyKey := append(append([]byte(nil), legacyPrefix...), make([]byte, deltaKeyTSSize+deltaKeySeqSize)...)
+
+	require.Equal(t, userKey, ExtractLegacyListUserKeyFromDeltaScanPrefix(legacyPrefix))
+	require.Equal(t, userKey, ExtractLegacyListUserKeyFromDelta(legacyKey))
+	require.False(t, IsListMetaDeltaKey(legacyKey), "legacy prefix is ambiguous with base !lst|meta| keys")
+	require.True(t, IsListMetaDeltaValue(MarshalListMetaDelta(ListMetaDelta{HeadDelta: 1, LenDelta: 2})))
+
+	metaValue, err := MarshalListMeta(ListMeta{Head: 1, Tail: 2, Len: 1})
+	require.NoError(t, err)
+	require.False(t, IsListMetaDeltaValue(metaValue))
+}
+
 func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 	buf := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
 	buf = append(buf, "d|"...)

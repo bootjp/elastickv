@@ -351,18 +351,19 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// truncation: if >MaxDeltaScanLimit deltas exist the transaction cannot
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if len(deltaKVs) > store.MaxDeltaScanLimit {
-		return nil, ErrDeltaScanTruncated
-	}
-	existingDeltas := make([][]byte, 0, len(deltaKVs))
-	for _, kv := range deltaKVs {
-		existingDeltas = append(existingDeltas, kv.Key)
+	var existingDeltas [][]byte
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		deltaEnd := store.PrefixScanEnd(deltaPrefix)
+		deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(deltaKVs) > store.MaxDeltaScanLimit {
+			return nil, ErrDeltaScanTruncated
+		}
+		for _, kv := range deltaKVs {
+			existingDeltas = append(existingDeltas, kv.Key)
+		}
 	}
 
 	st := &listTxnState{

@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"testing"
@@ -268,4 +269,41 @@ func TestRouteKeyFilterIncludesS3BucketAuxiliaryKeys(t *testing.T) {
 	require.True(t, filter(s3keys.ObjectManifestKey("bucket-b", 7, "m")))
 	require.False(t, filter(s3keys.BucketMetaKey("bucket-c")))
 	require.False(t, filter(s3keys.BucketGenerationKey("bucket-c")))
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryRawRoute(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter([]byte("!s3|"), nil)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+}
+
+func TestRouteKeyFilterForGroupUsesPartitionResolver(t *testing.T) {
+	t.Parallel()
+
+	partitionedKey := []byte(sqsMsgDataPrefix + sqsPartitionMarker + "orders|partition-0|message")
+	resolver := &migrationFilterPartitionResolver{
+		groups: map[string]uint64{string(partitionedKey): 42},
+	}
+
+	require.True(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 7, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(
+		[]byte(sqsMsgDataPrefix+sqsPartitionMarker+"orders|unknown-partition"),
+	))
+}
+
+type migrationFilterPartitionResolver struct {
+	groups map[string]uint64
+}
+
+func (r *migrationFilterPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
+	gid, ok := r.groups[string(key)]
+	return gid, ok
+}
+
+func (r *migrationFilterPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(sqsMsgDataPrefix+sqsPartitionMarker))
 }

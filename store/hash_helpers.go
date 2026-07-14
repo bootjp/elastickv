@@ -162,3 +162,9 @@ func ExtractHashUserKeyFromField(key []byte) []byte {
 func ExtractHashUserKeyFromDelta(key []byte) []byte {
 	return extractWideColumnUserKey(key, []byte(HashMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }
+
+// ExtractHashUserKeyFromDeltaScanPrefix extracts the user key from a hash
+// metadata delta scan start/prefix.
+func ExtractHashUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(HashMetaDeltaPrefix), 0, false)
+}

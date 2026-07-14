@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -52,6 +53,71 @@ func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bo
 		ambiguousDispatch:     ambiguousDispatch,
 		ambiguousLands:        lands,
 	}
+}
+
+func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 10, Tail: 12, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 3})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2, 0), delta, 2, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 3)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(9), meta.Head)
+	require.Equal(t, int64(5), meta.Len)
+	require.Equal(t, int64(14), meta.Tail)
+}
+
+func TestResolveListMetaDoesNotTreatDeltaLookingMetaValueAsLegacyDelta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := deltaLookingListMetaUserKey([]byte("embedded"), 7, 1)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 2)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(4), meta.Head)
+	require.Equal(t, int64(2), meta.Len)
+	require.Equal(t, int64(6), meta.Tail)
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }
 
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {

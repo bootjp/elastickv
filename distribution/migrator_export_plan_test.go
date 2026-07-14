@@ -204,6 +204,22 @@ func TestMigrationBracketContainsRoutedKeyForS3BucketAuxiliaryState(t *testing.T
 	}
 }
 
+func TestMigrationBracketContainsRoutedKeyForS3BucketRawRoute(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	byFamily := bracketsByFamily(brackets)
+	routeStart := []byte("!s3|")
+
+	require.True(t, byFamily[MigrationFamilyS3BucketMeta].ContainsRoutedKey(
+		s3keys.BucketMetaKey("bucket-b"), routeStart, nil, s3keys.ExtractRouteKey,
+	))
+	require.True(t, byFamily[MigrationFamilyS3BucketGeneration].ContainsRoutedKey(
+		s3keys.BucketGenerationKey("bucket-b"), routeStart, nil, s3keys.ExtractRouteKey,
+	))
+}
+
 func TestMigrationBracketContainsRoutedKeyUsesObjectRoutes(t *testing.T) {
 	t.Parallel()
 

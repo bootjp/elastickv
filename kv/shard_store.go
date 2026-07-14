@@ -260,9 +260,9 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
-	// For internal list keys, shard routing is based on the logical user key
-	// rather than the raw key prefix.
-	if userKey := store.ExtractListUserKey(start); userKey != nil {
+	// For internal wide-column keys, shard routing is based on the logical
+	// user key rather than the raw key prefix.
+	if userKey := scanRouteUserKey(start); userKey != nil {
 		route, ok := s.engine.GetRoute(userKey)
 		if !ok {
 			return []distribution.Route{}, false
@@ -279,6 +279,30 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	}
 
 	return routes, true
+}
+
+func scanRouteUserKey(start []byte) []byte {
+	for _, extract := range scanRouteUserKeyExtractors {
+		if userKey := extract(start); userKey != nil {
+			return userKey
+		}
+	}
+	return nil
+}
+
+var scanRouteUserKeyExtractors = []func([]byte) []byte{
+	store.ExtractListUserKey,
+	store.ExtractListUserKeyFromDeltaScanPrefix,
+	store.ExtractLegacyListUserKeyFromDeltaScanPrefix,
+	store.ExtractListUserKeyFromClaimScanPrefix,
+	store.ExtractHashUserKeyFromField,
+	store.ExtractHashUserKeyFromDeltaScanPrefix,
+	store.ExtractSetUserKeyFromMember,
+	store.ExtractSetUserKeyFromDeltaScanPrefix,
+	store.ExtractZSetUserKeyFromMember,
+	store.ExtractZSetUserKeyFromScore,
+	store.ExtractZSetUserKeyFromScoreScanPrefix,
+	store.ExtractZSetUserKeyFromDeltaScanPrefix,
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {

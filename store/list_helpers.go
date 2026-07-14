@@ -14,6 +14,11 @@ const (
 	// Layout: !lst|delta|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>
 	ListMetaDeltaPrefix = "!lst|delta|"
 
+	// LegacyListMetaDeltaPrefix is the pre-upgrade list metadata delta prefix.
+	// Writers use ListMetaDeltaPrefix, but readers and compactors keep scanning
+	// this prefix until old uncompacted deltas have been drained.
+	LegacyListMetaDeltaPrefix = "!lst|meta|d|"
+
 	// ListClaimPrefix is the prefix for list claim keys used by POP operations.
 	// Layout: !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)>
 	ListClaimPrefix = "!lst|claim|"
@@ -85,8 +90,27 @@ func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 
 // ListMetaDeltaScanPrefix returns the prefix used to scan all delta keys for a userKey.
 func ListMetaDeltaScanPrefix(userKey []byte) []byte {
-	buf := make([]byte, 0, len(ListMetaDeltaPrefix)+wideColKeyLenSize+len(userKey))
-	buf = append(buf, ListMetaDeltaPrefix...)
+	return listMetaDeltaScanPrefixFor(ListMetaDeltaPrefix, userKey)
+}
+
+// LegacyListMetaDeltaScanPrefix returns the pre-upgrade delta scan prefix for a userKey.
+func LegacyListMetaDeltaScanPrefix(userKey []byte) []byte {
+	return listMetaDeltaScanPrefixFor(LegacyListMetaDeltaPrefix, userKey)
+}
+
+// ListMetaDeltaScanPrefixes returns all prefixes that may contain visible list
+// metadata deltas for userKey. New writers emit only ListMetaDeltaPrefix, but
+// upgrade reads must include LegacyListMetaDeltaPrefix until compaction drains it.
+func ListMetaDeltaScanPrefixes(userKey []byte) [][]byte {
+	return [][]byte{
+		ListMetaDeltaScanPrefix(userKey),
+		LegacyListMetaDeltaScanPrefix(userKey),
+	}
+}
+
+func listMetaDeltaScanPrefixFor(prefix string, userKey []byte) []byte {
+	buf := make([]byte, 0, len(prefix)+wideColKeyLenSize+len(userKey))
+	buf = append(buf, prefix...)
 	var kl [4]byte
 	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey))) //nolint:gosec // len is bounded by max slice size
 	buf = append(buf, kl[:]...)
@@ -134,9 +158,40 @@ func ExtractListUserKeyFromDelta(key []byte) []byte {
 	return extractWideColumnUserKey(key, []byte(ListMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }
 
+// ExtractLegacyListUserKeyFromDelta extracts the user key from an old
+// !lst|meta|d| delta key. Callers that only have a key must be careful: this
+// legacy layout overlaps with base !lst|meta| keys whose user key begins with
+// d|. Prefer using it when the associated value is known to be a delta value.
+func ExtractLegacyListUserKeyFromDelta(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(LegacyListMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
+}
+
+// ExtractListUserKeyFromDeltaScanPrefix extracts the user key from a new-list
+// delta scan start/prefix.
+func ExtractListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(ListMetaDeltaPrefix), 0, false)
+}
+
+// ExtractLegacyListUserKeyFromDeltaScanPrefix extracts the user key from a
+// legacy-list delta scan start/prefix.
+func ExtractLegacyListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(LegacyListMetaDeltaPrefix), 0, false)
+}
+
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.
 func ExtractListUserKeyFromClaim(key []byte) []byte {
 	return extractWideColumnUserKey(key, []byte(ListClaimPrefix), sortableInt64Bytes, true)
+}
+
+// ExtractListUserKeyFromClaimScanPrefix extracts the user key from a list claim
+// scan start/prefix.
+func ExtractListUserKeyFromClaimScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(ListClaimPrefix), 0, false)
+}
+
+// IsListMetaDeltaValue reports whether value has the fixed delta encoding.
+func IsListMetaDeltaValue(value []byte) bool {
+	return len(value) == listDeltaSizeBytes
 }
 
 func extractWideColumnUserKey(key, prefix []byte, suffixLen uint64, exactLen bool) []byte {

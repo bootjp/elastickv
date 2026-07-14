@@ -42,11 +42,16 @@ import (
 //     source of truth and the
 //     delta arithmetic is not
 //     replayed at backup time.
+//   - !lst|meta|d|...                 -> legacy meta delta. This overlaps
+//     with base !lst|meta| keys whose user key begins with d|, so routing
+//     checks both the key prefix and the 16-byte delta value shape before
+//     dropping it as a delta.
 const (
-	ListMetaPrefix      = "!lst|meta|"
-	ListItemPrefix      = "!lst|itm|"
-	ListMetaDeltaPrefix = "!lst|delta|"
-	ListClaimPrefix     = "!lst|claim|"
+	ListMetaPrefix            = "!lst|meta|"
+	ListItemPrefix            = "!lst|itm|"
+	ListMetaDeltaPrefix       = "!lst|delta|"
+	LegacyListMetaDeltaPrefix = "!lst|meta|d|"
+	ListClaimPrefix           = "!lst|claim|"
 
 	// listMetaBinarySize mirrors store/list_helpers.go (24 bytes:
 	// Head(8) + Tail(8) + Len(8)). Re-declared here rather than
@@ -57,6 +62,8 @@ const (
 	// listSeqBytes is the fixed width of the trailing sortable-int64
 	// sequence number in an !lst|itm| key.
 	listSeqBytes = 8
+
+	listMetaDeltaBinarySize = 16
 )
 
 // ErrRedisInvalidListMeta is returned when an !lst|meta| value is not
@@ -90,7 +97,7 @@ type redisListState struct {
 // records are the source of truth for the restored list contents and
 // the delta arithmetic does not need to be replayed at backup time.
 func (r *RedisDB) HandleListMeta(key, value []byte) error {
-	if bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
+	if isListMetaDeltaRecord(key, value) {
 		return nil
 	}
 	userKey, ok := parseListMetaKey(key)
@@ -171,6 +178,14 @@ func parseListMetaKey(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return rest, true
+}
+
+func isListMetaDeltaRecord(key, value []byte) bool {
+	if bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
+		return true
+	}
+	return bytes.HasPrefix(key, []byte(LegacyListMetaDeltaPrefix)) &&
+		len(value) == listMetaDeltaBinarySize
 }
 
 // parseListItemKey strips !lst|itm| and extracts (userKey, seq). The

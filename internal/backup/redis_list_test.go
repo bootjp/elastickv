@@ -58,6 +58,20 @@ func listMetaDeltaKey(userKey string, commitTS uint64, seqInTxn uint32) []byte {
 	return append(out, seq[:]...)
 }
 
+func legacyListMetaDeltaKey(userKey string, commitTS uint64, seqInTxn uint32) []byte {
+	out := []byte(LegacyListMetaDeltaPrefix)
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
+	out = append(out, l[:]...)
+	out = append(out, userKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	out = append(out, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(out, seq[:]...)
+}
+
 // listClaimKey mirrors store.ListClaimKey:
 // !lst|claim|<userKeyLen(4)><userKey><sortable_seq(8)>.
 func listClaimKey(userKey string, seq int64) []byte {
@@ -185,6 +199,45 @@ func TestRedisDB_ListEmptyListStillEmitsFile(t *testing.T) {
 	if items := listItemsArray(t, got); len(items) != 0 {
 		t.Fatalf("empty list should emit empty items array, got %v", items)
 	}
+}
+
+func TestRedisDB_ListLegacyDeltaIsSkippedButDeltaLookingMetaIsPreserved(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleListMeta(legacyListMetaDeltaKey("q", 10, 0), make([]byte, listMetaDeltaBinarySize)); err != nil {
+		t.Fatal(err)
+	}
+	userKey := string(deltaLookingListMetaUserKeyForBackup([]byte("real"), 11, 1))
+	if err := db.HandleListMeta(listMetaKey(userKey), listMetaValue(0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleListItem(listItemKey(userKey, 0), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := readListJSON(t, filepath.Join(root, "redis", "db_0", "lists", EncodeSegment([]byte(userKey))+".json"))
+	assertListItems(t, got, []any{"v"})
+	if _, err := os.Stat(filepath.Join(root, "redis", "db_0", "lists", "q.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy delta must not emit q.json: stat err=%v", err)
+	}
+}
+
+func deltaLookingListMetaUserKeyForBackup(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }
 
 // TestRedisDB_ListTTLInlinedFromScanIndex pins that !redis|ttl| records

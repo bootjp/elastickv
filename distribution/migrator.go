@@ -262,6 +262,9 @@ func (b MigrationBracket) containsDecodedS3Route(rawKey, routeStart, routeEnd []
 	if !ok {
 		return false
 	}
+	if routeKeyInRange(rawKey, routeStart, routeEnd) {
+		return true
+	}
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
 	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
 }

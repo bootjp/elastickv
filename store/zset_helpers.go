@@ -281,3 +281,15 @@ func ExtractZSetUserKeyFromMember(key []byte) []byte {
 func ExtractZSetUserKeyFromScore(key []byte) []byte {
 	return extractWideColumnUserKey(key, []byte(ZSetScorePrefix), zsetMetaSizeBytes, false)
 }
+
+// ExtractZSetUserKeyFromScoreScanPrefix extracts the user key from a zset
+// score-index scan start/prefix that does not yet include the sortable score.
+func ExtractZSetUserKeyFromScoreScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(ZSetScorePrefix), 0, false)
+}
+
+// ExtractZSetUserKeyFromDeltaScanPrefix extracts the user key from a zset
+// metadata delta scan start/prefix.
+func ExtractZSetUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(ZSetMetaDeltaPrefix), 0, false)
+}

@@ -162,3 +162,9 @@ func ExtractSetUserKeyFromMember(key []byte) []byte {
 func ExtractSetUserKeyFromDelta(key []byte) []byte {
 	return extractWideColumnUserKey(key, []byte(SetMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }
+
+// ExtractSetUserKeyFromDeltaScanPrefix extracts the user key from a set
+// metadata delta scan start/prefix.
+func ExtractSetUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(SetMetaDeltaPrefix), 0, false)
+}

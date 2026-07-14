@@ -925,12 +925,14 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	}
 	// Always delete the base meta key (no-op tombstone if it doesn't exist).
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-	// Delete all delta keys (paginated).
-	deltaElems, err := r.scanAllDeltaElems(ctx, store.ListMetaDeltaScanPrefix(key), readTS)
-	if err != nil {
-		return nil, err
+	// Delete all delta keys (paginated), including the pre-upgrade prefix.
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		deltaElems, err := r.scanAllDeltaElems(ctx, deltaPrefix, readTS)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, deltaElems...)
 	}
-	elems = append(elems, deltaElems...)
 	// Delete all claim keys (paginated).
 	claimElems, err := r.scanAllDeltaElems(ctx, store.ListClaimScanPrefix(key), readTS)
 	if err != nil {
@@ -1284,6 +1286,30 @@ func (r *RedisServer) aggregateLenDeltas(ctx context.Context, prefix []byte, rea
 	return sum, len(deltas) > 0, nil
 }
 
+func (r *RedisServer) aggregateListMetaDeltas(ctx context.Context, key []byte, readTS uint64, applyDelta func(store.ListMetaDelta)) (int64, bool, error) {
+	var total int64
+	var any bool
+	for _, prefix := range store.ListMetaDeltaScanPrefixes(key) {
+		lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, func(b []byte) (int64, error) {
+			if !store.IsListMetaDeltaValue(b) {
+				return 0, nil
+			}
+			d, unmarshalErr := store.UnmarshalListMetaDelta(b)
+			if unmarshalErr != nil {
+				return 0, errors.WithStack(unmarshalErr)
+			}
+			applyDelta(d)
+			return d.LenDelta, nil
+		})
+		if err != nil {
+			return 0, false, err
+		}
+		total += lenSum
+		any = any || hasDeltas
+	}
+	return total, any, nil
+}
+
 // resolveListMeta aggregates the base list metadata with all uncompacted Delta keys
 // visible at readTS. Returns ErrDeltaScanTruncated if > MaxDeltaScanLimit deltas exist.
 func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
@@ -1295,15 +1321,13 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS ui
 
 	// 2. Scan and aggregate delta keys.
 	// The closure also captures baseMeta to accumulate the list-specific HeadDelta.
-	prefix := store.ListMetaDeltaScanPrefix(key)
-	lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, func(b []byte) (int64, error) {
-		d, unmarshalErr := store.UnmarshalListMetaDelta(b)
+	lenSum, hasDeltas, err := r.aggregateListMetaDeltas(ctx, key, readTS, func(d store.ListMetaDelta) {
 		baseMeta.Head += d.HeadDelta
-		return d.LenDelta, errors.WithStack(unmarshalErr)
 	})
 	if err != nil {
 		if errors.Is(err, ErrDeltaScanTruncated) {
 			r.triggerUrgentCompaction("list", key)
+			r.triggerUrgentCompaction("list-legacy", key)
 		}
 		return store.ListMeta{}, false, err
 	}
