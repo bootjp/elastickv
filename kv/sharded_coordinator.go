@@ -1065,6 +1065,9 @@ func (c *ShardedCoordinator) rejectWriteFencedPointElems(elems []*Elem[OP]) erro
 }
 
 func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
+	if c.partitionResolverRecognisesPointKey(key) {
+		return nil
+	}
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
 		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
@@ -1079,6 +1082,16 @@ func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) partitionResolverRecognisesPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	if _, ok := c.router.partitionResolver.ResolveGroup(key); ok {
+		return true
+	}
+	return c.router.partitionResolver.RecognisesPartitionedKey(key)
 }
 
 func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) error {

@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -113,6 +114,75 @@ func TestShardedCoordinator_DispatchHonoursPartitionResolver(t *testing.T) {
 	calls := resolver.callKeys()
 	require.NotEmpty(t, calls)
 	require.Equal(t, []byte("!sqs|msg|data|p|partitioned-key"), calls[0])
+}
+
+func TestShardedCoordinatorWriteFencePrecheckHonoursPartitionResolver(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateWriteFenced},
+		},
+	}))
+
+	g1 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	g42 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 42}},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1:  {Txn: g1, Store: store.NewMVCCStore()},
+		42: {Txn: g42, Store: store.NewMVCCStore()},
+	}, 1, NewHLC(), nil)
+
+	key := []byte("!sqs|msg|data|p|partitioned-key")
+	coord.WithPartitionResolver(&stubResolver{claim: map[string]uint64{
+		string(key): 42,
+	}})
+
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(42), resp.CommitIndex)
+	require.Empty(t, g1.requests, "engine route fence must not preempt resolver-owned keys")
+	require.Len(t, g42.requests, 1)
+}
+
+func TestShardedCoordinatorWriteFencePrecheckSkipsUnresolvedPartitionKey(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateWriteFenced},
+		},
+	}))
+
+	g1 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1, Store: store.NewMVCCStore()},
+	}, 1, NewHLC(), nil)
+
+	key := []byte("!sqs|msg|data|p|unknown-partition-key")
+	coord.WithPartitionResolver(&stubResolver{
+		recognisedPrefix: []byte("!sqs|msg|data|p|"),
+	})
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrInvalidRequest)
+	require.False(t, errors.Is(err, ErrRouteWriteFenced),
+		"resolver-recognised keys must fail through resolver routing, not engine route fences")
+	require.Empty(t, g1.requests)
 }
 
 // TestShardedCoordinator_DispatchSplitsMutationsByResolverGroup is
