@@ -728,9 +728,12 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		writeS3MutationError(w, err, bucket, "")
 		return
 	}
-	// Phase 2: best-effort DEL_PREFIX safety net. See
-	// AdminDeleteBucket / runBucketDeleteSafetyNet for the contract.
-	s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration)
+	// Phase 2: DEL_PREFIX safety net. See AdminDeleteBucket /
+	// runBucketDeleteSafetyNet for the contract.
+	if err := s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration); err != nil {
+		writeS3MutationError(w, err, bucket, "")
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -44,6 +44,10 @@ func isRetryableRedisTxnErr(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
 }
 
+func shouldPreserveRedisTxnAttempt(err error) bool {
+	return isRetryableRedisTxnErr(err) && !errors.Is(err, kv.ErrRouteWriteFenced)
+}
+
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
 	if errors.Is(err, kv.ErrTxnLocked) {
 		return redisTxnLockedRetryPolicy

@@ -2216,12 +2216,10 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		// iteration rebuilds from a fresh snapshot.
 		return nil, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): the reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine).
-	if isRetryableRedisTxnErr(dispErr) {
+	// Still ambiguous (lock / other retryable): the reuse may itself have
+	// landed, so the next retry must probe THIS commit_ts. Route-fence
+	// rejections are retryable but pre-apply, so keep the older witness.
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return nil, false, errors.WithStack(dispErr)
@@ -2347,12 +2345,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 	}
 	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
 		// Only remember the attempt for reuse if retryRedisWrite will
-		// actually loop. Mirrors listPushCoreWithDedup's gating
-		// rationale — errors that escape the loop (transient-leader,
-		// context deadline, FSM apply error) leave pending pointing at
-		// state wasted with the goroutine; ambiguous errors that
-		// escape to the client are out of scope for this loop.
-		if isRetryableRedisTxnErr(dispErr) {
+		// actually loop and the attempt may have landed. Mirrors
+		// listPushCoreWithDedup's gating rationale; route-fence
+		// rejections are retryable but pre-apply.
+		if shouldPreserveRedisTxnAttempt(dispErr) {
 			return nil, &reusableExecTxn{
 				elems:    prepared.elems,
 				startTS:  txn.startTS,
