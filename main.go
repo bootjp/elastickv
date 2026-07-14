@@ -504,6 +504,7 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
+		adapter.WithSplitMigrationCapabilityGate(splitMigrationCapabilityGate),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
@@ -663,6 +664,10 @@ func shardGroupIDs(groups map[uint64]*kv.ShardGroup) []uint64 {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+func splitMigrationCapabilityGate(context.Context) error {
+	return nil
 }
 
 type runtimeConfig struct {

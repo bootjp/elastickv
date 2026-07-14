@@ -68,3 +68,9 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, catalog)
 }
+
+func TestSplitMigrationCapabilityGateIsReady(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, splitMigrationCapabilityGate(context.Background()))
+}
