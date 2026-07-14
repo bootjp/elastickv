@@ -767,7 +767,7 @@ func TestBuildCatalogSplitOps_UsesSurgicalSplitMutations(t *testing.T) {
 		ParentRouteID: 1,
 	}
 
-	ops, err := buildCatalogSplitOps(1, left, right, 2, 5)
+	ops, err := buildCatalogSplitOps(1, left, right, 2, 5, false)
 	require.NoError(t, err)
 	require.Len(t, ops, 5)
 	require.Equal(t, kv.Del, ops[0].Op)
