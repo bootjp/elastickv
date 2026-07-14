@@ -131,33 +131,32 @@ func IsListClaimKey(key []byte) bool {
 
 // ExtractListUserKeyFromDelta extracts the logical user key from a list delta key.
 func ExtractListUserKeyFromDelta(key []byte) []byte {
-	if !bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
-		return nil
-	}
-	trimmed := key[len(ListMetaDeltaPrefix):]
-	if len(trimmed) < wideColKeyLenSize+deltaKeyTSSize+deltaKeySeqSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	wantLen := uint64(wideColKeyLenSize) + uint64(ukLen) + uint64(deltaKeyTSSize+deltaKeySeqSize)
-	if uint64(len(trimmed)) != wantLen {
-		return nil
-	}
-	userEnd := wideColKeyLenSize + int(ukLen) //nolint:gosec // exact length check above bounds ukLen to len(trimmed)
-	return trimmed[wideColKeyLenSize:userEnd]
+	return extractWideColumnUserKey(key, []byte(ListMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }
 
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.
 func ExtractListUserKeyFromClaim(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
-	if len(trimmed) < wideColKeyLenSize+sortableInt64Bytes {
+	return extractWideColumnUserKey(key, []byte(ListClaimPrefix), sortableInt64Bytes, true)
+}
+
+func extractWideColumnUserKey(key, prefix []byte, suffixLen uint64, exactLen bool) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	trimmed := key[len(prefix):]
+	if uint64(len(trimmed)) < uint64(wideColKeyLenSize)+suffixLen {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(sortableInt64Bytes) { //nolint:gosec // constants fit in uint32
+	userEnd := uint64(wideColKeyLenSize) + uint64(ukLen)
+	minLen := userEnd + suffixLen
+	if minLen > uint64(len(trimmed)) {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	if exactLen && minLen != uint64(len(trimmed)) {
+		return nil
+	}
+	return trimmed[wideColKeyLenSize:int(userEnd)] //nolint:gosec // userEnd is bounded by len(trimmed) above.
 }
 
 // PrefixScanEnd returns the exclusive end key for a prefix scan.

@@ -264,53 +264,20 @@ func IsZSetMetaDeltaKey(key []byte) bool {
 
 // ExtractZSetUserKeyFromDelta extracts the logical user key from a zset delta key.
 func ExtractZSetUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ZSetMetaDeltaPrefix))
-	minLen := wideColKeyLenSize + deltaKeyTSSize + deltaKeySeqSize
-	if len(trimmed) < minLen {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(ZSetMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }
 
 // ExtractZSetUserKeyFromMeta extracts the logical user key from a zset meta key.
 func ExtractZSetUserKeyFromMeta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ZSetMetaPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(ZSetMetaPrefix), 0, true)
 }
 
 // ExtractZSetUserKeyFromMember extracts the logical user key from a zset member key.
 func ExtractZSetUserKeyFromMember(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ZSetMemberPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(ZSetMemberPrefix), 0, false)
 }
 
 // ExtractZSetUserKeyFromScore extracts the logical user key from a zset score index key.
 func ExtractZSetUserKeyFromScore(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ZSetScorePrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(ZSetScorePrefix), zsetMetaSizeBytes, false)
 }

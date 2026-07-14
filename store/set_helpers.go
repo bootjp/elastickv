@@ -150,40 +150,15 @@ func IsSetMetaDeltaKey(key []byte) bool {
 
 // ExtractSetUserKeyFromMeta extracts the logical user key from a set meta key.
 func ExtractSetUserKeyFromMeta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(SetMetaPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(SetMetaPrefix), 0, true)
 }
 
 // ExtractSetUserKeyFromMember extracts the logical user key from a set member key.
 func ExtractSetUserKeyFromMember(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(SetMemberPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(SetMemberPrefix), 0, false)
 }
 
 // ExtractSetUserKeyFromDelta extracts the logical user key from a set delta key.
 func ExtractSetUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(SetMetaDeltaPrefix))
-	minLen := wideColKeyLenSize + deltaKeyTSSize + deltaKeySeqSize
-	if len(trimmed) < minLen {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(SetMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
 }

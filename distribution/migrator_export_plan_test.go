@@ -225,6 +225,29 @@ func TestMigrationBracketContainsRoutedKeyUsesObjectRoutes(t *testing.T) {
 	))
 }
 
+func TestMigrationBracketContainsRoutedKeyAcceptsEmptyLogicalRouteKey(t *testing.T) {
+	t.Parallel()
+
+	routeEnd := []byte{0x01}
+	brackets, err := PlanMigrationBrackets(nil, routeEnd)
+	require.NoError(t, err)
+	hash := bracketsByFamily(brackets)[MigrationFamilyHash]
+	rawKey := store.HashMetaKey(nil)
+
+	require.True(t, hash.ContainsRoutedKey(
+		rawKey,
+		nil,
+		routeEnd,
+		store.ExtractHashUserKeyFromMeta,
+	))
+	require.False(t, hash.ContainsRoutedKey(
+		rawKey,
+		nil,
+		routeEnd,
+		func([]byte) []byte { return nil },
+	))
+}
+
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	t.Parallel()
 

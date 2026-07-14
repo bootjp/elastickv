@@ -278,7 +278,7 @@ func (b MigrationBracket) decodedS3Bucket(rawKey []byte) (string, bool) {
 }
 
 func routeKeyInRange(routeKey, routeStart, routeEnd []byte) bool {
-	if len(routeKey) == 0 {
+	if routeKey == nil {
 		return false
 	}
 	if bytes.Compare(routeKey, routeStart) < 0 {

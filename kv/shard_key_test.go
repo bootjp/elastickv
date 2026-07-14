@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -123,6 +124,38 @@ func TestRouteKey_NormalizesCollectionMigrationFamilies(t *testing.T) {
 	}
 }
 
+func TestRouteKey_MalformedWideColumnKeysFallBackToRaw(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		malformedWideColumnKey(store.ListClaimPrefix, 8),
+		malformedWideColumnKey(store.HashMetaPrefix, 0),
+		malformedWideColumnKey(store.HashFieldPrefix, 0),
+		malformedWideColumnKey(store.HashMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.SetMetaPrefix, 0),
+		malformedWideColumnKey(store.SetMemberPrefix, 0),
+		malformedWideColumnKey(store.SetMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.ZSetMetaPrefix, 0),
+		malformedWideColumnKey(store.ZSetMemberPrefix, 0),
+		malformedWideColumnKey(store.ZSetScorePrefix, 8),
+		malformedWideColumnKey(store.ZSetMetaDeltaPrefix, 12),
+	} {
+		require.NotPanics(t, func() {
+			require.Equal(t, raw, routeKey(raw), "malformed key %q must not decode to a logical route", raw)
+		})
+	}
+}
+
+func malformedWideColumnKey(prefix string, suffixLen int) []byte {
+	key := make([]byte, 0, len(prefix)+4+suffixLen)
+	key = append(key, prefix...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], ^uint32(0))
+	key = append(key, lenPrefix[:]...)
+	key = append(key, make([]byte, suffixLen)...)
+	return key
+}
+
 func TestRouteKey_NormalizesTxnSuccessMarkerByLockedKey(t *testing.T) {
 	t.Parallel()
 
@@ -193,4 +226,19 @@ func TestRouteKeyFilterTreatsNilAndEmptyEndAsInfinity(t *testing.T) {
 			require.True(t, filter([]byte("z")))
 		})
 	}
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter(
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+	)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+	require.True(t, filter(s3keys.ObjectManifestKey("bucket-b", 7, "m")))
+	require.False(t, filter(s3keys.BucketMetaKey("bucket-c")))
+	require.False(t, filter(s3keys.BucketGenerationKey("bucket-c")))
 }
