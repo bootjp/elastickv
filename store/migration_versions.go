@@ -235,10 +235,17 @@ func (s *mvccStore) exportVersionsLocked(ctx context.Context, opts ExportVersion
 }
 
 func (s *mvccStore) checkExportReadTSLocked(opts ExportVersionsOptions) error {
-	if readTSCompacted(opts.ReadTS, s.minRetainedTS) {
+	if readTSCompacted(exportRetentionReadTS(opts), s.minRetainedTS) {
 		return ErrReadTSCompacted
 	}
 	return nil
+}
+
+func exportRetentionReadTS(opts ExportVersionsOptions) uint64 {
+	if opts.ReadTS != 0 {
+		return opts.ReadTS
+	}
+	return opts.MaxCommitTSInclusive
 }
 
 var errExportReachedEnd = errors.New("export reached end")

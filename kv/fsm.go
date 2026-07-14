@@ -719,34 +719,70 @@ func (f *kvFSM) verifyTargetReadinessForRange(ctx context.Context, start []byte,
 }
 
 func (f *kvFSM) verifyTargetReadinessForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) error {
+	_, err := f.targetReadyRoutesForRouteRange(ctx, routeStart, routeEnd)
+	return err
+}
+
+func (f *kvFSM) targetReadyRoutesForRange(ctx context.Context, start []byte, end []byte) ([]distribution.Route, error) {
+	routeStart, routeEnd := readinessRouteRange(start, end)
+	return f.targetReadyRoutesForRouteRange(ctx, routeStart, routeEnd)
+}
+
+func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
+	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(routeStart, routeEnd)
+
 	reader, ok := f.store.(store.MigrationTargetReadinessReader)
 	if !ok {
-		return nil
+		return routes, nil
 	}
 	states, err := reader.MigrationTargetReadinessStates(ctx)
 	if err != nil {
-		return errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	if len(states) == 0 {
-		return nil
+		return routes, nil
 	}
+	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, f.shardGroupID, catalogVersion, proof) {
+		return routes, nil
+	}
+	return nil, errors.WithStack(ErrRouteCutoverPending)
+}
 
-	var (
-		snap  RouteSnapshot
-		proof bool
-	)
-	if f.routes != nil {
-		snap, proof = f.routes.Current()
+func (f *kvFSM) currentShardRoutesForRouteRange(routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	if f.routes == nil {
+		return nil, 0, false
 	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil, 0, false
+	}
+	routes := make([]distribution.Route, 0)
+	for _, route := range snap.IntersectingRoutes(routeStart, routeEnd) {
+		if route.GroupID == f.shardGroupID {
+			routes = append(routes, route)
+		}
+	}
+	return routes, snap.Version(), true
+}
+
+func targetReadinessStatesSatisfied(
+	states []store.TargetStagedReadinessState,
+	routes []distribution.Route,
+	routeStart []byte,
+	routeEnd []byte,
+	groupID uint64,
+	catalogVersion uint64,
+	proof bool,
+) bool {
 	for _, ready := range states {
 		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
 			continue
 		}
-		if !proof || !routesSatisfyTargetReadiness(snap.IntersectingRoutes(routeStart, routeEnd), ready, f.shardGroupID, snap.Version()) {
-			return errors.WithStack(ErrRouteCutoverPending)
+		if !proof || !routesSatisfyTargetReadiness(routes, ready, groupID, catalogVersion) {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState, groupID uint64, catalogVersion uint64) bool {
@@ -1114,13 +1150,71 @@ func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, star
 		}
 		seen[keyStr] = struct{}{}
 
-		latest, exists, err := f.store.LatestCommitTS(ctx, mut.Key)
+		latest, exists, err := f.latestCommitTSForTargetReadyKey(ctx, mut.Key)
 		if err != nil {
 			return errors.WithStack(err)
 		}
 		if exists && latest > startTS {
 			return errors.WithStack(store.NewWriteConflictError(mut.Key))
 		}
+	}
+	return nil
+}
+
+func (f *kvFSM) validateReadConflicts(ctx context.Context, keys [][]byte, startTS uint64) error {
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 || isTxnInternalKey(key) {
+			continue
+		}
+		keyStr := string(key)
+		if _, ok := seen[keyStr]; ok {
+			continue
+		}
+		seen[keyStr] = struct{}{}
+
+		latest, exists, err := f.latestCommitTSForTargetReadyKey(ctx, key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if exists && latest > startTS {
+			return errors.WithStack(store.NewWriteConflictError(key))
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) latestCommitTSForTargetReadyKey(ctx context.Context, key []byte) (uint64, bool, error) {
+	routes, err := f.targetReadyRoutesForRange(ctx, key, nextScanCursor(key))
+	if err != nil {
+		return 0, false, err
+	}
+	liveTS, liveExists, err := f.store.LatestCommitTS(ctx, key)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	latest, exists := liveTS, liveExists
+	for _, route := range routes {
+		if !routeHasStagedVisibility(route) {
+			continue
+		}
+		stagedTS, stagedExists, err := f.store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+		if err != nil {
+			return 0, false, errors.WithStack(err)
+		}
+		if stagedExists && (!exists || stagedTS > latest) {
+			latest, exists = stagedTS, true
+		}
+	}
+	return latest, exists, nil
+}
+
+func (f *kvFSM) validateTxnConflicts(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, startTS uint64) error {
+	if err := f.validateConflicts(ctx, muts, startTS); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := f.validateReadConflicts(ctx, readKeys, startTS); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
@@ -1177,8 +1271,8 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
-		return errors.WithStack(err)
+	if err := f.validateTxnConflicts(ctx, uniq, r.ReadKeys, startTS); err != nil {
+		return err
 	}
 
 	expireAt := txnLockExpireAt(meta.LockTTLms)
@@ -1243,12 +1337,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, commitTS)
-	if err != nil {
-		return err
-	}
-
-	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
+	uniq, storeMuts, err := f.onePhaseStoreMutations(ctx, muts, r.ReadKeys, startTS, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1257,6 +1346,27 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	}
 	f.notifyApplyObservers(commitTS, uniq)
 	return nil
+}
+
+func (f *kvFSM) onePhaseStoreMutations(
+	ctx context.Context,
+	muts []*pb.Mutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) ([]*pb.Mutation, []*store.KVPairMutation, error) {
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, commitTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := f.validateTxnConflicts(ctx, uniq, readKeys, startTS); err != nil {
+		return nil, nil, err
+	}
+	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
+	if err != nil {
+		return nil, nil, err
+	}
+	return uniq, storeMuts, nil
 }
 
 func (f *kvFSM) uniqueMutationsNotFenced(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {

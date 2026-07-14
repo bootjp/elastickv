@@ -70,10 +70,18 @@ func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
 		})
 		require.ErrorIs(t, err, ErrReadTSCompacted)
 
-		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		_, err = st.ExportVersions(ctx, ExportVersionsOptions{
 			StartKey:             []byte("k"),
 			EndKey:               []byte("l"),
 			MaxCommitTSInclusive: 15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 25,
 			MaxVersions:          10,
 		})
 		require.NoError(t, err)

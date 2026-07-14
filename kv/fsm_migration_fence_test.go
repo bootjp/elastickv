@@ -439,6 +439,71 @@ func TestFSMPrepareTxnChecksReadKeysForTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
+func TestFSMPrepareTxnChecksStagedVisibilityWriteConflicts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	require.NoError(t, fsm.store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged"), 20, 0))
+
+	err := fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{
+				Op:  pb.Op_PUT,
+				Key: []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("b"),
+					CommitTS:   120,
+					LockTTLms:  defaultTxnLockTTLms,
+				}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 10)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+
+	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMOnePhaseTxnChecksStagedVisibilityReadConflicts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	require.NoError(t, fsm.store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("n")), []byte("staged"), 20, 0))
+
+	req := onePhaseReq(10, 120, 0, []byte("b"), []byte("v"))
+	req.ReadKeys = [][]byte{[]byte("n")}
+
+	err := fsm.handleTxnRequest(ctx, req, 120)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
 func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
 	t.Parallel()
 
