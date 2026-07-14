@@ -204,3 +204,58 @@ func TestStampRawTimestampsRejectsRouteWriteFloor(t *testing.T) {
 	err := i.stampRawTimestamps(context.Background(), reqs)
 	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
 }
+
+func TestStampRawTimestampsRejectsPreStampedRouteWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte(""),
+			End:                 nil,
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	i := &Internal{routeEngine: engine}
+	reqs := []*pb.Request{{
+		Ts:        100,
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+
+	err := i.stampRawTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
+}
+
+func TestStampTxnTimestampsRejectsRouteWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte(""),
+			End:                 nil,
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	i := &Internal{routeEngine: engine}
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    50,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		},
+	}}
+
+	err := i.stampTxnTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
+}

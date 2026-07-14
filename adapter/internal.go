@@ -287,12 +287,23 @@ func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func
 		if !ok {
 			return false
 		}
-		routeKey := s3keys.RouteKey(bucket, 0, "")
-		if len(routeStart) > 0 && bytes.Compare(routeKey, routeStart) < 0 {
-			return false
-		}
-		return len(routeEnd) == 0 || bytes.Compare(routeKey, routeEnd) < 0
+		return decodedS3BucketRouteIntersects(bucket, routeStart, routeEnd)
 	}
+}
+
+func decodedS3BucketRouteIntersects(bucket string, routeStart, routeEnd []byte) bool {
+	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+}
+
+func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
+	if len(aEnd) > 0 && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if len(bEnd) > 0 && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
 }
 
 func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
@@ -407,14 +418,13 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts != 0 {
-			continue
+		if r.Ts == 0 {
+			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
+			if err != nil {
+				return err
+			}
+			r.Ts = ts
 		}
-		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
-		if err != nil {
-			return err
-		}
-		r.Ts = ts
 		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
 			return err
 		}
@@ -467,7 +477,10 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) e
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS); err != nil {
+		return err
+	}
+	return i.rejectWriteTimestampFloorTxnRequests(reqs)
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -531,6 +544,34 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		item.m.Value = kv.EncodeTxnMeta(item.meta)
 	}
 	return nil
+}
+
+func (i *Internal) rejectWriteTimestampFloorTxnRequests(reqs []*pb.Request) error {
+	for _, r := range reqs {
+		commitTS, ok := forwardedTxnRequestCommitTS(r)
+		if !ok {
+			continue
+		}
+		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forwardedTxnRequestCommitTS(r *pb.Request) (uint64, bool) {
+	if r == nil || (r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE) {
+		return 0, false
+	}
+	m, ok := forwardedTxnMetaMutation(r, []byte(kv.TxnMetaPrefix))
+	if !ok {
+		return 0, false
+	}
+	meta, err := kv.DecodeTxnMeta(m.Value)
+	if err != nil || meta.CommitTS == 0 {
+		return 0, false
+	}
+	return meta.CommitTS, true
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

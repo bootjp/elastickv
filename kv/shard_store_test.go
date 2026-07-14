@@ -101,6 +101,100 @@ func TestShardStoreGetAt_MergesStagedVisibilityPebbleExactKey(t *testing.T) {
 	require.Equal(t, []byte("staged-new"), got)
 }
 
+func TestShardStoreGetAt_MergesStagedVisibilityForS3BucketAuxiliary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  routeStart,
+				End:                    routeEnd,
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{2: group})
+
+	for _, tc := range []struct {
+		name  string
+		key   []byte
+		value []byte
+	}{
+		{name: "bucket meta", key: s3keys.BucketMetaKey(bucket), value: []byte("meta")},
+		{name: "bucket generation", key: s3keys.BucketGenerationKey(bucket), value: []byte("generation")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, tc.key), tc.value, 20, 0))
+
+			got, err := st.GetAt(ctx, tc.key, 25)
+			require.NoError(t, err)
+			require.Equal(t, tc.value, got)
+		})
+	}
+}
+
+func TestShardStoreRejectsS3BucketAuxiliaryWriteAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 routeStart,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID:             2,
+				Start:               routeStart,
+				End:                 routeEnd,
+				GroupID:             2,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID:             3,
+				Start:               routeEnd,
+				End:                 nil,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		require.ErrorIs(t, st.PutAt(ctx, key, []byte("v"), 100, 0), ErrRouteWriteTimestampTooLow)
+		require.ErrorIs(t, st.ApplyMutations(ctx, []*store.KVPairMutation{{Op: store.OpTypePut, Key: key, Value: []byte("v")}}, nil, 90, 100), ErrRouteWriteTimestampTooLow)
+	}
+}
+
 func TestShardStoreStagedVisibilityReadTSCompacted(t *testing.T) {
 	t.Parallel()
 
@@ -159,6 +253,33 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(40), ts)
+}
+
+func TestShardStoreRouteFilteredLeaderScanUsesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-b"), 20, 0))
+	route, _, ok := st.routeAndGroupForKey([]byte("b"))
+	require.True(t, ok)
+
+	filtered, cursorKVs, err := st.scanRouteAtLeaderRouteFilter(
+		ctx,
+		group,
+		route,
+		[]byte("a"),
+		[]byte("z"),
+		10,
+		10,
+		25,
+		false,
+		[]byte("b"),
+		[]byte("c"),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: []byte("b"), Value: []byte("staged-b")}}, filtered)
+	require.Equal(t, []*store.KVPair{{Key: []byte("b"), Value: []byte("staged-b")}}, cursorKVs)
 }
 
 func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {

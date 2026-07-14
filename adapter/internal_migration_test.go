@@ -225,6 +225,58 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteIntersection(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	const bucket = "bucket-b"
+	for _, tc := range []struct {
+		name   string
+		family uint32
+		prefix string
+		key    []byte
+		value  []byte
+	}{
+		{
+			name:   "bucket meta",
+			family: distribution.MigrationFamilyS3BucketMeta,
+			prefix: s3keys.BucketMetaPrefix,
+			key:    s3keys.BucketMetaKey(bucket),
+			value:  []byte("meta"),
+		},
+		{
+			name:   "bucket generation",
+			family: distribution.MigrationFamilyS3BucketGeneration,
+			prefix: s3keys.BucketGenerationPrefix,
+			key:    s3keys.BucketGenerationKey(bucket),
+			value:  []byte("generation"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, st.PutAt(ctx, tc.key, tc.value, 10, 0))
+
+			stream := &captureExportRangeVersionsStream{ctx: ctx}
+			err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+				MaxCommitTs:     20,
+				RouteStart:      s3keys.RouteKey(bucket, 7, "m"),
+				RouteEnd:        s3keys.RouteKey(bucket, 7, "z"),
+				KeyFamily:       tc.family,
+				RangeStart:      []byte(tc.prefix),
+				RangeEnd:        testPrefixScanEnd([]byte(tc.prefix)),
+				MaxScannedBytes: 1 << 20,
+			}, stream)
+			require.NoError(t, err)
+			require.Len(t, stream.responses, 1)
+			require.Equal(t, []*pb.MVCCVersion{
+				{Key: tc.key, CommitTs: 10, Value: tc.value, KeyFamily: tc.family},
+			}, stream.responses[0].GetVersions())
+		})
+	}
+}
+
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	t.Parallel()
 

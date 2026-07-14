@@ -1110,12 +1110,26 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[O
 		if elem == nil || len(elem.Key) == 0 {
 			continue
 		}
-		rkey := routeKey(elem.Key)
-		route, ok := c.engine.GetRoute(rkey)
-		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-			continue
+		if err := c.rejectWriteTimestampFloorPointKey(elem.Key, commitTS); err != nil {
+			return err
 		}
-		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", elem.Key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
+	rkey := routeKey(key)
+	if route, ok := c.engine.GetRoute(rkey); ok && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, rkey, commitTS, route.MinWriteTSExclusive)
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
+	}
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
+		}
 	}
 	return nil
 }
@@ -2195,12 +2209,9 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutat
 		if mut == nil || len(mut.Key) == 0 {
 			continue
 		}
-		rkey := routeKey(mut.Key)
-		route, ok := c.engine.GetRoute(rkey)
-		if !ok || route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-			continue
+		if err := c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS); err != nil {
+			return err
 		}
-		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", mut.Key, rkey, commitTS, route.MinWriteTSExclusive)
 	}
 	return nil
 }
