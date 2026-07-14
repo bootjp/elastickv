@@ -221,6 +221,8 @@ type recordingRawReadFenceStore struct {
 	scanReadRouteVersion     uint64
 	scanReadRouteStart       []byte
 	scanReadRouteEnd         []byte
+	scanReverse              bool
+	scanGroupID              uint64
 	scanRouteBoundsPresent   bool
 	callerSuppliedGetSeen    uint64
 	callerSuppliedScanSeen   uint64
@@ -247,10 +249,12 @@ func (s *recordingRawReadFenceStore) LatestCommitTSWithReadFence(_ context.Conte
 	return 10, true, nil
 }
 
-func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, _ bool, _ uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	s.scanReadRouteVersion = readRouteVersion
 	s.scanReadRouteStart = cloneTestBytes(routeStart)
 	s.scanReadRouteEnd = cloneTestBytes(routeEnd)
+	s.scanReverse = reverse
+	s.scanGroupID = groupID
 	s.scanRouteBoundsPresent = routeStart != nil || routeEnd != nil
 	if readRouteVersion == 97 {
 		s.callerSuppliedScanSeen = readRouteVersion
@@ -366,6 +370,32 @@ func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceSto
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.Zero(t, st.scanReadRouteVersion)
+}
+
+func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithReadFenceStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:           []byte("!redis|meta|"),
+		EndKey:             []byte("!redis|meta}"),
+		Limit:              10,
+		Ts:                 10,
+		GroupId:            42,
+		Reverse:            true,
+		RouteStart:         []byte("m"),
+		RouteBoundsPresent: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.True(t, st.scanReverse)
+	require.Equal(t, []byte("m"), st.scanReadRouteStart)
+	require.NotNil(t, st.scanReadRouteEnd)
+	require.Empty(t, st.scanReadRouteEnd)
 }
 
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {

@@ -1365,11 +1365,13 @@ func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, e
 func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64, limit int, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
 	cursor := start
+	scanned := 0
 	for {
 		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
 		if err != nil {
 			return nil, err
 		}
+		scanned += len(lockKVs)
 		for _, kvp := range lockKVs {
 			if kvp == nil || !routeKeyInScanBounds(kvp.Key, routeStart, routeEnd) {
 				continue
@@ -1381,6 +1383,9 @@ func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, 
 		}
 		if done {
 			return out, nil
+		}
+		if scanned >= limit {
+			return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
 		}
 		cursor = nextCursor
 	}
