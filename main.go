@@ -53,6 +53,8 @@ const (
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
+
+	splitMigrationCapabilityProbeTimeout = 2 * time.Second
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -498,13 +500,18 @@ func run() error {
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
 	startMemoryWatchdog(runCtx, eg, cancel)
+	splitMigrationGate := newSplitMigrationCapabilityGate(
+		splitMigrationCapabilityPeers(bootstrapCfg, cfg.defaultGroup),
+		splitMigrationCapabilityProbeTimeout,
+		nil,
+	)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
-		adapter.WithSplitMigrationCapabilityGate(splitMigrationCapabilityGate),
+		adapter.WithSplitMigrationCapabilityGate(splitMigrationGate),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
@@ -666,7 +673,82 @@ func shardGroupIDs(groups map[uint64]*kv.ShardGroup) []uint64 {
 	return ids
 }
 
-func splitMigrationCapabilityGate(context.Context) error {
+type splitMigrationCapabilityPeer struct {
+	ID      string
+	Address string
+}
+
+type splitMigrationCapabilityProbe func(context.Context, string) error
+
+func splitMigrationCapabilityPeers(cfg raftBootstrapConfig, defaultGroup uint64) []splitMigrationCapabilityPeer {
+	servers := cfg.adminSeed(defaultGroup)
+	if len(servers) == 0 {
+		return nil
+	}
+	peers := make([]splitMigrationCapabilityPeer, 0, len(servers))
+	seen := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		key := server.ID + "\x00" + server.Address
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		id := server.ID
+		if id == "" {
+			id = server.Address
+		}
+		peers = append(peers, splitMigrationCapabilityPeer{
+			ID:      id,
+			Address: server.Address,
+		})
+	}
+	return peers
+}
+
+func newSplitMigrationCapabilityGate(peers []splitMigrationCapabilityPeer, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
+	if probe == nil {
+		probe = probeSplitMigrationCapabilityPeer
+	}
+	return func(ctx context.Context) error {
+		if len(peers) == 0 {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		for _, peer := range peers {
+			peerCtx := ctx
+			cancel := func() {}
+			if timeout > 0 {
+				var cancelCtx context.CancelFunc
+				peerCtx, cancelCtx = context.WithTimeout(ctx, timeout)
+				cancel = cancelCtx
+			}
+			err := probe(peerCtx, peer.Address)
+			cancel()
+			if err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration capability peer %s is not ready: %v", peer.ID, err)
+			}
+		}
+		return nil
+	}
+}
+
+func probeSplitMigrationCapabilityPeer(ctx context.Context, address string) error {
+	if strings.TrimSpace(address) == "" {
+		return errors.New("empty split migration capability peer address")
+	}
+	conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+	if err != nil {
+		return errors.Wrapf(err, "dial split migration capability peer %s", address)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+	resp, err := pb.NewDistributionClient(conn).GetSplitMigrationCapability(ctx, &pb.GetSplitMigrationCapabilityRequest{})
+	if err != nil {
+		return errors.Wrapf(err, "probe split migration capability peer %s", address)
+	}
+	if resp == nil || !resp.GetMigrationCapable() {
+		return errors.New("peer does not advertise split migration capability")
+	}
 	return nil
 }
 

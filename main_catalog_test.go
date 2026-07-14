@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestDistributionCatalogGroupID_UsesCatalogKeyRoute(t *testing.T) {
@@ -69,8 +73,76 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 	require.NotNil(t, catalog)
 }
 
-func TestSplitMigrationCapabilityGateIsReady(t *testing.T) {
+func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 	t.Parallel()
 
-	require.NoError(t, splitMigrationCapabilityGate(context.Background()))
+	peers := []splitMigrationCapabilityPeer{
+		{ID: "n1", Address: "10.0.0.11:50051"},
+		{ID: "n2", Address: "10.0.0.12:50051"},
+	}
+	var probed []string
+	gate := newSplitMigrationCapabilityGate(peers, time.Second, func(_ context.Context, address string) error {
+		probed = append(probed, address)
+		return nil
+	})
+
+	require.NoError(t, gate(context.Background()))
+	require.Equal(t, []string{"10.0.0.11:50051", "10.0.0.12:50051"}, probed)
+}
+
+func TestSplitMigrationCapabilityGateFailsClosedWithoutPeers(t *testing.T) {
+	t.Parallel()
+
+	gate := newSplitMigrationCapabilityGate(nil, time.Second, func(context.Context, string) error {
+		t.Fatal("probe must not run without peers")
+		return nil
+	})
+
+	err := gate(context.Background())
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "peers are not configured")
+}
+
+func TestSplitMigrationCapabilityGateFailsClosedWhenPeerMissingCapability(t *testing.T) {
+	t.Parallel()
+
+	peers := []splitMigrationCapabilityPeer{
+		{ID: "n1", Address: "10.0.0.11:50051"},
+		{ID: "n2", Address: "10.0.0.12:50051"},
+	}
+	gate := newSplitMigrationCapabilityGate(peers, time.Second, func(_ context.Context, address string) error {
+		if address == "10.0.0.12:50051" {
+			return status.Error(codes.Unimplemented, "method not found")
+		}
+		return nil
+	})
+
+	err := gate(context.Background())
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "n2")
+	require.ErrorContains(t, err, "method not found")
+}
+
+func TestSplitMigrationCapabilityPeersUseDefaultGroupAdminSeed(t *testing.T) {
+	t.Parallel()
+
+	cfg := raftBootstrapConfig{
+		groupServers: map[uint64][]raftengine.Server{
+			1: {
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
+			},
+			2: {
+				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50052"},
+				{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50052"},
+			},
+		},
+	}
+
+	require.Equal(t, []splitMigrationCapabilityPeer{
+		{ID: "n1", Address: "10.0.0.11:50052"},
+		{ID: "n2", Address: "10.0.0.12:50052"},
+	}, splitMigrationCapabilityPeers(cfg, 2))
 }

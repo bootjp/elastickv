@@ -149,6 +149,16 @@ func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
 	require.ErrorContains(t, err, errDistributionCatalogNotConfigured.Error())
 }
 
+func TestDistributionServerGetSplitMigrationCapabilityReportsReady(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil)
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.True(t, resp.GetMigrationCapable())
+	require.Contains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
 func TestDistributionServerStartSplitMigration_FailsClosedUntilCapabilityGate(t *testing.T) {
 	t.Parallel()
 

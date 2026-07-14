@@ -99,6 +99,7 @@ const (
 	splitJobListCursorTerminalOff  = 1
 	splitJobListCursorJobIDOff     = splitJobListCursorTerminalOff + 8
 	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
+	splitMigrationCapabilityV2     = "split_migration_v2"
 )
 
 var (
@@ -241,6 +242,13 @@ func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.St
 	return &pb.StartSplitMigrationResponse{
 		CatalogVersion: snapshot.Version,
 		JobId:          job.JobID,
+	}, nil
+}
+
+func (s *DistributionServer) GetSplitMigrationCapability(context.Context, *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
+	return &pb.GetSplitMigrationCapabilityResponse{
+		MigrationCapable: true,
+		Capabilities:     []string{splitMigrationCapabilityV2},
 	}, nil
 }
 
