@@ -557,8 +557,19 @@ func isPebbleMetaKey(rawKey []byte) bool {
 }
 
 func isPebbleWriterRegistryKey(rawKey []byte) bool {
+	if !couldBePebbleWriterRegistryKey(rawKey) {
+		return false
+	}
 	_, _, err := encryption.DecodeRegistryKey(rawKey)
 	return err == nil
+}
+
+func couldBePebbleWriterRegistryKey(rawKey []byte) bool {
+	const writerRegistrySuffixSize = 4 + 1 + 2
+	prefix := encryption.WriterRegistryPrefix
+	return len(rawKey) == len(prefix)+writerRegistrySuffixSize &&
+		bytes.HasPrefix(rawKey, prefix) &&
+		rawKey[len(prefix)+4] == '|'
 }
 
 var errMVCCMetadataKeyCollision = errors.New("store: mvcc encoded key collides with reserved pebble metadata key")

@@ -104,19 +104,24 @@ func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosit
 	if !pos.hasKey {
 		return nil
 	}
-	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
-		return errors.WithStack(ErrInvalidExportCursor)
-	}
 	if pos.tag == exportCursorTagSkippedKey {
-		if opts.EndKey == nil || bytes.Compare(pos.key, opts.EndKey) < 0 {
+		if !exportSkippedCursorOutsideRange(opts, pos.key) {
 			return errors.WithStack(ErrInvalidExportCursor)
 		}
 		return nil
+	}
+	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
 	}
 	if opts.EndKey != nil && bytes.Compare(pos.key, opts.EndKey) >= 0 {
 		return errors.WithStack(ErrInvalidExportCursor)
 	}
 	return nil
+}
+
+func exportSkippedCursorOutsideRange(opts ExportVersionsOptions, key []byte) bool {
+	return (opts.StartKey != nil && bytes.Compare(key, opts.StartKey) < 0) ||
+		(opts.EndKey != nil && bytes.Compare(key, opts.EndKey) >= 0)
 }
 
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
@@ -132,7 +137,9 @@ func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOp
 func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
 	return opts.AcceptKey != nil ||
 		opts.MaxCommitTSInclusive != 0 ||
-		opts.MinCommitTSExclusive != 0
+		opts.MinCommitTSExclusive != 0 ||
+		opts.StartKey != nil ||
+		opts.EndKey != nil
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {

@@ -110,8 +110,8 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 		return true, true, nil
 	}
 	if pebbleExportCursorWholeKeySkipped(pos, userKey, commitTS) {
-		advancePebbleExportPastCurrentUserKey(iter, userKey)
-		return false, true, nil
+		done := advancePebbleExportPastCurrentUserKey(iter, opts, userKey, pos.tag, result)
+		return false, done, nil
 	}
 	if pebbleExportCursorEqual(pos, userKey, commitTS) {
 		return true, true, nil
@@ -138,8 +138,7 @@ func (s *pebbleStore) skipPebbleExportKeyOutsideRange(
 	result *ExportVersionsResult,
 ) (bool, error) {
 	if opts.StartKey != nil && bytes.Compare(userKey, opts.StartKey) < 0 {
-		advancePebbleExportPastCurrentUserKey(iter, userKey)
-		return true, nil
+		return true, skipPebbleExportWholeKey(iter, opts, userKey, commitTS, exportCursorTagSkippedKey, result)
 	}
 	if opts.EndKey == nil || bytes.Compare(userKey, opts.EndKey) < 0 {
 		return false, nil
@@ -147,15 +146,28 @@ func (s *pebbleStore) skipPebbleExportKeyOutsideRange(
 	if pebbleExportCanStopAtEndKey(opts.StartKey, opts.EndKey, userKey) {
 		return true, errExportReachedEnd
 	}
+	return true, skipPebbleExportWholeKey(iter, opts, userKey, commitTS, exportCursorTagSkippedKey, result)
+}
+
+func skipPebbleExportWholeKey(
+	iter *pebble.Iterator,
+	opts ExportVersionsOptions,
+	userKey []byte,
+	commitTS uint64,
+	tag byte,
+	result *ExportVersionsResult,
+) error {
 	rawValue := iter.Value()
 	result.ScannedBytes += versionExportSize(userKey, len(rawValue))
-	result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagSkippedKey)
+	result.NextCursor = encodeExportCursor(userKey, commitTS, tag)
 	if finishExportIfLimited(opts, result) {
 		result.Done = false
-		return true, errExportChunkFull
+		return errExportChunkFull
 	}
-	advancePebbleExportPastCurrentUserKey(iter, userKey)
-	return true, nil
+	if !advancePebbleExportPastCurrentUserKey(iter, opts, userKey, tag, result) {
+		return errExportChunkFull
+	}
+	return nil
 }
 
 func (s *pebbleStore) skipPebbleExportVersionBelowMinTS(
@@ -172,18 +184,31 @@ func (s *pebbleStore) skipPebbleExportVersionBelowMinTS(
 		result.Done = false
 		return false, false, nil
 	}
-	advancePebbleExportPastCurrentUserKey(iter, userKey)
-	return false, true, nil
+	return false, advancePebbleExportPastCurrentUserKey(iter, opts, userKey, exportCursorTagPrunedKey, result), nil
 }
 
-func advancePebbleExportPastCurrentUserKey(iter *pebble.Iterator, userKey []byte) {
+func advancePebbleExportPastCurrentUserKey(
+	iter *pebble.Iterator,
+	opts ExportVersionsOptions,
+	userKey []byte,
+	tag byte,
+	result *ExportVersionsResult,
+) bool {
 	userKey = bytes.Clone(userKey)
 	for iter.Next() {
-		currentUserKey, _ := decodeKeyView(iter.Key())
+		currentUserKey, commitTS := decodeKeyView(iter.Key())
 		if !bytes.Equal(currentUserKey, userKey) {
-			return
+			return true
+		}
+		rawValue := iter.Value()
+		result.ScannedBytes += versionExportSize(currentUserKey, len(rawValue))
+		result.NextCursor = encodeExportCursor(currentUserKey, commitTS, tag)
+		if finishExportIfLimited(opts, result) {
+			result.Done = false
+			return false
 		}
 	}
+	return true
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {

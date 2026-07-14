@@ -269,14 +269,23 @@ func TestExportVersionsMinTSPruneCursorSkipsWholeKey(t *testing.T) {
 		require.Empty(t, first.Versions)
 		require.NotEmpty(t, first.NextCursor)
 
-		second, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			Cursor:               first.NextCursor,
-			MinCommitTSExclusive: 10,
-			MaxVersions:          10,
-		})
-		require.NoError(t, err)
-		require.True(t, second.Done)
-		require.Equal(t, []MVCCVersion{{Key: []byte("tail"), CommitTS: 20, Value: []byte("v20")}}, second.Versions)
+		cursor := first.NextCursor
+		for attempts := 0; attempts < 4; attempts++ {
+			next, err := st.ExportVersions(ctx, ExportVersionsOptions{
+				Cursor:               cursor,
+				MinCommitTSExclusive: 10,
+				MaxVersions:          10,
+			})
+			require.NoError(t, err)
+			if next.Done {
+				require.Equal(t, []MVCCVersion{{Key: []byte("tail"), CommitTS: 20, Value: []byte("v20")}}, next.Versions)
+				return
+			}
+			require.Empty(t, next.Versions)
+			require.NotEmpty(t, next.NextCursor)
+			cursor = next.NextCursor
+		}
+		t.Fatal("export did not finish after bounded pruned-key cursor resumes")
 	})
 }
 
@@ -614,6 +623,86 @@ func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, second.Done)
 	require.Equal(t, []MVCCVersion{{Key: []byte{}, CommitTS: 20, Value: []byte("empty")}}, second.Versions)
+}
+
+func TestPebbleExportOutOfRangeEndSkipChargesAllVersions(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-out-of-range-end-skip-versions-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("v10"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("v20"), 20, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("v30"), 30, 0))
+	require.NoError(t, st.PutAt(ctx, nil, []byte("empty"), 40, 0))
+
+	first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:          []byte("a"),
+		MaxVersions:     10,
+		MaxScannedBytes: versionExportSize([]byte("b"), len("v30")) + 1,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Empty(t, first.Versions)
+	require.NotEmpty(t, first.NextCursor)
+	require.GreaterOrEqual(t, first.ScannedBytes, versionExportSize([]byte("b"), len("v30"))+1)
+
+	second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:      []byte("a"),
+		Cursor:      first.NextCursor,
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, second.Done)
+	require.Equal(t, []MVCCVersion{{Key: []byte{}, CommitTS: 40, Value: []byte("empty")}}, second.Versions)
+}
+
+func TestPebbleExportAppliesDefaultScanBudgetForRangeBoundSkip(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-range-bound-scan-budget-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
+	require.NoError(t, st.PutAt(ctx, []byte("b"), value, 10, 0))
+	require.NoError(t, st.PutAt(ctx, nil, []byte("empty"), 20, 0))
+
+	first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:      []byte("a"),
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Empty(t, first.Versions)
+	require.NotEmpty(t, first.NextCursor)
+	require.GreaterOrEqual(t, first.ScannedBytes, uint64(defaultSparseExportMaxScannedBytes))
+
+	second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:      []byte("a"),
+		Cursor:      first.NextCursor,
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, second.Done)
+	require.Equal(t, []MVCCVersion{{Key: []byte{}, CommitTS: 20, Value: []byte("empty")}}, second.Versions)
+}
+
+func TestPebbleWriterRegistryKeyShapeRejectsOrdinaryRows(t *testing.T) {
+	registryKey := encryption.RegistryKey(1, 2)
+	require.True(t, isPebbleWriterRegistryKey(registryKey))
+
+	ordinary := encodeKey([]byte("ordinary"), 10)
+	require.False(t, isPebbleWriterRegistryKey(ordinary))
+
+	malformed := bytes.Clone(registryKey)
+	malformed[len(encryption.WriterRegistryPrefix)+4] = '#'
+	require.False(t, isPebbleWriterRegistryKey(malformed))
 }
 
 func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
