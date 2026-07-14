@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -117,6 +118,24 @@ func newReadinessReadKeyFSM(t *testing.T) *kvFSM {
 	return fsm
 }
 
+func s3BucketAuxiliaryFenceRoutes(bucket string, rawGroupID, fencedGroupID uint64) []distribution.RouteDescriptor {
+	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	end := prefixScanEnd(start)
+	return []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: start, GroupID: rawGroupID, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: start, End: end, GroupID: fencedGroupID, State: distribution.RouteStateWriteFenced},
+		{RouteID: 3, Start: end, End: nil, GroupID: rawGroupID, State: distribution.RouteStateActive},
+	}
+}
+
+func newS3BucketAuxiliaryWriteFencedFSM(t *testing.T, bucket string) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, s3BucketAuxiliaryFenceRoutes(bucket, 1, 1))
+	return newComposed1FSM(t, engine, 1)
+}
+
 func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -201,6 +220,27 @@ func TestFSMRejectsTargetReadinessProofFromAnotherGroup(t *testing.T) {
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
 	}, 101)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	fsm := newS3BucketAuxiliaryWriteFencedFSM(t, bucket)
+
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		err := fsm.handleRawRequest(ctx, &pb.Request{
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
+		}, 10)
+		require.ErrorIs(t, err, ErrRouteWriteFenced)
+
+		_, getErr := fsm.store.GetAt(ctx, key, ^uint64(0))
+		require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+	}
 }
 
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {

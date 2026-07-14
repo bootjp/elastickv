@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"testing"
@@ -96,6 +97,30 @@ func TestRegistrationGate_DirectPathFailsClosedBeforeRegistration(t *testing.T) 
 		mustGet(t, f.mvcc, []byte("a"), 250, "1")
 	})
 
+	t.Run("ImportVersions", func(t *testing.T) {
+		t.Parallel()
+		registered := false
+		f := newRegGateStore(t, &registered)
+		opts := ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 1,
+			BatchSeq:  1,
+			Cursor:    []byte("cursor"),
+			Versions: []MVCCVersion{
+				{Key: []byte("import"), CommitTS: 100, Value: []byte("v")},
+			},
+		}
+		_, err := f.mvcc.ImportVersions(ctx, opts)
+		if !errors.Is(err, ErrWriterNotRegistered) {
+			t.Fatalf("ImportVersions pre-registration: got %v, want ErrWriterNotRegistered", err)
+		}
+		registered = true
+		if _, err := f.mvcc.ImportVersions(ctx, opts); err != nil {
+			t.Fatalf("ImportVersions post-registration: %v", err)
+		}
+		mustGet(t, f.mvcc, []byte("import"), 150, "v")
+	})
+
 	t.Run("ExpireAt", func(t *testing.T) {
 		t.Parallel()
 		// ExpireAt re-encrypts the latest value, so seed a value first
@@ -133,6 +158,63 @@ func TestRegistrationGate_FSMApplyPathNeverGated(t *testing.T) {
 		t.Fatalf("ApplyMutationsRaft must not be gated, got: %v", err)
 	}
 	mustGet(t, f.mvcc, []byte("raft"), 150, "applied")
+
+	_, err := f.mvcc.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:     2,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor"),
+		Versions: []MVCCVersion{
+			{Key: []byte("raft-import"), CommitTS: 200, Value: []byte("imported")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ImportVersionsRaft must not be gated, got: %v", err)
+	}
+	mustGet(t, f.mvcc, []byte("raft-import"), 250, "imported")
+}
+
+func TestRegistrationGate_PromoteVersionsNeverGated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	registered := true
+	f := newRegGateStore(t, &registered)
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+
+	if err := f.mvcc.PutAt(ctx, stage("promote"), []byte("value"), 100, 0); err != nil {
+		t.Fatalf("seed staged PutAt: %v", err)
+	}
+	registered = false
+	if err := f.mvcc.PutAt(ctx, []byte("direct"), []byte("blocked"), 110, 0); !errors.Is(err, ErrWriterNotRegistered) {
+		t.Fatalf("direct PutAt pre-registration: got %v, want ErrWriterNotRegistered", err)
+	}
+	promoter, ok := f.mvcc.(MigrationPromoter)
+	if !ok {
+		t.Fatalf("expected MigrationPromoter, got %T", f.mvcc)
+	}
+
+	result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    []byte("stage|"),
+		EndKey:      PrefixScanEnd([]byte("stage|")),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	if err != nil {
+		t.Fatalf("PromoteVersions pre-registration: %v", err)
+	}
+	if !result.Done || result.PromotedRows != 1 {
+		t.Fatalf("PromoteVersions result = %+v, want done with one promoted row", result)
+	}
+	mustGet(t, f.mvcc, []byte("promote"), 150, "value")
+	if _, err := f.mvcc.GetAt(ctx, stage("promote"), 150); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("staged version after promotion: got %v, want ErrKeyNotFound", err)
+	}
 }
 
 // TestRegistrationGate_NotEncryptingIsUngated confirms the gate is only

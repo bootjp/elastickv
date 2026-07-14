@@ -68,7 +68,7 @@ type mvccStore struct {
 	log                     *slog.Logger
 	lastCommitTS            uint64
 	minRetainedTS           uint64
-	migrationAcks           map[string]migrationImportAck
+	migrationAcks           map[migrationAckID]migrationImportAck
 	migrationHLCFloors      map[uint64]uint64
 	migrationPromotions     map[uint64]PromotionState
 	migrationReadiness      map[uint64]TargetStagedReadinessState
@@ -119,7 +119,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		migrationAcks:       make(map[string]migrationImportAck),
+		migrationAcks:       make(map[migrationAckID]migrationImportAck),
 		migrationHLCFloors:  make(map[uint64]uint64),
 		migrationPromotions: make(map[uint64]PromotionState),
 		migrationReadiness:  make(map[uint64]TargetStagedReadinessState),
@@ -961,6 +961,9 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.tree = tree
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
+	s.migrationAcks = make(map[migrationAckID]migrationImportAck)
+	s.migrationHLCFloors = make(map[uint64]uint64)
+	s.migrationPromotions = make(map[uint64]PromotionState)
 	s.migrationReadiness = targetReadinessStateMap(readinessStates)
 	s.migrationReadinessCache = cloneTargetStagedReadinessStates(readinessStates)
 	return nil

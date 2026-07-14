@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -286,18 +287,7 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	)
 	lastID := ""
 	for i := range total {
-		var id string
-		err := retryNotLeader(ctx, func() error {
-			var xerr error
-			id, xerr = rdb.XAdd(ctx, &redis.XAddArgs{
-				Stream: "stream-lat",
-				ID:     "*",
-				Values: []string{"i", fmt.Sprint(i)},
-			}).Result()
-			return xerr
-		})
-		require.NoError(t, err)
-		lastID = id
+		lastID = xaddStreamLatencySeed(t, ctx, rdb, fmt.Sprint(i))
 	}
 
 	measure := func() time.Duration {
@@ -359,6 +349,34 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	require.LessOrEqualf(t, p95, p95Ceiling,
 		"XREAD p95 latency should not grow with stream size: baseline=%s median=%s p95=%s",
 		baseline, median, p95)
+}
+
+func xaddStreamLatencySeed(t *testing.T, ctx context.Context, rdb *redis.Client, value string) string {
+	t.Helper()
+
+	const maxAttempts = 10
+	for attempt := range maxAttempts {
+		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: "stream-lat",
+			ID:     "*",
+			Values: []string{"i", value},
+		}).Result()
+		if err == nil {
+			return id
+		}
+		if attempt == maxAttempts-1 || !isRetryableStreamLatencySeedErr(err) {
+			require.NoError(t, err)
+		}
+		time.Sleep(time.Duration(attempt+1) * leaderChurnRetryInterval)
+	}
+	return ""
+}
+
+func isRetryableStreamLatencySeedErr(err error) bool {
+	if err == nil || isTransientNotLeaderErr(err) {
+		return err != nil
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "write conflict")
 }
 
 func TestRedis_StreamXTrimMaxLen(t *testing.T) {

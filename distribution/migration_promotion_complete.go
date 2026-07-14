@@ -177,7 +177,7 @@ func (s *CatalogStore) buildPromotionCompleteMutations(
 		nextVersion: expectedVersion + 1,
 		routes:      completion.Routes,
 	}
-	mutations, err := s.buildSaveMutations(ctx, plan)
+	mutations, err := s.buildSaveMutations(ctx, &plan)
 	if err != nil {
 		return savePlan{}, nil, 0, err
 	}

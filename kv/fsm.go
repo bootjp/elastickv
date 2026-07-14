@@ -122,7 +122,7 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
-	// RouteOf returns the route descriptor that covered key at this
+	// RouteOf returns the complete route descriptor covering key at this
 	// snapshot's version. Used by apply-time target-readiness checks to
 	// prove staged/cleared descriptor state before mutating the store.
 	RouteOf(key []byte) (distribution.Route, bool)
@@ -286,6 +286,8 @@ var ErrUnknownRequestType = errors.New("unknown request type")
 // WriteFenced state during split migration. Callers should retry after routing
 // catches up to the promoted owner.
 var ErrRouteWriteFenced = errors.New("route is write-fenced; retry after route migration")
+
+var ErrRouteWriteTimestampTooLow = errors.New("route write timestamp is below migration floor")
 
 // ErrComposed1Violation is returned by verifyComposed1 when the
 // transaction's commit cannot proceed on this Raft group because the
@@ -520,10 +522,8 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return f.handleDelPrefix(ctx, prefix, commitTS)
 	}
 
-	for _, mut := range r.Mutations {
-		if err := f.verifyRawMutationCanApply(ctx, mut, commitTS); err != nil {
-			return err
-		}
+	if err := f.validateRawMutationsForApply(ctx, r.Mutations, commitTS); err != nil {
+		return err
 	}
 
 	muts, err := toStoreMutations(r.Mutations)
@@ -539,7 +539,16 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	return nil
 }
 
-func (f *kvFSM) verifyRawMutationCanApply(ctx context.Context, mut *pb.Mutation, commitTS uint64) error {
+func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, muts []*pb.Mutation, commitTS uint64) error {
+	for _, mut := range muts {
+		if err := f.validateRawMutationForApply(ctx, mut, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, commitTS uint64) error {
 	if mut == nil || len(mut.Key) == 0 {
 		return errors.WithStack(ErrInvalidRequest)
 	}
@@ -639,10 +648,13 @@ func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
 		return nil
 	}
 	rkey := routeKey(key)
-	if !snap.WriteFencedForKey(rkey) {
-		return nil
+	if snap.WriteFencedForKey(rkey) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
 	}
-	return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok && snap.WriteFencedIntersects(start, end) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+	}
+	return nil
 }
 
 func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
@@ -843,6 +855,11 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	}
 	start := routeKey(prefix)
 	return start, prefixScanEnd(start)
+}
+
+// RoutePrefixRange maps a raw key prefix to the routed key range it may touch.
+func RoutePrefixRange(prefix []byte) ([]byte, []byte) {
+	return routePrefixRange(prefix)
 }
 
 func routeKeyspaceWideRawPrefix(prefix []byte) bool {
@@ -1406,7 +1423,37 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, muts []*pb
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
+	if landed {
+		return true, nil
+	}
+	route, ok := f.currentStagedVisibilityRouteForKey(meta.PrimaryKey)
+	if !ok {
+		return false, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, meta.PrimaryKey)
+	landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
 	return landed, nil
+}
+
+func (f *kvFSM) currentStagedVisibilityRouteForKey(key []byte) (distribution.Route, bool) {
+	if f == nil || f.routes == nil || len(key) == 0 {
+		return distribution.Route{}, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return distribution.Route{}, false
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return distribution.Route{}, false
+	}
+	route, ok := snap.RouteOf(routeKey(key))
+	if !ok || route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
+		return distribution.Route{}, false
+	}
+	return route, true
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
