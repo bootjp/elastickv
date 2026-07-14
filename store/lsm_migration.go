@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -102,7 +103,7 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 		return false, false, errors.WithStack(err)
 	}
 	rawKey := iter.Key()
-	if isPebbleMetaKey(rawKey) {
+	if isPebbleExportMetadataKey(rawKey) {
 		return true, true, nil
 	}
 	userKey, commitTS := decodeKeyView(rawKey)
@@ -124,6 +125,10 @@ func (s *pebbleStore) exportPebbleIteratorPosition(
 	}
 	done, err = s.exportPebbleVersion(iter, opts, userKey, commitTS, result)
 	return true, done, err
+}
+
+func isPebbleExportMetadataKey(rawKey []byte) bool {
+	return isPebbleMetaKey(rawKey) || bytes.HasPrefix(rawKey, encryption.WriterRegistryPrefix)
 }
 
 func (s *pebbleStore) skipPebbleExportKeyOutsideRange(iter *pebble.Iterator, opts ExportVersionsOptions, userKey []byte) (bool, error) {

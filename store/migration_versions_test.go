@@ -363,6 +363,35 @@ func TestPebbleExportSkipsWriterRegistryRows(t *testing.T) {
 	require.Equal(t, []MVCCVersion{{Key: []byte("user"), CommitTS: 10, Value: []byte("value")}}, res.Versions)
 }
 
+func TestPebbleExportSkipsWriterRegistryRowsWithoutUserVersions(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-writer-registry-only-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	registry, err := WriterRegistryFor(st)
+	require.NoError(t, err)
+	require.NoError(t, registry.SetRegistryRow(
+		encryption.RegistryKey(1, 2),
+		encryption.EncodeRegistryValue(encryption.RegistryValue{
+			FullNodeID:          2,
+			FirstSeenLocalEpoch: 1,
+			LastSeenLocalEpoch:  1,
+		}),
+	))
+
+	res, err := st.ExportVersions(ctx, ExportVersionsOptions{MaxVersions: 10})
+	require.NoError(t, err)
+	require.True(t, res.Done)
+	require.Empty(t, res.NextCursor)
+	require.Empty(t, res.Versions)
+	require.Zero(t, res.ScannedBytes)
+	require.Zero(t, res.AcceptedRows)
+}
+
 func TestPebbleExportStopsAtEndKey(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-end-key-*")
