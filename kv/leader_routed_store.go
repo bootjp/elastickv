@@ -181,14 +181,15 @@ func (s *LeaderRoutedStore) proxyRawScanAtWithReadFence(
 
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey:         start,
-		EndKey:           end,
-		Limit:            int64(limit),
-		Ts:               ts,
-		Reverse:          reverse,
-		ReadRouteVersion: readRouteVersion,
-		RouteStart:       bytes.Clone(routeStart),
-		RouteEnd:         bytes.Clone(routeEnd),
+		StartKey:           start,
+		EndKey:             end,
+		Limit:              int64(limit),
+		Ts:                 ts,
+		Reverse:            reverse,
+		ReadRouteVersion:   readRouteVersion,
+		RouteStart:         bytes.Clone(routeStart),
+		RouteEnd:           bytes.Clone(routeEnd),
+		RouteBoundsPresent: routeScanBoundsPresent(routeStart, routeEnd),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
