@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -277,6 +278,63 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 		require.True(t, stagedLeft.Done)
 		require.Empty(t, stagedLeft.Versions)
 	})
+}
+
+func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			require.NoError(t, st.Close())
+		}
+	})
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok)
+
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+	prefix := []byte("stage|")
+
+	const promotedTS uint64 = 100
+	require.NoError(t, ps.db.Set(encodeKey(stage("k"), promotedTS), encodeValue([]byte("v100"), false, 0, encStateCleartext), pebble.NoSync))
+	require.Zero(t, ps.LastCommitTS())
+
+	result, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       101,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+	require.Equal(t, uint64(1), result.PromotedRows)
+	require.Equal(t, promotedTS, result.MaxPromotedTS)
+	require.Equal(t, promotedTS, ps.LastCommitTS())
+
+	metaTS, err := readPebbleUint64(ps.db, metaLastCommitTSBytes)
+	require.NoError(t, err)
+	require.Equal(t, promotedTS, metaTS)
+	val, err := ps.GetAt(ctx, []byte("k"), ps.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
+
+	require.NoError(t, st.Close())
+	closed = true
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, promotedTS, reopened.LastCommitTS())
+	val, err = reopened.GetAt(ctx, []byte("k"), reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
 }
 
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {

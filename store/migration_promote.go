@@ -219,7 +219,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 	}
 	if opts.JobID != 0 && state.Done {
 		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows}
-		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex)
+		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, 0)
 	}
 	opts.Cursor = cursor
 	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
@@ -227,7 +227,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 		return PromoteVersionsResult{}, err
 	}
 	result, stateToWrite := finishPromotionResult(opts, state, exported, promoted)
-	return s.finishPebblePromotion(toPromote, opts.JobID, stateToWrite, result, opts.AppliedIndex)
+	return s.finishPebblePromotion(toPromote, opts.JobID, stateToWrite, result, opts.AppliedIndex, promoted.MaxPromotedTS)
 }
 
 func (s *pebbleStore) finishPebblePromotion(
@@ -236,11 +236,12 @@ func (s *pebbleStore) finishPebblePromotion(
 	stateToWrite *PromotionState,
 	result PromoteVersionsResult,
 	appliedIndex uint64,
+	maxPromotedTS uint64,
 ) (PromoteVersionsResult, error) {
-	if len(toPromote) == 0 && stateToWrite == nil && appliedIndex == 0 {
+	if len(toPromote) == 0 && stateToWrite == nil && appliedIndex == 0 && maxPromotedTS == 0 {
 		return result, nil
 	}
-	if err := s.commitPebblePromoteVersions(toPromote, jobID, stateToWrite, appliedIndex); err != nil {
+	if err := s.commitPebblePromoteVersions(toPromote, jobID, stateToWrite, appliedIndex, maxPromotedTS); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	return result, nil
@@ -322,7 +323,7 @@ func (s *pebbleStore) readPebblePromotionState(jobID uint64) (PromotionState, bo
 	return state, true, nil
 }
 
-func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jobID uint64, state *PromotionState, appliedIndex uint64) error {
+func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jobID uint64, state *PromotionState, appliedIndex, maxPromotedTS uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	targets := make([]MVCCVersion, 0, len(versions))
@@ -348,6 +349,26 @@ func (s *pebbleStore) commitPebblePromoteVersions(versions []promotedVersion, jo
 		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
 			return err
 		}
+	}
+	return s.commitPebblePromotionBatch(batch, maxPromotedTS)
+}
+
+func (s *pebbleStore) commitPebblePromotionBatch(batch *pebble.Batch, maxPromotedTS uint64) error {
+	if maxPromotedTS > 0 {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+		newLastTS := s.lastCommitTS
+		if maxPromotedTS > newLastTS {
+			newLastTS = maxPromotedTS
+		}
+		if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
+			return err
+		}
+		if err := batch.Commit(s.directApplyWriteOpts()); err != nil {
+			return errors.WithStack(err)
+		}
+		s.updateLastCommitTS(newLastTS)
+		return nil
 	}
 	if err := batch.Commit(s.directApplyWriteOpts()); err != nil {
 		return errors.WithStack(err)
