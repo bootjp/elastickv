@@ -52,11 +52,11 @@ func (s *pebbleStore) ApplyTargetStagedReadiness(_ context.Context, state Target
 	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	if err := s.db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), s.directApplyWriteOpts()); err != nil {
 		return errors.WithStack(err)
 	}
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
 	return nil
 }

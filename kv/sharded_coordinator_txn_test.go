@@ -144,8 +144,8 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, []byte("b"), prepareMeta2.PrimaryKey)
 	require.Equal(t, defaultTxnLockTTLms, prepareMeta1.LockTTLms)
 	require.Equal(t, defaultTxnLockTTLms, prepareMeta2.LockTTLms)
-	require.Zero(t, prepareMeta1.CommitTS)
-	require.Zero(t, prepareMeta2.CommitTS)
+	require.Greater(t, prepareMeta1.CommitTS, startTS)
+	require.Equal(t, prepareMeta1.CommitTS, prepareMeta2.CommitTS)
 
 	require.Equal(t, pb.Phase_COMMIT, g1Commit.Phase)
 	require.Equal(t, pb.Phase_COMMIT, g2Commit.Phase)
@@ -164,7 +164,7 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, []byte("b"), commitMeta2.PrimaryKey)
 	require.Zero(t, commitMeta1.LockTTLms)
 	require.Zero(t, commitMeta2.LockTTLms)
-	require.Greater(t, commitMeta1.CommitTS, startTS)
+	require.Equal(t, prepareMeta1.CommitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
 }
 
@@ -244,6 +244,10 @@ func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitMeta2 := requestTxnMeta(t, g2Txn.requests[1])
 	require.Equal(t, commitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitTS, commitMeta2.CommitTS)
+	prepareMeta1 := requestTxnMeta(t, g1Txn.requests[0])
+	prepareMeta2 := requestTxnMeta(t, g2Txn.requests[0])
+	require.Equal(t, commitTS, prepareMeta1.CommitTS)
+	require.Equal(t, commitTS, prepareMeta2.CommitTS)
 }
 
 func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {

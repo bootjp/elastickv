@@ -1317,7 +1317,7 @@ type preparedGroup struct {
 }
 
 func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64) ([]preparedGroup, error) {
-	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
+	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, commitTS)
 	prepared := make([]preparedGroup, 0, len(gids))
 
 	for _, gid := range gids {
