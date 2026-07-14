@@ -1357,13 +1357,13 @@ func (r *RedisServer) aggregateLenDeltas(
 	ctx context.Context,
 	prefix []byte,
 	readTS uint64,
+	scanCap *deltaScanCap,
 	unmarshalDelta func(key []byte, value []byte) (int64, bool, error),
 ) (int64, bool, error) {
 	const cursorAdv = byte(0x00)
 	end := store.PrefixScanEnd(prefix)
 	var sum int64
 	var any bool
-	included := 0
 	cursor := prefix
 	for {
 		deltas, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit+1, readTS)
@@ -1378,8 +1378,10 @@ func (r *RedisServer) aggregateLenDeltas(
 			if !include {
 				continue
 			}
-			included++
-			if included > store.MaxDeltaScanLimit {
+			if scanCap == nil {
+				scanCap = &deltaScanCap{}
+			}
+			if !scanCap.accept() {
 				return 0, false, ErrDeltaScanTruncated
 			}
 			any = true
@@ -1393,12 +1395,22 @@ func (r *RedisServer) aggregateLenDeltas(
 	return sum, any, nil
 }
 
+type deltaScanCap struct {
+	accepted int
+}
+
+func (c *deltaScanCap) accept() bool {
+	c.accepted++
+	return c.accepted <= store.MaxDeltaScanLimit
+}
+
 func (r *RedisServer) aggregateListMetaDeltas(ctx context.Context, key []byte, readTS uint64, applyDelta func(store.ListMetaDelta)) (int64, bool, error) {
 	var total int64
 	var any bool
+	scanCap := &deltaScanCap{}
 	for _, prefix := range store.ListMetaDeltaScanPrefixes(key) {
 		legacy := isLegacyListMetaDeltaPrefix(prefix)
-		lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, func(deltaKey []byte, b []byte) (int64, bool, error) {
+		lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, scanCap, func(deltaKey []byte, b []byte) (int64, bool, error) {
 			if legacy && (!store.IsListMetaDeltaValue(b) || !bytes.Equal(store.ExtractLegacyListUserKeyFromDelta(deltaKey), key)) {
 				return 0, false, nil
 			}
@@ -1477,7 +1489,7 @@ func (r *RedisServer) resolveCollectionLen(
 		}
 	}
 
-	deltaSum, hasDeltas, err := r.aggregateLenDeltas(ctx, deltaPrefix, readTS, func(_ []byte, value []byte) (int64, bool, error) {
+	deltaSum, hasDeltas, err := r.aggregateLenDeltas(ctx, deltaPrefix, readTS, nil, func(_ []byte, value []byte) (int64, bool, error) {
 		delta, err := unmarshalDelta(value)
 		return delta, true, err
 	})

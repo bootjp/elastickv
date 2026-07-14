@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -53,6 +54,26 @@ func cloneTxnRequest(req *pb.Request) *pb.Request {
 		return nil
 	}
 	return request
+}
+
+func TestShardedCoordinatorGroupMutationsUsesExplicitElemGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	grouped, gids, err := coord.groupMutations([]*Elem[OP]{
+		{Op: Del, Key: []byte("a-key"), GroupID: 2},
+	}, keyviz.Label(""))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2}, gids)
+	require.Len(t, grouped[2], 1)
+	require.Equal(t, []byte("a-key"), grouped[2][0].Key)
 }
 
 func requestTxnMeta(t *testing.T, req *pb.Request) TxnMeta {

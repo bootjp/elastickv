@@ -240,7 +240,7 @@ func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte,
 		return b.containsDecodedS3Route(rawKey, routeStart, routeEnd)
 	}
 	if b.Family == MigrationFamilyLegacyListMetaDelta {
-		return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd)
+		return b.containsLegacyListMetaDeltaRoute(rawKey, routeStart, routeEnd)
 	}
 	if !b.RequiresRouteKeyCheck {
 		return true
@@ -249,6 +249,11 @@ func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte,
 		return false
 	}
 	return routeKeyInRange(routeKey(rawKey), routeStart, routeEnd)
+}
+
+func (b MigrationBracket) containsLegacyListMetaDeltaRoute(rawKey, routeStart, routeEnd []byte) bool {
+	return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd) ||
+		routeKeyInRange(store.ExtractListUserKey(rawKey), routeStart, routeEnd)
 }
 
 func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {

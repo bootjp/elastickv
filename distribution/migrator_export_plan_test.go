@@ -295,6 +295,29 @@ func TestMigrationBracketContainsRoutedKeyUsesLegacyListDeltaUserKey(t *testing.
 	))
 }
 
+func TestMigrationBracketContainsRoutedKeyRoutesAmbiguousLegacyListMetaByBaseKey(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("a"), []byte("z"))
+	require.NoError(t, err)
+	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
+	userKey := deltaLookingListMetaUserKey([]byte("target-list"), 10, 0)
+	raw := store.ListMetaKey(userKey)
+
+	require.True(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("d|"),
+		[]byte("d}"),
+		store.ExtractListUserKey,
+	))
+	require.False(t, legacy.ContainsRoutedKey(
+		raw,
+		[]byte("zzz"),
+		nil,
+		store.ExtractListUserKey,
+	))
+}
+
 func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	t.Parallel()
 

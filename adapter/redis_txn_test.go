@@ -67,6 +67,25 @@ func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	require.Equal(t, [][]byte{deltaKey}, stState.existingDeltas)
 }
 
+func TestRedisTxnLoadListStateEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
+	t.Parallel()
+
+	server, st := newRedisStorageMigrationTestServer(t)
+	ctx := context.Background()
+	key := []byte("txn-list-delta-cap")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, i, 0), delta, i, 0))
+	}
+	legacyTS := uint64(store.MaxDeltaScanLimit + 1)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, legacyTS), delta, legacyTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	txn.startTS = legacyTS
+	_, err := txn.loadListState(key)
+	require.ErrorIs(t, err, ErrDeltaScanTruncated)
+}
+
 func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 	for _, elem := range elems {
 		if elem != nil && string(elem.Key) == string(want) {

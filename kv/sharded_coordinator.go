@@ -2034,9 +2034,15 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		gid, ok := c.router.ResolveGroup(mut.Key)
-		if !ok {
-			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+		gid := req.GroupID
+		if gid == 0 {
+			var ok bool
+			gid, ok = c.router.ResolveGroup(mut.Key)
+			if !ok {
+				return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+			}
+		} else if _, ok := c.groups[gid]; !ok {
+			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
 		}
 		// Engine RouteID for keyviz observation; partition-resolved
 		// keys observe under the !sqs|route|global RouteID until

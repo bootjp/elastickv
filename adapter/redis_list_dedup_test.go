@@ -76,6 +76,24 @@ func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
 	require.Equal(t, int64(14), meta.Tail)
 }
 
+func TestResolveListMetaEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("list-delta-cap")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, i, 0), delta, i, 0))
+	}
+	legacyTS := uint64(store.MaxDeltaScanLimit + 1)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, legacyTS), delta, legacyTS, 0))
+
+	_, _, err := srv.resolveListMeta(ctx, key, legacyTS)
+	require.ErrorIs(t, err, ErrDeltaScanTruncated)
+}
+
 func TestResolveListMetaDoesNotTreatDeltaLookingMetaValueAsLegacyDelta(t *testing.T) {
 	t.Parallel()
 

@@ -352,6 +352,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
 	var existingDeltas [][]byte
+	acceptedDeltas := 0
 	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
 		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
 			ctx,
@@ -368,6 +369,10 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 			return nil, ErrDeltaScanTruncated
 		}
 		for _, kv := range deltaKVs {
+			acceptedDeltas++
+			if acceptedDeltas > store.MaxDeltaScanLimit {
+				return nil, ErrDeltaScanTruncated
+			}
 			existingDeltas = append(existingDeltas, kv.Key)
 		}
 	}
