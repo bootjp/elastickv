@@ -14,6 +14,7 @@ const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
 	exportCursorTagPrunedKey
+	exportCursorTagSkippedKey
 
 	migrationAckMetaKey      = "_migack"
 	migrationHLCFloorMetaKey = "_mighlc"
@@ -79,7 +80,10 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
 	tag := rest[0]
-	if tag != exportCursorTagEmitted && tag != exportCursorTagScanned && tag != exportCursorTagPrunedKey {
+	if tag != exportCursorTagEmitted &&
+		tag != exportCursorTagScanned &&
+		tag != exportCursorTagPrunedKey &&
+		tag != exportCursorTagSkippedKey {
 		return exportCursorPosition{}, errors.WithStack(ErrInvalidExportCursor)
 	}
 	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
@@ -102,6 +106,12 @@ func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosit
 	}
 	if opts.StartKey != nil && bytes.Compare(pos.key, opts.StartKey) < 0 {
 		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if pos.tag == exportCursorTagSkippedKey {
+		if opts.EndKey == nil || bytes.Compare(pos.key, opts.EndKey) < 0 {
+			return errors.WithStack(ErrInvalidExportCursor)
+		}
+		return nil
 	}
 	if opts.EndKey != nil && bytes.Compare(pos.key, opts.EndKey) >= 0 {
 		return errors.WithStack(ErrInvalidExportCursor)

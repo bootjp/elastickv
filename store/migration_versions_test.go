@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"math"
 	"os"
 	"testing"
@@ -477,6 +478,68 @@ func TestPebbleExportDoesNotDropWriterRegistryPrefixUserKey(t *testing.T) {
 	require.Equal(t, []MVCCVersion{{Key: registryKey, CommitTS: 10, Value: []byte("user-value")}}, res.Versions)
 }
 
+func TestPebbleRejectsMVCCKeyThatEncodesAsWriterRegistryRow(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-writer-registry-collision-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	rawRegistryKey := encryption.RegistryKey(1, 2)
+	userKey := bytes.Clone(rawRegistryKey[:len(rawRegistryKey)-timestampSize])
+	commitTS := ^binary.BigEndian.Uint64(rawRegistryKey[len(rawRegistryKey)-timestampSize:])
+	require.True(t, isPebbleWriterRegistryKey(encodeKey(userKey, commitTS)))
+
+	require.ErrorIs(t, st.PutAt(ctx, userKey, []byte("value"), commitTS, 0), errMVCCMetadataKeyCollision)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     1,
+		BracketID: 1,
+		BatchSeq:  1,
+		Versions: []MVCCVersion{{
+			Key:      userKey,
+			CommitTS: commitTS,
+			Value:    []byte("value"),
+		}},
+	})
+	require.ErrorIs(t, err, errMVCCMetadataKeyCollision)
+}
+
+func TestPebbleWriterRegistryRowIsNotVisibleAsMVCCCollision(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-writer-registry-read-collision-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	registryKey := encryption.RegistryKey(1, 2)
+	registry, err := WriterRegistryFor(st)
+	require.NoError(t, err)
+	require.NoError(t, registry.SetRegistryRow(
+		registryKey,
+		encryption.EncodeRegistryValue(encryption.RegistryValue{
+			FullNodeID:          2,
+			FirstSeenLocalEpoch: 1,
+			LastSeenLocalEpoch:  1,
+		}),
+	))
+
+	userKey := bytes.Clone(registryKey[:len(registryKey)-timestampSize])
+	commitTS := ^binary.BigEndian.Uint64(registryKey[len(registryKey)-timestampSize:])
+	_, err = st.GetAt(ctx, userKey, commitTS)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	ok, err := st.CommittedVersionAt(ctx, userKey, commitTS)
+	require.NoError(t, err)
+	require.False(t, ok)
+	latest, ok, err := st.LatestCommitTS(ctx, userKey)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Zero(t, latest)
+}
+
 func TestPebbleExportAuthenticatesEncryptedTombstoneHeader(t *testing.T) {
 	ctx := context.Background()
 	f := newEncryptedStoreFixture(t, 81)
@@ -518,6 +581,39 @@ func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
 	require.True(t, done)
 	require.Empty(t, result.Versions)
 	require.Zero(t, result.ScannedBytes)
+}
+
+func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-out-of-range-end-skip-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("later"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, nil, []byte("empty"), 20, 0))
+
+	first, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:          []byte("a"),
+		MaxVersions:     10,
+		MaxScannedBytes: 1,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Empty(t, first.Versions)
+	require.NotEmpty(t, first.NextCursor)
+	require.Greater(t, first.ScannedBytes, uint64(0))
+
+	second, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		EndKey:      []byte("a"),
+		Cursor:      first.NextCursor,
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, second.Done)
+	require.Equal(t, []MVCCVersion{{Key: []byte{}, CommitTS: 20, Value: []byte("empty")}}, second.Versions)
 }
 
 func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
