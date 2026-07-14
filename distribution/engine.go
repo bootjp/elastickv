@@ -424,12 +424,15 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 
 func cloneRoute(r Route) Route {
 	return Route{
-		RouteID: r.RouteID,
-		Start:   CloneBytes(r.Start),
-		End:     CloneBytes(r.End),
-		GroupID: r.GroupID,
-		State:   r.State,
-		Load:    r.Load,
+		RouteID:                r.RouteID,
+		Start:                  CloneBytes(r.Start),
+		End:                    CloneBytes(r.End),
+		GroupID:                r.GroupID,
+		State:                  r.State,
+		StagedVisibilityActive: r.StagedVisibilityActive,
+		MigrationJobID:         r.MigrationJobID,
+		MinWriteTSExclusive:    r.MinWriteTSExclusive,
+		Load:                   r.Load,
 	}
 }
 

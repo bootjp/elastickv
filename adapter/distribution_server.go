@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -162,7 +163,8 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return nil, err
 	}
-	if err := s.rejectLiveSplitJobOverlap(ctx, snapshot, parent); err != nil {
+	splitJobReadKeys, err := s.splitJobOverlapReadKeys(ctx, snapshot, parent)
+	if err != nil {
 		return nil, err
 	}
 
@@ -172,7 +174,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	}
 	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID)
 
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, splitJobReadKeys, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +215,7 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	readTS uint64,
 	expectedVersion uint64,
 	parentID uint64,
+	readKeys [][]byte,
 	left distribution.RouteDescriptor,
 	right distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, error) {
@@ -230,10 +233,14 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems:   ops,
-		IsTxn:   true,
-		StartTS: readTS,
+		Elems:    ops,
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: readKeys,
 	}); err != nil {
+		if errors.Is(err, store.ErrWriteConflict) {
+			return distribution.CatalogSnapshot{}, grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
+		}
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
 	}
 	return s.loadCatalogSnapshotAtLeastVersion(ctx, nextVersion)
@@ -380,22 +387,36 @@ func validateSplitKey(parent distribution.RouteDescriptor, splitKey []byte) erro
 	return nil
 }
 
-func (s *DistributionServer) rejectLiveSplitJobOverlap(ctx context.Context, snapshot distribution.CatalogSnapshot, parent distribution.RouteDescriptor) error {
+func (s *DistributionServer) splitJobOverlapReadKeys(ctx context.Context, snapshot distribution.CatalogSnapshot, parent distribution.RouteDescriptor) ([][]byte, error) {
 	jobs, err := s.catalog.ListSplitJobsAt(ctx, snapshot.ReadTS)
 	if err != nil {
-		return grpcStatusErrorf(codes.Internal, "load split jobs: %v", err)
+		return nil, grpcStatusErrorf(codes.Internal, "load split jobs: %v", err)
 	}
+	readKeys := splitJobReadFenceKeys(jobs)
 	for _, job := range jobs {
 		if !splitJobIsLive(job) {
 			continue
 		}
 		for _, interval := range liveSplitJobIntervals(job, snapshot.Routes) {
 			if routeRangeIntersects(parent.Start, parent.End, interval.start, interval.end) {
-				return grpcStatusError(codes.Aborted, distribution.ErrSplitJobOverlap.Error())
+				return nil, grpcStatusError(codes.Aborted, distribution.ErrSplitJobOverlap.Error())
 			}
 		}
 	}
-	return nil
+	return readKeys, nil
+}
+
+func splitJobReadFenceKeys(jobs []distribution.SplitJob) [][]byte {
+	readKeys := make([][]byte, 0, len(jobs)+1)
+	readKeys = append(readKeys, distribution.CatalogNextSplitJobIDKey())
+	for _, job := range jobs {
+		if job.TerminalAtMs > 0 {
+			readKeys = append(readKeys, distribution.CatalogSplitJobHistoryKey(job.TerminalAtMs, job.JobID))
+			continue
+		}
+		readKeys = append(readKeys, distribution.CatalogSplitJobKey(job.JobID))
+	}
+	return readKeys
 }
 
 func splitJobIsLive(job distribution.SplitJob) bool {

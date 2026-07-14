@@ -1105,7 +1105,7 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 }
 
 func isRetryableTransactWriteError(err error) bool {
-	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
 }
 
 func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {
