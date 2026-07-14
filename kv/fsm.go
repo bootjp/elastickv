@@ -595,10 +595,13 @@ func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
 		return nil
 	}
 	rkey := routeKey(key)
-	if !snap.WriteFencedForKey(rkey) {
-		return nil
+	if snap.WriteFencedForKey(rkey) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
 	}
-	return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok && snap.WriteFencedIntersects(start, end) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+	}
+	return nil
 }
 
 func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {

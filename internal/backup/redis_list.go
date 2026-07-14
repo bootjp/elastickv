@@ -33,7 +33,7 @@ import (
 //     item record for the popped
 //     seq. The encoder therefore
 //     skips claim keys entirely.
-//   - !lst|meta|d|...                 -> meta delta. The hash encoder
+//   - !lst|delta|...                  -> meta delta. The hash encoder
 //     skips its analogous deltas
 //     and treats !hs|fld| as the
 //     source of truth; the list
@@ -42,11 +42,16 @@ import (
 //     source of truth and the
 //     delta arithmetic is not
 //     replayed at backup time.
+//   - !lst|meta|d|...                 -> legacy meta delta. This overlaps
+//     with base !lst|meta| keys whose user key begins with d|, so routing
+//     checks both the key prefix and the 16-byte delta value shape before
+//     dropping it as a delta.
 const (
-	ListMetaPrefix      = "!lst|meta|"
-	ListItemPrefix      = "!lst|itm|"
-	ListMetaDeltaPrefix = "!lst|meta|d|"
-	ListClaimPrefix     = "!lst|claim|"
+	ListMetaPrefix            = "!lst|meta|"
+	ListItemPrefix            = "!lst|itm|"
+	ListMetaDeltaPrefix       = "!lst|delta|"
+	LegacyListMetaDeltaPrefix = "!lst|meta|d|"
+	ListClaimPrefix           = "!lst|claim|"
 
 	// listMetaBinarySize mirrors store/list_helpers.go (24 bytes:
 	// Head(8) + Tail(8) + Len(8)). Re-declared here rather than
@@ -57,6 +62,8 @@ const (
 	// listSeqBytes is the fixed width of the trailing sortable-int64
 	// sequence number in an !lst|itm| key.
 	listSeqBytes = 8
+
+	listMetaDeltaBinarySize = 16
 )
 
 // ErrRedisInvalidListMeta is returned when an !lst|meta| value is not
@@ -85,15 +92,12 @@ type redisListState struct {
 // register the user key so a later !redis|ttl|<userKey> record routes
 // back to this list state.
 //
-// !lst|meta|d|<userKey>... delta keys share the !lst|meta| string
-// prefix, so a snapshot dispatcher that routes by "starts with
-// ListMetaPrefix" lands delta records here too. The hash encoder
-// solved the analogous problem (Codex P1 round 14 PR #725) by silently
-// skipping the delta family; we mirror that policy because !lst|itm|
+// List deltas normally dispatch through HandleListMetaDelta, but keep
+// the guard here so direct callers also skip the delta family. !lst|itm|
 // records are the source of truth for the restored list contents and
 // the delta arithmetic does not need to be replayed at backup time.
 func (r *RedisDB) HandleListMeta(key, value []byte) error {
-	if bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
+	if isListMetaDeltaRecord(key, value) {
 		return nil
 	}
 	userKey, ok := parseListMetaKey(key)
@@ -140,7 +144,7 @@ func (r *RedisDB) HandleListItem(key, value []byte) error {
 // therefore reflect the post-POP state without any claim replay.
 func (r *RedisDB) HandleListClaim(_, _ []byte) error { return nil }
 
-// HandleListMetaDelta accepts and discards one !lst|meta|d|... record.
+// HandleListMetaDelta accepts and discards one !lst|delta|... record.
 // See HandleListMeta's docstring for the rationale; !lst|itm| is the
 // source of truth at backup time.
 func (r *RedisDB) HandleListMetaDelta(_, _ []byte) error { return nil }
@@ -162,10 +166,9 @@ func (r *RedisDB) listState(userKey []byte) *redisListState {
 // parseListMetaKey strips !lst|meta| from a meta key and returns
 // (userKey, true). The list meta key shape is `prefix + userKey` with
 // no length prefix (mirror of store.ListMetaKey), so the trimmed
-// remainder is the userKey verbatim. Delta keys (!lst|meta|d|...)
-// share the meta string prefix and must be rejected here so a
-// misrouted delta surfaces a parse failure rather than silent state
-// corruption — analogous to parseHashMetaKey's delta guard.
+// remainder is the userKey verbatim. Delta keys are rejected here so
+// a misrouted delta surfaces a parse failure rather than silent state
+// corruption.
 func parseListMetaKey(key []byte) ([]byte, bool) {
 	if bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
 		return nil, false
@@ -175,6 +178,14 @@ func parseListMetaKey(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return rest, true
+}
+
+func isListMetaDeltaRecord(key, value []byte) bool {
+	if bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix)) {
+		return true
+	}
+	return bytes.HasPrefix(key, []byte(LegacyListMetaDeltaPrefix)) &&
+		len(value) == listMetaDeltaBinarySize
 }
 
 // parseListItemKey strips !lst|itm| and extracts (userKey, seq). The

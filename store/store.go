@@ -15,6 +15,10 @@ import (
 // single definition due to the store→kv import cycle.
 var txnInternalKeyPrefix = []byte("!txn|")
 
+// txnLockKeyPrefix must match kv's txn lock namespace. Migration exports skip
+// these in-flight lock records so a target range never imports a stale lock.
+var txnLockKeyPrefix = []byte("!txn|lock|")
+
 var ErrKeyNotFound = errors.New("not found")
 var ErrUnknownOp = errors.New("unknown op")
 var ErrNotSupported = errors.New("not supported")

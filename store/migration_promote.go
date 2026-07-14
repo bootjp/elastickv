@@ -89,12 +89,19 @@ func (s *mvccStore) planMemoryPromotionLocked(
 	opts PromoteVersionsOptions,
 	cursor []byte,
 ) (ExportVersionsResult, []promotedVersion, PromoteVersionsResult, error) {
-	pos, err := decodeExportCursor(cursor)
+	exportOpts := normalizeExportVersionsOptions(ExportVersionsOptions{
+		StartKey:        opts.StartKey,
+		EndKey:          opts.EndKey,
+		Cursor:          cursor,
+		MaxVersions:     opts.MaxVersions,
+		MaxBytes:        opts.MaxBytes,
+		MaxScannedBytes: opts.MaxScannedBytes,
+	})
+	pos, err := decodeExportCursorForOptions(exportOpts)
 	if err != nil {
 		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
 	}
-	opts.Cursor = cursor
-	exported, err := s.exportMemoryVersionsLocked(ctx, opts, pos)
+	exported, err := s.exportMemoryVersionsLocked(ctx, exportOpts, pos)
 	if err != nil {
 		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
 	}
@@ -131,18 +138,10 @@ func (s *mvccStore) MigrationPromotionState(_ context.Context, jobID uint64) (Pr
 	return clonePromotionState(state), ok, nil
 }
 
-func (s *mvccStore) exportMemoryVersionsLocked(ctx context.Context, opts PromoteVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
-	exportOpts := ExportVersionsOptions{
-		StartKey:        opts.StartKey,
-		EndKey:          opts.EndKey,
-		Cursor:          opts.Cursor,
-		MaxVersions:     opts.MaxVersions,
-		MaxBytes:        opts.MaxBytes,
-		MaxScannedBytes: opts.MaxScannedBytes,
-	}
+func (s *mvccStore) exportMemoryVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
-	if !s.seekMemoryExportStart(&it, opts.StartKey, pos.key) {
+	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
 		result.Done = true
 		return result, nil
 	}
@@ -159,7 +158,7 @@ func (s *mvccStore) exportMemoryVersionsLocked(ctx context.Context, opts Promote
 		if !keyOK {
 			continue
 		}
-		done, err := exportMemoryIteratorKey(ctx, exportOpts, pos, key, it.Value(), &result)
+		done, err := exportMemoryIteratorKey(ctx, opts, pos, key, it.Value(), &result)
 		if err != nil || !done {
 			return result, err
 		}
@@ -332,19 +331,37 @@ func (s *pebbleStore) MigrationPromotionState(_ context.Context, jobID uint64) (
 }
 
 func (s *pebbleStore) readPebblePromotionState(jobID uint64) (PromotionState, bool, error) {
-	val, closer, err := s.db.Get(migrationPromoteKey(jobID))
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return PromotionState{}, false, err
+	}
+	state, ok := states[jobID]
+	return clonePromotionState(state), ok, nil
+}
+
+func (s *pebbleStore) readPebblePromotionStates() (map[uint64]PromotionState, error) {
+	val, closer, err := s.db.Get(migrationPromoteMetaKeyBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return PromotionState{}, false, nil
+			return make(map[uint64]PromotionState), nil
 		}
-		return PromotionState{}, false, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	defer func() { _ = closer.Close() }()
-	state, ok := decodePromotionState(val)
+	states, ok := decodeMigrationPromotionStates(val)
 	if !ok {
-		return PromotionState{}, false, errors.New("corrupt migration promotion state")
+		return nil, errors.New("corrupt migration promotion state metadata")
 	}
-	return state, true, nil
+	return states, nil
+}
+
+func (s *pebbleStore) stagePebblePromotionState(batch *pebble.Batch, jobID uint64, state PromotionState) error {
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return err
+	}
+	states[jobID] = clonePromotionState(state)
+	return errors.WithStack(batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(states), nil))
 }
 
 func (s *pebbleStore) commitPebblePromoteVersions(
@@ -372,8 +389,8 @@ func (s *pebbleStore) commitPebblePromoteVersions(
 		}
 	}
 	if state != nil {
-		if err := batch.Set(migrationPromoteKey(jobID), encodePromotionState(*state), nil); err != nil {
-			return errors.WithStack(err)
+		if err := s.stagePebblePromotionState(batch, jobID, *state); err != nil {
+			return err
 		}
 	}
 	if appliedIndex > 0 {
