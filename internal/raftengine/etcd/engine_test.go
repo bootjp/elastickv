@@ -647,6 +647,28 @@ func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 }
 
+func TestEnqueueStepSnapshotBypassesFullBulkQueue(t *testing.T) {
+	engine := &Engine{
+		doneCh:         make(chan struct{}),
+		stepCh:         make(chan raftpb.Message, 1),
+		priorityStepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)}
+
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap)})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), engine.StepQueueFullCount())
+
+	select {
+	case msg := <-engine.priorityStepCh:
+		require.Equal(t, raftpb.MsgSnap, msg.GetType())
+	default:
+		t.Fatal("snapshot step was not enqueued on the priority queue")
+	}
+
+	require.Len(t, engine.stepCh, 1)
+}
+
 func TestHandleEventDrainsPriorityStepBeforeBulkStep(t *testing.T) {
 	engine := &Engine{
 		closeCh:          make(chan struct{}),

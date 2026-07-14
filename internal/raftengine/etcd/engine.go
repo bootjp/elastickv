@@ -60,9 +60,10 @@ const (
 	// from shrinking the shared inbound queue enough to drop heartbeats.
 	minInboundQueueCapacity = 128
 	// priorityStepQueueCapacity is the inbound control-plane queue size.
-	// Heartbeats, votes, read-index responses, and timeout-now messages are
-	// tiny but time-sensitive; keeping them off the bulk stepCh prevents a
-	// MsgApp burst from forcing followers into avoidable elections.
+	// Heartbeats, votes, read-index responses, timeout-now messages, and
+	// received snapshot tokens are tiny but time-sensitive; keeping them off the
+	// bulk stepCh prevents a MsgApp burst from forcing followers into avoidable
+	// elections or rejecting a catch-up snapshot after its payload was streamed.
 	priorityStepQueueCapacity = 1024
 	// priorityStepBurstLimit bounds consecutive non-blocking priority drains
 	// so a sustained control-message stream cannot starve Tick, proposals, or
@@ -2493,6 +2494,14 @@ func isPriorityMsg(t raftpb.MessageType) bool {
 		t == raftpb.MsgTimeoutNow
 }
 
+func isInboundPriorityMsg(t raftpb.MessageType) bool {
+	return isPriorityMsg(t) || t == raftpb.MsgSnap
+}
+
+func isBlockingInboundStepMsg(t raftpb.MessageType) bool {
+	return t == raftpb.MsgSnap
+}
+
 // selectDispatchLane picks the per-peer channel for msgType. In the legacy
 // layout it returns pd.heartbeatResp for MsgHeartbeatResp, pd.heartbeat for
 // other priority control traffic, and pd.normal for everything else. In the
@@ -4346,9 +4355,10 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
-	ch := e.stepCh
-	if isPriorityMsg(msg.GetType()) && e.priorityStepCh != nil {
-		ch = e.priorityStepCh
+	ch := e.stepChannelFor(msg.GetType())
+
+	if isBlockingInboundStepMsg(msg.GetType()) {
+		return e.enqueueBlockingStep(ctx, ch, msg)
 	}
 
 	select {
@@ -4361,6 +4371,24 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 	default:
 		e.stepQueueFullCount.Add(1)
 		return errors.WithStack(errStepQueueFull)
+	}
+}
+
+func (e *Engine) stepChannelFor(msgType raftpb.MessageType) chan raftpb.Message {
+	if isInboundPriorityMsg(msgType) && e.priorityStepCh != nil {
+		return e.priorityStepCh
+	}
+	return e.stepCh
+}
+
+func (e *Engine) enqueueBlockingStep(ctx context.Context, ch chan raftpb.Message, msg raftpb.Message) error {
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return e.currentErrorOrClosed()
+	case ch <- msg:
+		return nil
 	}
 }
 
