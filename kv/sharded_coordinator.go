@@ -1979,7 +1979,12 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 	if _, err := linearizableReadEngineCtx(ctx, engineForGroup(g)); err != nil {
 		return errors.WithStack(err)
 	}
+	readiness := &ShardStore{engine: c.engine, groups: c.groups}
 	for _, key := range keys {
+		route := readiness.explicitGroupRouteForKey(gid, key)
+		if err := readiness.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+			return err
+		}
 		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
 		if err != nil {
 			return errors.WithStack(err)

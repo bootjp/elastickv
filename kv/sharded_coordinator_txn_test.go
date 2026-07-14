@@ -387,6 +387,7 @@ func TestGroupReadKeysByShardID_FailsClosedOnUnroutable(t *testing.T) {
 type stubMVCCStore struct {
 	store.MVCCStore
 	latestTS  map[string]uint64
+	readiness []store.TargetStagedReadinessState
 	returnErr error
 }
 
@@ -396,6 +397,10 @@ func (s *stubMVCCStore) LatestCommitTS(_ context.Context, key []byte) (uint64, b
 	}
 	ts, ok := s.latestTS[string(key)]
 	return ts, ok, nil
+}
+
+func (s *stubMVCCStore) MigrationTargetReadinessStates(_ context.Context) ([]store.TargetStagedReadinessState, error) {
+	return s.readiness, nil
 }
 
 // noopEngine satisfies raftengine.Engine for unit tests.
@@ -482,6 +487,58 @@ func TestValidateReadOnlyShards_NoConflictWhenKeyUnchanged(t *testing.T) {
 	}
 	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
 	require.NoError(t, err)
+}
+
+func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID: 1,
+				Start:   []byte("a"),
+				End:     []byte("m"),
+				GroupID: 1,
+				State:   distribution.RouteStateActive,
+			},
+			{
+				RouteID: 2,
+				Start:   []byte("m"),
+				End:     nil,
+				GroupID: 2,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+
+	readOnlyStore := &stubMVCCStore{
+		latestTS: map[string]uint64{
+			"x": 5,
+		},
+		readiness: []store.TargetStagedReadinessState{
+			{
+				JobID:                  7,
+				RouteStart:             []byte("m"),
+				RouteEnd:               nil,
+				ExpectedCutoverVersion: 2,
+				MigrationJobID:         7,
+				MinWriteTSExclusive:    100,
+				Armed:                  true,
+			},
+		},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
 func TestValidateReadOnlyShards_PropagatesStoreError(t *testing.T) {
