@@ -352,8 +352,8 @@ type Engine struct {
 	closeCh        chan struct{}
 	doneCh         chan struct{}
 	// startedCh is closed after startup has drained committed Ready entries.
-	// Open waits on this gate so callers never observe a store-ready engine
-	// before replay has caught the local state machine up to the raft log.
+	// Multi-node Open must return before this so callers can register the
+	// transport listener; service startup waits through WaitStarted instead.
 	startedCh chan struct{}
 
 	leaderReady  chan struct{}
@@ -916,16 +916,23 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 }
 
 func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engine, error) {
-	if err := waitForEngineSignal(ctx, engine, engine.startedCh); err != nil {
-		return nil, err
-	}
 	if !waitForLeader {
 		return engine, nil
+	}
+	if err := waitForEngineSignal(ctx, engine, engine.startedCh); err != nil {
+		return nil, err
 	}
 	if err := waitForEngineSignal(ctx, engine, engine.leaderReady); err != nil {
 		return nil, err
 	}
 	return engine, nil
+}
+
+func (e *Engine) WaitStarted(ctx context.Context) error {
+	if e == nil {
+		return errors.WithStack(errNilEngine)
+	}
+	return waitForEngineSignal(ctx, e, e.startedCh)
 }
 
 func waitForEngineSignal(ctx context.Context, engine *Engine, ready <-chan struct{}) error {

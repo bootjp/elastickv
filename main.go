@@ -1543,6 +1543,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
+	if err := waitForRaftStartupAfterTransport(in.ctx, in.runtimes); err != nil {
+		return runner.startupFailure(err)
+	}
 	if err := runner.preparePublicServices(); err != nil {
 		return runner.startupFailure(err)
 	}
@@ -1577,6 +1580,23 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	runner.startAdminHTTP()
+	return nil
+}
+
+func waitForRaftStartupAfterTransport(ctx context.Context, runtimes []*raftGroupRuntime) error {
+	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
+		engine := rt.snapshotEngine()
+		barrier, ok := engine.(raftengine.StartupBarrier)
+		if !ok {
+			continue
+		}
+		if err := barrier.WaitStarted(ctx); err != nil {
+			return errors.Wrapf(err, "wait for raft group %d startup", rt.spec.id)
+		}
+	}
 	return nil
 }
 

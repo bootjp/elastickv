@@ -1430,7 +1430,7 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
 }
 
-func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
+func TestOpenMultiNodeWaitStartedWaitsForCommittedTailDrain(t *testing.T) {
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1451,10 +1451,6 @@ func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	type openResult struct {
-		engine *Engine
-		err    error
-	}
 	done := make(chan openResult, 1)
 	go func() {
 		engine, err := Open(context.Background(), OpenConfig{
@@ -1468,39 +1464,70 @@ func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
 		done <- openResult{engine: engine, err: err}
 	}()
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("startup committed tail was not being applied")
-	}
-
-	select {
-	case result := <-done:
-		if result.engine != nil {
-			require.NoError(t, result.engine.Close())
-		}
-		require.NoError(t, result.err)
-		t.Fatal("multi-node Open returned before committed tail drain completed")
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	close(fsm.release)
-
-	var result openResult
-	select {
-	case result = <-done:
-	case <-time.After(time.Second):
-		t.Fatal("multi-node Open did not return after committed tail drain completed")
-	}
+	result := requireOpenResult(t, done, time.Second, "multi-node Open did not return before committed tail drain completed")
 	require.NoError(t, result.err)
 	require.NotNil(t, result.engine)
 	defer func() {
 		require.NoError(t, result.engine.Close())
 	}()
+
+	requireSignal(t, fsm.started, time.Second, "startup committed tail was not being applied")
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- result.engine.WaitStarted(context.Background())
+	}()
+
+	requireNoStartupWaitResult(t, waitDone, 20*time.Millisecond, "WaitStarted returned before committed tail drain completed")
+
+	close(fsm.release)
+
+	requireStartupWaitResult(t, waitDone, time.Second, "WaitStarted did not return after committed tail drain completed")
+	requireSignal(t, result.engine.startedCh, time.Second, "engine did not mark started after committed tail drain completed")
+}
+
+type openResult struct {
+	engine *Engine
+	err    error
+}
+
+func requireOpenResult(t *testing.T, ch <-chan openResult, timeout time.Duration, msg string) openResult {
+	t.Helper()
 	select {
-	case <-result.engine.startedCh:
-	case <-time.After(time.Second):
-		t.Fatal("engine did not mark started after committed tail drain completed")
+	case result := <-ch:
+		return result
+	case <-time.After(timeout):
+		t.Fatal(msg)
+		return openResult{}
+	}
+}
+
+func requireSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatal(msg)
+	}
+}
+
+func requireNoStartupWaitResult(t *testing.T, ch <-chan error, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		require.NoError(t, err)
+		t.Fatal(msg)
+	case <-time.After(timeout):
+	}
+}
+
+func requireStartupWaitResult(t *testing.T, ch <-chan error, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		require.NoError(t, err)
+	case <-time.After(timeout):
+		t.Fatal(msg)
 	}
 }
 
