@@ -176,7 +176,7 @@ func TestPostDispatchReport_AbortsOnClose(t *testing.T) {
 	}
 }
 
-func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
+func TestEnqueueDispatchDefersDroppedSnapshotReportWhenLaneFull(t *testing.T) {
 	t.Parallel()
 	snapshotCh := make(chan dispatchRequest, 1)
 	snapshotCh <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}}
@@ -195,10 +195,10 @@ func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
 	require.Equal(t, uint64(1), e.DispatchDropCount())
 	select {
 	case got := <-e.dispatchReportCh:
-		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgSnap}, got)
+		t.Fatalf("dropped MsgSnap should defer without queueing: %+v", got)
 	default:
-		t.Fatal("expected dropped MsgSnap to report SnapshotFailure input")
 	}
+	require.Equal(t, []dispatchReport{{to: 2, msgType: raftpb.MsgSnap}}, e.deferredReadyDispatchReports)
 }
 
 func TestEnqueueDispatchReportsDroppedRegularMessageWhenLaneFull(t *testing.T) {

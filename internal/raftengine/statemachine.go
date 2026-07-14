@@ -69,24 +69,25 @@ type AppliedIndexReader interface {
 }
 
 // AppliedIndexWriter is an OPTIONAL extension that lets the engine
-// pin the FSM's durable applied-index to a known value at snapshot
-// persist time. See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md
+// pin the FSM's durable applied-index to a known value at raft
+// durability boundaries. See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md
 // §6 "HLC lease entries — checkpoint at snapshot persist".
 //
-// The engine calls SetDurableAppliedIndex(snap.Metadata.Index)
-// before it calls persist.SaveSnap, so that on every successful
-// snapshot persist the invariant `LastAppliedIndex >=
-// snapshot.Metadata.Index` holds unconditionally — closing the
-// HLC-lease-only / encryption-only fallback that would otherwise
-// leave LastAppliedIndex stuck at the last data-Apply index.
+// The engine calls SetDurableAppliedIndex at local snapshot persist,
+// after received-snapshot WAL persistence, and at startup
+// committed-tail drain boundaries, so the invariant
+// `LastAppliedIndex >= the locally durable raft state` holds once the
+// engine is store-ready. This closes the HLC-lease-only /
+// encryption-only fallback that would otherwise leave LastAppliedIndex
+// stuck at the last data-Apply index.
 //
 // Implementations MUST persist the value with pebble.Sync (or the
 // equivalent strong-durability flag for the backing store)
 // regardless of ELASTICKV_FSM_SYNC_MODE. The checkpoint is the only
-// durable carrier of metaAppliedIndex at this point — once
-// persist.SaveSnap returns, WAL compaction discards every log entry
-// at or before snap.Metadata.Index, so there is no source to replay
-// the meta key bump from.
+// durable carrier of metaAppliedIndex at local snapshot persist time
+// — once persist.SaveSnap returns, WAL compaction discards every log
+// entry at or before snap.Metadata.Index, so there is no source to
+// replay the meta key bump from.
 type AppliedIndexWriter interface {
 	SetDurableAppliedIndex(idx uint64) error
 }

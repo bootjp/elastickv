@@ -114,6 +114,18 @@ type blockingApplyStateMachine struct {
 	startOnce sync.Once
 }
 
+type recordingStartupApplyStateMachine struct {
+	*blockingApplyStateMachine
+	rec *applyIndexOrderRecorder
+}
+
+func (s *recordingStartupApplyStateMachine) SetDurableAppliedIndex(idx uint64) error {
+	if s.rec != nil {
+		s.rec.record("bump", idx)
+	}
+	return nil
+}
+
 type blockingSnapshot struct {
 	started chan struct{}
 	release chan struct{}
@@ -787,6 +799,58 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("sendMessages blocked on a full dispatch queue")
 	}
+}
+
+func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
+	engine := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	engine.dispatchReportCh <- dispatchReport{to: 2, msgType: raftpb.MsgHeartbeat}
+
+	done := make(chan struct{})
+	go func() {
+		engine.reportFailedDispatch(raftpb.Message{
+			Type: messageTypePtr(raftpb.MsgSnap),
+			To:   uint64Ptr(3),
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("MsgSnap failure report must wait instead of dropping when report channel is full")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	<-engine.dispatchReportCh
+	requireSignal(t, done, time.Second, "MsgSnap failure report was not delivered after report channel drained")
+	report := <-engine.dispatchReportCh
+	require.Equal(t, uint64(3), report.to)
+	require.Equal(t, raftpb.MsgSnap, report.msgType)
+	require.False(t, report.snapshotFinish)
+}
+
+func TestReportDroppedDispatchDefersMsgSnapUntilReadyAdvanced(t *testing.T) {
+	engine := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	queued := dispatchReport{to: 2, msgType: raftpb.MsgHeartbeat}
+	engine.dispatchReportCh <- queued
+
+	engine.reportDroppedDispatch(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(3),
+	})
+
+	require.Equal(t, queued, <-engine.dispatchReportCh)
+	select {
+	case report := <-engine.dispatchReportCh:
+		t.Fatalf("dropped MsgSnap report should not enqueue from the event loop: %+v", report)
+	default:
+	}
+	require.Equal(t, []dispatchReport{{to: 3, msgType: raftpb.MsgSnap}}, engine.deferredReadyDispatchReports)
 }
 
 func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
@@ -1554,9 +1618,13 @@ func TestOpenMultiNodeWaitStartedWaitsForCommittedTailDrain(t *testing.T) {
 		}},
 	}))
 
-	fsm := &blockingApplyStateMachine{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingStartupApplyStateMachine{
+		blockingApplyStateMachine: &blockingApplyStateMachine{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		},
+		rec: rec,
 	}
 	done := make(chan openResult, 1)
 	go func() {
@@ -1591,6 +1659,8 @@ func TestOpenMultiNodeWaitStartedWaitsForCommittedTailDrain(t *testing.T) {
 
 	requireStartupWaitResult(t, waitDone, time.Second, "WaitStarted did not return after committed tail drain completed")
 	requireSignal(t, result.engine.startedCh, time.Second, "engine did not mark started after committed tail drain completed")
+	require.Equal(t, []orderEvent{{kind: "bump", index: 2}}, rec.snapshot(),
+		"startup must persist the committed tail applied index before marking the engine started")
 }
 
 type openResult struct {
@@ -1635,6 +1705,24 @@ func requireStartupWaitResult(t *testing.T, ch <-chan error, timeout time.Durati
 		require.NoError(t, err)
 	case <-time.After(timeout):
 		t.Fatal(msg)
+	}
+}
+
+func TestWaitStartedTimeoutDoesNotCloseEngine(t *testing.T) {
+	engine := &Engine{
+		startedCh: make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		closeCh:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := engine.WaitStarted(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-engine.closeCh:
+		t.Fatal("WaitStarted timeout must not close an already-returned engine")
+	default:
 	}
 }
 

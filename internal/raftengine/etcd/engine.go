@@ -326,15 +326,16 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh         chan proposalRequest
-	readCh            chan readRequest
-	adminCh           chan adminRequest
-	stepCh            chan raftpb.Message
-	priorityStepCh    chan raftpb.Message
-	priorityStepBurst int
-	dispatchReportCh  chan dispatchReport
-	peerDispatchers   map[uint64]*peerQueues
-	perPeerQueueSize  int
+	proposeCh                    chan proposalRequest
+	readCh                       chan readRequest
+	adminCh                      chan adminRequest
+	stepCh                       chan raftpb.Message
+	priorityStepCh               chan raftpb.Message
+	priorityStepBurst            int
+	dispatchReportCh             chan dispatchReport
+	deferredReadyDispatchReports []dispatchReport
+	peerDispatchers              map[uint64]*peerQueues
+	perPeerQueueSize             int
 	// dispatcherLanesEnabled toggles the opt-in multi-lane dispatcher layout. Captured
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
@@ -927,10 +928,10 @@ func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engi
 	if !waitForLeader {
 		return engine, nil
 	}
-	if err := waitForEngineSignal(ctx, engine, engine.startedCh); err != nil {
+	if err := waitForOpenSignal(ctx, engine, engine.startedCh); err != nil {
 		return nil, err
 	}
-	if err := waitForEngineSignal(ctx, engine, engine.leaderReady); err != nil {
+	if err := waitForOpenSignal(ctx, engine, engine.leaderReady); err != nil {
 		return nil, err
 	}
 	return engine, nil
@@ -940,13 +941,19 @@ func (e *Engine) WaitStarted(ctx context.Context) error {
 	if e == nil {
 		return errors.WithStack(errNilEngine)
 	}
-	return waitForEngineSignal(ctx, e, e.startedCh)
+	return waitForEngineSignal(ctx, e, e.startedCh, false)
 }
 
-func waitForEngineSignal(ctx context.Context, engine *Engine, ready <-chan struct{}) error {
+func waitForOpenSignal(ctx context.Context, engine *Engine, ready <-chan struct{}) error {
+	return waitForEngineSignal(ctx, engine, ready, true)
+}
+
+func waitForEngineSignal(ctx context.Context, engine *Engine, ready <-chan struct{}, closeOnCancel bool) error {
 	select {
 	case <-ctx.Done():
-		_ = engine.Close()
+		if closeOnCancel {
+			_ = engine.Close()
+		}
 		return errors.WithStack(ctx.Err())
 	case <-ready:
 		return nil
@@ -1720,6 +1727,10 @@ func (e *Engine) run() {
 		e.fail(err)
 		return
 	}
+	if err := e.persistStartupAppliedIndex(); err != nil {
+		e.fail(err)
+		return
+	}
 	e.markStarted()
 
 	for {
@@ -1868,7 +1879,7 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 // If the channel is full (unlikely — the buffer is sized to MaxInflightMsg),
 // the report is dropped and logged; this is acceptable because raft will retry
 // on the next tick and we only need eventual consistency between transport
-// state and Progress state. Successful MsgSnap reports are the exception; see
+// state and Progress state. MsgSnap reports are the exception; see
 // postReliableDispatchReport.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
@@ -1883,9 +1894,10 @@ func (e *Engine) postDispatchReport(report dispatchReport) {
 }
 
 // postReliableDispatchReport delivers a dispatch outcome that must not be
-// dropped. SnapshotFinish is not eventually consistent with ordinary
-// unreachable reports: if it is lost, raft can keep the follower's Progress in
-// StateSnapshot after the follower accepted the snapshot.
+// dropped. SnapshotFinish and SnapshotFailure are not eventually consistent
+// with ordinary unreachable reports: if either is lost, raft can keep the
+// follower's Progress in StateSnapshot after the follower accepted or missed
+// the snapshot.
 func (e *Engine) postReliableDispatchReport(report dispatchReport) {
 	if e.dispatchReportCh == nil {
 		return
@@ -2189,6 +2201,7 @@ func (e *Engine) drainReady() error {
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
 		e.handleReadStates(rd.ReadStates)
 		e.rawNode.Advance(rd)
+		e.flushDeferredDispatchReports()
 		if err := e.maybePersistLocalSnapshot(); err != nil {
 			return err
 		}
@@ -2227,6 +2240,9 @@ func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
 		return nil
 	}
 	if err := persistReadyToWAL(e.persist, rd); err != nil {
+		return err
+	}
+	if err := e.persistReceivedSnapshotAppliedIndex(rd.Snapshot); err != nil {
 		return err
 	}
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(snapshotIndex(rd.Snapshot))
@@ -2547,15 +2563,6 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		if err != nil {
 			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
 		}
-		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
-		// after Restore so peer-after-InstallSnapshot populates the meta
-		// key. The local-snapshot persist path already bumps the live
-		// store (engine.persistLocalSnapshotPayload), but the receiving
-		// node's restored store inherits the pre-bump value embedded in
-		// the snapshot artifact. Design Non-Goals §
-		// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md#non-goals
-		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
-		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
@@ -2565,7 +2572,6 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
 		}
 	}
-
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
@@ -3535,29 +3541,60 @@ func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, 
 	}
 }
 
+// setDurableAppliedIndex pins the FSM's durable applied index to a
+// known raft log index. FSMs that do not expose
+// raftengine.AppliedIndexWriter silently no-op; the skip optimisation
+// falls back to full restore for them (legacy test fakes, in-memory
+// backends).
+func (e *Engine) setDurableAppliedIndex(index uint64) error {
+	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(index))
+}
+
 // bumpDurableAppliedIndexBeforeSave pins the FSM's durable applied
 // index to `index` BEFORE the engine calls persist.SaveSnap, so a
 // successful snapshot persist always implies LastAppliedIndex >=
 // snap.Metadata.Index — closes the HLC-lease-only / encryption-only
 // fallback (PR #910 design §6).
 //
-// FSMs that do not expose raftengine.AppliedIndexWriter silently
-// no-op; the skip optimisation falls back to full restore for them
-// (legacy test fakes, in-memory backends). pebble.Sync is forced on
-// the writer side regardless of ELASTICKV_FSM_SYNC_MODE — once
-// persist.SaveSnap returns, WAL compaction discards every log entry
-// at or before snap.Metadata.Index, so there is no source to replay
-// the meta key bump from.
+// pebble.Sync is forced on the writer side regardless of
+// ELASTICKV_FSM_SYNC_MODE — once persist.SaveSnap returns, WAL
+// compaction discards every log entry at or before snap.Metadata.Index,
+// so there is no source to replay the meta key bump from.
 //
 // Used by BOTH snapshot persist sites: persistCreatedSnapshot (this
 // file) and e.persistLocalSnapshotPayload (the steady-state
 // SnapshotCount-triggered hot path).
 func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
-	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
-	if !ok {
+	return e.setDurableAppliedIndex(index)
+}
+
+func (e *Engine) persistStartupAppliedIndex() error {
+	if e.applied == 0 {
 		return nil
 	}
-	return errors.WithStack(w.SetDurableAppliedIndex(index))
+	return e.setDurableAppliedIndex(e.applied)
+}
+
+// persistReceivedSnapshotAppliedIndex runs only after persistReadyToWAL has
+// saved the incoming raft snapshot. A crash before this point must fall back to
+// a full FSM restore instead of letting the FSM meta index get ahead of the
+// local durable raft snapshot.
+func (e *Engine) persistReceivedSnapshotAppliedIndex(snapshot *raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snapshot) {
+		return nil
+	}
+	index := snapshot.GetMetadata().GetIndex()
+	if index == 0 {
+		return nil
+	}
+	if err := e.setDurableAppliedIndex(index); err != nil {
+		return errors.Wrapf(err, "persist durable applied index from snapshot index=%d", index)
+	}
+	return nil
 }
 
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
@@ -4535,7 +4572,7 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	// out of StateReplicate / StateSnapshot. Without this the leader keeps
 	// Progress stuck and never retries sendAppend/sendSnap for the peer,
 	// leaving the follower indefinitely stale even after heartbeats resume.
-	e.postDispatchReport(dispatchReport{to: req.msg.GetTo(), msgType: req.msg.GetType()})
+	e.reportFailedDispatch(req.msg)
 }
 
 func (e *Engine) reportSuccessfulDispatch(msg raftpb.Message) {
@@ -4942,10 +4979,39 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 }
 
 func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
+	report := dispatchReport{to: msg.GetTo(), msgType: msg.GetType()}
+	if msg.GetType() == raftpb.MsgSnap {
+		e.deferReadyDispatchReport(report)
+		return
+	}
 	if e.dispatchReportCh == nil {
 		return
 	}
-	e.postDispatchReport(dispatchReport{to: msg.GetTo(), msgType: msg.GetType()})
+	e.postDispatchReport(report)
+}
+
+func (e *Engine) reportFailedDispatch(msg raftpb.Message) {
+	report := dispatchReport{to: msg.GetTo(), msgType: msg.GetType()}
+	if msg.GetType() == raftpb.MsgSnap {
+		e.postReliableDispatchReport(report)
+		return
+	}
+	e.postDispatchReport(report)
+}
+
+func (e *Engine) deferReadyDispatchReport(report dispatchReport) {
+	e.deferredReadyDispatchReports = append(e.deferredReadyDispatchReports, report)
+}
+
+func (e *Engine) flushDeferredDispatchReports() {
+	if len(e.deferredReadyDispatchReports) == 0 {
+		return
+	}
+	reports := e.deferredReadyDispatchReports
+	e.deferredReadyDispatchReports = nil
+	for _, report := range reports {
+		e.handleDispatchReport(report)
+	}
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or
