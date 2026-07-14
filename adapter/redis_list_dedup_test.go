@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -52,6 +53,203 @@ func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bo
 		ambiguousDispatch:     ambiguousDispatch,
 		ambiguousLands:        lands,
 	}
+}
+
+func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 10, Tail: 12, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 3})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 3)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(9), meta.Head)
+	require.Equal(t, int64(5), meta.Len)
+	require.Equal(t, int64(14), meta.Tail)
+}
+
+func TestResolveListMetaDoesNotTreatDeltaLookingMetaValueAsLegacyDelta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := deltaLookingListMetaUserKey([]byte("embedded"))
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 2)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(4), meta.Head)
+	require.Equal(t, int64(2), meta.Len)
+	require.Equal(t, int64(6), meta.Tail)
+}
+
+func TestResolveListMetaIgnoresLegacyDeltaPrefixCollisionForMissingKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-collision")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), base, 1, 0))
+
+	_, exists, err := srv.resolveListMeta(ctx, key, 2)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func TestResolveListMetaCountsOnlyAcceptedLegacyDeltasForTruncation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-collision-window")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(2); i < uint64(store.MaxDeltaScanLimit+2); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	deltaTS := uint64(store.MaxDeltaScanLimit + 2)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(2), meta.Len)
+}
+
+func TestProbeListTypeReadsLegacyDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+
+	typ, found, err := srv.probeListType(ctx, key, 3)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, redisTypeList, typ)
+}
+
+func TestProbeListTypeIgnoresLegacyDeltaPrefixCollision(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type-collision")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), base, 1, 0))
+
+	_, found, err := srv.probeListType(ctx, key, 2)
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+func TestProbeListTypePagesPastLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type-page")
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	deltaTS := uint64(store.MaxDeltaScanLimit + 1)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	typ, found, err := srv.probeListType(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, redisTypeList, typ)
+}
+
+func TestDeleteListElemsFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-delete")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	collidingMetaKey := store.ListMetaKey(collidingUserKey)
+	require.NoError(t, st.PutAt(ctx, collidingMetaKey, base, 1, 0))
+	deltaKey := legacyListMetaDeltaKey(key, 2)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	elems, err := srv.deleteListElems(ctx, key, 3)
+	require.NoError(t, err)
+	deleted := make(map[string]struct{}, len(elems))
+	for _, elem := range elems {
+		if elem.Op == kv.Del {
+			deleted[string(elem.Key)] = struct{}{}
+		}
+	}
+	require.Contains(t, deleted, string(deltaKey))
+	require.NotContains(t, deleted, string(collidingMetaKey))
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], 0)
+	return append(key, seq[:]...)
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte) []byte {
+	return deltaLookingListMetaUserKeyAt(fakeUserKey, 7, 1)
+}
+
+func deltaLookingListMetaUserKeyAt(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }
 
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {

@@ -71,6 +71,17 @@ func TestExtractRouteKey_ObjectScopedKeys(t *testing.T) {
 	}
 }
 
+func TestRoutePrefixForBucketAnyGeneration(t *testing.T) {
+	t.Parallel()
+
+	bucket := string([]byte{'b', 0x00, 'k'})
+	prefix := RoutePrefixForBucketAnyGeneration(bucket)
+
+	require.True(t, bytes.HasPrefix(RouteKey(bucket, 1, "a"), prefix))
+	require.True(t, bytes.HasPrefix(RouteKey(bucket, 2, "b"), prefix))
+	require.False(t, bytes.HasPrefix(RouteKey("other", 1, "a"), prefix))
+}
+
 func TestManifestScanRouteBounds(t *testing.T) {
 	t.Parallel()
 

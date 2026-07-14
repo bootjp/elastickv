@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -41,6 +43,27 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 		[]byte("!redis|txn-wide-zset|user:key"),
 	} {
 		require.Equal(t, userKey, routeKey(raw))
+	}
+}
+
+func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.HashMetaDeltaKey(userKey, 10, 0),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.SetMetaDeltaKey(userKey, 11, 0),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 12, 0),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.5, []byte("member")),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
 	}
 }
 
@@ -121,6 +144,87 @@ func TestRouteKey_NormalizesCollectionMigrationFamilies(t *testing.T) {
 	for _, raw := range cases {
 		require.Equal(t, userKey, routeKey(raw), "raw key %q must route by its logical user key", raw)
 	}
+}
+
+func TestRouteKey_ListMetaKeyThatLooksLikeNewDeltaRoutesByRealListKey(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte(store.ListMetaDeltaPrefix + "fake:user")
+	baseMeta := store.ListMetaKey(userKey)
+	deltaKey := store.ListMetaDeltaKey(userKey, 10, 1)
+
+	require.Equal(t, userKey, routeKey(baseMeta), "base list metadata must not decode as a new delta")
+	require.Equal(t, userKey, routeKey(deltaKey), "real list deltas must still route by the logical list key")
+}
+
+func TestRouteKey_LegacyListDeltaKeyOnlyUsesBaseMetaRoute(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("legacy:list")
+	raw := legacyListMetaDeltaKey(userKey, 42, 7)
+	require.Equal(t, store.ExtractListUserKey(raw), routeKey(raw))
+	require.NotEqual(t, userKey, routeKey(raw), "key-only routing must not decode ambiguous legacy deltas")
+
+	collidingUserKey := deltaLookingListMetaUserKey(userKey, 42, 7)
+	collidingMeta := store.ListMetaKey(collidingUserKey)
+	require.Equal(t, collidingUserKey, routeKey(collidingMeta))
+}
+
+func TestRouteKey_MalformedWideColumnKeysFallBackToRaw(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		malformedWideColumnKey(store.ListClaimPrefix, 8),
+		malformedWideColumnKey(store.HashMetaPrefix, 0),
+		malformedWideColumnKey(store.HashFieldPrefix, 0),
+		malformedWideColumnKey(store.HashMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.SetMetaPrefix, 0),
+		malformedWideColumnKey(store.SetMemberPrefix, 0),
+		malformedWideColumnKey(store.SetMetaDeltaPrefix, 12),
+		malformedWideColumnKey(store.ZSetMetaPrefix, 0),
+		malformedWideColumnKey(store.ZSetMemberPrefix, 0),
+		malformedWideColumnKey(store.ZSetScorePrefix, 8),
+		malformedWideColumnKey(store.ZSetMetaDeltaPrefix, 12),
+	} {
+		require.NotPanics(t, func() {
+			require.Equal(t, raw, routeKey(raw), "malformed key %q must not decode to a logical route", raw)
+		})
+	}
+}
+
+func malformedWideColumnKey(prefix string, suffixLen int) []byte {
+	key := make([]byte, 0, len(prefix)+4+suffixLen)
+	key = append(key, prefix...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], ^uint32(0))
+	key = append(key, lenPrefix[:]...)
+	key = append(key, make([]byte, suffixLen)...)
+	return key
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }
 
 func TestRouteKey_NormalizesTxnSuccessMarkerByLockedKey(t *testing.T) {
@@ -252,4 +356,56 @@ func TestRouteKeyFilterTreatsNilAndEmptyEndAsInfinity(t *testing.T) {
 			require.True(t, filter([]byte("z")))
 		})
 	}
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter(
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+	)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+	require.True(t, filter(s3keys.ObjectManifestKey("bucket-b", 7, "m")))
+	require.False(t, filter(s3keys.BucketMetaKey("bucket-c")))
+	require.False(t, filter(s3keys.BucketGenerationKey("bucket-c")))
+}
+
+func TestRouteKeyFilterIncludesS3BucketAuxiliaryRawRoute(t *testing.T) {
+	t.Parallel()
+
+	filter := RouteKeyFilter([]byte("!s3|"), nil)
+
+	require.True(t, filter(s3keys.BucketMetaKey("bucket-b")))
+	require.True(t, filter(s3keys.BucketGenerationKey("bucket-b")))
+}
+
+func TestRouteKeyFilterForGroupUsesPartitionResolver(t *testing.T) {
+	t.Parallel()
+
+	partitionedKey := []byte(sqsMsgDataPrefix + sqsPartitionMarker + "orders|partition-0|message")
+	resolver := &migrationFilterPartitionResolver{
+		groups: map[string]uint64{string(partitionedKey): 42},
+	}
+
+	require.True(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 7, resolver)(partitionedKey))
+	require.False(t, RouteKeyFilterForGroup(nil, nil, 42, resolver)(
+		[]byte(sqsMsgDataPrefix+sqsPartitionMarker+"orders|unknown-partition"),
+	))
+}
+
+type migrationFilterPartitionResolver struct {
+	groups map[string]uint64
+}
+
+func (r *migrationFilterPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
+	gid, ok := r.groups[string(key)]
+	return gid, ok
+}
+
+func (r *migrationFilterPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(sqsMsgDataPrefix+sqsPartitionMarker))
 }

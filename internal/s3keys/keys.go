@@ -238,6 +238,13 @@ func RoutePrefixForBucket(bucket string, generation uint64) []byte {
 	return bucketScopedPrefix(routePrefixBytes, bucket, generation)
 }
 
+func RoutePrefixForBucketAnyGeneration(bucket string) []byte {
+	out := make([]byte, 0, len(RoutePrefix)+len(bucket)+segmentEscapeOverhead)
+	out = append(out, routePrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	return out
+}
+
 func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {
 	out := make([]byte, 0, len(prefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
 	out = append(out, prefix...)

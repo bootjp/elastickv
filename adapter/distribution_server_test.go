@@ -76,7 +76,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore(), distribution.WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
 			RouteID:                2,
@@ -258,15 +258,16 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 
 	ctx := context.Background()
 	baseStore := store.NewMVCCStore()
-	catalog := distribution.NewCatalogStore(baseStore)
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
 	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{
-			RouteID:       1,
-			Start:         []byte(""),
-			End:           []byte("m"),
-			GroupID:       1,
-			State:         distribution.RouteStateActive,
-			ParentRouteID: 0,
+			RouteID:             1,
+			Start:               []byte(""),
+			End:                 []byte("m"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			ParentRouteID:       0,
+			MinWriteTSExclusive: 99,
 		},
 		{
 			RouteID:       2,
@@ -299,11 +300,13 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, []byte("g"), resp.Left.End)
 	require.Equal(t, uint64(1), resp.Left.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Left.ParentRouteId)
+	require.Equal(t, uint64(99), resp.Left.MinWriteTsExclusive)
 	require.Equal(t, uint64(4), resp.Right.RouteId)
 	require.Equal(t, []byte("g"), resp.Right.Start)
 	require.Equal(t, []byte("m"), resp.Right.End)
 	require.Equal(t, uint64(1), resp.Right.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Right.ParentRouteId)
+	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
 
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
@@ -311,16 +314,20 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Len(t, snapshot.Routes, 3)
 	// Catalog snapshots are sorted by range start key.
 	require.Equal(t, uint64(3), snapshot.Routes[0].RouteID)
+	require.Equal(t, uint64(99), snapshot.Routes[0].MinWriteTSExclusive)
 	require.Equal(t, uint64(4), snapshot.Routes[1].RouteID)
+	require.Equal(t, uint64(99), snapshot.Routes[1].MinWriteTSExclusive)
 	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))
 	require.True(t, ok)
 	require.Equal(t, uint64(3), leftRoute.RouteID)
+	require.Equal(t, uint64(99), leftRoute.MinWriteTSExclusive)
 	rightRoute, ok := engine.GetRoute([]byte("h"))
 	require.True(t, ok)
 	require.Equal(t, uint64(4), rightRoute.RouteID)
+	require.Equal(t, uint64(99), rightRoute.MinWriteTSExclusive)
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
@@ -718,7 +725,7 @@ func TestBuildCatalogSplitOps_UsesSurgicalSplitMutations(t *testing.T) {
 		ParentRouteID: 1,
 	}
 
-	ops, err := buildCatalogSplitOps(1, left, right, 2, 5)
+	ops, err := buildCatalogSplitOps(1, left, right, 2, 5, false)
 	require.NoError(t, err)
 	require.Len(t, ops, 5)
 	require.Equal(t, kv.Del, ops[0].Op)

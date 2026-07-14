@@ -83,6 +83,7 @@ message RawScanAtRequest {
   uint64 read_route_version = 7; // stamped by server-side routing for migration read fences
   bytes route_start = 8; // route-key-normalized inclusive start, when already known
   bytes route_end = 9; // route-key-normalized exclusive end; empty means +infinity
+  bool route_bounds_present = 10; // true when route_start/route_end were supplied, including ["", +infinity)
 }
 
 message RawKVPair {
