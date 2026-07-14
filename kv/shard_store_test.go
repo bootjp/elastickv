@@ -548,6 +548,22 @@ func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0))
 }
 
+func TestShardStoreRaftApplySkipsMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	require.NoError(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("k-raft"), Value: []byte("v")},
+	}, nil, 90, 100))
+	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("k-raft-at"), Value: []byte("v")},
+	}, nil, 90, 100, 1))
+	require.NoError(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100))
+	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2))
+}
+
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 
