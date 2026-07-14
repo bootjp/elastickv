@@ -219,12 +219,47 @@ func (s *LeaderRoutedStore) ScanAtWithReadFence(ctx context.Context, start []byt
 	if !ok {
 		return s.proxyRawScanAtWithReadFence(ctx, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
 	}
+	readTS := max(ts, fenceTS)
+	if routeScanBoundsPresent(routeStart, routeEnd) {
+		return s.scanLocalRouteFilteredAt(ctx, start, end, limit, readTS, reverse, routeStart, routeEnd)
+	}
 	if reverse {
-		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, max(ts, fenceTS))
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, limit, readTS)
 		return kvs, errors.WithStack(err)
 	}
-	kvs, err := s.local.ScanAt(ctx, start, end, limit, max(ts, fenceTS))
+	kvs, err := s.local.ScanAt(ctx, start, end, limit, readTS)
 	return kvs, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) scanLocalRouteFilteredAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, min(limit, routeFilteredScanBatchMin))
+	scanStart := start
+	scanEnd := end
+	for len(out) < limit {
+		batchLimit := routeFilteredScanBatchLimit(limit - len(out))
+		var (
+			kvs []*store.KVPair
+			err error
+		)
+		if reverse {
+			kvs, err = s.local.ReverseScanAt(ctx, scanStart, scanEnd, batchLimit, ts)
+		} else {
+			kvs, err = s.local.ScanAt(ctx, scanStart, scanEnd, batchLimit, ts)
+		}
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out = appendRouteFilteredKVs(out, kvs, limit, routeStart, routeEnd)
+		if routeFilteredScanDone(kvs, batchLimit, len(out), limit) {
+			break
+		}
+		var done bool
+		scanStart, scanEnd, done = nextRouteFilteredScanWindow(kvs, scanStart, scanEnd, reverse)
+		if done {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {

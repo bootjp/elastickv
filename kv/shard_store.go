@@ -494,21 +494,63 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
 	scanEnd := end
 	for len(out) < limit {
 		batchLimit := routeFilteredScanBatchLimit(limit - len(out))
-		kvs, err := s.scanRouteAtDirectionWithReadFenceOnce(ctx, route, scanStart, scanEnd, batchLimit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
+		kvs, cursorKVs, err := s.scanRouteAtDirectionWithReadFenceRouteFilterPage(ctx, route, scanStart, scanEnd, batchLimit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
 		if err != nil {
 			return nil, err
 		}
 		out = appendRouteFilteredKVs(out, kvs, limit, routeStart, routeEnd)
-		if routeFilteredScanDone(kvs, batchLimit, len(out), limit) {
+		if routeFilteredScanDone(cursorKVs, batchLimit, len(out), limit) {
 			break
 		}
 		var done bool
-		scanStart, scanEnd, done = nextRouteFilteredScanWindow(kvs, scanStart, scanEnd, reverse)
+		scanStart, scanEnd, done = nextRouteFilteredScanWindow(cursorKVs, scanStart, scanEnd, reverse)
 		if done {
 			break
 		}
 	}
 	return out, nil
+}
+
+func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+	explicitGroup bool,
+	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
+) ([]*store.KVPair, []*store.KVPair, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, nil, nil
+	}
+
+	if engineForGroup(g) == nil {
+		kvs, err := s.scanRouteLocal(ctx, g, start, end, limit, ts, reverse)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		return filterTxnInternalKVs(kvs), kvs, nil
+	}
+
+	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
+		return s.scanRouteAtLeaderRouteFilter(ctx, g, start, end, limit, ts, reverse, routeStart, routeEnd)
+	}
+
+	var groupID uint64
+	if explicitGroup {
+		groupID = route.GroupID
+	}
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
+	if err != nil {
+		return nil, nil, err
+	}
+	filtered := filterTxnInternalKVs(kvs)
+	return filtered, kvs, nil
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
@@ -754,6 +796,53 @@ func (s *ShardStore) scanRouteAtLeader(
 		return nil, err
 	}
 	return s.resolveScanLocks(ctx, g, kvs, lockKVs, ts)
+}
+
+func (s *ShardStore) scanRouteAtLeaderRouteFilter(
+	ctx context.Context,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+	routeStart []byte,
+	routeEnd []byte,
+) ([]*store.KVPair, []*store.KVPair, error) {
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if reverse {
+		kvs, err = g.Store.ReverseScanAt(ctx, start, end, limit, ts)
+	} else {
+		kvs, err = g.Store.ScanAt(ctx, start, end, limit, ts)
+	}
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, limit)
+	filteredKVs := filterRouteScanKVs(kvs, routeStart, routeEnd)
+	lockKVs, err := scanTxnLockRangeAtWithRouteFilter(ctx, g, lockStart, lockEnd, ts, limit, routeStart, routeEnd)
+	if err != nil {
+		return nil, nil, err
+	}
+	resolved, err := s.resolveScanLocks(ctx, g, filteredKVs, lockKVs, ts)
+	return resolved, kvs, err
+}
+
+func filterRouteScanKVs(kvs []*store.KVPair, routeStart []byte, routeEnd []byte) []*store.KVPair {
+	if len(kvs) == 0 {
+		return kvs
+	}
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil || !routeKeyInScanBounds(kvp.Key, routeStart, routeEnd) {
+			continue
+		}
+		out = append(out, kvp)
+	}
+	return out
 }
 
 func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int) ([]byte, []byte) {
@@ -1238,6 +1327,18 @@ func scanTxnLockRangeAt(ctx context.Context, g *ShardGroup, start []byte, end []
 	return scanTxnLockPagesAt(ctx, g.Store, lockStart, lockEnd, ts, boundedTxnLockScanLimit(limit))
 }
 
+func scanTxnLockRangeAtWithRouteFilter(ctx context.Context, g *ShardGroup, start []byte, end []byte, ts uint64, limit int, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if g == nil || g.Store == nil {
+		return []*store.KVPair{}, nil
+	}
+	if !routeScanBoundsPresent(routeStart, routeEnd) {
+		return scanTxnLockRangeAt(ctx, g, start, end, ts, limit)
+	}
+
+	lockStart, lockEnd := txnLockScanBounds(start, end)
+	return scanTxnLockPagesAtWithRouteFilter(ctx, g.Store, lockStart, lockEnd, ts, boundedTxnLockScanLimit(limit), routeStart, routeEnd)
+}
+
 func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64, limit int) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
 	cursor := start
@@ -1254,6 +1355,30 @@ func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, e
 			if len(out) > limit {
 				out = out[:limit]
 			}
+			return out, nil
+		}
+		cursor = nextCursor
+	}
+}
+
+func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64, limit int, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
+	cursor := start
+	for {
+		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
+		if err != nil {
+			return nil, err
+		}
+		for _, kvp := range lockKVs {
+			if kvp == nil || !routeKeyInScanBounds(kvp.Key, routeStart, routeEnd) {
+				continue
+			}
+			out = append(out, kvp)
+			if len(out) > limit {
+				return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
+			}
+		}
+		if done {
 			return out, nil
 		}
 		cursor = nextCursor
