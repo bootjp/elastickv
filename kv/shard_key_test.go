@@ -136,11 +136,17 @@ func TestRouteKey_ListMetaKeyThatLooksLikeNewDeltaRoutesByRealListKey(t *testing
 	require.Equal(t, userKey, routeKey(deltaKey), "real list deltas must still route by the logical list key")
 }
 
-func TestRouteKey_LegacyListDeltaRoutesByDecodedUserKey(t *testing.T) {
+func TestRouteKey_LegacyListDeltaKeyOnlyUsesBaseMetaRoute(t *testing.T) {
 	t.Parallel()
 
 	userKey := []byte("legacy:list")
-	require.Equal(t, userKey, routeKey(legacyListMetaDeltaKey(userKey, 42, 7)))
+	raw := legacyListMetaDeltaKey(userKey, 42, 7)
+	require.Equal(t, store.ExtractListUserKey(raw), routeKey(raw))
+	require.NotEqual(t, userKey, routeKey(raw), "key-only routing must not decode ambiguous legacy deltas")
+
+	collidingUserKey := deltaLookingListMetaUserKey(userKey, 42, 7)
+	collidingMeta := store.ListMetaKey(collidingUserKey)
+	require.Equal(t, collidingUserKey, routeKey(collidingMeta))
 }
 
 func TestRouteKey_MalformedWideColumnKeysFallBackToRaw(t *testing.T) {
@@ -177,6 +183,21 @@ func malformedWideColumnKey(prefix string, suffixLen int) []byte {
 
 func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], commitTS)
 	key = append(key, ts[:]...)

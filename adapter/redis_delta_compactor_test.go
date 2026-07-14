@@ -372,6 +372,28 @@ func TestDeltaCompactor_ListNoBaseMeta(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredRawRows(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i <= deltaCompactorTickScanLimit; i++ {
+		userKey := deltaLookingListMetaUserKeyAt([]byte("compactor-collision"), i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), meta, i, 0))
+	}
+
+	h := c.legacyListHandler()
+	readTS := st.LastCommitTS()
+	require.NoError(t, c.compactHandler(ctx, h, readTS))
+
+	c.cursorMu.Lock()
+	got := bytes.Clone(c.cursors[h.typeName])
+	c.cursorMu.Unlock()
+	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt([]byte("compactor-collision"), deltaCompactorTickScanLimit, 0)), got)
+}
+
 // TestDeltaCompactor_UrgentCompactionTriggeredByChannel verifies that a request
 // queued via TriggerUrgentCompaction is processed by the Run loop, compacting
 // the targeted key without waiting for the next regular tick.

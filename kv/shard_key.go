@@ -152,9 +152,6 @@ func listRouteKey(key []byte) []byte {
 	if userKey := store.ExtractListUserKeyFromDelta(key); userKey != nil {
 		return userKey
 	}
-	if userKey := store.ExtractLegacyListUserKeyFromDelta(key); userKey != nil {
-		return userKey
-	}
 	if userKey := store.ExtractListUserKeyFromClaim(key); userKey != nil {
 		return userKey
 	}

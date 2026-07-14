@@ -1041,6 +1041,39 @@ func (r *RedisServer) scanAllDeltaElemsFiltered(
 	return elems, nil
 }
 
+func scanAcceptedDeltaKVsAt(
+	ctx context.Context,
+	st store.MVCCStore,
+	prefix []byte,
+	limit int,
+	readTS uint64,
+	accept func(*store.KVPair) bool,
+) ([]*store.KVPair, bool, error) {
+	const cursorAdv = byte(0x00)
+	end := store.PrefixScanEnd(prefix)
+	cursor := prefix
+	out := make([]*store.KVPair, 0, limit)
+	for {
+		rawKVs, err := st.ScanAt(ctx, cursor, end, limit+1, readTS)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		for _, pair := range rawKVs {
+			if accept != nil && !accept(pair) {
+				continue
+			}
+			out = append(out, pair)
+			if len(out) > limit {
+				return out, true, nil
+			}
+		}
+		if len(rawKVs) < limit+1 {
+			return out, false, nil
+		}
+		cursor = append(bytes.Clone(rawKVs[len(rawKVs)-1].Key), cursorAdv)
+	}
+}
+
 func isLegacyListMetaDeltaPrefix(prefix []byte) bool {
 	return bytes.HasPrefix(prefix, []byte(store.LegacyListMetaDeltaPrefix))
 }
@@ -1309,37 +1342,43 @@ func minRedisInt(a, b int) int {
 
 // aggregateLenDeltas scans delta keys under prefix and sums the LenDelta values
 // via unmarshalDelta. Returns (sum, hasDeltas, error).
-// ErrDeltaScanTruncated is returned when the scan hits MaxDeltaScanLimit.
+// ErrDeltaScanTruncated is returned when accepted deltas exceed MaxDeltaScanLimit.
 func (r *RedisServer) aggregateLenDeltas(
 	ctx context.Context,
 	prefix []byte,
 	readTS uint64,
 	unmarshalDelta func(key []byte, value []byte) (int64, bool, error),
 ) (int64, bool, error) {
+	const cursorAdv = byte(0x00)
 	end := store.PrefixScanEnd(prefix)
-	// Scan one extra key beyond the limit so we can distinguish "exactly
-	// MaxDeltaScanLimit results" (no truncation) from "more than MaxDeltaScanLimit
-	// results" (truncated). Without the +1, a collection with exactly
-	// MaxDeltaScanLimit deltas would incorrectly trigger ErrDeltaScanTruncated.
-	deltas, err := r.store.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
-	if err != nil {
-		return 0, false, errors.WithStack(err)
-	}
-	if len(deltas) > store.MaxDeltaScanLimit {
-		return 0, false, ErrDeltaScanTruncated
-	}
 	var sum int64
 	var any bool
-	for _, d := range deltas {
-		delta, include, err := unmarshalDelta(d.Key, d.Value)
+	included := 0
+	cursor := prefix
+	for {
+		deltas, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit+1, readTS)
 		if err != nil {
 			return 0, false, errors.WithStack(err)
 		}
-		if !include {
-			continue
+		for _, d := range deltas {
+			delta, include, err := unmarshalDelta(d.Key, d.Value)
+			if err != nil {
+				return 0, false, errors.WithStack(err)
+			}
+			if !include {
+				continue
+			}
+			included++
+			if included > store.MaxDeltaScanLimit {
+				return 0, false, ErrDeltaScanTruncated
+			}
+			any = true
+			sum += delta
 		}
-		any = true
-		sum += delta
+		if len(deltas) < store.MaxDeltaScanLimit+1 {
+			break
+		}
+		cursor = append(bytes.Clone(deltas[len(deltas)-1].Key), cursorAdv)
 	}
 	return sum, any, nil
 }

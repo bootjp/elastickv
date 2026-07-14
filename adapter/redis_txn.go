@@ -353,12 +353,18 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// and let the caller retry after the background compactor has caught up.
 	var existingDeltas [][]byte
 	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
-		deltaEnd := store.PrefixScanEnd(deltaPrefix)
-		deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
+		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
+			ctx,
+			t.server.store,
+			deltaPrefix,
+			store.MaxDeltaScanLimit,
+			t.startTS,
+			listTxnDeltaFilter(key, deltaPrefix),
+		)
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, err
 		}
-		if len(deltaKVs) > store.MaxDeltaScanLimit {
+		if truncated {
 			return nil, ErrDeltaScanTruncated
 		}
 		for _, kv := range deltaKVs {
@@ -389,6 +395,15 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	}
 
 	return st, nil
+}
+
+func listTxnDeltaFilter(key []byte, deltaPrefix []byte) func(*store.KVPair) bool {
+	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return nil
+	}
+	return func(pair *store.KVPair) bool {
+		return legacyListDeltaPairForUserKey(pair, key)
+	}
 }
 
 func (t *txnContext) loadHashStateForFields(key []byte, fields [][]byte) (*hashTxnState, error) {

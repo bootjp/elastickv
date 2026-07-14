@@ -112,6 +112,33 @@ func TestResolveListMetaIgnoresLegacyDeltaPrefixCollisionForMissingKey(t *testin
 	require.False(t, exists)
 }
 
+func TestResolveListMetaCountsOnlyAcceptedLegacyDeltasForTruncation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-collision-window")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(2); i < uint64(store.MaxDeltaScanLimit+2); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	deltaTS := uint64(store.MaxDeltaScanLimit + 2)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(2), meta.Len)
+}
+
 func TestProbeListTypeReadsLegacyDeltaPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -184,6 +211,10 @@ func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
 }
 
 func deltaLookingListMetaUserKey(fakeUserKey []byte) []byte {
+	return deltaLookingListMetaUserKeyAt(fakeUserKey, 7, 1)
+}
+
+func deltaLookingListMetaUserKeyAt(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
 	key = append(key, "d|"...)
 	var lenPrefix [4]byte
@@ -191,10 +222,10 @@ func deltaLookingListMetaUserKey(fakeUserKey []byte) []byte {
 	key = append(key, lenPrefix[:]...)
 	key = append(key, fakeUserKey...)
 	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], 7)
+	binary.BigEndian.PutUint64(ts[:], commitTS)
 	key = append(key, ts[:]...)
 	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], 1)
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
 	return append(key, seq[:]...)
 }
 

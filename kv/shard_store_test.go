@@ -78,18 +78,23 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 	ctx := context.Background()
 	userKey := []byte("x") // routes to group 2; raw !lst|* prefixes route to group 1.
 	for _, tc := range []struct {
-		name      string
-		key       []byte
-		scanStart []byte
+		name          string
+		key           []byte
+		scanStart     []byte
+		legacyRouting bool
 	}{
 		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
-		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey)},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			st := newTwoRouteShardStoreForScanTest()
 			deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-			require.NoError(t, st.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			if tc.legacyRouting {
+				require.NoError(t, st.groups[2].Store.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			} else {
+				require.NoError(t, st.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			}
 
 			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
 			require.NoError(t, err)

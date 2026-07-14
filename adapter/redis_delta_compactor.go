@@ -223,11 +223,10 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 	defer cancel()
 
 	prefix := h.deltaKeyPrefixFn(req.userKey)
-	end := store.PrefixScanEnd(prefix)
 	totalCompacted, done := 0, false
 	for !done {
 		var n int
-		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix, end)
+		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix)
 		totalCompacted += n
 		if n == 0 {
 			break
@@ -244,22 +243,17 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 // Returns (n, done): n is the number of delta keys processed in this batch;
 // done is true when the remaining delta count is at or below MaxDeltaScanLimit
 // (the key is now readable).
-func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix, end []byte) (int, bool) {
+func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix []byte) (int, bool) {
 	// Use a fresh readTS each iteration so we observe the committed state from
 	// the previous compaction pass and do not re-scan already-deleted delta keys.
 	readTS := snapshotTS(c.coord.Clock(), c.st)
 
-	// Scan one extra beyond MaxDeltaScanLimit to detect whether more remain.
-	kvs, err := c.st.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
+	kvs, truncated, err := scanAcceptedDeltaKVsAt(ctx, c.st, prefix, store.MaxDeltaScanLimit, readTS, h.acceptDeltaKV)
 	if err != nil {
 		c.logger.WarnContext(ctx, "delta compactor urgent: scan failed",
 			"type", req.typeName, "key", string(req.userKey), "error", err)
 		return 0, true
 	}
-	if len(kvs) == 0 {
-		return 0, true
-	}
-	kvs = filterDeltaKVs(kvs, h.acceptDeltaKV)
 	if len(kvs) == 0 {
 		return 0, true
 	}
@@ -275,8 +269,7 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 			"type", req.typeName, "key", string(req.userKey), "error", err)
 		return 0, true
 	}
-	// Fewer than MaxDeltaScanLimit+1 results means no more deltas remain; key is readable.
-	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
+	return len(kvs), !truncated
 }
 
 // SyncOnce runs one compaction pass. The IsLeader() guard avoids the
@@ -472,9 +465,13 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		return err
 	}
 
-	kvs = filterDeltaKVs(kvs, h.acceptDeltaKV)
+	rawKVs := kvs
+	kvs = filterDeltaKVs(rawKVs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
+	if truncated && len(lastScannedKey) == 0 && len(kvs) == 0 && len(rawKVs) > 0 {
+		lastScannedKey = rawKVs[len(rawKVs)-1].Key
+	}
 
 	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
 
