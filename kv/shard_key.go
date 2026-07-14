@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -11,6 +12,8 @@ import (
 const redisInternalRoutePrefix = "!redis|"
 
 var redisInternalRoutePrefixBytes = []byte(redisInternalRoutePrefix)
+
+const wideColumnEncodedKeyLengthSize = 4
 
 const (
 	dynamoRoutePrefix = "!ddb|route|table|"
@@ -69,6 +72,9 @@ func normalizeRouteKey(key []byte) []byte {
 	if user := redisRouteKey(key); user != nil {
 		return user
 	}
+	if user := redisWideColumnRouteKey(key); user != nil {
+		return user
+	}
 	if table := dynamoRouteKey(key); table != nil {
 		return table
 	}
@@ -85,6 +91,119 @@ func normalizeRouteKey(key []byte) []byte {
 		return user
 	}
 	return key
+}
+
+func redisWideColumnRouteKey(key []byte) []byte {
+	if user := redisHashRouteKey(key); user != nil {
+		return user
+	}
+	if user := redisSetRouteKey(key); user != nil {
+		return user
+	}
+	return redisZSetRouteKey(key)
+}
+
+func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
+	for _, prefix := range [][]byte{
+		[]byte(store.HashMetaDeltaPrefix),
+		[]byte(store.HashMetaPrefix),
+		[]byte(store.HashFieldPrefix),
+		[]byte(store.SetMetaDeltaPrefix),
+		[]byte(store.SetMetaPrefix),
+		[]byte(store.SetMemberPrefix),
+		[]byte(store.ZSetMetaDeltaPrefix),
+		[]byte(store.ZSetMetaPrefix),
+		[]byte(store.ZSetMemberPrefix),
+		[]byte(store.ZSetScorePrefix),
+	} {
+		if !bytes.HasPrefix(key, prefix) {
+			continue
+		}
+		user := wideColumnScanUserKey(key, prefix)
+		if user == nil {
+			return prefix, nil, nil, true, false
+		}
+		prefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		return prefix, user, key[:prefixLen], true, true
+	}
+	return nil, nil, nil, false, false
+}
+
+func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
+	prefix, userKey, userPrefix, owned, parsed := redisWideColumnScanRouteParts(start)
+	if !owned {
+		return nil, nil, false, false
+	}
+	if !parsed {
+		return nil, nil, false, true
+	}
+	if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+		return userKey, nil, true, true
+	}
+	if bytes.Equal(start, userPrefix) && end != nil && bytes.Compare(end, prefixScanEnd(prefix)) <= 0 {
+		return userKey, prefixScanEnd(userKey), false, true
+	}
+	// Physical wide-column cursors include a field/member suffix. Their raw
+	// ordering cannot be projected to a logical user-key lower bound, so the
+	// remaining namespace must fan out to every logical route.
+	return nil, nil, false, true
+}
+
+func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	rest := key[len(prefix):]
+	if len(rest) < wideColumnEncodedKeyLengthSize {
+		return nil
+	}
+	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
+	rest = rest[wideColumnEncodedKeyLengthSize:]
+	if uint64(keyLen) > uint64(len(rest)) {
+		return nil
+	}
+	return rest[:keyLen]
+}
+
+func redisHashRouteKey(key []byte) []byte {
+	switch {
+	case store.IsHashMetaDeltaKey(key):
+		return store.ExtractHashUserKeyFromDelta(key)
+	case store.IsHashMetaKey(key):
+		return store.ExtractHashUserKeyFromMeta(key)
+	case store.IsHashFieldKey(key):
+		return store.ExtractHashUserKeyFromField(key)
+	default:
+		return nil
+	}
+}
+
+func redisSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsSetMetaDeltaKey(key):
+		return store.ExtractSetUserKeyFromDelta(key)
+	case store.IsSetMetaKey(key):
+		return store.ExtractSetUserKeyFromMeta(key)
+	case store.IsSetMemberKey(key):
+		return store.ExtractSetUserKeyFromMember(key)
+	default:
+		return nil
+	}
+}
+
+func redisZSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsZSetMetaDeltaKey(key):
+		return store.ExtractZSetUserKeyFromDelta(key)
+	case store.IsZSetMetaKey(key):
+		return store.ExtractZSetUserKeyFromMeta(key)
+	case store.IsZSetMemberKey(key):
+		return store.ExtractZSetUserKeyFromMember(key)
+	case store.IsZSetScoreKey(key):
+		return store.ExtractZSetUserKeyFromScore(key)
+	default:
+		return nil
+	}
 }
 
 func redisRouteKey(key []byte) []byte {
