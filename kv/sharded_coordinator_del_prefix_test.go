@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -144,6 +145,36 @@ func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {
 	})
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 	require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the fenced shard")
+}
+
+func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryFenceRoutes(bucket, 1, 2),
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+			Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("v")}},
+		})
+		require.ErrorIs(t, err, ErrRouteWriteFenced)
+		require.Empty(t, g1Txn.requests, "coordinator must reject before proposing to the raw-key shard")
+		require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the fenced shard")
+	}
 }
 
 func TestShardedCoordinatorRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
