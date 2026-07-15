@@ -1340,8 +1340,9 @@ func (s *SQSServer) rotateMessagesForDelivery(
 //   - (msg, false, nil)  → delivered, caller appends.
 //   - (nil, true,  nil)  → expected race; skip this candidate only.
 //     Covers ErrKeyNotFound (someone deleted the record between the
-//     vis-index scan and our GetAt) and ErrWriteConflict on dispatch
-//     (another receive rotated the same record).
+//     vis-index scan and our GetAt), plus non-fence dispatch races
+//     like ErrWriteConflict / ErrTxnLocked (another receive rotated
+//     the same record).
 //   - (nil, false, err)  → non-retryable failure; propagate up the
 //     stack so ReceiveMessage returns an actionable 5xx instead of
 //     a false-empty 200.
@@ -1441,7 +1442,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		return nil, false, err
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return nil, true, nil
 		}
 		return nil, false, errors.WithStack(err)
