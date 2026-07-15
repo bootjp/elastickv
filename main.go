@@ -1564,6 +1564,9 @@ func prepareRuntimeServerRunner(waitRotateOnStartup startupRotationWaiter, in se
 		})
 	}
 	publicKVGate := &startupPublicKVGate{}
+	if in.distServer != nil {
+		in.distServer.SetReadGate(publicKVGate.blocked)
+	}
 	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
 	adapterCoordinate := startupGatedCoordinator{
 		inner: in.coordinate,
@@ -2185,6 +2188,7 @@ func startRaftServers(
 	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
+	readGate func() bool,
 	distServer *adapter.DistributionServer,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
@@ -2218,7 +2222,7 @@ func startRaftServers(
 		}
 		gs := grpc.NewServer(opts...)
 		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
-		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
+		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate, adapter.WithGRPCReadGate(readGate))
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
@@ -2658,8 +2662,10 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		return r.startupFailure(err)
 	}
 	adminGRPCOpts := r.adminGRPCOpts
+	var readGate func() bool
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
+		readGate = r.publicKVGate.blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
@@ -2674,6 +2680,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardGroups,
 		r.shardStore,
 		r.coordinate,
+		readGate,
 		r.distServer,
 		r.pubsubRelay,
 		func(groupID uint64) kv.ProposalObserver {

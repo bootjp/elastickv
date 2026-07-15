@@ -23,6 +23,7 @@ type DistributionServer struct {
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
 	readTracker *kv.ActiveTimestampTracker
+	readBlocked func() bool
 	reloadRetry struct {
 		attempts int
 		interval time.Duration
@@ -44,6 +45,12 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.readTracker = tracker
+	}
+}
+
+func WithDistributionReadGate(blocked func() bool) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.readBlocked = blocked
 	}
 }
 
@@ -96,6 +103,20 @@ func NewDistributionServer(e *distribution.Engine, catalog *distribution.Catalog
 	return s
 }
 
+func (s *DistributionServer) SetReadGate(blocked func() bool) {
+	if s != nil {
+		s.readBlocked = blocked
+	}
+}
+
+func (s *DistributionServer) requireReadReady() error {
+	if s != nil && s.readBlocked != nil && s.readBlocked() {
+		//nolint:wrapcheck // Preserve the gRPC status code for startup readers.
+		return status.Error(codes.Unavailable, "distribution startup has not completed")
+	}
+	return nil
+}
+
 // UpdateRoute allows updating route information.
 func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
 	s.engine.UpdateRoute(start, end, group)
@@ -103,6 +124,9 @@ func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
 
 // GetRoute returns route for a key.
 func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteRequest) (*pb.GetRouteResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	r, ok := s.engine.GetRoute(req.Key)
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
@@ -122,6 +146,9 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 
 // ListRoutes returns all durable routes from catalog storage.
 func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesRequest) (*pb.ListRoutesResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.loadCatalogSnapshot(ctx)
 	if err != nil {
 		return nil, err

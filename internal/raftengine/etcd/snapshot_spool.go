@@ -33,6 +33,8 @@ const maxSnapshotPayloadBytesEnvVar = "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES
 
 const snapshotSpoolMinFreeBytesEnvVar = "ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES"
 
+const defaultReceiveSnapshotSpoolMinFreeBytes int64 = 1 << 30 // 1 GiB
+
 // resolveMaxSnapshotPayloadBytes evaluates the env override once per spool
 // creation. Snapshots are infrequent enough that one Getenv + ParseInt per
 // spool is invisible in profiles, and resolving at construction means tests
@@ -94,11 +96,13 @@ func newSnapshotSpool(dir string) (*snapshotSpool, error) {
 
 func newReceiveSnapshotSpool(dir string) (*snapshotSpool, error) {
 	maxSize := resolveMaxSnapshotPayloadBytes()
-	// Keep one full max-size snapshot worth of headroom after receive-side
-	// spooling. Applying a token snapshot restores the FSM from the completed
-	// .fsm into a new local store directory, so a node can transiently need old
-	// snapshot + incoming .fsm + restored store bytes.
-	return newSnapshotSpoolWithLimits(dir, maxSize, resolveSnapshotSpoolMinFreeBytes(maxSize))
+	// Keep a fixed emergency reserve after receive-side spooling. Tying this
+	// reserve to the configured maximum snapshot size made the default 16 GiB
+	// cap also require 16 GiB of free space after every chunk; production nodes
+	// with enough space for a real 13 GiB FSM snapshot were rejecting the stream
+	// around 4 GiB and retrying forever. Operators that restore into a layout
+	// needing a larger reserve can still raise it with the env knob.
+	return newSnapshotSpoolWithLimits(dir, maxSize, resolveSnapshotSpoolMinFreeBytes(defaultReceiveSnapshotSpoolMinFreeBytes))
 }
 
 func newSnapshotSpoolWithLimits(dir string, maxSize, minFreeBytes int64) (*snapshotSpool, error) {

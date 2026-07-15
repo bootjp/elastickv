@@ -38,6 +38,35 @@ func TestDistributionServerGetRoute_HitAndMiss(t *testing.T) {
 	require.Nil(t, miss.End)
 }
 
+func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	_, err := catalog.Save(context.Background(), 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+
+	blocked := true
+	s := NewDistributionServer(engine, catalog, WithDistributionReadGate(func() bool { return blocked }))
+
+	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	blocked = false
+	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
+	require.NoError(t, err)
+	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.NoError(t, err)
+}
+
 func TestDistributionServerGetTimestamp_IsMonotonic(t *testing.T) {
 	t.Parallel()
 

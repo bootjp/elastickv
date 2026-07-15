@@ -460,14 +460,38 @@ func TestPrewriteRestorableCheckUsesSnapshotFooterOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	require.True(t, fsmSnapshotPairRestorable(
+	restorable, _ := fsmSnapshotPairRestorable(
 		snapDir,
 		fsmSnapDir,
 		"0000000000000001-0000000000000064.snap",
 		1,
 		100,
-	))
+	)
+	require.True(t, restorable)
 	require.ErrorIs(t, verifyFSMSnapshotFile(path, crc), ErrFSMSnapshotFileCRC)
+}
+
+func TestPrepareFSMSnapshotWriteVerifiesRetainedFooterOnlyFallbackBeforePruning(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	crc100, _ := writeFSMFileForTest(t, fsmSnapDir, 100, []byte("valid fallback"))
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc100)
+	crc200, path200 := writeFSMFileForTest(t, fsmSnapDir, 200, []byte("corrupt newest fallback"))
+	createTokenSnapFileWithTerm(t, snapDir, 1, 200, crc200)
+
+	f, err := os.OpenFile(path200, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte("X"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 300))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
 }
 
 func TestPrepareFSMSnapshotWriteKeepsWALValidAndRestorableFallbacksWhenWALValidCandidateIsBroken(t *testing.T) {

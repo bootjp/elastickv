@@ -195,7 +195,7 @@ func TestShardedCoordinator_RetriesRawWriteWhenObservedRouteVersionGCd(t *testin
 	require.Equal(t, uint64(9), txn.requests[1].GetObservedRouteVersion())
 }
 
-func TestShardedCoordinator_RetriesDelPrefixWhenObservedRouteVersionGCd(t *testing.T) {
+func TestShardedCoordinator_DoesNotRetryDelPrefixWhenObservedRouteVersionGCd(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -216,10 +216,87 @@ func TestShardedCoordinator_RetriesDelPrefixWhenObservedRouteVersionGCd(t *testi
 		ObservedRouteVersion: 2,
 		Elems:                []*Elem[OP]{{Op: DelPrefix, Key: []byte("user:")}},
 	})
-	require.NoError(t, err)
-	require.Len(t, txn.requests, 2)
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, txn.requests, 1)
 	require.Equal(t, uint64(2), txn.requests[0].GetObservedRouteVersion())
-	require.Equal(t, uint64(7), txn.requests[1].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_DoesNotRetryMultiShardRawWriteWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 11,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{errs: []error{ErrComposed1VersionGCd}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("a"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("z"), Value: []byte("v2")},
+		},
+	})
+
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, g1Txn.requests, 1)
+	require.Len(t, g2Txn.requests, 1)
+	require.Equal(t, uint64(3), g1Txn.requests[0].GetObservedRouteVersion())
+	require.Equal(t, uint64(3), g2Txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_DoesNotRetryRawWriteWhenRetryRouteBecomesMultiShard(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 11,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+		onCommit: func(call int, _ *pb.Request) {
+			if call != 0 {
+				return
+			}
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 12,
+				Routes: []distribution.RouteDescriptor{
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+					{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+				},
+			}))
+		},
+	}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("a"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("z"), Value: []byte("v2")},
+		},
+	})
+
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, g1Txn.requests, 1)
+	require.Len(t, g2Txn.requests, 0)
+	require.Equal(t, uint64(3), g1Txn.requests[0].GetObservedRouteVersion())
 }
 
 func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {

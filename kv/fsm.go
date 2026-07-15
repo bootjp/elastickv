@@ -546,11 +546,37 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if start, ok := s3keys.BucketGenerationRoutePrefixForCleanupPrefix(prefix); ok {
 		return start, prefixScanEnd(start)
 	}
+	if start, ok := dynamoExactCleanupRouteKey(prefix); ok {
+		return start, routePointRangeEnd(start)
+	}
 	if routeKeyspaceWideRawPrefix(prefix) {
 		return []byte(""), nil
 	}
 	start := routeKey(prefix)
 	return start, prefixScanEnd(start)
+}
+
+func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
+	switch {
+	case bytes.HasPrefix(prefix, dynamoTableMetaPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoTableGenerationPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoItemPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoGSIPrefixBytes):
+	default:
+		return nil, false
+	}
+	start := routeKey(prefix)
+	if len(start) == 0 || bytes.Equal(start, prefix) || !bytes.HasPrefix(start, dynamoRoutePrefixBytes) {
+		return nil, false
+	}
+	return start, true
+}
+
+func routePointRangeEnd(start []byte) []byte {
+	end := make([]byte, 0, len(start)+1)
+	end = append(end, start...)
+	end = append(end, 0)
+	return end
 }
 
 func routeKeyspaceWideRawPrefix(prefix []byte) bool {

@@ -97,7 +97,7 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.maxSize)
 }
 
-func TestSnapshotSpoolDefaultReserveTracksPayloadCap(t *testing.T) {
+func TestSnapshotSpoolDefaultReserveUsesFixedEmergencyHeadroom(t *testing.T) {
 	const spoolCap = int64(4096)
 	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
 
@@ -106,7 +106,7 @@ func TestSnapshotSpoolDefaultReserveTracksPayloadCap(t *testing.T) {
 	t.Cleanup(func() { _ = spool.Close() })
 
 	require.Equal(t, spoolCap, spool.maxSize)
-	require.Equal(t, spoolCap, spool.minFreeBytes)
+	require.Equal(t, defaultReceiveSnapshotSpoolMinFreeBytes, spool.minFreeBytes)
 }
 
 func TestSnapshotSpoolMaterializeDoesNotReserveDiskHeadroom(t *testing.T) {

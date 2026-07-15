@@ -940,6 +940,7 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 	require.True(t, ok, "dispatcher must be created on upsert")
 	require.Equal(t, defaultHeartbeatBufPerPeer, cap(pd.heartbeat))
 	require.Equal(t, defaultHeartbeatRespBufPerPeer, cap(pd.heartbeatResp))
+	require.Equal(t, defaultReadIndexRespBufPerPeer, cap(pd.readIndexResp))
 	require.Equal(t, 4, cap(pd.normal))
 
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
@@ -962,6 +963,7 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		normal:        make(chan dispatchRequest, 4),
 		heartbeat:     make(chan dispatchRequest, 4),
 		heartbeatResp: make(chan dispatchRequest, 4),
+		readIndexResp: make(chan dispatchRequest, 4),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -971,10 +973,11 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		peerDispatchers: map[uint64]*peerQueues{2: pd},
 		dispatchStopCh:  stopCh,
 	}
-	engine.dispatchWG.Add(3)
+	engine.dispatchWG.Add(4)
 	go engine.runDispatchWorker(ctx, pd.normal)
 	go engine.runDispatchWorker(ctx, pd.heartbeat)
 	go engine.runDispatchWorker(ctx, pd.heartbeatResp)
+	go engine.runDispatchWorker(ctx, pd.readIndexResp)
 
 	engine.removePeer(2)
 
@@ -1581,6 +1584,44 @@ func TestEnqueueDispatchMessageCoalescesPlainHeartbeatBehindReadIndex(t *testing
 	require.Equal(t, uint64(99), req.msg.GetIndex())
 	req = <-pd.heartbeatResp
 	require.Equal(t, uint64(11), req.msg.GetIndex())
+}
+
+func TestEnqueueDispatchMessagePreservesIncomingReadIndexHeartbeatWhenRespLaneFull(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 2),
+		readIndexResp: make(chan dispatchRequest, 1),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-a"),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-b"),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-c"),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 2)
+	require.Len(t, pd.readIndexResp, 1)
+	req := <-pd.readIndexResp
+	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
+	require.Equal(t, []byte("read-index-c"), req.msg.Context)
 }
 
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
@@ -2335,6 +2376,7 @@ func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
 		normal:        make(chan dispatchRequest, 1),
 		heartbeat:     make(chan dispatchRequest, 1),
 		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
 	}
 
 	cases := map[raftpb.MessageType]chan dispatchRequest{
@@ -2355,6 +2397,11 @@ func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
 		got := engine.selectDispatchLane(pd, mt)
 		require.Equalf(t, want, got, "legacy mode routing for %s", mt)
 	}
+	got := engine.selectDispatchLaneForMessage(pd, raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		Context: []byte("read-index"),
+	})
+	require.Equal(t, pd.readIndexResp, got)
 }
 
 // TestSelectDispatchLane_FiveLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
@@ -2367,6 +2414,7 @@ func TestSelectDispatchLane_FiveLane(t *testing.T) {
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, 1),
 		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
 		replication:   make(chan dispatchRequest, 1),
 		snapshot:      make(chan dispatchRequest, 1),
 		other:         make(chan dispatchRequest, 1),
@@ -2390,6 +2438,11 @@ func TestSelectDispatchLane_FiveLane(t *testing.T) {
 		got := engine.selectDispatchLane(pd, mt)
 		require.Equalf(t, want, got, "multi-lane mode routing for %s", mt)
 	}
+	got := engine.selectDispatchLaneForMessage(pd, raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		Context: []byte("read-index"),
+	})
+	require.Equal(t, pd.readIndexResp, got)
 }
 
 // TestSelectDispatchLane_MsgPropReachesDefaultFallback verifies that MsgProp,
@@ -2403,6 +2456,7 @@ func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, 1),
 		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
 		replication:   make(chan dispatchRequest, 1),
 		snapshot:      make(chan dispatchRequest, 1),
 		other:         make(chan dispatchRequest, 1),

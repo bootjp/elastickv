@@ -1007,9 +1007,40 @@ func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, 
 		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
 			return resp, err
 		}
+		if !c.canRetryRawVersionGC(reqs) {
+			return resp, err
+		}
 		reqs.ObservedRouteVersion = c.engine.Version()
 	}
 	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+func (c *ShardedCoordinator) canRetryRawVersionGC(reqs *OperationGroup[OP]) bool {
+	if c == nil || c.router == nil || reqs == nil || hasDelPrefixElem(reqs.Elems) {
+		return false
+	}
+	var (
+		firstGID uint64
+		seen     bool
+	)
+	for _, elem := range reqs.Elems {
+		if elem == nil {
+			return false
+		}
+		gid, ok := c.router.ResolveGroup(elem.Key)
+		if !ok {
+			return false
+		}
+		if !seen {
+			firstGID = gid
+			seen = true
+			continue
+		}
+		if gid != firstGID {
+			return false
+		}
+	}
+	return seen
 }
 
 // hasDelPrefixElem returns true if any element is a DelPrefix operation.

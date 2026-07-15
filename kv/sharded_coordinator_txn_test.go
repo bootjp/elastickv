@@ -19,6 +19,7 @@ type recordingTransactional struct {
 	requests  []*pb.Request
 	responses []*TransactionResponse
 	errs      []error
+	onCommit  func(call int, req *pb.Request)
 }
 
 func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -30,6 +31,9 @@ func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (
 	}
 	s.requests = append(s.requests, cloneTxnRequest(reqs[0]))
 	call := len(s.requests) - 1
+	if s.onCommit != nil {
+		s.onCommit(call, s.requests[call])
+	}
 	if call < len(s.errs) && s.errs[call] != nil {
 		return nil, s.errs[call]
 	}

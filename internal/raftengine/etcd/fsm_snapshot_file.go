@@ -619,6 +619,7 @@ type snapFileCandidate struct {
 	index      uint64
 	restorable bool
 	walValid   bool
+	tokenCRC   uint32
 }
 
 type prewriteSnapshotRetention struct {
@@ -655,7 +656,7 @@ func purgeOlderSnapshotPairsBeforeWrite(
 		return candidates[i].index < candidates[j].index
 	})
 
-	retention := keepRestorablePrewriteSnapshots(candidates)
+	retention := keepVerifiedPrewriteSnapshots(fsmSnapDir, candidates)
 	var combined error
 	combined = errors.CombineErrors(combined, purgeUnretainedPrewriteSnapshots(snapDir, fsmSnapDir, candidates, retention))
 	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(
@@ -746,6 +747,69 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 	return retention
 }
 
+func keepVerifiedPrewriteSnapshots(fsmSnapDir string, candidates []snapFileCandidate) prewriteSnapshotRetention {
+	retention := keepRestorablePrewriteSnapshots(candidates)
+	if fsmSnapDir == "" || len(candidates) <= prewriteSnapKeep {
+		return retention
+	}
+	for {
+		if !invalidateUnverifiedRetainedPrewriteSnapshots(fsmSnapDir, candidates, retention) {
+			return retention
+		}
+		retention = keepRestorablePrewriteSnapshots(candidates)
+		if !retentionHasRestorable(candidates, retention) {
+			return keepAllPrewriteSnapshots(candidates)
+		}
+	}
+}
+
+func invalidateUnverifiedRetainedPrewriteSnapshots(
+	fsmSnapDir string,
+	candidates []snapFileCandidate,
+	retention prewriteSnapshotRetention,
+) bool {
+	invalidated := false
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !candidate.restorable || !retention.keep[candidate.name] || !retainedPrewriteSnapshotPrunesOlder(candidates, retention, *candidate) {
+			continue
+		}
+		if verifyFSMSnapshotFileWithToken(fsmSnapPath(fsmSnapDir, candidate.index), candidate.tokenCRC, true) == nil {
+			continue
+		}
+		candidate.restorable = false
+		invalidated = true
+	}
+	return invalidated
+}
+
+func retainedPrewriteSnapshotPrunesOlder(candidates []snapFileCandidate, retention prewriteSnapshotRetention, retained snapFileCandidate) bool {
+	for _, candidate := range candidates {
+		if candidate.index >= retained.index || retention.keep[candidate.name] {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func retentionHasRestorable(candidates []snapFileCandidate, retention prewriteSnapshotRetention) bool {
+	for _, candidate := range candidates {
+		if candidate.restorable && retention.keep[candidate.name] {
+			return true
+		}
+	}
+	return false
+}
+
+func keepAllPrewriteSnapshots(candidates []snapFileCandidate) prewriteSnapshotRetention {
+	retention := prewriteSnapshotRetention{keep: make(map[string]bool, len(candidates))}
+	for _, candidate := range candidates {
+		retention.keep[candidate.name] = true
+	}
+	return retention
+}
+
 func keepNewestMatchingPrewriteSnapshots(
 	candidates []snapFileCandidate,
 	retention *prewriteSnapshotRetention,
@@ -813,28 +877,30 @@ func collectPrewriteSnapCandidates(
 		if index == 0 || index >= nextIndex {
 			continue
 		}
+		restorable, tokenCRC := fsmSnapshotPairRestorable(snapDir, fsmSnapDir, e.Name(), term, index)
 		candidates = append(candidates, snapFileCandidate{
 			name:       e.Name(),
 			index:      index,
-			restorable: fsmSnapshotPairRestorable(snapDir, fsmSnapDir, e.Name(), term, index),
+			restorable: restorable,
 			walValid:   walValidIndexes == nil || walValidIndexes[walSnapshotKey{term: term, index: index}],
+			tokenCRC:   tokenCRC,
 		})
 	}
 	return candidates
 }
 
-func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index uint64) bool {
+func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index uint64) (bool, uint32) {
 	if fsmSnapDir == "" {
-		return false
+		return false, 0
 	}
 	tok, ok := snapshotTokenFromSnapFile(snapDir, snapName, term, index)
 	if !ok {
-		return false
+		return false, 0
 	}
 	// Prewrite cleanup runs on the snapshot receive hot path before gRPC starts
 	// draining payload chunks. Only do a footer/token check here; full-payload
 	// CRC remains in the actual restore/open paths.
-	return fsmSnapshotFooterMatchesToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C) == nil
+	return fsmSnapshotFooterMatchesToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C) == nil, tok.CRC32C
 }
 
 func fsmSnapshotFooterMatchesToken(path string, tokenCRC uint32) error {

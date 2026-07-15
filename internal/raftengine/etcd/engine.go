@@ -85,6 +85,12 @@ const (
 	// upside is that a ~5 s transient pause (election-timeout scale)
 	// no longer drops heartbeats and forces the peers' lease to expire.
 	defaultHeartbeatBufPerPeer = 512
+	// defaultReadIndexRespBufPerPeer sizes the dedicated follower-to-leader
+	// ReadIndex heartbeat response lane. etcd/raft encodes ReadIndex
+	// completions as MsgHeartbeatResp messages with Context set; unlike plain
+	// heartbeat acks, each context is tied to a caller waiting in handleRead
+	// and must not be coalesced or dropped behind superseded empty acks.
+	defaultReadIndexRespBufPerPeer = 512
 	// defaultHeartbeatRespBufPerPeer sizes the dedicated follower-to-leader
 	// heartbeat response lane. When a follower is receiving a large snapshot,
 	// the leader may continue to send heartbeats while the follower's outbound
@@ -577,21 +583,23 @@ type dispatchRequest struct {
 // peerQueues holds separate dispatch channels per peer so that heartbeats
 // are never blocked behind large log-entry RPCs.
 //
-// Legacy 3-lane layout (default): heartbeat + heartbeatResp + normal.
+// Legacy 4-lane layout (default): heartbeat + heartbeatResp +
+// readIndexResp + normal.
 //
-// 5-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
-// heartbeatResp + replication (MsgApp/MsgAppResp) + snapshot (MsgSnap) +
-// other. Each lane gets its own goroutine so a bulky MsgSnap transfer cannot
-// stall MsgApp replication and vice versa. Per-peer ordering within a given
-// message type is preserved because a single peer's MsgApp stream all share
-// one lane and one worker.
+// 6-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
+// heartbeatResp + readIndexResp + replication (MsgApp/MsgAppResp) + snapshot
+// (MsgSnap) + other. Each lane gets its own goroutine so a bulky MsgSnap
+// transfer cannot stall MsgApp replication and vice versa. Per-peer ordering
+// within a given message type is preserved because a single peer's MsgApp
+// stream all share one lane and one worker.
 type peerQueues struct {
 	normal        chan dispatchRequest
 	heartbeat     chan dispatchRequest
 	heartbeatResp chan dispatchRequest
-	replication   chan dispatchRequest // 5-lane mode only; nil otherwise
-	snapshot      chan dispatchRequest // 5-lane mode only; nil otherwise
-	other         chan dispatchRequest // 5-lane mode only; nil otherwise
+	readIndexResp chan dispatchRequest
+	replication   chan dispatchRequest // 6-lane mode only; nil otherwise
+	snapshot      chan dispatchRequest // 6-lane mode only; nil otherwise
+	other         chan dispatchRequest // 6-lane mode only; nil otherwise
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -2416,7 +2424,7 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
-	ch := e.selectDispatchLane(pd, msg.GetType())
+	ch := e.selectDispatchLaneForMessage(pd, msg)
 	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
 	// is already full. The len/cap check is safe here because this function is
 	// only ever called from the single engine event-loop goroutine.
@@ -2519,6 +2527,14 @@ func isBlockingInboundStepMsg(t raftpb.MessageType) bool {
 // opt-in multi-lane layout it additionally partitions the non-heartbeat traffic
 // so that MsgApp/MsgAppResp and MsgSnap do not share a goroutine and cannot
 // block each other.
+func (e *Engine) selectDispatchLaneForMessage(pd *peerQueues, msg raftpb.Message) chan dispatchRequest {
+	msgType := msg.GetType()
+	if msgType == raftpb.MsgHeartbeatResp && len(msg.GetContext()) > 0 && pd.readIndexResp != nil {
+		return pd.readIndexResp
+	}
+	return e.selectDispatchLane(pd, msgType)
+}
+
 func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) chan dispatchRequest {
 	if msgType == raftpb.MsgHeartbeatResp && pd.heartbeatResp != nil {
 		return pd.heartbeatResp
@@ -4457,24 +4473,25 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
 		heartbeatResp: make(chan dispatchRequest, defaultHeartbeatRespBufPerPeer),
+		readIndexResp: make(chan dispatchRequest, defaultReadIndexRespBufPerPeer),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
 	var workers []chan dispatchRequest
 	if e.dispatcherLanesEnabled {
-		// 5-lane layout: split MsgHeartbeatResp, MsgApp/MsgAppResp
-		// (replication), MsgSnap (snapshot), and misc (other) onto independent
-		// goroutines so a bulky snapshot transfer cannot stall replication or
-		// follower heartbeat responses. Each channel still serves a single
-		// peer, so within-type ordering (the raft invariant we care about for
-		// MsgApp) is preserved.
+		// 6-lane layout: split MsgHeartbeatResp, ReadIndex heartbeat
+		// responses, MsgApp/MsgAppResp (replication), MsgSnap (snapshot), and
+		// misc (other) onto independent goroutines so a bulky snapshot transfer
+		// cannot stall replication or follower heartbeat responses. Each channel
+		// still serves a single peer, so within-type ordering (the raft invariant
+		// we care about for MsgApp) is preserved.
 		pd.replication = make(chan dispatchRequest, size)
 		pd.snapshot = make(chan dispatchRequest, defaultSnapshotLaneBufPerPeer)
 		pd.other = make(chan dispatchRequest, defaultOtherLaneBufPerPeer)
-		workers = []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.replication, pd.snapshot, pd.other}
+		workers = []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.replication, pd.snapshot, pd.other}
 	} else {
 		pd.normal = make(chan dispatchRequest, size)
-		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.heartbeatResp}
+		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.heartbeatResp, pd.readIndexResp}
 	}
 	e.peerDispatchers[nodeID] = pd
 	e.dispatchWG.Add(len(workers))
@@ -4549,7 +4566,7 @@ func dispatcherLanesEnabledFromEnv() bool {
 // drain loops in runDispatchWorker exit. It is safe to call with any dispatch
 // layout because unused lanes are nil.
 func closePeerLanes(pd *peerQueues) {
-	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
+	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
 		if ch != nil {
 			close(ch)
 		}
