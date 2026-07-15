@@ -35,6 +35,7 @@ var (
 	ErrCatalogSplitJobKeyIDMismatch       = errors.New("catalog split job key and record job id mismatch")
 	ErrCatalogSplitJobConflict            = errors.New("catalog split job conflict")
 	ErrCatalogSplitJobTerminalRequired    = errors.New("catalog split job terminal state is required")
+	ErrSplitJobOverlap                    = errors.New("split job overlaps requested route")
 )
 
 // SplitJobPhase is the durable phase of a split migration job.

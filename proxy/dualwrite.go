@@ -25,16 +25,14 @@ const (
 	// (EVAL / EVALSHA). Lua scripts under high load cause write conflicts in the Raft
 	// layer, and each conflict triggers a full script re-execution. Capping the
 	// concurrency reduces contention so individual scripts complete within
-	// SecondaryTimeout. Excess secondary script writes may be dropped to keep
-	// contention bounded; this is only tolerable in modes where the script write
-	// is targeting the non-authoritative backend.
+	// SecondaryTimeout. Strict dual-write script replays wait for capacity instead
+	// of being dropped; best-effort users of goScript may still drop.
 	maxScriptWriteGoroutines = 64
 
-	// maxCompactedRetries caps retries when the secondary returns
-	// "read timestamp has been compacted". Each attempt re-sends the command so
-	// the secondary re-selects a fresh read snapshot; a small bound is enough
-	// because the compaction waterline advances slowly relative to SecondaryTimeout.
-	maxCompactedRetries = 3
+	// maxSecondaryTransientRetries caps proxy-level retries when the secondary
+	// returns a transient OCC/read-snapshot error after exhausting its own retry
+	// loop. SecondaryTimeout still bounds the whole replay.
+	maxSecondaryTransientRetries = 3
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
@@ -65,6 +63,21 @@ func isReadTSCompactedError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), readTSCompactedMarker)
+}
+
+func isRetryableSecondaryWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isReadTSCompactedError(err) {
+		return true
+	}
+	switch classifySecondaryWriteError(err) {
+	case "retry_limit", "write_conflict", "txn_locked":
+		return true
+	default:
+		return false
+	}
 }
 
 // DualWriter routes commands to primary and secondary backends based on mode.
@@ -148,7 +161,9 @@ func (d *DualWriter) Close() {
 	d.wg.Wait()
 }
 
-// Write sends a write command to the primary synchronously, then to the secondary asynchronously.
+// Write sends a write command to the primary synchronously, then to the secondary.
+// The secondary write uses a bounded async slot when possible, but applies
+// caller backpressure instead of dropping when the slot pool is saturated.
 // cmd must be the pre-uppercased command name.
 func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
@@ -166,9 +181,8 @@ func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any,
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	// Secondary: async fire-and-forget (bounded)
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
+		d.runSecondaryWrite(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -257,7 +271,9 @@ func (d *DualWriter) Admin(ctx context.Context, cmd string, args [][]byte) (any,
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
-// Script forwards EVAL/EVALSHA to the primary, and async replays to secondary.
+// Script forwards EVAL/EVALSHA to the primary, and replays to secondary.
+// Secondary script replays are concurrency-limited and apply caller
+// backpressure rather than dropping when the script slot pool is saturated.
 // cmd must be the pre-uppercased command name.
 func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
@@ -275,23 +291,21 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	d.rememberScript(cmd, args)
 
 	if d.hasSecondaryWrite() {
-		d.goScript(func() { d.writeSecondary(cmd, iArgs) })
+		d.runSecondaryScript(func() { d.writeSecondary(cmd, iArgs) })
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
 // writeSecondary sends the command to the secondary, handling the NOSCRIPT
-// → EVAL fallback and transparently retrying when the secondary reports that
-// the read snapshot has been compacted. A re-sent command causes the backend
-// to re-select a fresh read timestamp, which is the only way to recover once
-// the original startTS has fallen behind MinRetainedTS on a peer node.
+// → EVAL fallback and transparently retrying transient secondary errors. A
+// re-sent command causes the backend to re-select a fresh timestamp and can
+// also recover from hot-key OCC retry exhaustion in the secondary Redis adapter.
 //
 // The secondary's raw redis error is kept in sErr (not wrapped) so that
 // writeSecondary can classify it via errors.Is(sErr, redis.Nil), attach the
 // original message to Sentry and the structured log, and so the retry
-// predicate isReadTSCompactedError matches the exact substring coming back
-// from gRPC.
+// predicate can match the exact substring coming back from gRPC.
 func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 	defer cancel()
@@ -317,14 +331,14 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 				_, sErr = result.Result()
 			}
 		}
-		if !isReadTSCompactedError(sErr) {
+		if !isRetryableSecondaryWriteError(sErr) {
 			break
 		}
-		if attempt >= maxCompactedRetries {
+		if attempt >= maxSecondaryTransientRetries {
 			break
 		}
-		d.logger.Debug("retrying secondary write on compacted snapshot",
-			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		d.logger.Debug("retrying secondary write after transient error",
+			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "reason", classifySecondaryWriteError(sErr), "err", sErr)
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
@@ -365,6 +379,19 @@ func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapse
 		warnArgs = append(warnArgs, "noscript_fallback", true)
 	}
 	d.logger.Warn("secondary write failed", warnArgs...)
+}
+
+func (d *DualWriter) replaySecondaryPipeline(cmds [][]any) {
+	d.runSecondaryWrite(func() {
+		sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
+		defer cancel()
+		_, pErr := d.secondary.Pipeline(sCtx, cmds)
+		if pErr != nil {
+			d.logger.Warn("secondary txn replay failed", "err", pErr)
+			d.metrics.SecondaryWriteErrors.Inc()
+			d.metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", classifySecondaryWriteError(pErr)).Inc()
+		}
+	})
 }
 
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early
@@ -416,13 +443,15 @@ func nextCompactedRetryBackoff(current time.Duration) time.Duration {
 }
 
 // goWrite launches fn in a bounded write goroutine.
+// It is best-effort: when the pool is saturated the work is dropped.
+// Strict secondary writes should use runSecondaryWrite.
 func (d *DualWriter) goWrite(fn func()) {
 	d.goAsyncWithSem(d.writeSem, fn)
 }
 
 // goScript launches fn in a bounded Lua-script write goroutine.
-// It uses a smaller semaphore than goWrite to cap the number of concurrent
-// EVAL/EVALSHA secondary writes. When the cap is reached the write is dropped.
+// It is best-effort: when the pool is saturated the work is dropped.
+// Strict secondary scripts should use runSecondaryScript.
 func (d *DualWriter) goScript(fn func()) {
 	d.goAsyncWithSem(d.scriptSem, fn)
 }
@@ -463,6 +492,49 @@ func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
 		d.metrics.AsyncDrops.Inc()
 		d.logAsyncDrop()
 	}
+}
+
+// runSecondaryWrite launches a strict secondary write. It uses the async write
+// pool while capacity is available, and otherwise blocks the caller until a
+// slot is available. This preserves dual-write consistency while still bounding
+// secondary backend concurrency.
+func (d *DualWriter) runSecondaryWrite(fn func()) {
+	d.runSecondaryWithBackpressure(d.writeSem, fn)
+}
+
+// runSecondaryScript is the strict variant of goScript for EVAL/EVALSHA replay.
+func (d *DualWriter) runSecondaryScript(fn func()) {
+	d.runSecondaryWithBackpressure(d.scriptSem, fn)
+}
+
+func (d *DualWriter) runSecondaryWithBackpressure(sem chan struct{}, fn func()) {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	select {
+	case sem <- struct{}{}:
+		d.wg.Add(1)
+		d.mu.Unlock()
+		go func() {
+			defer func() {
+				<-sem
+				d.wg.Done()
+			}()
+			fn()
+		}()
+		return
+	default:
+		d.metrics.AsyncBackpressure.Inc()
+		d.wg.Add(1)
+		d.mu.Unlock()
+	}
+
+	defer d.wg.Done()
+	sem <- struct{}{}
+	defer func() { <-sem }()
+	fn()
 }
 
 func (d *DualWriter) logAsyncDrop() {

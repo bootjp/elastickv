@@ -1105,7 +1105,17 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 }
 
 func isRetryableTransactWriteError(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
+}
+
+func isIgnorableTransactRaceError(err error) bool {
+	// Route fences reject before applying the write. They must be retried or
+	// propagated, not swallowed as "another worker already completed it".
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+}
+
+func shouldPreserveTransactWriteAttempt(err error) bool {
+	return isRetryableTransactWriteError(err) && !errors.Is(err, kv.ErrRouteWriteFenced)
 }
 
 func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {

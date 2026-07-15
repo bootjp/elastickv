@@ -36,14 +36,19 @@ const dispatchLeaderRetryInterval = 25 * time.Millisecond
 
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
 // physical ceiling extends ahead of the current wall clock. Modelled after
-// TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
+// TiDB's TSO window strategy: the leader commits ceiling = now + window, and
 // renews before the window expires. A new leader inherits the committed ceiling
 // so it never issues timestamps that collide with the previous leader's window.
-const hlcPhysicalWindowMs int64 = 3_000
+const hlcPhysicalWindowMs int64 = 15_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
 // Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
 const hlcRenewalInterval = 1 * time.Second
+
+// hlcRenewalTimeout bounds a single renewal proposal. It is intentionally
+// longer than hlcRenewalInterval so transient Raft write backlog does not
+// cancel the renewal before the physical ceiling has real risk of expiring.
+const hlcRenewalTimeout = 5 * time.Second
 
 // CoordinatorOption is a functional option for Coordinate constructors.
 type CoordinatorOption func(*Coordinate)
@@ -813,10 +818,10 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new
 // physical ceiling to the Raft cluster while this node is the leader.
 //
-// The ceiling is set to now + hlcPhysicalWindowMs (3 s) and is renewed every
-// hlcRenewalInterval (1 s), mirroring TiDB's TSO window strategy. Because the
-// window is always at least 2 s ahead of any real timestamp, a new leader will
-// never issue timestamps that overlap with the previous leader's window.
+// The ceiling is set to now + hlcPhysicalWindowMs and is renewed every
+// hlcRenewalInterval, mirroring TiDB's TSO window strategy. Because the window
+// stays ahead of real timestamps, a new leader will never issue timestamps that
+// overlap with the previous leader's window.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
@@ -835,7 +840,10 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 			}
 			if c.IsLeaderAcceptingWrites() {
 				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
+				pctx, cancel := context.WithTimeout(ctx, hlcRenewalTimeout)
+				err := c.ProposeHLCLease(pctx, ceilingMs)
+				cancel()
+				if err != nil {
 					c.log.WarnContext(ctx, "hlc lease renewal failed",
 						slog.Int64("ceiling_ms", ceilingMs),
 						slog.Any("err", err),
@@ -1088,7 +1096,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	// carries the option-2 one-phase dedup probe key for a retry that reuses
 	// a failed attempt's write set.
 	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys, observedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys, observedRouteVersion, nil),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1145,12 +1153,13 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 // The returned Request is structurally identical to the pre-stamping
 // shape the leader's stampRawTimestamps already handles for Ts == 0
 // (see adapter/internal.go).
-func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
+func (c *Coordinate) toRawRequest(req *Elem[OP], observedRouteVersion uint64) *pb.Request {
 	switch req.Op {
 	case Put:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -1162,8 +1171,9 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 	case Del:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
@@ -1174,8 +1184,9 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 	case DelPrefix:
 		return &pb.Request{
-			IsTxn: false,
-			Phase: pb.Phase_NONE,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			ObservedRouteVersion: observedRouteVersion,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL_PREFIX,
@@ -1238,7 +1249,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toRawRequest(req))
+			requests = append(requests, c.toRawRequest(req, reqs.ObservedRouteVersion))
 		}
 		return requests, nil
 	}
@@ -1262,7 +1273,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 		commitTS = 0
 	}
 	return []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion, nil),
 	}, nil
 }
 
@@ -1316,7 +1327,7 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 // route catalog snapshot at txn-begin (M1 plumbing, see
 // docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md).
 // Zero is the legacy "unpinned" sentinel.
-func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) *pb.Request {
+func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
 	muts = append(muts, &pb.Mutation{
 		Op:    pb.Op_PUT,
@@ -1333,6 +1344,7 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 		Mutations:            muts,
 		ReadKeys:             readKeys,
 		ObservedRouteVersion: observedRouteVersion,
+		WriteFenceBypassKeys: writeFenceBypassKeys,
 	}
 }
 

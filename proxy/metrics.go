@@ -17,7 +17,8 @@ type ProxyMetrics struct {
 
 	ActiveConnections prometheus.Gauge
 
-	AsyncDrops prometheus.Counter
+	AsyncDrops        prometheus.Counter
+	AsyncBackpressure prometheus.Counter
 
 	PubSubShadowDivergences *prometheus.CounterVec
 	PubSubShadowErrors      prometheus.Counter
@@ -78,7 +79,12 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		AsyncDrops: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "proxy",
 			Name:      "async_drops_total",
-			Help:      "Total async operations dropped due to semaphore backpressure.",
+			Help:      "Total best-effort async operations dropped due to semaphore backpressure.",
+		}),
+		AsyncBackpressure: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "proxy",
+			Name:      "async_backpressure_total",
+			Help:      "Total strict secondary writes that waited for an async semaphore slot instead of being dropped.",
 		}),
 
 		ActiveConnections: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -110,6 +116,7 @@ func NewProxyMetrics(reg prometheus.Registerer) *ProxyMetrics {
 		m.Divergences,
 		m.MigrationGaps,
 		m.AsyncDrops,
+		m.AsyncBackpressure,
 		m.ActiveConnections,
 		m.PubSubShadowDivergences,
 		m.PubSubShadowErrors,

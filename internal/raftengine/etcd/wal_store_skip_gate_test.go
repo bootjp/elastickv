@@ -53,16 +53,12 @@ func (f *skipGateFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
 	if f.parseErr != nil {
 		return 0, 0, f.parseErr
 	}
-	// Mimic the real kvFSM contract: parse + drain. We don't actually
-	// parse a header here; the test fixtures embed magic+ceiling but
-	// for the gate-level tests we just drain so the CRC matches.
+	// Mimic the real kvFSM contract: parse only the header. The skip path
+	// must not drain multi-GiB snapshot bodies just to seed header state.
 	hdrLen := 16
 	hdr := make([]byte, hdrLen)
 	if n, _ := io.ReadFull(r, hdr); n == hdrLen && bytes.HasPrefix(hdr, []byte("EKVTHLC1")) {
 		f.parsedCeiling = binary.BigEndian.Uint64(hdr[8:16])
-	}
-	if _, err := io.Copy(io.Discard, r); err != nil {
-		return 0, 0, err
 	}
 	return f.parsedCeiling, 0, nil
 }
@@ -230,13 +226,10 @@ func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
 	require.Empty(t, obs.fallbacks)
 }
 
-// TestColdStartSkipThreshold pins codex P2 #934 round 3. The
-// threshold caps at hardState.Commit so a follower carrying an
-// uncommitted WAL suffix is NOT forced to run the full restore
-// every restart (the original gate used the WAL tail, which can
-// exceed Commit, and raft would not deliver those entries until
-// the leader confirmed them).
-func TestColdStartSkipThreshold(t *testing.T) {
+// TestColdStartReplayTarget verifies the committed replay target caps at
+// hardState.Commit so a follower carrying an uncommitted WAL suffix does not
+// report or initialize from entries raft cannot deliver yet.
+func TestColdStartReplayTarget(t *testing.T) {
 	t.Parallel()
 	mkSnap := func(idx uint64) raftpb.Snapshot {
 		return raftTestSnapshot(idx, 0, nil, nil)
@@ -253,36 +246,30 @@ func TestColdStartSkipThreshold(t *testing.T) {
 		{"hardState.Commit zero", mkSnap(100), testHardState(0, 0), 100},
 	}
 	for _, c := range cases {
-		got := coldStartSkipThreshold(c.snap, c.hs)
+		got := coldStartReplayTarget(c.snap, c.hs)
 		if got != c.expected {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.expected)
 		}
 	}
 }
 
-// TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries pins
-// codex P1 #934. When the FSM is past tok.Index but the WAL still
-// carries entries tok.Index+1 .. have (the normal interval between
-// snapshots — metaAppliedIndex advances on each Apply), the skip
-// path MUST NOT fire even though have > tok.Index. Those WAL
-// entries would re-apply onto a Pebble store that already contains
-// them, hitting OCC conflicts and leaving the HLC below timestamps
-// already on disk.
-//
-// Fixture: snap.Index=100, fsm.applied=150, lastWalIndex=150 (the
-// WAL has entries 101..150 mirroring the applied tail). Gate
-// criterion is have >= lastWalIndex, which holds; that's the
-// happy-skip case. To exercise the bug, set lastWalIndex=200 (the
-// WAL still has entries 151..200 that have NOT been applied yet);
-// have=150 < lastWalIndex=200 must trigger execute, not skip.
-func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
+// TestSkipGate_SkipsWhenWALCarriesPostSnapshotTail verifies a node can skip
+// the multi-GiB snapshot restore even when the committed WAL has entries past
+// the FSM's durable applied index. Engine.Open seeds e.applied with `have`,
+// then RawNode/applyCommitted replays only the needed tail and drops
+// data-mutating duplicates at or below `have`.
+func TestSkipGate_SkipsWhenWALCarriesPostSnapshotTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
 		snapIndex    uint64 = 100
 		appliedIdx   uint64 = 150
-		lastWalIndex uint64 = 200
+		replayTarget uint64 = 200
+		ceilingMs    uint64 = 1700_000_000_002
 	)
-	payload := []byte("body-bytes-for-execute")
+	payload := make([]byte, 16, 16+len("body-bytes-after-header"))
+	copy(payload[:8], "EKVTHLC1")
+	binary.BigEndian.PutUint64(payload[8:], ceilingMs)
+	payload = append(payload, []byte("body-bytes-after-header")...)
 	crc, _ := writeFSMFileForTest(t, dir, snapIndex, payload)
 
 	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
@@ -291,19 +278,15 @@ func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
 		Metadata: testSnapshotMetadata(snapIndex, 0, nil),
 	}
 	obs := &recordingObs{}
-	_, gateErr := restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil)
+	effective, gateErr := restoreSnapshotState(fsm, snap, replayTarget, dir, obs, nil)
 	require.NoError(t, gateErr)
 
-	require.Equal(t, payload, fsm.bodyBytes,
-		"have(150) < lastWalIndex(200) MUST execute full restore so the WAL replay does not duplicate-apply")
-	require.False(t, fsm.restoredHeader, "execute path MUST NOT use ApplySnapshotHeader")
-	require.Empty(t, obs.skipped)
-	// recordingObs now stores |snapIndex - have| (round-5 fix; mirrors
-	// monitoring.ColdStartObserver semantics so the FSM-ahead-of-
-	// snapshot case doesn't underflow). For have(150) > snapIndex(100)
-	// the absolute gap is 50.
-	require.Equal(t, []uint64{appliedIdx - snapIndex}, obs.executed,
-		"observer MUST record the absolute snapshot-relative gap")
+	require.Empty(t, fsm.bodyBytes, "skip path MUST NOT call fsm.Restore")
+	require.True(t, fsm.restoredHeader)
+	require.Equal(t, ceilingMs, fsm.appliedCeiling)
+	require.Equal(t, appliedIdx, effective)
+	require.Equal(t, []uint64{appliedIdx - snapIndex}, obs.skipped)
+	require.Empty(t, obs.executed)
 	require.Empty(t, obs.fallbacks)
 }
 
@@ -392,30 +375,37 @@ func TestApplyHeaderStateOnSkip_WrongTokenCRC(t *testing.T) {
 	require.False(t, fsm.restoredHeader, "FSM state MUST NOT mutate on verification failure")
 }
 
-// TestApplyHeaderStateOnSkip_BodyCorruption asserts step 3 catches a
-// flipped body byte (CRC mismatch).
-func TestApplyHeaderStateOnSkip_BodyCorruption(t *testing.T) {
+// TestApplyHeaderStateOnSkip_DoesNotScanBody asserts skip startup cost is
+// bounded by the header, not the snapshot body. Body corruption is still
+// caught by the full restore path, where the body is actually consumed.
+func TestApplyHeaderStateOnSkip_DoesNotScanBody(t *testing.T) {
 	dir := t.TempDir()
-	crc, path := writeFSMFileForTest(t, dir, 1, []byte("payload-bytes"))
+	const ceilingMs uint64 = 1700_000_000_001
+	payload := make([]byte, 16, 16+len("payload-bytes"))
+	copy(payload[:8], "EKVTHLC1")
+	binary.BigEndian.PutUint64(payload[8:], ceilingMs)
+	payload = append(payload, []byte("payload-bytes")...)
+	crc, path := writeFSMFileForTest(t, dir, 1, payload)
 
-	// Flip the first byte of the body in-place. The footer still
+	// Flip a byte after the fixed 16-byte header. The footer still
 	// reads as `crc`, but the on-the-wire content no longer matches
-	// it. Step 2 (footer-vs-token) passes (we pass the same `crc`
-	// as tokenCRC), step 3 (full-body CRC) fails.
+	// it. The skip path should still succeed because it never uses body
+	// bytes; the full restore path remains responsible for body CRC.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	require.NoError(t, err)
 	defer f.Close()
 	var b [1]byte
-	_, err = f.ReadAt(b[:], 0)
+	_, err = f.ReadAt(b[:], 16)
 	require.NoError(t, err)
 	b[0] ^= 0x01
-	_, err = f.WriteAt(b[:], 0)
+	_, err = f.WriteAt(b[:], 16)
 	require.NoError(t, err)
 
 	fsm := &skipGateFSM{}
 	err = applyHeaderStateOnSkip(fsm, path, crc)
-	require.ErrorIs(t, err, ErrFSMSnapshotFileCRC)
-	require.False(t, fsm.restoredHeader, "FSM state MUST NOT mutate on verification failure")
+	require.NoError(t, err)
+	require.True(t, fsm.restoredHeader)
+	require.Equal(t, ceilingMs, fsm.appliedCeiling)
 }
 
 // --- kvFSM header preservation contract ---

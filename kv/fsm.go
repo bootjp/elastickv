@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -120,6 +121,12 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
+	// WriteFencedForKey reports whether key is currently inside a
+	// WriteFenced route in this snapshot.
+	WriteFencedForKey(key []byte) bool
+	// WriteFencedIntersects reports whether [start, end) intersects
+	// any WriteFenced route in this snapshot.
+	WriteFencedIntersects(start, end []byte) bool
 }
 
 // SetApplyIndex implements raftengine.ApplyIndexAware. The engine
@@ -260,6 +267,11 @@ var _ FSM = (*kvFSM)(nil)
 var _ raftengine.StateMachine = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
+
+// ErrRouteWriteFenced is returned when a mutation targets a route that is in
+// WriteFenced state during split migration. Callers should retry after routing
+// catches up to the promoted owner.
+var ErrRouteWriteFenced = errors.New("route is write-fenced; retry after route migration")
 
 // ErrComposed1Violation is returned by verifyComposed1 when the
 // transaction's commit cannot proceed on this Raft group because the
@@ -470,6 +482,9 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	// DEL_PREFIX mutations are handled by the store's DeletePrefixAt which
 	// scans and writes tombstones locally. A DEL_PREFIX request must be the
 	// sole mutation in a request (enforced by the coordinator's toRawRequest).
@@ -522,6 +537,95 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
+}
+
+func routePrefixRange(prefix []byte) ([]byte, []byte) {
+	if len(prefix) == 0 {
+		return []byte(""), nil
+	}
+	if start, ok := s3keys.BucketGenerationRoutePrefixForCleanupPrefix(prefix); ok {
+		return start, prefixScanEnd(start)
+	}
+	if start, ok := dynamoExactCleanupRouteKey(prefix); ok {
+		return start, routePointRangeEnd(start)
+	}
+	if routeKeyspaceWideRawPrefix(prefix) {
+		return []byte(""), nil
+	}
+	start := routeKey(prefix)
+	return start, prefixScanEnd(start)
+}
+
+func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
+	switch {
+	case bytes.HasPrefix(prefix, dynamoTableMetaPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoTableGenerationPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoItemPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoGSIPrefixBytes):
+	default:
+		return nil, false
+	}
+	start := routeKey(prefix)
+	if len(start) == 0 || bytes.Equal(start, prefix) || !bytes.HasPrefix(start, dynamoRoutePrefixBytes) {
+		return nil, false
+	}
+	return start, true
+}
+
+func routePointRangeEnd(start []byte) []byte {
+	end := make([]byte, 0, len(start)+1)
+	end = append(end, start...)
+	end = append(end, 0)
+	return end
+}
+
+func routeKeyspaceWideRawPrefix(prefix []byte) bool {
+	if !rawPrefixMayContainRouteMappedKeys(prefix) {
+		return false
+	}
+	return bytes.Equal(routeKey(prefix), prefix)
+}
+
+func rawPrefixMayContainRouteMappedKeys(prefix []byte) bool {
+	for _, mappedPrefix := range routeMappedRawPrefixes {
+		if bytes.HasPrefix(prefix, mappedPrefix) || bytes.HasPrefix(mappedPrefix, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+var routeMappedRawPrefixes = [][]byte{
+	[]byte(redisInternalRoutePrefix),
+	[]byte(DynamoTableMetaPrefix),
+	[]byte(DynamoTableGenerationPrefix),
+	[]byte(DynamoItemPrefix),
+	[]byte(DynamoGSIPrefix),
+	[]byte(sqsInternalPrefix),
+	[]byte(store.ListMetaPrefix),
+	[]byte(store.ListItemPrefix),
+	[]byte(store.ListMetaDeltaPrefix),
+	[]byte(store.ListClaimPrefix),
+	[]byte(store.HashMetaPrefix),
+	[]byte(store.HashFieldPrefix),
+	[]byte(store.HashMetaDeltaPrefix),
+	[]byte(store.SetMetaPrefix),
+	[]byte(store.SetMemberPrefix),
+	[]byte(store.SetMetaDeltaPrefix),
+	[]byte(store.ZSetMetaPrefix),
+	[]byte(store.ZSetMemberPrefix),
+	[]byte(store.ZSetScorePrefix),
+	[]byte(store.ZSetMetaDeltaPrefix),
+	[]byte(store.StreamMetaPrefix),
+	[]byte(store.StreamEntryPrefix),
+	[]byte(s3keys.BucketMetaPrefix),
+	[]byte(s3keys.BucketGenerationPrefix),
+	[]byte(s3keys.ObjectManifestPrefix),
+	[]byte(s3keys.UploadMetaPrefix),
+	[]byte(s3keys.UploadPartPrefix),
+	[]byte(s3keys.BlobPrefix),
+	[]byte(s3keys.GCUploadPrefix),
+	[]byte(s3keys.RoutePrefix),
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -583,28 +687,21 @@ func (f *kvFSM) RestoredCutover() uint64 {
 
 // ParseSnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 1 — the cold-start skip path's parse-without-side-effect
-// step. The engine has wrapped `r` in a crc32 TeeReader sized at
-// the body payload (file size minus 4-byte footer), so every byte
-// pulled from `r` flows through the engine's hash. We read the
-// v1/v2 header via ReadSnapshotHeader, then drain the rest of the
-// body so the wrapping hash covers every payload byte — matching
-// restoreAndComputeCRC's behaviour in openAndRestoreFSMSnapshot.
+// step. The skip path only needs the header state because the FSM body
+// is already present locally, so this reads the v1/v2 header and leaves
+// the remainder untouched. Full-body CRC verification still happens on
+// the restore path where the body bytes are consumed.
 //
 // IMPORTANT: this method MUST NOT touch f.hlc or f.restoredCutover.
 // The engine calls ApplySnapshotHeader separately, only after the
-// wrapping CRC verification passes. Mutating FSM state here would
-// defeat the "no side-effect on CRC failure" contract that the
-// PR #910 design §5 round-7 split is designed to preserve.
+// snapshot envelope checks pass. Mutating FSM state here would defeat
+// the "no side-effect on parse failure" contract that the PR #910
+// design §5 round-7 split is designed to preserve.
 func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
-	br := bufio.NewReaderSize(r, 1<<20) //nolint:mnd // 1 MiB, local to kv
-	ceiling, cutover, err := ReadSnapshotHeader(br)
+	const headerReadBufferSize = 4 << 10
+
+	ceiling, cutover, err := ReadSnapshotHeader(bufio.NewReaderSize(r, headerReadBufferSize))
 	if err != nil {
-		return 0, 0, errors.WithStack(err)
-	}
-	// Drain the remainder so the engine's TeeReader-wrapped CRC
-	// covers every byte of the body (LimitReader exhaustion
-	// signals "full payload consumed" to the caller).
-	if _, err := io.Copy(io.Discard, br); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
 	return ceiling, cutover, nil
@@ -612,8 +709,8 @@ func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
 
 // ApplySnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 2 — pure assignment of the verified header state. Called
-// only after ParseSnapshotHeader returned successfully AND the
-// engine's wrapping crc32 hash matched the file footer. Mirrors
+// only after ParseSnapshotHeader returned successfully and the
+// snapshot file's footer matched the raft token. Mirrors
 // the two side-effects Restore would have applied for the header
 // portion (HLC physical ceiling + restoredCutover). See PR #910
 // design §5 round-7.
@@ -645,6 +742,9 @@ func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	if err := f.verifyComposed1(r); err != nil {
 		return err
 	}
@@ -740,6 +840,103 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 		return nil
 	}
 	return f.verifyOwnerFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+}
+
+func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
+	if requestBypassesWriteFence(r) {
+		return nil
+	}
+	observedVer := r.GetObservedRouteVersion()
+	if !f.writeFenceHistoryReady() {
+		return nil
+	}
+	currentSnap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+
+	if observedVer != 0 {
+		observedSnap, ok := f.routes.SnapshotAt(observedVer)
+		if !ok {
+			return errors.WithStack(ErrComposed1VersionGCd)
+		}
+		if err := verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), observedSnap, observedVer, "observed"); err != nil {
+			return err
+		}
+		if currentSnap.Version() == observedSnap.Version() {
+			return nil
+		}
+	}
+
+	return verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), currentSnap, currentSnap.Version(), "current")
+}
+
+func requestBypassesWriteFence(r *pb.Request) bool {
+	if !r.GetIsTxn() {
+		return false
+	}
+	switch r.GetPhase() {
+	case pb.Phase_COMMIT, pb.Phase_ABORT:
+		return true
+	case pb.Phase_NONE, pb.Phase_PREPARE:
+		return false
+	}
+	return false
+}
+
+func (f *kvFSM) writeFenceHistoryReady() bool {
+	return f.routes != nil && f.shardGroupID != 0
+}
+
+func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys [][]byte, snap RouteSnapshot, snapVer uint64, phase string) error {
+	bypassKeys := writeFenceBypassKeySet(writeFenceBypassKeys)
+	for _, mut := range mutations {
+		if mut == nil {
+			continue
+		}
+		if isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if mut.GetOp() == pb.Op_DEL_PREFIX {
+			start, end := routePrefixRange(mut.Key)
+			if snap.WriteFencedIntersects(start, end) {
+				return errors.Wrapf(ErrRouteWriteFenced,
+					"%s-version v=%d: prefix %q route range [%q,%q)",
+					phase, snapVer, mut.Key, start, end)
+			}
+			continue
+		}
+		if _, ok := bypassKeys[string(mut.Key)]; ok {
+			continue
+		}
+		rKey := routeKey(mut.Key)
+		if snap.WriteFencedForKey(rKey) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q routeKey %q",
+				phase, snapVer, mut.Key, rKey)
+		}
+		start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key)
+		if ok && snap.WriteFencedIntersects(start, end) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q route range [%q,%q)",
+				phase, snapVer, mut.Key, start, end)
+		}
+	}
+	return nil
+}
+
+func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		out[string(key)] = struct{}{}
+	}
+	return out
 }
 
 // verifyOwnerFromSnapshot is the shared per-mutation owner-check

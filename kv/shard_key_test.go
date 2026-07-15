@@ -278,6 +278,97 @@ func TestRouteKey_S3DecoderIsConcreteOnly(t *testing.T) {
 	require.Equal(t, rawUser, routeKey(rawUser), "adapter-looking raw user key must stay on its raw route")
 }
 
+func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
+	t.Parallel()
+
+	tableSegment := base64.RawURLEncoding.EncodeToString([]byte("users"))
+	dynamoTableRoute := dynamoRouteTableKey([]byte(tableSegment))
+
+	for _, tc := range []struct {
+		name      string
+		prefix    []byte
+		wantStart []byte
+		wantEnd   []byte
+	}{
+		{
+			name:      "raw user prefix",
+			prefix:    []byte("ab"),
+			wantStart: []byte("ab"),
+			wantEnd:   prefixScanEnd([]byte("ab")),
+		},
+		{
+			name:      "concrete redis prefix",
+			prefix:    []byte("!redis|string|ab"),
+			wantStart: []byte("ab"),
+			wantEnd:   prefixScanEnd([]byte("ab")),
+		},
+		{
+			name:      "dynamo table cleanup prefix",
+			prefix:    []byte(DynamoItemPrefix + tableSegment + "|7|"),
+			wantStart: dynamoTableRoute,
+			wantEnd:   routePointRangeEnd(dynamoTableRoute),
+		},
+		{
+			name:      "broad redis namespace",
+			prefix:    []byte("!redis|"),
+			wantStart: []byte(""),
+			wantEnd:   nil,
+		},
+		{
+			name:      "broad wide-column namespace",
+			prefix:    []byte("!lst|"),
+			wantStart: []byte(""),
+			wantEnd:   nil,
+		},
+		{
+			name:      "s3 bucket cleanup prefix",
+			prefix:    s3keys.ObjectManifestPrefixForBucket("bucket", 2),
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
+		},
+		{
+			name:      "s3 bucket cleanup route prefix",
+			prefix:    s3keys.RoutePrefixForBucket("bucket", 2),
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			start, end := routePrefixRange(tc.prefix)
+			require.Equal(t, tc.wantStart, start)
+			require.Equal(t, tc.wantEnd, end)
+		})
+	}
+}
+
+func TestRoutePrefixRangeTreatsDynamoCleanupAsExactRouteKey(t *testing.T) {
+	t.Parallel()
+
+	fooSegment := base64.RawURLEncoding.EncodeToString([]byte("foo"))
+	foobarSegment := base64.RawURLEncoding.EncodeToString([]byte("foobar"))
+	fooRoute := dynamoRouteTableKey([]byte(fooSegment))
+	foobarRoute := dynamoRouteTableKey([]byte(foobarSegment))
+
+	start, end := routePrefixRange([]byte(DynamoItemPrefix + fooSegment + "|7|"))
+
+	require.Equal(t, fooRoute, start)
+	require.Equal(t, routePointRangeEnd(fooRoute), end)
+	require.False(t, rangesIntersectForTest(start, end, foobarRoute, prefixScanEnd(foobarRoute)),
+		"cleanup for table foo must not intersect table foobar's route")
+}
+
+func rangesIntersectForTest(aStart, aEnd, bStart, bEnd []byte) bool {
+	if aEnd != nil && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if bEnd != nil && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
+}
+
 func TestRouteKeyFilterTreatsNilAndEmptyEndAsInfinity(t *testing.T) {
 	t.Parallel()
 
