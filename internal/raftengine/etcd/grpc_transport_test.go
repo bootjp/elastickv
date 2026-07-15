@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -908,6 +909,30 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 	require.Zero(t, client.sendStreamCalls.Load())
 }
 
+func TestDispatchRegularDropsCachedPeerConnAfterUnaryUnavailable(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{sendErr: status.Error(codes.Unavailable, "connection refused")}
+	injectClient(t, transport, addr, client)
+
+	err := transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:   messageTypePtr(raftpb.MsgHeartbeat),
+		From:   uint64Ptr(1),
+		To:     uint64Ptr(2),
+		Term:   uint64Ptr(4),
+		Commit: uint64Ptr(22),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, grpcStatusCode(err))
+
+	transport.mu.RLock()
+	_, cached := transport.clients[addr]
+	transport.mu.RUnlock()
+	require.False(t, cached)
+	require.Equal(t, int32(1), client.sendCalls.Load())
+}
+
 func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
 	t.Setenv(sendStreamEnabledEnvVar, "false")
 	const addr = "host:2"
@@ -1522,12 +1547,16 @@ type testEtcdRaftClient struct {
 	blockSendStreamUntilContext bool
 	sendStreamStarted           chan struct{}
 	releaseSendStream           chan struct{}
+	sendErr                     error
 	sendCalls                   atomic.Int32
 	sendStreamCalls             atomic.Int32
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
 	c.sendCalls.Add(1)
+	if c.sendErr != nil {
+		return nil, c.sendErr
+	}
 	return &pb.EtcdRaftAck{}, nil
 }
 

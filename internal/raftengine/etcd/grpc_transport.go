@@ -533,7 +533,9 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	}
 	req := &pb.EtcdRaftMessage{Message: raw}
 	if isPriorityMsg(msg.GetType()) || !t.sendStreamEnabledNow() || !t.allowPeerStreamProbe(peer.Address, time.Now()) {
-		return t.dispatchRegularUnary(ctx, client, req)
+		err := t.dispatchRegularUnary(ctx, client, req)
+		t.closePeerConnOnRetryableDialError(peer.Address, err)
+		return err
 	}
 	err = t.dispatchRegularStream(ctx, peer.Address, client, req)
 	if err == nil {
@@ -541,17 +543,31 @@ func (t *GRPCTransport) dispatchRegular(ctx context.Context, msg raftpb.Message)
 	}
 	if grpcStatusCode(err) == codes.Unimplemented {
 		t.markPeerStreamUnsupported(peer.Address)
-		return t.dispatchRegularUnary(ctx, client, req)
+		err := t.dispatchRegularUnary(ctx, client, req)
+		t.closePeerConnOnRetryableDialError(peer.Address, err)
+		return err
 	}
 	if isSendStreamDisabled(err) {
-		return t.dispatchRegularUnary(ctx, client, req)
+		err := t.dispatchRegularUnary(ctx, client, req)
+		t.closePeerConnOnRetryableDialError(peer.Address, err)
+		return err
 	}
+	t.closePeerConnOnRetryableDialError(peer.Address, err)
 	return errors.WithStack(err)
 }
 
 func (t *GRPCTransport) dispatchRegularUnary(ctx context.Context, client pb.EtcdRaftClient, req *pb.EtcdRaftMessage) error {
 	_, err := client.Send(ctx, req)
 	return errors.WithStack(err)
+}
+
+func (t *GRPCTransport) closePeerConnOnRetryableDialError(address string, err error) {
+	if grpcStatusCode(err) != codes.Unavailable {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closePeerConnLocked(address)
 }
 
 func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address string, client pb.EtcdRaftClient, req *pb.EtcdRaftMessage) error {
