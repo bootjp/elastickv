@@ -684,6 +684,92 @@ func TestRedisTxnSetReplacementConflictsWithConcurrentWideHashWrite(t *testing.T
 		"SET replacement in MULTI must conflict with concurrent HSET of a new field")
 }
 
+func TestRedisTxnSetReplacementTracksWideFencesBeforeBuild(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-replace:fence-read")
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", res.str)
+	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {
+		require.Contains(t, txn.readKeys, string(fenceKey))
+	}
+
+	require.NoError(t, st.PutAt(ctx, redisTxnWideHashFenceKey(key), []byte{}, redisTxnTestStartTS+1, 0))
+	require.ErrorIs(t, txn.validateReadSet(ctx), store.ErrWriteConflict)
+}
+
+func TestRedisTxnSetReplacementSkipsWideCleanupForRawStringOrMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		seed func(store.MVCCStore, []byte)
+	}{
+		{name: "missing"},
+		{
+			name: "string",
+			seed: func(st store.MVCCStore, key []byte) {
+				require.NoError(t, st.PutAt(ctx, redisStrKey(key), encodeRedisStr([]byte("old"), nil), redisTxnTestStartTS, 0))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("set-replace:no-wide-cleanup:" + tc.name)
+			if tc.seed != nil {
+				tc.seed(st, key)
+			}
+
+			txn := newRedisTxnTestContext(server)
+			res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+			require.NoError(t, err)
+			require.Equal(t, "OK", res.str)
+
+			elems, err := txn.buildReplacementElems(ctx)
+			require.NoError(t, err)
+			require.False(t, elemKeysContain(elems, store.HashMetaKey(key)))
+			require.False(t, elemKeysContain(elems, store.SetMetaKey(key)))
+			require.False(t, elemKeysContain(elems, store.ZSetMetaKey(key)))
+			require.False(t, elemKeysContain(elems, store.ListMetaKey(key)))
+			require.False(t, elemKeysContain(elems, store.StreamMetaKey(key)))
+			require.True(t, elemKeysContain(elems, redisStrKey(key)))
+		})
+	}
+}
+
+func TestRedisTxnSetReplacementDeletesExpiredRawHash(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-replace:expired-hash")
+	expired := time.Now().Add(-time.Hour)
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("v"), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expired), redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", res.str)
+
+	elems, err := txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+	require.True(t, elemKeysContain(elems, store.HashFieldKey(key, []byte("old"))))
+	require.True(t, elemKeysContain(elems, store.HashMetaKey(key)))
+	require.True(t, elemKeysContain(elems, redisStrKey(key)))
+}
+
 func TestRedisTxnSetReplacementConflictsWithConcurrentListPush(t *testing.T) {
 	t.Parallel()
 

@@ -1549,10 +1549,13 @@ func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), defaultSnapshotChunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 1)
+	require.Len(t, client.chunks, 2)
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, payload, client.chunks[0].Chunk)
-	require.True(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[1].Metadata)
+	require.Equal(t, payload, client.chunks[1].Chunk)
+	require.True(t, client.chunks[1].Final)
 }
 
 func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
@@ -1562,10 +1565,13 @@ func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(nil), defaultSnapshotChunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 1)
+	require.Len(t, client.chunks, 2)
 	require.Equal(t, header, client.chunks[0].Metadata)
 	require.Empty(t, client.chunks[0].Chunk)
-	require.True(t, client.chunks[0].Final)
+	require.False(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[1].Metadata)
+	require.Empty(t, client.chunks[1].Chunk)
+	require.True(t, client.chunks[1].Final)
 }
 
 // testSnapshotSendClient captures chunks sent via sendSnapshotReaderChunks / sendSnapshotChunks.
@@ -1718,19 +1724,23 @@ func TestSendSnapshotReaderChunksMultiChunk(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 3)
+	require.Len(t, client.chunks, 4)
 
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
 	require.Empty(t, client.chunks[1].Metadata)
-	require.Equal(t, []byte("abcd"), client.chunks[1].Chunk)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
 	require.False(t, client.chunks[1].Final)
 
 	require.Empty(t, client.chunks[2].Metadata)
-	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
-	require.True(t, client.chunks[2].Final)
+	require.Equal(t, []byte("abcd"), client.chunks[2].Chunk)
+	require.False(t, client.chunks[2].Final)
+
+	require.Empty(t, client.chunks[3].Metadata)
+	require.Equal(t, []byte("5678"), client.chunks[3].Chunk)
+	require.True(t, client.chunks[3].Final)
 }
 
 func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
@@ -1743,13 +1753,16 @@ func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 2)
+	require.Len(t, client.chunks, 3)
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
-	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
-	require.True(t, client.chunks[1].Final)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
+	require.False(t, client.chunks[1].Final)
+
+	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
+	require.True(t, client.chunks[2].Final)
 }
 
 // TestSendSnapshotReaderChunksTrailingPartialChunk regressions a production
@@ -1772,17 +1785,20 @@ func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 3, "expected two full chunks plus a trailing partial")
+	require.Len(t, client.chunks, 4, "expected metadata, two full chunks, and a trailing partial")
 
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
-	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
 	require.False(t, client.chunks[1].Final)
 
-	require.Equal(t, []byte("X"), client.chunks[2].Chunk)
-	require.True(t, client.chunks[2].Final)
+	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
+	require.False(t, client.chunks[2].Final)
+
+	require.Equal(t, []byte("X"), client.chunks[3].Chunk)
+	require.True(t, client.chunks[3].Final)
 
 	var delivered []byte
 	for _, c := range client.chunks {

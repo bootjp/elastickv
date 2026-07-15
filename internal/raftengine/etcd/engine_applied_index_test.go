@@ -268,8 +268,29 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsUnprotectsNonSnapshotReady(t *tes
 	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
 }
 
-func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+func TestReleaseIgnoredReceivedFSMSnapshotStepsRemovesIgnoredFSMFile(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("ignored snapshot"))
 	e := &Engine{
+		fsmSnapDir:                fsmSnapDir,
+		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
+		pendingReceivedFSMSnapshotStep: map[uint64]int{
+			10: 1,
+		},
+	}
+
+	e.releaseIgnoredReceivedFSMSnapshotSteps(etcdraft.Ready{})
+
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 10))
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+}
+
+func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("accepted snapshot"))
+	e := &Engine{
+		fsmSnapDir:                fsmSnapDir,
 		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
 		pendingReceivedFSMSnapshotStep: map[uint64]int{
 			10: 1,
@@ -283,6 +304,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 
 	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
 	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 10))
 }
 
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-

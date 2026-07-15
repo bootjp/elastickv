@@ -1087,8 +1087,11 @@ func snapshotMessageHeader(msg raftpb.Message) ([]byte, error) {
 }
 
 func sendSnapshotChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, payload []byte, chunkSize int) error {
+	if err := sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header}); err != nil {
+		return err
+	}
 	if len(payload) == 0 {
-		return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header, Final: true})
+		return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Final: true})
 	}
 	for offset := 0; offset < len(payload); offset += chunkSize {
 		end := offset + chunkSize
@@ -1098,9 +1101,6 @@ func sendSnapshotChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, pa
 		chunk := &pb.EtcdRaftSnapshotChunk{
 			Chunk: payload[offset:end],
 			Final: end == len(payload),
-		}
-		if offset == 0 {
-			chunk.Metadata = header
 		}
 		if err := sendSnapshotChunk(stream, chunk); err != nil {
 			return err
@@ -1120,6 +1120,9 @@ func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []by
 	if chunkSize <= 0 {
 		chunkSize = defaultSnapshotChunkSize
 	}
+	if err := sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{Metadata: header}); err != nil {
+		return err
+	}
 	buffered := bufio.NewReaderSize(reader, chunkSize)
 	current, err := readSnapshotChunk(buffered, chunkSize)
 	if err != nil {
@@ -1129,14 +1132,13 @@ func sendSnapshotReaderChunks(stream pb.EtcdRaft_SendSnapshotClient, header []by
 			// a small snapshot. Include it so the receiver does not get an
 			// empty snapshot.Data.
 			return sendSnapshotChunk(stream, &pb.EtcdRaftSnapshotChunk{
-				Metadata: header,
-				Chunk:    current,
-				Final:    true,
+				Chunk: current,
+				Final: true,
 			})
 		}
 		return errors.WithStack(err)
 	}
-	return streamReaderChunks(stream, header, buffered, current, chunkSize)
+	return streamReaderChunks(stream, nil, buffered, current, chunkSize)
 }
 
 // streamReaderChunks drains buffered starting from `current` (the first full

@@ -100,24 +100,22 @@ type AppliedIndexWriter interface {
 //
 // The interface is two-phase by design:
 //
-//   - ParseSnapshotHeader reads the v1/v2 header from a caller-
-//     supplied io.Reader (wrapped in a crc32 TeeReader by the
-//     engine) and drains the remaining bytes so the wrapping CRC
-//     covers the full payload. It returns the parsed (ceiling,
-//     cutover) pair WITHOUT mutating FSM state. Errors propagate
-//     from the underlying header parser
-//     (ErrSnapshotHeaderUnknownMagic / InvalidLength) or from the
-//     drain pass (I/O errors); FSM state stays untouched on error.
+//   - ParseSnapshotHeader reads only the v1/v2 header from a caller-
+//     supplied io.Reader. It returns the parsed (ceiling, cutover) pair
+//     WITHOUT mutating FSM state. Errors propagate from the underlying
+//     header parser (ErrSnapshotHeaderUnknownMagic / InvalidLength);
+//     FSM state stays untouched on error.
 //
 //   - ApplySnapshotHeader is pure assignment of the verified header
 //     state. The engine calls this only after ParseSnapshotHeader
-//     returned successfully AND the wrapping crc32 hash matched
-//     the file footer.
+//     returned successfully and the snapshot file's footer matches the
+//     raft token.
 //
-// Splitting parse from apply lets the CRC verifier stay co-located
-// with its private helpers in internal/raftengine/etcd (matching
-// the openAndRestoreFSMSnapshot safety contract) while the v1/v2
-// header parser stays inside the kv package where it already lives.
+// Splitting parse from apply keeps the v1/v2 header parser inside the
+// kv package where it already lives, while the engine remains responsible
+// for deciding whether the snapshot body is actually needed. Full-body CRC
+// verification still happens on the restore path; the skip path only reads
+// the header because the FSM body state is already present locally.
 // Neither package imports the other in production.
 type SnapshotHeaderApplier interface {
 	ParseSnapshotHeader(r io.Reader) (ceiling, cutover uint64, err error)

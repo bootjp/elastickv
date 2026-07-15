@@ -116,10 +116,10 @@ const (
 	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
 	// snapshot once the applied index has advanced this many entries past
 	// the last snapshot's index. etcd/raft itself uses 10_000 as a default,
-	// but with fat proposal payloads (e.g. Lua scripts) this can produce a
-	// multi-GiB WAL between snapshots. Operators can lower via
+	// but multi-GiB FSM snapshots can take tens of seconds to persist and
+	// contend with the Raft hot path. Operators can lower or raise via
 	// ELASTICKV_RAFT_SNAPSHOT_COUNT without a rebuild.
-	defaultSnapshotEvery     = 10_000
+	defaultSnapshotEvery     = 100_000
 	snapshotEveryEnvVar      = "ELASTICKV_RAFT_SNAPSHOT_COUNT"
 	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
@@ -1250,12 +1250,11 @@ func (e *Engine) recordDispatchErrorCode(code string) uint64 {
 }
 
 // StepQueueFullCount returns the total number of inbound raft messages
-// that could not be enqueued into the selected inbound step queue
-// because the channel was at capacity. This is the "etcd raft inbound
-// step queue is full" signal from the task description: a spike
-// indicates the local raft loop is starved, usually by something
-// blocking the apply path such as
-// the pre-#560 rawKeyTypeAt seek storm.
+// that found the selected inbound step queue at capacity. Blocking inbound
+// message classes wait for space after incrementing this counter; best-effort
+// classes still return errStepQueueFull. A spike indicates the local raft loop
+// is starved, usually by something blocking the apply path such as the
+// pre-#560 rawKeyTypeAt seek storm.
 func (e *Engine) StepQueueFullCount() uint64 {
 	if e == nil {
 		return 0
@@ -2298,6 +2297,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	commitBeforeStep := e.rawNode.Status().GetCommit()
 	if err := e.rawNode.Step(&msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
+			e.removeReceivedFSMSnapshotToken(msg)
 			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
 		}
@@ -2305,9 +2305,11 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		return
 	}
 	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg, commitBeforeStep) {
+		e.removeReceivedFSMSnapshotToken(msg)
 		return
 	}
 	if !e.rawNode.HasReady() {
+		e.removeReceivedFSMSnapshotToken(msg)
 		e.unprotectReceivedFSMSnapshotToken(msg)
 		return
 	}
@@ -2518,7 +2520,7 @@ func isInboundPriorityMsg(t raftpb.MessageType) bool {
 }
 
 func isBlockingInboundStepMsg(t raftpb.MessageType) bool {
-	return t == raftpb.MsgSnap
+	return t == raftpb.MsgSnap || t == raftpb.MsgApp || t == raftpb.MsgAppResp
 }
 
 // selectDispatchLane picks the per-peer channel for msgType. In the legacy
@@ -3475,6 +3477,7 @@ func (e *Engine) releaseIgnoredReceivedFSMSnapshotSteps(rd etcdraft.Ready) {
 		if index == readySnapshotIndex {
 			continue
 		}
+		e.removeReceivedFSMSnapshotIndex(index)
 		for i := 0; i < count; i++ {
 			e.unprotectReceivedFSMSnapshot(index)
 		}
@@ -3487,6 +3490,23 @@ func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {
 		return
 	}
 	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func (e *Engine) removeReceivedFSMSnapshotToken(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok {
+		return
+	}
+	e.removeReceivedFSMSnapshotIndex(index)
+}
+
+func (e *Engine) removeReceivedFSMSnapshotIndex(index uint64) {
+	if e == nil || e.fsmSnapDir == "" || index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	removeWithWarn(fsmSnapPath(e.fsmSnapDir, index), "ignored received fsm snapshot")
 }
 
 func receivedFSMSnapshotTokenIndex(msg raftpb.Message) (uint64, bool) {
@@ -4412,6 +4432,13 @@ func (e *Engine) stepChannelFor(msgType raftpb.MessageType) chan raftpb.Message 
 }
 
 func (e *Engine) enqueueBlockingStep(ctx context.Context, ch chan raftpb.Message, msg raftpb.Message) error {
+	select {
+	case ch <- msg:
+		return nil
+	default:
+		e.stepQueueFullCount.Add(1)
+	}
+
 	select {
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())

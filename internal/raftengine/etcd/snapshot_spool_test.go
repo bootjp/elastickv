@@ -374,6 +374,48 @@ func TestPurgeOldSnapFiles(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestPurgeOldSnapFilesHonorsFSMByteBudget(t *testing.T) {
+	t.Setenv(maxRetainedFSMSnapshotBytesEnvVar, "100")
+
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	for i := uint64(1); i <= 3; i++ {
+		index := i * 10000
+		createSnapFile(t, snapDir, index)
+		require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, index), bytes.Repeat([]byte("x"), 60), 0o600))
+	}
+
+	require.NoError(t, purgeOldSnapshotFiles(snapDir, fsmSnapDir))
+
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(10000))))
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(20000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(30000))))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 10000))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 20000))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 30000))
+}
+
+func TestPurgeOldSnapFilesBudgetCanBeDisabled(t *testing.T) {
+	t.Setenv(maxRetainedFSMSnapshotBytesEnvVar, "0")
+
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	for i := uint64(1); i <= 4; i++ {
+		index := i * 10000
+		createSnapFile(t, snapDir, index)
+		require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, index), bytes.Repeat([]byte("x"), 60), 0o600))
+	}
+
+	require.NoError(t, purgeOldSnapshotFiles(snapDir, fsmSnapDir))
+
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(10000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(20000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(30000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(40000))))
+}
+
 func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()

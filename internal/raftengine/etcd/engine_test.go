@@ -599,7 +599,7 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
-func TestEnqueueStepReturnsQueueFull(t *testing.T) {
+func TestEnqueueStepBestEffortReturnsQueueFull(t *testing.T) {
 	engine := &Engine{
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
@@ -608,18 +608,64 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 
 	require.Equal(t, uint64(0), engine.StepQueueFullCount())
 
-	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgStorageAppend)})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
 
 	// The Prometheus hot-path dashboard relies on StepQueueFullCount
-	// advancing exactly once per rejected enqueue so the scraped rate
-	// equals the true drop rate, not a multiple of it.
+	// advancing exactly once per full enqueue attempt so the scraped
+	// rate equals the true congestion rate, not a multiple of it.
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 
-	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgStorageAppend)})
 	require.Error(t, err)
 	require.Equal(t, uint64(2), engine.StepQueueFullCount())
+}
+
+func TestEnqueueStepMsgAppWaitsForQueueSlot(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("MsgApp enqueue returned before the queue had room: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+
+	firstMsg := <-engine.stepCh
+	require.Equal(t, raftpb.MsgHeartbeat, firstMsg.GetType())
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("MsgApp enqueue did not resume after the queue had room")
+	}
+	nextMsg := <-engine.stepCh
+	require.Equal(t, raftpb.MsgApp, nextMsg.GetType())
+}
+
+func TestEnqueueStepMsgAppReturnsContextDeadlineWhenQueueStaysFull(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := engine.enqueueStep(ctx, raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 }
 
 func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
@@ -641,9 +687,11 @@ func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
 		t.Fatal("priority heartbeat was not enqueued")
 	}
 
-	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err = engine.enqueueStep(ctx, raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
 	require.Error(t, err)
-	require.True(t, errors.Is(err, errStepQueueFull))
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 }
 

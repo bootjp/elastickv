@@ -23,7 +23,8 @@ type fakeLeaseEngine struct {
 	linearizableCalls        atomic.Int32
 	proposeErr               error // when set, Propose returns it (warm-up failure tests)
 	proposeCalls             atomic.Int32
-	proposeHook              func()       // invoked inside Propose before returning (race injection)
+	proposeHook              func() // invoked inside Propose before returning (race injection)
+	proposeCtxHook           func(context.Context)
 	state                    atomic.Value // stores raftengine.State; default Leader
 	lastQuorumAckMonoNs      atomic.Int64 // 0 = no ack yet. Updated by setQuorumAck().
 	leaderLossCallbacksMu    sync.Mutex
@@ -62,8 +63,11 @@ func (e *fakeLeaseEngine) Status() raftengine.Status {
 func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+func (e *fakeLeaseEngine) Propose(ctx context.Context, _ []byte) (*raftengine.ProposalResult, error) {
 	e.proposeCalls.Add(1)
+	if e.proposeCtxHook != nil {
+		e.proposeCtxHook(ctx)
+	}
 	if e.proposeHook != nil {
 		e.proposeHook()
 	}

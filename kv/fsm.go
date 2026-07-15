@@ -687,28 +687,21 @@ func (f *kvFSM) RestoredCutover() uint64 {
 
 // ParseSnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 1 — the cold-start skip path's parse-without-side-effect
-// step. The engine has wrapped `r` in a crc32 TeeReader sized at
-// the body payload (file size minus 4-byte footer), so every byte
-// pulled from `r` flows through the engine's hash. We read the
-// v1/v2 header via ReadSnapshotHeader, then drain the rest of the
-// body so the wrapping hash covers every payload byte — matching
-// restoreAndComputeCRC's behaviour in openAndRestoreFSMSnapshot.
+// step. The skip path only needs the header state because the FSM body
+// is already present locally, so this reads the v1/v2 header and leaves
+// the remainder untouched. Full-body CRC verification still happens on
+// the restore path where the body bytes are consumed.
 //
 // IMPORTANT: this method MUST NOT touch f.hlc or f.restoredCutover.
 // The engine calls ApplySnapshotHeader separately, only after the
-// wrapping CRC verification passes. Mutating FSM state here would
-// defeat the "no side-effect on CRC failure" contract that the
-// PR #910 design §5 round-7 split is designed to preserve.
+// snapshot envelope checks pass. Mutating FSM state here would defeat
+// the "no side-effect on parse failure" contract that the PR #910
+// design §5 round-7 split is designed to preserve.
 func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
-	br := bufio.NewReaderSize(r, 1<<20) //nolint:mnd // 1 MiB, local to kv
-	ceiling, cutover, err := ReadSnapshotHeader(br)
+	const headerReadBufferSize = 4 << 10
+
+	ceiling, cutover, err := ReadSnapshotHeader(bufio.NewReaderSize(r, headerReadBufferSize))
 	if err != nil {
-		return 0, 0, errors.WithStack(err)
-	}
-	// Drain the remainder so the engine's TeeReader-wrapped CRC
-	// covers every byte of the body (LimitReader exhaustion
-	// signals "full payload consumed" to the caller).
-	if _, err := io.Copy(io.Discard, br); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
 	return ceiling, cutover, nil
@@ -716,8 +709,8 @@ func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
 
 // ApplySnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 2 — pure assignment of the verified header state. Called
-// only after ParseSnapshotHeader returned successfully AND the
-// engine's wrapping crc32 hash matched the file footer. Mirrors
+// only after ParseSnapshotHeader returned successfully and the
+// snapshot file's footer matched the raft token. Mirrors
 // the two side-effects Restore would have applied for the header
 // portion (HLC physical ceiling + restoredCutover). See PR #910
 // design §5 round-7.

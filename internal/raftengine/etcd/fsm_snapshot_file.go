@@ -46,12 +46,20 @@ const (
 	// fsmWriteBufSize is the bufio.Writer buffer size used when writing .fsm files.
 	fsmWriteBufSize = 1 << 20 // 1 MiB
 
+	// defaultMaxRetainedFSMSnapshotBytes bounds retained .fsm payload bytes
+	// after successful snapshot publication. Large production FSM snapshots can
+	// be tens of GiB; keeping defaultMaxSnapFiles full copies leaves too little
+	// headroom for the next receive-side spool.
+	defaultMaxRetainedFSMSnapshotBytes = int64(16 << 30) // 16 GiB
+
 	// fsmMaxInMemPayload is the maximum payload size that readFSMSnapshotPayload
 	// will materialise into memory. Larger snapshots must use the streaming path
 	// (openFSMSnapshotPayloadReader) to avoid OOM. 1 GiB is chosen as a generous
 	// upper bound; real FSM payloads for this workload are typically much smaller.
 	fsmMaxInMemPayload = int64(1 << 30) // 1 GiB
 )
+
+const maxRetainedFSMSnapshotBytesEnvVar = "ELASTICKV_RAFT_MAX_RETAINED_FSM_SNAPSHOT_BYTES"
 
 var (
 	snapshotTokenMagic = [snapshotTokenMagicLen]byte{'E', 'K', 'V', 'T'}
@@ -1081,7 +1089,7 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	}
 
 	snaps := collectSnapNames(entries)
-	if len(snaps) <= defaultMaxSnapFiles {
+	if len(snaps) == 0 {
 		return nil
 	}
 	// Sort explicitly: os.ReadDir returns lexicographic order on most systems,
@@ -1089,8 +1097,12 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	// hex, so lexicographic == chronological order (oldest first).
 	sort.Strings(snaps)
 
+	maxKeep := retainedSnapshotFileLimit(snaps, fsmSnapDir)
+	if len(snaps) <= maxKeep {
+		return nil
+	}
 	var combined error
-	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
+	for _, name := range snaps[:len(snaps)-maxKeep] {
 		if err := purgeSnapPair(snapDir, fsmSnapDir, name); err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}
@@ -1099,6 +1111,60 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	combined = errors.CombineErrors(combined, syncDirIfExists(snapDir))
 	combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
 	return errors.WithStack(combined)
+}
+
+func retainedSnapshotFileLimit(snaps []string, fsmSnapDir string) int {
+	maxKeep := defaultMaxSnapFiles
+	if maxKeep < 1 {
+		maxKeep = 1
+	}
+	if maxKeep > len(snaps) {
+		maxKeep = len(snaps)
+	}
+	if fsmSnapDir == "" {
+		return maxKeep
+	}
+	budget := maxRetainedFSMSnapshotBytes()
+	if budget <= 0 {
+		return maxKeep
+	}
+	for maxKeep > 1 && retainedFSMSnapshotBytes(snaps[len(snaps)-maxKeep:], fsmSnapDir) > budget {
+		maxKeep--
+	}
+	return maxKeep
+}
+
+func maxRetainedFSMSnapshotBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv(maxRetainedFSMSnapshotBytesEnvVar))
+	if raw == "" {
+		return defaultMaxRetainedFSMSnapshotBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		slog.Warn("invalid max retained FSM snapshot bytes; using default",
+			"env", maxRetainedFSMSnapshotBytesEnvVar,
+			"value", raw,
+			"error", err,
+		)
+		return defaultMaxRetainedFSMSnapshotBytes
+	}
+	return n
+}
+
+func retainedFSMSnapshotBytes(snaps []string, fsmSnapDir string) int64 {
+	var total int64
+	for _, name := range snaps {
+		idx := parseSnapFileIndex(name)
+		if idx == 0 {
+			continue
+		}
+		info, err := os.Stat(fsmSnapPath(fsmSnapDir, idx))
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+	}
+	return total
 }
 
 func collectSnapNames(entries []os.DirEntry) []string {

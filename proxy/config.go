@@ -71,7 +71,9 @@ type ProxyConfig struct {
 	SentryEnv                  string
 	SentrySampleRate           float64
 	MetricsAddr                string
+	PProfAddr                  string
 	PubSubCompareWindow        time.Duration
+	RedisOnlyRaw               bool
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.
@@ -86,5 +88,6 @@ func DefaultConfig() ProxyConfig {
 		SentrySampleRate:    1.0,
 		MetricsAddr:         ":9191",
 		PubSubCompareWindow: defaultPubSubCompareWindow,
+		RedisOnlyRaw:        true,
 	}
 }
