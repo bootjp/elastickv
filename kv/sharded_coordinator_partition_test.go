@@ -151,6 +151,8 @@ func TestShardedCoordinatorWriteFencePrecheckHonoursPartitionResolver(t *testing
 	require.Equal(t, uint64(42), resp.CommitIndex)
 	require.Empty(t, g1.requests, "engine route fence must not preempt resolver-owned keys")
 	require.Len(t, g42.requests, 1)
+	require.Equal(t, [][]byte{key}, g42.requests[0].GetWriteFenceBypassKeys(),
+		"resolver-owned point writes must carry the FSM write-fence bypass marker")
 }
 
 func TestShardedCoordinatorWriteFencePrecheckSkipsUnresolvedPartitionKey(t *testing.T) {
@@ -183,6 +185,47 @@ func TestShardedCoordinatorWriteFencePrecheckSkipsUnresolvedPartitionKey(t *test
 	require.False(t, errors.Is(err, ErrRouteWriteFenced),
 		"resolver-recognised keys must fail through resolver routing, not engine route fences")
 	require.Empty(t, g1.requests)
+}
+
+func TestShardedCoordinatorTxnCarriesResolverWriteFenceBypassKeys(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateWriteFenced},
+		},
+	}))
+
+	g1 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	g42 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 42}},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1:  {Txn: g1, Store: store.NewMVCCStore()},
+		42: {Txn: g42, Store: store.NewMVCCStore()},
+	}, 1, NewHLC(), nil)
+
+	key := []byte("!sqs|msg|data|p|txn-partitioned-key")
+	coord.WithPartitionResolver(&stubResolver{claim: map[string]uint64{
+		string(key): 42,
+	}})
+
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  100,
+		CommitTS: 200,
+		Elems:    []*Elem[OP]{{Op: Put, Key: key, Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Empty(t, g1.requests)
+	require.Len(t, g42.requests, 1)
+	require.Equal(t, [][]byte{key}, g42.requests[0].GetWriteFenceBypassKeys(),
+		"single-shard txn prepare/one-phase request must preserve the resolver-owned point key for the FSM")
 }
 
 // TestShardedCoordinator_DispatchSplitsMutationsByResolverGroup is

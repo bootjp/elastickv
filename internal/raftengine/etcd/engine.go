@@ -3386,6 +3386,9 @@ func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
 	}
+	if e.protectedReceivedFSMSnaps[index] > 0 {
+		return false
+	}
 	e.protectedReceivedFSMSnaps[index]++
 	return true
 }

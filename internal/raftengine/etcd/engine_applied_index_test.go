@@ -208,6 +208,18 @@ func TestProtectReceivedFSMSnapshotWaitsOnSnapshotMuForAlreadyAppliedIndex(t *te
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
+func TestProtectReceivedFSMSnapshotRejectsDuplicateInFlightIndex(t *testing.T) {
+	e := &Engine{}
+
+	require.True(t, e.protectReceivedFSMSnapshot(9))
+	require.False(t, e.protectReceivedFSMSnapshot(9))
+	require.Equal(t, map[uint64]int{9: 1}, e.protectedReceivedFSMSnaps)
+
+	e.unprotectReceivedFSMSnapshot(9)
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.True(t, e.protectReceivedFSMSnapshot(9))
+}
+
 func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{9: 1},

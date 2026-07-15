@@ -867,7 +867,7 @@ func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
 		if !ok {
 			return errors.WithStack(ErrComposed1VersionGCd)
 		}
-		if err := verifyWriteFenceFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
+		if err := verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), observedSnap, observedVer, "observed"); err != nil {
 			return err
 		}
 		if currentSnap.Version() == observedSnap.Version() {
@@ -875,7 +875,7 @@ func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
 		}
 	}
 
-	return verifyWriteFenceFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+	return verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), currentSnap, currentSnap.Version(), "current")
 }
 
 func requestBypassesWriteFence(r *pb.Request) bool {
@@ -895,7 +895,8 @@ func (f *kvFSM) writeFenceHistoryReady() bool {
 	return f.routes != nil && f.shardGroupID != 0
 }
 
-func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, snapVer uint64, phase string) error {
+func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys [][]byte, snap RouteSnapshot, snapVer uint64, phase string) error {
+	bypassKeys := writeFenceBypassKeySet(writeFenceBypassKeys)
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
@@ -912,6 +913,9 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, 
 			}
 			continue
 		}
+		if _, ok := bypassKeys[string(mut.Key)]; ok {
+			continue
+		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {
 			return errors.Wrapf(ErrRouteWriteFenced,
@@ -926,6 +930,20 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, 
 		}
 	}
 	return nil
+}
+
+func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		out[string(key)] = struct{}{}
+	}
+	return out
 }
 
 // verifyOwnerFromSnapshot is the shared per-mutation owner-check

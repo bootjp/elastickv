@@ -41,6 +41,7 @@ var (
 	errSnapshotMetadataDuplicate = errors.New("etcd raft snapshot metadata was sent more than once")
 	errSnapshotMessageNil        = errors.New("etcd raft snapshot message is required")
 	errSnapshotStreamShort       = errors.New("etcd raft snapshot stream closed before final chunk")
+	errSnapshotDispatchBusy      = errors.New("etcd raft snapshot dispatch already in progress")
 	errReceivedFSMSnapshotStale  = errors.New("etcd raft received fsm snapshot is stale")
 	errPeerStreamClosed          = errors.New("etcd raft SendStream closed")
 	errSendStreamDisabled        = errors.New("etcd raft SendStream is disabled")
@@ -132,7 +133,8 @@ type GRPCTransport struct {
 	// bridgeSem limits concurrent bridge-mode snapshot materializations so
 	// that aggregate in-memory allocation stays bounded even when multiple
 	// dispatch workers run simultaneously.
-	bridgeSem chan struct{}
+	bridgeSem       chan struct{}
+	snapshotSendSem chan struct{}
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -167,6 +169,7 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		sendStreamCancel:    sendStreamCancel,
 		snapshotChunkSize:   defaultSnapshotChunkSize,
 		bridgeSem:           make(chan struct{}, defaultBridgeMaterializeLimit),
+		snapshotSendSem:     make(chan struct{}, 1),
 	}
 }
 
@@ -389,6 +392,10 @@ func isSnapshotMsg(msg raftpb.Message) bool {
 func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message) error {
 	ctx, cancel := transportContext(ctx, defaultSnapshotDispatchTimeout)
 	defer cancel()
+	if !t.tryAcquireSnapshotSend() {
+		return errors.WithStack(errors.Mark(status.Error(codes.ResourceExhausted, errSnapshotDispatchBusy.Error()), errSnapshotDispatchBusy))
+	}
+	defer t.releaseSnapshotSend()
 
 	// Prefer streaming when the snapshot holds a token and an opener is wired.
 	// This avoids materialising the full FSM payload in memory on the sender.
@@ -411,6 +418,28 @@ func (t *GRPCTransport) dispatchSnapshot(ctx context.Context, msg raftpb.Message
 		return err
 	}
 	return t.sendSnapshot(ctx, patched)
+}
+
+func (t *GRPCTransport) tryAcquireSnapshotSend() bool {
+	if t == nil || t.snapshotSendSem == nil {
+		return true
+	}
+	select {
+	case t.snapshotSendSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *GRPCTransport) releaseSnapshotSend() {
+	if t == nil || t.snapshotSendSem == nil {
+		return
+	}
+	select {
+	case <-t.snapshotSendSem:
+	default:
+	}
 }
 
 // streamFSMSnapshot streams the .fsm payload file directly to the peer using
@@ -1247,6 +1276,11 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	if err != nil {
 		return raftpb.Message{}, err
 	}
+	protection, err := protectReceivedSnapshotMetadata(metadata, fsmSnapDir, protectFn, unprotectFn)
+	if err != nil {
+		return raftpb.Message{}, err
+	}
+	defer protection.releaseUnlessHandedOff()
 	spool, err := newReceiveSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
@@ -1275,10 +1309,12 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		metadata,
 		firstPayloadChunk,
 		preparedFSMWrite,
+		protection.protected,
 	)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
+	protection.handoff()
 	index := uint64(0)
 	if msg.Snapshot != nil {
 		index = msg.Snapshot.GetMetadata().GetIndex()
@@ -1290,6 +1326,50 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		"format", snapshotDataFormatLabel(msg.Snapshot),
 	)
 	return msg, nil
+}
+
+type receivedSnapshotProtection struct {
+	index       uint64
+	protected   bool
+	handedOff   bool
+	unprotectFn func(uint64)
+}
+
+func protectReceivedSnapshotMetadata(
+	metadata raftpb.Message,
+	fsmSnapDir string,
+	protectFn func(uint64) bool,
+	unprotectFn func(uint64),
+) (receivedSnapshotProtection, error) {
+	if fsmSnapDir == "" || metadata.Snapshot == nil {
+		return receivedSnapshotProtection{}, nil
+	}
+	index := metadata.Snapshot.GetMetadata().GetIndex()
+	if index == 0 || protectFn == nil {
+		return receivedSnapshotProtection{}, nil
+	}
+	if !protectFn(index) {
+		return receivedSnapshotProtection{}, errors.WithStack(errReceivedFSMSnapshotStale)
+	}
+	return receivedSnapshotProtection{
+		index:       index,
+		protected:   true,
+		unprotectFn: unprotectFn,
+	}, nil
+}
+
+func (p *receivedSnapshotProtection) handoff() {
+	if p == nil {
+		return
+	}
+	p.handedOff = true
+}
+
+func (p *receivedSnapshotProtection) releaseUnlessHandedOff() {
+	if p == nil || !p.protected || p.handedOff || p.unprotectFn == nil {
+		return
+	}
+	p.unprotectFn(p.index)
 }
 
 // drainSnapshotChunks consumes the SendSnapshot stream into spool, computes
@@ -1308,7 +1388,7 @@ func drainSnapshotChunks(
 	unprotectFn func(uint64),
 ) (raftpb.Message, int64, error) {
 	var metadata raftpb.Message
-	return drainSnapshotChunksFrom(stream, spool, fsmSnapDir, prepareFn, protectFn, unprotectFn, metadata, nil, false)
+	return drainSnapshotChunksFrom(stream, spool, fsmSnapDir, prepareFn, protectFn, unprotectFn, metadata, nil, false, false)
 }
 
 func drainSnapshotChunksFrom(
@@ -1321,6 +1401,7 @@ func drainSnapshotChunksFrom(
 	metadata raftpb.Message,
 	firstPayloadChunk *pb.EtcdRaftSnapshotChunk,
 	preparedFSMWrite bool,
+	preprotected bool,
 ) (raftpb.Message, int64, error) {
 	seenMetadata := metadata.Snapshot != nil
 	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit
@@ -1353,7 +1434,7 @@ func drainSnapshotChunksFrom(
 		}
 		payloadBytes += int64(len(chunk.Chunk))
 		if chunk.Final {
-			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, protectFn, unprotectFn, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, protectFn, unprotectFn, seenMetadata, preprotected)
 			if err != nil {
 				return raftpb.Message{}, 0, err
 			}
@@ -1436,6 +1517,7 @@ func finalizeReceivedSnapshot(
 	protectFn func(uint64) bool,
 	unprotectFn func(uint64),
 	seenMetadata bool,
+	preprotected bool,
 ) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
 		return raftpb.Message{}, errors.WithStack(errSnapshotMetadataNil)
@@ -1447,21 +1529,36 @@ func finalizeReceivedSnapshot(
 		// rename to).
 		return buildSnapshotMessage(metadata, spool, seenMetadata)
 	}
-	protected := false
-	if protectFn != nil {
-		if !protectFn(index) {
-			return raftpb.Message{}, errors.WithStack(errReceivedFSMSnapshotStale)
-		}
-		protected = true
+	protected, err := protectReceivedSnapshotForFinalize(index, preprotected, protectFn)
+	if err != nil {
+		return raftpb.Message{}, err
 	}
 	if err := spool.FinalizeAsFSMFile(fsmSnapDir, index, crc32c); err != nil {
-		if protected && unprotectFn != nil {
-			unprotectFn(index)
-		}
+		releaseFinalizeSnapshotProtection(index, protected, preprotected, unprotectFn)
 		return raftpb.Message{}, err
 	}
 	metadata.Snapshot.Data = encodeSnapshotToken(index, crc32c)
 	return metadata, nil
+}
+
+func protectReceivedSnapshotForFinalize(index uint64, preprotected bool, protectFn func(uint64) bool) (bool, error) {
+	if preprotected {
+		return true, nil
+	}
+	if protectFn == nil {
+		return false, nil
+	}
+	if !protectFn(index) {
+		return false, errors.WithStack(errReceivedFSMSnapshotStale)
+	}
+	return true, nil
+}
+
+func releaseFinalizeSnapshotProtection(index uint64, protected bool, preprotected bool, unprotectFn func(uint64)) {
+	if !protected || preprotected || unprotectFn == nil {
+		return
+	}
+	unprotectFn(index)
 }
 
 func maybePrepareReceivedFSMSnapshotWrite(

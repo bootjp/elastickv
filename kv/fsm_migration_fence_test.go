@@ -81,6 +81,34 @@ func TestFSMRejectsObservedWriteFencedRawPointWrite(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
+func TestFSMWriteFenceBypassAllowsMarkedRawPointWrite(t *testing.T) {
+	t.Parallel()
+
+	fsm := newFirstRouteWriteFencedFSM(t)
+	key := []byte("!sqs|msg|data|p|partitioned-key")
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		WriteFenceBypassKeys: [][]byte{key},
+		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
+	}, 10)
+	require.NoError(t, err)
+
+	got, err := fsm.store.GetAt(context.Background(), key, 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMWriteFenceBypassDoesNotAllowDelPrefix(t *testing.T) {
+	t.Parallel()
+
+	fsm := newFirstRouteWriteFencedFSM(t)
+	prefix := []byte("!sqs|msg|data|p|")
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		WriteFenceBypassKeys: [][]byte{prefix},
+		Mutations:            []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: prefix}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
 func TestFSMRejectsCurrentWriteFenceAfterObservedActiveRawPointWrite(t *testing.T) {
 	t.Parallel()
 

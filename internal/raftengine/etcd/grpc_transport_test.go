@@ -125,6 +125,58 @@ func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 	require.True(t, errors.Is(err, errSnapshotMetadataDuplicate))
 }
 
+func TestSnapshotSendGateAllowsOnlyOneInFlightSnapshot(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	require.True(t, transport.tryAcquireSnapshotSend())
+	require.False(t, transport.tryAcquireSnapshotSend())
+
+	transport.releaseSnapshotSend()
+	require.True(t, transport.tryAcquireSnapshotSend())
+	transport.releaseSnapshotSend()
+}
+
+func TestReceiveSnapshotStreamRejectsProtectedIndexBeforePayload(t *testing.T) {
+	const index = uint64(127)
+	metadata := raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
+		Snapshot: &raftpb.Snapshot{
+			Metadata: testSnapshotMetadata(index, 1, nil),
+		},
+	}
+	raw, err := proto.Marshal(&metadata)
+	require.NoError(t, err)
+
+	transport := NewGRPCTransport(nil)
+	fsmSnapDir := t.TempDir()
+	transport.SetFSMSnapDir(fsmSnapDir)
+	var protected []uint64
+	transport.SetFSMSnapshotProtection(
+		func(got uint64) bool {
+			protected = append(protected, got)
+			return false
+		},
+		func(uint64) {
+			t.Fatal("stale snapshot rejection must not unprotect an index it did not protect")
+		},
+	)
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: []byte("payload that must not be read"), Final: true},
+		},
+	}
+
+	_, err = transport.receiveSnapshotStream(stream)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errReceivedFSMSnapshotStale))
+	require.Equal(t, []uint64{index}, protected)
+	require.Equal(t, 1, stream.index, "receiver must reject after metadata before reading payload chunks")
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, index))
+}
+
 // TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet pins the
 // memory-safety win: when the receive transport has fsmSnapDir wired,
 // the spool file is renamed to fsmSnapPath(...) and Snapshot.Data is
