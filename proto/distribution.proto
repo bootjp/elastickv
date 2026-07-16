@@ -8,6 +8,7 @@ service Distribution {
   rpc ListRoutes (ListRoutesRequest) returns (ListRoutesResponse) {}
   rpc SplitRange (SplitRangeRequest) returns (SplitRangeResponse) {}
   rpc StartSplitMigration (StartSplitMigrationRequest) returns (StartSplitMigrationResponse) {}
+  rpc GetSplitMigrationCapability (GetSplitMigrationCapabilityRequest) returns (GetSplitMigrationCapabilityResponse) {}
   rpc GetRouteOwnership (GetRouteOwnershipRequest) returns (GetRouteOwnershipResponse) {}
   rpc GetIntersectingRoutes (GetIntersectingRoutesRequest) returns (GetIntersectingRoutesResponse) {}
   rpc GetSplitJob (GetSplitJobRequest) returns (GetSplitJobResponse) {}
@@ -158,6 +159,13 @@ message StartSplitMigrationRequest {
 message StartSplitMigrationResponse {
   uint64 catalog_version = 1;
   uint64 job_id = 2;
+}
+
+message GetSplitMigrationCapabilityRequest {}
+
+message GetSplitMigrationCapabilityResponse {
+  bool migration_capable = 1;
+  repeated string capabilities = 2;
 }
 
 message GetRouteOwnershipRequest {

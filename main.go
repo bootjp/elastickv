@@ -53,6 +53,8 @@ const (
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
+
+	splitMigrationCapabilityProbeTimeout = 2 * time.Second
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -498,12 +500,20 @@ func run() error {
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
 	startMemoryWatchdog(runCtx, eg, cancel)
+	splitMigrationGate := newSplitMigrationCapabilityGate(
+		splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
+		splitMigrationCapabilityProbeTimeout,
+		nil,
+	)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
+		adapter.WithSplitMigrationCapabilityGate(splitMigrationGate),
 	)
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
@@ -520,7 +530,6 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
 		*encryptionRotateOnStartup,
@@ -653,6 +662,142 @@ func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
 		return nil
 	}
 	return append([]raftengine.Server(nil), in...)
+}
+
+func shardGroupIDs(groups map[uint64]*kv.ShardGroup) []uint64 {
+	ids := make([]uint64, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+type splitMigrationCapabilityPeer struct {
+	ID      string
+	Address string
+}
+
+type splitMigrationCapabilityPeerSource func(context.Context) ([]splitMigrationCapabilityPeer, error)
+
+type splitMigrationCapabilityProbe func(context.Context, string) error
+
+func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) splitMigrationCapabilityPeerSource {
+	return func(ctx context.Context) ([]splitMigrationCapabilityPeer, error) {
+		if len(runtimes) == 0 {
+			return nil, errors.New("raft group runtimes are not configured")
+		}
+		peers := make([]splitMigrationCapabilityPeer, 0)
+		seen := make(map[string]struct{})
+		for _, rt := range runtimes {
+			if rt == nil {
+				return nil, errors.New("raft group runtime is not configured")
+			}
+			engine := rt.snapshotEngine()
+			if engine == nil {
+				return nil, errors.Errorf("raft group %d engine is not configured", rt.spec.id)
+			}
+			cfg, err := engine.Configuration(ctx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "raft group %d configuration", rt.spec.id)
+			}
+			groupPeers := splitMigrationCapabilityPeersFromConfiguration(cfg)
+			if len(groupPeers) == 0 {
+				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.spec.id)
+			}
+			for _, peer := range groupPeers {
+				key := peer.ID + "\x00" + peer.Address
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				peers = append(peers, peer)
+			}
+		}
+		return peers, nil
+	}
+}
+
+func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration) []splitMigrationCapabilityPeer {
+	servers := cfg.Servers
+	if len(servers) == 0 {
+		return nil
+	}
+	peers := make([]splitMigrationCapabilityPeer, 0, len(servers))
+	seen := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		key := server.ID + "\x00" + server.Address
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		id := server.ID
+		if id == "" {
+			id = server.Address
+		}
+		peers = append(peers, splitMigrationCapabilityPeer{
+			ID:      id,
+			Address: server.Address,
+		})
+	}
+	return peers
+}
+
+func newSplitMigrationCapabilityGate(source splitMigrationCapabilityPeerSource, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
+	if probe == nil {
+		probe = probeSplitMigrationCapabilityPeer
+	}
+	return func(ctx context.Context) error {
+		if source == nil {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		peers, err := source(ctx)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "split migration capability peers are not available: %v", err)
+		}
+		if len(peers) == 0 {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		for _, peer := range peers {
+			peerCtx := ctx
+			cancel := func() {}
+			if timeout > 0 {
+				var cancelCtx context.CancelFunc
+				peerCtx, cancelCtx = context.WithTimeout(ctx, timeout)
+				cancel = cancelCtx
+			}
+			err := probe(peerCtx, peer.Address)
+			cancel()
+			if err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration capability peer %s is not ready: %v", peer.ID, err)
+			}
+		}
+		return nil
+	}
+}
+
+func probeSplitMigrationCapabilityPeer(ctx context.Context, address string) error {
+	if strings.TrimSpace(address) == "" {
+		return errors.New("empty split migration capability peer address")
+	}
+	conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+	if err != nil {
+		return errors.Wrapf(err, "dial split migration capability peer %s", address)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+	resp, err := pb.NewDistributionClient(conn).GetSplitMigrationCapability(ctx, &pb.GetSplitMigrationCapabilityRequest{})
+	if err != nil {
+		return errors.Wrapf(err, "probe split migration capability peer %s", address)
+	}
+	if resp == nil || !resp.GetMigrationCapable() {
+		return errors.New("peer does not advertise split migration capability")
+	}
+	if !slices.Contains(resp.GetCapabilities(), adapter.SplitMigrationCapabilityV2) {
+		return errors.Errorf("peer does not advertise %s", adapter.SplitMigrationCapabilityV2)
+	}
+	return nil
 }
 
 type runtimeConfig struct {
@@ -1832,6 +1977,9 @@ func startupRotationGatedMethod(fullMethod string) bool {
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
+		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_AbandonSplitJob_FullMethodName,
+		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
 		pb.RaftAdmin_AddLearner_FullMethodName,
 		pb.RaftAdmin_PromoteLearner_FullMethodName,
