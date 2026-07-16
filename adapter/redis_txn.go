@@ -141,7 +141,12 @@ type listTxnState struct {
 	deleted        bool
 	purge          bool
 	purgeMeta      store.ListMeta
-	existingDeltas [][]byte // delta key bytes present at load time; deleted on purge/delete
+	existingDeltas []listDeltaRef // delta keys present at load time; deleted on purge/delete
+}
+
+type listDeltaRef struct {
+	key     []byte
+	groupID uint64
 }
 
 type hashTxnState struct {
@@ -354,7 +359,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// truncation: if >MaxDeltaScanLimit deltas exist the transaction cannot
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
-	var existingDeltas [][]byte
+	var existingDeltas []listDeltaRef
 	acceptedDeltas := 0
 	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
 		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
@@ -376,7 +381,10 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 			if acceptedDeltas > store.MaxDeltaScanLimit {
 				return nil, ErrDeltaScanTruncated
 			}
-			existingDeltas = append(existingDeltas, kv.Key)
+			existingDeltas = append(existingDeltas, listDeltaRef{
+				key:     bytes.Clone(kv.Key),
+				groupID: kv.RouteGroupID,
+			})
 		}
 	}
 
@@ -1866,7 +1874,7 @@ func appendListDeletionElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTx
 	}
 	// Delete existing delta keys so they do not survive logical delete/purge.
 	for _, dk := range st.existingDeltas {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk.key, GroupID: dk.groupID})
 	}
 	elems = append(elems, redisTxnWideListFenceElem(userKey))
 	return elems

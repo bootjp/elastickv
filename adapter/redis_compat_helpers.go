@@ -991,7 +991,7 @@ func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, read
 			if len(elems)+1 > maxWideColumnItems {
 				return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
 			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key), GroupID: pair.RouteGroupID})
 		}
 		if len(itemKVs) < store.MaxDeltaScanLimit {
 			break
@@ -1041,7 +1041,7 @@ func (r *RedisServer) scanAllDeltaElemsFiltered(
 			if len(elems)+1 > maxWideColumnItems {
 				return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
 			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key), GroupID: pair.RouteGroupID})
 		}
 		if len(deltaKVs) < store.MaxDeltaScanLimit {
 			break

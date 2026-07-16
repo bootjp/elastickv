@@ -41,6 +41,22 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 	}
 }
 
+type routeGroupScanStore struct {
+	store.MVCCStore
+	groupID uint64
+}
+
+func (s *routeGroupScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, err
+	}
+	for _, kvp := range kvs {
+		kvp.RouteGroupID = s.groupID
+	}
+	return kvs, nil
+}
+
 func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	t.Parallel()
 
@@ -64,7 +80,48 @@ func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	txn.startTS = 4
 	stState, err := txn.loadListState(key)
 	require.NoError(t, err)
-	require.Equal(t, [][]byte{deltaKey}, stState.existingDeltas)
+	require.Equal(t, []listDeltaRef{{key: deltaKey}}, stState.existingDeltas)
+}
+
+func TestRedisTxnLoadListStatePreservesDeltaRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	baseStore := store.NewMVCCStore()
+	scanStore := &routeGroupScanStore{MVCCStore: baseStore, groupID: 7}
+	server := NewRedisServer(nil, "", scanStore, newLocalAdapterCoordinator(baseStore), nil, nil)
+	ctx := context.Background()
+	key := []byte("txn-list-route-group")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, baseStore.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+	deltaKey := store.ListMetaDeltaKey(key, 2, 0)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, baseStore.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	txn := newRedisTxnTestContext(server)
+	txn.startTS = 3
+	stState, err := txn.loadListState(key)
+	require.NoError(t, err)
+	require.Equal(t, []listDeltaRef{{key: deltaKey, groupID: 7}}, stState.existingDeltas)
+}
+
+func TestRedisScanAllDeltaElemsFilteredPreservesRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	baseStore := store.NewMVCCStore()
+	scanStore := &routeGroupScanStore{MVCCStore: baseStore, groupID: 11}
+	server := NewRedisServer(nil, "", scanStore, newLocalAdapterCoordinator(baseStore), nil, nil)
+	ctx := context.Background()
+	key := []byte("scan-list-route-group")
+	deltaKey := store.ListMetaDeltaKey(key, 2, 0)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	require.NoError(t, baseStore.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	elems, err := server.scanAllDeltaElemsFiltered(ctx, store.ListMetaDeltaScanPrefix(key), 3, nil)
+	require.NoError(t, err)
+	require.Len(t, elems, 1)
+	require.Equal(t, deltaKey, elems[0].Key)
+	require.Equal(t, uint64(11), elems[0].GroupID)
 }
 
 func TestRedisTxnLoadListStateEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
@@ -1177,6 +1234,19 @@ func TestRedisTxnListDeletionElemsWriteFence(t *testing.T) {
 		metaExists: true,
 		deleted:    true,
 	})
+	require.True(t, elemKeysContain(elems, redisTxnWideListFenceKey(key)))
+}
+
+func TestRedisTxnListDeletionElemsPreserveDeltaRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("delete-route-group:list")
+	deltaKey := store.ListMetaDeltaKey(key, 9, 0)
+	elems := appendListDeletionElems(nil, key, &listTxnState{
+		existingDeltas: []listDeltaRef{{key: deltaKey, groupID: 17}},
+		deleted:        true,
+	})
+	require.Equal(t, uint64(17), requireElemByKey(t, elems, deltaKey).GroupID)
 	require.True(t, elemKeysContain(elems, redisTxnWideListFenceKey(key)))
 }
 
