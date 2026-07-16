@@ -3,6 +3,8 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"os"
+	"strings"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -35,6 +37,12 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationPromoteGate = gate
+	}
+}
+
 func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 	return func(i *Internal) {
 		i.routeEngine = engine
@@ -43,10 +51,11 @@ func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
-		leader:             leader,
-		transactionManager: txm,
-		clock:              clock,
-		relay:              relay,
+		leader:               leader,
+		transactionManager:   txm,
+		clock:                clock,
+		relay:                relay,
+		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -55,14 +64,15 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
-	store              store.MVCCStore
-	migrationProposer  raftengine.Proposer
-	routeEngine        *distribution.Engine
+	leader               raftengine.LeaderView
+	transactionManager   kv.Transactional
+	clock                *kv.HLC
+	tsAllocator          kv.TimestampAllocator
+	relay                *RedisPubSubRelay
+	store                store.MVCCStore
+	migrationProposer    raftengine.Proposer
+	migrationPromoteGate func(context.Context) error
+	routeEngine          *distribution.Engine
 
 	pb.UnimplementedInternalServer
 }
@@ -210,6 +220,77 @@ func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) erro
 	return nil
 }
 
+func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteStagedVersionsRequest) (*pb.PromoteStagedVersionsResponse, error) {
+	if req == nil {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions request is nil"))
+	}
+	if req.GetJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions job_id is required"))
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+		return nil, err
+	}
+	if err := validatePromoteStagedVersionsRequest(req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	result, err := i.proposeMigrationPromote(ctx, req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if i.clock != nil && result.MaxPromotedTS > 0 {
+		i.clock.Observe(result.MaxPromotedTS)
+	}
+	return &pb.PromoteStagedVersionsResponse{
+		NextCursor:    result.NextCursor,
+		Done:          result.Done,
+		PromotedRows:  result.PromotedRows,
+		MaxPromotedTs: result.MaxPromotedTS,
+	}, nil
+}
+
+func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
+	if i.migrationPromoteGate == nil {
+		return nil
+	}
+	if err := i.migrationPromoteGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
+	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
+	if err := store.ValidatePromotionCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
+		if errors.Is(err, store.ErrInvalidExportCursor) {
+			return errors.WithStack(status.Error(codes.InvalidArgument, store.ErrInvalidExportCursor.Error()))
+		}
+		return errors.WithStack(status.Errorf(codes.Internal, "validate promote cursor: %v", err))
+	}
+	return nil
+}
+
+func defaultMigrationPromoteGate(context.Context) error {
+	if migrationPromoteOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
+}
+
+func migrationPromoteOpcodeEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 	if i.leader == nil {
 		return errors.WithStack(ErrNotLeader)
@@ -239,14 +320,11 @@ func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRan
 	if err != nil {
 		return store.ImportVersionsResult{}, errors.WithStack(err)
 	}
-	result, err := i.migrationProposer.Propose(ctx, cmd)
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "migration import")
 	if err != nil {
 		return store.ImportVersionsResult{}, errors.WithStack(err)
 	}
-	if result == nil {
-		return store.ImportVersionsResult{}, errors.New("migration import proposal returned nil result")
-	}
-	switch resp := result.Response.(type) {
+	switch resp := resp.(type) {
 	case store.ImportVersionsResult:
 		return resp, nil
 	case *store.ImportVersionsResult:
@@ -259,6 +337,41 @@ func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRan
 	default:
 		return store.ImportVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration import apply response type %T", resp))
 	}
+}
+
+func (i *Internal) proposeMigrationPromote(ctx context.Context, req *pb.PromoteStagedVersionsRequest) (store.PromoteVersionsResult, error) {
+	cmd, err := kv.MarshalMigrationPromoteCommand(req)
+	if err != nil {
+		return store.PromoteVersionsResult{}, errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "migration promote")
+	if err != nil {
+		return store.PromoteVersionsResult{}, errors.WithStack(err)
+	}
+	switch resp := resp.(type) {
+	case store.PromoteVersionsResult:
+		return resp, nil
+	case *store.PromoteVersionsResult:
+		if resp == nil {
+			return store.PromoteVersionsResult{}, errors.New("migration promote apply returned nil result")
+		}
+		return *resp, nil
+	case error:
+		return store.PromoteVersionsResult{}, errors.WithStack(resp)
+	default:
+		return store.PromoteVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration promote apply response type %T", resp))
+	}
+}
+
+func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, label string) (any, error) {
+	result, err := i.migrationProposer.Propose(ctx, cmd)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if result == nil {
+		return nil, errors.WithStack(errors.Newf("%s proposal returned nil result", label))
+	}
+	return result.Response, nil
 }
 
 func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {

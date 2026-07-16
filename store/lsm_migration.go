@@ -10,6 +10,13 @@ import (
 )
 
 func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	return s.exportVersionsLocked(ctx, opts)
+}
+
+func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
 	opts = normalizeExportVersionsOptions(opts)
 	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
@@ -18,9 +25,6 @@ func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOpt
 	if opts.MaxVersions <= 0 {
 		return ExportVersionsResult{Done: true}, nil
 	}
-
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {

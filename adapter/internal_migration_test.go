@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -76,6 +77,13 @@ type captureExportRangeVersionsStream struct {
 	responses []*pb.ExportRangeVersionsResponse
 }
 
+const (
+	testExportCursorTagEmitted byte = iota
+	testExportCursorTagScanned
+	testExportCursorTagPrunedKey
+	testExportCursorTagSkippedKey
+)
+
 func (s *captureExportRangeVersionsStream) Context() context.Context {
 	if s.ctx != nil {
 		return s.ctx
@@ -86,6 +94,15 @@ func (s *captureExportRangeVersionsStream) Context() context.Context {
 func (s *captureExportRangeVersionsStream) Send(resp *pb.ExportRangeVersionsResponse) error {
 	s.responses = append(s.responses, resp)
 	return nil
+}
+
+func encodeTestExportCursor(key []byte, commitTS uint64, tag byte) []byte {
+	var out []byte
+	out = binary.AppendUvarint(out, uint64(len(key)))
+	out = append(out, key...)
+	out = binary.AppendUvarint(out, commitTS)
+	out = append(out, tag)
+	return out
 }
 
 func testPrefixScanEnd(prefix []byte) []byte {
@@ -427,4 +444,121 @@ func TestInternalImportRangeVersionsRejectsMissingIdentifiers(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestInternalPromoteStagedVersionsRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration promote disabled for test")
+		}),
+	)
+
+	resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+		JobId:       7,
+		MaxVersions: 10,
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
+}
+
+func TestInternalPromoteStagedVersionsRejectsInvalidCursorBeforePropose(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		cursor []byte
+	}{
+		{name: "malformed cursor", cursor: []byte{0xff}},
+		{
+			name:   "cursor outside job staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(8, []byte("k")), 30, testExportCursorTagEmitted),
+		},
+		{
+			name:   "scanned cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 31, testExportCursorTagScanned),
+		},
+		{
+			name:   "pruned-key cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 32, testExportCursorTagPrunedKey),
+		},
+		{
+			name:   "skipped-key cursor inside staged prefix",
+			cursor: encodeTestExportCursor(distribution.MigrationStagedDataKey(7, []byte("k")), 33, testExportCursorTagSkippedKey),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			clock := kv.NewHLC()
+			proposer := &applyingMigrationProposer{
+				fsm: kv.NewKvFSMWithHLC(st, clock),
+			}
+			internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+				WithInternalStore(st),
+				WithInternalMigrationProposer(proposer),
+				WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+			)
+
+			resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+				JobId:       7,
+				Cursor:      tc.cursor,
+				MaxVersions: 10,
+			})
+			require.Nil(t, resp)
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, store.ErrInvalidExportCursor.Error())
+			require.Equal(t, uint64(0), proposer.calls)
+		})
+	}
+}
+
+func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+	)
+
+	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
+	require.NoError(t, st.PutAt(ctx, staged, []byte("v"), 30, 0))
+
+	resp, err := internal.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+		JobId:       7,
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.GetDone())
+	require.Equal(t, uint64(1), resp.GetPromotedRows())
+	require.Equal(t, uint64(30), resp.GetMaxPromotedTs())
+	require.Equal(t, uint64(1), proposer.calls)
+
+	got, err := st.GetAt(ctx, []byte("k"), 30)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+	_, err = st.GetAt(ctx, staged, 30)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	require.GreaterOrEqual(t, clock.Current(), uint64(30))
 }
