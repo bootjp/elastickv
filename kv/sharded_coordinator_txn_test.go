@@ -655,6 +655,35 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 	require.Equal(t, [][]byte{[]byte("rk1"), []byte("rk2")}, g1Txn.requests[0].ReadKeys)
 }
 
+func TestShardedCoordinatorCommitPrimaryUsesPinnedMutationGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 2)
+
+	g1Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 7}}}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 2, NewHLC(), nil)
+
+	primaryKey := []byte("!lst|meta|d|pinned")
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_DEL, Key: primaryKey}},
+		2: {{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
+	}
+	primaryGid, commitIndex, err := coord.commitPrimaryTxn(context.Background(), 10, primaryKey, grouped, []uint64{1, 2}, 20, 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), primaryGid)
+	require.Equal(t, uint64(7), commitIndex)
+	require.Len(t, g1Txn.requests, 1)
+	require.Empty(t, g2Txn.requests)
+	require.Equal(t, pb.Phase_COMMIT, g1Txn.requests[0].Phase)
+	require.Len(t, g1Txn.requests[0].Mutations, 2)
+	require.Equal(t, primaryKey, g1Txn.requests[0].Mutations[1].Key)
+}
+
 // TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion
 // is the gemini-critical regression from PR #881.  Contract:
 // every PREPARE and COMMIT envelope across the 2PC paths
