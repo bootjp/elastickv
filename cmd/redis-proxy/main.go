@@ -123,21 +123,27 @@ func newBackends(cfg proxy.ProxyConfig, primaryPoolSize, elasticKVPoolSize int, 
 	secondaryOpts.PoolSize = elasticKVPoolSize
 
 	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
-	if len(secondarySeeds) == 0 {
-		return nil, nil, fmt.Errorf("at least one secondary address is required")
-	}
 
 	switch cfg.Mode {
 	case proxy.ModeElasticKVPrimary:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
 		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
 			proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts), nil
 	case proxy.ModeElasticKVOnly:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
 		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
 			proxy.NewNoopBackend("redis"), nil
 	case proxy.ModeRedisOnly:
 		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
 			proxy.NewNoopBackend("elastickv"), nil
 	case proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
 		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
 			proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger), nil
 	default:

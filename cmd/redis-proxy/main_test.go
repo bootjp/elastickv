@@ -18,6 +18,33 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryConcurrency(t *testing.T) {
 	assert.Contains(t, err.Error(), "secondary-script-concurrency")
 }
 
+func TestNewBackendsAllowsRedisOnlyWithoutSecondarySeeds(t *testing.T) {
+	cfg := proxy.DefaultConfig()
+	cfg.Mode = proxy.ModeRedisOnly
+	cfg.PrimaryAddr = "127.0.0.1:6379"
+	cfg.SecondaryAddr = ""
+
+	primary, secondary, err := newBackends(cfg, 2, 2, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, primary.Close())
+		require.NoError(t, secondary.Close())
+	})
+	assert.Equal(t, "redis", primary.Name())
+	assert.Equal(t, "elastickv", secondary.Name())
+}
+
+func TestNewBackendsRejectsDualWriteWithoutSecondarySeeds(t *testing.T) {
+	cfg := proxy.DefaultConfig()
+	cfg.Mode = proxy.ModeDualWrite
+	cfg.PrimaryAddr = "127.0.0.1:6379"
+	cfg.SecondaryAddr = ""
+
+	_, _, err := newBackends(cfg, 2, 2, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary address")
+}
+
 func TestDeriveSecondaryConcurrency(t *testing.T) {
 	tests := []struct {
 		name                  string
