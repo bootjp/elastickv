@@ -624,7 +624,7 @@ func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
 	require.Zero(t, result.ScannedBytes)
 }
 
-func TestPebbleExportStopsLeadingRangeWithExplicitEmptyStartAtEndKey(t *testing.T) {
+func TestPebbleExportDoesNotStopLeadingRangeWithExplicitEmptyStartAtEndKey(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-leading-end-key-*")
 	require.NoError(t, err)
@@ -632,25 +632,21 @@ func TestPebbleExportStopsLeadingRangeWithExplicitEmptyStartAtEndKey(t *testing.
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	ps, ok := st.(*pebbleStore)
-	require.True(t, ok)
-	require.NoError(t, ps.PutAt(ctx, []byte("b"), []byte("later"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("later"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, nil, []byte("empty"), 20, 0))
 
-	iter, err := ps.db.NewIter(nil)
+	res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+		StartKey:    []byte{},
+		EndKey:      []byte("b"),
+		MaxVersions: 10,
+	})
 	require.NoError(t, err)
-	defer func() { require.NoError(t, iter.Close()) }()
-	require.True(t, iter.SeekGE(encodeKey([]byte("b"), math.MaxUint64)))
-
-	result := newExportVersionsResult(10)
-	advance, done, err := ps.exportPebbleIteratorPosition(ctx, iter, ExportVersionsOptions{
-		StartKey: []byte{},
-		EndKey:   []byte("b"),
-	}, exportCursorPosition{}, &result)
-	require.ErrorIs(t, err, errExportReachedEnd)
-	require.False(t, advance)
-	require.True(t, done)
-	require.Empty(t, result.Versions)
-	require.Zero(t, result.ScannedBytes)
+	require.True(t, res.Done)
+	require.Equal(t, []MVCCVersion{{
+		Key:      []byte{},
+		CommitTS: 20,
+		Value:    []byte("empty"),
+	}}, res.Versions)
 }
 
 func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
