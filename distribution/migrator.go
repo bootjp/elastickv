@@ -259,6 +259,10 @@ func (b MigrationBracket) ContainsRoutedVersion(rawKey, value, routeStart, route
 }
 
 func (b MigrationBracket) containsLegacyListMetaDeltaRoute(rawKey, value, routeStart, routeEnd []byte) bool {
+	if value == nil {
+		return routeKeyInRange(store.ExtractListUserKey(rawKey), routeStart, routeEnd) ||
+			routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd)
+	}
 	if value != nil && !store.IsListMetaDeltaValue(value) {
 		return routeKeyInRange(store.ExtractListUserKey(rawKey), routeStart, routeEnd)
 	}
