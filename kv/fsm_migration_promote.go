@@ -45,6 +45,9 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 	}
 	result, err := promoter.PromoteVersions(ctx, migrationPromoteOptionsFromProto(req, f.pendingApplyIdx))
 	if err != nil {
+		if isMigrationPromoteOrdinaryApplyError(err) {
+			return errors.Wrap(err, "kv/fsm: apply migration promote")
+		}
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationPromoteApply), "kv/fsm: apply migration promote"))
 	}
 	if f.hlc != nil && result.MaxPromotedTS > 0 {
@@ -78,6 +81,10 @@ func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest, appl
 		MaxScannedBytes: maxScannedBytes,
 		TargetKey:       migrationPromoteTargetKey(req.GetJobId()),
 	}
+}
+
+func isMigrationPromoteOrdinaryApplyError(err error) bool {
+	return errors.Is(err, store.ErrInvalidExportCursor)
 }
 
 func migrationPromoteTargetKey(jobID uint64) func([]byte) ([]byte, bool) {
