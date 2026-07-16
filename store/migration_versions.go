@@ -22,7 +22,9 @@ const (
 	migrationMetadataVersion = 1
 
 	migrationAckPrefix                 = "!migstage|ack|"
+	migrationReadyPrefix               = "!migstage|ready|"
 	migrationUint64Bytes               = 8
+	migrationAckKeyIDBytes             = 2 * migrationUint64Bytes
 	exportVersionSizeOverhead          = 24
 	defaultSparseExportMaxScannedBytes = 1 << 20
 )
@@ -192,10 +194,18 @@ func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
 		opts.EndKey != nil
 }
 
+func migrationReadyKey(jobID uint64) []byte {
+	key := make([]byte, len(migrationReadyPrefix)+migrationUint64Bytes)
+	copy(key, migrationReadyPrefix)
+	binary.BigEndian.PutUint64(key[len(migrationReadyPrefix):], jobID)
+	return key
+}
+
 func isMigrationMetadataKey(rawKey []byte) bool {
 	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
-		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes)
+		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes) ||
+		(len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix)))
 }
 
 func encodeMigrationImportAcks(acks map[migrationAckID]migrationImportAck) []byte {
@@ -420,7 +430,14 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := s.checkExportReadTSLocked(opts); err != nil {
+		return ExportVersionsResult{}, err
+	}
 
+	return s.exportVersionsLocked(ctx, opts, pos)
+}
+
+func (s *mvccStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
 	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
@@ -449,6 +466,20 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 	result.Done = true
 	result.NextCursor = nil
 	return result, nil
+}
+
+func (s *mvccStore) checkExportReadTSLocked(opts ExportVersionsOptions) error {
+	if readTSCompacted(exportRetentionReadTS(opts), s.minRetainedTS) {
+		return ErrReadTSCompacted
+	}
+	return nil
+}
+
+func exportRetentionReadTS(opts ExportVersionsOptions) uint64 {
+	if opts.ReadTS != 0 {
+		return opts.ReadTS
+	}
+	return opts.MaxCommitTSInclusive
 }
 
 var errExportReachedEnd = errors.New("export reached end")

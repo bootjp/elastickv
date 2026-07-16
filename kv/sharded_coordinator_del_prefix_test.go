@@ -329,6 +329,70 @@ func TestShardedCoordinatorRejectsDelPrefixIntersectingWriteFencedRoute(t *testi
 	require.Empty(t, g2Txn.requests)
 }
 
+func TestShardedCoordinatorRejectsDelPrefixBelowRouteFloorBeforeBroadcast(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("z")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+}
+
+func TestShardedCoordinatorRejectsDelPrefixWithoutTargetReadinessProofBeforeBroadcast(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	g1 := &ShardGroup{Txn: g1Txn, Store: store.NewMVCCStore()}
+	g2 := &ShardGroup{Txn: g2Txn, Store: store.NewMVCCStore()}
+	applyTargetReadinessState(t, g2, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+	groups := map[uint64]*ShardGroup{1: g1, 2: g2}
+	shardStore := NewShardStore(engine, groups)
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("z")}},
+	})
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+}
+
 func TestShardedCoordinatorRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 

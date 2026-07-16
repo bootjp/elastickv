@@ -86,12 +86,14 @@ type ExportVersionsOptions struct {
 	EndKey               []byte
 	MinCommitTSExclusive uint64
 	MaxCommitTSInclusive uint64
-	Cursor               []byte
-	MaxVersions          int
-	MaxBytes             uint64
-	MaxScannedBytes      uint64
-	KeyFamily            uint32
-	AcceptKey            func([]byte) bool
+	// ReadTS asks export to enforce the same retention watermark as GetAt/ScanAt.
+	ReadTS          uint64
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptKey       func([]byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.
@@ -155,6 +157,19 @@ type PromotionState struct {
 	LastError    string
 }
 
+// TargetStagedReadinessState is a target-local guard that makes a target voter
+// fail closed for a moving route until it has either the staged descriptor or
+// the cleared descriptor with the retained write timestamp floor.
+type TargetStagedReadinessState struct {
+	JobID                  uint64
+	RouteStart             []byte
+	RouteEnd               []byte
+	ExpectedCutoverVersion uint64
+	MigrationJobID         uint64
+	MinWriteTSExclusive    uint64
+	Armed                  bool
+}
+
 // MigrationPromoter is implemented by stores that can promote staged range
 // migration data into the live keyspace.
 type MigrationPromoter interface {
@@ -164,6 +179,17 @@ type MigrationPromoter interface {
 // MigrationPromotionStateReader reads target-local staged promotion state.
 type MigrationPromotionStateReader interface {
 	MigrationPromotionState(ctx context.Context, jobID uint64) (PromotionState, bool, error)
+}
+
+// MigrationTargetReadinessWriter persists a target-local staged-readiness
+// guard through the target Raft group.
+type MigrationTargetReadinessWriter interface {
+	ApplyTargetStagedReadiness(ctx context.Context, state TargetStagedReadinessState) error
+}
+
+// MigrationTargetReadinessReader reads retained target-local readiness guards.
+type MigrationTargetReadinessReader interface {
+	MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error)
 }
 
 // OpType describes a mutation kind.

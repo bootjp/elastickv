@@ -1039,6 +1039,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	if err := c.rejectWriteTimestampFloorDelPrefixes(elems, ts); err != nil {
 		return nil, err
 	}
+	if err := c.rejectDelPrefixesWithoutTargetReadinessProof(ctx, elems, ts); err != nil {
+		return nil, err
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -1097,6 +1100,22 @@ func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) err
 			if route.State == distribution.RouteStateWriteFenced {
 				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
 			}
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectDelPrefixesWithoutTargetReadinessProof(ctx context.Context, elems []*Elem[OP], commitTS uint64) error {
+	shards, ok := c.store.(*ShardStore)
+	if !ok || shards == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		if _, err := shards.verifyPrefixDeleteRoutes(ctx, elem.Key, commitTS); err != nil {
+			return errors.Wrapf(err, "prefix %q", elem.Key)
 		}
 	}
 	return nil
@@ -1399,7 +1418,7 @@ type preparedGroup struct {
 }
 
 func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64) ([]preparedGroup, error) {
-	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
+	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, commitTS)
 	prepared := make([]preparedGroup, 0, len(gids))
 
 	for _, gid := range gids {
@@ -2140,6 +2159,9 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		return errors.WithStack(err)
 	}
 	for _, key := range keys {
+		if err := c.verifyTargetReadinessForReadKeyOnShard(ctx, gid, g, key); err != nil {
+			return err
+		}
 		ts, exists, err := c.latestCommitTSForReadKeyOnShard(ctx, gid, g, key)
 		if err != nil {
 			return errors.WithStack(err)
@@ -2149,6 +2171,43 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) error {
+	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(states) == 0 {
+		return nil
+	}
+	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
+	routes, catalogVersion, proof := c.currentShardRoutesForRouteRange(gid, routeStart, routeEnd)
+	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, gid, catalogVersion, proof) {
+		return nil
+	}
+	return errors.WithStack(ErrRouteCutoverPending)
+}
+
+func (c *ShardedCoordinator) currentShardRoutesForRouteRange(gid uint64, routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	if c == nil || c.engine == nil {
+		return nil, 0, false
+	}
+	snap, ok := c.engine.Current()
+	if !ok {
+		return nil, 0, false
+	}
+	routes := make([]distribution.Route, 0)
+	for _, route := range snap.IntersectingRoutes(routeStart, routeEnd) {
+		if route.GroupID == gid {
+			routes = append(routes, route)
+		}
+	}
+	return routes, snap.Version(), true
 }
 
 func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {

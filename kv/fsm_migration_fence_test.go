@@ -12,6 +12,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type deletePrefixIndexRecordingStore struct {
+	store.MVCCStore
+
+	deletePrefixIndexes  []uint64
+	deletePrefixPrefixes [][]byte
+}
+
+func (s *deletePrefixIndexRecordingStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	s.deletePrefixIndexes = append(s.deletePrefixIndexes, appliedIndex)
+	s.deletePrefixPrefixes = append(s.deletePrefixPrefixes, append([]byte(nil), prefix...))
+	return s.MVCCStore.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex)
+}
+
+func (s *deletePrefixIndexRecordingStore) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
+	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, nil
+	}
+	return reader.MigrationTargetReadinessStates(ctx)
+}
+
+func (s *deletePrefixIndexRecordingStore) ApplyTargetStagedReadiness(ctx context.Context, state store.TargetStagedReadinessState) error {
+	writer, ok := s.MVCCStore.(store.MigrationTargetReadinessWriter)
+	if !ok {
+		return store.ErrNotSupported
+	}
+	return writer.ApplyTargetStagedReadiness(ctx, state)
+}
+
 func newWriteFencedFSM(t *testing.T) *kvFSM {
 	t.Helper()
 
@@ -28,9 +57,65 @@ func newWriteFloorFSM(t *testing.T) *kvFSM {
 
 	engine := distribution.NewEngine()
 	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
-		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		},
 	})
 	return newComposed1FSM(t, engine, 1)
+}
+
+func newTargetReadinessFSM(t *testing.T, route distribution.RouteDescriptor) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{route})
+	fsm := newComposed1FSM(t, engine, route.GroupID)
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
+	return fsm
+}
+
+func applyTargetReadinessToFSM(t *testing.T, fsm *kvFSM, state store.TargetStagedReadinessState) {
+	t.Helper()
+
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
+}
+
+func newReadinessReadKeyFSM(t *testing.T) *kvFSM {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("m"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+	return fsm
 }
 
 func s3BucketAuxiliaryFenceRoutes(bucket string, rawGroupID, fencedGroupID uint64) []distribution.RouteDescriptor {
@@ -64,6 +149,79 @@ func TestFSMRejectsRawPointWriteOnWriteFencedRoute(t *testing.T) {
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
+func TestFSMRejectsRawPointWriteWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMAllowsRawPointWriteWithClearedTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 101)
+	require.NoError(t, err)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsTargetReadinessProofFromAnotherGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             2,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 101)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -85,6 +243,62 @@ func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
 	}
 }
 
+func TestFSMRejectsS3BucketAuxiliaryPointWriteBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{{
+		RouteID:             1,
+		Start:               routeStart,
+		End:                 routeEnd,
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: s3keys.BucketMetaKey(bucket), Value: []byte("v")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+}
+
+func TestFSMRejectsS3BucketAuxiliaryPointWriteWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   routeStart,
+		End:     routeEnd,
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: s3keys.BucketGenerationKey(bucket), Value: []byte("v")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -101,6 +315,87 @@ func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMRejectsDelPrefixWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	require.NoError(t, fsm.store.PutAt(context.Background(), []byte("b"), []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("b")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMDelPrefixTombstonesStagedVisibilityRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, fsm.store.PutAt(ctx, stagedKey, []byte("staged"), 110, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: rawKey}},
+	}, 120)
+	require.NoError(t, err)
+
+	_, err = fsm.store.GetAt(ctx, stagedKey, 130)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestFSMDelPrefixAdvancesApplyIndexOnlyOnLiveDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	recording := &deletePrefixIndexRecordingStore{MVCCStore: fsm.store}
+	fsm.store = recording
+	fsm.SetApplyIndex(55)
+
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, fsm.store.PutAt(ctx, stagedKey, []byte("staged"), 110, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: rawKey}},
+	}, 120)
+	require.NoError(t, err)
+
+	require.Equal(t, []uint64{0, 55}, recording.deletePrefixIndexes)
+	require.Equal(t, stagedKey, recording.deletePrefixPrefixes[0])
+	require.Equal(t, rawKey, recording.deletePrefixPrefixes[1])
+}
+
 func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 
@@ -113,6 +408,35 @@ func TestFSMRejectsFullRangeDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 
 	got, getErr := fsm.store.GetAt(context.Background(), []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsRawPointWriteBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMRejectsDelPrefixBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	require.NoError(t, fsm.store.PutAt(context.Background(), []byte("b"), []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("b")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	got, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v"), got)
 }
@@ -132,6 +456,230 @@ func TestFSMRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t *testing.T) {
 	got, getErr := fsm.store.GetAt(context.Background(), key, ^uint64(0))
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMRejectsOnePhaseTxnBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), onePhaseReq(10, 100, 0, []byte("b"), []byte("v")), 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	_, getErr := fsm.store.GetAt(context.Background(), []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMOnePhaseDedupChecksTargetReadinessBeforeNoOp(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	require.NoError(t, fsm.store.PutAt(ctx, []byte("b"), []byte("landed"), 20, 0))
+
+	err := fsm.handleTxnRequest(ctx, onePhaseReq(30, 40, 20, []byte("b"), []byte("retry")), 40)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	landedAt40, probeErr := fsm.store.CommittedVersionAt(ctx, []byte("b"), 40)
+	require.NoError(t, probeErr)
+	require.False(t, landedAt40)
+}
+
+func TestFSMOnePhaseTxnChecksReadKeysForTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newReadinessReadKeyFSM(t)
+	req := onePhaseReq(10, 20, 0, []byte("b"), []byte("v"))
+	req.ReadKeys = [][]byte{[]byte("n")}
+
+	err := fsm.handleTxnRequest(ctx, req, 20)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMPrepareTxnChecksReadKeysForTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newReadinessReadKeyFSM(t)
+	req := &pb.Request{
+		IsTxn:    true,
+		Phase:    pb.Phase_PREPARE,
+		Ts:       10,
+		ReadKeys: [][]byte{[]byte("n")},
+		Mutations: []*pb.Mutation{
+			{
+				Op:  pb.Op_PUT,
+				Key: []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("b"),
+					LockTTLms:  defaultTxnLockTTLms,
+				}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}
+
+	err := fsm.handleTxnRequest(ctx, req, 10)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMPrepareTxnSkipsRemotePrimaryForTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("m"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	err := fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{
+				Op:  pb.Op_PUT,
+				Key: []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("b"),
+					LockTTLms:  defaultTxnLockTTLms,
+				}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("v")},
+		},
+	}, 10)
+	require.NoError(t, err)
+
+	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("n")), ^uint64(0))
+	require.NoError(t, getErr)
+}
+
+func TestFSMPrepareTxnChecksStagedVisibilityWriteConflicts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	require.NoError(t, fsm.store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged"), 20, 0))
+
+	err := fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{
+				Op:  pb.Op_PUT,
+				Key: []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("b"),
+					CommitTS:   120,
+					LockTTLms:  defaultTxnLockTTLms,
+				}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 10)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+
+	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMOnePhaseTxnChecksStagedVisibilityReadConflicts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+	})
+	require.NoError(t, fsm.store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("n")), []byte("staged"), 20, 0))
+
+	req := onePhaseReq(10, 120, 0, []byte("b"), []byte("v"))
+	req.ReadKeys = [][]byte{[]byte("n")}
+
+	err := fsm.handleTxnRequest(ctx, req, 120)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+
+	_, getErr := fsm.store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    50,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("b"), LockTTLms: defaultTxnLockTTLms, CommitTS: 101}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 50)
+	require.NoError(t, err)
+}
+
+func TestFSMPrepareWithoutCommitTSUsesStartTSForRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    100,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("b"), LockTTLms: defaultTxnLockTTLms}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+		},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
 }
 
 func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
@@ -163,85 +711,80 @@ func TestFSMRejectsPrepareOnWriteFencedRouteButAllowsAbort(t *testing.T) {
 	require.False(t, errors.Is(err, ErrRouteWriteFenced), "ABORT must keep the narrow cleanup lane open")
 }
 
-func TestFSMAllowsRawPointWriteAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+func TestFSMAbortCleanupBypassesRetainedWriteFloor(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
-	err := fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("replayed")}},
-	}, 100)
-	require.NoError(t, err)
-	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("replayed"), got)
-}
+	startTS := uint64(10)
+	abortTS := uint64(11)
+	primaryKey := []byte("b")
+	require.NoError(t, fsm.store.PutAt(ctx, txnLockKey(primaryKey), encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		PrimaryKey:   primaryKey,
+		IsPrimaryKey: true,
+	}), startTS, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, txnIntentKey(primaryKey), encodeTxnIntent(txnIntent{
+		StartTS: startTS,
+		Op:      txnIntentOpPut,
+		Value:   []byte("v"),
+	}), startTS, 0))
 
-func TestFSMAllowsDelPrefixAtMigrationTimestampFloorDuringReplay(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	fsm := newWriteFloorFSM(t)
-	require.NoError(t, fsm.store.PutAt(ctx, []byte("z"), []byte("v"), 10, 0))
-
-	err := fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
-	}, 100)
-	require.NoError(t, err)
-
-	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
-}
-
-func TestFSMAllowsOnePhaseTxnAtMigrationTimestampFloorDuringReplay(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	fsm := newWriteFloorFSM(t)
-	req := &pb.Request{
+	abort := &pb.Request{
 		IsTxn: true,
-		Phase: pb.Phase_NONE,
-		Ts:    90,
+		Phase: pb.Phase_ABORT,
+		Ts:    startTS,
 		Mutations: []*pb.Mutation{
-			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
-			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: abortTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	err := fsm.handleTxnRequest(ctx, req, 100)
-	require.NoError(t, err)
-	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("low"), got)
+	require.NoError(t, fsm.handleTxnRequest(ctx, abort, abortTS))
+
+	_, lockErr := fsm.store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
+	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
 }
 
-func TestFSMAllowsCommitAtMigrationTimestampFloorDuringReplay(t *testing.T) {
+func TestFSMAbortCleanupBypassesTargetReadiness(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	fsm := newWriteFloorFSM(t)
-	prepare := &pb.Request{
-		IsTxn: true,
-		Phase: pb.Phase_PREPARE,
-		Ts:    90,
-		Mutations: []*pb.Mutation{
-			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms})},
-			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
-		},
-	}
-	require.NoError(t, fsm.handleTxnRequest(ctx, prepare, 90))
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	startTS := uint64(10)
+	abortTS := uint64(11)
+	primaryKey := []byte("b")
+	require.NoError(t, fsm.store.PutAt(ctx, txnLockKey(primaryKey), encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		PrimaryKey:   primaryKey,
+		IsPrimaryKey: true,
+	}), startTS, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, txnIntentKey(primaryKey), encodeTxnIntent(txnIntent{
+		StartTS: startTS,
+		Op:      txnIntentOpPut,
+		Value:   []byte("v"),
+	}), startTS, 0))
 
-	commit := &pb.Request{
+	abort := &pb.Request{
 		IsTxn: true,
-		Phase: pb.Phase_COMMIT,
-		Ts:    90,
+		Phase: pb.Phase_ABORT,
+		Ts:    startTS,
 		Mutations: []*pb.Mutation{
-			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
-			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: abortTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	err := fsm.handleTxnRequest(ctx, commit, 100)
-	require.NoError(t, err)
-	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
+	require.NoError(t, fsm.handleTxnRequest(ctx, abort, abortTS))
+
+	_, lockErr := fsm.store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
+	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
+	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
 }

@@ -25,6 +25,9 @@ func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersi
 	if opts.MaxVersions <= 0 {
 		return ExportVersionsResult{Done: true}, nil
 	}
+	if readTSCompacted(exportRetentionReadTS(opts), s.effectiveMinRetainedTS()) {
+		return ExportVersionsResult{}, ErrReadTSCompacted
+	}
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {
