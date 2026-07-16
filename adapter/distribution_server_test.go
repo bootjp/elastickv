@@ -3,10 +3,12 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -133,6 +135,24 @@ func TestWithCatalogReloadRetryPolicy_OverridesDefaults(t *testing.T) {
 	require.Equal(t, 5*time.Millisecond, s.reloadRetry.interval)
 }
 
+func TestDistributionServerPinReadTSWithoutTrackerReturnsReleasableToken(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil)
+	token := s.pinReadTS(10)
+	require.NotNil(t, token)
+	require.NotPanics(t, func() {
+		token.Release()
+	})
+
+	var nilServer *DistributionServer
+	nilToken := nilServer.pinReadTS(10)
+	require.NotNil(t, nilToken)
+	require.NotPanics(t, func() {
+		nilToken.Release()
+	})
+}
+
 func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
@@ -188,6 +208,602 @@ func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.ErrorContains(t, err, errDistributionCatalogNotConfigured.Error())
+}
+
+func TestDistributionServerGetSplitMigrationCapabilityReportsNotReadyUntilRunnerReady(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil)
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.False(t, resp.GetMigrationCapable())
+	require.NotContains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
+func TestDistributionServerGetSplitMigrationCapabilityReportsReadyWhenRunnerReady(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil, WithSplitJobRunnerReady())
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.True(t, resp.GetMigrationCapable())
+	require.Contains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
+func TestDistributionServerStartSplitMigration_FailsClosedUntilCapabilityGate(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+
+	_, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: 1,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionClusterNotReady.Error())
+	require.Zero(t, coordinator.dispatchCalls)
+
+	jobs, listErr := catalog.ListSplitJobs(ctx)
+	require.NoError(t, listErr)
+	require.Empty(t, jobs)
+}
+
+func TestDistributionServerStartSplitMigrationReturnsCapabilityGateError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			return status.Error(codes.Unavailable, "split migration capability not ready")
+		}),
+	)
+
+	_, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: 1,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "split migration capability not ready")
+	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerStartSplitMigrationCapabilityGateRunsOutsideCatalogLock(t *testing.T) {
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 0,
+	}})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	gateEntered := make(chan struct{})
+	releaseGate := make(chan struct{})
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			close(gateEntered)
+			<-releaseGate
+			return status.Error(codes.Unavailable, "split migration capability not ready")
+		}),
+	)
+
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+			ExpectedCatalogVersion: saved.Version,
+			RouteId:                1,
+			SplitKey:               []byte("g"),
+			TargetGroupId:          2,
+		})
+		startDone <- err
+	}()
+	<-gateEntered
+
+	splitDone := make(chan error, 1)
+	go func() {
+		_, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+			ExpectedCatalogVersion: saved.Version,
+			RouteId:                1,
+			SplitKey:               []byte("g"),
+		})
+		splitDone <- err
+	}()
+	select {
+	case err := <-splitDone:
+		require.NoError(t, err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SplitRange blocked behind StartSplitMigration capability gate")
+	}
+
+	close(releaseGate)
+	err = <-startDone
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+}
+
+func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 0,
+	}})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	gateCalls := 0
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			gateCalls++
+			return nil
+		}),
+	)
+
+	resp, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, saved.Version, resp.CatalogVersion)
+	require.Equal(t, uint64(1), resp.JobId)
+	require.Equal(t, 1, gateCalls)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+	require.ElementsMatch(t, []string{
+		string(distribution.CatalogSplitJobKey(1)),
+		string(distribution.CatalogNextSplitJobIDKey()),
+		string(distribution.CatalogVersionKey()),
+		string(distribution.CatalogRouteKey(1)),
+	}, byteSliceStrings(coordinator.lastReadKeys))
+
+	jobs, err := catalog.ListSplitJobs(ctx)
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	job := jobs[0]
+	require.Equal(t, uint64(1), job.JobID)
+	require.Equal(t, uint64(1), job.SourceRouteID)
+	require.Equal(t, []byte("g"), job.SplitKey)
+	require.Equal(t, uint64(2), job.TargetGroupID)
+	require.Equal(t, distribution.SplitJobPhasePlanned, job.Phase)
+	require.NotZero(t, job.StartedAtMs)
+	require.NotZero(t, job.UpdatedAtMs)
+	require.NotEmpty(t, job.BracketProgress)
+	next, err := catalog.NextSplitJobID(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), next)
+}
+
+func TestDistributionServerStartSplitMigration_RejectsUnknownTargetGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         distribution.RouteStateActive,
+		ParentRouteID: 0,
+	}})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+	)
+
+	_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          3,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionUnknownTargetGroup.Error())
+	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerStartSplitMigration_RejectsNonActiveSourceRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		state distribution.RouteState
+	}{
+		{name: "write_fenced", state: distribution.RouteStateWriteFenced},
+		{name: "migrating_source", state: distribution.RouteStateMigratingSource},
+		{name: "migrating_target", state: distribution.RouteStateMigratingTarget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+				RouteID:       1,
+				Start:         []byte("a"),
+				End:           []byte("m"),
+				GroupID:       1,
+				State:         tc.state,
+				ParentRouteID: 0,
+			}})
+			require.NoError(t, err)
+
+			coordinator := newDistributionCoordinatorStub(baseStore, true)
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(coordinator),
+				WithDistributionKnownRaftGroups(1, 2),
+				WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+			)
+
+			_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               []byte("g"),
+				TargetGroupId:          2,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, errDistributionSourceRouteNotActive.Error())
+			require.Zero(t, coordinator.dispatchCalls)
+
+			jobs, listErr := catalog.ListSplitJobs(ctx)
+			require.NoError(t, listErr)
+			require.Empty(t, jobs)
+		})
+	}
+}
+
+func TestDistributionServerStartSplitMigration_RejectsSecondLiveJob(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID:       1,
+			Start:         []byte("a"),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+		{
+			RouteID:       2,
+			Start:         []byte("m"),
+			End:           nil,
+			GroupID:       2,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 0,
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(ctx, distribution.SplitJob{
+		JobID:         1,
+		SourceRouteID: 2,
+		SplitKey:      []byte("t"),
+		TargetGroupID: 3,
+		Phase:         distribution.SplitJobPhaseBackfill,
+		StartedAtMs:   1000,
+		UpdatedAtMs:   1000,
+	}))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithDistributionKnownRaftGroups(1, 2, 3, 4),
+		WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+	)
+
+	_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+		TargetGroupId:          4,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.ErrorContains(t, err, distribution.ErrTooManyInFlightSplitJobs.Error())
+	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerStartSplitMigration_RejectsReservedMigrationRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		splitKey []byte
+		end      []byte
+	}{
+		{name: "dist catalog", splitKey: []byte("!dist|"), end: nil},
+		{name: "dist staged catalog", splitKey: []byte("!dist|migstage|"), end: nil},
+		{name: "migration staged", splitKey: []byte("!migstage|ready|1"), end: nil},
+		{name: "migration tracker", splitKey: []byte("!migwrite|"), end: nil},
+		{name: "migration fence", splitKey: []byte("!migfence|"), end: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+				RouteID:       1,
+				Start:         []byte(""),
+				End:           tc.end,
+				GroupID:       1,
+				State:         distribution.RouteStateActive,
+				ParentRouteID: 0,
+			}})
+			require.NoError(t, err)
+
+			coordinator := newDistributionCoordinatorStub(baseStore, true)
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(coordinator),
+				WithDistributionKnownRaftGroups(1, 2),
+				WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+			)
+
+			_, err = s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               tc.splitKey,
+				TargetGroupId:          2,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, distribution.ErrMigrationReservedRange.Error())
+			require.Zero(t, coordinator.dispatchCalls)
+
+			jobs, listErr := catalog.ListSplitJobs(ctx)
+			require.NoError(t, listErr)
+			require.Empty(t, jobs)
+		})
+	}
+}
+
+func TestDistributionServerSplitJobRPCs_ReadAndListCatalogJobs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	live := sampleDistributionSplitJob(10)
+	live.Phase = distribution.SplitJobPhaseDeltaCopy
+	require.NoError(t, catalog.CreateSplitJob(ctx, live))
+	history := sampleDistributionSplitJob(11)
+	history.Phase = distribution.SplitJobPhaseDone
+	history.TerminalAtMs = 2000
+	require.NoError(t, catalog.CreateSplitJob(ctx, history))
+	require.NoError(t, catalog.MoveSplitJobToHistory(ctx, history, history))
+
+	s := NewDistributionServer(distribution.NewEngine(), catalog)
+	got, err := s.GetSplitJob(ctx, &pb.GetSplitJobRequest{JobId: live.JobID})
+	require.NoError(t, err)
+	require.Equal(t, live.JobID, got.Job.JobId)
+	require.Equal(t, pb.SplitJobPhase_SPLIT_JOB_PHASE_DELTA_COPY, got.Job.Phase)
+
+	listAll, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{})
+	require.NoError(t, err)
+	require.Len(t, listAll.Jobs, 2)
+	require.Equal(t, []uint64{live.JobID, history.JobID}, []uint64{listAll.Jobs[0].JobId, listAll.Jobs[1].JobId})
+
+	listDone, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{Phase: "done"})
+	require.NoError(t, err)
+	require.Len(t, listDone.Jobs, 1)
+	require.Equal(t, history.JobID, listDone.Jobs[0].JobId)
+
+	_, err = s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{Phase: "not-a-phase"})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestDistributionServerListSplitJobs_PaginatesNewestHistory(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	for jobID, terminalAtMs := uint64(1), int64(1001); jobID <= 205; jobID, terminalAtMs = jobID+1, terminalAtMs+1 {
+		job := sampleDistributionSplitJob(jobID)
+		job.Phase = distribution.SplitJobPhaseDone
+		job.TerminalAtMs = terminalAtMs
+		job.UpdatedAtMs = job.TerminalAtMs
+		require.NoError(t, catalog.CreateSplitJob(ctx, job))
+		require.NoError(t, catalog.MoveSplitJobToHistory(ctx, job, job))
+	}
+
+	s := NewDistributionServer(distribution.NewEngine(), catalog)
+	first, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{})
+	require.NoError(t, err)
+	require.Len(t, first.Jobs, listSplitJobsDefaultPageSize)
+	require.NotEmpty(t, first.NextPageCursor)
+	require.Equal(t, uint64(205), first.Jobs[0].JobId)
+	require.Equal(t, uint64(6), first.Jobs[len(first.Jobs)-1].JobId)
+
+	second, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: first.NextPageCursor})
+	require.NoError(t, err)
+	require.Empty(t, second.NextPageCursor)
+	require.Equal(t, []uint64{5, 4, 3, 2, 1}, splitJobIDs(second.Jobs))
+}
+
+func TestDistributionServerListSplitJobs_RejectsInvalidCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	job := sampleDistributionSplitJob(1)
+	job.Phase = distribution.SplitJobPhaseDone
+	job.TerminalAtMs = 1000
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+	require.NoError(t, catalog.MoveSplitJobToHistory(ctx, job, job))
+
+	s := NewDistributionServer(distribution.NewEngine(), catalog)
+	_, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: []byte("bad")})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	missing := sampleDistributionSplitJob(999)
+	missing.TerminalAtMs = 9999
+	_, err = s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: encodeSplitJobListCursor(missing)})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestDistributionServerRetrySplitJob_UsesCoordinatorCAS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	job := sampleDistributionSplitJob(12)
+	job.Phase = distribution.SplitJobPhaseFailed
+	job.RetryPhase = distribution.SplitJobPhaseFence
+	job.LastError = "retry me"
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+	_, err := s.RetrySplitJob(ctx, &pb.RetrySplitJobRequest{JobId: job.JobID})
+	require.NoError(t, err)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	got, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, distribution.SplitJobPhaseFence, got.Phase)
+	require.Equal(t, distribution.SplitJobPhaseNone, got.RetryPhase)
+	require.Empty(t, got.LastError)
+}
+
+func TestDistributionServerRetrySplitJob_MapsDispatchLeadershipLoss(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "leader not found", err: kv.ErrLeaderNotFound},
+		{name: "raft not leader", err: raftengine.ErrNotLeader},
+		{name: "leadership lost", err: raftengine.ErrLeadershipLost},
+		{name: "transfer in progress", err: raftengine.ErrLeadershipTransferInProgress},
+		{name: "wrapped grpc detail", err: errors.New("rpc error: code = Unknown desc = raft engine: leadership lost")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			job := sampleDistributionSplitJob(15)
+			job.Phase = distribution.SplitJobPhaseFailed
+			job.RetryPhase = distribution.SplitJobPhaseFence
+			require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+			coordinator := newDistributionCoordinatorStub(baseStore, true)
+			coordinator.dispatchErr = tc.err
+			s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+			_, err := s.RetrySplitJob(ctx, &pb.RetrySplitJobRequest{JobId: job.JobID})
+			require.Error(t, err)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, errDistributionNotLeader.Error())
+			require.Equal(t, 1, coordinator.dispatchCalls)
+		})
+	}
+}
+
+func TestDistributionServerAbandonSplitJob_RecordsAbandoningViaCoordinator(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	job := sampleDistributionSplitJob(13)
+	job.Phase = distribution.SplitJobPhaseFailed
+	job.RetryPhase = distribution.SplitJobPhaseBackfill
+	job.AbandonFromPhase = distribution.SplitJobPhaseNone
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+	_, err := s.AbandonSplitJob(ctx, &pb.AbandonSplitJobRequest{JobId: job.JobID})
+	require.NoError(t, err)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	got, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, distribution.SplitJobPhaseAbandoning, got.Phase)
+	require.Equal(t, distribution.SplitJobPhaseNone, got.RetryPhase)
+	require.Equal(t, distribution.SplitJobPhaseBackfill, got.AbandonFromPhase)
+}
+
+func TestDistributionServerRetrySplitJob_RequiresCatalogLeader(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	job := sampleDistributionSplitJob(14)
+	job.Phase = distribution.SplitJobPhaseFailed
+	job.RetryPhase = distribution.SplitJobPhaseBackfill
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, false)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+	_, err := s.RetrySplitJob(ctx, &pb.RetrySplitJobRequest{JobId: job.JobID})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Zero(t, coordinator.dispatchCalls)
 }
 
 func TestDistributionServerGetRouteOwnership_UsesExactVersionSnapshot(t *testing.T) {
@@ -917,9 +1533,39 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 	return NewDistributionServer(distribution.NewEngine(), catalog), saved.Version
 }
 
+func sampleDistributionSplitJob(jobID uint64) distribution.SplitJob {
+	return distribution.SplitJob{
+		JobID:         jobID,
+		SourceRouteID: 1,
+		SplitKey:      []byte("g"),
+		TargetGroupID: 2,
+		Phase:         distribution.SplitJobPhaseBackfill,
+		RetryPhase:    distribution.SplitJobPhaseNone,
+		StartedAtMs:   1000,
+		UpdatedAtMs:   1000,
+	}
+}
+
+func splitJobIDs(jobs []*pb.SplitJob) []uint64 {
+	ids := make([]uint64, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.GetJobId())
+	}
+	return ids
+}
+
+func byteSliceStrings(in [][]byte) []string {
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		out = append(out, string(item))
+	}
+	return out
+}
+
 type distributionCoordinatorStub struct {
 	store           store.MVCCStore
 	leader          bool
+	dispatchErr     error
 	nextTS          uint64
 	lastStartTS     uint64
 	lastReadKeys    [][]byte
@@ -942,6 +1588,9 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
+	if s.dispatchErr != nil {
+		return nil, s.dispatchErr
+	}
 	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
 	s.lastStartTS = startTS
 	readKeys := cloneDistributionReadKeys(reqs.ReadKeys)

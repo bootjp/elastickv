@@ -122,9 +122,12 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
-	// RouteOf returns the complete route descriptor covering key.
+	// RouteOf returns the complete route descriptor covering key at this
+	// snapshot's version. Used by apply-time target-readiness checks to
+	// prove staged/cleared descriptor state before mutating the store.
 	RouteOf(key []byte) (distribution.Route, bool)
-	// IntersectingRoutes returns every route intersecting [start, end).
+	// IntersectingRoutes returns the route descriptors that intersect
+	// [start, end) at this snapshot's version. A nil end denotes +infinity.
 	IntersectingRoutes(start, end []byte) []distribution.Route
 	// WriteFencedForKey reports whether key is currently inside a
 	// WriteFenced route in this snapshot.
@@ -132,6 +135,12 @@ type RouteSnapshot interface {
 	// WriteFencedIntersects reports whether [start, end) intersects
 	// any WriteFenced route in this snapshot.
 	WriteFencedIntersects(start, end []byte) bool
+	// WriteFloorForKey returns the post-migration write timestamp floor
+	// for key, when the current route retains one.
+	WriteFloorForKey(key []byte) (uint64, bool)
+	// WriteFloorIntersects returns the maximum post-migration write
+	// timestamp floor across routes intersecting [start, end).
+	WriteFloorIntersects(start, end []byte) (uint64, bool)
 }
 
 // SetApplyIndex implements raftengine.ApplyIndexAware. The engine
@@ -373,6 +382,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyMigrationImport(ctx, data[1:]), true
 	case data[0] == raftEncodeMigrationPromote:
 		return f.applyMigrationPromote(ctx, data[1:]), true
+	case data[0] == raftEncodeTargetReadiness:
+		return f.applyTargetStagedReadiness(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -412,6 +423,10 @@ const (
 	// data promotion chunk. Every target voter atomically copies staged MVCC
 	// versions into the live keyspace and removes the promoted staged rows.
 	raftEncodeMigrationPromote byte = 0x0b
+	// raftEncodeTargetReadiness carries the target-local staged-readiness
+	// guard. It must be replicated through the target Raft group before the
+	// migration controller can treat a target as fail-closed for cutover.
+	raftEncodeTargetReadiness byte = 0x0c
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
@@ -550,7 +565,10 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 			return err
 		}
 	}
-	if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+	if err := f.verifyTargetReadinessForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+		return err
+	}
+	if err := f.verifyRouteWriteFloorForKey(mut.Key, commitTS); err != nil {
 		return err
 	}
 	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
@@ -576,13 +594,54 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
 		return err
 	}
-	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
+	if err := f.verifyTargetReadinessForPrefix(ctx, prefix); err != nil {
+		return err
+	}
+	if err := f.verifyRouteWriteFloorForPrefix(prefix, commitTS); err != nil {
+		return err
+	}
+	routes := f.stagedVisibilityRoutesForPrefix(prefix)
+	deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+		return f.store.DeletePrefixAtRaftAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS, 0)
+	}
+	if err := deleteStagedVisibilityPrefixes(routes, prefix, txnCommonPrefix, deleteStagedPrefix); err != nil {
 		return err
 	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
+	return nil
+}
+
+func (f *kvFSM) stagedVisibilityRoutesForPrefix(prefix []byte) []distribution.Route {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	routes := snap.IntersectingRoutes(start, end)
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.GroupID == f.shardGroupID && routeHasStagedVisibility(route) {
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -619,44 +678,183 @@ func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
 	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
 }
 
-func (f *kvFSM) verifyRouteWriteTimestampFloorForKey(key []byte, commitTS uint64) error {
-	if f.routes == nil || commitTS == 0 {
+func (f *kvFSM) verifyRouteWriteFloorForMutations(muts []*pb.Mutation, commitTS uint64) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := f.verifyRouteWriteFloorForKey(mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForMutations(ctx context.Context, muts []*pb.Mutation) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := f.verifyTargetReadinessForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForReadKeys(ctx context.Context, keys [][]byte) error {
+	for _, key := range keys {
+		if isTxnInternalKey(key) {
+			continue
+		}
+		if err := f.verifyTargetReadinessForRange(ctx, key, nextScanCursor(key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyTargetReadinessForTxnFootprint(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, primaryKey []byte) error {
+	if len(primaryKey) != 0 && !isTxnInternalKey(primaryKey) {
+		if err := f.verifyTargetReadinessForRange(ctx, primaryKey, nextScanCursor(primaryKey)); err != nil {
+			return err
+		}
+	}
+	if err := f.verifyTargetReadinessForReadKeys(ctx, readKeys); err != nil {
+		return err
+	}
+	return f.verifyTargetReadinessForMutations(ctx, muts)
+}
+
+func (f *kvFSM) verifyTargetReadinessForPrefix(ctx context.Context, prefix []byte) error {
+	start, end := routePrefixRange(prefix)
+	return f.verifyTargetReadinessForRouteRange(ctx, start, end)
+}
+
+func (f *kvFSM) verifyTargetReadinessForRange(ctx context.Context, start []byte, end []byte) error {
+	routeStart, routeEnd := readinessRouteRange(start, end)
+	return f.verifyTargetReadinessForRouteRange(ctx, routeStart, routeEnd)
+}
+
+func (f *kvFSM) verifyTargetReadinessForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) error {
+	_, err := f.targetReadyRoutesForRouteRange(ctx, routeStart, routeEnd)
+	return err
+}
+
+func (f *kvFSM) targetReadyRoutesForRange(ctx context.Context, start []byte, end []byte) ([]distribution.Route, error) {
+	routeStart, routeEnd := readinessRouteRange(start, end)
+	return f.targetReadyRoutesForRouteRange(ctx, routeStart, routeEnd)
+}
+
+func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
+	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(routeStart, routeEnd)
+
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return routes, nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if len(states) == 0 {
+		return routes, nil
+	}
+	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, f.shardGroupID, catalogVersion, proof) {
+		return routes, nil
+	}
+	return nil, errors.WithStack(ErrRouteCutoverPending)
+}
+
+func (f *kvFSM) currentShardRoutesForRouteRange(routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	if f.routes == nil {
+		return nil, 0, false
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil, 0, false
+	}
+	routes := make([]distribution.Route, 0)
+	for _, route := range snap.IntersectingRoutes(routeStart, routeEnd) {
+		if route.GroupID == f.shardGroupID {
+			routes = append(routes, route)
+		}
+	}
+	return routes, snap.Version(), true
+}
+
+func targetReadinessStatesSatisfied(
+	states []store.TargetStagedReadinessState,
+	routes []distribution.Route,
+	routeStart []byte,
+	routeEnd []byte,
+	groupID uint64,
+	catalogVersion uint64,
+	proof bool,
+) bool {
+	for _, ready := range states {
+		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+			continue
+		}
+		if !proof || !routesSatisfyTargetReadiness(routes, ready, groupID, catalogVersion) {
+			return false
+		}
+	}
+	return true
+}
+
+func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.TargetStagedReadinessState, groupID uint64, catalogVersion uint64) bool {
+	matched := false
+	for _, route := range routes {
+		if route.GroupID != groupID {
+			continue
+		}
+		if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+			continue
+		}
+		matched = true
+		if !routeSatisfiesTargetReadiness(route, ready, catalogVersion) {
+			return false
+		}
+	}
+	return matched
+}
+
+func (f *kvFSM) verifyRouteWriteFloorForKey(key []byte, commitTS uint64) error {
+	if f.routes == nil {
 		return nil
 	}
 	snap, ok := f.routes.Current()
 	if !ok {
 		return nil
 	}
-	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
-		for _, route := range snap.IntersectingRoutes(start, end) {
-			if err := verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS); err != nil {
-				return err
-			}
-		}
+	rkey := routeKey(key)
+	floor, ok := snap.WriteFloorForKey(rkey)
+	if ok && commitTS != 0 && commitTS <= floor {
+		return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q routeKey %q", commitTS, floor, key, rkey)
+	}
+	if err := f.verifyS3BucketAuxiliaryRouteWriteFloor(snap, key, commitTS); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyS3BucketAuxiliaryRouteWriteFloor(snap RouteSnapshot, key []byte, commitTS uint64) error {
+	if commitTS == 0 {
 		return nil
 	}
-	rkey := routeKey(key)
-	if route, ok := snap.RouteOf(rkey); ok {
-		if err := verifyRouteWriteTimestampFloorForRoute(route, key, commitTS); err != nil {
-			return err
-		}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
 	}
-	return nil
+	floor, ok := snap.WriteFloorIntersects(start, end)
+	if !ok || commitTS > floor {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q route range [%q,%q)", commitTS, floor, key, start, end)
 }
 
-func (f *kvFSM) verifyRouteWriteTimestampFloorsForMutations(muts []*pb.Mutation, commitTS uint64) error {
-	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
-			continue
-		}
-		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (f *kvFSM) verifyRouteWriteTimestampFloorForPrefix(prefix []byte, commitTS uint64) error {
+func (f *kvFSM) verifyRouteWriteFloorForPrefix(prefix []byte, commitTS uint64) error {
 	if f.routes == nil || commitTS == 0 {
 		return nil
 	}
@@ -665,26 +863,11 @@ func (f *kvFSM) verifyRouteWriteTimestampFloorForPrefix(prefix []byte, commitTS 
 		return nil
 	}
 	start, end := routePrefixRange(prefix)
-	for _, route := range snap.IntersectingRoutes(start, end) {
-		if err := verifyRouteWriteTimestampFloorForRange(route, prefix, start, end, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func verifyRouteWriteTimestampFloorForRoute(route distribution.Route, key []byte, commitTS uint64) error {
-	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+	floor, ok := snap.WriteFloorIntersects(start, end)
+	if !ok || commitTS > floor {
 		return nil
 	}
-	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, routeKey(key), commitTS, route.MinWriteTSExclusive)
-}
-
-func verifyRouteWriteTimestampFloorForRange(route distribution.Route, key, start, end []byte, commitTS uint64) error {
-	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-		return nil
-	}
-	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
+	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for prefix %q route range [%q,%q)", commitTS, floor, prefix, start, end)
 }
 
 func routePrefixRange(prefix []byte) ([]byte, []byte) {
@@ -1133,13 +1316,71 @@ func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, star
 		}
 		seen[keyStr] = struct{}{}
 
-		latest, exists, err := f.store.LatestCommitTS(ctx, mut.Key)
+		latest, exists, err := f.latestCommitTSForTargetReadyKey(ctx, mut.Key)
 		if err != nil {
 			return errors.WithStack(err)
 		}
 		if exists && latest > startTS {
 			return errors.WithStack(store.NewWriteConflictError(mut.Key))
 		}
+	}
+	return nil
+}
+
+func (f *kvFSM) validateReadConflicts(ctx context.Context, keys [][]byte, startTS uint64) error {
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 || isTxnInternalKey(key) {
+			continue
+		}
+		keyStr := string(key)
+		if _, ok := seen[keyStr]; ok {
+			continue
+		}
+		seen[keyStr] = struct{}{}
+
+		latest, exists, err := f.latestCommitTSForTargetReadyKey(ctx, key)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if exists && latest > startTS {
+			return errors.WithStack(store.NewWriteConflictError(key))
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) latestCommitTSForTargetReadyKey(ctx context.Context, key []byte) (uint64, bool, error) {
+	routes, err := f.targetReadyRoutesForRange(ctx, key, nextScanCursor(key))
+	if err != nil {
+		return 0, false, err
+	}
+	liveTS, liveExists, err := f.store.LatestCommitTS(ctx, key)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	latest, exists := liveTS, liveExists
+	for _, route := range routes {
+		if !routeHasStagedVisibility(route) {
+			continue
+		}
+		stagedTS, stagedExists, err := f.store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+		if err != nil {
+			return 0, false, errors.WithStack(err)
+		}
+		if stagedExists && (!exists || stagedTS > latest) {
+			latest, exists = stagedTS, true
+		}
+	}
+	return latest, exists, nil
+}
+
+func (f *kvFSM) validateTxnConflicts(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, startTS uint64) error {
+	if err := f.validateConflicts(ctx, muts, startTS); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := f.validateReadConflicts(ctx, readKeys, startTS); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
@@ -1185,12 +1426,19 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := f.uniqueMutationsAboveFloor(muts, startTS)
+	floorTS := startTS
+	if meta.CommitTS != 0 {
+		floorTS = meta.CommitTS
+	}
+	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, nil); err != nil {
+		return err
+	}
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, floorTS)
 	if err != nil {
 		return err
 	}
-	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
-		return errors.WithStack(err)
+	if err := f.validateTxnConflicts(ctx, uniq, r.ReadKeys, startTS); err != nil {
+		return err
 	}
 
 	expireAt := txnLockExpireAt(meta.LockTTLms)
@@ -1247,7 +1495,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// applying this log entry. The retention-window > max-retry-latency
 	// invariant prevents the rare case where a real never-landed retry
 	// arrives with PrevCommitTS below pebble's compacted floor.
-	dedup, err := f.dedupProbeOnePhase(ctx, meta)
+	dedup, err := f.dedupProbeOnePhase(ctx, meta, muts, r.ReadKeys)
 	if err != nil {
 		return err
 	}
@@ -1255,12 +1503,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsAboveFloor(muts, commitTS)
-	if err != nil {
-		return err
-	}
-
-	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
+	uniq, storeMuts, err := f.onePhaseStoreMutations(ctx, muts, r.ReadKeys, startTS, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1271,45 +1514,57 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	return nil
 }
 
-func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
+func (f *kvFSM) onePhaseStoreMutations(
+	ctx context.Context,
+	muts []*pb.Mutation,
+	readKeys [][]byte,
+	startTS uint64,
+	commitTS uint64,
+) ([]*pb.Mutation, []*store.KVPairMutation, error) {
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, commitTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := f.validateTxnConflicts(ctx, uniq, readKeys, startTS); err != nil {
+		return nil, nil, err
+	}
+	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
+	if err != nil {
+		return nil, nil, err
+	}
+	return uniq, storeMuts, nil
+}
+
+func (f *kvFSM) uniqueMutationsNotFenced(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return nil, err
 	}
-	return uniq, nil
-}
-
-func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
-	uniq, err := uniqueMutations(muts)
-	if err != nil {
+	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
 		return nil, err
 	}
-	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
+	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
 		return nil, err
 	}
-	return uniq, nil
-}
-
-func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
-	uniq, err := uniqueTxnMutations(muts)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
+	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
 		return nil, err
 	}
 	return uniq, nil
 }
 
-// dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
-// because the entry is a retry whose prior attempt already landed. Extracted
-// to keep handleOnePhaseTxnRequest under the cyclop budget; the determinism
-// rationale lives at the call site.
+// dedupProbeOnePhase first fail-closes the target readiness footprint, then
+// decides whether handleOnePhaseTxnRequest should no-op because the entry is a
+// retry whose prior attempt already landed. Extracted to keep
+// handleOnePhaseTxnRequest under the cyclop budget; the determinism rationale
+// lives at the call site.
 //
 // Returns (true, nil) → the entry must no-op (prior attempt landed).
 // Returns (false, nil) → fall through to normal apply.
 // Returns (false, err) → propagate err; apply must not proceed.
-func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, error) {
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, muts []*pb.Mutation, readKeys [][]byte) (bool, error) {
+	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, readKeys, meta.PrimaryKey); err != nil {
+		return false, err
+	}
 	if meta.PrevCommitTS == 0 {
 		return false, nil
 	}
@@ -1386,7 +1641,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	uniq, err := f.uniqueTxnMutationsAboveFloor(muts, commitTS)
+	uniq, err := f.uniqueMutationsAboveWriteFloor(ctx, muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1503,7 +1758,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	// shouldClearAbortKey (lock-missing ⇒ nothing to do) and for the
 	// rollback-marker Put in appendRollbackRecord.
 
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueAbortCleanupMutations(ctx, muts)
 	if err != nil {
 		return err
 	}
@@ -1521,6 +1776,24 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 		return nil
 	}
 	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, startTS, abortTS, f.pendingApplyIdx))
+}
+
+func (f *kvFSM) uniqueMutationsAboveWriteFloor(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
+		return nil, err
+	}
+	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueAbortCleanupMutations(_ context.Context, muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	return uniqueMutations(muts)
 }
 
 func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

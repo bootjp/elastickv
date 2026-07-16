@@ -322,8 +322,8 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, []byte("b"), prepareMeta2.PrimaryKey)
 	require.Equal(t, defaultTxnLockTTLms, prepareMeta1.LockTTLms)
 	require.Equal(t, defaultTxnLockTTLms, prepareMeta2.LockTTLms)
-	require.Zero(t, prepareMeta1.CommitTS)
-	require.Zero(t, prepareMeta2.CommitTS)
+	require.Greater(t, prepareMeta1.CommitTS, startTS)
+	require.Equal(t, prepareMeta1.CommitTS, prepareMeta2.CommitTS)
 
 	require.Equal(t, pb.Phase_COMMIT, g1Commit.Phase)
 	require.Equal(t, pb.Phase_COMMIT, g2Commit.Phase)
@@ -342,7 +342,7 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Equal(t, []byte("b"), commitMeta2.PrimaryKey)
 	require.Zero(t, commitMeta1.LockTTLms)
 	require.Zero(t, commitMeta2.LockTTLms)
-	require.Greater(t, commitMeta1.CommitTS, startTS)
+	require.Equal(t, prepareMeta1.CommitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
 }
 
@@ -422,6 +422,10 @@ func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitMeta2 := requestTxnMeta(t, g2Txn.requests[1])
 	require.Equal(t, commitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitTS, commitMeta2.CommitTS)
+	prepareMeta1 := requestTxnMeta(t, g1Txn.requests[0])
+	prepareMeta2 := requestTxnMeta(t, g2Txn.requests[0])
+	require.Equal(t, commitTS, prepareMeta1.CommitTS)
+	require.Equal(t, commitTS, prepareMeta2.CommitTS)
 }
 
 func TestShardedCoordinatorDispatchTxn_RejectsMigrationTimestampFloor(t *testing.T) {
@@ -605,6 +609,7 @@ func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToStagedOwner(t *testing.
 type stubMVCCStore struct {
 	store.MVCCStore
 	latestTS  map[string]uint64
+	readiness []store.TargetStagedReadinessState
 	returnErr error
 }
 
@@ -614,6 +619,10 @@ func (s *stubMVCCStore) LatestCommitTS(_ context.Context, key []byte) (uint64, b
 	}
 	ts, ok := s.latestTS[string(key)]
 	return ts, ok, nil
+}
+
+func (s *stubMVCCStore) MigrationTargetReadinessStates(_ context.Context) ([]store.TargetStagedReadinessState, error) {
+	return s.readiness, nil
 }
 
 // noopEngine satisfies raftengine.Engine for unit tests.
@@ -700,6 +709,111 @@ func TestValidateReadOnlyShards_NoConflictWhenKeyUnchanged(t *testing.T) {
 	}
 	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
 	require.NoError(t, err)
+}
+
+func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID: 1,
+				Start:   []byte("a"),
+				End:     []byte("m"),
+				GroupID: 1,
+				State:   distribution.RouteStateActive,
+			},
+			{
+				RouteID: 2,
+				Start:   []byte("m"),
+				End:     nil,
+				GroupID: 2,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+
+	readOnlyStore := &stubMVCCStore{
+		latestTS: map[string]uint64{
+			"x": 5,
+		},
+		readiness: []store.TargetStagedReadinessState{
+			{
+				JobID:                  7,
+				RouteStart:             []byte("m"),
+				RouteEnd:               nil,
+				ExpectedCutoverVersion: 2,
+				MigrationJobID:         7,
+				MinWriteTSExclusive:    100,
+				Armed:                  true,
+			},
+		},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID: 1,
+				Start:   []byte("a"),
+				End:     []byte("m"),
+				GroupID: 1,
+				State:   distribution.RouteStateActive,
+			},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    []byte("z"),
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         7,
+			},
+		},
+	}))
+
+	readOnlyStore := &stubMVCCStore{
+		latestTS: map[string]uint64{
+			"x": 5,
+			string(distribution.MigrationStagedDataKey(7, []byte("x"))): 20,
+		},
+		readiness: []store.TargetStagedReadinessState{
+			{
+				JobID:                  7,
+				RouteStart:             []byte("m"),
+				RouteEnd:               []byte("z"),
+				ExpectedCutoverVersion: 2,
+				MigrationJobID:         7,
+				Armed:                  true,
+			},
+		},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	groupedReadKeys := map[uint64][][]byte{
+		2: {[]byte("x")},
+	}
+	err := coord.validateReadOnlyShards(context.Background(), groupedReadKeys, []uint64{1}, 10)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
 }
 
 func TestValidateReadOnlyShards_PropagatesStoreError(t *testing.T) {

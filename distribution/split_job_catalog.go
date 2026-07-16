@@ -36,6 +36,7 @@ var (
 	ErrCatalogSplitJobConflict            = errors.New("catalog split job conflict")
 	ErrCatalogSplitJobTerminalRequired    = errors.New("catalog split job terminal state is required")
 	ErrSplitJobOverlap                    = errors.New("split job overlaps requested route")
+	ErrTooManyInFlightSplitJobs           = errors.New("too many in-flight split jobs")
 )
 
 // SplitJobPhase is the durable phase of a split migration job.
@@ -906,6 +907,11 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
 	}
+}
+
+// SplitJobToProto converts a catalog SplitJob into its wire representation.
+func SplitJobToProto(job SplitJob) *pb.SplitJob {
+	return splitJobToProto(job)
 }
 
 func splitJobToProto(job SplitJob) *pb.SplitJob {

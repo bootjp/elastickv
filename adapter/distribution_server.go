@@ -3,11 +3,15 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"math"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -18,13 +22,16 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
-	mu          sync.Mutex
-	engine      *distribution.Engine
-	catalog     *distribution.CatalogStore
-	coordinator kv.Coordinator
-	readTracker *kv.ActiveTimestampTracker
-	readBlocked func() bool
-	reloadRetry struct {
+	mu                      sync.Mutex
+	engine                  *distribution.Engine
+	catalog                 *distribution.CatalogStore
+	coordinator             kv.Coordinator
+	readTracker             *kv.ActiveTimestampTracker
+	readBlocked             func() bool
+	migrationCapabilityGate SplitMigrationCapabilityGate
+	splitJobRunnerReady     bool
+	knownRaftGroups         map[uint64]struct{}
+	reloadRetry             struct {
 		attempts int
 		interval time.Duration
 	}
@@ -33,6 +40,10 @@ type DistributionServer struct {
 
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
+
+// SplitMigrationCapabilityGate reports whether this node can safely create
+// migration-only side effects. A nil gate keeps StartSplitMigration fail-closed.
+type SplitMigrationCapabilityGate func(context.Context) error
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -54,6 +65,35 @@ func WithDistributionReadGate(blocked func() bool) DistributionServerOption {
 	}
 }
 
+func WithSplitMigrationCapabilityGate(gate SplitMigrationCapabilityGate) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.migrationCapabilityGate = gate
+	}
+}
+
+// WithSplitJobRunnerReady opens the split migration capability probe once this
+// node can advance planned split jobs.
+func WithSplitJobRunnerReady() DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitJobRunnerReady = true
+	}
+}
+
+// WithDistributionKnownRaftGroups configures the Raft group IDs this node can
+// route migration work to.
+func WithDistributionKnownRaftGroups(groupIDs ...uint64) DistributionServerOption {
+	return func(s *DistributionServer) {
+		groups := make(map[uint64]struct{}, len(groupIDs))
+		for _, groupID := range groupIDs {
+			if groupID == 0 {
+				continue
+			}
+			groups[groupID] = struct{}{}
+		}
+		s.knownRaftGroups = groups
+	}
+}
+
 // WithCatalogReloadRetryPolicy configures the retry policy used after split
 // commit when waiting for the local catalog snapshot to become visible.
 func WithCatalogReloadRetryPolicy(attempts int, interval time.Duration) DistributionServerOption {
@@ -68,8 +108,15 @@ func WithCatalogReloadRetryPolicy(attempts int, interval time.Duration) Distribu
 }
 
 const (
-	childRouteCount      = 2
-	splitMutationOpCount = childRouteCount + 3
+	childRouteCount                = 2
+	splitMutationOpCount           = childRouteCount + 3
+	listSplitJobsDefaultPageSize   = 200
+	splitJobListCursorVersion      = byte(1)
+	splitJobListCursorTerminalOff  = 1
+	splitJobListCursorJobIDOff     = splitJobListCursorTerminalOff + 8
+	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
+	SplitMigrationCapabilityV2     = "cap_migration_v2"
+	splitMigrationCapabilityV2     = SplitMigrationCapabilityV2
 )
 
 var (
@@ -86,6 +133,10 @@ var (
 	errDistributionCoordinatorRequired    = errors.New("distribution coordinator is not configured")
 	errDistributionEngineNotConfigured    = errors.New("distribution engine is not configured")
 	errDistributionCatalogVersionNotFound = errors.New("route catalog version not found")
+	errDistributionClusterNotReady        = errors.New("cluster is not ready for split migration")
+	errDistributionRaftGroupsNotKnown     = errors.New("distribution raft groups are not configured")
+	errDistributionUnknownTargetGroup     = errors.New("unknown target group")
+	errDistributionSourceRouteNotActive   = errors.New("source route is not active")
 )
 
 // NewDistributionServer creates a new server.
@@ -206,6 +257,201 @@ func (s *DistributionServer) GetIntersectingRoutes(ctx context.Context, req *pb.
 	}, nil
 }
 
+func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.StartSplitMigrationRequest) (*pb.StartSplitMigrationResponse, error) {
+	if err := s.verifyStartSplitMigrationPreflight(ctx, req); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.verifyStartSplitMigrationCatalogReady(ctx); err != nil {
+		return nil, err
+	}
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseReadPin(s.pinReadTS(snapshot.ReadTS))
+
+	parent, err := s.startSplitMigrationParent(ctx, snapshot, req)
+	if err != nil {
+		return nil, err
+	}
+	job, err := s.newSplitMigrationJob(ctx, snapshot, parent, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.createSplitJobViaCoordinator(ctx, snapshot.ReadTS, job); err != nil {
+		return nil, err
+	}
+	return &pb.StartSplitMigrationResponse{
+		CatalogVersion: snapshot.Version,
+		JobId:          job.JobID,
+	}, nil
+}
+
+func (s *DistributionServer) GetSplitMigrationCapability(context.Context, *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
+	if !s.splitJobRunnerReady {
+		return &pb.GetSplitMigrationCapabilityResponse{}, nil
+	}
+	return &pb.GetSplitMigrationCapabilityResponse{
+		MigrationCapable: true,
+		Capabilities:     []string{splitMigrationCapabilityV2},
+	}, nil
+}
+
+func (s *DistributionServer) verifyStartSplitMigrationPreflight(ctx context.Context, req *pb.StartSplitMigrationRequest) error {
+	if req.GetTargetGroupId() == 0 {
+		return grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobTargetGroupRequired.Error())
+	}
+	if err := s.verifyStartSplitMigrationCatalogReady(ctx); err != nil {
+		return err
+	}
+	return s.verifySplitMigrationCapability(ctx)
+}
+
+func (s *DistributionServer) verifyStartSplitMigrationCatalogReady(ctx context.Context) error {
+	if err := s.verifyCatalogLeader(ctx); err != nil {
+		return err
+	}
+	if s.catalog == nil {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	return nil
+}
+
+func (s *DistributionServer) startSplitMigrationParent(
+	ctx context.Context,
+	snapshot distribution.CatalogSnapshot,
+	req *pb.StartSplitMigrationRequest,
+) (distribution.RouteDescriptor, error) {
+	if err := validateExpectedCatalogVersion(snapshot.Version, req.GetExpectedCatalogVersion()); err != nil {
+		return distribution.RouteDescriptor{}, err
+	}
+	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
+	if !found {
+		return distribution.RouteDescriptor{}, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
+	}
+	if parent.State != distribution.RouteStateActive {
+		return distribution.RouteDescriptor{}, grpcStatusError(codes.FailedPrecondition, errDistributionSourceRouteNotActive.Error())
+	}
+	splitKey := distribution.CloneBytes(req.GetSplitKey())
+	if err := validateSplitKey(parent, splitKey); err != nil {
+		return distribution.RouteDescriptor{}, err
+	}
+	if err := distribution.ValidateMigrationRouteRange(splitKey, parent.End); err != nil {
+		return distribution.RouteDescriptor{}, splitMigrationRangeStatusError(err)
+	}
+	if parent.GroupID == req.GetTargetGroupId() {
+		return distribution.RouteDescriptor{}, grpcStatusError(codes.InvalidArgument, "target group must differ from source route group")
+	}
+	if err := s.verifyKnownTargetGroup(req.GetTargetGroupId()); err != nil {
+		return distribution.RouteDescriptor{}, err
+	}
+	if err := s.rejectLiveSplitJob(ctx, snapshot, parent); err != nil {
+		return distribution.RouteDescriptor{}, err
+	}
+	return parent, nil
+}
+
+func (s *DistributionServer) newSplitMigrationJob(
+	ctx context.Context,
+	snapshot distribution.CatalogSnapshot,
+	parent distribution.RouteDescriptor,
+	req *pb.StartSplitMigrationRequest,
+) (distribution.SplitJob, error) {
+	jobID, err := s.catalog.NextSplitJobIDAt(ctx, snapshot.ReadTS)
+	if err != nil {
+		return distribution.SplitJob{}, splitJobCatalogStatusError(err)
+	}
+	job, err := distribution.InitializeSplitJobPlan(distribution.SplitJob{
+		JobID:         jobID,
+		SourceRouteID: parent.RouteID,
+		SplitKey:      distribution.CloneBytes(req.GetSplitKey()),
+		TargetGroupID: req.GetTargetGroupId(),
+	}, parent, time.Now().UnixMilli())
+	if err != nil {
+		return distribution.SplitJob{}, splitJobCatalogStatusError(err)
+	}
+	return job, nil
+}
+
+func (s *DistributionServer) GetSplitJob(ctx context.Context, req *pb.GetSplitJobRequest) (*pb.GetSplitJobResponse, error) {
+	if req.GetJobId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobIDRequired.Error())
+	}
+	if s.catalog == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	job, found, err := s.catalog.SplitJob(ctx, req.GetJobId())
+	if err != nil {
+		return nil, splitJobCatalogStatusError(err)
+	}
+	if !found {
+		return nil, grpcStatusError(codes.NotFound, distribution.ErrCatalogSplitJobNotFound.Error())
+	}
+	return &pb.GetSplitJobResponse{Job: distribution.SplitJobToProto(job)}, nil
+}
+
+func (s *DistributionServer) ListSplitJobs(ctx context.Context, req *pb.ListSplitJobsRequest) (*pb.ListSplitJobsResponse, error) {
+	if s.catalog == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	if req == nil {
+		req = &pb.ListSplitJobsRequest{}
+	}
+	phaseFilter := normalizeSplitJobPhaseFilter(req.GetPhase())
+	if phaseFilter != "" && !validSplitJobPhaseFilter(phaseFilter) {
+		return nil, grpcStatusErrorf(codes.InvalidArgument, "unknown split job phase %q", req.GetPhase())
+	}
+	jobs, err := s.catalog.ListSplitJobs(ctx)
+	if err != nil {
+		return nil, splitJobCatalogStatusError(err)
+	}
+	resp, err := splitJobListPage(jobs, req, phaseFilter)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *DistributionServer) AbandonSplitJob(ctx context.Context, req *pb.AbandonSplitJobRequest) (*pb.AbandonSplitJobResponse, error) {
+	if req.GetJobId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobIDRequired.Error())
+	}
+	if err := s.verifyCatalogLeader(ctx); err != nil {
+		return nil, err
+	}
+	if s.catalog == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	if err := s.updateSplitJobViaCoordinator(ctx, req.GetJobId(), func(job distribution.SplitJob) (distribution.SplitJob, error) {
+		return distribution.BeginSplitJobAbandon(job, time.Now().UnixMilli())
+	}); err != nil {
+		return nil, err
+	}
+	return &pb.AbandonSplitJobResponse{}, nil
+}
+
+func (s *DistributionServer) RetrySplitJob(ctx context.Context, req *pb.RetrySplitJobRequest) (*pb.RetrySplitJobResponse, error) {
+	if req.GetJobId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobIDRequired.Error())
+	}
+	if err := s.verifyCatalogLeader(ctx); err != nil {
+		return nil, err
+	}
+	if s.catalog == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	if err := s.updateSplitJobViaCoordinator(ctx, req.GetJobId(), func(job distribution.SplitJob) (distribution.SplitJob, error) {
+		return distribution.RetrySplitJobState(job, time.Now().UnixMilli())
+	}); err != nil {
+		return nil, err
+	}
+	return &pb.RetrySplitJobResponse{}, nil
+}
+
 func (s *DistributionServer) routeSnapshotAt(version uint64) (distribution.RouteHistorySnapshot, error) {
 	if s.engine == nil {
 		return distribution.RouteHistorySnapshot{}, grpcStatusError(codes.FailedPrecondition, errDistributionEngineNotConfigured.Error())
@@ -232,13 +478,12 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
-	readPin := s.pinReadTS(snapshot.ReadTS)
-	defer readPin.Release()
+	defer releaseReadPin(s.pinReadTS(snapshot.ReadTS))
 	if err := validateExpectedCatalogVersion(snapshot.Version, req.GetExpectedCatalogVersion()); err != nil {
 		return nil, err
 	}
 
-	parent, _, found := findRouteByID(snapshot.Routes, req.GetRouteId())
+	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
 	if !found {
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
@@ -275,9 +520,16 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 
 func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	if s == nil || s.readTracker == nil {
-		return nil
+		return &kv.ActiveTimestampToken{}
 	}
 	return s.readTracker.Pin(ts)
+}
+
+func releaseReadPin(token *kv.ActiveTimestampToken) {
+	if token == nil {
+		return
+	}
+	token.Release()
 }
 
 func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
@@ -442,6 +694,99 @@ func (s *DistributionServer) applyEngineSnapshot(snapshot distribution.CatalogSn
 	return nil
 }
 
+func (s *DistributionServer) updateSplitJobViaCoordinator(
+	ctx context.Context,
+	jobID uint64,
+	transition func(distribution.SplitJob) (distribution.SplitJob, error),
+) error {
+	expected, readTS, err := s.catalog.LiveSplitJobForUpdate(ctx, jobID)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	next, err := transition(expected)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	if distribution.SplitJobsEquivalent(expected, next) {
+		return nil
+	}
+	encoded, err := distribution.EncodeSplitJob(next)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	key := distribution.CatalogSplitJobKey(jobID)
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems: []*kv.Elem[kv.OP]{{
+			Op:    kv.Put,
+			Key:   key,
+			Value: encoded,
+		}},
+		IsTxn:    true,
+		StartTS:  readTS,
+		ReadKeys: [][]byte{key},
+	}); err != nil {
+		return splitJobCoordinatorStatusError(err)
+	}
+	return nil
+}
+
+func (s *DistributionServer) verifyKnownTargetGroup(groupID uint64) error {
+	if len(s.knownRaftGroups) == 0 {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionRaftGroupsNotKnown.Error())
+	}
+	if _, ok := s.knownRaftGroups[groupID]; !ok {
+		return grpcStatusError(codes.InvalidArgument, errDistributionUnknownTargetGroup.Error())
+	}
+	return nil
+}
+
+func (s *DistributionServer) createSplitJobViaCoordinator(ctx context.Context, readTS uint64, job distribution.SplitJob) error {
+	if job.JobID == math.MaxUint64 {
+		return splitJobCatalogStatusError(distribution.ErrCatalogSplitJobIDOverflow)
+	}
+	encoded, err := distribution.EncodeSplitJob(job)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	jobKey := distribution.CatalogSplitJobKey(job.JobID)
+	nextIDKey := distribution.CatalogNextSplitJobIDKey()
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems: []*kv.Elem[kv.OP]{
+			{
+				Op:    kv.Put,
+				Key:   jobKey,
+				Value: encoded,
+			},
+			{
+				Op:    kv.Put,
+				Key:   nextIDKey,
+				Value: distribution.EncodeCatalogNextSplitJobID(job.JobID + 1),
+			},
+		},
+		IsTxn:   true,
+		StartTS: readTS,
+		ReadKeys: [][]byte{
+			jobKey,
+			nextIDKey,
+			distribution.CatalogVersionKey(),
+			distribution.CatalogRouteKey(job.SourceRouteID),
+		},
+	}); err != nil {
+		return splitJobCoordinatorStatusError(err)
+	}
+	return nil
+}
+
+func (s *DistributionServer) verifySplitMigrationCapability(ctx context.Context) error {
+	if s.migrationCapabilityGate == nil {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionClusterNotReady.Error())
+	}
+	if err := s.migrationCapabilityGate(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateExpectedCatalogVersion(currentVersion, expectedVersion uint64) error {
 	if currentVersion != expectedVersion {
 		return grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
@@ -501,6 +846,29 @@ func splitJobReadFenceKeys(jobs []distribution.SplitJob) [][]byte {
 	return readKeys
 }
 
+func (s *DistributionServer) rejectLiveSplitJob(ctx context.Context, snapshot distribution.CatalogSnapshot, parent distribution.RouteDescriptor) error {
+	jobs, err := s.catalog.ListSplitJobsAt(ctx, snapshot.ReadTS)
+	if err != nil {
+		return grpcStatusErrorf(codes.Internal, "load split jobs: %v", err)
+	}
+	liveJobs := 0
+	for _, job := range jobs {
+		if !splitJobIsLive(job) {
+			continue
+		}
+		liveJobs++
+		for _, interval := range liveSplitJobIntervals(job, snapshot.Routes) {
+			if routeRangeIntersects(parent.Start, parent.End, interval.start, interval.end) {
+				return grpcStatusError(codes.Aborted, distribution.ErrSplitJobOverlap.Error())
+			}
+		}
+	}
+	if liveJobs > 0 {
+		return grpcStatusError(codes.ResourceExhausted, distribution.ErrTooManyInFlightSplitJobs.Error())
+	}
+	return nil
+}
+
 func splitJobIsLive(job distribution.SplitJob) bool {
 	return job.Phase != distribution.SplitJobPhaseDone && job.Phase != distribution.SplitJobPhaseAbandoned
 }
@@ -544,6 +912,201 @@ func routeRangeIntersects(aStart, aEnd, bStart, bEnd []byte) bool {
 		return false
 	}
 	return true
+}
+
+func splitJobPassesListFilter(job distribution.SplitJob, sinceTerminalAtMs uint64, phaseFilter string) bool {
+	if sinceTerminalAtMs > 0 && job.TerminalAtMs > 0 && uint64(job.TerminalAtMs) < sinceTerminalAtMs {
+		return false
+	}
+	if phaseFilter == "" {
+		return true
+	}
+	return normalizeSplitJobPhaseFilter(pb.SplitJobPhase(job.Phase).String()) == phaseFilter ||
+		normalizeSplitJobPhaseFilter(strings.TrimPrefix(pb.SplitJobPhase(job.Phase).String(), "SPLIT_JOB_PHASE_")) == phaseFilter
+}
+
+func normalizeSplitJobPhaseFilter(phase string) string {
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		return ""
+	}
+	phase = strings.ReplaceAll(phase, "-", "_")
+	phase = strings.ReplaceAll(phase, " ", "_")
+	return strings.ToUpper(phase)
+}
+
+func validSplitJobPhaseFilter(phase string) bool {
+	for _, candidate := range pb.SplitJobPhase_name {
+		full := normalizeSplitJobPhaseFilter(candidate)
+		short := normalizeSplitJobPhaseFilter(strings.TrimPrefix(candidate, "SPLIT_JOB_PHASE_"))
+		if phase == full || phase == short {
+			return true
+		}
+	}
+	return false
+}
+
+func splitJobCatalogStatusError(err error) error {
+	switch {
+	case errors.Is(err, distribution.ErrCatalogSplitJobIDRequired):
+		return grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobIDRequired.Error())
+	case errors.Is(err, distribution.ErrCatalogSplitJobNotFound):
+		return grpcStatusError(codes.NotFound, distribution.ErrCatalogSplitJobNotFound.Error())
+	case errors.Is(err, distribution.ErrCatalogSplitJobCannotRetry),
+		errors.Is(err, distribution.ErrCatalogSplitJobCannotAbandon):
+		return grpcStatusError(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, distribution.ErrCatalogSplitJobConflict):
+		return grpcStatusError(codes.Aborted, distribution.ErrCatalogSplitJobConflict.Error())
+	default:
+		return grpcStatusErrorf(codes.Internal, "split job catalog: %v", err)
+	}
+}
+
+func splitMigrationRangeStatusError(err error) error {
+	switch {
+	case errors.Is(err, distribution.ErrMigrationReservedRange),
+		errors.Is(err, distribution.ErrMigrationInvalidRoute):
+		return grpcStatusError(codes.InvalidArgument, err.Error())
+	default:
+		return grpcStatusErrorf(codes.Internal, "validate split migration range: %v", err)
+	}
+}
+
+func splitJobCoordinatorStatusError(err error) error {
+	switch {
+	case errors.Is(err, store.ErrWriteConflict):
+		return grpcStatusError(codes.Aborted, distribution.ErrCatalogSplitJobConflict.Error())
+	case splitJobCoordinatorLeadershipError(err):
+		return grpcStatusError(codes.FailedPrecondition, errDistributionNotLeader.Error())
+	default:
+		return grpcStatusErrorf(codes.Internal, "commit split job mutation: %v", err)
+	}
+}
+
+func splitJobListPage(jobs []distribution.SplitJob, req *pb.ListSplitJobsRequest, phaseFilter string) (*pb.ListSplitJobsResponse, error) {
+	filtered := make([]distribution.SplitJob, 0, len(jobs))
+	for _, job := range jobs {
+		if splitJobPassesListFilter(job, req.GetSinceTerminalAtMs(), phaseFilter) {
+			filtered = append(filtered, job)
+		}
+	}
+	sortSplitJobsForList(filtered)
+
+	start, err := splitJobListStartIndex(filtered, req.GetPageCursor())
+	if err != nil {
+		return nil, err
+	}
+	end := start + listSplitJobsDefaultPageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+
+	resp := &pb.ListSplitJobsResponse{
+		Jobs: make([]*pb.SplitJob, 0, end-start),
+	}
+	for _, job := range filtered[start:end] {
+		resp.Jobs = append(resp.Jobs, distribution.SplitJobToProto(job))
+	}
+	if end < len(filtered) {
+		resp.NextPageCursor = encodeSplitJobListCursor(filtered[end-1])
+	}
+	return resp, nil
+}
+
+func sortSplitJobsForList(jobs []distribution.SplitJob) {
+	sort.Slice(jobs, func(i, j int) bool {
+		left, right := jobs[i], jobs[j]
+		leftLive := left.TerminalAtMs <= 0
+		rightLive := right.TerminalAtMs <= 0
+		if leftLive != rightLive {
+			return leftLive
+		}
+		if leftLive {
+			if left.UpdatedAtMs != right.UpdatedAtMs {
+				return left.UpdatedAtMs > right.UpdatedAtMs
+			}
+			return left.JobID > right.JobID
+		}
+		if left.TerminalAtMs != right.TerminalAtMs {
+			return left.TerminalAtMs > right.TerminalAtMs
+		}
+		return left.JobID > right.JobID
+	})
+}
+
+func splitJobListStartIndex(jobs []distribution.SplitJob, cursor []byte) (int, error) {
+	if len(cursor) == 0 {
+		return 0, nil
+	}
+	terminalAtMs, jobID, err := decodeSplitJobListCursor(cursor)
+	if err != nil {
+		return 0, err
+	}
+	for i, job := range jobs {
+		if job.JobID == jobID && splitJobListCursorTerminalAtMs(job) == terminalAtMs {
+			return i + 1, nil
+		}
+	}
+	return 0, grpcStatusError(codes.InvalidArgument, "split job page cursor does not match the filtered result set")
+}
+
+func encodeSplitJobListCursor(job distribution.SplitJob) []byte {
+	cursor := make([]byte, splitJobListCursorEncodedBytes)
+	cursor[0] = splitJobListCursorVersion
+	binary.BigEndian.PutUint64(
+		cursor[splitJobListCursorTerminalOff:splitJobListCursorJobIDOff],
+		splitJobListCursorTerminalAtMs(job),
+	)
+	binary.BigEndian.PutUint64(cursor[splitJobListCursorJobIDOff:], job.JobID)
+	return cursor
+}
+
+func decodeSplitJobListCursor(cursor []byte) (uint64, uint64, error) {
+	if len(cursor) != splitJobListCursorEncodedBytes || cursor[0] != splitJobListCursorVersion {
+		return 0, 0, grpcStatusError(codes.InvalidArgument, "invalid split job page cursor")
+	}
+	terminalAtMs := binary.BigEndian.Uint64(cursor[splitJobListCursorTerminalOff:splitJobListCursorJobIDOff])
+	jobID := binary.BigEndian.Uint64(cursor[splitJobListCursorJobIDOff:])
+	if jobID == 0 {
+		return 0, 0, grpcStatusError(codes.InvalidArgument, "invalid split job page cursor")
+	}
+	return terminalAtMs, jobID, nil
+}
+
+func splitJobListCursorTerminalAtMs(job distribution.SplitJob) uint64 {
+	if job.TerminalAtMs <= 0 {
+		return 0
+	}
+	return uint64(job.TerminalAtMs)
+}
+
+func splitJobCoordinatorLeadershipError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		return true
+	}
+	return hasSplitJobLeaderErrorSuffix(err.Error())
+}
+
+var splitJobLeaderErrorPhrases = []string{
+	"not leader",
+	"leader not found",
+	"leadership lost",
+	"leadership transfer in progress",
+}
+
+func hasSplitJobLeaderErrorSuffix(msg string) bool {
+	for _, phrase := range splitJobLeaderErrorPhrases {
+		if len(msg) >= len(phrase) && strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func splitCatalogRoutes(
@@ -604,13 +1167,13 @@ func (s *DistributionServer) allocateChildRouteIDs(ctx context.Context, readTS u
 	return leftID, rightID, nil
 }
 
-func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, int, bool) {
-	for i, route := range routes {
+func findRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {
+	for _, route := range routes {
 		if route.RouteID == routeID {
-			return distribution.CloneRouteDescriptor(route), i, true
+			return distribution.CloneRouteDescriptor(route), true
 		}
 	}
-	return distribution.RouteDescriptor{}, -1, false
+	return distribution.RouteDescriptor{}, false
 }
 
 func toProtoRouteDescriptors(routes []distribution.RouteDescriptor) []*pb.RouteDescriptor {

@@ -279,7 +279,7 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	defer func() { _ = rdb.Close() }()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	const (
 		total  = 10_000
@@ -291,13 +291,21 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	}
 
 	measure := func() time.Duration {
-		start := time.Now()
-		streams, err := rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{"stream-lat", lastID},
-			Count:   10,
-			Block:   10 * time.Millisecond,
-		}).Result()
-		elapsed := time.Since(start)
+		var (
+			streams []redis.XStream
+			elapsed time.Duration
+		)
+		err := retryNotLeader(ctx, func() error {
+			start := time.Now()
+			var xerr error
+			streams, xerr = rdb.XRead(ctx, &redis.XReadArgs{
+				Streams: []string{"stream-lat", lastID},
+				Count:   10,
+				Block:   10 * time.Millisecond,
+			}).Result()
+			elapsed = time.Since(start)
+			return xerr
+		})
 		require.True(t, errors.Is(err, redis.Nil) || err == nil)
 		require.Empty(t, streams)
 		return elapsed
