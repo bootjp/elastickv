@@ -72,6 +72,24 @@ func (b *mockBackend) Calls() [][]any {
 	return out
 }
 
+type refreshableMockBackend struct {
+	*mockBackend
+	refreshMu sync.Mutex
+	refreshes int
+}
+
+func (b *refreshableMockBackend) RefreshLeaderNow(ctx context.Context) {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	b.refreshes++
+}
+
+func (b *refreshableMockBackend) RefreshCount() int {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	return b.refreshes
+}
+
 // Helper to create a doFunc that returns a specific value.
 func makeCmd(val any, err error) func(ctx context.Context, args ...any) *redis.Cmd {
 	return func(ctx context.Context, args ...any) *redis.Cmd {
@@ -1183,6 +1201,35 @@ func TestDualWriter_writeSecondary_RetriesRetryLimitWriteConflict(t *testing.T) 
 	assert.Equal(t, 3, calls, "secondary must retry transient retry-limit write conflicts")
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a retried success must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_RetriesNotLeaderAfterRefresh(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
+	notLeaderErr := testRedisErr("ERR etcd raft engine is not leader")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		if calls == 1 {
+			cmd.SetErr(notLeaderErr)
+			return cmd
+		}
+		cmd.SetVal("OK")
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 2, calls, "secondary must retry after a not-leader rejection")
+	assert.Equal(t, 1, secondary.RefreshCount(), "not-leader retries must force leader rediscovery before retrying")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a refreshed retry success must not count as a secondary write error")
 }
 
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {

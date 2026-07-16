@@ -127,6 +127,10 @@ func (n *fakeElasticKVNode) handleConn(conn net.Conn) {
 			_, _ = fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(body), body)
 		default:
 			n.commands.Add(1)
+			if leader := n.Leader(); leader != "" && leader != n.addr {
+				_, _ = conn.Write([]byte("-ERR etcd raft engine is not leader\r\n"))
+				continue
+			}
 			_, _ = conn.Write([]byte("+OK\r\n"))
 		}
 	}
@@ -212,6 +216,36 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.NoError(t, res.Err())
 	require.Equal(t, beforeA, nodeA.commands.Load(), "command must not reach former leader A")
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
+}
+
+func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
+
+	nodeA.SetLeader(nodeA.addr)
+	nodeB.SetLeader(nodeA.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{nodeA.addr, nodeB.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == nodeA.addr
+	}, 2*time.Second, 10*time.Millisecond, "initial leader must be A")
+
+	nodeA.SetLeader(nodeB.addr)
+	nodeB.SetLeader(nodeB.addr)
+
+	res := backend.Do(context.Background(), "SET", "k", "v")
+	require.NoError(t, res.Err())
+	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "not-leader retry must synchronously adopt the advertised leader")
+	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt should hit the former leader and be rejected")
+	require.Equal(t, int64(1), nodeB.commands.Load(), "retry should land on the refreshed leader")
 }
 
 func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {

@@ -52,6 +52,10 @@ const (
 	asyncDropLogInterval = 5 * time.Second
 )
 
+type leaderRefreshingBackend interface {
+	RefreshLeaderNow(context.Context)
+}
+
 // readTSCompactedMarker is the substring produced by
 // store.ErrReadTSCompacted as it flows through gRPC (wrapped as
 // FailedPrecondition) and Lua PCall. Matching on substring is necessary
@@ -73,10 +77,23 @@ func isRetryableSecondaryWriteError(err error) bool {
 		return true
 	}
 	switch classifySecondaryWriteError(err) {
-	case "retry_limit", "write_conflict", "txn_locked":
+	case "retry_limit", "write_conflict", "txn_locked", "not_leader":
 		return true
 	default:
 		return false
+	}
+}
+
+func isNotLeaderError(err error) bool {
+	return classifySecondaryWriteError(err) == "not_leader"
+}
+
+func refreshSecondaryLeader(ctx context.Context, backend Backend, err error) {
+	if !isNotLeaderError(err) {
+		return
+	}
+	if refresher, ok := backend.(leaderRefreshingBackend); ok {
+		refresher.RefreshLeaderNow(ctx)
 	}
 }
 
@@ -334,8 +351,10 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 		if attempt >= maxSecondaryTransientRetries {
 			break
 		}
+		reason := classifySecondaryWriteError(sErr)
+		refreshSecondaryLeader(sCtx, d.secondary, sErr)
 		d.logger.Debug("retrying secondary write after transient error",
-			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "reason", classifySecondaryWriteError(sErr), "err", sErr)
+			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "reason", reason, "err", sErr)
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
