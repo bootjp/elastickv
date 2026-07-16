@@ -56,6 +56,10 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 
 func blockingReplayCommand(cmd string, _ [][]byte, resp any) (string, []any, bool) {
 	switch strings.ToUpper(cmd) {
+	case "BLPOP":
+		return blockingListPopReplay(1, resp)
+	case "BRPOP":
+		return blockingListPopReplay(-1, resp)
 	case "BZPOPMIN", "BZPOPMAX":
 		parts, ok := redisArray(resp)
 		if !ok || len(parts) < 2 {
@@ -70,6 +74,19 @@ func blockingReplayCommand(cmd string, _ [][]byte, resp any) (string, []any, boo
 	default:
 		return "", nil, false
 	}
+}
+
+func blockingListPopReplay(count int64, resp any) (string, []any, bool) {
+	parts, ok := redisArray(resp)
+	if !ok || len(parts) < 2 {
+		return "", nil, false
+	}
+	key, keyOK := redisArg(parts[0])
+	value, valueOK := redisArg(parts[1])
+	if !keyOK || !valueOK {
+		return "", nil, false
+	}
+	return "LREM", []any{[]byte("LREM"), key, count, value}, true
 }
 
 func redisArray(v any) ([]any, bool) {

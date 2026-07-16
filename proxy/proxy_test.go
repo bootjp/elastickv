@@ -672,6 +672,51 @@ func TestDualWriter_Blocking_ReplaysBZPopMinAsZRem(t *testing.T) {
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "ok")), 0.001)
 }
 
+func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		resp []any
+		want [][]any
+	}{
+		{
+			name: "BLPOP removes first matching element",
+			cmd:  "BLPOP",
+			resp: []any{[]byte("queue"), []byte("job-1")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(1), []byte("job-1")}},
+		},
+		{
+			name: "BRPOP removes last matching element",
+			cmd:  "BRPOP",
+			resp: []any{[]byte("queue"), []byte("job-2")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(-1), []byte("job-2")}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: tc.resp,
+			}
+			secondary := newMockBackend("secondary")
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, [][]byte{[]byte(tc.cmd), []byte("queue"), []byte("5")})
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, tc.want, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("LREM", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
 func TestDualWriter_Blocking_XReadDoesNotUseWriteSemaphore(t *testing.T) {
 	primary := &timeoutCapturingBackend{name: "primary", returnValue: []any{}}
 	secondary := newMockBackend("secondary")
@@ -1230,6 +1275,49 @@ func TestDualWriter_writeSecondary_RetriesNotLeaderAfterRefresh(t *testing.T) {
 	assert.Equal(t, 1, secondary.RefreshCount(), "not-leader retries must force leader rediscovery before retrying")
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a refreshed retry success must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_DoesNotRetryUserNotLeaderError(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
+	userErr := testRedisErr("ERR not leader")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(userErr)
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 1, calls, "user Redis not-leader text must not be retried")
+	assert.Equal(t, 0, secondary.RefreshCount(), "user Redis not-leader text must not force rediscovery")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestDualWriter_ReplaySecondaryPipeline_RecordsReplyErrors(t *testing.T) {
+	primary := newMockBackend("primary")
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(testRedisErr("ERR etcd raft engine is not leader"))
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.replaySecondaryPipeline([][]any{{[]byte("MULTI")}, {[]byte("SET"), []byte("k"), []byte("v")}, {[]byte("EXEC")}})
+	d.Close()
+
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", "not_leader")), 0.001)
 }
 
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {

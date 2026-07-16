@@ -3340,38 +3340,61 @@ func (c *luaScriptContext) streamDeltaStateForXAdd(key []byte) (*luaStreamState,
 	if st != nil && st.loaded {
 		return nil, false, nil
 	}
+	if st != nil && st.delta != nil {
+		return nil, false, nil
+	}
 	if st == nil {
 		st = &luaStreamState{}
 		c.streams[keyString] = st
 	}
-	if st.delta != nil {
-		return st, true, nil
-	}
-	delta, err := c.newLuaStreamDelta(key)
+	delta, useDelta, err := c.newLuaStreamDelta(key)
 	if err != nil {
 		return nil, true, err
+	}
+	if !useDelta {
+		delete(c.streams, keyString)
+		return nil, false, nil
 	}
 	st.delta = delta
 	return st, true, nil
 }
 
-func (c *luaScriptContext) newLuaStreamDelta(key []byte) (*luaStreamDeltaState, error) {
+func (c *luaScriptContext) newLuaStreamDelta(key []byte) (*luaStreamDeltaState, bool, error) {
 	typ, err := c.server.keyTypeAtExpect(c.scriptCtx(), key, c.startTS, redisTypeStream)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if typ != redisTypeNone && typ != redisTypeStream {
-		return nil, wrongTypeError()
+		return nil, false, wrongTypeError()
 	}
 	legacyCleanup, meta, metaFound, err := c.server.streamWriteBase(c.scriptCtx(), key, c.startTS)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	useDelta, err := c.canUseLuaStreamDelta(key, typ, metaFound, legacyCleanup)
+	if err != nil || !useDelta {
+		return nil, false, err
 	}
 	return &luaStreamDeltaState{
 		legacyCleanup: legacyCleanup,
 		meta:          meta,
 		metaFound:     metaFound,
-	}, nil
+	}, true, nil
+}
+
+func (c *luaScriptContext) canUseLuaStreamDelta(key []byte, typ redisValueType, metaFound bool, legacyCleanup []*kv.Elem[kv.OP]) (bool, error) {
+	hasPhysicalStream := metaFound || len(legacyCleanup) != 0
+	if !hasPhysicalStream {
+		return true, nil
+	}
+	expired, err := c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
+	if err != nil {
+		return false, err
+	}
+	if expired || typ == redisTypeNone {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (c *luaScriptContext) applyLuaXAddDeltaTrim(delta *luaStreamDeltaState, maxLen int, appendedID redisStreamID) {

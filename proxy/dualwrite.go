@@ -76,8 +76,11 @@ func isRetryableSecondaryWriteError(err error) bool {
 	if isReadTSCompactedError(err) {
 		return true
 	}
+	if isElasticKVNotLeaderError(err) {
+		return true
+	}
 	switch classifySecondaryWriteError(err) {
-	case "retry_limit", "write_conflict", "txn_locked", "not_leader":
+	case "retry_limit", "write_conflict", "txn_locked":
 		return true
 	default:
 		return false
@@ -85,7 +88,23 @@ func isRetryableSecondaryWriteError(err error) bool {
 }
 
 func isNotLeaderError(err error) bool {
-	return classifySecondaryWriteError(err) == "not_leader"
+	return isElasticKVNotLeaderError(err)
+}
+
+func isElasticKVNotLeaderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.TrimSpace(err.Error())
+	if strings.HasPrefix(strings.ToUpper(msg), "NOTLEADER ") {
+		return true
+	}
+	if strings.Contains(msg, "etcd raft engine is not leader") ||
+		strings.Contains(msg, "raft engine: not leader") {
+		return true
+	}
+	return msg == "leader not found" ||
+		strings.HasSuffix(msg, "desc = leader not found")
 }
 
 func refreshSecondaryLeader(ctx context.Context, backend Backend, err error) {
@@ -401,13 +420,32 @@ func (d *DualWriter) replaySecondaryPipeline(cmds [][]any) {
 	d.runSecondaryWrite(func() {
 		sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 		defer cancel()
-		_, pErr := d.secondary.Pipeline(sCtx, cmds)
+		results, pErr := d.secondary.Pipeline(sCtx, cmds)
 		if pErr != nil {
 			d.logger.Warn("secondary txn replay failed", "err", pErr)
 			d.metrics.SecondaryWriteErrors.Inc()
 			d.metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", classifySecondaryWriteError(pErr)).Inc()
+			return
+		}
+		if rErr := firstPipelineResultError(results); rErr != nil {
+			d.logger.Warn("secondary txn replay failed", "err", rErr)
+			d.metrics.SecondaryWriteErrors.Inc()
+			d.metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", classifySecondaryWriteError(rErr)).Inc()
 		}
 	})
+}
+
+func firstPipelineResultError(results []*redis.Cmd) error {
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		err := result.Err()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return fmt.Errorf("pipeline result: %w", err)
+		}
+	}
+	return nil
 }
 
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early

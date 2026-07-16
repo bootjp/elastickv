@@ -403,8 +403,19 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
-// Pipeline forwards a batch to the current leader.
+// Pipeline forwards a batch to the current leader. A not-leader Redis reply in
+// any result means the leader rejected the batch before applying it, so retrying
+// once after synchronous discovery is safe.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	results, err := b.pipelineOnce(ctx, cmds)
+	if err != nil || !pipelineHasElasticKVNotLeader(results) {
+		return results, err
+	}
+	b.RefreshLeaderNow(ctx)
+	return b.pipelineOnce(ctx, cmds)
+}
+
+func (b *LeaderAwareRedisBackend) pipelineOnce(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	cli := b.currentClient()
 	if cli == nil {
 		return nil, ErrNoLeaderBackend
@@ -423,6 +434,15 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil
+}
+
+func pipelineHasElasticKVNotLeader(results []*redis.Cmd) bool {
+	for _, result := range results {
+		if result != nil && isElasticKVNotLeaderError(result.Err()) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewPubSub opens a subscribe connection on the current leader.
