@@ -322,6 +322,9 @@ func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVer
 		return ImportVersionsResult{}, err
 	}
 	if duplicate {
+		if err := s.commitPebbleImportAppliedIndex(opts.AppliedIndex, writeOpts); err != nil {
+			return ImportVersionsResult{}, err
+		}
 		return ImportVersionsResult{AckedCursor: ackedCursor, Duplicate: true}, nil
 	}
 
@@ -337,6 +340,18 @@ func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVer
 		"max_imported_ts", batchMax,
 	)
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
+}
+
+func (s *pebbleStore) commitPebbleImportAppliedIndex(appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	if appliedIndex == 0 {
+		return nil
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(writeOpts))
 }
 
 func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (bool, []byte, error) {
@@ -376,6 +391,9 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 		return err
 	}
 	defer unlock()
+	if err := stagePebbleAppliedIndex(batch, opts.AppliedIndex); err != nil {
+		return err
+	}
 	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
@@ -383,6 +401,13 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 		s.lastCommitTS = newLastTS
 	}
 	return nil
+}
+
+func stagePebbleAppliedIndex(batch *pebble.Batch, appliedIndex uint64) error {
+	if appliedIndex == 0 {
+		return nil
+	}
+	return setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex)
 }
 
 func (s *pebbleStore) stageMigrationImportAck(batch *pebble.Batch, jobID, bracketID uint64, ack migrationImportAck) error {

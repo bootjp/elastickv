@@ -107,11 +107,14 @@ type ExportVersionsResult struct {
 
 // ImportVersionsOptions applies one idempotent migration-import batch.
 type ImportVersionsOptions struct {
-	JobID     uint64
-	BracketID uint64
-	BatchSeq  uint64
-	Versions  []MVCCVersion
-	Cursor    []byte
+	JobID uint64
+	// AppliedIndex is the optional Raft entry index to bundle with Pebble
+	// import batches as metaAppliedIndex. Zero leaves the meta key unchanged.
+	AppliedIndex uint64
+	BracketID    uint64
+	BatchSeq     uint64
+	Versions     []MVCCVersion
+	Cursor       []byte
 }
 
 // ImportVersionsResult reports the cursor durably acknowledged by the target.
@@ -319,6 +322,8 @@ type MVCCStore interface {
 	ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
 	// ImportVersionsRaft is the raft-apply variant of ImportVersions. It
 	// preserves the same idempotency contract while using the FSM write path.
+	// When opts.AppliedIndex is non-zero, the implementation must durably
+	// bundle metaAppliedIndex with the import batch.
 	ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
