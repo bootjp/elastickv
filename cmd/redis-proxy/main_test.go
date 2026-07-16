@@ -44,7 +44,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:       128,
 			elasticKVPoolSize:     8,
 			wantWriteConcurrency:  4,
-			wantScriptConcurrency: 2,
+			wantScriptConcurrency: 1,
 		},
 		{
 			name:                  "ElasticKV primary derives from Redis secondary pool",
@@ -61,7 +61,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:     4,
 			writeConcurrency:      5,
 			wantWriteConcurrency:  5,
-			wantScriptConcurrency: 2,
+			wantScriptConcurrency: 1,
 		},
 		{
 			name:                  "explicit values win",

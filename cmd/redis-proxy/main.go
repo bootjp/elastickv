@@ -23,6 +23,7 @@ const (
 	sentryFlushTimeout          = 2 * time.Second
 	metricsShutdownTimeout      = 5 * time.Second
 	secondaryConcurrencyDivisor = 2
+	elasticKVScriptConcurrency  = 1
 	elasticKVDispatchTimeout    = 10 * time.Second
 	backendTimeoutGrace         = time.Second
 )
@@ -229,6 +230,9 @@ func deriveSecondaryConcurrency(mode proxy.ProxyMode, primaryPoolSize, elasticKV
 	}
 	if scriptConcurrency == 0 {
 		scriptConcurrency = defaultSecondaryScriptConcurrency(writeConcurrency)
+		if mode != proxy.ModeElasticKVPrimary && scriptConcurrency > elasticKVScriptConcurrency {
+			scriptConcurrency = elasticKVScriptConcurrency
+		}
 	}
 	return writeConcurrency, scriptConcurrency
 }
