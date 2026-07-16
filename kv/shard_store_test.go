@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -255,6 +256,83 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.Equal(t, uint64(40), ts)
 }
 
+func TestShardStoreScanAt_FiltersStagedShadowRowsFromLiveCandidates(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	rawKey := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 20, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte(""), nil, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: rawKey, Value: []byte("staged")}}, kvs)
+}
+
+func TestShardStoreScanAt_RoutesS3BucketAuxiliaryStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  routeStart,
+				End:                    routeEnd,
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		key    []byte
+		value  []byte
+	}{
+		{name: "bucket meta", prefix: s3keys.BucketMetaPrefix, key: s3keys.BucketMetaKey(bucket), value: []byte("meta")},
+		{name: "bucket generation", prefix: s3keys.BucketGenerationPrefix, key: s3keys.BucketGenerationKey(bucket), value: []byte("generation")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, tc.key), tc.value, 20, 0))
+
+			kvs, err := st.ScanAt(ctx, []byte(tc.prefix), prefixScanEnd([]byte(tc.prefix)), 10, 30)
+			require.NoError(t, err)
+			require.Contains(t, kvs, &store.KVPair{Key: tc.key, Value: tc.value})
+		})
+	}
+}
+
+func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityPebbleShardStore(t)
+	rawKey := []byte("k")
+	large := bytes.Repeat([]byte("x"), 1<<20)
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, []byte("old"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, large, 30, 0))
+
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), got)
+}
+
 func TestShardStoreDeletePrefixAtDeletesStagedVisibilityRows(t *testing.T) {
 	t.Parallel()
 
@@ -322,6 +400,13 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 	require.Equal(t, []byte("staged-b"), got)
 
 	kvs, err := st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 35)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("staged-b")},
+		{Key: []byte("c"), Value: []byte("staged-c")},
+	}, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, false, 1, 0, []byte("a"), []byte("z"))
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{
 		{Key: []byte("b"), Value: []byte("staged-b")},
@@ -774,6 +859,34 @@ func TestShardStoreScanGroupAt_DoesNotClampRouteMappedRawBounds(t *testing.T) {
 	ctx := context.Background()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 42)
+	groups := map[uint64]*ShardGroup{
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	start := []byte("!sqs|msg|vis|p|")
+	key := []byte("!sqs|msg|vis|p|orders|partition-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("msg-2"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("msg-2")}}, kvs)
+}
+
+func TestShardStoreScanGroupAt_DeduplicatesRouteMappedSameGroupSplits(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	routeEnd := prefixScanEnd(sqsGlobalRouteKey)
+	split := append(bytes.Clone(sqsGlobalRouteKey), 'm')
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: sqsGlobalRouteKey, End: split, GroupID: 42, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: split, End: routeEnd, GroupID: 42, State: distribution.RouteStateActive},
+		},
+	}))
 	groups := map[uint64]*ShardGroup{
 		42: {Store: store.NewMVCCStore()},
 	}

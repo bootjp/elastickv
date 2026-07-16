@@ -162,6 +162,9 @@ func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesR
 }
 
 func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetRouteOwnershipRequest) (*pb.GetRouteOwnershipResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
 	if err != nil {
 		return nil, err
@@ -181,6 +184,9 @@ func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetR
 }
 
 func (s *DistributionServer) GetIntersectingRoutes(ctx context.Context, req *pb.GetIntersectingRoutesRequest) (*pb.GetIntersectingRoutesResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
 	if err != nil {
 		return nil, err

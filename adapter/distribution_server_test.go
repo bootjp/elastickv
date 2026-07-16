@@ -42,7 +42,12 @@ func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte("a"), nil, 1)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
 	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
 	_, err := catalog.Save(context.Background(), 0, []distribution.RouteDescriptor{
 		{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
@@ -60,10 +65,36 @@ func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, codes.Unavailable, status.Code(err))
 
+	_, err = s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: engine.Version(),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("a"),
+		End:            []byte("z"),
+		CatalogVersion: engine.Version(),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
 	blocked = false
 	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
 	require.NoError(t, err)
 	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.NoError(t, err)
+	_, err = s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: engine.Version(),
+	})
+	require.NoError(t, err)
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("a"),
+		End:            []byte("z"),
+		CatalogVersion: engine.Version(),
+	})
 	require.NoError(t, err)
 }
 

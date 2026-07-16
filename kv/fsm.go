@@ -1334,11 +1334,27 @@ func (f *kvFSM) currentStagedVisibilityRouteForKey(key []byte) (distribution.Rou
 	if !ok {
 		return distribution.Route{}, false
 	}
+	if route, ok := currentStagedVisibilityRouteForS3BucketAuxiliaryKey(snap, key, f.shardGroupID); ok {
+		return route, true
+	}
 	route, ok := snap.RouteOf(routeKey(key))
 	if !ok || route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
 		return distribution.Route{}, false
 	}
 	return route, true
+}
+
+func currentStagedVisibilityRouteForS3BucketAuxiliaryKey(snap RouteSnapshot, key []byte, shardGroupID uint64) (distribution.Route, bool) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	for _, route := range snap.IntersectingRoutes(start, end) {
+		if route.GroupID == shardGroupID && routeHasStagedVisibility(route) {
+			return route, true
+		}
+	}
+	return distribution.Route{}, false
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {

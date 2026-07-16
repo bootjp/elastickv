@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,39 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLandedAsStagedVersion(t *testing.T) 
 	at40, err := st.CommittedVersionAt(ctx, key, 40)
 	require.NoError(t, err)
 	require.False(t, at40, "retry must not write a live version when the prior attempt is staged")
+	stagedAt20, err := st.CommittedVersionAt(ctx, distribution.MigrationStagedDataKey(9, key), 20)
+	require.NoError(t, err)
+	require.True(t, stagedAt20)
+}
+
+func TestOnePhaseDedup_NoOpsWhenS3AuxiliaryPriorAttemptLandedAsStagedVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	engine := distribution.NewEngine()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID:                1,
+		Start:                  routeStart,
+		End:                    prefixScanEnd(routeStart),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+	}})
+	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
+	fsm, ok := fsmIface.(*kvFSM)
+	require.True(t, ok)
+
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
+
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(30, 40, 20, key, []byte("v"))))
+
+	at40, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.False(t, at40, "retry must not write a live S3 auxiliary version when the prior attempt is staged")
 	stagedAt20, err := st.CommittedVersionAt(ctx, distribution.MigrationStagedDataKey(9, key), 20)
 	require.NoError(t, err)
 	require.True(t, stagedAt20)
