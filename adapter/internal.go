@@ -121,7 +121,7 @@ func (i *Internal) ExportRangeVersions(req *pb.ExportRangeVersionsRequest, strea
 	if err := i.validateExportRangeVersionsRequest(req); err != nil {
 		return err
 	}
-	if err := i.verifyInternalLeader(stream.Context()); err != nil {
+	if err := i.verifyInternalLeaderApplied(stream.Context()); err != nil {
 		return err
 	}
 	return i.streamExportRangeVersions(req, stream)
@@ -211,6 +211,9 @@ func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) erro
 }
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
+	if i.leader == nil {
+		return errors.WithStack(ErrNotLeader)
+	}
 	if i.leader.State() != raftengine.StateLeader {
 		return errors.WithStack(ErrNotLeader)
 	}
@@ -218,6 +221,17 @@ func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 		return errors.WithStack(ErrNotLeader)
 	}
 	return nil
+}
+
+func (i *Internal) verifyInternalLeaderApplied(ctx context.Context) error {
+	if i.leader == nil {
+		return errors.WithStack(ErrNotLeader)
+	}
+	if i.leader.State() != raftengine.StateLeader {
+		return errors.WithStack(ErrNotLeader)
+	}
+	_, err := i.leader.LinearizableRead(ctx)
+	return errors.WithStack(err)
 }
 
 func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRangeVersionsRequest) (store.ImportVersionsResult, error) {
