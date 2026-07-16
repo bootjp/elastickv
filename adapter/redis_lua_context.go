@@ -182,6 +182,10 @@ type luaPhysicalLimitedScanStore interface {
 	ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
 }
 
+type luaExactScanFallbackDecider interface {
+	AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) bool
+}
+
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
 type luaRenameHandler func(*luaScriptContext, []byte, []byte) error
 
@@ -2189,6 +2193,66 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
 	}
+	if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+		return item, true, nil
+	}
+	if physicalLimitReached {
+		if !c.allowExactListScanFallback(startKey, endKey, scanLimit, !left) {
+			return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+				"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
+		}
+		return c.scanListItemWindowExact(key, meta, startKey, endKey, left)
+	}
+	if len(kvs) >= scanLimit {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
+	}
+	return luaLazyListBoundaryItem{}, false, nil
+}
+
+func (c *luaScriptContext) allowExactListScanFallback(startKey, endKey []byte, scanLimit int, reverse bool) bool {
+	decider, ok := c.server.store.(luaExactScanFallbackDecider)
+	if !ok {
+		return true
+	}
+	return decider.AllowExactScanFallbackAfterPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS, reverse)
+}
+
+func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMeta, startKey, endKey []byte, left bool) (luaLazyListBoundaryItem, bool, error) {
+	for {
+		var (
+			kvs []*store.KVPair
+			err error
+		)
+		if left {
+			kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		} else {
+			kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		}
+		if err != nil {
+			return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
+		}
+		if len(kvs) == 0 {
+			return luaLazyListBoundaryItem{}, false, nil
+		}
+		if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+			return item, true, nil
+		}
+		if left {
+			startKey = scanStartAfterKey(kvs[0].Key)
+		} else {
+			endKey = append([]byte(nil), kvs[0].Key...)
+		}
+	}
+}
+
+func scanStartAfterKey(key []byte) []byte {
+	next := make([]byte, len(key)+1)
+	copy(next, key)
+	return next
+}
+
+func luaListBoundaryItemFromKVs(key []byte, meta store.ListMeta, kvs []*store.KVPair) (luaLazyListBoundaryItem, bool) {
 	for _, kvp := range kvs {
 		seq, ok := store.ExtractListItemSeq(kvp.Key, key)
 		if !ok {
@@ -2197,17 +2261,9 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 		return luaLazyListBoundaryItem{
 			value: string(kvp.Value),
 			index: seq - meta.Head,
-		}, true, nil
+		}, true
 	}
-	if physicalLimitReached {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
-	}
-	if len(kvs) >= scanLimit {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
-	}
-	return luaLazyListBoundaryItem{}, false, nil
+	return luaLazyListBoundaryItem{}, false
 }
 
 func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
