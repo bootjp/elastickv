@@ -202,6 +202,10 @@ type luaExactScanFallbackDecider interface {
 	AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) bool
 }
 
+type luaRoutePinnedScanStore interface {
+	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
+}
+
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
 type luaRenameHandler func(*luaScriptContext, []byte, []byte) error
 
@@ -2283,18 +2287,12 @@ func (c *luaScriptContext) allowExactListScanFallback(startKey, endKey []byte, s
 }
 
 func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMeta, startKey, endKey []byte, left bool) (luaLazyListBoundaryItem, bool, error) {
+	routeStart := append([]byte(nil), startKey...)
+	routeEnd := append([]byte(nil), endKey...)
 	for {
-		var (
-			kvs []*store.KVPair
-			err error
-		)
-		if left {
-			kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
-		} else {
-			kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
-		}
+		kvs, err := c.scanExactListPage(startKey, endKey, routeStart, routeEnd, left)
 		if err != nil {
-			return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
+			return luaLazyListBoundaryItem{}, false, err
 		}
 		if len(kvs) == 0 {
 			return luaLazyListBoundaryItem{}, false, nil
@@ -2308,6 +2306,24 @@ func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMe
 			endKey = append([]byte(nil), kvs[0].Key...)
 		}
 	}
+}
+
+func (c *luaScriptContext) scanExactListPage(startKey, endKey, routeStart, routeEnd []byte, left bool) ([]*store.KVPair, error) {
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if scanner, ok := c.server.store.(luaRoutePinnedScanStore); ok {
+		kvs, err = scanner.ScanAtWithReadFence(c.ctx, startKey, endKey, 1, c.startTS, !left, 0, 0, routeStart, routeEnd)
+	} else if left {
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	} else {
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return kvs, nil
 }
 
 func scanStartAfterKey(key []byte) []byte {
@@ -3343,6 +3359,9 @@ func (c *luaScriptContext) streamDeltaStateForXAdd(key []byte) (*luaStreamState,
 	if st != nil && st.delta != nil {
 		return nil, false, nil
 	}
+	if cached, handled, err := c.streamDeltaDecisionFromCachedType(key); cached {
+		return nil, handled, err
+	}
 	if st == nil {
 		st = &luaStreamState{}
 		c.streams[keyString] = st
@@ -3357,6 +3376,17 @@ func (c *luaScriptContext) streamDeltaStateForXAdd(key []byte) (*luaStreamState,
 	}
 	st.delta = delta
 	return st, true, nil
+}
+
+func (c *luaScriptContext) streamDeltaDecisionFromCachedType(key []byte) (bool, bool, error) {
+	typ, cached := c.cachedType(key)
+	if !cached {
+		return false, false, nil
+	}
+	if typ != redisTypeNone && typ != redisTypeStream {
+		return true, true, wrongTypeError()
+	}
+	return true, false, nil
 }
 
 func (c *luaScriptContext) newLuaStreamDelta(key []byte) (*luaStreamDeltaState, bool, error) {

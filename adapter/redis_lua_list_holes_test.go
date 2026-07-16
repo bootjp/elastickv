@@ -339,6 +339,41 @@ func TestRedisLua_RPopLPushSyntheticPhysicalLimitFailsClosed(t *testing.T) {
 	require.ErrorIs(t, err, ErrCollectionTooLarge)
 }
 
+func TestRedisLua_ListExactFallbackPinsRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := []byte("bull:test:wait:route-pin")
+	meta := store.ListMeta{Head: 0, Len: 2, Tail: 2}
+	startKey := listItemKey(src, 0)
+	endKey := listItemKey(src, 2)
+
+	collider := append([]byte{}, src...)
+	collider = append(collider, listItemKey(src, 0)[len(store.ListItemPrefix)+len(src):]...)
+	collider = append(collider, 'x')
+	st := &routePinnedExactScanStore{
+		MVCCStore:      store.NewMVCCStore(),
+		t:              t,
+		wantRouteStart: startKey,
+		wantRouteEnd:   endKey,
+		pages: [][]*store.KVPair{
+			{{Key: listItemKey(collider, 0), Value: []byte("other-list-job")}},
+			{{Key: listItemKey(src, 1), Value: []byte("job-1")}},
+		},
+	}
+	r := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	item, ok, err := scriptCtx.scanListItemWindowExact(src, meta, startKey, endKey, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(1), item.index)
+	require.Equal(t, "job-1", item.value)
+	require.Equal(t, 2, st.calls)
+}
+
 func TestRedisLua_RPopLPushDeletesLargeSparseListWithoutItems(t *testing.T) {
 	t.Parallel()
 
@@ -398,4 +433,37 @@ func (s noExactFallbackPhysicalLimitStore) ReverseScanAtPhysicalLimit(context.Co
 
 func (s noExactFallbackPhysicalLimitStore) AllowExactScanFallbackAfterPhysicalLimit(context.Context, []byte, []byte, int, int, uint64, bool) bool {
 	return false
+}
+
+type routePinnedExactScanStore struct {
+	store.MVCCStore
+	t              *testing.T
+	wantRouteStart []byte
+	wantRouteEnd   []byte
+	pages          [][]*store.KVPair
+	calls          int
+}
+
+func (s *routePinnedExactScanStore) ScanAtWithReadFence(
+	_ context.Context,
+	_ []byte,
+	_ []byte,
+	_ int,
+	_ uint64,
+	_ bool,
+	_ uint64,
+	_ uint64,
+	routeStart []byte,
+	routeEnd []byte,
+) ([]*store.KVPair, error) {
+	s.t.Helper()
+	require.Equal(s.t, s.wantRouteStart, routeStart)
+	require.Equal(s.t, s.wantRouteEnd, routeEnd)
+	if s.calls >= len(s.pages) {
+		s.calls++
+		return nil, nil
+	}
+	page := s.pages[s.calls]
+	s.calls++
+	return page, nil
 }

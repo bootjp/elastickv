@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -238,6 +239,23 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
 	require.Len(t, events, 1)
 	require.Equal(t, id, events[0].ID)
 	require.Equal(t, map[string]any{"event": "new"}, events[0].Values)
+}
+
+func TestRedis_LuaXAddHonorsScriptLocalStringType(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const key = "bull:test:events-local-string"
+	_, err := rdb.Eval(ctx, `
+redis.call("SET", KEYS[1], "string-value")
+return redis.call("XADD", KEYS[1], "*", "event", "bad")
+`, []string{key}).Result()
+	require.Error(t, err)
+	require.Contains(t, strings.ToUpper(err.Error()), "WRONGTYPE")
 }
 
 func TestRedis_LuaReplyHelpers(t *testing.T) {
