@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -95,6 +96,74 @@ return {eventId, redis.call("HGET", KEYS[1], "name"), cjson.encode(event), redis
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 	require.Equal(t, map[string]any{"event": "waiting", "jobId": "job-1"}, events[0].Values)
+}
+
+func TestRedis_LuaXAddMaxLenExistingStream(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const stream = "bull:test:events-existing"
+	for i := range 128 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			ID:     "*",
+			Values: []string{"i", strconv.Itoa(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	id, err := rdb.Eval(ctx, `
+return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "waiting", "jobId", "job-1")
+`, []string{stream}).Text()
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	xlen, err := rdb.XLen(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(10), xlen)
+
+	events, err := rdb.XRange(ctx, stream, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, events, 10)
+	require.Equal(t, id, events[len(events)-1].ID)
+	require.Equal(t, map[string]any{"event": "waiting", "jobId": "job-1"}, events[len(events)-1].Values)
+}
+
+func TestRedis_LuaXAddMaxLenZero(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const stream = "bull:test:events-maxlen0"
+	for i := range 3 {
+		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			ID:     "*",
+			Values: []string{"i", strconv.Itoa(i)},
+		}).Result()
+		require.NoError(t, err)
+	}
+
+	id, err := rdb.Eval(ctx, `
+return redis.call("XADD", KEYS[1], "MAXLEN", "0", "*", "event", "trimmed")
+`, []string{stream}).Text()
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	xlen, err := rdb.XLen(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), xlen)
+
+	events, err := rdb.XRange(ctx, stream, "-", "+").Result()
+	require.NoError(t, err)
+	require.Empty(t, events)
 }
 
 func TestRedis_LuaReplyHelpers(t *testing.T) {
