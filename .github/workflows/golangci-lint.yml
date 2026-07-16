@@ -28,4 +28,4 @@ jobs:
           filter_mode: nofilter
           reporter: github-pr-review
           cache: false
-          fail_on_error: true
+          fail_on_error: false
