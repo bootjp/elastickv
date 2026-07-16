@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -51,4 +52,56 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 		return 0
 	}
 	return time.Duration(millis) * time.Millisecond
+}
+
+func blockingReplayCommand(cmd string, _ [][]byte, resp any) (string, []any, bool) {
+	switch strings.ToUpper(cmd) {
+	case "BZPOPMIN", "BZPOPMAX":
+		parts, ok := redisArray(resp)
+		if !ok || len(parts) < 2 {
+			return "", nil, false
+		}
+		key, keyOK := redisArg(parts[0])
+		member, memberOK := redisArg(parts[1])
+		if !keyOK || !memberOK {
+			return "", nil, false
+		}
+		return "ZREM", []any{[]byte("ZREM"), key, member}, true
+	default:
+		return "", nil, false
+	}
+}
+
+func redisArray(v any) ([]any, bool) {
+	switch x := v.(type) {
+	case []any:
+		return x, true
+	case []string:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = x[i]
+		}
+		return out, true
+	case [][]byte:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = x[i]
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func redisArg(v any) (any, bool) {
+	switch x := v.(type) {
+	case nil:
+		return nil, false
+	case []byte:
+		return append([]byte(nil), x...), true
+	case string:
+		return []byte(x), true
+	default:
+		return []byte(fmt.Sprint(x)), true
+	}
 }

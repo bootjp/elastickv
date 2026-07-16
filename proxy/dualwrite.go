@@ -241,13 +241,10 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	// Warmup: send to secondary with short timeout (fire-and-forget, bounded)
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() {
-			sCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			d.secondary.Do(sCtx, iArgs...)
-		})
+		if replayCmd, replayArgs, ok := blockingReplayCommand(cmd, args, resp); ok {
+			d.runSecondaryWrite(func() { d.writeSecondary(replayCmd, replayArgs) })
+		}
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies

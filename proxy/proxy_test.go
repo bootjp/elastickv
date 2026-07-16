@@ -62,6 +62,16 @@ func (b *mockBackend) CallCount() int {
 	return len(b.calls)
 }
 
+func (b *mockBackend) Calls() [][]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([][]any, len(b.calls))
+	for i := range b.calls {
+		out[i] = append([]any(nil), b.calls[i]...)
+	}
+	return out
+}
+
 // Helper to create a doFunc that returns a specific value.
 func makeCmd(val any, err error) func(ctx context.Context, args ...any) *redis.Cmd {
 	return func(ctx context.Context, args ...any) *redis.Cmd {
@@ -621,6 +631,53 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 	assert.Equal(t, 1, primary.doWithCalls)
 	assert.Equal(t, 5*time.Second, primary.timeout)
 	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
+}
+
+func TestDualWriter_Blocking_ReplaysBZPopMinAsZRem(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{[]byte("queue"), []byte("job-1"), []byte("42")},
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{[]byte("queue"), []byte("job-1"), []byte("42")}, resp)
+	d.Close()
+
+	assert.Equal(t, [][]any{{[]byte("ZREM"), []byte("queue"), []byte("job-1")}}, secondary.Calls())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "ok")), 0.001)
+}
+
+func TestDualWriter_Blocking_XReadDoesNotUseWriteSemaphore(t *testing.T) {
+	primary := &timeoutCapturingBackend{name: "primary", returnValue: []any{}}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	blocker := make(chan struct{})
+	d.goWrite(func() {
+		<-blocker
+	})
+
+	resp, err := d.Blocking(context.Background(), "XREAD", [][]byte{
+		[]byte("XREAD"), []byte("BLOCK"), []byte("1"), []byte("STREAMS"), []byte("jobs"), []byte("0"),
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{}, resp)
+	assert.Empty(t, secondary.Calls())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+
+	close(blocker)
+	d.Close()
 }
 
 func TestDualWriter_GoAsync_Bounded(t *testing.T) {
