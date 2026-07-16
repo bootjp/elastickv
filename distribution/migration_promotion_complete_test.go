@@ -92,6 +92,29 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionCommitsRouteAndJobTogether(t
 	require.Equal(t, uint64(777), target.MinWriteTSExclusive)
 }
 
+func TestCatalogStoreCompleteSplitJobTargetPromotionRetryAfterCommit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cs := NewCatalogStore(store.NewMVCCStore(), WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := cs.Save(ctx, 0, promotionCompleteTestRoutes())
+	require.NoError(t, err)
+	job := promotionCompleteTestJob()
+	require.NoError(t, cs.CreateSplitJob(ctx, job))
+
+	firstSnapshot, firstCompleted, err := cs.CompleteSplitJobTargetPromotion(ctx, saved.Version, job, 1000)
+	require.NoError(t, err)
+
+	retrySnapshot, retryCompleted, err := cs.CompleteSplitJobTargetPromotion(ctx, saved.Version, job, 2000)
+	require.NoError(t, err)
+	require.Equal(t, firstSnapshot.Version, retrySnapshot.Version)
+	assertSplitJobEqual(t, firstCompleted, retryCompleted)
+
+	loaded, err := cs.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, firstSnapshot.Version, loaded.Version)
+}
+
 func TestCatalogStoreCompleteSplitJobTargetPromotionIsIdempotentAfterClearedDescriptor(t *testing.T) {
 	t.Parallel()
 
@@ -150,7 +173,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionPreservesVersionConflict(t *
 	job := promotionCompleteTestJob()
 	require.NoError(t, cs.CreateSplitJob(ctx, job))
 
-	readTS, _, routes, err := cs.loadPromotionCompleteInputs(ctx, saved.Version, job)
+	readTS, _, routes, _, _, err := cs.loadPromotionCompleteInputs(ctx, saved.Version, job)
 	require.NoError(t, err)
 	completion, err := CompleteTargetPromotionState(job, routes, 1000)
 	require.NoError(t, err)

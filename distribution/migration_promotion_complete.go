@@ -103,9 +103,16 @@ func (s *CatalogStore) CompleteSplitJobTargetPromotion(
 	}
 	ctx = contextOrBackground(ctx)
 
-	readTS, currentVersion, routes, err := s.loadPromotionCompleteInputs(ctx, expectedVersion, expected)
+	readTS, currentVersion, routes, currentJob, alreadyApplied, err := s.loadPromotionCompleteInputs(ctx, expectedVersion, expected)
 	if err != nil {
 		return CatalogSnapshot{}, SplitJob{}, err
+	}
+	if alreadyApplied {
+		return CatalogSnapshot{
+			Version: currentVersion,
+			Routes:  cloneRouteDescriptors(routes),
+			ReadTS:  readTS,
+		}, currentJob, nil
 	}
 	completion, err := CompleteTargetPromotionState(expected, routes, nowMs)
 	if err != nil {
@@ -133,27 +140,105 @@ func (s *CatalogStore) CompleteSplitJobTargetPromotion(
 	}, completion.Job, nil
 }
 
-func (s *CatalogStore) loadPromotionCompleteInputs(ctx context.Context, expectedVersion uint64, expected SplitJob) (uint64, uint64, []RouteDescriptor, error) {
+func (s *CatalogStore) loadPromotionCompleteInputs(ctx context.Context, expectedVersion uint64, expected SplitJob) (uint64, uint64, []RouteDescriptor, SplitJob, bool, error) {
 	expectedRaw, err := EncodeSplitJob(expected)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, SplitJob{}, false, err
 	}
 	readTS := s.store.LastCommitTS()
 	currentVersion, err := s.versionAt(ctx, readTS)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, SplitJob{}, false, err
 	}
-	if currentVersion != expectedVersion {
-		return 0, 0, nil, errors.WithStack(ErrCatalogVersionMismatch)
+	raw, currentJob, err := s.livePromotionCompleteJobAt(ctx, expected.JobID, readTS, expectedVersion, currentVersion)
+	if err != nil {
+		return 0, 0, nil, SplitJob{}, false, err
 	}
-	if err := s.expectLiveSplitJobAt(ctx, expected.JobID, expectedRaw, readTS); err != nil {
-		return 0, 0, nil, err
+	if currentVersion != expectedVersion || !bytes.Equal(raw, expectedRaw) {
+		return s.resolvePromotionCompleteInputConflict(ctx, readTS, currentVersion, expectedVersion, expected, expectedRaw, currentJob)
 	}
 	routes, err := s.routesAt(ctx, readTS)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, SplitJob{}, false, err
 	}
-	return readTS, currentVersion, routes, nil
+	return readTS, currentVersion, routes, currentJob, false, nil
+}
+
+func (s *CatalogStore) livePromotionCompleteJobAt(ctx context.Context, jobID uint64, ts uint64, expectedVersion uint64, currentVersion uint64) ([]byte, SplitJob, error) {
+	raw, err := s.store.GetAt(ctx, CatalogSplitJobKey(jobID), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, SplitJob{}, promotionCompleteMissingJobError(expectedVersion, currentVersion)
+		}
+		return nil, SplitJob{}, errors.WithStack(err)
+	}
+	currentJob, err := DecodeSplitJob(raw)
+	if err != nil {
+		return nil, SplitJob{}, err
+	}
+	if currentJob.JobID != jobID {
+		return nil, SplitJob{}, errors.WithStack(ErrCatalogSplitJobKeyIDMismatch)
+	}
+	return raw, currentJob, nil
+}
+
+func promotionCompleteMissingJobError(expectedVersion uint64, currentVersion uint64) error {
+	if currentVersion != expectedVersion {
+		return errors.WithStack(ErrCatalogVersionMismatch)
+	}
+	return errors.WithStack(ErrCatalogSplitJobConflict)
+}
+
+func (s *CatalogStore) resolvePromotionCompleteInputConflict(
+	ctx context.Context,
+	readTS uint64,
+	currentVersion uint64,
+	expectedVersion uint64,
+	expected SplitJob,
+	expectedRaw []byte,
+	currentJob SplitJob,
+) (uint64, uint64, []RouteDescriptor, SplitJob, bool, error) {
+	alreadyApplied, routes, err := s.promotionCompleteAlreadyAppliedAt(ctx, readTS, expected, expectedRaw, currentJob)
+	if err != nil {
+		return 0, 0, nil, SplitJob{}, false, err
+	}
+	if alreadyApplied {
+		return readTS, currentVersion, routes, currentJob, true, nil
+	}
+	if currentVersion != expectedVersion {
+		return 0, 0, nil, SplitJob{}, false, errors.WithStack(ErrCatalogVersionMismatch)
+	}
+	return 0, 0, nil, SplitJob{}, false, errors.WithStack(ErrCatalogSplitJobConflict)
+}
+
+func (s *CatalogStore) promotionCompleteAlreadyAppliedAt(ctx context.Context, ts uint64, expected SplitJob, expectedRaw []byte, current SplitJob) (bool, []RouteDescriptor, error) {
+	matches, err := promotionCompleteJobMatchesExpected(expected, expectedRaw, current)
+	if err != nil || !matches {
+		return false, nil, err
+	}
+	routes, err := s.routesAt(ctx, ts)
+	if err != nil {
+		return false, nil, err
+	}
+	if !targetClearedDescriptorPresent(current, routes) {
+		return false, nil, errors.WithStack(ErrMigrationPromotionTargetAbsent)
+	}
+	return true, routes, nil
+}
+
+func promotionCompleteJobMatchesExpected(expected SplitJob, expectedRaw []byte, current SplitJob) (bool, error) {
+	if expected.TargetPromotionDone || !current.TargetPromotionDone || current.PromotionCompletedTS == 0 {
+		return false, nil
+	}
+	normalized := CloneSplitJob(current)
+	normalized.TargetPromotionDone = expected.TargetPromotionDone
+	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
+	normalized.UpdatedAtMs = expected.UpdatedAtMs
+	raw, err := EncodeSplitJob(normalized)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(raw, expectedRaw), nil
 }
 
 func (s *CatalogStore) buildPromotionCompleteMutations(
