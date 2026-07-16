@@ -167,6 +167,36 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "0", "*", "event", "trimmed")
 	require.Empty(t, events)
 }
 
+func TestRedis_LuaXAddMaxLenZeroThenAppendInScript(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const stream = "bull:test:events-maxlen0-then-append"
+	result, err := rdb.Eval(ctx, `
+local trimmed = redis.call("XADD", KEYS[1], "MAXLEN", "0", "*", "event", "trimmed")
+local kept = redis.call("XADD", KEYS[1], "MAXLEN", "1", "*", "event", "kept")
+return {trimmed, kept}
+`, []string{stream}).Result()
+	require.NoError(t, err)
+	ids, ok := result.([]any)
+	require.True(t, ok)
+	require.Len(t, ids, 2)
+
+	xlen, err := rdb.XLen(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), xlen)
+
+	events, err := rdb.XRange(ctx, stream, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, ids[1], events[0].ID)
+	require.Equal(t, map[string]any{"event": "kept"}, events[0].Values)
+}
+
 func TestRedis_LuaXAddMultipleMaxLenTrimsInScript(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
