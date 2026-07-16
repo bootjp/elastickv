@@ -93,6 +93,7 @@ type ExportVersionsOptions struct {
 	MaxScannedBytes      uint64
 	KeyFamily            uint32
 	AcceptKey            func([]byte) bool
+	AcceptVersion        func(key []byte, value []byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.

@@ -253,6 +253,14 @@ func (s *pebbleStore) exportPebbleVersion(
 		if err != nil {
 			return false, err
 		}
+		if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
+			result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+			if finishExportIfLimited(opts, result) {
+				result.Done = false
+				return false, nil
+			}
+			return true, nil
+		}
 		result.Versions = append(result.Versions, version)
 		result.ExportedBytes += versionExportSize(userKey, len(version.Value))
 		result.AcceptedRows++

@@ -70,6 +70,24 @@ func TestExportVersionsExcludesTxnLocks(t *testing.T) {
 	})
 }
 
+func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("drop"), []byte("legacy-meta"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("keep"), []byte("legacy-delta"), 20, 0))
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxVersions: 10,
+			AcceptVersion: func(_ []byte, value []byte) bool {
+				return bytes.Equal(value, []byte("legacy-delta"))
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, result.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("keep"), CommitTS: 20, Value: []byte("legacy-delta")}}, result.Versions)
+	})
+}
+
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

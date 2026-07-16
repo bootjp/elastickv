@@ -232,6 +232,13 @@ func (b MigrationBracket) ContainsRawKey(rawKey []byte) bool {
 // route ownership predicate. S3 bucket-level auxiliary rows do not encode an
 // object route key, so they are matched by bucket route-prefix intersection.
 func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte, routeKey func([]byte) []byte) bool {
+	return b.ContainsRoutedVersion(rawKey, nil, routeStart, routeEnd, routeKey)
+}
+
+// ContainsRoutedVersion is the value-aware variant of ContainsRoutedKey. It is
+// needed for legacy list metadata because old delta keys overlap byte-for-byte
+// with base metadata keys whose user key begins with "d|".
+func (b MigrationBracket) ContainsRoutedVersion(rawKey, value, routeStart, routeEnd []byte, routeKey func([]byte) []byte) bool {
 	if !b.ContainsRawKey(rawKey) {
 		return false
 	}
@@ -240,7 +247,7 @@ func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte,
 		return b.containsDecodedS3Route(rawKey, routeStart, routeEnd)
 	}
 	if b.Family == MigrationFamilyLegacyListMetaDelta {
-		return b.containsLegacyListMetaDeltaRoute(rawKey, routeStart, routeEnd)
+		return b.containsLegacyListMetaDeltaRoute(rawKey, value, routeStart, routeEnd)
 	}
 	if !b.RequiresRouteKeyCheck {
 		return true
@@ -251,9 +258,11 @@ func (b MigrationBracket) ContainsRoutedKey(rawKey, routeStart, routeEnd []byte,
 	return routeKeyInRange(routeKey(rawKey), routeStart, routeEnd)
 }
 
-func (b MigrationBracket) containsLegacyListMetaDeltaRoute(rawKey, routeStart, routeEnd []byte) bool {
-	return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd) ||
-		routeKeyInRange(store.ExtractListUserKey(rawKey), routeStart, routeEnd)
+func (b MigrationBracket) containsLegacyListMetaDeltaRoute(rawKey, value, routeStart, routeEnd []byte) bool {
+	if value != nil && !store.IsListMetaDeltaValue(value) {
+		return routeKeyInRange(store.ExtractListUserKey(rawKey), routeStart, routeEnd)
+	}
+	return routeKeyInRange(store.ExtractLegacyListUserKeyFromDelta(rawKey), routeStart, routeEnd)
 }
 
 func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {
