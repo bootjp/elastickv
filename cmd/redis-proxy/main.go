@@ -23,6 +23,8 @@ const (
 	sentryFlushTimeout          = 2 * time.Second
 	metricsShutdownTimeout      = 5 * time.Second
 	secondaryConcurrencyDivisor = 2
+	elasticKVDispatchTimeout    = 10 * time.Second
+	backendTimeoutGrace         = time.Second
 )
 
 func main() {
@@ -121,6 +123,7 @@ func newBackends(cfg proxy.ProxyConfig, primaryPoolSize, elasticKVPoolSize int, 
 	secondaryOpts.DB = cfg.SecondaryDB
 	secondaryOpts.Password = cfg.SecondaryPassword
 	secondaryOpts.PoolSize = elasticKVPoolSize
+	alignElasticKVBackendTimeouts(&secondaryOpts, cfg.SecondaryTimeout)
 
 	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
 	if len(secondarySeeds) == 0 {
@@ -142,6 +145,23 @@ func newBackends(cfg proxy.ProxyConfig, primaryPoolSize, elasticKVPoolSize int, 
 			proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger), nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported mode: %s", cfg.Mode.String())
+	}
+}
+
+func alignElasticKVBackendTimeouts(opts *proxy.BackendOptions, operationTimeout time.Duration) {
+	if opts == nil {
+		return
+	}
+	floor := elasticKVDispatchTimeout
+	if operationTimeout > floor {
+		floor = operationTimeout
+	}
+	floor += backendTimeoutGrace
+	if opts.ReadTimeout > 0 && opts.ReadTimeout < floor {
+		opts.ReadTimeout = floor
+	}
+	if opts.WriteTimeout > 0 && opts.WriteTimeout < floor {
+		opts.WriteTimeout = floor
 	}
 }
 
