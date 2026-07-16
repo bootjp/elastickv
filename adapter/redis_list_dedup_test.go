@@ -39,8 +39,12 @@ type dedupTestCoordinator struct {
 	// WITHOUT applying — an ambiguous retryable error distinct from
 	// WriteConflict, exercising the "advance pending.commitTS and retry" branch.
 	txnLockedAtDispatch int
-	dispatches          int
-	probeNoOps          int
+	// routeFenceAtDispatch makes the named dispatch return ErrRouteWriteFenced
+	// before the FSM dedup probe or apply. It is retryable but cannot be
+	// treated as an ambiguous landing.
+	routeFenceAtDispatch int
+	dispatches           int
+	probeNoOps           int
 	// beforeDispatch, if set, runs at the start of each Dispatch with the
 	// 1-based dispatch number — lets a test inject a concurrent commit
 	// between the adapter's attempts.
@@ -74,6 +78,24 @@ func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
 	require.Equal(t, int64(9), meta.Head)
 	require.Equal(t, int64(5), meta.Len)
 	require.Equal(t, int64(14), meta.Tail)
+}
+
+func TestResolveListMetaEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("list-delta-cap")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, i, 0), delta, i, 0))
+	}
+	legacyTS := uint64(store.MaxDeltaScanLimit + 1)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, legacyTS), delta, legacyTS, 0))
+
+	_, _, err := srv.resolveListMeta(ctx, key, legacyTS)
+	require.ErrorIs(t, err, ErrDeltaScanTruncated)
 }
 
 func TestResolveListMetaDoesNotTreatDeltaLookingMetaValueAsLegacyDelta(t *testing.T) {
@@ -258,16 +280,14 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	if c.beforeDispatch != nil {
 		c.beforeDispatch(n)
 	}
+	if c.shouldRouteFence(n) {
+		return nil, kv.ErrRouteWriteFenced
+	}
 	if handled, resp, err := c.maybeProbe(ctx, req); handled {
 		return resp, err
 	}
-	if n == c.ambiguousDispatch && !c.ambiguousLands {
-		// OCC-style pre-reject: nothing is written, definitely did not land.
-		return nil, store.ErrWriteConflict
-	}
-	if n == c.txnLockedAtDispatch {
-		// Ambiguous lock error, nothing written: definitely did not land.
-		return nil, kv.ErrTxnLocked
+	if err := c.preApplyError(n); err != nil {
+		return nil, err
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
@@ -285,6 +305,21 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return nil, store.ErrWriteConflict
 	}
 	return resp, nil
+}
+
+func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {
+	return dispatch == c.routeFenceAtDispatch
+}
+
+func (c *dedupTestCoordinator) preApplyError(dispatch int) error {
+	switch {
+	case dispatch == c.ambiguousDispatch && !c.ambiguousLands:
+		return store.ErrWriteConflict
+	case dispatch == c.txnLockedAtDispatch:
+		return kv.ErrTxnLocked
+	default:
+		return nil
+	}
 }
 
 // maybeProbe mimics handleOnePhaseTxnRequest's exact-ts dedup check. It
@@ -363,6 +398,27 @@ func TestListPushDedup_LandedPriorAttempt_NoDuplicate(t *testing.T) {
 	val, err := st.GetAt(ctx, listItemKey(key, meta.Head), readTS)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), val)
+}
+
+func TestListPushDedup_RouteFenceRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.routeFenceAtDispatch = 2
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	key := []byte("mylist")
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+	require.Equal(t, 3, coord.dispatches, "attempt 1 landed, route-fenced reuse, then dedup probe retry")
+	require.Equal(t, 1, coord.probeNoOps, "route-fenced reuse must not replace the prior landed probe")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len, "route-fence retry must not append a duplicate")
 }
 
 // TestListPushDedup_PriorAttemptDidNotLand_Applies covers the truncated case:

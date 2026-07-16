@@ -213,12 +213,27 @@ func TestToRawRequestLeavesTsForLeaderStamping(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := c.toRawRequest(tc.req)
+			r := c.toRawRequest(tc.req, 0)
 			require.NotNil(t, r)
 			require.Equal(t, uint64(0), r.Ts,
 				"forwarded raw requests must arrive with Ts==0 so the leader's stampRawTimestamps assigns the canonical ts (HLC leader-only invariant + HLC-4 (iii) fence)")
 		})
 	}
+}
+
+func TestBuildRedirectRequests_PreservesRawObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	c := &Coordinate{}
+	got, err := c.buildRedirectRequests(&OperationGroup[OP]{
+		ObservedRouteVersion: 17,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(17), got[0].GetObservedRouteVersion())
 }
 
 // TestBuildRedirectRequestsSurvivesStaleFollowerCeiling exercises the

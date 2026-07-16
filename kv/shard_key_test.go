@@ -306,7 +306,7 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 			name:      "dynamo table cleanup prefix",
 			prefix:    []byte(DynamoItemPrefix + tableSegment + "|7|"),
 			wantStart: dynamoTableRoute,
-			wantEnd:   prefixScanEnd(dynamoTableRoute),
+			wantEnd:   routePointRangeEnd(dynamoTableRoute),
 		},
 		{
 			name:      "broad redis namespace",
@@ -323,8 +323,14 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 		{
 			name:      "s3 bucket cleanup prefix",
 			prefix:    s3keys.ObjectManifestPrefixForBucket("bucket", 2),
-			wantStart: []byte(""),
-			wantEnd:   nil,
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
+		},
+		{
+			name:      "s3 bucket cleanup route prefix",
+			prefix:    s3keys.RoutePrefixForBucket("bucket", 2),
+			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),
+			wantEnd:   prefixScanEnd(s3keys.RoutePrefixForBucket("bucket", 2)),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -335,6 +341,32 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 			require.Equal(t, tc.wantEnd, end)
 		})
 	}
+}
+
+func TestRoutePrefixRangeTreatsDynamoCleanupAsExactRouteKey(t *testing.T) {
+	t.Parallel()
+
+	fooSegment := base64.RawURLEncoding.EncodeToString([]byte("foo"))
+	foobarSegment := base64.RawURLEncoding.EncodeToString([]byte("foobar"))
+	fooRoute := dynamoRouteTableKey([]byte(fooSegment))
+	foobarRoute := dynamoRouteTableKey([]byte(foobarSegment))
+
+	start, end := routePrefixRange([]byte(DynamoItemPrefix + fooSegment + "|7|"))
+
+	require.Equal(t, fooRoute, start)
+	require.Equal(t, routePointRangeEnd(fooRoute), end)
+	require.False(t, rangesIntersectForTest(start, end, foobarRoute, prefixScanEnd(foobarRoute)),
+		"cleanup for table foo must not intersect table foobar's route")
+}
+
+func rangesIntersectForTest(aStart, aEnd, bStart, bEnd []byte) bool {
+	if aEnd != nil && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if bEnd != nil && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
 }
 
 func TestRouteKeyFilterTreatsNilAndEmptyEndAsInfinity(t *testing.T) {

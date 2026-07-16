@@ -169,6 +169,41 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 		"HLC renewal should resume after startup rotation blocker clears")
 }
 
+func TestCoordinate_RunHLCLeaseRenewal_UsesRenewalTimeout(t *testing.T) {
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+	deadline := make(chan time.Duration, 1)
+	eng.proposeCtxHook = func(ctx context.Context) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			deadline <- 0
+			return
+		}
+		deadline <- time.Until(d)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.RunHLCLeaseRenewal(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	select {
+	case got := <-deadline:
+		require.Greater(t, got, hlcRenewalInterval,
+			"HLC renewal proposal deadline must outlive the renewal cadence")
+		require.LessOrEqual(t, got, hlcRenewalTimeout,
+			"HLC renewal proposal deadline must remain bounded")
+	case <-time.After(2 * hlcRenewalInterval):
+		t.Fatal("timed out waiting for HLC renewal proposal")
+	}
+}
+
 // TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the
 // sharded renewal path warms the target group's lease on a successful
 // propose, so LeaseReadForKey on a key owned by that group serves from the
@@ -292,6 +327,35 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 	require.Equal(t, uint64(200), idx)
 	require.Equal(t, int32(0), eng2.linearizableCalls.Load(),
 		"the non-default group lease must be warmed by all-group renewal")
+}
+
+func TestShardedCoordinator_RenewHLCLeases_UsesRenewalTimeout(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	deadline := make(chan time.Duration, 1)
+	eng1.proposeCtxHook = func(ctx context.Context) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			deadline <- 0
+			return
+		}
+		deadline <- time.Until(d)
+	}
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	select {
+	case got := <-deadline:
+		require.Greater(t, got, hlcRenewalInterval,
+			"HLC renewal proposal deadline must outlive the renewal cadence")
+		require.LessOrEqual(t, got, hlcRenewalTimeout,
+			"HLC renewal proposal deadline must remain bounded")
+	default:
+		t.Fatal("missing HLC renewal proposal deadline sample")
+	}
 }
 
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {

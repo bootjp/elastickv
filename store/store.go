@@ -65,8 +65,9 @@ func (e *WriteConflictError) Unwrap() error {
 }
 
 type KVPair struct {
-	Key   []byte
-	Value []byte
+	Key          []byte
+	Value        []byte
+	RouteGroupID uint64
 }
 
 // MVCCVersion is a raw committed MVCC version for range migration.

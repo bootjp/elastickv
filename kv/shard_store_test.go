@@ -657,6 +657,26 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 	}
 }
 
+func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTwoRouteShardStoreForScanTest()
+	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10, 1)
+	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11, 1)
+	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte(store.LegacyListMetaDeltaPrefix), store.PrefixScanEnd([]byte(store.LegacyListMetaDeltaPrefix)), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, leftKey, kvs[0].Key)
+	require.Equal(t, uint64(1), kvs[0].RouteGroupID)
+	require.Equal(t, rightKey, kvs[1].Key)
+	require.Equal(t, uint64(2), kvs[1].RouteGroupID)
+}
+
 func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
 	t.Parallel()
 

@@ -700,10 +700,6 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
-	if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
-		return resp, err
-	}
-
 	// Capture whether the caller supplied a non-zero StartTS BEFORE
 	// the coordinator-allocates-on-zero branch below mutates the
 	// field.  A caller-supplied StartTS names a specific snapshot
@@ -735,10 +731,13 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
+		if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
+			return resp, err
+		}
 		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
-	return c.dispatchNonTxn(ctx, reqs)
+	return c.dispatchRawWithComposed1Retry(ctx, reqs)
 }
 
 func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, bool, error) {
@@ -746,7 +745,7 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
+		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems, reqs.ObservedRouteVersion)
 		return resp, true, err
 	}
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
@@ -814,16 +813,17 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 //     gate spuriously rejects resolver-routed commits even when
 //     the resolver picked the correct gid.  Skip the auto-pin
 //     for any resolver-recognised key; the request flows with
-//     ObservedRouteVersion=0 and the M3 gate short-circuits —
-//     restoring the pre-auto-pin behaviour for resolver-routed
-//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
-//     6a458a28, PR #900).
+//     ObservedRouteVersion=0 and the Composed-1 owner gate
+//     short-circuits — restoring the pre-auto-pin behaviour for
+//     resolver-routed txns.  Resolver-aware M3 is M5+ work (PR #900).
 //
 // The non-auto-pin case (request flows with ObservedRouteVersion=0,
-// M3 gate short-circuits) is the safe non-regressing posture for
-// non-migrated callers — the gate cannot retroactively pin reads
-// it was not present for.  Adapters that want M3 protection must
-// migrate to pin at BeginTxn per §4.1.
+// Composed-1 owner gate short-circuits) is the safe non-regressing
+// posture for non-migrated callers — the owner gate cannot
+// retroactively pin reads it was not present for.  The write-fence
+// gate still checks the current route snapshot at apply time.
+// Adapters that want full M3 owner protection must migrate to pin at
+// BeginTxn per §4.1.
 //
 // Extracted from dispatchTxnWithComposed1Retry to keep its
 // cyclomatic complexity in the cyclop budget.
@@ -995,6 +995,54 @@ func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *Operation
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
 }
 
+func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
+		if !handled {
+			resp, err = c.dispatchNonTxn(ctx, reqs)
+		}
+		if err == nil {
+			return resp, nil
+		}
+		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+			return resp, err
+		}
+		if !c.canRetryRawVersionGC(reqs) {
+			return resp, err
+		}
+		reqs.ObservedRouteVersion = c.engine.Version()
+	}
+	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+func (c *ShardedCoordinator) canRetryRawVersionGC(reqs *OperationGroup[OP]) bool {
+	if c == nil || c.router == nil || reqs == nil || hasDelPrefixElem(reqs.Elems) {
+		return false
+	}
+	var (
+		firstGID uint64
+		seen     bool
+	)
+	for _, elem := range reqs.Elems {
+		if elem == nil {
+			return false
+		}
+		gid, ok := c.router.ResolveGroup(elem.Key)
+		if !ok {
+			return false
+		}
+		if !seen {
+			firstGID = gid
+			seen = true
+			continue
+		}
+		if gid != firstGID {
+			return false
+		}
+	}
+	return seen
+}
+
 // hasDelPrefixElem returns true if any element is a DelPrefix operation.
 func hasDelPrefixElem(elems []*Elem[OP]) bool {
 	for _, e := range elems {
@@ -1021,7 +1069,7 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 // to every shard group. Each element becomes a separate pb.Request (the FSM's
 // extractDelPrefix processes only the first DEL_PREFIX mutation per request).
 // All requests are batched into a single Commit call per shard group.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP], observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
 	}
@@ -1042,10 +1090,11 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: []*pb.Mutation{elemToMutation(elem)},
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            []*pb.Mutation{elemToMutation(elem)},
+			ObservedRouteVersion: observedRouteVersion,
 		})
 	}
 
@@ -1068,6 +1117,9 @@ func (c *ShardedCoordinator) rejectWriteFencedPointElems(elems []*Elem[OP]) erro
 }
 
 func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
+	if c.partitionResolverRecognisesPointKey(key) {
+		return nil
+	}
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
 		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
@@ -1082,6 +1134,52 @@ func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) partitionResolverRecognisesPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	if _, ok := c.router.partitionResolver.ResolveGroup(key); ok {
+		return true
+	}
+	return c.router.partitionResolver.RecognisesPartitionedKey(key)
+}
+
+func (c *ShardedCoordinator) resolverClaimedWriteFenceBypassKeysForElems(elems []*Elem[OP]) [][]byte {
+	if len(elems) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(elems))
+	for _, elem := range elems {
+		if elem == nil || elem.Op == DelPrefix || !c.partitionResolverClaimsPointKey(elem.Key) {
+			continue
+		}
+		out = append(out, bytes.Clone(elem.Key))
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) resolverClaimedWriteFenceBypassKeys(muts []*pb.Mutation) [][]byte {
+	if len(muts) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(muts))
+	for _, mut := range muts {
+		if mut == nil || mut.GetOp() == pb.Op_DEL_PREFIX || !c.partitionResolverClaimsPointKey(mut.Key) {
+			continue
+		}
+		out = append(out, bytes.Clone(mut.Key))
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) partitionResolverClaimsPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	_, ok := c.router.partitionResolver.ResolveGroup(key)
+	return ok
 }
 
 func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) error {
@@ -1340,7 +1438,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	// carries the one-phase dedup probe key for a retry that reuses a failed
 	// attempt's write set.
 	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, c.resolverClaimedWriteFenceBypassKeysForElems(elems)),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1414,6 +1512,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			Mutations:            append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
 			ReadKeys:             groupedReadKeys[gid],
 			ObservedRouteVersion: observedRouteVersion,
+			WriteFenceBypassKeys: c.resolverClaimedWriteFenceBypassKeys(grouped[gid]),
 		}
 		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
 			// Same WithoutCancel pattern as dispatchTxn's
@@ -1466,6 +1565,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		Ts:                   startTS,
 		Mutations:            append([]*pb.Mutation{meta}, keys...),
 		ObservedRouteVersion: observedRouteVersion,
+		WriteFenceBypassKeys: c.resolverClaimedWriteFenceBypassKeys(keys),
 	}
 
 	r, err := g.Txn.Commit(ctx, []*pb.Request{req})
@@ -1515,6 +1615,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			Ts:                   startTS,
 			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
 			ObservedRouteVersion: observedRouteVersion,
+			WriteFenceBypassKeys: c.resolverClaimedWriteFenceBypassKeys(grouped[gid]),
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
@@ -2225,10 +2326,12 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 			return nil, err
 		}
 		logs = append(logs, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: grouped[gid],
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            grouped[gid],
+			ObservedRouteVersion: reqs.ObservedRouteVersion,
+			WriteFenceBypassKeys: c.resolverClaimedWriteFenceBypassKeys(grouped[gid]),
 		})
 	}
 	return logs, nil
@@ -2287,7 +2390,11 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err != nil {
 		return nil, err
 	}
-	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion)
+	bypassKeysByGroup := make(map[uint64][][]byte, len(grouped))
+	for gid, muts := range grouped {
+		bypassKeysByGroup[gid] = c.resolverClaimedWriteFenceBypassKeys(muts)
+	}
+	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
 }
 
 // observeMutation: counted pre-commit, so a mutation that subsequently
@@ -2341,8 +2448,18 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		gid, routeID, ok := c.resolveGroupAndRouteForKey(mut.Key)
-		if !ok {
+		gid := req.GroupID
+		_, routeID, routeOK := c.resolveGroupAndRouteForKey(mut.Key)
+		if gid == 0 {
+			resolvedGID, resolvedRouteID, ok := c.resolveGroupAndRouteForKey(mut.Key)
+			if !ok {
+				return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+			}
+			gid = resolvedGID
+			routeID = resolvedRouteID
+		} else if _, ok := c.groups[gid]; !ok {
+			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
+		} else if !routeOK {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
 		c.observeMutation(routeID, mut, label)
@@ -2356,7 +2473,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 	return grouped, gids, nil
 }
 
-func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64) ([]*pb.Request, error) {
+func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64, writeFenceBypassKeysByGroup map[uint64][][]byte) ([]*pb.Request, error) {
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
@@ -2373,6 +2490,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
 				}, muts...),
 				ObservedRouteVersion: observedRouteVersion,
+				WriteFenceBypassKeys: writeFenceBypassKeysByGroup[gid],
 			},
 			&pb.Request{
 				IsTxn: true,
@@ -2382,6 +2500,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
 				}, keys...),
 				ObservedRouteVersion: observedRouteVersion,
+				WriteFenceBypassKeys: writeFenceBypassKeysByGroup[gid],
 			},
 		)
 	}
@@ -2469,7 +2588,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		go func(gid uint64, group *ShardGroup) {
 			defer wg.Done()
 			defer c.finishHLCLeaseRenewal(gid)
-			pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+			pctx, cancel := context.WithTimeout(ctx, hlcRenewalTimeout)
 			defer cancel()
 			c.renewHLCLease(pctx, gid, group)
 		}(gid, group)

@@ -208,6 +208,11 @@ type Request struct {
 	// is plumbing only — the FSM ignores the value, so all existing
 	// callers see no behaviour change.
 	ObservedRouteVersion uint64 `protobuf:"varint,6,opt,name=observed_route_version,json=observedRouteVersion,proto3" json:"observed_route_version,omitempty"`
+	// write_fence_bypass_keys carries point keys whose owner was resolved by a
+	// higher-level partition resolver before the request was appended to Raft.
+	// The FSM uses it only to skip the byte-route write fence for those exact
+	// point mutations; prefix deletes and unmarked keys still fail closed.
+	WriteFenceBypassKeys [][]byte `protobuf:"bytes,7,rep,name=write_fence_bypass_keys,json=writeFenceBypassKeys,proto3" json:"write_fence_bypass_keys,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -282,6 +287,13 @@ func (x *Request) GetObservedRouteVersion() uint64 {
 		return x.ObservedRouteVersion
 	}
 	return 0
+}
+
+func (x *Request) GetWriteFenceBypassKeys() [][]byte {
+	if x != nil {
+		return x.WriteFenceBypassKeys
+	}
+	return nil
 }
 
 type RaftCommand struct {
@@ -939,14 +951,15 @@ const file_internal_proto_rawDesc = "" +
 	"\bMutation\x12\x13\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x03.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\fR\x05value\"\xca\x01\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\"\x81\x02\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12'\n" +
 	"\tmutations\x18\x04 \x03(\v2\t.MutationR\tmutations\x12\x1b\n" +
 	"\tread_keys\x18\x05 \x03(\fR\breadKeys\x124\n" +
-	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\"3\n" +
+	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
+	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +

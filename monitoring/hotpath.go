@@ -98,7 +98,7 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 		stepQueueFullTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_step_queue_full_total",
-				Help: "Inbound raft messages that could not be enqueued because the selected step queue was full; indicates the raft loop is starved (classic pre-#560 seek-storm symptom).",
+				Help: "Inbound raft messages that found the selected step queue full. Blocking replication messages wait for space; best-effort messages may still be rejected. Indicates the raft loop is starved.",
 			},
 			[]string{"group"},
 		),

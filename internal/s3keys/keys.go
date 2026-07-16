@@ -245,6 +245,41 @@ func RoutePrefixForBucketAnyGeneration(bucket string) []byte {
 	return out
 }
 
+func BucketGenerationRoutePrefixForCleanupPrefix(prefix []byte) ([]byte, bool) {
+	familyPrefix := bucketGenerationFamilyPrefix(prefix)
+	if familyPrefix == nil {
+		return nil, false
+	}
+	bucketRaw, next, ok := decodeSegment(prefix, len(familyPrefix))
+	if !ok {
+		return nil, false
+	}
+	generation, next, ok := readU64(prefix, next)
+	if !ok || next != len(prefix) {
+		return nil, false
+	}
+	return RoutePrefixForBucket(string(bucketRaw), generation), true
+}
+
+func bucketGenerationFamilyPrefix(key []byte) []byte {
+	switch {
+	case bytes.HasPrefix(key, objectManifestPrefixBytes):
+		return objectManifestPrefixBytes
+	case bytes.HasPrefix(key, uploadMetaPrefixBytes):
+		return uploadMetaPrefixBytes
+	case bytes.HasPrefix(key, uploadPartPrefixBytes):
+		return uploadPartPrefixBytes
+	case bytes.HasPrefix(key, blobPrefixBytes):
+		return blobPrefixBytes
+	case bytes.HasPrefix(key, gcUploadPrefixBytes):
+		return gcUploadPrefixBytes
+	case bytes.HasPrefix(key, routePrefixBytes):
+		return routePrefixBytes
+	default:
+		return nil
+	}
+}
+
 func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {
 	out := make([]byte, 0, len(prefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
 	out = append(out, prefix...)

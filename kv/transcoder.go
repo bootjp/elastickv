@@ -19,6 +19,9 @@ type Elem[T OP] struct {
 	Op    T
 	Key   []byte
 	Value []byte
+	// GroupID optionally pins this mutation to a shard group. Zero preserves
+	// normal key-based routing.
+	GroupID uint64
 }
 
 // OperationGroup is a group of operations that should be executed atomically.

@@ -445,6 +445,9 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
 	}
+	if isBroadLegacyListDeltaScan(start) {
+		return s.engine.GetIntersectingRoutes(nil, nil), false
+	}
 	if routes, ok := s.routesForLegacyListDeltaScan(start, end); ok {
 		return routes, false
 	}
@@ -538,6 +541,19 @@ func (s *ShardStore) routesForLegacyListDeltaScan(start []byte, end []byte) ([]d
 		routes = append(routes, s.engine.GetIntersectingRoutes(storedStart, storedEnd)...)
 	}
 	return routes, true
+}
+
+func isBroadLegacyListDeltaScan(start []byte) bool {
+	prefix := []byte(store.LegacyListMetaDeltaPrefix)
+	if !bytes.HasPrefix(start, prefix) {
+		return false
+	}
+	logicalUserKey := store.ExtractLegacyListUserKeyFromDeltaScanPrefix(start)
+	return logicalUserKey == nil || !bytes.Equal(start, store.LegacyListMetaDeltaScanPrefix(logicalUserKey))
+}
+
+func shouldMarkRouteGroupOnScan(start []byte, explicitGroup bool, routeStart []byte, routeEnd []byte) bool {
+	return !explicitGroup && !routeScanBoundsPresent(routeStart, routeEnd) && isBroadLegacyListDeltaScan(start)
 }
 
 func scanRouteUserKey(start []byte) []byte {
@@ -798,17 +814,19 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil, nil
 	}
+	markRouteGroup := shouldMarkRouteGroupOnScan(start, explicitGroup, routeStart, routeEnd)
 
 	if engineForGroup(g) == nil {
 		kvs, err := s.scanRouteLocal(ctx, g, route, start, end, limit, ts, reverse)
 		if err != nil {
 			return nil, nil, errors.WithStack(err)
 		}
-		return filterTxnInternalKVs(kvs), kvs, nil
+		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), markScanRouteGroup(kvs, route.GroupID, markRouteGroup), nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		return s.scanRouteAtLeaderRouteFilter(ctx, g, route, start, end, limit, visibleLimit, ts, reverse, routeStart, routeEnd)
+		kvs, cursorKVs, err := s.scanRouteAtLeaderRouteFilter(ctx, g, route, start, end, limit, visibleLimit, ts, reverse, routeStart, routeEnd)
+		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), markScanRouteGroup(cursorKVs, route.GroupID, markRouteGroup), err
 	}
 
 	groupID := proxyScanGroupID(route, explicitGroup, routeStart, routeEnd)
@@ -817,7 +835,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 		return nil, nil, err
 	}
 	filtered := filterTxnInternalKVs(kvs)
-	return filtered, kvs, nil
+	return markScanRouteGroup(filtered, route.GroupID, markRouteGroup), markScanRouteGroup(kvs, route.GroupID, markRouteGroup), nil
 }
 
 func proxyScanGroupID(route distribution.Route, explicitGroup bool, routeStart []byte, routeEnd []byte) uint64 {
@@ -844,17 +862,19 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil
 	}
+	markRouteGroup := shouldMarkRouteGroupOnScan(start, explicitGroup, routeStart, routeEnd)
 
 	if engineForGroup(g) == nil {
 		kvs, err := s.scanRouteLocal(ctx, g, route, start, end, limit, ts, reverse)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return filterTxnInternalKVs(kvs), nil
+		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		return s.scanRouteAtLeader(ctx, g, route, start, end, limit, ts, reverse)
+		kvs, err := s.scanRouteAtLeader(ctx, g, route, start, end, limit, ts, reverse)
+		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), err
 	}
 
 	groupID := proxyScanGroupID(route, explicitGroup, routeStart, routeEnd)
@@ -864,7 +884,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	}
 	// The leader's RawScanAt is expected to perform lock resolution and filtering
 	// via ShardStore.ScanAt, so avoid N+1 proxy gets here.
-	return filterTxnInternalKVs(kvs), nil
+	return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), nil
 }
 
 const routeFilteredScanBatchMin = 128
@@ -978,6 +998,7 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 	if !ok || g == nil || g.Store == nil {
 		return nil, false, nil
 	}
+	markRouteGroup := shouldMarkRouteGroupOnScan(start, false, nil, nil)
 
 	if engineForGroup(g) == nil {
 		if routeHasStagedVisibility(route) {
@@ -987,14 +1008,15 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 		if err != nil {
 			return nil, limitReached, errors.WithStack(err)
 		}
-		return filterTxnInternalKVs(kvs), limitReached, nil
+		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), limitReached, nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		if routeHasStagedVisibility(route) {
 			return nil, true, nil
 		}
-		return s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
+		kvs, limitReached, err := s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
+		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), limitReached, err
 	}
 
 	// RawScanAt cannot enforce physicalLimit, so report truncation and let
@@ -2212,6 +2234,18 @@ func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
 		out = append(out, kvp)
 	}
 	return out
+}
+
+func markScanRouteGroup(kvs []*store.KVPair, groupID uint64, mark bool) []*store.KVPair {
+	if !mark || groupID == 0 {
+		return kvs
+	}
+	for _, kvp := range kvs {
+		if kvp != nil {
+			kvp.RouteGroupID = groupID
+		}
+	}
+	return kvs
 }
 
 type txnStatus int

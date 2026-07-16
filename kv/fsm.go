@@ -494,6 +494,9 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	// DEL_PREFIX mutations are handled by the store's DeletePrefixAt which
 	// scans and writes tombstones locally. A DEL_PREFIX request must be the
 	// sole mutation in a request (enforced by the coordinator's toRawRequest).
@@ -501,7 +504,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return f.handleDelPrefix(ctx, prefix, commitTS)
 	}
 
-	if err := f.validateRawMutationsForApply(ctx, r.Mutations); err != nil {
+	if err := f.validateRawMutationsForApply(ctx, r); err != nil {
 		return err
 	}
 
@@ -518,16 +521,17 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	return nil
 }
 
-func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, muts []*pb.Mutation) error {
-	for _, mut := range muts {
-		if err := f.validateRawMutationForApply(ctx, mut); err != nil {
+func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, r *pb.Request) error {
+	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
+	for _, mut := range r.GetMutations() {
+		if err := f.validateRawMutationForApply(ctx, mut, bypassKeys); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation) error {
+func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, writeFenceBypassKeys map[string]struct{}) error {
 	if mut == nil || len(mut.Key) == 0 {
 		return errors.WithStack(ErrInvalidRequest)
 	}
@@ -535,8 +539,10 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 	if isTxnInternalKey(mut.Key) {
 		return errors.WithStack(ErrInvalidRequest)
 	}
-	if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
-		return err
+	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
+		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+			return err
+		}
 	}
 	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 		return err
@@ -565,18 +571,6 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
-	return nil
-}
-
-func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation) error {
-	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
-			continue
-		}
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -617,6 +611,12 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if len(prefix) == 0 {
 		return []byte(""), nil
 	}
+	if start, ok := s3keys.BucketGenerationRoutePrefixForCleanupPrefix(prefix); ok {
+		return start, prefixScanEnd(start)
+	}
+	if start, ok := dynamoExactCleanupRouteKey(prefix); ok {
+		return start, routePointRangeEnd(start)
+	}
 	if routeKeyspaceWideRawPrefix(prefix) {
 		return []byte(""), nil
 	}
@@ -627,6 +627,29 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 // RoutePrefixRange maps a raw key prefix to the routed key range it may touch.
 func RoutePrefixRange(prefix []byte) ([]byte, []byte) {
 	return routePrefixRange(prefix)
+}
+
+func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
+	switch {
+	case bytes.HasPrefix(prefix, dynamoTableMetaPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoTableGenerationPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoItemPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoGSIPrefixBytes):
+	default:
+		return nil, false
+	}
+	start := routeKey(prefix)
+	if len(start) == 0 || bytes.Equal(start, prefix) || !bytes.HasPrefix(start, dynamoRoutePrefixBytes) {
+		return nil, false
+	}
+	return start, true
+}
+
+func routePointRangeEnd(start []byte) []byte {
+	end := make([]byte, 0, len(start)+1)
+	end = append(end, start...)
+	end = append(end, 0)
+	return end
 }
 
 func routeKeyspaceWideRawPrefix(prefix []byte) bool {
@@ -737,28 +760,21 @@ func (f *kvFSM) RestoredCutover() uint64 {
 
 // ParseSnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 1 — the cold-start skip path's parse-without-side-effect
-// step. The engine has wrapped `r` in a crc32 TeeReader sized at
-// the body payload (file size minus 4-byte footer), so every byte
-// pulled from `r` flows through the engine's hash. We read the
-// v1/v2 header via ReadSnapshotHeader, then drain the rest of the
-// body so the wrapping hash covers every payload byte — matching
-// restoreAndComputeCRC's behaviour in openAndRestoreFSMSnapshot.
+// step. The skip path only needs the header state because the FSM body
+// is already present locally, so this reads the v1/v2 header and leaves
+// the remainder untouched. Full-body CRC verification still happens on
+// the restore path where the body bytes are consumed.
 //
 // IMPORTANT: this method MUST NOT touch f.hlc or f.restoredCutover.
 // The engine calls ApplySnapshotHeader separately, only after the
-// wrapping CRC verification passes. Mutating FSM state here would
-// defeat the "no side-effect on CRC failure" contract that the
-// PR #910 design §5 round-7 split is designed to preserve.
+// snapshot envelope checks pass. Mutating FSM state here would defeat
+// the "no side-effect on parse failure" contract that the PR #910
+// design §5 round-7 split is designed to preserve.
 func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
-	br := bufio.NewReaderSize(r, 1<<20) //nolint:mnd // 1 MiB, local to kv
-	ceiling, cutover, err := ReadSnapshotHeader(br)
+	const headerReadBufferSize = 4 << 10
+
+	ceiling, cutover, err := ReadSnapshotHeader(bufio.NewReaderSize(r, headerReadBufferSize))
 	if err != nil {
-		return 0, 0, errors.WithStack(err)
-	}
-	// Drain the remainder so the engine's TeeReader-wrapped CRC
-	// covers every byte of the body (LimitReader exhaustion
-	// signals "full payload consumed" to the caller).
-	if _, err := io.Copy(io.Discard, br); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
 	return ceiling, cutover, nil
@@ -766,8 +782,8 @@ func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
 
 // ApplySnapshotHeader implements raftengine.SnapshotHeaderApplier
 // phase 2 — pure assignment of the verified header state. Called
-// only after ParseSnapshotHeader returned successfully AND the
-// engine's wrapping crc32 hash matched the file footer. Mirrors
+// only after ParseSnapshotHeader returned successfully and the
+// snapshot file's footer matched the raft token. Mirrors
 // the two side-effects Restore would have applied for the header
 // portion (HLC physical ceiling + restoredCutover). See PR #910
 // design §5 round-7.
@@ -799,6 +815,9 @@ func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyWriteFence(r); err != nil {
+		return err
+	}
 	if err := f.verifyComposed1(r); err != nil {
 		return err
 	}
@@ -896,6 +915,103 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	return f.verifyOwnerFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
 }
 
+func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
+	if requestBypassesWriteFence(r) {
+		return nil
+	}
+	observedVer := r.GetObservedRouteVersion()
+	if !f.writeFenceHistoryReady() {
+		return nil
+	}
+	currentSnap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+
+	if observedVer != 0 {
+		observedSnap, ok := f.routes.SnapshotAt(observedVer)
+		if !ok {
+			return errors.WithStack(ErrComposed1VersionGCd)
+		}
+		if err := verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), observedSnap, observedVer, "observed"); err != nil {
+			return err
+		}
+		if currentSnap.Version() == observedSnap.Version() {
+			return nil
+		}
+	}
+
+	return verifyWriteFenceFromSnapshot(r.GetMutations(), r.GetWriteFenceBypassKeys(), currentSnap, currentSnap.Version(), "current")
+}
+
+func requestBypassesWriteFence(r *pb.Request) bool {
+	if !r.GetIsTxn() {
+		return false
+	}
+	switch r.GetPhase() {
+	case pb.Phase_COMMIT, pb.Phase_ABORT:
+		return true
+	case pb.Phase_NONE, pb.Phase_PREPARE:
+		return false
+	}
+	return false
+}
+
+func (f *kvFSM) writeFenceHistoryReady() bool {
+	return f.routes != nil && f.shardGroupID != 0
+}
+
+func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys [][]byte, snap RouteSnapshot, snapVer uint64, phase string) error {
+	bypassKeys := writeFenceBypassKeySet(writeFenceBypassKeys)
+	for _, mut := range mutations {
+		if mut == nil {
+			continue
+		}
+		if isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if mut.GetOp() == pb.Op_DEL_PREFIX {
+			start, end := routePrefixRange(mut.Key)
+			if snap.WriteFencedIntersects(start, end) {
+				return errors.Wrapf(ErrRouteWriteFenced,
+					"%s-version v=%d: prefix %q route range [%q,%q)",
+					phase, snapVer, mut.Key, start, end)
+			}
+			continue
+		}
+		if _, ok := bypassKeys[string(mut.Key)]; ok {
+			continue
+		}
+		rKey := routeKey(mut.Key)
+		if snap.WriteFencedForKey(rKey) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q routeKey %q",
+				phase, snapVer, mut.Key, rKey)
+		}
+		start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key)
+		if ok && snap.WriteFencedIntersects(start, end) {
+			return errors.Wrapf(ErrRouteWriteFenced,
+				"%s-version v=%d: key %q route range [%q,%q)",
+				phase, snapVer, mut.Key, start, end)
+		}
+	}
+	return nil
+}
+
+func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		out[string(key)] = struct{}{}
+	}
+	return out
+}
+
 // verifyOwnerFromSnapshot is the shared per-mutation owner-check
 // loop used by verifyComposed1's observed-version and current-
 // version passes.  `phase` is the diagnostic label ("observed" /
@@ -990,9 +1106,6 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
-		return err
-	}
 	if err := f.validateConflicts(ctx, uniq, startTS); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1059,7 +1172,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsNotFenced(muts)
+	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
 	}
@@ -1073,17 +1186,6 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	}
 	f.notifyApplyObservers(commitTS, uniq)
 	return nil
-}
-
-func (f *kvFSM) uniqueMutationsNotFenced(muts []*pb.Mutation) ([]*pb.Mutation, error) {
-	uniq, err := uniqueMutations(muts)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
-		return nil, err
-	}
-	return uniq, nil
 }
 
 func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {

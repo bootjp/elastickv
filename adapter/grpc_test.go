@@ -19,6 +19,8 @@ import (
 	goproto "google.golang.org/protobuf/proto"
 )
 
+const consistencySequenceIterations = 512
+
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
@@ -288,6 +290,36 @@ func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(55), st.scanReadRouteVersion)
 }
 
+func TestGRPCServer_ReadsHonorStartupGate(t *testing.T) {
+	t.Parallel()
+
+	blocked := true
+	s := NewGRPCServer(store.NewMVCCStore(), nil, WithGRPCReadGate(func() bool { return blocked }))
+	ctx := context.Background()
+
+	_, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{Limit: 10, Ts: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.Get(ctx, &pb.GetRequest{Key: []byte("k")})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	blocked = false
+	_, err = s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+	require.NoError(t, err)
+	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
+	require.NoError(t, err)
+}
+
 func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	t.Parallel()
 
@@ -466,7 +498,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	// not abort the test. The post-RPC assert.Equal still pins the
 	// consistency invariant: once Put eventually succeeds, the
 	// subsequent Get must return the same value, otherwise we fail.
-	for i := range 9999 {
+	for i := range consistencySequenceIterations {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
@@ -521,7 +553,7 @@ func Test_grpc_transaction(t *testing.T) {
 	// _sequence: tolerate transient leader churn (purely availability,
 	// not consistency) while keeping the Put → Get → Delete → Get
 	// invariants strict.
-	for i := range 9999 {
+	for i := range consistencySequenceIterations {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.Put(ctx, &pb.PutRequest{Key: key, Value: want})

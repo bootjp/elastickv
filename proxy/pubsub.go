@@ -470,15 +470,7 @@ func (s *pubsubSession) execTxn() {
 	s.writeMu.Unlock()
 
 	if s.proxy.dual.hasSecondaryWrite() {
-		s.proxy.dual.goAsync(func() {
-			sCtx, cancel := context.WithTimeout(context.Background(), s.proxy.cfg.SecondaryTimeout)
-			defer cancel()
-			_, pErr := s.proxy.dual.Secondary().Pipeline(sCtx, cmds)
-			if pErr != nil {
-				s.proxy.logger.Warn("secondary txn replay failed", "err", pErr)
-				s.proxy.metrics.SecondaryWriteErrors.Inc()
-			}
-		})
+		s.proxy.dual.replaySecondaryPipeline(cmds)
 	}
 }
 
