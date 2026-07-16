@@ -255,6 +255,31 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.Equal(t, uint64(40), ts)
 }
 
+func TestShardStoreDeletePrefixAtDeletesStagedVisibilityRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	dropKey := []byte("b/drop")
+	keepKey := []byte("b/keep")
+	outsideKey := []byte("c/outside")
+
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, dropKey), []byte("drop"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, keepKey), []byte("keep"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, outsideKey), []byte("outside"), 20, 0))
+
+	require.NoError(t, st.DeletePrefixAt(ctx, []byte("b/"), []byte("b/keep"), 101))
+
+	_, err := st.GetAt(ctx, dropKey, 150)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	got, err := st.GetAt(ctx, keepKey, 150)
+	require.NoError(t, err)
+	require.Equal(t, []byte("keep"), got)
+	got, err = st.GetAt(ctx, outsideKey, 150)
+	require.NoError(t, err)
+	require.Equal(t, []byte("outside"), got)
+}
+
 func TestShardStoreRouteFilteredLeaderScanUsesStagedVisibility(t *testing.T) {
 	t.Parallel()
 
