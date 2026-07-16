@@ -149,10 +149,11 @@ type PromoteVersionsResult struct {
 
 // PromotionState is the target-local durable cursor for staged data promotion.
 type PromotionState struct {
-	Cursor       []byte
-	Done         bool
-	PromotedRows uint64
-	LastError    string
+	Cursor        []byte
+	Done          bool
+	PromotedRows  uint64
+	MaxPromotedTS uint64
+	LastError     string
 }
 
 // MigrationPromoter is implemented by stores that can promote staged range

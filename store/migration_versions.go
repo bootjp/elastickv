@@ -147,7 +147,7 @@ func decodeExportCursorForOptions(opts ExportVersionsOptions) (exportCursorPosit
 	if err := validateExportCursorRange(opts, pos); err != nil {
 		return exportCursorPosition{}, err
 	}
-	return pos, nil
+	return normalizeExportCursorPositionForRange(opts, pos), nil
 }
 
 func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosition) error {
@@ -172,6 +172,16 @@ func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosit
 func exportSkippedCursorOutsideRange(opts ExportVersionsOptions, key []byte) bool {
 	return (opts.StartKey != nil && bytes.Compare(key, opts.StartKey) < 0) ||
 		(opts.EndKey != nil && bytes.Compare(key, opts.EndKey) >= 0)
+}
+
+func normalizeExportCursorPositionForRange(opts ExportVersionsOptions, pos exportCursorPosition) exportCursorPosition {
+	if !pos.hasKey || pos.tag != exportCursorTagSkippedKey || opts.StartKey == nil {
+		return pos
+	}
+	if bytes.Compare(pos.key, opts.StartKey) >= 0 {
+		return pos
+	}
+	return exportCursorPosition{}
 }
 
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
