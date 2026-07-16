@@ -2643,7 +2643,7 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store)
+			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogRouteDescriptorV2Writes(true))
 		}
 	}
 	return nil

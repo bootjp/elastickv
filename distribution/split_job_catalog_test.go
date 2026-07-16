@@ -376,11 +376,8 @@ func TestCatalogStoreRetrySplitJobRejectsMissingRetryWitness(t *testing.T) {
 	job.Phase = SplitJobPhaseFailed
 	job.RetryPhase = SplitJobPhaseNone
 
-	if err := cs.CreateSplitJob(ctx, job); err != nil {
-		t.Fatalf("create split job: %v", err)
-	}
-	if _, err := cs.RetrySplitJob(ctx, job.JobID, 1200); !errors.Is(err, ErrCatalogSplitJobCannotRetry) {
-		t.Fatalf("expected ErrCatalogSplitJobCannotRetry, got %v", err)
+	if err := cs.CreateSplitJob(ctx, job); !errors.Is(err, ErrCatalogInvalidSplitJobPhase) {
+		t.Fatalf("expected ErrCatalogInvalidSplitJobPhase, got %v", err)
 	}
 }
 

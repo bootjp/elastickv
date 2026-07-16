@@ -78,6 +78,22 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 	require.NotNil(t, catalog)
 }
 
+func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testing.T) {
+	t.Parallel()
+
+	rt := &raftGroupRuntime{
+		spec:  groupSpec{id: 5},
+		store: store.NewMVCCStore(),
+	}
+	t.Cleanup(func() {
+		rt.Close()
+	})
+
+	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{rt}, 5)
+	require.NotNil(t, catalog)
+	require.True(t, catalog.AllowsRouteDescriptorV2Writes())
+}
+
 func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 	t.Parallel()
 

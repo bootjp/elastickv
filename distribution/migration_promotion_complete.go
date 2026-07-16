@@ -204,11 +204,22 @@ func (s *CatalogStore) applyPromotionCompleteMutations(ctx context.Context, plan
 	}
 	if err := s.store.ApplyMutations(ctx, mutations, readKeys, plan.readTS, commitTS); err != nil {
 		if errors.Is(err, store.ErrWriteConflict) {
-			return errors.WithStack(ErrCatalogSplitJobConflict)
+			return s.promotionCompleteWriteConflict(ctx, plan)
 		}
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func (s *CatalogStore) promotionCompleteWriteConflict(ctx context.Context, plan savePlan) error {
+	currentVersion, err := s.versionAt(ctx, s.store.LastCommitTS())
+	if err != nil {
+		return err
+	}
+	if currentVersion != plan.nextVersion-1 {
+		return errors.WithStack(ErrCatalogVersionMismatch)
+	}
+	return errors.WithStack(ErrCatalogSplitJobConflict)
 }
 
 func targetClearedDescriptorPresent(job SplitJob, routes []RouteDescriptor) bool {

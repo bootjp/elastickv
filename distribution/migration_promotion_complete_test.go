@@ -140,6 +140,30 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionRejectsStaleInputs(t *testin
 	require.True(t, errors.Is(err, ErrCatalogSplitJobConflict), "got %v", err)
 }
 
+func TestCatalogStoreCompleteSplitJobTargetPromotionPreservesVersionConflict(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cs := NewCatalogStore(store.NewMVCCStore(), WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := cs.Save(ctx, 0, promotionCompleteTestRoutes())
+	require.NoError(t, err)
+	job := promotionCompleteTestJob()
+	require.NoError(t, cs.CreateSplitJob(ctx, job))
+
+	readTS, _, routes, err := cs.loadPromotionCompleteInputs(ctx, saved.Version, job)
+	require.NoError(t, err)
+	completion, err := CompleteTargetPromotionState(job, routes, 1000)
+	require.NoError(t, err)
+	plan, mutations, commitTS, err := cs.buildPromotionCompleteMutations(ctx, readTS, saved.Version, job.JobID, &completion)
+	require.NoError(t, err)
+
+	_, err = cs.Save(ctx, saved.Version, promotionCompleteTestRoutes())
+	require.NoError(t, err)
+
+	err = cs.applyPromotionCompleteMutations(ctx, plan, mutations, job.JobID, commitTS)
+	require.True(t, errors.Is(err, ErrCatalogVersionMismatch), "got %v", err)
+}
+
 func promotionCompleteTestJob() SplitJob {
 	return SplitJob{
 		JobID:         99,
