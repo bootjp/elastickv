@@ -243,13 +243,10 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 		// iteration recomputes from a fresh meta read.
 		return 0, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): this reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine, so the update is wasted and the
-	// stale value would be misleading if some future caller reads it).
-	if isRetryableRedisTxnErr(dispErr) {
+	// Still ambiguous (lock / other retryable): this reuse may itself have
+	// landed, so the next retry must probe THIS commit_ts. Route-fence
+	// rejections are retryable but pre-apply, so keep the older witness.
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return 0, false, errors.WithStack(dispErr)
@@ -411,7 +408,9 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			return nil
 		}
 		// Only remember the attempt for reuse if retryRedisWrite will actually
-		// loop — i.e. the error is one of WriteConflict / TxnLocked. For
+		// loop and the attempt may have landed. Route-fence rejections are
+		// retryable but happen before this write set can apply, so preserving
+		// that commitTS would overwrite an older ambiguous witness. For
 		// errors that escape the loop (transient-leader, context deadline,
 		// FSM apply error, etc.), `pending` would be discarded with the
 		// goroutine, and recording it would mislead a future reader about
@@ -419,7 +418,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		// retryRedisWrite's retry predicate; ambiguous errors that escape
 		// to the client are a separate problem space (cross-request
 		// idempotency cache) and out of scope for this design.
-		if isRetryableRedisTxnErr(dispErr) {
+		if shouldPreserveRedisTxnAttempt(dispErr) {
 			pending = &reusableListPush{
 				ops:      ops,
 				startTS:  startTS,

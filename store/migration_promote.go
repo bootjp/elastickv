@@ -9,7 +9,10 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-const migrationPromotionDoneFlag byte = 1
+const (
+	migrationPromotionDoneFlag          byte = 1
+	migrationPromotionStateVersion2Flag byte = 1 << 7
+)
 
 type promotedVersion struct {
 	staged MVCCVersion
@@ -67,17 +70,17 @@ func (s *mvccStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOpt
 
 	state, cursor := s.promotionStateAndCursorLocked(opts)
 	if opts.JobID != 0 && state.Done {
-		return PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows}, nil
+		return PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}, nil
 	}
 	exported, toPromote, promoted, err := s.planMemoryPromotionLocked(ctx, opts, cursor)
 	if err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	s.applyMemoryPromotionLocked(toPromote)
-	if promoted.MaxPromotedTS > s.lastCommitTS {
-		s.lastCommitTS = promoted.MaxPromotedTS
-	}
 	result, updatedState := finishPromotionResult(opts, state, exported, promoted)
+	if result.MaxPromotedTS > s.lastCommitTS {
+		s.lastCommitTS = result.MaxPromotedTS
+	}
 	if updatedState != nil {
 		s.migrationPromotions[opts.JobID] = clonePromotionState(*updatedState)
 	}
@@ -219,8 +222,8 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 	}
 	writeOpts := s.promotionWriteOpts(opts.AppliedIndex)
 	if opts.JobID != 0 && state.Done {
-		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows}
-		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, 0, writeOpts)
+		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}
+		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
 	}
 	opts.Cursor = cursor
 	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
@@ -234,7 +237,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 		stateToWrite,
 		result,
 		opts.AppliedIndex,
-		promoted.MaxPromotedTS,
+		result.MaxPromotedTS,
 		writeOpts,
 	)
 }
@@ -306,8 +309,12 @@ func finishPromotionResult(
 	state.Cursor = bytes.Clone(exported.NextCursor)
 	state.Done = exported.Done
 	state.PromotedRows += promoted.PromotedRows
+	if promoted.MaxPromotedTS > state.MaxPromotedTS {
+		state.MaxPromotedTS = promoted.MaxPromotedTS
+	}
 	state.LastError = ""
 	promoted.TotalPromotedRows = state.PromotedRows
+	promoted.MaxPromotedTS = state.MaxPromotedTS
 	return promoted, &state
 }
 
@@ -430,13 +437,14 @@ func (s *pebbleStore) commitPebblePromotionBatch(
 }
 
 func encodePromotionState(state PromotionState) []byte {
-	buf := make([]byte, 0, 1+migrationUint64Bytes+binary.MaxVarintLen64*2+len(state.Cursor)+len(state.LastError))
+	buf := make([]byte, 0, 1+2*migrationUint64Bytes+binary.MaxVarintLen64*2+len(state.Cursor)+len(state.LastError))
+	flags := migrationPromotionStateVersion2Flag
 	if state.Done {
-		buf = append(buf, migrationPromotionDoneFlag)
-	} else {
-		buf = append(buf, 0)
+		flags |= migrationPromotionDoneFlag
 	}
+	buf = append(buf, flags)
 	buf = binary.BigEndian.AppendUint64(buf, state.PromotedRows)
+	buf = binary.BigEndian.AppendUint64(buf, state.MaxPromotedTS)
 	buf = binary.AppendUvarint(buf, lenAsUint64(len(state.Cursor)))
 	buf = append(buf, state.Cursor...)
 	buf = binary.AppendUvarint(buf, lenAsUint64(len(state.LastError)))
@@ -448,11 +456,19 @@ func decodePromotionState(data []byte) (PromotionState, bool) {
 	if len(data) < 1+migrationUint64Bytes {
 		return PromotionState{}, false
 	}
+	flags := data[0]
 	state := PromotionState{
-		Done:         data[0]&migrationPromotionDoneFlag != 0,
+		Done:         flags&migrationPromotionDoneFlag != 0,
 		PromotedRows: binary.BigEndian.Uint64(data[1 : 1+migrationUint64Bytes]),
 	}
 	rest := data[1+migrationUint64Bytes:]
+	if flags&migrationPromotionStateVersion2Flag != 0 {
+		if len(rest) < migrationUint64Bytes {
+			return PromotionState{}, false
+		}
+		state.MaxPromotedTS = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		rest = rest[migrationUint64Bytes:]
+	}
 	cursorLen, n := binary.Uvarint(rest)
 	if n <= 0 || cursorLen > lenAsUint64(len(rest[n:])) {
 		return PromotionState{}, false

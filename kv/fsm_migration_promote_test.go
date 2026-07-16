@@ -54,6 +54,7 @@ func TestApplyMigrationPromoteMovesStagedVersions(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, state.Done)
 	require.Equal(t, uint64(2), state.PromotedRows)
+	require.Equal(t, uint64(20), state.MaxPromotedTS)
 
 	got, err := st.GetAt(ctx, []byte("user|k"), 10)
 	require.NoError(t, err)
@@ -75,4 +76,21 @@ func TestApplyMigrationPromoteMalformedPayloadHalts(t *testing.T) {
 	fsm := &kvFSM{store: store.NewMVCCStore()}
 	err := haltApplyOf(fsm.Apply([]byte{raftEncodeMigrationPromote, 0xff, 0xff}))
 	require.True(t, errors.Is(err, ErrMigrationPromoteApply), "got %v", err)
+}
+
+func TestApplyMigrationPromoteInvalidCursorReturnsOrdinaryError(t *testing.T) {
+	t.Parallel()
+
+	fsm := &kvFSM{store: store.NewMVCCStore()}
+	cmd, err := MarshalMigrationPromoteCommand(&pb.PromoteStagedVersionsRequest{
+		Cursor:      []byte{0xff},
+		MaxVersions: 10,
+	})
+	require.NoError(t, err)
+	resp := fsm.Apply(cmd)
+	require.Nil(t, haltApplyOf(resp))
+	err, ok := resp.(error)
+	require.True(t, ok, "got %T: %v", resp, resp)
+	require.ErrorIs(t, err, store.ErrInvalidExportCursor)
+	require.False(t, errors.Is(err, ErrMigrationPromoteApply))
 }

@@ -98,9 +98,11 @@ type txnValue struct {
 }
 
 type stringReplacement struct {
-	key   []byte
-	value []byte
-	ttl   *time.Time
+	key         []byte
+	value       []byte
+	ttl         *time.Time
+	rawTyp      redisValueType
+	rawTypKnown bool
 }
 
 type txnContext struct {
@@ -352,6 +354,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
 	var existingDeltas [][]byte
+	acceptedDeltas := 0
 	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
 		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
 			ctx,
@@ -368,6 +371,10 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 			return nil, ErrDeltaScanTruncated
 		}
 		for _, kv := range deltaKVs {
+			acceptedDeltas++
+			if acceptedDeltas > store.MaxDeltaScanLimit {
+				return nil, ErrDeltaScanTruncated
+			}
 			existingDeltas = append(existingDeltas, kv.Key)
 		}
 	}
@@ -617,18 +624,48 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 }
 
 func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
+	view, err := t.stagedKeyTypeView(key)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	return view.typ, nil
+}
+
+type txnKeyTypeView struct {
+	typ         redisValueType
+	rawTyp      redisValueType
+	rawTypKnown bool
+}
+
+func (t *txnContext) stagedKeyTypeView(key []byte) (txnKeyTypeView, error) {
 	k := string(key)
-	if _, ok := t.replacers[k]; ok {
-		return redisTypeString, nil
+	if repl, ok := t.replacers[k]; ok {
+		return txnKeyTypeView{
+			typ:         redisTypeString,
+			rawTyp:      repl.rawTyp,
+			rawTypKnown: repl.rawTypKnown,
+		}, nil
 	}
 	if typ, ok := t.stagedPositiveKeyType(k); ok {
-		return typ, nil
+		return txnKeyTypeView{typ: typ}, nil
 	}
 	if t.hasStagedTypeDeletion(k) {
-		return redisTypeNone, nil
+		return txnKeyTypeView{typ: redisTypeNone}, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	rawTyp, err := t.server.rawKeyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return txnKeyTypeView{}, err
+	}
+	typ, err := t.server.applyTTLFilter(t.ctxOrBackground(), key, t.startTS, rawTyp)
+	if err != nil {
+		return txnKeyTypeView{}, err
+	}
+	return txnKeyTypeView{
+		typ:         typ,
+		rawTyp:      rawTyp,
+		rawTypKnown: true,
+	}, nil
 }
 
 func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {
@@ -721,10 +758,11 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	typ, err := t.stagedKeyType(cmd.Args[1])
+	typeView, err := t.stagedKeyTypeView(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
+	typ := typeView.typ
 
 	// NX/XX: skip the write if the key-existence condition is not met.
 	exists := typ != redisTypeNone
@@ -739,7 +777,8 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	t.stageStringReplacement(cmd.Args[1], cmd.Args[2], opts.ttl)
+	t.trackWideCollectionFenceReads(cmd.Args[1])
+	t.stageStringReplacementWithRawType(cmd.Args[1], cmd.Args[2], opts.ttl, typeView.rawTyp, typeView.rawTypKnown)
 	return applySetResult(opts, oldValue), nil
 }
 
@@ -777,15 +816,32 @@ func cloneTimePtr(in *time.Time) *time.Time {
 }
 
 func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
+	t.stageStringReplacementWithRawType(key, value, ttl, redisTypeNone, false)
+}
+
+func (t *txnContext) stageStringReplacementWithRawType(key, value []byte, ttl *time.Time, rawTyp redisValueType, rawTypKnown bool) {
 	if t.replacers == nil {
 		t.replacers = map[string]*stringReplacement{}
 	}
 	k := string(key)
-	t.replacers[k] = &stringReplacement{
-		key:   bytes.Clone(key),
-		value: bytes.Clone(value),
-		ttl:   cloneTimePtr(ttl),
+	if repl, ok := t.replacers[k]; ok {
+		repl.value = bytes.Clone(value)
+		repl.ttl = cloneTimePtr(ttl)
+		if rawTypKnown {
+			repl.rawTyp = rawTyp
+			repl.rawTypKnown = true
+		}
+		delete(t.deletedKeys, k)
+		return
 	}
+	repl := &stringReplacement{
+		key:         bytes.Clone(key),
+		value:       bytes.Clone(value),
+		ttl:         cloneTimePtr(ttl),
+		rawTyp:      rawTyp,
+		rawTypKnown: rawTypKnown,
+	}
+	t.replacers[k] = repl
 	delete(t.deletedKeys, k)
 }
 
@@ -1576,11 +1632,13 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 	for _, k := range keys {
 		repl := t.replacers[k]
 		t.trackWideCollectionFenceReads(repl.key)
-		deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
-		if err != nil {
-			return nil, err
+		if repl.needsFullLogicalDelete() {
+			deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, deleteElems...)
 		}
-		elems = append(elems, deleteElems...)
 		elems = append(elems, redisTxnWideCollectionFenceElems(repl.key)...)
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -1594,6 +1652,13 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(repl.key), Value: encodeRedisTTL(*repl.ttl)})
 	}
 	return elems, nil
+}
+
+func (r *stringReplacement) needsFullLogicalDelete() bool {
+	if !r.rawTypKnown {
+		return true
+	}
+	return isNonStringCollectionType(r.rawTyp)
 }
 
 func (t *txnContext) buildLogicalDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
@@ -2216,12 +2281,10 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		// iteration rebuilds from a fresh snapshot.
 		return nil, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): the reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine).
-	if isRetryableRedisTxnErr(dispErr) {
+	// Still ambiguous (lock / other retryable): the reuse may itself have
+	// landed, so the next retry must probe THIS commit_ts. Route-fence
+	// rejections are retryable but pre-apply, so keep the older witness.
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return nil, false, errors.WithStack(dispErr)
@@ -2347,12 +2410,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 	}
 	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
 		// Only remember the attempt for reuse if retryRedisWrite will
-		// actually loop. Mirrors listPushCoreWithDedup's gating
-		// rationale — errors that escape the loop (transient-leader,
-		// context deadline, FSM apply error) leave pending pointing at
-		// state wasted with the goroutine; ambiguous errors that
-		// escape to the client are out of scope for this loop.
-		if isRetryableRedisTxnErr(dispErr) {
+		// actually loop and the attempt may have landed. Mirrors
+		// listPushCoreWithDedup's gating rationale; route-fence
+		// rejections are retryable but pre-apply.
+		if shouldPreserveRedisTxnAttempt(dispErr) {
 			return nil, &reusableExecTxn{
 				elems:    prepared.elems,
 				startTS:  txn.startTS,

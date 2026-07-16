@@ -165,11 +165,16 @@ func (s RouteHistorySnapshot) Version() uint64 { return s.version }
 // scan from O(N) to "first non-covering gap" without changing the
 // resolution semantics).
 func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
-	r, ok := s.RouteOf(key)
-	if !ok {
-		return 0, false
+	for _, r := range s.routes {
+		if bytes.Compare(key, r.Start) < 0 {
+			break
+		}
+		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
+			continue
+		}
+		return r.GroupID, true
 	}
-	return r.GroupID, true
+	return 0, false
 }
 
 // RouteOf returns the route that covered key at this snapshot's version.

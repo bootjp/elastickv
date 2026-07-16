@@ -102,6 +102,102 @@ func TestSplitJobCodecRejectsInvalidPhase(t *testing.T) {
 	}
 }
 
+func TestSplitJobCodecValidatesRestartPhases(t *testing.T) {
+	for _, phase := range []SplitJobPhase{
+		SplitJobPhaseBackfill,
+		SplitJobPhaseFence,
+		SplitJobPhaseDeltaCopy,
+		SplitJobPhaseCutover,
+		SplitJobPhaseCleanup,
+	} {
+		job := sampleSplitJob(uint64(phase) + 10)
+		job.Phase = SplitJobPhaseFailed
+		job.RetryPhase = phase
+		if _, err := EncodeSplitJob(job); err != nil {
+			t.Fatalf("expected failed job with retry phase %v to encode: %v", phase, err)
+		}
+	}
+
+	for _, phase := range []SplitJobPhase{
+		SplitJobPhaseBackfill,
+		SplitJobPhaseFence,
+		SplitJobPhaseDeltaCopy,
+	} {
+		job := sampleSplitJob(uint64(phase) + 20)
+		job.Phase = SplitJobPhaseAbandoning
+		job.AbandonFromPhase = phase
+		if _, err := EncodeSplitJob(job); err != nil {
+			t.Fatalf("expected abandoning job from phase %v to encode: %v", phase, err)
+		}
+	}
+}
+
+func TestSplitJobCodecRejectsInvalidRestartPhases(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		phase            SplitJobPhase
+		retryPhase       SplitJobPhase
+		abandonFromPhase SplitJobPhase
+	}{
+		{
+			name:       "retry phase outside failed",
+			phase:      SplitJobPhaseDeltaCopy,
+			retryPhase: SplitJobPhaseBackfill,
+		},
+		{
+			name:       "failed without retry phase",
+			phase:      SplitJobPhaseFailed,
+			retryPhase: SplitJobPhaseNone,
+		},
+		{
+			name:       "failed retry to planned",
+			phase:      SplitJobPhaseFailed,
+			retryPhase: SplitJobPhasePlanned,
+		},
+		{
+			name:       "failed retry to terminal",
+			phase:      SplitJobPhaseFailed,
+			retryPhase: SplitJobPhaseDone,
+		},
+		{
+			name:             "abandon phase outside abandoning",
+			phase:            SplitJobPhaseDeltaCopy,
+			abandonFromPhase: SplitJobPhaseFence,
+		},
+		{
+			name:             "abandoning without source phase",
+			phase:            SplitJobPhaseAbandoning,
+			abandonFromPhase: SplitJobPhaseNone,
+		},
+		{
+			name:             "abandoning from cutover",
+			phase:            SplitJobPhaseAbandoning,
+			abandonFromPhase: SplitJobPhaseCutover,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := sampleSplitJob(2)
+			job.Phase = tc.phase
+			job.RetryPhase = tc.retryPhase
+			job.AbandonFromPhase = tc.abandonFromPhase
+			if _, err := EncodeSplitJob(job); !errors.Is(err, ErrCatalogInvalidSplitJobPhase) {
+				t.Fatalf("expected ErrCatalogInvalidSplitJobPhase, got %v", err)
+			}
+		})
+	}
+}
+
+func TestSplitJobCodecRejectsDuplicateBracketIDs(t *testing.T) {
+	job := sampleSplitJob(1)
+	dupe := job.BracketProgress[0]
+	dupe.Family++
+	dupe.Cursor = []byte("other-cursor")
+	job.BracketProgress = append(job.BracketProgress, dupe)
+	if _, err := EncodeSplitJob(job); !errors.Is(err, ErrCatalogInvalidSplitJobRecord) {
+		t.Fatalf("expected ErrCatalogInvalidSplitJobRecord, got %v", err)
+	}
+}
+
 func TestSplitJobCodecRejectsUnknownProtoEnumValues(t *testing.T) {
 	body, err := gproto.MarshalOptions{Deterministic: true}.Marshal(&pb.SplitJob{
 		JobId:         1,
@@ -412,6 +508,36 @@ func TestCatalogStoreSaveSeedsNextSplitJobIDFromExistingJobsWhenMetaMissing(t *t
 	}
 }
 
+func TestCatalogStoreBuildSplitJobPutMutationsSkipsCurrentNextSplitJobID(t *testing.T) {
+	st := store.NewMVCCStore()
+	cs := NewCatalogStore(st)
+	ctx := context.Background()
+
+	for _, jobID := range []uint64{1, 2} {
+		if err := cs.CreateSplitJob(ctx, sampleSplitJob(jobID)); err != nil {
+			t.Fatalf("create split job %d: %v", jobID, err)
+		}
+	}
+	updated := sampleSplitJob(1)
+	updated.Phase = SplitJobPhaseBackfill
+	updated.UpdatedAtMs++
+	raw, err := EncodeSplitJob(updated)
+	if err != nil {
+		t.Fatalf("encode updated split job: %v", err)
+	}
+
+	mutations, err := cs.buildSplitJobPutMutations(ctx, st.LastCommitTS(), CatalogSplitJobKey(updated.JobID), raw, updated.JobID)
+	if err != nil {
+		t.Fatalf("build split job mutations: %v", err)
+	}
+	if len(mutations) != 1 {
+		t.Fatalf("expected only job mutation, got %d", len(mutations))
+	}
+	if string(mutations[0].Key) != string(CatalogSplitJobKey(updated.JobID)) {
+		t.Fatalf("expected job mutation, got key %q", mutations[0].Key)
+	}
+}
+
 func TestCatalogStoreNextSplitJobIDAt_FallsBackWhenMetaMissing(t *testing.T) {
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
@@ -461,8 +587,8 @@ func sampleSplitJob(jobID uint64) SplitJob {
 		SplitKey:                         []byte("split-key"),
 		TargetGroupID:                    22,
 		Phase:                            SplitJobPhaseDeltaCopy,
-		RetryPhase:                       SplitJobPhaseBackfill,
-		AbandonFromPhase:                 SplitJobPhaseFence,
+		RetryPhase:                       SplitJobPhaseNone,
+		AbandonFromPhase:                 SplitJobPhaseNone,
 		SnapshotTS:                       101,
 		SnapshotMinAdmittedTS:            102,
 		WriteTrackerArmed:                true,

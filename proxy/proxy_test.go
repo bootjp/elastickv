@@ -688,7 +688,53 @@ func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
 	d.Close()
 }
 
-func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
+func TestDualWriter_Write_WaitsWhenWriteSemFull(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	blocker := make(chan struct{})
+	d.goAsync(func() {
+		<-blocker
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_, err := d.Write(context.Background(), "SET", [][]byte{
+			[]byte("SET"), []byte("key"), []byte("value"),
+		})
+		assert.NoError(t, err)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("Write returned while the strict secondary write slot was full")
+	case <-time.After(100 * time.Millisecond):
+		// good: the primary succeeded, but strict secondary replay is applying backpressure.
+	}
+
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+
+	close(blocker)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Write did not complete after a secondary write slot was released")
+	}
+	assert.Equal(t, 1, secondary.CallCount())
+	d.Close()
+}
+
+func TestDualWriter_Script_WaitsWhenScriptSemFull(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -707,7 +753,6 @@ func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 		})
 	}
 
-	// Script should return promptly even when scriptSem is full.
 	done := make(chan struct{})
 	go func() {
 		_, err := d.Script(context.Background(), "EVALSHA", [][]byte{
@@ -719,16 +764,23 @@ func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 
 	select {
 	case <-done:
-		// good — Script returned without blocking on a full scriptSem
-	case <-time.After(time.Second):
-		t.Fatal("Script blocked when script semaphore was full")
+		t.Fatal("Script returned while the strict script replay slot was full")
+	case <-time.After(100 * time.Millisecond):
+		// good: strict EVALSHA replay is applying backpressure instead of dropping.
 	}
 
-	// The async replay to secondary must be dropped.
 	assert.Equal(t, 0, secondary.CallCount())
-	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
 
 	close(blocker)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Script did not complete after a secondary script slot was released")
+	}
+	assert.Equal(t, 1, secondary.CallCount())
 	d.Close()
 }
 
@@ -1024,8 +1076,8 @@ func TestDualWriter_writeSecondary_RetriesReadTSCompacted(t *testing.T) {
 }
 
 func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T) {
-	// When the compacted error is persistent, the retry loop must stop after
-	// maxCompactedRetries+1 attempts so the secondary goroutine returns
+	// When the transient error is persistent, the retry loop must stop after
+	// maxSecondaryTransientRetries+1 attempts so the secondary goroutine returns
 	// instead of burning a scriptSem slot indefinitely.
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -1039,10 +1091,41 @@ func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T
 
 	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
 
-	assert.Equal(t, maxCompactedRetries+1, secondary.CallCount(),
-		"secondary must stop after maxCompactedRetries+1 attempts")
+	assert.Equal(t, maxSecondaryTransientRetries+1, secondary.CallCount(),
+		"secondary must stop after maxSecondaryTransientRetries+1 attempts")
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a persistent compacted error must still be reported as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_RetriesRetryLimitWriteConflict(t *testing.T) {
+	// A hot key can exhaust the secondary Redis adapter's internal OCC retry loop.
+	// Re-sending the command lets the backend choose a fresh timestamp and keeps
+	// dual-write traffic from permanently diverging on a transient conflict.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	retryLimitErr := testRedisErr("redis txn retry limit exceeded: key: myzset: write conflict")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		if calls < 3 {
+			cmd.SetErr(retryLimitErr)
+			return cmd
+		}
+		cmd.SetVal("OK")
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("ZADD", []any{[]byte("ZADD"), []byte("myzset"), []byte("1"), []byte("member")})
+
+	assert.Equal(t, 3, calls, "secondary must retry transient retry-limit write conflicts")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a retried success must not count as a secondary write error")
 }
 
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {

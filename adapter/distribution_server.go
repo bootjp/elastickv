@@ -23,6 +23,7 @@ type DistributionServer struct {
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
 	readTracker *kv.ActiveTimestampTracker
+	readBlocked func() bool
 	reloadRetry struct {
 		attempts int
 		interval time.Duration
@@ -44,6 +45,12 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.readTracker = tracker
+	}
+}
+
+func WithDistributionReadGate(blocked func() bool) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.readBlocked = blocked
 	}
 }
 
@@ -97,6 +104,20 @@ func NewDistributionServer(e *distribution.Engine, catalog *distribution.Catalog
 	return s
 }
 
+func (s *DistributionServer) SetReadGate(blocked func() bool) {
+	if s != nil {
+		s.readBlocked = blocked
+	}
+}
+
+func (s *DistributionServer) requireReadReady() error {
+	if s != nil && s.readBlocked != nil && s.readBlocked() {
+		//nolint:wrapcheck // Preserve the gRPC status code for startup readers.
+		return status.Error(codes.Unavailable, "distribution startup has not completed")
+	}
+	return nil
+}
+
 // UpdateRoute allows updating route information.
 func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
 	s.engine.UpdateRoute(start, end, group)
@@ -104,6 +125,9 @@ func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
 
 // GetRoute returns route for a key.
 func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteRequest) (*pb.GetRouteResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	r, ok := s.engine.GetRoute(req.Key)
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
@@ -123,6 +147,9 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 
 // ListRoutes returns all durable routes from catalog storage.
 func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesRequest) (*pb.ListRoutesResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.loadCatalogSnapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -135,6 +162,9 @@ func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesR
 }
 
 func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetRouteOwnershipRequest) (*pb.GetRouteOwnershipResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
 	if err != nil {
 		return nil, err
@@ -154,6 +184,9 @@ func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetR
 }
 
 func (s *DistributionServer) GetIntersectingRoutes(ctx context.Context, req *pb.GetIntersectingRoutesRequest) (*pb.GetIntersectingRoutesResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
 	if err != nil {
 		return nil, err
@@ -461,11 +494,9 @@ func splitJobReadFenceKeys(jobs []distribution.SplitJob) [][]byte {
 	readKeys := make([][]byte, 0, len(jobs)+1)
 	readKeys = append(readKeys, distribution.CatalogNextSplitJobIDKey())
 	for _, job := range jobs {
-		if job.TerminalAtMs > 0 {
-			readKeys = append(readKeys, distribution.CatalogSplitJobHistoryKey(job.TerminalAtMs, job.JobID))
-			continue
+		if splitJobIsLive(job) {
+			readKeys = append(readKeys, distribution.CatalogSplitJobKey(job.JobID))
 		}
-		readKeys = append(readKeys, distribution.CatalogSplitJobKey(job.JobID))
 	}
 	return readKeys
 }

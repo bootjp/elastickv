@@ -37,6 +37,23 @@ func (mockInternalLeader) LinearizableRead(context.Context) (uint64, error) {
 	return 1, nil
 }
 
+type recordingInternalLeader struct {
+	mockInternalLeader
+	linearizableReadErr   error
+	linearizableReadCalls int
+	verifyLeaderCalls     int
+}
+
+func (l *recordingInternalLeader) VerifyLeader(context.Context) error {
+	l.verifyLeaderCalls++
+	return nil
+}
+
+func (l *recordingInternalLeader) LinearizableRead(context.Context) (uint64, error) {
+	l.linearizableReadCalls++
+	return 7, l.linearizableReadErr
+}
+
 type applyingMigrationProposer struct {
 	fsm   raftengine.StateMachine
 	calls uint64
@@ -128,6 +145,53 @@ func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	require.Equal(t, []*pb.MVCCVersion{
 		{Key: []byte("a"), CommitTs: 10, Value: []byte("va"), KeyFamily: distribution.MigrationFamilyUser},
 	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsUsesAppliedReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	leader := &recordingInternalLeader{}
+	internal := NewInternalWithEngine(nil, leader, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte("a"),
+		RouteEnd:        []byte("b"),
+		KeyFamily:       distribution.MigrationFamilyUser,
+		RangeStart:      []byte("a"),
+		RangeEnd:        []byte("b"),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Equal(t, 1, leader.linearizableReadCalls)
+	require.Zero(t, leader.verifyLeaderCalls)
+	require.Len(t, stream.responses, 1)
+	require.True(t, stream.responses[0].GetDone())
+}
+
+func TestInternalExportRangeVersionsFailsClosedWhenAppliedReadFenceFails(t *testing.T) {
+	t.Parallel()
+
+	leader := &recordingInternalLeader{linearizableReadErr: context.Canceled}
+	internal := NewInternalWithEngine(nil, leader, nil, nil, WithInternalStore(store.NewMVCCStore()))
+	stream := &captureExportRangeVersionsStream{ctx: context.Background()}
+
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte("a"),
+		RouteEnd:        []byte("b"),
+		KeyFamily:       distribution.MigrationFamilyUser,
+		RangeStart:      []byte("a"),
+		RangeEnd:        []byte("b"),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, leader.linearizableReadCalls)
+	require.Empty(t, stream.responses)
 }
 
 func TestInternalExportRangeVersionsRejectsUnboundedExport(t *testing.T) {

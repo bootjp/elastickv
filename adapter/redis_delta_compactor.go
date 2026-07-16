@@ -468,17 +468,8 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	rawKVs := kvs
 	kvs = filterDeltaKVs(rawKVs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
-	var lastAcceptedKey []byte
-	if len(kvs) > 0 {
-		lastAcceptedKey = kvs[len(kvs)-1].Key
-	}
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
-	if truncated && len(rawKVs) > 0 {
-		if len(kvs) == 0 ||
-			(!bytes.Equal(lastScannedKey, lastAcceptedKey) && rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey)) {
-			lastScannedKey = rawKVs[len(rawKVs)-1].Key
-		}
-	}
+	lastScannedKey = deltaCompactorCursorAfterFiltering(rawKVs, kvs, lastScannedKey, truncated)
 
 	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
 
@@ -492,6 +483,28 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	return nil
 }
 
+func deltaCompactorCursorAfterFiltering(rawKVs, acceptedKVs []*store.KVPair, lastScannedKey []byte, truncated bool) []byte {
+	if !truncated || len(rawKVs) == 0 {
+		return lastScannedKey
+	}
+	if len(acceptedKVs) == 0 {
+		return rawKVs[len(rawKVs)-1].Key
+	}
+	lastAcceptedKey := acceptedKVs[len(acceptedKVs)-1].Key
+	switch {
+	case len(lastScannedKey) == 0:
+		if prev := rawKeyBeforeAcceptedTail(rawKVs, lastAcceptedKey); len(prev) > 0 {
+			return prev
+		}
+		if rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey) {
+			return rawKVs[len(rawKVs)-1].Key
+		}
+	case !bytes.Equal(lastScannedKey, lastAcceptedKey) && rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey):
+		return rawKVs[len(rawKVs)-1].Key
+	}
+	return lastScannedKey
+}
+
 func rawPageHasRejectedTailAfter(rawKVs []*store.KVPair, acceptedKey []byte) bool {
 	if len(rawKVs) == 0 || len(acceptedKey) == 0 {
 		return false
@@ -502,6 +515,22 @@ func rawPageHasRejectedTailAfter(rawKVs []*store.KVPair, acceptedKey []byte) boo
 		}
 	}
 	return false
+}
+
+func rawKeyBeforeAcceptedTail(rawKVs []*store.KVPair, acceptedKey []byte) []byte {
+	if len(rawKVs) < 2 || len(acceptedKey) == 0 {
+		return nil
+	}
+	last := len(rawKVs) - 1
+	if rawKVs[last] == nil || !bytes.Equal(rawKVs[last].Key, acceptedKey) {
+		return nil
+	}
+	for i := last - 1; i >= 0; i-- {
+		if rawKVs[i] != nil {
+			return rawKVs[i].Key
+		}
+	}
+	return nil
 }
 
 // groupByUserKey groups KVPairs by their user key, returning both the map and
@@ -729,7 +758,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs)+len(claimElems))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key), GroupID: d.RouteGroupID})
 	}
 	return append(elems, claimElems...), nil
 }
@@ -894,7 +923,7 @@ func foldSimpleLenDeltas(
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key), GroupID: d.RouteGroupID})
 	}
 	return elems, nil
 }

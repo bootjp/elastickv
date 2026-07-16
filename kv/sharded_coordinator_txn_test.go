@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -20,6 +21,7 @@ type recordingTransactional struct {
 	requests  []*pb.Request
 	responses []*TransactionResponse
 	errs      []error
+	onCommit  func(call int, req *pb.Request)
 }
 
 func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -31,6 +33,9 @@ func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (
 	}
 	s.requests = append(s.requests, cloneTxnRequest(reqs[0]))
 	call := len(s.requests) - 1
+	if s.onCommit != nil {
+		s.onCommit(call, s.requests[call])
+	}
 	if call < len(s.errs) && s.errs[call] != nil {
 		return nil, s.errs[call]
 	}
@@ -206,6 +211,26 @@ func cloneTxnRequest(req *pb.Request) *pb.Request {
 		return nil
 	}
 	return request
+}
+
+func TestShardedCoordinatorGroupMutationsUsesExplicitElemGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	grouped, gids, err := coord.groupMutations([]*Elem[OP]{
+		{Op: Del, Key: []byte("a-key"), GroupID: 2},
+	}, keyviz.Label(""))
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2}, gids)
+	require.Len(t, grouped[2], 1)
+	require.Equal(t, []byte("a-key"), grouped[2][0].Key)
 }
 
 func requestTxnMeta(t *testing.T, req *pb.Request) TxnMeta {

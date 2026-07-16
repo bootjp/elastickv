@@ -65,8 +65,9 @@ func (e *WriteConflictError) Unwrap() error {
 }
 
 type KVPair struct {
-	Key   []byte
-	Value []byte
+	Key          []byte
+	Value        []byte
+	RouteGroupID uint64
 }
 
 // MVCCVersion is a raw committed MVCC version for range migration.
@@ -149,10 +150,11 @@ type PromoteVersionsResult struct {
 
 // PromotionState is the target-local durable cursor for staged data promotion.
 type PromotionState struct {
-	Cursor       []byte
-	Done         bool
-	PromotedRows uint64
-	LastError    string
+	Cursor        []byte
+	Done          bool
+	PromotedRows  uint64
+	MaxPromotedTS uint64
+	LastError     string
 }
 
 // MigrationPromoter is implemented by stores that can promote staged range

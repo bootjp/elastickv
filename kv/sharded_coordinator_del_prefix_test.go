@@ -172,6 +172,183 @@ func TestShardedCoordinatorRejectsDelPrefixAtMigrationTimestampFloor(t *testing.
 	require.Empty(t, g1Txn.requests, "coordinator must reject before broadcasting a floor-violating prefix delete")
 }
 
+func TestShardedCoordinator_DelPrefixDoesNotAutoPinObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("user:")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Zero(t, txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_RawWriteDoesNotAutoPinObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Zero(t, txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_RetriesRawWriteWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems:                []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 2)
+	require.Equal(t, uint64(3), txn.requests[0].GetObservedRouteVersion())
+	require.Equal(t, uint64(9), txn.requests[1].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_DoesNotRetryDelPrefixWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: nil, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 2,
+		Elems:                []*Elem[OP]{{Op: DelPrefix, Key: []byte("user:")}},
+	})
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, uint64(2), txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_DoesNotRetryMultiShardRawWriteWhenObservedRouteVersionGCd(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 11,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{errs: []error{ErrComposed1VersionGCd}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("a"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("z"), Value: []byte("v2")},
+		},
+	})
+
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, g1Txn.requests, 1)
+	require.Len(t, g2Txn.requests, 1)
+	require.Equal(t, uint64(3), g1Txn.requests[0].GetObservedRouteVersion())
+	require.Equal(t, uint64(3), g2Txn.requests[0].GetObservedRouteVersion())
+}
+
+func TestShardedCoordinator_DoesNotRetryRawWriteWhenRetryRouteBecomesMultiShard(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 11,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{
+		errs: []error{ErrComposed1VersionGCd},
+		onCommit: func(call int, _ *pb.Request) {
+			if call != 0 {
+				return
+			}
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 12,
+				Routes: []distribution.RouteDescriptor{
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+					{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+				},
+			}))
+		},
+	}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		ObservedRouteVersion: 3,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("a"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("z"), Value: []byte("v2")},
+		},
+	})
+
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.Len(t, g1Txn.requests, 1)
+	require.Len(t, g2Txn.requests, 0)
+	require.Equal(t, uint64(3), g1Txn.requests[0].GetObservedRouteVersion())
+}
+
 func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -264,6 +441,43 @@ func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToStagedOwner(t *testing.
 	require.Empty(t, g1Txn.requests)
 	require.Len(t, g2Txn.requests, 1)
 	require.Equal(t, key, g2Txn.requests[0].Mutations[0].Key)
+}
+
+func TestShardedCoordinatorIgnoresRawRouteFloorForS3BucketAuxiliaryWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliaryStagedRoutes(bucket, 1, 2)
+	routes[2].MinWriteTSExclusive = ^uint64(0)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  routes,
+	}))
+
+	rawRoute, ok := engine.GetRoute(routeKey(key))
+	require.True(t, ok)
+	require.Equal(t, ^uint64(0), rawRoute.MinWriteTSExclusive)
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.NotEmpty(t, auxRoutes)
+	require.Zero(t, auxRoutes[0].MinWriteTSExclusive)
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
 }
 
 func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteAtMigrationTimestampFloor(t *testing.T) {
@@ -390,6 +604,46 @@ func TestShardedCoordinatorRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t
 			require.Empty(t, g2Txn.requests)
 		})
 	}
+}
+
+func TestShardedCoordinatorAllowsS3BucketDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	const (
+		activeBucket = "bucket-a"
+		fencedBucket = "bucket-b"
+		generation   = uint64(7)
+	)
+	activeStart := s3keys.RoutePrefixForBucketAnyGeneration(activeBucket)
+	activeEnd := prefixScanEnd(activeStart)
+	fencedStart := s3keys.RoutePrefixForBucketAnyGeneration(fencedBucket)
+	fencedEnd := prefixScanEnd(fencedStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: activeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: activeStart, End: activeEnd, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 3, Start: activeEnd, End: fencedStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 4, Start: fencedStart, End: fencedEnd, GroupID: 2, State: distribution.RouteStateWriteFenced},
+			{RouteID: 5, Start: fencedEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: s3keys.ObjectManifestPrefixForBucket(activeBucket, generation)}},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, g1Txn.requests)
+	require.NotEmpty(t, g2Txn.requests, "DEL_PREFIX still broadcasts to every group after the narrow fence precheck passes")
 }
 
 // TestShardedCoordinator_DelPrefixRejectsTxn verifies that DEL_PREFIX inside

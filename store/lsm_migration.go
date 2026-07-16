@@ -216,12 +216,15 @@ func advancePebbleExportPastCurrentUserKey(
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
-	if len(startKey) == 0 {
+	if startKey == nil {
 		return false
 	}
 	for prefixLen := 1; prefixLen <= len(userKey); prefixLen++ {
 		prefix := userKey[:prefixLen]
-		if bytes.Compare(prefix, startKey) >= 0 && bytes.Compare(prefix, endKey) < 0 {
+		if len(startKey) != 0 && bytes.Compare(prefix, startKey) < 0 {
+			continue
+		}
+		if bytes.Compare(prefix, endKey) < 0 {
 			return false
 		}
 	}

@@ -405,6 +405,24 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 	})
 }
 
+func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte("z"),
+			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
+	})
+}
+
 func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
 	t.Parallel()
 
@@ -655,6 +673,35 @@ func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
 	require.Zero(t, result.ScannedBytes)
 }
 
+func TestPebbleExportStopsLeadingRangeWithExplicitEmptyStartAtEndKey(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-leading-end-key-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok)
+	require.NoError(t, ps.PutAt(ctx, []byte("b"), []byte("later"), 10, 0))
+
+	iter, err := ps.db.NewIter(nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, iter.Close()) }()
+	require.True(t, iter.SeekGE(encodeKey([]byte("b"), math.MaxUint64)))
+
+	result := newExportVersionsResult(10)
+	advance, done, err := ps.exportPebbleIteratorPosition(ctx, iter, ExportVersionsOptions{
+		StartKey: []byte{},
+		EndKey:   []byte("b"),
+	}, exportCursorPosition{}, &result)
+	require.ErrorIs(t, err, errExportReachedEnd)
+	require.False(t, advance)
+	require.True(t, done)
+	require.Empty(t, result.Versions)
+	require.Zero(t, result.ScannedBytes)
+}
+
 func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-out-of-range-end-skip-*")
@@ -878,6 +925,7 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 		require.False(t, state.Done)
 		require.Equal(t, first.NextCursor, state.Cursor)
 		require.Equal(t, uint64(2), state.PromotedRows)
+		require.Equal(t, uint64(30), state.MaxPromotedTS)
 
 		got, err := st.GetAt(ctx, []byte("k"), 25)
 		require.NoError(t, err)
@@ -908,13 +956,27 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 		require.Empty(t, second.NextCursor)
 		require.Equal(t, uint64(2), second.PromotedRows)
 		require.Equal(t, uint64(4), second.TotalPromotedRows)
-		require.Equal(t, uint64(15), second.MaxPromotedTS)
+		require.Equal(t, uint64(30), second.MaxPromotedTS)
 		state, ok, err = stateReader.MigrationPromotionState(ctx, 99)
 		require.NoError(t, err)
 		require.True(t, ok)
 		require.True(t, state.Done)
 		require.Empty(t, state.Cursor)
 		require.Equal(t, uint64(4), state.PromotedRows)
+		require.Equal(t, uint64(30), state.MaxPromotedTS)
+
+		retry, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, retry.Done)
+		require.Zero(t, retry.PromotedRows)
+		require.Equal(t, uint64(4), retry.TotalPromotedRows)
+		require.Equal(t, uint64(30), retry.MaxPromotedTS)
 
 		got, err = st.GetAt(ctx, []byte("k"), 10)
 		require.NoError(t, err)
@@ -972,6 +1034,7 @@ func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
 		require.True(t, ok)
 		require.True(t, state.Done)
 		require.Equal(t, uint64(2), state.PromotedRows)
+		require.Equal(t, uint64(20), state.MaxPromotedTS)
 
 		got, err := st.GetAt(ctx, []byte("a"), 10)
 		require.NoError(t, err)
@@ -1028,6 +1091,10 @@ func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
 	require.Equal(t, uint64(1), result.PromotedRows)
 	require.Equal(t, promotedTS, result.MaxPromotedTS)
 	require.Equal(t, promotedTS, ps.LastCommitTS())
+	state, ok, err := ps.MigrationPromotionState(ctx, 101)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, promotedTS, state.MaxPromotedTS)
 
 	metaTS, err := readPebbleUint64(ps.db, metaLastCommitTSBytes)
 	require.NoError(t, err)
@@ -1045,6 +1112,49 @@ func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
 	val, err = reopened.GetAt(ctx, []byte("k"), reopened.LastCommitTS())
 	require.NoError(t, err)
 	require.Equal(t, []byte("v100"), val)
+	reopenedPromoter, ok := reopened.(MigrationPromoter)
+	require.True(t, ok)
+	retry, err := reopenedPromoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       101,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, retry.Done)
+	require.Zero(t, retry.PromotedRows)
+	require.Equal(t, uint64(1), retry.TotalPromotedRows)
+	require.Equal(t, promotedTS, retry.MaxPromotedTS)
+}
+
+func TestPromotionStateCodecPreservesMaxPromotedTS(t *testing.T) {
+	t.Parallel()
+
+	state := PromotionState{
+		Cursor:        []byte("cursor"),
+		Done:          true,
+		PromotedRows:  7,
+		MaxPromotedTS: 42,
+		LastError:     "boom",
+	}
+	decoded, ok := decodePromotionState(encodePromotionState(state))
+	require.True(t, ok)
+	require.Equal(t, state, decoded)
+
+	old := []byte{migrationPromotionDoneFlag}
+	old = binary.BigEndian.AppendUint64(old, 3)
+	old = binary.AppendUvarint(old, lenAsUint64(len("old-cursor")))
+	old = append(old, "old-cursor"...)
+	old = binary.AppendUvarint(old, lenAsUint64(len("old-error")))
+	old = append(old, "old-error"...)
+	decoded, ok = decodePromotionState(old)
+	require.True(t, ok)
+	require.True(t, decoded.Done)
+	require.Equal(t, uint64(3), decoded.PromotedRows)
+	require.Zero(t, decoded.MaxPromotedTS)
+	require.Equal(t, []byte("old-cursor"), decoded.Cursor)
+	require.Equal(t, "old-error", decoded.LastError)
 }
 
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {

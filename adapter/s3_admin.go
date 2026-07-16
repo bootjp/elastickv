@@ -423,12 +423,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 	if err != nil {
 		return err //nolint:wrapcheck // sentinel errors propagate as-is.
 	}
-	// Phase 2: best-effort safety-net DEL_PREFIX. Outside the
-	// retryS3Mutation closure because retrying after Phase 1
-	// committed would 404 at loadBucketMetaAt; we want the error
-	// (if any) logged but not propagated to the operator.
-	s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration)
-	return nil
+	return s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration)
 }
 
 // adminDeleteBucketTxnBody is the per-attempt body retryS3Mutation
@@ -501,22 +496,26 @@ func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.
 	}
 }
 
-// runBucketDeleteSafetyNet runs the Phase-2 DEL_PREFIX dispatch
-// and swallows transport / cluster errors after logging — the
-// caller has already deleted the bucket meta and the operator-
-// visible state is consistent with that. Shared between admin and
-// SigV4 paths.
-func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, generation uint64) {
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems: bucketDeleteSafetyNetElems(bucket, generation),
-	}); err != nil {
+// runBucketDeleteSafetyNet runs the Phase-2 DEL_PREFIX dispatch. Phase 1 has
+// already deleted the bucket meta, so this helper retries transient fencing in
+// place instead of re-entering the full delete transaction.
+func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, generation uint64) error {
+	err := s.retryS3Mutation(ctx, func() error {
+		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			Elems: bucketDeleteSafetyNetElems(bucket, generation),
+		})
+		return errors.WithStack(err)
+	})
+	if err != nil {
 		slog.WarnContext(ctx,
 			"bucket delete safety-net DEL_PREFIX failed; bucket meta is gone but orphan sweep incomplete",
 			slog.String("bucket", bucket),
 			slog.Uint64("generation", generation),
 			slog.String("error", err.Error()),
 		)
+		return err
 	}
+	return nil
 }
 
 // adminCanonicalACL normalises an empty input to the canned
