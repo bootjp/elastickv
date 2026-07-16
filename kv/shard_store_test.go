@@ -352,6 +352,55 @@ func TestShardStoreScanAt_FiltersStagedShadowRowsFromLiveCandidates(t *testing.T
 	require.Equal(t, []*store.KVPair{{Key: rawKey, Value: []byte("staged")}}, kvs)
 }
 
+func TestShardStoreScanAt_PreservesNonStagedRoutesDuringBroadStagedVisibilityScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    []byte("t"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 3, Start: []byte("t"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live-n"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("u"), []byte("live-u"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("n")), []byte("staged-n"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("o")), []byte("staged-o"), 20, 0))
+
+	kvs, err := st.ScanAt(ctx, nil, nil, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("live-b")},
+		{Key: []byte("n"), Value: []byte("staged-n")},
+		{Key: []byte("o"), Value: []byte("staged-o")},
+		{Key: []byte("u"), Value: []byte("live-u")},
+	}, kvs)
+
+	kvs, err = st.ReverseScanAt(ctx, nil, nil, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("u"), Value: []byte("live-u")},
+		{Key: []byte("o"), Value: []byte("staged-o")},
+		{Key: []byte("n"), Value: []byte("staged-n")},
+		{Key: []byte("b"), Value: []byte("live-b")},
+	}, kvs)
+}
+
 func TestShardStoreScanAt_RoutesS3BucketAuxiliaryStagedVisibility(t *testing.T) {
 	t.Parallel()
 
