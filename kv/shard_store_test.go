@@ -548,20 +548,20 @@ func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0))
 }
 
-func TestShardStoreRaftApplySkipsMigrationTimestampFloor(t *testing.T) {
+func TestShardStoreRaftApplyRejectsMigrationTimestampFloor(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	st, _ := newStagedVisibilityShardStore(t)
 
-	require.NoError(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
+	require.ErrorIs(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
 		{Op: store.OpTypePut, Key: []byte("k-raft"), Value: []byte("v")},
-	}, nil, 90, 100))
-	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
+	}, nil, 90, 100), ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
 		{Op: store.OpTypePut, Key: []byte("k-raft-at"), Value: []byte("v")},
-	}, nil, 90, 100, 1))
-	require.NoError(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100))
-	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2))
+	}, nil, 90, 100, 1), ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100), ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2), ErrRouteWriteTimestampTooLow)
 }
 
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {

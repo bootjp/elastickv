@@ -460,16 +460,27 @@ func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commi
 	}
 	routes := i.routeEngine.Stats()
 	for _, mut := range muts {
-		if mut == nil || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
+		if mut == nil || forwardedTxnControlMutation(mut) || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
 			continue
 		}
-		for _, route := range routes {
-			if routeWriteTimestampFloorApplies(route, mut, commitTS) {
-				return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
-			}
+		if err := rejectMutationBelowRouteWriteFloor(routes, mut, commitTS); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func rejectMutationBelowRouteWriteFloor(routes []distribution.Route, mut *pb.Mutation, commitTS uint64) error {
+	for _, route := range routes {
+		if routeWriteTimestampFloorApplies(route, mut, commitTS) {
+			return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnControlMutation(mut *pb.Mutation) bool {
+	return mut != nil && bytes.HasPrefix(mut.GetKey(), []byte(kv.TxnKeyPrefix))
 }
 
 func routeWriteTimestampFloorApplies(route distribution.Route, mut *pb.Mutation, commitTS uint64) bool {

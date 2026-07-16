@@ -504,7 +504,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return f.handleDelPrefix(ctx, prefix, commitTS)
 	}
 
-	if err := f.validateRawMutationsForApply(ctx, r); err != nil {
+	if err := f.validateRawMutationsForApply(ctx, r, commitTS); err != nil {
 		return err
 	}
 
@@ -521,17 +521,17 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	return nil
 }
 
-func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, r *pb.Request) error {
+func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
 	for _, mut := range r.GetMutations() {
-		if err := f.validateRawMutationForApply(ctx, mut, bypassKeys); err != nil {
+		if err := f.validateRawMutationForApply(ctx, mut, bypassKeys, commitTS); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, writeFenceBypassKeys map[string]struct{}) error {
+func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, writeFenceBypassKeys map[string]struct{}, commitTS uint64) error {
 	if mut == nil || len(mut.Key) == 0 {
 		return errors.WithStack(ErrInvalidRequest)
 	}
@@ -543,6 +543,9 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
 			return err
 		}
+	}
+	if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+		return err
 	}
 	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 		return err
@@ -565,6 +568,9 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
 	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
+		return err
+	}
+	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
 		return err
 	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
@@ -605,6 +611,74 @@ func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
 		return nil
 	}
 	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorForKey(key []byte, commitTS uint64) error {
+	if f.routes == nil || commitTS == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		for _, route := range snap.IntersectingRoutes(start, end) {
+			if err := verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	rkey := routeKey(key)
+	if route, ok := snap.RouteOf(rkey); ok {
+		if err := verifyRouteWriteTimestampFloorForRoute(route, key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorsForMutations(muts []*pb.Mutation, commitTS uint64) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorForPrefix(prefix []byte, commitTS uint64) error {
+	if f.routes == nil || commitTS == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	for _, route := range snap.IntersectingRoutes(start, end) {
+		if err := verifyRouteWriteTimestampFloorForRange(route, prefix, start, end, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteTimestampFloorForRoute(route distribution.Route, key []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, routeKey(key), commitTS, route.MinWriteTSExclusive)
+}
+
+func verifyRouteWriteTimestampFloorForRange(route distribution.Route, key, start, end []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
 }
 
 func routePrefixRange(prefix []byte) ([]byte, []byte) {
@@ -1102,7 +1176,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, startTS)
 	if err != nil {
 		return err
 	}
@@ -1172,7 +1246,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1191,6 +1265,28 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	uniq, err := uniqueTxnMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
 		return nil, err
 	}
 	return uniq, nil
@@ -1265,7 +1361,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	uniq, err := uniqueTxnMutations(muts)
+	uniq, err := f.uniqueTxnMutationsAboveFloor(muts, commitTS)
 	if err != nil {
 		return err
 	}

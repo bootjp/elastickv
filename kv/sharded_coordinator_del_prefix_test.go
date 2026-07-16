@@ -443,6 +443,43 @@ func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToStagedOwner(t *testing.
 	require.Equal(t, key, g2Txn.requests[0].Mutations[0].Key)
 }
 
+func TestShardedCoordinatorIgnoresRawRouteFloorForS3BucketAuxiliaryWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliaryStagedRoutes(bucket, 1, 2)
+	routes[2].MinWriteTSExclusive = ^uint64(0)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  routes,
+	}))
+
+	rawRoute, ok := engine.GetRoute(routeKey(key))
+	require.True(t, ok)
+	require.Equal(t, ^uint64(0), rawRoute.MinWriteTSExclusive)
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.NotEmpty(t, auxRoutes)
+	require.Zero(t, auxRoutes[0].MinWriteTSExclusive)
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+}
+
 func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteAtMigrationTimestampFloor(t *testing.T) {
 	t.Parallel()
 

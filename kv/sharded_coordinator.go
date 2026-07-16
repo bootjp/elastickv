@@ -1216,18 +1216,18 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[O
 }
 
 func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if ok {
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+				return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
+			}
+		}
+		return nil
+	}
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
 		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, rkey, commitTS, route.MinWriteTSExclusive)
-	}
-	start, end, ok := s3BucketAuxiliaryRouteRange(key)
-	if !ok {
-		return nil
-	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
-		}
 	}
 	return nil
 }

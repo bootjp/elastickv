@@ -2443,6 +2443,9 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 	if err != nil || group == nil {
 		return err
 	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
+		return err
+	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
 	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
@@ -2454,6 +2457,9 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
 	group, err := s.resolveSingleShardGroup(mutations)
 	if err != nil || group == nil {
+		return err
+	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
@@ -2473,7 +2479,7 @@ func (s *ShardStore) ensureMutationWriteTimestampFloors(mutations []*store.KVPai
 		return nil
 	}
 	for _, mut := range mutations {
-		if mut == nil || len(mut.Key) == 0 {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
 			continue
 		}
 		route, _, ok := s.routeAndGroupForKey(mut.Key)
@@ -2607,6 +2613,9 @@ func (s *ShardStore) ensurePrefixWriteTimestampFloors(prefix []byte, commitTS ui
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -2633,6 +2642,9 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue

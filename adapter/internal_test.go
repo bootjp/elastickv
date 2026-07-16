@@ -294,3 +294,41 @@ func TestStampTxnTimestampsRejectsRouteWriteFloor(t *testing.T) {
 	err := i.stampTxnTimestamps(context.Background(), reqs)
 	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
 }
+
+func TestStampTxnTimestampsIgnoresMetadataForRouteWriteFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 []byte("m"),
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID: 2,
+				Start:   []byte("m"),
+				End:     nil,
+				GroupID: 2,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+	i := &Internal{routeEngine: engine}
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    50,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}}
+
+	require.NoError(t, i.stampTxnTimestamps(context.Background(), reqs))
+}
