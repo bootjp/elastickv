@@ -451,6 +451,22 @@ func TestDeltaCompactor_LegacyListCursorAdvancesPastRejectedPrefixBeforeAccepted
 	require.NoError(t, err)
 }
 
+func TestDeltaCompactor_CursorBacktracksBeforeWholeAcceptedTail(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("compactor-accepted-tail")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	d1 := legacyListMetaDeltaKey(userKey, 1)
+	d2 := legacyListMetaDeltaKey(userKey, 2)
+	rawKVs := []*store.KVPair{
+		{Key: d1, Value: delta},
+		{Key: d2, Value: delta},
+	}
+
+	got := deltaCompactorCursorAfterFiltering(rawKVs, rawKVs, nil, true, store.ExtractLegacyListUserKeyFromDelta)
+	require.Nil(t, got)
+}
+
 func TestDeltaCompactor_ListDeltaDeletesPreserveScanRouteGroup(t *testing.T) {
 	t.Parallel()
 

@@ -469,7 +469,7 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	kvs = filterDeltaKVs(rawKVs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
-	lastScannedKey = deltaCompactorCursorAfterFiltering(rawKVs, kvs, lastScannedKey, truncated)
+	lastScannedKey = deltaCompactorCursorAfterFiltering(rawKVs, kvs, lastScannedKey, truncated, h.extractUserKey)
 
 	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
 
@@ -483,7 +483,12 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	return nil
 }
 
-func deltaCompactorCursorAfterFiltering(rawKVs, acceptedKVs []*store.KVPair, lastScannedKey []byte, truncated bool) []byte {
+func deltaCompactorCursorAfterFiltering(
+	rawKVs, acceptedKVs []*store.KVPair,
+	lastScannedKey []byte,
+	truncated bool,
+	extractUserKey func([]byte) []byte,
+) []byte {
 	if !truncated || len(rawKVs) == 0 {
 		return lastScannedKey
 	}
@@ -493,7 +498,7 @@ func deltaCompactorCursorAfterFiltering(rawKVs, acceptedKVs []*store.KVPair, las
 	lastAcceptedKey := acceptedKVs[len(acceptedKVs)-1].Key
 	switch {
 	case len(lastScannedKey) == 0:
-		if prev := rawKeyBeforeAcceptedTail(rawKVs, lastAcceptedKey); len(prev) > 0 {
+		if prev := rawKeyBeforeAcceptedTail(rawKVs, acceptedKVs, lastAcceptedKey, extractUserKey); len(prev) > 0 {
 			return prev
 		}
 		if rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey) {
@@ -517,7 +522,11 @@ func rawPageHasRejectedTailAfter(rawKVs []*store.KVPair, acceptedKey []byte) boo
 	return false
 }
 
-func rawKeyBeforeAcceptedTail(rawKVs []*store.KVPair, acceptedKey []byte) []byte {
+func rawKeyBeforeAcceptedTail(
+	rawKVs, acceptedKVs []*store.KVPair,
+	acceptedKey []byte,
+	extractUserKey func([]byte) []byte,
+) []byte {
 	if len(rawKVs) < 2 || len(acceptedKey) == 0 {
 		return nil
 	}
@@ -525,12 +534,46 @@ func rawKeyBeforeAcceptedTail(rawKVs []*store.KVPair, acceptedKey []byte) []byte
 	if rawKVs[last] == nil || !bytes.Equal(rawKVs[last].Key, acceptedKey) {
 		return nil
 	}
+	acceptedUserKey := []byte(nil)
+	if extractUserKey != nil {
+		acceptedUserKey = extractUserKey(acceptedKey)
+	}
+	acceptedKeys := deltaCompactorAcceptedKeySet(acceptedKVs)
 	for i := last - 1; i >= 0; i-- {
-		if rawKVs[i] != nil {
-			return rawKVs[i].Key
+		if rawKVs[i] == nil {
+			continue
 		}
+		if deltaCompactorSameAcceptedTailUser(rawKVs[i].Key, acceptedKeys, acceptedUserKey, extractUserKey) {
+			continue
+		}
+		return rawKVs[i].Key
 	}
 	return nil
+}
+
+func deltaCompactorAcceptedKeySet(acceptedKVs []*store.KVPair) map[string]struct{} {
+	acceptedKeys := make(map[string]struct{}, len(acceptedKVs))
+	for _, kvp := range acceptedKVs {
+		if kvp != nil {
+			acceptedKeys[string(kvp.Key)] = struct{}{}
+		}
+	}
+	return acceptedKeys
+}
+
+func deltaCompactorSameAcceptedTailUser(
+	rawKey []byte,
+	acceptedKeys map[string]struct{},
+	acceptedUserKey []byte,
+	extractUserKey func([]byte) []byte,
+) bool {
+	if len(acceptedUserKey) == 0 || extractUserKey == nil {
+		return false
+	}
+	if _, accepted := acceptedKeys[string(rawKey)]; !accepted {
+		return false
+	}
+	return bytes.Equal(extractUserKey(rawKey), acceptedUserKey)
 }
 
 // groupByUserKey groups KVPairs by their user key, returning both the map and
