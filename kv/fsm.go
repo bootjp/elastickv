@@ -1100,19 +1100,22 @@ func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, snap RouteSnap
 		if isTxnInternalKey(mut.Key) {
 			continue
 		}
-		// routeKey-normalize before OwnerOf so the gate routes the
-		// same way as ShardRouter.ResolveGroup — raw adapter keys
-		// and route catalog ranges live in different lex bands
-		// (issue #930).
-		rKey := routeKey(mut.Key)
-		owner, found := snap.OwnerOf(rKey)
+		ownerKey := composed1OwnerKey(mut.Key)
+		owner, found := snap.OwnerOf(ownerKey)
 		if !found || owner != f.shardGroupID {
 			return errors.Wrapf(ErrComposed1Violation,
 				"%s-version v=%d: key %q (routeKey %q) owned by group %d (found=%v); this FSM serves group %d",
-				phase, snapVer, mut.Key, rKey, owner, found, f.shardGroupID)
+				phase, snapVer, mut.Key, ownerKey, owner, found, f.shardGroupID)
 		}
 	}
 	return nil
+}
+
+func composed1OwnerKey(key []byte) []byte {
+	if start, _, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		return start
+	}
+	return routeKey(key)
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {

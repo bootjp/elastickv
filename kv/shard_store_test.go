@@ -145,6 +145,89 @@ func TestShardStoreGetAt_MergesStagedVisibilityForS3BucketAuxiliary(t *testing.T
 	}
 }
 
+func TestShardStoreS3BucketAuxiliaryScanFiltersStagedRoutesToBucketRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const (
+		bucketA = "bucket-a"
+		bucketB = "bucket-b"
+		bucketC = "bucket-c"
+	)
+	routeStartA := s3keys.RoutePrefixForBucketAnyGeneration(bucketA)
+	routeEndA := prefixScanEnd(routeStartA)
+	routeStartB := s3keys.RoutePrefixForBucketAnyGeneration(bucketB)
+	routeEndB := prefixScanEnd(routeStartB)
+	require.Less(t, bytes.Compare(routeStartA, routeStartB), 0)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStartA, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStartA, End: routeEndA, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEndA, End: routeStartB, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 4, Start: routeStartB, End: routeEndB, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 10},
+			{RouteID: 5, Start: routeEndB, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+
+	keyA := s3keys.BucketMetaKey(bucketA)
+	keyB := s3keys.BucketMetaKey(bucketB)
+	keyC := s3keys.BucketMetaKey(bucketC)
+	require.NoError(t, group.Store.PutAt(ctx, keyA, []byte("live-a"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, keyB, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, keyC, []byte("live-c"), 10, 0))
+
+	exactA, err := st.ScanAt(ctx, keyA, prefixScanEnd(keyA), 10, 20)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: keyA, Value: []byte("live-a")}}, exactA)
+
+	all, err := st.ScanAt(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 20)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: keyA, Value: []byte("live-a")},
+		{Key: keyB, Value: []byte("live-b")},
+		{Key: keyC, Value: []byte("live-c")},
+	}, all)
+
+	reverseAll, err := st.ReverseScanAt(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 20)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: keyC, Value: []byte("live-c")},
+		{Key: keyB, Value: []byte("live-b")},
+		{Key: keyA, Value: []byte("live-a")},
+	}, reverseAll)
+}
+
+func TestShardStoreRouteBoundedS3BucketAuxiliaryScanKeepsStagedRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStart, End: routeEnd, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("staged"), 20, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 25, false, 0, 1, routeStart, routeEnd)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("staged")}}, kvs)
+}
+
 func TestShardStoreRejectsS3BucketAuxiliaryWriteAtMigrationTimestampFloor(t *testing.T) {
 	t.Parallel()
 

@@ -396,13 +396,14 @@ func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, group
 		return nil, err
 	}
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
-	if !clampToRoutes && !routeFilterPresent {
+	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
+	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
 		routes = dedupeRepeatedRawScanRoutes(routes)
 	}
-	return s.scanExplicitGroupRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd, clampToRoutes)
+	return s.scanExplicitGroupRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd, clampToRoutes, dedupeByKey)
 }
 
-func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte, clampToRoutes bool) ([]*store.KVPair, error) {
+func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte, clampToRoutes bool, dedupeByKey bool) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	for i := 0; i < len(routes); i++ {
 		route := routes[i]
@@ -427,11 +428,7 @@ func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context,
 			}
 			continue
 		}
-		if reverse {
-			out = mergeAndTrimReverseScanResults(out, kvs, limit)
-		} else {
-			out = mergeAndTrimScanResults(out, kvs, limit)
-		}
+		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, reverse, dedupeByKey)
 	}
 	return out, nil
 }
@@ -511,12 +508,13 @@ func (s *ShardStore) routesForS3BucketAuxiliaryScan(start []byte, end []byte) ([
 	}
 	routes := make([]distribution.Route, 0)
 	routes = append(routes, s.engine.GetIntersectingRoutes(start, end)...)
-	for _, route := range s.engine.GetIntersectingRoutes([]byte(s3keys.RoutePrefix), prefixScanEnd([]byte(s3keys.RoutePrefix))) {
+	routeStart, routeEnd := s3BucketAuxiliaryScanRouteRange(start, end)
+	for _, route := range s.engine.GetIntersectingRoutes(routeStart, routeEnd) {
 		if routeHasStagedVisibility(route) {
 			routes = append(routes, route)
 		}
 	}
-	return dedupeRepeatedRawScanRoutes(routes), true
+	return routes, true
 }
 
 func s3BucketAuxiliaryScanBounds(start []byte, end []byte) bool {
@@ -528,6 +526,14 @@ func s3BucketAuxiliaryScanBounds(start []byte, end []byte) bool {
 		return true
 	}
 	return bytes.Compare(start, end) < 0
+}
+
+func s3BucketAuxiliaryScanRouteRange(start []byte, end []byte) ([]byte, []byte) {
+	if routeStart, routeEnd, ok := s3BucketAuxiliaryRouteRange(start); ok && end != nil && bytes.Compare(end, prefixScanEnd(start)) <= 0 {
+		return routeStart, routeEnd
+	}
+	routeStart := []byte(s3keys.RoutePrefix)
+	return routeStart, prefixScanEnd(routeStart)
 }
 
 type repeatedRawScanRouteKey struct {
@@ -728,7 +734,8 @@ func normalizedRouteScanEnd(routeEnd []byte) []byte {
 func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
-	if !clampToRoutes && !routeFilterPresent {
+	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
+	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
 		routes = dedupeRepeatedRawScanRoutes(routes)
 	}
 	for _, route := range routes {
@@ -751,7 +758,7 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 			}
 			continue
 		}
-		out = mergeAndTrimScanResults(out, kvs, limit)
+		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, false, dedupeByKey)
 	}
 	return out, nil
 }
@@ -770,7 +777,8 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
-	if !clampToRoutes && !routeFilterPresent {
+	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
+	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
 		routes = dedupeRepeatedRawScanRoutes(routes)
 	}
 	for i := len(routes) - 1; i >= 0; i-- {
@@ -795,7 +803,7 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 		if err != nil {
 			return nil, err
 		}
-		out = mergeAndTrimReverseScanResults(out, kvs, limit)
+		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, true, dedupeByKey)
 	}
 	return out, nil
 }
@@ -1072,6 +1080,9 @@ func minScanEnd(a []byte, b []byte) []byte {
 }
 
 func routeKeyInScanBounds(key []byte, routeStart []byte, routeEnd []byte) bool {
+	if s3BucketAuxiliaryRouteInRange(key, routeStart, routeEnd) {
+		return true
+	}
 	key = routeKey(key)
 	if len(routeStart) > 0 && bytes.Compare(key, routeStart) < 0 {
 		return false
@@ -1315,6 +1326,7 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 			return nil, nil, false, err
 		}
 		out := visibleLogicalKVs(versions, ts, reverse)
+		out = filterRouteScanKVs(out, route.Start, route.End)
 		liveExhausted := len(liveKVs) < window
 		stagedExhausted := len(stagedKVs) < window
 		boundary, hasBoundary := stagedVisibilityCandidateBoundary(liveKVs, stagedKVs, liveExhausted, stagedExhausted, reverse)
@@ -1690,34 +1702,54 @@ func scanUserKey(kvp *store.KVPair) ([]byte, bool) {
 	return txnUserKeyFromLockKey(kvp.Key)
 }
 
-func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
+func mergeAndTrimScanResultsWithOptions(out []*store.KVPair, kvs []*store.KVPair, limit int, reverse bool, dedupeByKey bool) []*store.KVPair {
 	if len(kvs) == 0 {
 		return out
 	}
-	out = append(out, kvs...)
+	if dedupeByKey {
+		out = appendReplacingKVsByKey(out, kvs)
+	} else {
+		out = append(out, kvs...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		cmp := bytes.Compare(out[i].Key, out[j].Key)
+		if reverse {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
 	if len(out) <= limit {
 		return out
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(out[i].Key, out[j].Key) < 0
-	})
 	clear(out[limit:])
 	return out[:limit]
 }
 
 func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int) []*store.KVPair {
-	if len(kvs) == 0 {
-		return out
+	return mergeAndTrimScanResultsWithOptions(out, kvs, limit, true, false)
+}
+
+func appendReplacingKVsByKey(out []*store.KVPair, kvs []*store.KVPair) []*store.KVPair {
+	indexByKey := make(map[string]int, len(out)+len(kvs))
+	for i, kvp := range out {
+		if kvp == nil {
+			continue
+		}
+		indexByKey[string(kvp.Key)] = i
 	}
-	out = append(out, kvs...)
-	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(out[i].Key, out[j].Key) > 0
-	})
-	if len(out) <= limit {
-		return out
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		key := string(kvp.Key)
+		if idx, ok := indexByKey[key]; ok {
+			out[idx] = kvp
+			continue
+		}
+		indexByKey[key] = len(out)
+		out = append(out, kvp)
 	}
-	clear(out[limit:])
-	return out[:limit]
+	return out
 }
 
 func countNonInternalKVs(kvs []*store.KVPair) int {

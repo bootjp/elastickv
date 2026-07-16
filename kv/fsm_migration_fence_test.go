@@ -169,7 +169,7 @@ func TestFSMRejectsCurrentWriteFencedS3BucketAuxiliaryPointWrite(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	const bucket = "bucket-a"
+	const bucket = "bucket-b"
 	fsm := newS3BucketAuxiliaryWriteFencedFSM(t, bucket)
 
 	for _, key := range [][]byte{
@@ -186,7 +186,7 @@ func TestFSMRejectsCurrentWriteFencedS3BucketAuxiliaryPointWrite(t *testing.T) {
 func TestFSMRejectsObservedWriteFencedS3BucketAuxiliaryPointWrite(t *testing.T) {
 	t.Parallel()
 
-	const bucket = "bucket-a"
+	const bucket = "bucket-b"
 	fsm := newS3BucketAuxiliaryWriteFencedFSM(t, bucket)
 
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
@@ -196,6 +196,28 @@ func TestFSMRejectsObservedWriteFencedS3BucketAuxiliaryPointWrite(t *testing.T) 
 		},
 	}, 10)
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMComposed1UsesS3BucketAuxiliaryRouteOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-b"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, s3BucketAuxiliaryStagedRoutes(bucket, 3, 4))
+	fsm := newComposed1FSM(t, engine, 4)
+
+	err := fsm.verifyComposed1(&pb.Request{
+		IsTxn:                true,
+		Phase:                pb.Phase_PREPARE,
+		Ts:                   10,
+		ObservedRouteVersion: 1,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("meta")},
+		},
+	})
+	require.NoError(t, err)
 }
 
 func TestFSMIgnoresRawRouteFloorForS3BucketAuxiliaryWrite(t *testing.T) {
