@@ -243,6 +243,62 @@ func TestFSMRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
 	}
 }
 
+func TestFSMRejectsS3BucketAuxiliaryPointWriteBelowRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{{
+		RouteID:             1,
+		Start:               routeStart,
+		End:                 routeEnd,
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: s3keys.BucketMetaKey(bucket), Value: []byte("v")}},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+}
+
+func TestFSMRejectsS3BucketAuxiliaryPointWriteWithoutTargetReadinessProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   routeStart,
+		End:     routeEnd,
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: s3keys.BucketGenerationKey(bucket), Value: []byte("v")}},
+	}, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestFSMRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -477,6 +533,48 @@ func TestFSMPrepareTxnChecksReadKeysForTargetReadiness(t *testing.T) {
 
 	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMPrepareTxnSkipsRemotePrimaryForTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("m"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	err := fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{
+				Op:  pb.Op_PUT,
+				Key: []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("b"),
+					LockTTLms:  defaultTxnLockTTLms,
+				}),
+			},
+			{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("v")},
+		},
+	}, 10)
+	require.NoError(t, err)
+
+	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("n")), ^uint64(0))
+	require.NoError(t, getErr)
 }
 
 func TestFSMPrepareTxnChecksStagedVisibilityWriteConflicts(t *testing.T) {

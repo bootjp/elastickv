@@ -553,6 +553,31 @@ func TestShardStoreScanGroupAtChecksEveryCoveredRoute(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreScanGroupAtClampsSingleMatchedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("m"),
+			End:     []byte("z"),
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("outside"), 7, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("inside"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: []byte("n"), Value: []byte("inside")}}, kvs)
+}
+
 func TestShardStoreScanGroupAtSplitsCoveredRoutesForStagedVisibility(t *testing.T) {
 	t.Parallel()
 
@@ -883,6 +908,50 @@ func TestShardStoreDeletePrefixAtChecksTargetReadinessBeforeDelete(t *testing.T)
 	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
 
 	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtRaftChecksTargetReadinessBeforeDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAtRaft(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtRaftAtChecksTargetReadinessBeforeDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAtRaftAt(ctx, []byte("b"), nil, 120, 10)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
 	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
@@ -1322,7 +1391,7 @@ func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0))
 }
 
-func TestShardStoreRaftApplySkipsMigrationTimestampFloor(t *testing.T) {
+func TestShardStoreRaftApplySkipsPointMigrationTimestampFloorButGuardsPrefixDeletes(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1334,8 +1403,8 @@ func TestShardStoreRaftApplySkipsMigrationTimestampFloor(t *testing.T) {
 	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
 		{Op: store.OpTypePut, Key: []byte("k-raft-at"), Value: []byte("v")},
 	}, nil, 90, 100, 1))
-	require.NoError(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100))
-	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2))
+	require.ErrorIs(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100), ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2), ErrRouteWriteTimestampTooLow)
 }
 
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {

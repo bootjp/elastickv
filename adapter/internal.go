@@ -270,6 +270,9 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
+	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+		return nil, err
+	}
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -21,6 +21,8 @@ func validateTargetStagedReadinessState(state TargetStagedReadinessState) error 
 		return errors.New("target staged readiness job_id is required")
 	case state.MigrationJobID == 0:
 		return errors.New("target staged readiness migration_job_id is required")
+	case state.Armed && state.MinWriteTSExclusive == 0:
+		return errors.New("target staged readiness min_write_ts_exclusive is required when armed")
 	case state.RouteEnd != nil && bytes.Compare(state.RouteStart, state.RouteEnd) >= 0:
 		return errors.New("target staged readiness route range is invalid")
 	default:

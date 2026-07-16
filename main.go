@@ -512,6 +512,7 @@ func run() error {
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
 		adapter.WithSplitMigrationCapabilityGate(splitMigrationGate),
+		adapter.WithSplitJobRunnerReady(),
 	)
 	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)

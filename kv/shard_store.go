@@ -279,6 +279,9 @@ func targetReadinessAppliesToRoute(route distribution.Route, routeStart []byte, 
 }
 
 func readinessRouteRange(start []byte, end []byte) ([]byte, []byte) {
+	if routeStart, routeEnd, ok := s3BucketAuxiliaryRouteRange(start); ok && (end == nil || bytes.Equal(end, nextScanCursor(start))) {
+		return routeStart, routeEnd
+	}
 	routeStart := routeKey(start)
 	if end == nil {
 		return routeStart, nil
@@ -590,7 +593,7 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 }
 
 func (s *ShardStore) scanExplicitGroupRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
-	if len(routes) == 1 {
+	if len(routes) == 1 && !clampToRoutes {
 		return s.scanRouteAtDirection(ctx, routes[0], start, end, limit, ts, false, true)
 	}
 	out := make([]*store.KVPair, 0, limit)
@@ -2858,7 +2861,10 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	routes := s.stagedVisibilityRoutesForPrefix(prefix)
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
+		return err
+	}
 	for groupID, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -2891,7 +2897,10 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	routes := s.stagedVisibilityRoutesForPrefix(prefix)
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
+		return err
+	}
 	for groupID, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -2917,21 +2926,6 @@ func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, ex
 		}
 	}
 	return nil
-}
-
-func (s *ShardStore) stagedVisibilityRoutesForPrefix(prefix []byte) []distribution.Route {
-	if s == nil || s.engine == nil {
-		return nil
-	}
-	start, end := routePrefixRange(prefix)
-	routes := s.engine.GetIntersectingRoutes(start, end)
-	out := make([]distribution.Route, 0, len(routes))
-	for _, route := range routes {
-		if routeHasStagedVisibility(route) {
-			out = append(out, route)
-		}
-	}
-	return out
 }
 
 func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte, commitTS uint64) ([]distribution.Route, error) {

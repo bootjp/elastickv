@@ -1017,6 +1017,23 @@ func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
 	})
 }
 
+func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+
+		err := writer.ApplyTargetStagedReadiness(context.Background(), TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			Armed:                  true,
+		})
+		require.ErrorContains(t, err, "min_write_ts_exclusive")
+	})
+}
+
 func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-ready-persist-*")

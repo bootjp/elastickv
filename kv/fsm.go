@@ -824,10 +824,28 @@ func (f *kvFSM) verifyRouteWriteFloorForKey(key []byte, commitTS uint64) error {
 	}
 	rkey := routeKey(key)
 	floor, ok := snap.WriteFloorForKey(rkey)
+	if ok && commitTS != 0 && commitTS <= floor {
+		return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q routeKey %q", commitTS, floor, key, rkey)
+	}
+	if err := f.verifyS3BucketAuxiliaryRouteWriteFloor(snap, key, commitTS); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyS3BucketAuxiliaryRouteWriteFloor(snap RouteSnapshot, key []byte, commitTS uint64) error {
+	if commitTS == 0 {
+		return nil
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return nil
+	}
+	floor, ok := snap.WriteFloorIntersects(start, end)
 	if !ok || commitTS > floor {
 		return nil
 	}
-	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q routeKey %q", commitTS, floor, key, rkey)
+	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q route range [%q,%q)", commitTS, floor, key, start, end)
 }
 
 func (f *kvFSM) verifyRouteWriteFloorForPrefix(prefix []byte, commitTS uint64) error {
@@ -1281,7 +1299,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if meta.CommitTS != 0 {
 		floorTS = meta.CommitTS
 	}
-	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, meta.PrimaryKey); err != nil {
+	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, nil); err != nil {
 		return err
 	}
 	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, floorTS)
