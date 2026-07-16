@@ -766,6 +766,51 @@ func TestRedisTxnSetReplacementSkipsWideCleanupForRawStringOrMissing(t *testing.
 	}
 }
 
+func TestRedisTxnSetReplacementDeletesNonPrefixedStringEncodings(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name        string
+		seedKey     func([]byte) []byte
+		seedValue   []byte
+		expectedDel func([]byte) []byte
+	}{
+		{
+			name:        "hll",
+			seedKey:     redisHLLKey,
+			seedValue:   []byte("hll-payload"),
+			expectedDel: redisHLLKey,
+		},
+		{
+			name:        "legacy-bare-string",
+			seedKey:     func(key []byte) []byte { return key },
+			seedValue:   []byte("old"),
+			expectedDel: func(key []byte) []byte { return key },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("set-replace:non-prefixed-string:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.seedKey(key), tc.seedValue, redisTxnTestStartTS, 0))
+
+			txn := newRedisTxnTestContext(server)
+			res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+			require.NoError(t, err)
+			require.Equal(t, "OK", res.str)
+
+			elems, err := txn.buildReplacementElems(ctx)
+			require.NoError(t, err)
+			require.True(t, elemKeysContain(elems, tc.expectedDel(key)))
+			require.True(t, elemKeysContain(elems, redisStrKey(key)))
+		})
+	}
+}
+
 func TestRedisTxnSetReplacementDeletesExpiredRawHash(t *testing.T) {
 	t.Parallel()
 

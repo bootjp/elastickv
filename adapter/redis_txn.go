@@ -98,11 +98,12 @@ type txnValue struct {
 }
 
 type stringReplacement struct {
-	key         []byte
-	value       []byte
-	ttl         *time.Time
-	rawTyp      redisValueType
-	rawTypKnown bool
+	key               []byte
+	value             []byte
+	ttl               *time.Time
+	rawTyp            redisValueType
+	rawTypKnown       bool
+	rawPrefixedString bool
 }
 
 type txnContext struct {
@@ -778,7 +779,11 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 		return redisResult{}, err
 	}
 	t.trackWideCollectionFenceReads(cmd.Args[1])
-	t.stageStringReplacementWithRawType(cmd.Args[1], cmd.Args[2], opts.ttl, typeView.rawTyp, typeView.rawTypKnown)
+	rawPrefixedString, err := t.rawPrefixedStringAtStart(cmd.Args[1], typeView)
+	if err != nil {
+		return redisResult{}, err
+	}
+	t.stageStringReplacementWithRawType(cmd.Args[1], cmd.Args[2], opts.ttl, typeView.rawTyp, typeView.rawTypKnown, rawPrefixedString)
 	return applySetResult(opts, oldValue), nil
 }
 
@@ -816,10 +821,10 @@ func cloneTimePtr(in *time.Time) *time.Time {
 }
 
 func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
-	t.stageStringReplacementWithRawType(key, value, ttl, redisTypeNone, false)
+	t.stageStringReplacementWithRawType(key, value, ttl, redisTypeNone, false, false)
 }
 
-func (t *txnContext) stageStringReplacementWithRawType(key, value []byte, ttl *time.Time, rawTyp redisValueType, rawTypKnown bool) {
+func (t *txnContext) stageStringReplacementWithRawType(key, value []byte, ttl *time.Time, rawTyp redisValueType, rawTypKnown bool, rawPrefixedString bool) {
 	if t.replacers == nil {
 		t.replacers = map[string]*stringReplacement{}
 	}
@@ -830,19 +835,32 @@ func (t *txnContext) stageStringReplacementWithRawType(key, value []byte, ttl *t
 		if rawTypKnown {
 			repl.rawTyp = rawTyp
 			repl.rawTypKnown = true
+			repl.rawPrefixedString = rawPrefixedString
 		}
 		delete(t.deletedKeys, k)
 		return
 	}
 	repl := &stringReplacement{
-		key:         bytes.Clone(key),
-		value:       bytes.Clone(value),
-		ttl:         cloneTimePtr(ttl),
-		rawTyp:      rawTyp,
-		rawTypKnown: rawTypKnown,
+		key:               bytes.Clone(key),
+		value:             bytes.Clone(value),
+		ttl:               cloneTimePtr(ttl),
+		rawTyp:            rawTyp,
+		rawTypKnown:       rawTypKnown,
+		rawPrefixedString: rawPrefixedString,
 	}
 	t.replacers[k] = repl
 	delete(t.deletedKeys, k)
+}
+
+func (t *txnContext) rawPrefixedStringAtStart(key []byte, view txnKeyTypeView) (bool, error) {
+	if !view.rawTypKnown || view.rawTyp != redisTypeString {
+		return false, nil
+	}
+	exists, err := t.server.store.ExistsAt(t.ctxOrBackground(), redisStrKey(key), t.startTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
 }
 
 func (t *txnContext) updateStringReplacementTTL(key []byte, ttl *time.Time) bool {
@@ -1657,6 +1675,9 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 func (r *stringReplacement) needsFullLogicalDelete() bool {
 	if !r.rawTypKnown {
 		return true
+	}
+	if r.rawTyp == redisTypeString {
+		return !r.rawPrefixedString
 	}
 	return isNonStringCollectionType(r.rawTyp)
 }

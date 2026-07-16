@@ -500,13 +500,11 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 	}
 }
 
-// applyHeaderStateOnSkip validates the cheap snapshot envelope checks
-// (size + footer-vs-tokenCRC) and applies only the header side-effects
-// (HLC ceiling + Stage 8a cutover) instead of running the body restore.
-// The body bytes are not read here: fsm.db already holds equivalent state,
-// which is precisely the reason we're skipping the restore. Full-body CRC
-// verification still runs on the execute/full-restore path where body
-// bytes are actually consumed.
+// applyHeaderStateOnSkip validates the snapshot envelope and full payload CRC,
+// then applies only the header side-effects (HLC ceiling + Stage 8a cutover)
+// instead of running the body restore. The FSM body is already durable enough
+// to skip restoring, but header side-effects still come from this file and
+// must not be applied from corrupt bytes.
 //
 // FSMs that do not implement raftengine.SnapshotHeaderApplier
 // silently no-op the apply phase -- the FSM has no header state to
@@ -523,8 +521,17 @@ func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) 
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if _, err := verifyFSMSnapshotPrefix(file, info.Size(), snapPath, tokenCRC); err != nil {
+	footer, err := verifyFSMSnapshotPrefix(file, info.Size(), snapPath, tokenCRC)
+	if err != nil {
 		return err
+	}
+	computed, err := computeFSMSnapshotPayloadCRC(file, info.Size())
+	if err != nil {
+		return err
+	}
+	if computed != footer {
+		return errors.Wrapf(ErrFSMSnapshotFileCRC,
+			"path=%s footer=%08x computed=%08x", snapPath, footer, computed)
 	}
 
 	setter, hasSetter := fsm.(raftengine.SnapshotHeaderApplier)

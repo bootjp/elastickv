@@ -80,6 +80,57 @@ func TestShardedCoordinatorGroupMutationsUsesExplicitElemGroup(t *testing.T) {
 	require.Equal(t, []byte("a-key"), grouped[2][0].Key)
 }
 
+func TestShardedCoordinatorDispatchTxn_CommitPrimaryUsesPinnedGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},
+			{CommitIndex: 11},
+		},
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 5},
+			{CommitIndex: 27},
+		},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	startTS := uint64(10)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*Elem[OP]{
+			{Op: Del, Key: []byte("a-key"), GroupID: 2},
+			{Op: Put, Key: []byte("z-key"), Value: []byte("v"), GroupID: 1},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 2)
+	require.Len(t, g2Txn.requests, 2)
+
+	g1Commit := g1Txn.requests[1]
+	g2Commit := g2Txn.requests[1]
+	require.Equal(t, pb.Phase_COMMIT, g1Commit.Phase)
+	require.Equal(t, pb.Phase_COMMIT, g2Commit.Phase)
+	require.Equal(t, []byte("z-key"), g1Commit.Mutations[1].Key)
+	require.Equal(t, pb.Op_PUT, g1Commit.Mutations[1].Op)
+	require.Equal(t, []byte("a-key"), g2Commit.Mutations[1].Key)
+	require.Equal(t, pb.Op_PUT, g2Commit.Mutations[1].Op)
+
+	primaryCommitMeta := requestTxnMeta(t, g2Commit)
+	require.Equal(t, []byte("a-key"), primaryCommitMeta.PrimaryKey)
+	require.Greater(t, primaryCommitMeta.CommitTS, startTS)
+}
+
 func requestTxnMeta(t *testing.T, req *pb.Request) TxnMeta {
 	t.Helper()
 	require.NotNil(t, req)

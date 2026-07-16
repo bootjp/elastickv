@@ -1299,7 +1299,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, err
 	}
 
-	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS, observedRouteVersion)
+	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion)
 	if err != nil {
 		// abortPreparedTxn must run even when ctx was the reason
 		// commitPrimaryTxn failed — otherwise prewrite intents on
@@ -1439,9 +1439,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	return prepared, nil
 }
 
-func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64, observedRouteVersion uint64) (uint64, uint64, error) {
-	primaryGid := c.engineGroupIDForKey(primaryKey)
-	if primaryGid == 0 {
+func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, observedRouteVersion uint64) (uint64, uint64, error) {
+	primaryGid, ok := primaryGroupIDForKey(primaryKey, grouped, gids)
+	if !ok {
 		return 0, 0, errors.WithStack(ErrInvalidRequest)
 	}
 
@@ -1469,6 +1469,17 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		return primaryGid, 0, nil
 	}
 	return primaryGid, r.CommitIndex, nil
+}
+
+func primaryGroupIDForKey(primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) (uint64, bool) {
+	for _, gid := range gids {
+		for _, mut := range grouped[gid] {
+			if mut != nil && bytes.Equal(mut.Key, primaryKey) {
+				return gid, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) (uint64, error) {
