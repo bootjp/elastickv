@@ -37,6 +37,12 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalMigrationImportGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationImportGate = gate
+	}
+}
+
 func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
 	return func(i *Internal) {
 		i.migrationPromoteGate = gate
@@ -49,12 +55,20 @@ func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 	}
 }
 
+func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionResolver) InternalOption {
+	return func(i *Internal) {
+		i.migrationExportGroupID = groupID
+		i.migrationExportResolver = resolver
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:               leader,
 		transactionManager:   txm,
 		clock:                clock,
 		relay:                relay,
+		migrationImportGate:  defaultMigrationImportGate,
 		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
@@ -64,15 +78,18 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader               raftengine.LeaderView
-	transactionManager   kv.Transactional
-	clock                *kv.HLC
-	tsAllocator          kv.TimestampAllocator
-	relay                *RedisPubSubRelay
-	store                store.MVCCStore
-	migrationProposer    raftengine.Proposer
-	migrationPromoteGate func(context.Context) error
-	routeEngine          *distribution.Engine
+	leader                  raftengine.LeaderView
+	transactionManager      kv.Transactional
+	clock                   *kv.HLC
+	tsAllocator             kv.TimestampAllocator
+	relay                   *RedisPubSubRelay
+	store                   store.MVCCStore
+	migrationProposer       raftengine.Proposer
+	migrationImportGate     func(context.Context) error
+	migrationPromoteGate    func(context.Context) error
+	routeEngine             *distribution.Engine
+	migrationExportGroupID  uint64
+	migrationExportResolver kv.PartitionResolver
 
 	pb.UnimplementedInternalServer
 }
@@ -164,7 +181,7 @@ func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest
 }
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
-	opts := exportRangeVersionsOptions(req)
+	opts := i.exportRangeVersionsOptions(req)
 	for {
 		result, err := i.store.ExportVersions(stream.Context(), opts)
 		if err != nil {
@@ -200,6 +217,9 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
+	if err := i.verifyMigrationImportEnabled(ctx); err != nil {
+		return nil, err
+	}
 	result, err := i.proposeMigrationImport(ctx, req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -216,6 +236,16 @@ func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) erro
 	}
 	if req.GetBracketId() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions bracket_id is required"))
+	}
+	return nil
+}
+
+func (i *Internal) verifyMigrationImportEnabled(ctx context.Context) error {
+	if i.migrationImportGate == nil {
+		return nil
+	}
+	if err := i.migrationImportGate(ctx); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
@@ -300,6 +330,17 @@ func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) 
 	return nil
 }
 
+func defaultMigrationImportGate(context.Context) error {
+	if migrationImportOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration import opcode is disabled; enable after every voter is running a build that supports migration import"))
+}
+
+func migrationImportOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE")
+}
+
 func defaultMigrationPromoteGate(context.Context) error {
 	if migrationPromoteOpcodeEnabledFromEnv() {
 		return nil
@@ -308,7 +349,11 @@ func defaultMigrationPromoteGate(context.Context) error {
 }
 
 func migrationPromoteOpcodeEnabledFromEnv() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"))) {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE")
+}
+
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
@@ -417,7 +462,7 @@ func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, labe
 	return result.Response, nil
 }
 
-func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
+func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
 	chunkBytes := uint64(req.GetChunkBytes())
 	if chunkBytes == 0 {
 		chunkBytes = defaultMigrationExportChunkBytes
@@ -436,13 +481,13 @@ func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.Export
 		MaxBytes:             chunkBytes,
 		MaxScannedBytes:      maxScannedBytes,
 		KeyFamily:            req.GetKeyFamily(),
-		AcceptKey:            migrationExportFilter(req),
+		AcceptKey:            i.migrationExportFilter(req),
 	}
 	return opts
 }
 
-func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
-	routeFilter := kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+func (i *Internal) migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	routeFilter := i.migrationExportRouteFilter(req)
 	if migrationFamilyRequiresDecodedS3(req.GetKeyFamily()) {
 		routeFilter = decodedS3BucketRouteFilter(req.GetKeyFamily(), req.GetRouteStart(), req.GetRouteEnd())
 	}
@@ -457,6 +502,13 @@ func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool
 	return func(rawKey []byte) bool {
 		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
 	}
+}
+
+func (i *Internal) migrationExportRouteFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	if i != nil && i.migrationExportGroupID != 0 && i.migrationExportResolver != nil {
+		return kv.RouteKeyFilterForGroup(req.GetRouteStart(), req.GetRouteEnd(), i.migrationExportGroupID, i.migrationExportResolver)
+	}
+	return kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
 }
 
 func migrationFamilyRequiresDecodedS3(family uint32) bool {

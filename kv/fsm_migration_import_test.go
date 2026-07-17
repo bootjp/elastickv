@@ -73,3 +73,40 @@ func TestApplyMigrationImportWritesOnlyStagedKeys(t *testing.T) {
 	_, err = st.GetAt(ctx, []byte("user|k"), 10)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
+
+type captureMigrationImportStore struct {
+	store.MVCCStore
+	opts store.ImportVersionsOptions
+}
+
+func (s *captureMigrationImportStore) ImportVersionsRaft(_ context.Context, opts store.ImportVersionsOptions) (store.ImportVersionsResult, error) {
+	s.opts = opts
+	return store.ImportVersionsResult{AckedCursor: opts.Cursor, MaxImportedTS: 10}, nil
+}
+
+func TestApplyMigrationImportThreadsPendingApplyIndex(t *testing.T) {
+	t.Parallel()
+
+	capturing := &captureMigrationImportStore{}
+	fsm := &kvFSM{store: capturing, pendingApplyIdx: 1234}
+	req := &pb.ImportRangeVersionsRequest{
+		JobId:     9,
+		BracketId: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor"),
+		Versions: []*pb.MVCCVersion{
+			{Key: []byte("user|k"), CommitTs: 10, Value: []byte("v")},
+		},
+	}
+	data, err := proto.Marshal(req)
+	require.NoError(t, err)
+
+	applied := fsm.applyMigrationImport(context.Background(), data)
+	result, ok := applied.(store.ImportVersionsResult)
+	require.True(t, ok, "got %T: %v", applied, applied)
+	require.Equal(t, []byte("cursor"), result.AckedCursor)
+	require.Equal(t, uint64(1234), capturing.opts.AppliedIndex)
+	require.Equal(t, uint64(9), capturing.opts.JobID)
+	require.Len(t, capturing.opts.Versions, 1)
+	require.Equal(t, distribution.MigrationStagedDataKey(9, []byte("user|k")), capturing.opts.Versions[0].Key)
+}

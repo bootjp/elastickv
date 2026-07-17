@@ -35,11 +35,12 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 		return errors.WithStack(err)
 	}
 	result, err := f.store.ImportVersionsRaft(ctx, store.ImportVersionsOptions{
-		JobID:     req.GetJobId(),
-		BracketID: req.GetBracketId(),
-		BatchSeq:  req.GetBatchSeq(),
-		Cursor:    req.GetCursor(),
-		Versions:  migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions()),
+		JobID:        req.GetJobId(),
+		AppliedIndex: f.pendingApplyIdx,
+		BracketID:    req.GetBracketId(),
+		BatchSeq:     req.GetBatchSeq(),
+		Cursor:       req.GetCursor(),
+		Versions:     migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions()),
 	})
 	if err != nil {
 		return errors.WithStack(err)

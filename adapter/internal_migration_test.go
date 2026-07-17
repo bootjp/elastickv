@@ -385,6 +385,42 @@ func TestInternalExportRangeVersionsPreservesS3BucketRawRouteMatches(t *testing.
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	resolver := NewSQSPartitionResolver(map[string][]uint64{
+		"orders.fifo": {10, 11},
+	})
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalStore(st),
+		WithInternalMigrationExportRouting(11, resolver),
+	)
+
+	p0 := sqsPartitionedMsgDataKey("orders.fifo", 0, 1, "msg-0")
+	p1 := sqsPartitionedMsgDataKey("orders.fifo", 1, 1, "msg-1")
+	unknown := sqsPartitionedMsgDataKey("unknown.fifo", 0, 1, "msg-unknown")
+	require.NoError(t, st.PutAt(ctx, p0, []byte("p0"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, p1, []byte("p1"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, unknown, []byte("unknown"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	prefix := []byte(SqsPartitionedMsgDataPrefix)
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		KeyFamily:       distribution.MigrationFamilySQSPartitionedMessageData,
+		RangeStart:      prefix,
+		RangeEnd:        testPrefixScanEnd(prefix),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: distribution.MigrationFamilySQSPartitionedMessageData},
+	}, stream.responses[0].GetVersions())
+}
+
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	t.Parallel()
 
@@ -397,6 +433,7 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
 		WithInternalStore(st),
 		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationImportGate(func(context.Context) error { return nil }),
 	)
 
 	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
@@ -422,6 +459,38 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(30), floor)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}
+
+func TestInternalImportRangeVersionsRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationImportGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration import disabled for test")
+		}),
+	)
+
+	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
+		JobId:     7,
+		BracketId: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor-1"),
+		Versions: []*pb.MVCCVersion{
+			{Key: []byte("k"), CommitTs: 30, Value: []byte("v")},
+		},
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
 }
 
 func TestInternalImportRangeVersionsRejectsMissingIdentifiers(t *testing.T) {

@@ -569,7 +569,8 @@ func (s *ShardStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end 
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
 	if routesContainStagedVisibility(routes) {
-		return nil, true, nil
+		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
 	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
@@ -601,8 +602,8 @@ func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, group
 	}
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
-	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
-		routes = dedupeRepeatedRawScanRoutes(routes)
+	if !clampToRoutes && !routeFilterPresent {
+		routes, dedupeByKey = prepareUnclampedRawScanRoutes(routes, dedupeByKey)
 	}
 	return s.scanExplicitGroupRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd, clampToRoutes, dedupeByKey)
 }
@@ -611,7 +612,7 @@ func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context,
 	out := make([]*store.KVPair, 0)
 	for i := 0; i < len(routes); i++ {
 		route := routes[i]
-		if reverse {
+		if reverse && clampToRoutes {
 			route = routes[len(routes)-1-i]
 		}
 		scanStart := start
@@ -663,7 +664,8 @@ func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byt
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
 	if routesContainStagedVisibility(routes) {
-		return nil, true, nil
+		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
 	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
@@ -744,29 +746,18 @@ type repeatedRawScanRouteKey struct {
 	groupID        uint64
 	staged         bool
 	migrationJobID uint64
+	routeStart     string
+	routeEnd       string
 }
 
 func dedupeRepeatedRawScanRoutes(routes []distribution.Route) []distribution.Route {
 	if len(routes) <= 1 {
 		return routes
 	}
-	stagedGroups := make(map[uint64]struct{})
-	for _, route := range routes {
-		if routeHasStagedVisibility(route) {
-			stagedGroups[route.GroupID] = struct{}{}
-		}
-	}
 	out := make([]distribution.Route, 0, len(routes))
 	seen := make(map[repeatedRawScanRouteKey]struct{}, len(routes))
 	for _, route := range routes {
-		if _, hasStaged := stagedGroups[route.GroupID]; hasStaged && !routeHasStagedVisibility(route) {
-			continue
-		}
-		key := repeatedRawScanRouteKey{groupID: route.GroupID}
-		if routeHasStagedVisibility(route) {
-			key.staged = true
-			key.migrationJobID = route.MigrationJobID
-		}
+		key := repeatedRawScanRouteDedupeKey(route)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -774,6 +765,44 @@ func dedupeRepeatedRawScanRoutes(routes []distribution.Route) []distribution.Rou
 		out = append(out, route)
 	}
 	return out
+}
+
+func repeatedRawScanRouteDedupeKey(route distribution.Route) repeatedRawScanRouteKey {
+	key := repeatedRawScanRouteKey{groupID: route.GroupID}
+	if routeHasStagedVisibility(route) {
+		key.staged = true
+		key.migrationJobID = route.MigrationJobID
+		key.routeStart = string(route.Start)
+		key.routeEnd = string(route.End)
+	}
+	return key
+}
+
+func prepareUnclampedRawScanRoutes(routes []distribution.Route, dedupeByKey bool) ([]distribution.Route, bool) {
+	if routesContainStagedVisibility(routes) {
+		routes = dedupeRepeatedRawScanRoutes(routes)
+		return orderRawScanRoutesForStagedVisibility(routes), true
+	}
+	if !dedupeByKey {
+		routes = dedupeRepeatedRawScanRoutes(routes)
+	}
+	return routes, dedupeByKey
+}
+
+func orderRawScanRoutesForStagedVisibility(routes []distribution.Route) []distribution.Route {
+	if !routesContainStagedVisibility(routes) {
+		return routes
+	}
+	out := make([]distribution.Route, 0, len(routes))
+	staged := make([]distribution.Route, 0)
+	for _, route := range routes {
+		if routeHasStagedVisibility(route) {
+			staged = append(staged, route)
+			continue
+		}
+		out = append(out, route)
+	}
+	return append(out, staged...)
 }
 
 func routesContainStagedVisibility(routes []distribution.Route) bool {
@@ -939,8 +968,8 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 	out := make([]*store.KVPair, 0)
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
-	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
-		routes = dedupeRepeatedRawScanRoutes(routes)
+	if !clampToRoutes && !routeFilterPresent {
+		routes, dedupeByKey = prepareUnclampedRawScanRoutes(routes, dedupeByKey)
 	}
 	for _, route := range routes {
 		scanStart := start
@@ -982,12 +1011,13 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 	out := make([]*store.KVPair, 0)
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
-	if !clampToRoutes && !routeFilterPresent && !dedupeByKey {
-		routes = dedupeRepeatedRawScanRoutes(routes)
+	if !clampToRoutes && !routeFilterPresent {
+		routes, dedupeByKey = prepareUnclampedRawScanRoutes(routes, dedupeByKey)
 	}
-	for i := len(routes) - 1; i >= 0; i-- {
+	for i := 0; i < len(routes); i++ {
 		route := routes[i]
 		if clampToRoutes {
+			route = routes[len(routes)-1-i]
 			kvs, done, err := s.clampedReverseScanRouteAtWithReadFence(ctx, route, start, end, limit, len(out), ts, readRouteVersion, routeStart, routeEnd)
 			if err != nil {
 				return nil, err
@@ -1136,7 +1166,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 		if err != nil {
 			return nil, nil, errors.WithStack(err)
 		}
-		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), markScanRouteGroup(kvs, route.GroupID, markRouteGroup), nil
+		return markScanRouteGroup(filterScanInternalKVs(kvs), route.GroupID, markRouteGroup), markScanRouteGroup(kvs, route.GroupID, markRouteGroup), nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
@@ -1149,7 +1179,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	if err != nil {
 		return nil, nil, err
 	}
-	filtered := filterTxnInternalKVs(kvs)
+	filtered := filterScanInternalKVs(kvs)
 	return markScanRouteGroup(filtered, route.GroupID, markRouteGroup), markScanRouteGroup(kvs, route.GroupID, markRouteGroup), nil
 }
 
@@ -1184,7 +1214,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), nil
+		return markScanRouteGroup(filterScanInternalKVs(kvs), route.GroupID, markRouteGroup), nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
@@ -1199,7 +1229,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	}
 	// The leader's RawScanAt is expected to perform lock resolution and filtering
 	// via ShardStore.ScanAt, so avoid N+1 proxy gets here.
-	return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), nil
+	return markScanRouteGroup(filterScanInternalKVs(kvs), route.GroupID, markRouteGroup), nil
 }
 
 const routeFilteredScanBatchMin = 128
@@ -1325,13 +1355,14 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 
 	if engineForGroup(g) == nil {
 		if routeHasStagedVisibility(route) {
-			return nil, true, nil
+			kvs, err := s.scanRouteLocal(ctx, g, route, start, end, visibleLimit, ts, reverse)
+			return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), false, err
 		}
 		kvs, limitReached, err := scanLocalPhysicalLimit(ctx, g.Store, start, end, visibleLimit, physicalLimit, ts, reverse)
 		if err != nil {
 			return nil, limitReached, errors.WithStack(err)
 		}
-		return markScanRouteGroup(filterTxnInternalKVs(kvs), route.GroupID, markRouteGroup), limitReached, nil
+		return markScanRouteGroup(filterScanInternalKVs(kvs), route.GroupID, markRouteGroup), limitReached, nil
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
@@ -1360,7 +1391,8 @@ func (s *ShardStore) scanReadyLeaderPhysicalLimit(
 		return nil, false, err
 	}
 	if routeHasStagedVisibility(route) {
-		return nil, true, nil
+		kvs, err := s.scanRouteAtLeader(ctx, g, route, start, end, visibleLimit, ts, reverse)
+		return kvs, false, err
 	}
 	return s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
 }
@@ -1935,6 +1967,9 @@ func scanUserKey(kvp *store.KVPair) ([]byte, bool) {
 	if kvp == nil || len(kvp.Key) == 0 {
 		return nil, false
 	}
+	if isMigrationStagedDataKey(kvp.Key) {
+		return nil, false
+	}
 	if !isTxnInternalKey(kvp.Key) {
 		return kvp.Key, true
 	}
@@ -1994,7 +2029,7 @@ func appendReplacingKVsByKey(out []*store.KVPair, kvs []*store.KVPair) []*store.
 func countNonInternalKVs(kvs []*store.KVPair) int {
 	count := 0
 	for _, kvp := range kvs {
-		if kvp == nil || isTxnInternalKey(kvp.Key) {
+		if kvp == nil || isScanInternalKey(kvp.Key) {
 			continue
 		}
 		count++
@@ -2348,7 +2383,7 @@ func (s *ShardStore) planScanLockFromLockKVP(ctx context.Context, plan *scanLock
 }
 
 func (s *ShardStore) planScanLockItem(ctx context.Context, g *ShardGroup, ts uint64, plan *scanLockPlan, kvp *store.KVPair) error {
-	if kvp == nil || isTxnInternalKey(kvp.Key) {
+	if kvp == nil || isScanInternalKey(kvp.Key) {
 		plan.items = append(plan.items, scanItem{skip: true})
 		return nil
 	}
@@ -2629,7 +2664,7 @@ func (s *ShardStore) materializeScanLockResults(ctx context.Context, g *ShardGro
 	return out, nil
 }
 
-func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
+func filterScanInternalKVs(kvs []*store.KVPair) []*store.KVPair {
 	if len(kvs) == 0 {
 		return kvs
 	}
@@ -2638,12 +2673,16 @@ func filterTxnInternalKVs(kvs []*store.KVPair) []*store.KVPair {
 		if kvp == nil {
 			continue
 		}
-		if isTxnInternalKey(kvp.Key) {
+		if isScanInternalKey(kvp.Key) {
 			continue
 		}
 		out = append(out, kvp)
 	}
 	return out
+}
+
+func isScanInternalKey(key []byte) bool {
+	return isTxnInternalKey(key) || isMigrationStagedDataKey(key)
 }
 
 func markScanRouteGroup(kvs []*store.KVPair, groupID uint64, mark bool) []*store.KVPair {

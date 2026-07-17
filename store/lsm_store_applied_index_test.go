@@ -155,6 +155,60 @@ func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, retryEntryIdx, got)
 }
 
+func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const entryIdx uint64 = 123
+	result, err := ps.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:        9,
+		AppliedIndex: entryIdx,
+		BracketID:    1,
+		BatchSeq:     1,
+		Cursor:       []byte("c1"),
+		Versions: []MVCCVersion{
+			{Key: []byte("stage|k"), CommitTS: 100, Value: []byte("v100")},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []byte("c1"), result.AckedCursor)
+	require.Equal(t, uint64(100), result.MaxImportedTS)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "ImportVersionsRaft must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("stage|k"), 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
+
+	const retryEntryIdx uint64 = 124
+	duplicate, err := ps.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:        9,
+		AppliedIndex: retryEntryIdx,
+		BracketID:    1,
+		BatchSeq:     1,
+		Cursor:       []byte("ignored"),
+		Versions: []MVCCVersion{
+			{Key: []byte("stage|k"), CommitTS: 100, Value: []byte("changed")},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, duplicate.Duplicate)
+	require.Equal(t, []byte("c1"), duplicate.AckedCursor)
+
+	got, present, err = ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "duplicate ImportVersionsRaft retry must still advance metaAppliedIndex")
+	require.Equal(t, retryEntryIdx, got)
+
+	val, err = ps.GetAt(ctx, []byte("stage|k"), 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val, "duplicate import must not rewrite the acknowledged batch")
+}
+
 // TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey covers the
 // appliedIndex==0 escape hatch — callers without a raft entry index
 // (test fakes, legacy ApplyMutationsRaft) MUST NOT bump the meta key.

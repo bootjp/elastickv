@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1098,6 +1099,144 @@ func TestShardStoreStagedVisibilityPreservesCompactionErrors(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
+func TestShardStoreScanAt_PreservesNonStagedRoutesDuringBroadStagedVisibilityScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    []byte("t"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 3, Start: []byte("t"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live-n"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("u"), []byte("live-u"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("n")), []byte("staged-n"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("o")), []byte("staged-o"), 20, 0))
+
+	kvs, err := st.ScanAt(ctx, nil, nil, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("live-b")},
+		{Key: []byte("n"), Value: []byte("staged-n")},
+		{Key: []byte("o"), Value: []byte("staged-o")},
+		{Key: []byte("u"), Value: []byte("live-u")},
+	}, kvs)
+
+	kvs, err = st.ReverseScanAt(ctx, nil, nil, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("u"), Value: []byte("live-u")},
+		{Key: []byte("o"), Value: []byte("staged-o")},
+		{Key: []byte("n"), Value: []byte("staged-n")},
+		{Key: []byte("b"), Value: []byte("live-b")},
+	}, kvs)
+}
+
+func TestShardStoreScanAt_RoutesS3BucketAuxiliaryStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  routeStart,
+				End:                    routeEnd,
+				GroupID:                2,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		key    []byte
+		value  []byte
+	}{
+		{name: "bucket meta", prefix: s3keys.BucketMetaPrefix, key: s3keys.BucketMetaKey(bucket), value: []byte("meta")},
+		{name: "bucket generation", prefix: s3keys.BucketGenerationPrefix, key: s3keys.BucketGenerationKey(bucket), value: []byte("generation")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, tc.key), tc.value, 20, 0))
+
+			kvs, err := st.ScanAt(ctx, []byte(tc.prefix), prefixScanEnd([]byte(tc.prefix)), 10, 30)
+			require.NoError(t, err)
+			require.Contains(t, kvs, &store.KVPair{Key: tc.key, Value: tc.value})
+		})
+	}
+}
+
+func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityPebbleShardStore(t)
+	rawKey := []byte("k")
+	large := bytes.Repeat([]byte("x"), 1<<20)
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, []byte("old"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, rawKey, large, 30, 0))
+
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), got)
+}
+
+func TestShardStoreDeletePrefixAtDeletesStagedVisibilityRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	dropKey := []byte("b/drop")
+	keepKey := []byte("b/keep")
+	outsideKey := []byte("c/outside")
+
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, dropKey), []byte("drop"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, keepKey), []byte("keep"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, outsideKey), []byte("outside"), 20, 0))
+
+	require.NoError(t, st.DeletePrefixAt(ctx, []byte("b/"), []byte("b/keep"), 101))
+
+	_, err := st.GetAt(ctx, dropKey, 150)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	got, err := st.GetAt(ctx, keepKey, 150)
+	require.NoError(t, err)
+	require.Equal(t, []byte("keep"), got)
+	got, err = st.GetAt(ctx, outsideKey, 150)
+	require.NoError(t, err)
+	require.Equal(t, []byte("outside"), got)
+}
+
 func TestShardStoreRouteFilteredLeaderScanUsesStagedVisibility(t *testing.T) {
 	t.Parallel()
 
@@ -1363,21 +1502,29 @@ func TestShardStoreApplyMutations_ValidatesStagedWriteKeys(t *testing.T) {
 	}
 }
 
-func TestShardStorePhysicalLimitFailsClosedBeforeStagedVisibilityFallback(t *testing.T) {
+func TestShardStorePhysicalLimitFallsBackToStagedVisibilityScan(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	st, _ := newStagedVisibilityShardStore(t)
+	st, group := newStagedVisibilityShardStore(t)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b/live"), []byte("live"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b/staged")), []byte("staged"), 20, 0))
 
 	kvs, limitReached, err := st.ScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
 	require.NoError(t, err)
-	require.True(t, limitReached)
-	require.Nil(t, kvs)
+	require.False(t, limitReached)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b/live"), Value: []byte("live")},
+		{Key: []byte("b/staged"), Value: []byte("staged")},
+	}, kvs)
 
 	kvs, limitReached, err = st.ReverseScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
 	require.NoError(t, err)
-	require.True(t, limitReached)
-	require.Nil(t, kvs)
+	require.False(t, limitReached)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b/staged"), Value: []byte("staged")},
+		{Key: []byte("b/live"), Value: []byte("live")},
+	}, kvs)
 }
 
 func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
