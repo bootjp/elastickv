@@ -100,8 +100,10 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	}
 	var ceilingMs int64
 	var allocationFloor uint64
+	var legacySnapshot bool
 	switch len(payload) {
 	case tsoSnapshotV1Len:
+		legacySnapshot = true
 		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // legacy snapshot value.
 	case tsoSnapshotV2Len:
 		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
@@ -111,6 +113,9 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	}
 	if ceilingMs < 0 {
 		return errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+	}
+	if legacySnapshot && ceilingMs > 0 {
+		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
 	}
 	if f != nil {
 		f.restoreSnapshotState(ceilingMs, allocationFloor)
@@ -147,14 +152,18 @@ func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor 
 	if f == nil {
 		return
 	}
-	f.ceilingMs.Store(ceilingMs)
-	f.allocationFloor.Store(allocationFloor)
+	if ceilingMs > 0 {
+		storeMaxInt64(&f.ceilingMs, ceilingMs)
+	}
+	if allocationFloor > 0 {
+		storeMaxUint64(&f.allocationFloor, allocationFloor)
+	}
 	if f.hlc != nil {
-		if ceilingMs > 0 {
-			f.hlc.SetPhysicalCeiling(ceilingMs)
+		if currentCeiling := f.ceilingMs.Load(); currentCeiling > 0 {
+			f.hlc.SetPhysicalCeiling(currentCeiling)
 		}
-		if allocationFloor > 0 {
-			f.hlc.Observe(allocationFloor)
+		if currentFloor := f.allocationFloor.Load(); currentFloor > 0 {
+			f.hlc.Observe(currentFloor)
 		}
 	}
 }

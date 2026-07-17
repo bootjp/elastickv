@@ -153,7 +153,7 @@ func TestTSOStateMachineRestoreRejectsTruncatedSnapshot(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestTSOStateMachineRestoreLegacySnapshotPreservesCeilingWithoutFloor(t *testing.T) {
+func TestTSOStateMachineRestoreLegacySnapshotDerivesAllocationFloor(t *testing.T) {
 	t.Parallel()
 
 	const ceilingMs = int64(1_700_000_654_321)
@@ -163,7 +163,7 @@ func TestTSOStateMachineRestoreLegacySnapshotPreservesCeilingWithoutFloor(t *tes
 	hlc := NewHLC()
 	require.NoError(t, NewTSOStateMachine(hlc).Restore(bytes.NewReader(buf[:])))
 	require.Equal(t, ceilingMs, hlc.PhysicalCeiling())
-	require.Zero(t, hlc.Current())
+	require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), hlc.Current())
 }
 
 func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
@@ -184,6 +184,17 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 	require.NoError(t, fsm.Restore(bytes.NewReader(buf[:])))
 	require.Equal(t, higherCeiling, hlc.PhysicalCeiling())
 	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), hlc.Current())
+
+	snap, err := fsm.Snapshot()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
+
+	var snapBuf bytes.Buffer
+	n, err := snap.WriteTo(&snapBuf)
+	require.NoError(t, err)
+	require.EqualValues(t, tsoSnapshotV2Len, n)
+	require.Equal(t, uint64(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[:hlcLeasePayloadLen]))
+	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[hlcLeasePayloadLen:]))
 }
 
 func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {

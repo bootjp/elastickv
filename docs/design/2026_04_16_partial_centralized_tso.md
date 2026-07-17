@@ -263,17 +263,27 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 }
 
 // Restore deserialises ceiling/floor state and mirrors it to the shared HLC.
+// Current snapshots are 16 bytes; legacy 8-byte ceiling snapshots derive the
+// allocation floor from the ceiling used by the previous FSM format.
 // The caller owns the reader and is responsible for closing it.
 func (f *TSOStateMachine) Restore(r io.Reader) error {
     payload, err := io.ReadAll(io.LimitReader(r, 17))
     if err != nil {
         return err
     }
-    if len(payload) != 16 {
-        return errors.Newf("expected 16 snapshot bytes, got %d", len(payload))
+    var ceiling int64
+    var floor uint64
+    switch len(payload) {
+    case 8:
+        ceiling = int64(binary.BigEndian.Uint64(payload[:8]))
+        floor = tsoLeaseAllocationFloor(ceiling)
+    case 16:
+        ceiling = int64(binary.BigEndian.Uint64(payload[:8]))
+        floor = binary.BigEndian.Uint64(payload[8:])
+    default:
+        return errors.Newf("expected 8 or 16 snapshot bytes, got %d",
+            len(payload))
     }
-    ceiling := int64(binary.BigEndian.Uint64(payload[:8]))
-    floor := binary.BigEndian.Uint64(payload[8:])
     f.restoreSnapshotState(ceiling, floor)
     return nil
 }
