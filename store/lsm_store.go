@@ -1027,7 +1027,7 @@ func (s *pebbleStore) getAtBatchWithIter(ctx context.Context, iter *pebble.Itera
 		}
 		seekKey = appendEncodedKey(seekKey, key, ts)
 		upperBound = appendKeyUpperBound(upperBound, key)
-		if iter.SeekGEWithLimit(seekKey, upperBound) != pebble.IterValid {
+		if !iter.SeekGE(seekKey) {
 			if err := iter.Error(); err != nil {
 				return nil, errors.WithStack(err)
 			}
@@ -1630,7 +1630,7 @@ func conflictTSFromCurrentIter(iter *pebble.Iterator, key []byte, limit int) (ui
 		case c == 0:
 			return version, true, true, nil
 		default:
-			return 0, false, true, nil
+			return 0, false, false, nil
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -1869,13 +1869,18 @@ func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, 
 	if len(mutations) == 0 {
 		return false, nil
 	}
+	probed := false
 	for _, mut := range mutations {
 		if mut == nil || len(mut.Key) == 0 {
 			continue
 		}
-		return s.committedVersionAtLocked(mut.Key, commitTS)
+		landed, err := s.committedVersionAtLocked(mut.Key, commitTS)
+		if err != nil || !landed {
+			return false, err
+		}
+		probed = true
 	}
-	return false, nil
+	return probed, nil
 }
 
 func (s *pebbleStore) shouldWriteAppliedIndexLocked(appliedIndex uint64) (bool, error) {

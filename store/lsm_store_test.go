@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -243,6 +244,55 @@ func TestPebbleStore_GetAtBatch(t *testing.T) {
 		"b": []byte("v-b"),
 		"a": []byte("v-a"),
 	}, got)
+}
+
+func TestPebbleStore_GetAtBatchReseeksFromLaterIteratorPosition(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("b"), []byte("v-b"), 20, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("c"), []byte("v-c"), 30, 0))
+
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{})
+	require.NoError(t, err)
+	defer iter.Close()
+	require.True(t, iter.SeekGE(encodeKey([]byte("c"), math.MaxUint64)))
+
+	got, err := ps.getAtBatchWithIter(ctx, iter, [][]byte{[]byte("b")}, math.MaxUint64)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]byte{"b": []byte("v-b")}, got)
+}
+
+func TestPebbleStore_LatestCommitTSWithIterReseeksWhenIteratorAhead(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("b"), []byte("v-b"), 20, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("c"), []byte("v-c"), 30, 0))
+
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{})
+	require.NoError(t, err)
+	defer iter.Close()
+	require.True(t, iter.SeekGE(encodeKey([]byte("c"), math.MaxUint64)))
+
+	var seekKey []byte
+	var upperBound []byte
+	ts, exists, err := ps.latestCommitTSWithIter(ctx, iter, []byte("b"), &seekKey, &upperBound, true, 8)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(20), ts)
 }
 
 func TestPebbleStore_MinRetainedTSPersistedAcrossRestart(t *testing.T) {

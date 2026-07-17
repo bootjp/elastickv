@@ -129,6 +129,40 @@ func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.
 	require.Equal(t, []byte("v1"), val)
 }
 
+func TestApplyMutationsRaftAt_AlreadyLandedRequiresEveryMutationKey(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const (
+		startTS  uint64 = 100
+		commitTS uint64 = 200
+		entryIdx uint64 = 42
+	)
+	require.NoError(t, ps.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("a"), Value: []byte("old-a")},
+		{Op: OpTypePut, Key: []byte("b"), Value: []byte("old-b")},
+	}, nil, commitTS, commitTS))
+
+	var staleAppliedIndex [8]byte
+	binary.LittleEndian.PutUint64(staleAppliedIndex[:], entryIdx-1)
+	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, staleAppliedIndex[:], pebble.Sync))
+
+	err := ps.ApplyMutationsRaftAt(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("a"), Value: []byte("new-a")},
+		{Op: OpTypePut, Key: []byte("c"), Value: []byte("new-c")},
+	}, nil, startTS, commitTS, entryIdx)
+	require.ErrorIs(t, err, ErrWriteConflict)
+
+	got, present, idxErr := ps.LastAppliedIndex()
+	require.NoError(t, idxErr)
+	require.True(t, present)
+	require.Equal(t, entryIdx-1, got)
+
+	_, getErr := ps.GetAt(ctx, []byte("c"), commitTS)
+	require.ErrorIs(t, getErr, ErrKeyNotFound)
+}
+
 func TestApplyMutationsRaftAt_AlreadyLandedFastPathDoesNotHideConflict(t *testing.T) {
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)

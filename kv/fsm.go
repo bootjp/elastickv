@@ -25,6 +25,13 @@ func hlcCeilingFromHLC(hlc *HLC) int64 {
 	return hlc.PhysicalCeiling()
 }
 
+func observeStoreLastCommitTS(hlc *HLC, st store.MVCCStore) {
+	if hlc == nil || st == nil {
+		return
+	}
+	hlc.Observe(st.LastCommitTS())
+}
+
 type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
@@ -253,6 +260,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 		opt(f)
 	}
 	f.snapLatch.log = f.log
+	observeStoreLastCommitTS(hlc, store)
 	return f
 }
 
