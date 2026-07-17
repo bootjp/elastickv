@@ -162,7 +162,7 @@ func blockingBLMPopReplay(args [][]byte, resp any) (string, []any, bool) {
 	}
 
 	replay := []any{
-		[]byte("EVAL"),
+		[]byte(cmdEval),
 		blockingListMultiPopReplayScript,
 		blockingListPopReplayKeyCount,
 		key,
@@ -175,7 +175,7 @@ func blockingBLMPopReplay(args [][]byte, resp any) (string, []any, bool) {
 		}
 		replay = append(replay, arg)
 	}
-	return "EVAL", replay, true
+	return cmdEval, replay, true
 }
 
 func parseBlockingBLMPopArgs(args [][]byte) (int, int64, bool) {
@@ -240,8 +240,8 @@ func blockingListMoveReplay(args [][]byte, resp any, count int64, to string) (st
 	}
 	source := append([]byte(nil), args[1]...)
 	destination := append([]byte(nil), args[2]...)
-	return "EVAL", []any{
-		[]byte("EVAL"),
+	return cmdEval, []any{
+		[]byte(cmdEval),
 		blockingListMoveReplayScript,
 		blockingListMoveReplayKeyCount,
 		source,

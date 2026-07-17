@@ -3423,7 +3423,7 @@ func (c *luaScriptContext) canUseLuaStreamDelta(key []byte, typ redisValueType, 
 	)
 	if typ == redisTypeNone {
 		var err error
-		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
+		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, false)
 		if err != nil {
 			return false, err
 		}

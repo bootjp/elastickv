@@ -146,7 +146,7 @@ func (n *fakeElasticKVNode) writeCommandReply(conn net.Conn) {
 		return
 	}
 	if leader := n.Leader(); leader != "" && leader != n.addr {
-		_, _ = conn.Write([]byte("-ERR etcd raft engine is not leader\r\n"))
+		_, _ = conn.Write([]byte("-NOTLEADER etcd raft engine is not leader\r\n"))
 		return
 	}
 	_, _ = conn.Write([]byte("+OK\r\n"))
@@ -267,7 +267,7 @@ func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
 func TestLeaderAwareRedisBackend_DoesNotRetryUserNotLeaderError(t *testing.T) {
 	node := newFakeElasticKVNode(t)
 	node.SetLeader(node.addr)
-	node.SetCommandError("ERR not leader")
+	node.SetCommandError("ERR raft engine: not leader")
 
 	backend := NewLeaderAwareRedisBackendWithInterval(
 		[]string{node.addr},
@@ -282,9 +282,9 @@ func TestLeaderAwareRedisBackend_DoesNotRetryUserNotLeaderError(t *testing.T) {
 		return backend.CurrentLeader() == node.addr
 	}, 2*time.Second, 10*time.Millisecond, "initial leader must be set")
 
-	res := backend.Do(context.Background(), "EVAL", "return redis.error_reply('not leader')", 0)
+	res := backend.Do(context.Background(), "EVAL", "return redis.error_reply('raft engine: not leader')", 0)
 	require.Error(t, res.Err())
-	require.Contains(t, res.Err().Error(), "not leader")
+	require.Contains(t, res.Err().Error(), "raft engine: not leader")
 	require.Equal(t, int64(1), node.commands.Load(), "user Redis error must not be retried")
 }
 

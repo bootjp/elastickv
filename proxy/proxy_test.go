@@ -1389,7 +1389,7 @@ func TestDualWriter_writeSecondary_RetriesNotLeaderAfterRefresh(t *testing.T) {
 	primary.doFunc = makeCmd("OK", nil)
 
 	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
-	notLeaderErr := testRedisErr("ERR etcd raft engine is not leader")
+	notLeaderErr := testRedisErr("NOTLEADER etcd raft engine is not leader")
 	var calls int
 	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
 		calls++
@@ -1418,7 +1418,7 @@ func TestDualWriter_writeSecondary_DoesNotRetryUserNotLeaderError(t *testing.T) 
 	primary.doFunc = makeCmd("OK", nil)
 
 	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
-	userErr := testRedisErr("ERR not leader")
+	userErr := testRedisErr("ERR raft engine: not leader")
 	var calls int
 	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
 		calls++
@@ -1437,12 +1437,32 @@ func TestDualWriter_writeSecondary_DoesNotRetryUserNotLeaderError(t *testing.T) 
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 }
 
+func TestIsElasticKVNotLeaderErrorClassifiesWireNotLeaderOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "redis wire notleader", err: testRedisErr("NOTLEADER raft engine: not leader"), want: true},
+		{name: "grpc wrapped no redis err prefix", err: errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"), want: true},
+		{name: "bare leader not found", err: errors.New("leader not found"), want: true},
+		{name: "lua user err exact raft phrase", err: testRedisErr("ERR raft engine: not leader"), want: false},
+		{name: "lua user err etcd phrase", err: testRedisErr("ERR etcd raft engine is not leader"), want: false},
+		{name: "lua user err leader not found", err: testRedisErr("ERR leader not found"), want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isElasticKVNotLeaderError(tc.err))
+		})
+	}
+}
+
 func TestDualWriter_ReplaySecondaryPipeline_RecordsReplyErrors(t *testing.T) {
 	primary := newMockBackend("primary")
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
 		cmd := redis.NewCmd(ctx, args...)
-		cmd.SetErr(testRedisErr("ERR etcd raft engine is not leader"))
+		cmd.SetErr(testRedisErr("NOTLEADER etcd raft engine is not leader"))
 		return cmd
 	}
 
