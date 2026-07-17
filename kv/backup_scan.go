@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/store"
@@ -30,6 +31,11 @@ type backupScanner struct {
 	index         int
 	closed        bool
 	exhausted     bool
+}
+
+type routedScanKey struct {
+	key   []byte
+	route distribution.Route
 }
 
 func NewBackupScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupScanner {
@@ -93,27 +99,31 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		s.index = 0
 		return nil
 	}
-	keys, err := s.store.scanKeyRoutesAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
+	keys, err := s.store.scanKeyRoutesWithSourceAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
 	if err != nil {
 		return err
 	}
 	s.page = s.page[:0]
-	for _, key := range keys {
-		val, err := s.getAtCapturedRoute(ctx, key)
+	for _, item := range keys {
+		route, ok := s.materializeRouteForKey(item)
+		if !ok {
+			continue
+		}
+		val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
 		if errors.Is(err, store.ErrKeyNotFound) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		s.page = append(s.page, &store.KVPair{Key: bytes.Clone(key), Value: bytes.Clone(val)})
+		s.page = append(s.page, &store.KVPair{Key: bytes.Clone(item.key), Value: bytes.Clone(val)})
 	}
 	s.index = 0
 	if len(keys) == 0 {
 		s.exhausted = true
 		return nil
 	}
-	last := lastScanKey(keys)
+	last := lastRoutedScanKey(keys)
 	if last == nil {
 		s.exhausted = true
 		return nil
@@ -122,14 +132,105 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	return nil
 }
 
-func (s *backupScanner) getAtCapturedRoute(ctx context.Context, key []byte) ([]byte, error) {
-	normalized := routeKey(key)
+func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution.Route, bool) {
+	key := routeKey(item.key)
+	if routeContainsKey(item.route, key) {
+		return item.route, true
+	}
 	for _, route := range s.routes {
-		if routeContainsKey(route, normalized) {
-			return s.store.getRouteAt(ctx, route, key, s.ts)
+		if route.GroupID != item.route.GroupID {
+			continue
+		}
+		if routeContainsKey(route, key) {
+			return route, true
 		}
 	}
-	return nil, store.ErrKeyNotFound
+	return distribution.Route{}, false
+}
+
+func (s *ShardStore) scanKeyRoutesWithSourceAt(
+	ctx context.Context,
+	routes []distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	clampToRoutes bool,
+) ([]routedScanKey, error) {
+	out := make([]routedScanKey, 0)
+	seenGroups := make(map[uint64]struct{})
+	for _, route := range routes {
+		scanStart := start
+		scanEnd := end
+		if clampToRoutes {
+			scanStart = clampScanStart(start, route.Start)
+			scanEnd = clampScanEnd(end, route.End)
+		} else {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
+		}
+
+		keys, err := s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+		if err != nil {
+			return nil, err
+		}
+		out = mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), limit)
+		if clampToRoutes && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func routedScanKeys(route distribution.Route, keys [][]byte) []routedScanKey {
+	items := make([]routedScanKey, 0, len(keys))
+	for _, key := range keys {
+		if key == nil {
+			continue
+		}
+		items = append(items, routedScanKey{key: key, route: route})
+	}
+	return items
+}
+
+func mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit int) []routedScanKey {
+	if len(keys) == 0 {
+		return out
+	}
+	out = append(out, keys...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return bytes.Compare(out[i].key, out[j].key) < 0
+	})
+	write := 0
+	for _, item := range out {
+		if item.key == nil {
+			continue
+		}
+		if write > 0 && bytes.Equal(out[write-1].key, item.key) {
+			out[write-1] = item
+			continue
+		}
+		out[write] = item
+		write++
+	}
+	clear(out[write:])
+	out = out[:write]
+	if len(out) <= limit {
+		return out
+	}
+	clear(out[limit:])
+	return out[:limit]
+}
+
+func lastRoutedScanKey(keys []routedScanKey) []byte {
+	for i := len(keys) - 1; i >= 0; i-- {
+		if keys[i].key != nil {
+			return keys[i].key
+		}
+	}
+	return nil
 }
 
 func routeContainsKey(route distribution.Route, key []byte) bool {

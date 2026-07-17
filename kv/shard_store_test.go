@@ -495,6 +495,36 @@ func TestBackupScannerMaterializesFromCapturedRoute(t *testing.T) {
 	require.Nil(t, kvp)
 }
 
+func TestBackupScannerMaterializesFromEnumeratedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale-first-route"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("enumerated-route"), 2, 0))
+
+	sc := &backupScanner{
+		store:         st,
+		routes:        []distribution.Route{{RouteID: 1, Start: []byte(""), GroupID: 1}, {RouteID: 2, Start: []byte(""), GroupID: 2}},
+		clampToRoutes: false,
+		cursor:        []byte(""),
+		ts:            ^uint64(0),
+		pageSize:      1,
+	}
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("enumerated-route"), kvp.Value)
+}
+
 func TestBackupScannerPreservesFullRoutingAfterListKeyCursor(t *testing.T) {
 	t.Parallel()
 

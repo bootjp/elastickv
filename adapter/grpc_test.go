@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
 	"strconv"
 	"sync"
@@ -23,7 +22,8 @@ func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
 	pairs := rawKeyPairs([][]byte{nil, {}, []byte("a")})
 	require.Len(t, pairs, 3)
 	require.Nil(t, pairs[0].Key)
-	require.True(t, bytes.Equal([]byte{}, pairs[1].Key))
+	require.NotNil(t, pairs[1].Key)
+	require.Empty(t, pairs[1].Key)
 	require.Equal(t, []byte("a"), pairs[2].Key)
 }
 
