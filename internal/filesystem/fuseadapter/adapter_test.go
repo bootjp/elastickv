@@ -168,6 +168,42 @@ func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
 	}
 }
 
+func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{
+		refreshCh:      make(chan openHandleRefresh, 8),
+		blockRefreshFH: 1,
+	}
+	adapter := New(
+		core,
+		[]byte("fuse-session"),
+		WithHandleKeepaliveInterval(time.Hour),
+		WithHandleKeepaliveTimeout(10*time.Millisecond),
+	)
+	t.Cleanup(adapter.Close)
+	adapter.trackOpenHandle(7, 1)
+	adapter.trackOpenHandle(8, 2)
+
+	adapter.refreshTrackedOpenHandles(ctx)
+
+	var sawBlocked bool
+	var sawSecond bool
+	deadline := time.After(time.Second)
+	for !sawBlocked || !sawSecond {
+		select {
+		case got := <-core.refreshCh:
+			if got.inode == 7 && got.fh == 1 {
+				sawBlocked = true
+			}
+			if got.inode == 8 && got.fh == 2 {
+				sawSecond = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for refreshes: blocked=%v second=%v", sawBlocked, sawSecond)
+		}
+	}
+}
+
 type openHandleRefresh struct {
 	inode    uint64
 	fh       uint64
@@ -203,6 +239,7 @@ type fakeCore struct {
 	refreshClientID []byte
 	refreshErr      error
 	refreshCh       chan openHandleRefresh
+	blockRefreshFH  uint64
 
 	readCalled bool
 	readData   []byte
@@ -265,7 +302,7 @@ func (f *fakeCore) Release(_ context.Context, inode uint64, fh uint64, clientID 
 	return f.releaseErr
 }
 
-func (f *fakeCore) RefreshOpenHandleLease(_ context.Context, inode uint64, fh uint64, clientID []byte) error {
+func (f *fakeCore) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
 	f.refreshInode = inode
 	f.refreshFH = fh
 	f.refreshClientID = append([]byte(nil), clientID...)
@@ -278,6 +315,10 @@ func (f *fakeCore) RefreshOpenHandleLease(_ context.Context, inode uint64, fh ui
 		}:
 		default:
 		}
+	}
+	if f.blockRefreshFH == fh {
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	return f.refreshErr
 }

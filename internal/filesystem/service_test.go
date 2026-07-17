@@ -1063,6 +1063,34 @@ func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestServiceTruncateShrinkReclaimsStaleChunksPastCurrentEOF(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, bytes.Repeat([]byte{'x'}, int(3*testChunkSize)))
+	require.NoError(t, err)
+	forceInodeSizeForTest(t, ctx, svc, file.Inode, 2*testChunkSize)
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 3*testChunkSize, stats.Capacity-stats.Free)
+
+	require.NoError(t, svc.Truncate(ctx, file.Inode, testChunkSize))
+	stats, err = svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, testChunkSize, stats.Capacity-stats.Free)
+
+	meta, err := svc.inodeAt(ctx, file.Inode, svc.store.LastCommitTS())
+	require.NoError(t, err)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(meta.HomeSlot, file.Inode, 1), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(meta.HomeSlot, file.Inode, 2), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestServiceTruncateGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
@@ -1158,10 +1186,15 @@ func cloneKeys(in [][]byte) [][]byte {
 
 func forceInodeSizeZeroForTest(t *testing.T, ctx context.Context, svc *Service, inode uint64) {
 	t.Helper()
+	forceInodeSizeForTest(t, ctx, svc, inode, 0)
+}
+
+func forceInodeSizeForTest(t *testing.T, ctx context.Context, svc *Service, inode uint64, size uint64) {
+	t.Helper()
 	ts := svc.store.LastCommitTS()
 	meta, err := svc.inodeAt(ctx, inode, ts)
 	require.NoError(t, err)
-	meta.Size = 0
+	meta.Size = size
 	elem, err := putElem(fskeys.InodeKey(inode), meta)
 	require.NoError(t, err)
 	require.NoError(t, svc.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{elem}, [][]byte{fskeys.InodeKey(inode)}))

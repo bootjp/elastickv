@@ -247,6 +247,41 @@ func TestDistributionServerSplitRange_SnapsFilesystemChunkKeyToFileBoundary(t *t
 	require.Equal(t, wantBoundary, resp.Right.Start)
 }
 
+func TestDistributionServerSplitRange_SnapsTxnWrappedFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+	txnChunkKey := append([]byte(kv.TxnKeyPrefix+"lock|"), fskeys.ChunkKey(11, 22, 99)...)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               txnChunkKey,
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
 func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *testing.T) {
 	t.Parallel()
 

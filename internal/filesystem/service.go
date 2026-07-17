@@ -402,7 +402,7 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		var sizeElems []*kv.Elem[kv.OP]
 		var sizeReads [][]byte
 		var sizeDelta usageDelta
-		ts, meta, sizeElems, sizeReads, sizeDelta, chunkDeletes, oldSize, err = s.setAttrSizeTxnParts(ctx, inode, attrs.Size, ts, meta)
+		ts, meta, sizeElems, sizeReads, sizeDelta, chunkDeletes, oldSize, err = s.setAttrSizeTxnParts(ctx, inode, attrs.Size, meta)
 		if err != nil {
 			return Stat{}, err
 		}
@@ -451,16 +451,18 @@ func (s *Service) setAttrSizeTxnParts(
 	ctx context.Context,
 	inode uint64,
 	size uint64,
-	ts uint64,
 	meta *InodeMeta,
 ) (uint64, *InodeMeta, []*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, uint64, error) {
 	if meta.Type == TypeDirectory {
 		return 0, nil, nil, nil, usageDelta{}, nil, 0, ErrIsDir
 	}
 	oldSize := meta.Size
-	var err error
-	var refreshed bool
-	ts, meta, refreshed, err = s.cleanupNonShrinkingSizeChange(ctx, inode, size, meta, ts)
+	var (
+		ts        uint64
+		err       error
+		refreshed bool
+	)
+	ts, meta, refreshed, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 	if err != nil {
 		return 0, nil, nil, nil, usageDelta{}, nil, 0, err
 	}
@@ -630,7 +632,7 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 		return 0, ErrIsDir
 	}
 	if end > meta.Size {
-		ts, meta, _, err = s.cleanupNonShrinkingSizeChange(ctx, inode, end, meta, ts)
+		ts, meta, _, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 		if err != nil {
 			return 0, err
 		}
@@ -742,7 +744,7 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	if meta.Type == TypeDirectory {
 		return ErrIsDir
 	}
-	ts, meta, _, err = s.cleanupNonShrinkingSizeChange(ctx, inode, size, meta, ts)
+	ts, meta, _, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 	if err != nil {
 		return err
 	}
@@ -2064,16 +2066,11 @@ func (s *Service) deleteChunksPastCurrentEOF(ctx context.Context, meta *InodeMet
 	})
 }
 
-func (s *Service) cleanupNonShrinkingSizeChange(
+func (s *Service) cleanupStaleChunksBeforeSizeChange(
 	ctx context.Context,
 	inode uint64,
-	size uint64,
 	meta *InodeMeta,
-	ts uint64,
 ) (uint64, *InodeMeta, bool, error) {
-	if size < meta.Size {
-		return ts, meta, false, nil
-	}
 	if err := s.deleteChunksPastCurrentEOF(ctx, meta); err != nil {
 		return 0, nil, false, err
 	}

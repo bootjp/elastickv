@@ -174,7 +174,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	}
 
 	rawSplitKey := req.GetSplitKey()
-	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(rawSplitKey))
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
 		return nil, err

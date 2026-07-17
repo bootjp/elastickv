@@ -2,6 +2,7 @@ package fuseadapter
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"syscall"
 	"time"
@@ -14,6 +15,7 @@ import (
 const (
 	defaultReaddirLimit             = 128
 	defaultHandleKeepaliveInterval  = time.Minute
+	defaultHandleKeepaliveTimeout   = 5 * time.Second
 	disabledHandleKeepaliveInterval = 0
 )
 
@@ -43,6 +45,7 @@ type Adapter struct {
 	clientID          []byte
 	readdirLimit      int
 	keepaliveInterval time.Duration
+	keepaliveTimeout  time.Duration
 	keepaliveCancel   context.CancelFunc
 	closeOnce         sync.Once
 	handlesMu         sync.Mutex
@@ -87,12 +90,21 @@ func WithHandleKeepaliveInterval(interval time.Duration) Option {
 	}
 }
 
+func WithHandleKeepaliveTimeout(timeout time.Duration) Option {
+	return func(a *Adapter) {
+		if timeout > 0 {
+			a.keepaliveTimeout = timeout
+		}
+	}
+}
+
 func New(core Core, clientID []byte, opts ...Option) *Adapter {
 	a := &Adapter{
 		core:              core,
 		clientID:          append([]byte(nil), clientID...),
 		readdirLimit:      defaultReaddirLimit,
 		keepaliveInterval: defaultHandleKeepaliveInterval,
+		keepaliveTimeout:  defaultHandleKeepaliveTimeout,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -298,9 +310,21 @@ func (a *Adapter) keepOpenHandlesAlive(ctx context.Context) {
 
 func (a *Adapter) refreshTrackedOpenHandles(ctx context.Context) {
 	for _, handle := range a.openHandleSnapshot() {
-		err := a.core.RefreshOpenHandleLease(ctx, handle.inode, handle.fh, a.clientID)
-		if errors.Is(err, filesystem.ErrNotFound) {
+		handleCtx, cancel := context.WithTimeout(ctx, a.keepaliveTimeout)
+		err := a.core.RefreshOpenHandleLease(handleCtx, handle.inode, handle.fh, a.clientID)
+		cancel()
+		switch {
+		case err == nil:
+		case errors.Is(err, filesystem.ErrNotFound):
 			a.untrackOpenHandle(handle.inode, handle.fh)
+		case ctx.Err() != nil:
+			return
+		default:
+			slog.WarnContext(ctx, "filesystem open handle lease refresh failed",
+				"inode", handle.inode,
+				"fh", handle.fh,
+				"err", err,
+			)
 		}
 	}
 }
