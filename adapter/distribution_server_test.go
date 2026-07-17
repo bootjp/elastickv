@@ -820,16 +820,20 @@ func TestDistributionServerCompleteSplitJobTargetPromotion_UsesCoordinatorCAS(t 
 	require.NoError(t, err)
 
 	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	coordinator.timestampNext = before.ReadTS + 10
 	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
 
 	snapshot, completed, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, saved.Version, job, 2000)
 	require.NoError(t, err)
 	require.Equal(t, saved.Version+1, snapshot.Version)
 	require.True(t, completed.TargetPromotionDone)
-	require.Greater(t, completed.PromotionCompletedTS, before.ReadTS)
+	require.Equal(t, distribution.SplitJobPhaseDone, completed.Phase)
+	require.Equal(t, before.ReadTS+10, completed.PromotionCompletedTS)
 	require.Equal(t, int64(2000), completed.UpdatedAtMs)
 	require.Equal(t, 1, coordinator.dispatchCalls)
+	require.Equal(t, 1, coordinator.timestampCalls)
 	require.Equal(t, before.ReadTS, coordinator.lastStartTS)
+	require.Equal(t, completed.PromotionCompletedTS, coordinator.lastCommitTS)
 	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogVersionKey())
 	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogSplitJobKey(job.JobID))
 
@@ -910,6 +914,7 @@ func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T
 	require.NoError(t, err)
 	require.True(t, found)
 	require.True(t, loadedJob.TargetPromotionDone)
+	require.Equal(t, distribution.SplitJobPhaseDone, loadedJob.Phase)
 	require.NotZero(t, loadedJob.PromotionCompletedTS)
 
 	loaded, err := catalog.Snapshot(ctx)
@@ -919,6 +924,59 @@ func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T
 	require.False(t, target.StagedVisibilityActive)
 	require.Equal(t, uint64(0), target.MigrationJobID)
 	require.Equal(t, uint64(777), target.MinWriteTSExclusive)
+
+	route, ok := s.engine.GetRoute([]byte("z"))
+	require.True(t, ok)
+	require.False(t, route.StagedVisibilityActive)
+	require.Equal(t, uint64(0), route.MigrationJobID)
+	require.Equal(t, saved.Version+1, s.engine.Version())
+}
+
+func TestDistributionServerRunSplitJobRunnerOnce_TerminalizesPromotedCleanupJob(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	routes := promotionCompleteDistributionRoutes()
+	routes[1].StagedVisibilityActive = false
+	routes[1].MigrationJobID = 0
+	saved, err := catalog.Save(ctx, 0, routes)
+	require.NoError(t, err)
+	job := promotionCompleteDistributionJob()
+	job.TargetPromotionDone = true
+	job.PromotionCompletedTS = saved.ReadTS + 1
+	job.UpdatedAtMs = 2000
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	client := &splitPromotionClientStub{
+		responses: []*pb.PromoteStagedVersionsResponse{{Done: true}},
+	}
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return client, nil
+		}),
+	)
+
+	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+	require.Zero(t, client.calls)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	loadedJob, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, distribution.SplitJobPhaseDone, loadedJob.Phase)
+	require.True(t, loadedJob.TargetPromotionDone)
+	require.Equal(t, job.PromotionCompletedTS, loadedJob.PromotionCompletedTS)
+
+	loaded, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, saved.Version+1, loaded.Version)
+	require.Equal(t, saved.Version+1, s.engine.Version())
 }
 
 func TestDistributionServerRunSplitJobRunnerOnce_SkipsFollower(t *testing.T) {
@@ -1835,7 +1893,11 @@ type distributionCoordinatorStub struct {
 	leader          bool
 	dispatchErr     error
 	nextTS          uint64
+	timestampNext   uint64
+	timestampErr    error
+	timestampCalls  int
 	lastStartTS     uint64
+	lastCommitTS    uint64
 	lastReadKeys    [][]byte
 	beforeApply     func(context.Context, store.MVCCStore) error
 	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
@@ -1859,8 +1921,9 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	if s.dispatchErr != nil {
 		return nil, s.dispatchErr
 	}
-	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
+	startTS, commitTS := s.nextTimestamps(reqs.StartTS, reqs.CommitTS)
 	s.lastStartTS = startTS
+	s.lastCommitTS = commitTS
 	readKeys := cloneDistributionReadKeys(reqs.ReadKeys)
 	s.lastReadKeys = readKeys
 
@@ -1896,7 +1959,13 @@ func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[k
 	return nil
 }
 
-func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64) (uint64, uint64) {
+func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCommitTS uint64) (uint64, uint64) {
+	if requestedCommitTS != 0 {
+		if s.nextTS <= requestedCommitTS {
+			s.nextTS = requestedCommitTS + 1
+		}
+		return startTS, requestedCommitTS
+	}
 	if s.nextTS == 0 {
 		s.nextTS = s.store.LastCommitTS() + 1
 	}
@@ -2028,6 +2097,26 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
 	return nil
+}
+
+func (s *distributionCoordinatorStub) Next(ctx context.Context) (uint64, error) {
+	return s.NextAfter(ctx, 0)
+}
+
+func (s *distributionCoordinatorStub) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	s.timestampCalls++
+	if s.timestampErr != nil {
+		return 0, s.timestampErr
+	}
+	next := s.timestampNext
+	if next == 0 {
+		next = s.store.LastCommitTS() + 1
+	}
+	if next <= min {
+		next = min + 1
+	}
+	s.timestampNext = next + 1
+	return next, nil
 }
 
 func (s *distributionCoordinatorStub) LinearizableRead(_ context.Context) (uint64, error) {

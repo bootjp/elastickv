@@ -265,7 +265,7 @@ func (s *DistributionServer) verifySplitJobRunnerLeader(ctx context.Context) (bo
 
 func nextCleanupSplitJob(jobs []distribution.SplitJob) (distribution.SplitJob, bool) {
 	for _, job := range jobs {
-		if job.Phase == distribution.SplitJobPhaseCleanup && !job.TargetPromotionDone {
+		if job.Phase == distribution.SplitJobPhaseCleanup {
 			return job, true
 		}
 	}
@@ -273,15 +273,17 @@ func nextCleanupSplitJob(jobs []distribution.SplitJob) (distribution.SplitJob, b
 }
 
 func (s *DistributionServer) promoteSplitJobTargetAndComplete(ctx context.Context, job distribution.SplitJob) error {
-	client, err := s.splitPromotionClientFactory(ctx, job)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if client == nil {
-		return errors.New("split promotion client is nil")
-	}
-	if err := promoteSplitJobTarget(ctx, client, job); err != nil {
-		return errors.WithStack(err)
+	if !job.TargetPromotionDone {
+		client, err := s.splitPromotionClientFactory(ctx, job)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if client == nil {
+			return errors.New("split promotion client is nil")
+		}
+		if err := promoteSplitJobTarget(ctx, client, job); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	snapshot, err := s.loadCatalogSnapshot(ctx)
 	if err != nil {
@@ -294,8 +296,11 @@ func (s *DistributionServer) promoteSplitJobTargetAndComplete(ctx context.Contex
 	if !found {
 		return splitJobPromotionStatusError(distribution.ErrCatalogSplitJobConflict)
 	}
-	_, _, err = s.completeSplitJobTargetPromotionViaCoordinator(ctx, snapshot.Version, current, time.Now().UnixMilli())
-	return err
+	completed, _, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, snapshot.Version, current, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	return s.applyEngineSnapshot(completed)
 }
 
 func promoteSplitJobTarget(ctx context.Context, client SplitPromotionClient, job distribution.SplitJob) error {
@@ -1009,11 +1014,13 @@ func (s *DistributionServer) dispatchPromotionCompletion(
 	if !completion.Changed {
 		return snapshot, completion.Job, nil
 	}
-	commitTS, err := s.nextPromotionCompleteCommitTS(snapshot.ReadTS)
+	commitTS, err := s.nextPromotionCompleteCommitTS(ctx, snapshot.ReadTS)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, err
 	}
-	completion.Job.PromotionCompletedTS = commitTS
+	if completion.Job.PromotionCompletedTS == 0 {
+		completion.Job.PromotionCompletedTS = commitTS
+	}
 	ops, err := s.buildPromotionCompleteOps(expectedVersion, completion)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobPromotionStatusError(err)
@@ -1038,24 +1045,11 @@ func (s *DistributionServer) dispatchPromotionCompletion(
 	return loaded, completion.Job, nil
 }
 
-func (s *DistributionServer) nextPromotionCompleteCommitTS(readTS uint64) (uint64, error) {
+func (s *DistributionServer) nextPromotionCompleteCommitTS(ctx context.Context, readTS uint64) (uint64, error) {
 	if readTS == math.MaxUint64 {
 		return 0, grpcStatusError(codes.Internal, distribution.ErrCatalogVersionOverflow.Error())
 	}
-	clock := s.coordinator.Clock()
-	if clock == nil {
-		return readTS + 1, nil
-	}
-	clock.Observe(readTS)
-	commitTS, err := clock.NextFenced()
-	if err != nil {
-		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate promotion completion timestamp: %v", err)
-	}
-	if commitTS > readTS {
-		return commitTS, nil
-	}
-	clock.Observe(readTS)
-	commitTS, err = clock.NextFenced()
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, s.coordinator, readTS, "allocate promotion completion timestamp")
 	if err != nil {
 		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate promotion completion timestamp: %v", err)
 	}
@@ -1115,10 +1109,14 @@ func promotionCompleteRouteByID(routes []distribution.RouteDescriptor, routeID u
 }
 
 func splitJobPromotionMatchesExpected(expected, current distribution.SplitJob) (bool, error) {
-	if expected.TargetPromotionDone || !current.TargetPromotionDone || current.PromotionCompletedTS == 0 {
+	if expected.TargetPromotionDone ||
+		!current.TargetPromotionDone ||
+		current.PromotionCompletedTS == 0 ||
+		current.Phase != distribution.SplitJobPhaseDone {
 		return false, nil
 	}
 	normalized := distribution.CloneSplitJob(current)
+	normalized.Phase = expected.Phase
 	normalized.TargetPromotionDone = expected.TargetPromotionDone
 	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
 	normalized.UpdatedAtMs = expected.UpdatedAtMs

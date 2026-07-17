@@ -39,6 +39,11 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 	}
 	if out.Job.TargetPromotionDone {
 		if targetClearedDescriptorPresent(out.Job, out.Routes) {
+			if out.Job.Phase != SplitJobPhaseDone {
+				out.Changed = true
+				out.Job.Phase = SplitJobPhaseDone
+				out.Job.UpdatedAtMs = nowMs
+			}
 			return out, nil
 		}
 		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
@@ -55,6 +60,7 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 	out.Changed = true
 	out.ClearedRouteIDs = cleared
 	out.Job.TargetPromotionDone = true
+	out.Job.Phase = SplitJobPhaseDone
 	out.Job.UpdatedAtMs = nowMs
 	return out, nil
 }
@@ -62,6 +68,9 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 func normalizePromotionCompletionInput(job SplitJob, routes []RouteDescriptor) ([]RouteDescriptor, error) {
 	if err := validateSplitJob(job); err != nil {
 		return nil, err
+	}
+	if job.Phase == SplitJobPhaseDone && job.TargetPromotionDone {
+		return normalizeRoutes(routes)
 	}
 	if job.Phase != SplitJobPhaseCleanup {
 		return nil, errors.WithStack(ErrMigrationPromotionNotReady)
@@ -227,10 +236,14 @@ func (s *CatalogStore) promotionCompleteAlreadyAppliedAt(ctx context.Context, ts
 }
 
 func promotionCompleteJobMatchesExpected(expected SplitJob, expectedRaw []byte, current SplitJob) (bool, error) {
-	if expected.TargetPromotionDone || !current.TargetPromotionDone || current.PromotionCompletedTS == 0 {
+	if expected.TargetPromotionDone ||
+		!current.TargetPromotionDone ||
+		current.PromotionCompletedTS == 0 ||
+		current.Phase != SplitJobPhaseDone {
 		return false, nil
 	}
 	normalized := CloneSplitJob(current)
+	normalized.Phase = expected.Phase
 	normalized.TargetPromotionDone = expected.TargetPromotionDone
 	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
 	normalized.UpdatedAtMs = expected.UpdatedAtMs
@@ -270,7 +283,9 @@ func (s *CatalogStore) buildPromotionCompleteMutations(
 	if err != nil {
 		return savePlan{}, nil, 0, err
 	}
-	completion.Job.PromotionCompletedTS = commitTS
+	if completion.Job.PromotionCompletedTS == 0 {
+		completion.Job.PromotionCompletedTS = commitTS
+	}
 	encodedJob, err := EncodeSplitJob(completion.Job)
 	if err != nil {
 		return savePlan{}, nil, 0, err
