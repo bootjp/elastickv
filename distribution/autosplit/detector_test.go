@@ -196,6 +196,39 @@ func TestConsecutiveWindowsPromoteAndBelowThresholdResets(t *testing.T) {
 	require.Equal(t, 3, state.RouteStatus(1).ConsecutiveOver)
 }
 
+func TestDuplicateColumnsAreSkippedAcrossEvaluations(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(325, 0)
+	state := NewDetectorState()
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+
+	first := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{hotWindow(at)},
+		Now:     at,
+	})
+	require.Empty(t, first.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+
+	duplicate := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{hotWindow(at)},
+		Now:     at.Add(30 * time.Second),
+	})
+	require.Empty(t, duplicate.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+
+	next := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{hotWindow(at.Add(time.Minute))},
+		Now:     at.Add(time.Minute),
+	})
+	require.Len(t, next.Decisions, 1)
+	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+}
+
 func TestBufferedColdColumnAfterHotRunSuppressesDecision(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(350, 0)
@@ -258,6 +291,31 @@ func TestCooldownDropsBufferedWindowsFromCooldownPeriod(t *testing.T) {
 
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	requireEvent(t, result.Events, 1, SkipReasonCooldown)
+}
+
+func TestCooldownDropsWindowThatStartedBeforeDeadline(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(460, 0)
+	state := NewDetectorState()
+	state.SetCooldown(1, at.Add(3*time.Minute))
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 1
+
+	result := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			testWindow(at.Add(4*time.Minute), 2*time.Minute,
+				testRow(1, 1, 0, 2, "a", "m", 60, 0),
+				testRow(1, 1, 1, 2, "m", "z", 60, 0),
+			),
+		},
+		Now: at.Add(4 * time.Minute),
+	})
+
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 0, state.RouteStatus(1).ConsecutiveOver)
 	requireEvent(t, result.Events, 1, SkipReasonCooldown)
 }
 
@@ -408,6 +466,28 @@ func TestP50BoundarySelection(t *testing.T) {
 			require.Equal(t, tc.wantOrigin, result.Decisions[0].SplitOrigin)
 		})
 	}
+}
+
+func TestP50CoalescesDuplicateSubBucketRows(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(850, 0)
+	route := testRoute(1, 1, "a", "z")
+	window := testWindow(at, time.Minute,
+		testRow(1, 1, 0, 2, "a", "m", 1000, 0),
+		testRow(1, 1, 0, 2, "a", "m", 900, 0),
+		testRow(1, 1, 1, 2, "m", "z", 100, 0),
+	)
+
+	result := Evaluate(testConfig(), NewDetectorState(), Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{window},
+		Now:     at,
+	})
+
+	require.Len(t, result.Decisions, 1)
+	require.Equal(t, []byte("m"), result.Decisions[0].SplitKey)
+	require.InDelta(t, 1900, result.Decisions[0].LeftLoad, 0.0001)
+	require.InDelta(t, 100, result.Decisions[0].RightLoad, 0.0001)
 }
 
 func testConfig() Config {

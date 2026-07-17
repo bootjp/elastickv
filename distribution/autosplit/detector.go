@@ -123,6 +123,7 @@ type Result struct {
 type RouteStatus struct {
 	ConsecutiveOver int
 	CooldownUntil   time.Time
+	LastProcessedAt time.Time
 }
 
 // DetectorState carries leader-local confidence and cooldown state.
@@ -249,7 +250,7 @@ func processWindow(
 	if window.Duration <= 0 {
 		result.Events = append(result.Events, Event{Reason: SkipReasonInvalidWindow, At: window.Column.At})
 		for _, route := range active {
-			state.ResetConfidence(route.RouteID)
+			state.resetConfidenceAt(route.RouteID, window.Column.At)
 			delete(latestHot, route.RouteID)
 		}
 		return
@@ -275,8 +276,12 @@ func processRouteWindow(
 	result *Result,
 ) {
 	status := state.routes[route.RouteID]
-	if now.Before(status.CooldownUntil) || window.Column.At.Before(status.CooldownUntil) {
+	if !window.Column.At.After(status.LastProcessedAt) {
+		return
+	}
+	if now.Before(status.CooldownUntil) || windowOverlapsCooldown(window, status.CooldownUntil) {
 		status.ConsecutiveOver = 0
+		status.LastProcessedAt = window.Column.At
 		state.routes[route.RouteID] = status
 		delete(latestHot, route.RouteID)
 		result.Events = append(result.Events, Event{RouteID: route.RouteID, Reason: SkipReasonCooldown, At: window.Column.At})
@@ -288,12 +293,14 @@ func processRouteWindow(
 	score := scoreOpsPerMinute(load, window.Duration, cfg)
 	if score < cfg.ThresholdOpsMin {
 		status.ConsecutiveOver = 0
+		status.LastProcessedAt = window.Column.At
 		state.routes[route.RouteID] = status
 		delete(latestHot, route.RouteID)
 		return
 	}
 
 	status.ConsecutiveOver++
+	status.LastProcessedAt = window.Column.At
 	state.routes[route.RouteID] = status
 	latestHot[route.RouteID] = candidate{
 		route:           route,
@@ -343,6 +350,13 @@ func selectDecisions(
 	}
 }
 
+func windowOverlapsCooldown(window ColumnWindow, cooldownUntil time.Time) bool {
+	if cooldownUntil.IsZero() {
+		return false
+	}
+	return window.Column.At.Before(cooldownUntil) || window.Column.At.Add(-window.Duration).Before(cooldownUntil)
+}
+
 type candidate struct {
 	route           distribution.RouteDescriptor
 	rows            []keyviz.MatrixRow
@@ -360,6 +374,19 @@ func (s *DetectorState) ensure() {
 	if s.routes == nil {
 		s.routes = map[uint64]RouteStatus{}
 	}
+}
+
+func (s *DetectorState) resetConfidenceAt(routeID uint64, at time.Time) {
+	if s == nil {
+		return
+	}
+	s.ensure()
+	status := s.routes[routeID]
+	status.ConsecutiveOver = 0
+	if at.After(status.LastProcessedAt) {
+		status.LastProcessedAt = at
+	}
+	s.routes[routeID] = status
 }
 
 func (s *DetectorState) gc(live map[uint64]distribution.RouteDescriptor) {
@@ -444,6 +471,7 @@ func selectP50SplitKey(cfg Config, route distribution.RouteDescriptor, rows []ke
 		return nil, "", 0, 0, false
 	}
 	sortSubBucketRows(rows)
+	rows = coalesceSubBucketRows(rows)
 
 	median, total, leftLoad, loadBeforeMedian, ok := weightedMedianRow(cfg, rows)
 	if !ok {
@@ -463,6 +491,34 @@ func sortSubBucketRows(rows []keyviz.MatrixRow) {
 		}
 		return rows[i].SubBucket < rows[j].SubBucket
 	})
+}
+
+func coalesceSubBucketRows(rows []keyviz.MatrixRow) []keyviz.MatrixRow {
+	if len(rows) <= 1 {
+		return rows
+	}
+	out := rows[:0]
+	for _, row := range rows {
+		if len(out) == 0 || !sameSubBucketRow(out[len(out)-1], row) {
+			out = append(out, row)
+			continue
+		}
+		last := &out[len(out)-1]
+		last.Reads += row.Reads
+		last.Writes += row.Writes
+		last.ReadBytes += row.ReadBytes
+		last.WriteBytes += row.WriteBytes
+	}
+	return out
+}
+
+func sameSubBucketRow(a, b keyviz.MatrixRow) bool {
+	return a.RouteID == b.RouteID &&
+		a.RaftGroupID == b.RaftGroupID &&
+		a.SubBucket == b.SubBucket &&
+		a.SubBucketCount == b.SubBucketCount &&
+		bytes.Equal(a.Start, b.Start) &&
+		bytes.Equal(a.End, b.End)
 }
 
 func weightedMedianRow(cfg Config, rows []keyviz.MatrixRow) (keyviz.MatrixRow, float64, float64, float64, bool) {
