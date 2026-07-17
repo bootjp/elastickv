@@ -279,9 +279,6 @@ func rawKvPairs(res []*store.KVPair) []*pb.RawKVPair {
 func rawKeyPairs(keys [][]byte) []*pb.RawKVPair {
 	out := make([]*pb.RawKVPair, 0, len(keys))
 	for _, key := range keys {
-		if key == nil {
-			continue
-		}
 		out = append(out, &pb.RawKVPair{Key: key})
 	}
 	return out

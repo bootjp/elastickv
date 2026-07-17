@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"strconv"
 	"sync"
@@ -15,6 +16,16 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
 )
+
+func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
+	t.Parallel()
+
+	pairs := rawKeyPairs([][]byte{nil, {}, []byte("a")})
+	require.Len(t, pairs, 3)
+	require.Nil(t, pairs[0].Key)
+	require.True(t, bytes.Equal([]byte{}, pairs[1].Key))
+	require.Equal(t, []byte("a"), pairs[2].Key)
+}
 
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()

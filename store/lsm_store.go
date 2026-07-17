@@ -1165,9 +1165,14 @@ func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, userKey []byte
 	return kv, s.skipToNextUserKey(iter, userKey), nil
 }
 
-func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([][]byte, error) {
+type pebbleIteratorProvider interface {
+	NewIter(*pebble.IterOptions) (*pebble.Iterator, error)
+}
+
+func (s *pebbleStore) collectScanKeys(ctx context.Context, reader pebbleIteratorProvider, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([][]byte, error) {
 	result := make([][]byte, 0, boundedScanResultCapacity(limit))
 	seen := make(map[string]struct{}, boundedScanResultCapacity(limit))
+	probedPrefixes := make(map[string]struct{}, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
 		userKey, version, ok, err := s.nextForwardScanUserKeyContext(ctx, iter, start)
@@ -1175,7 +1180,7 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 			return nil, err
 		}
 		var done bool
-		result, done, err = s.appendEndPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts, ok)
+		result, done, err = s.appendEndPrefixScanKeys(ctx, reader, result, seen, probedPrefixes, userKey, start, end, limit, ts, ok)
 		if err != nil {
 			return nil, err
 		}
@@ -1184,7 +1189,7 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 		}
 
 		var advance bool
-		result, advance, err = s.collectVisibleScanKey(ctx, iter, result, seen, userKey, version, start, end, limit, ts)
+		result, advance, err = s.collectVisibleScanKey(ctx, reader, iter, result, seen, probedPrefixes, userKey, version, start, end, limit, ts)
 		if err != nil {
 			return nil, err
 		}
@@ -1198,8 +1203,10 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 
 func (s *pebbleStore) appendEndPrefixScanKeys(
 	ctx context.Context,
+	reader pebbleIteratorProvider,
 	result [][]byte,
 	seen map[string]struct{},
+	probedPrefixes map[string]struct{},
 	userKey []byte,
 	start []byte,
 	end []byte,
@@ -1213,7 +1220,7 @@ func (s *pebbleStore) appendEndPrefixScanKeys(
 	if !pastScanEnd(userKey, end) {
 		return result, false, nil
 	}
-	result, err := s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
+	result, err := s.appendVisibleProperPrefixScanKeys(ctx, reader, result, seen, probedPrefixes, userKey, start, end, limit, ts)
 	if err != nil {
 		return nil, true, err
 	}
@@ -1222,9 +1229,11 @@ func (s *pebbleStore) appendEndPrefixScanKeys(
 
 func (s *pebbleStore) collectVisibleScanKey(
 	ctx context.Context,
+	reader pebbleIteratorProvider,
 	iter *pebble.Iterator,
 	result [][]byte,
 	seen map[string]struct{},
+	probedPrefixes map[string]struct{},
 	userKey []byte,
 	version uint64,
 	start []byte,
@@ -1232,17 +1241,22 @@ func (s *pebbleStore) collectVisibleScanKey(
 	limit int,
 	ts uint64,
 ) ([][]byte, bool, error) {
-	if !s.seekToVisibleVersion(iter, userKey, version, ts) {
-		return result, true, nil
+	if _, ok := seen[string(userKey)]; ok {
+		return result, s.skipToNextUserKey(iter, userKey), nil
 	}
-
-	visible, err := s.foundValueVisible(iter, ts)
+	var visible bool
+	var err error
+	if version <= ts {
+		visible, err = s.foundValueVisible(iter, ts)
+	} else {
+		visible, err = s.visibleExactKeyAt(ctx, reader, userKey, ts)
+	}
 	if err != nil {
 		return nil, false, err
 	}
 	if visible {
 		result = appendScanKeyResult(result, seen, userKey, limit)
-		result, err = s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
+		result, err = s.appendVisibleProperPrefixScanKeys(ctx, reader, result, seen, probedPrefixes, userKey, start, end, limit, ts)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1271,8 +1285,10 @@ func appendScanKeyResult(result [][]byte, seen map[string]struct{}, key []byte, 
 
 func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
 	ctx context.Context,
+	reader pebbleIteratorProvider,
 	result [][]byte,
 	seen map[string]struct{},
+	probedPrefixes map[string]struct{},
 	userKey []byte,
 	start []byte,
 	end []byte,
@@ -1284,10 +1300,15 @@ func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
 		if _, ok := seen[string(prefix)]; ok {
 			continue
 		}
+		probeKey := string(prefix)
+		if _, ok := probedPrefixes[probeKey]; ok {
+			continue
+		}
+		probedPrefixes[probeKey] = struct{}{}
 		if beforeScanStart(prefix, start) || pastScanEnd(prefix, end) {
 			continue
 		}
-		visible, err := s.visibleExactKeyAt(ctx, prefix, ts)
+		visible, err := s.visibleExactKeyAt(ctx, reader, prefix, ts)
 		if err != nil {
 			return nil, err
 		}
@@ -1298,8 +1319,8 @@ func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
 	return result, nil
 }
 
-func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIteratorProvider, key []byte, ts uint64) (bool, error) {
+	iter, err := reader.NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(key, math.MaxUint64),
 		UpperBound: keyUpperBound(key),
 	})
@@ -1423,7 +1444,10 @@ func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, 
 		return nil, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	snap := s.db.NewSnapshot()
+	defer snap.Close()
+
+	iter, err := snap.NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(start, math.MaxUint64),
 	})
 	if err != nil {
@@ -1431,7 +1455,7 @@ func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, 
 	}
 	defer iter.Close()
 
-	return s.collectScanKeys(ctx, iter, start, end, limit, ts)
+	return s.collectScanKeys(ctx, snap, iter, start, end, limit, ts)
 }
 
 func (s *pebbleStore) collectReverseScanResults(
