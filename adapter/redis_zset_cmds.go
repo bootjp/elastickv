@@ -667,7 +667,8 @@ func (r *RedisServer) prepareZSetWriteBase(ctx context.Context, key []byte, read
 		return zsetWriteBase{}, err
 	}
 	var migrationElems []*kv.Elem[kv.OP]
-	if !expiredRecreate {
+	skipLegacy := cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeZSet)
+	if !expiredRecreate && !skipLegacy {
 		migrationElems, err = r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 		if err != nil {
 			return zsetWriteBase{}, err

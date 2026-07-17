@@ -154,7 +154,10 @@ func (r *RedisServer) listPushSnapshot(ctx context.Context, key []byte, readTS u
 	if err != nil {
 		return store.ListMeta{}, false, redisTypeNone, nil, err
 	}
-	return meta, exists, typ, nil, nil
+	if len(cleanup) > 0 && exists {
+		typ = redisTypeList
+	}
+	return meta, exists, typ, cleanup, nil
 }
 
 // reusableListPush captures a dispatched list-push attempt so a subsequent

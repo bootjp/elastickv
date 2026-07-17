@@ -178,7 +178,8 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(
 			return nil, false, err
 		}
 		if staleDeltaOnly {
-			return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey(key)}}, false, nil
+			elems, err := r.staleDeltaOnlyCollectionCleanupElems(ctx, key, readTS, expected)
+			return elems, false, err
 		}
 		return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
 	}
@@ -187,6 +188,44 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(
 		return nil, false, err
 	}
 	return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
+}
+
+func (r *RedisServer) staleDeltaOnlyCollectionCleanupElems(ctx context.Context, key []byte, readTS uint64, expected redisValueType) ([]*kv.Elem[kv.OP], error) {
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey(key)}}
+	if legacyKey, ok := legacyCollectionBlobKey(key, expected); ok {
+		exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if exists {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: legacyKey})
+		}
+	}
+	if expected != redisTypeSet {
+		return elems, nil
+	}
+	hllExpired, err := r.hllExpiredAt(ctx, key, readTS)
+	if err != nil || !hllExpired {
+		return elems, err
+	}
+	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHLLKey(key)}), nil
+}
+
+func cleanupDeletesLegacyCollection(elems []*kv.Elem[kv.OP], key []byte, typ redisValueType) bool {
+	legacyKey, ok := legacyCollectionBlobKey(key, typ)
+	if !ok {
+		return false
+	}
+	return opElemsDeleteKey(elems, legacyKey)
+}
+
+func opElemsDeleteKey(elems []*kv.Elem[kv.OP], want []byte) bool {
+	for _, elem := range elems {
+		if elem != nil && elem.Op == kv.Del && bytes.Equal(elem.Key, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RedisServer) expiredTTLIndexPrecedesDeltaOnlyCollection(

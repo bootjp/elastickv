@@ -365,6 +365,9 @@ func expiredTTLIndexPrecedesDeltaOnlyCollection(
 	}
 	deltas, err := scanner.scanDeltaKVs(ctx, prefix, readTS)
 	if err != nil {
+		if errors.Is(err, ErrDeltaScanTruncated) {
+			return false, nil
+		}
 		return false, err
 	}
 	return legacyTTLPrecedesAllMetaDeltas(ttlCommitTS, deltas, prefix), nil

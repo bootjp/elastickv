@@ -368,12 +368,17 @@ func (r *RedisServer) setWideMutationBase(
 	if expiredRecreate {
 		return cleanupElems, nil, nil, true, nil
 	}
-	if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
-		return nil, nil, nil, false, err
+	if !opElemsDeleteKey(cleanupElems, redisHLLKey(key)) {
+		if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
-	migrationElems, err := r.buildSetLegacyMigrationElems(ctx, key, readTS)
-	if err != nil {
-		return nil, nil, nil, false, err
+	var migrationElems []*kv.Elem[kv.OP]
+	if !cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeSet) {
+		migrationElems, err = r.buildSetLegacyMigrationElems(ctx, key, readTS)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
 	// Extract legacy member names from migration ops so that applySetMemberMutations
 	// can treat them as already-existing (they are not yet visible at readTS).
