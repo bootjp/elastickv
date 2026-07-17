@@ -320,6 +320,43 @@ func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *
 	require.Equal(t, []string{DistributionFilePinnedHotspotSplitBoundary}, observer.reasons)
 }
 
+func TestDistributionServerSplitRange_DoesNotRecordNonFilesystemNormalizedBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	routeStart := []byte("queue")
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     []byte("queuez"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	observer := &recordingDistributionFilesystemObserver{}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithDistributionFilesystemObserver(observer),
+	)
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               store.ListItemKey(routeStart, 1),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+	require.Empty(t, observer.reasons)
+}
+
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
 	t.Parallel()
 

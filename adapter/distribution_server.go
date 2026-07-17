@@ -212,6 +212,9 @@ func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte
 	if s == nil || s.fsObserver == nil || bytes.Equal(rawSplitKey, splitKey) || !isSplitBoundaryError(err) {
 		return
 	}
+	if !fskeys.IsChunkRouteDomainKey(splitKey) {
+		return
+	}
 	s.fsObserver.ObserveFilePinnedHotspot(DistributionFilePinnedHotspotSplitBoundary)
 }
 

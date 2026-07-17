@@ -375,7 +375,7 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 		}
 		scanStart := start
 		scanEnd := end
-		explicitGroup := !clampToRoutes && len(start) > 0
+		explicitGroup := !clampToRoutes
 		if clampToRoutes {
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)

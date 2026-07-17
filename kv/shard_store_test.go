@@ -2,11 +2,14 @@ package kv
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -398,6 +401,38 @@ func TestShardStoreScanAt_UpperBoundedFilesystemChunkScanIncludesChunkRoutes(t *
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_NilStartFanoutUsesExplicitGroupForProxy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	recorder := &recordingRawScanKVServer{}
+	addr, stop := startRawKVServer(t, recorder)
+	t.Cleanup(stop)
+
+	rawRouteEnd := fskeys.ChunkRouteKey(11, 22)
+	chunkRouteEnd := prefixScanEnd(rawRouteEnd)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), rawRouteEnd, 1)
+	engine.UpdateRoute(rawRouteEnd, chunkRouteEnd, 2)
+	engine.UpdateRoute(chunkRouteEnd, nil, 3)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: followerEngineForTest(addr), Store: store.NewMVCCStore()},
+		2: {Engine: followerEngineForTest(addr), Store: store.NewMVCCStore()},
+		3: {Engine: followerEngineForTest(addr), Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	_, err := st.ScanAt(ctx, nil, prefixScanEnd(fskeys.ChunkAllPrefix()), 10, ^uint64(0))
+	require.NoError(t, err)
+
+	groupIDs := recorder.rawScanGroupIDs()
+	require.NotContains(t, groupIDs, uint64(0))
+	require.Contains(t, groupIDs, uint64(1))
+	require.Contains(t, groupIDs, uint64(2))
+}
+
 func TestShardStoreReverseScanAt_UpperBoundedFilesystemChunkScanIncludesChunkRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -426,6 +461,41 @@ func TestShardStoreReverseScanAt_UpperBoundedFilesystemChunkScanIncludesChunkRou
 	require.Len(t, kvs, 2)
 	require.Equal(t, k1, kvs[0].Key)
 	require.Equal(t, k0, kvs[1].Key)
+}
+
+type recordingRawScanKVServer struct {
+	pb.UnimplementedRawKVServer
+
+	mu       sync.Mutex
+	groupIDs []uint64
+}
+
+func (s *recordingRawScanKVServer) RawScanAt(_ context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.groupIDs = append(s.groupIDs, req.GetGroupId())
+	return &pb.RawScanAtResponse{}, nil
+}
+
+func (s *recordingRawScanKVServer) rawScanGroupIDs() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint64(nil), s.groupIDs...)
+}
+
+type followerLeaderAddrEngine struct {
+	*fakeLeaseEngine
+	addr string
+}
+
+func followerEngineForTest(addr string) *followerLeaderAddrEngine {
+	inner := &fakeLeaseEngine{}
+	inner.state.Store(raftengine.StateFollower)
+	return &followerLeaderAddrEngine{fakeLeaseEngine: inner, addr: addr}
+}
+
+func (e *followerLeaderAddrEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "n1", Address: e.addr}
 }
 
 func TestShardStoreScanAt_DeduplicatesFilesystemChunkRoutesByGroup(t *testing.T) {

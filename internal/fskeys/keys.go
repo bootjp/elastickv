@@ -101,6 +101,12 @@ func ChunkAllPrefix() []byte {
 	return []byte(chunkPrefix)
 }
 
+// IsChunkRouteDomainKey reports whether key is in the virtual chunk routing
+// domain used to keep all chunks of a file on the same shard group.
+func IsChunkRouteDomainKey(key []byte) bool {
+	return bytes.HasPrefix(key, chunkRoutePrefixBytes)
+}
+
 // ChunkRouteKey returns the logical route domain for every chunk of the same
 // file home. It intentionally excludes chunkIndex so range splitting does not
 // scatter one file's chunks across routes under normal placement.
