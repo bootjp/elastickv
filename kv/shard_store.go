@@ -889,7 +889,7 @@ func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
 	if err != nil {
 		return nil, limitReached, errors.WithStack(err)
 	}
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, visibleLimit)
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, start, end, visibleLimit, reverse)
 	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, visibleLimit)
 	if err != nil {
 		return nil, limitReached, err
@@ -919,7 +919,7 @@ func (s *ShardStore) scanRouteAtLeader(
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, start, end, limit)
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, start, end, limit, reverse)
 	lockKVs, err := scanTxnLockRangeAt(ctx, g, lockStart, lockEnd, ts, limit)
 	if err != nil {
 		return nil, err
@@ -928,12 +928,19 @@ func (s *ShardStore) scanRouteAtLeader(
 }
 
 func scanLockBoundsForKVs(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int) ([]byte, []byte) {
+	return scanLockBoundsForKVsDirection(kvs, scanStart, scanEnd, limit, false)
+}
+
+func scanLockBoundsForKVsDirection(kvs []*store.KVPair, scanStart []byte, scanEnd []byte, limit int, reverse bool) ([]byte, []byte) {
 	if len(kvs) < limit {
 		return scanStart, scanEnd
 	}
 	_, lastUserKey, ok := observedScanUserBounds(kvs)
 	if ok {
 		return scanStart, boundScanEnd(scanEnd, nextScanCursor(lastUserKey))
+	}
+	if reverse {
+		return scanStart, scanEnd
 	}
 	if lastKey := lastKVKey(kvs); lastKey != nil {
 		return scanStart, boundScanEnd(scanEnd, nextScanCursor(lastKey))

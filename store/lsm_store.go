@@ -1386,14 +1386,11 @@ func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byt
 	if version > ts {
 		return false, false, nil
 	}
-	_, err := s.readVisibleVersion(iter, key, ts)
-	if errors.Is(err, ErrKeyNotFound) {
-		return false, true, nil
-	}
+	visible, err := s.foundValueVisible(iter, ts)
 	if err != nil {
 		return false, true, err
 	}
-	return true, true, nil
+	return visible, true, nil
 }
 
 func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {

@@ -973,3 +973,16 @@ func TestScanLockBoundsForKVs_FullInternalPageUsesRawPageBound(t *testing.T) {
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, nextScanCursor(internalKey), lockEnd)
 }
+
+func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testing.T) {
+	t.Parallel()
+
+	internalKey := txnCommitKey([]byte("primary"), 10)
+	kvs := []*store.KVPair{
+		{Key: internalKey, Value: []byte("commit")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte(""), []byte("z"), 1, true)
+	require.Equal(t, []byte(""), lockStart)
+	require.Equal(t, []byte("z"), lockEnd)
+}
