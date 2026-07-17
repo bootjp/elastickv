@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -174,6 +175,44 @@ func TestPebbleStore_RebuildsStaleLastCommitTSOnOpen(t *testing.T) {
 	val, err := reopened.GetAt(ctx, []byte("k"), 55)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v50"), val)
+}
+
+func TestPebbleStore_RebuildLastCommitTSIgnoresWriterRegistryRows(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-last-ts-registry-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("v50"), 50, 0))
+
+	reg, err := WriterRegistryFor(ps)
+	require.NoError(t, err)
+	registryKey := encryption.RegistryKey(0xfeedbeef, 0xcafe)
+	_, decodedRegistryTS := decodeKeyView(registryKey)
+	require.Greater(t, decodedRegistryTS, uint64(50))
+	require.NoError(t, reg.SetRegistryRow(registryKey, encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID:          0x1234_5678_9abc_def0,
+		FirstSeenLocalEpoch: 1,
+		LastSeenLocalEpoch:  2,
+	})))
+
+	require.NoError(t, writePebbleUint64(ps.db, metaLastCommitTSBytes, 5, pebble.Sync))
+	require.NoError(t, ps.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	require.Equal(t, uint64(50), reopened.LastCommitTS())
+
+	kvs, err := reopened.ScanAt(ctx, nil, nil, 10, reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("k"), kvs[0].Key)
+	require.Equal(t, []byte("v50"), kvs[0].Value)
 }
 
 func TestPebbleStore_GetAtBatch(t *testing.T) {

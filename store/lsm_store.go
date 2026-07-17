@@ -595,6 +595,11 @@ func isPebbleMetaKey(rawKey []byte) bool {
 		bytes.Equal(rawKey, metaAppliedIndexBytes)
 }
 
+func isPebbleOperationalKey(rawKey []byte) bool {
+	return isPebbleMetaKey(rawKey) ||
+		bytes.HasPrefix(rawKey, encryption.WriterRegistryPrefix)
+}
+
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	metaTS, err := readPebbleUint64(s.db, metaLastCommitTSBytes)
 	if err != nil {
@@ -623,7 +628,7 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 	var maxTS uint64
 	for iter.First(); iter.Valid(); iter.Next() {
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			continue
 		}
 		userKey, ts := decodeKeyView(rawKey)
@@ -1172,7 +1177,7 @@ func pastScanEnd(userKey, end []byte) bool {
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Next() {
 				return nil, 0, false
 			}
@@ -1196,7 +1201,7 @@ func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]
 			return nil, 0, false, errors.WithStack(err)
 		}
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Next() {
 				return nil, 0, false, nil
 			}
@@ -1217,7 +1222,7 @@ func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Prev() {
 				return nil, false
 			}
@@ -2307,7 +2312,7 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 		}
 
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {
