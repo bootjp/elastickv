@@ -354,8 +354,8 @@ func TestRedisLua_ListExactFallbackPinsRouteBounds(t *testing.T) {
 	st := &routePinnedExactScanStore{
 		MVCCStore:      store.NewMVCCStore(),
 		t:              t,
-		wantRouteStart: startKey,
-		wantRouteEnd:   endKey,
+		wantRouteStart: src,
+		wantRouteEnd:   prefixScanEnd(src),
 		pages: [][]*store.KVPair{
 			{{Key: listItemKey(collider, 0), Value: []byte("other-list-job")}},
 			{{Key: listItemKey(src, 1), Value: []byte("job-1")}},

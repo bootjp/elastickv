@@ -2287,8 +2287,7 @@ func (c *luaScriptContext) allowExactListScanFallback(startKey, endKey []byte, s
 }
 
 func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMeta, startKey, endKey []byte, left bool) (luaLazyListBoundaryItem, bool, error) {
-	routeStart := append([]byte(nil), startKey...)
-	routeEnd := append([]byte(nil), endKey...)
+	routeStart, routeEnd := luaListRouteScanBounds(key)
 	for {
 		kvs, err := c.scanExactListPage(startKey, endKey, routeStart, routeEnd, left)
 		if err != nil {
@@ -2306,6 +2305,10 @@ func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMe
 			endKey = append([]byte(nil), kvs[0].Key...)
 		}
 	}
+}
+
+func luaListRouteScanBounds(key []byte) ([]byte, []byte) {
+	return append([]byte(nil), key...), prefixScanEnd(key)
 }
 
 func (c *luaScriptContext) scanExactListPage(startKey, endKey, routeStart, routeEnd []byte, left bool) ([]*store.KVPair, error) {
