@@ -37,6 +37,12 @@ func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption 
 	}
 }
 
+func WithInternalMigrationImportGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationImportGate = gate
+	}
+}
+
 func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
 	return func(i *Internal) {
 		i.migrationPromoteGate = gate
@@ -55,6 +61,7 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 		transactionManager:   txm,
 		clock:                clock,
 		relay:                relay,
+		migrationImportGate:  defaultMigrationImportGate,
 		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
@@ -71,6 +78,7 @@ type Internal struct {
 	relay                *RedisPubSubRelay
 	store                store.MVCCStore
 	migrationProposer    raftengine.Proposer
+	migrationImportGate  func(context.Context) error
 	migrationPromoteGate func(context.Context) error
 	routeEngine          *distribution.Engine
 
@@ -200,6 +208,9 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
+	if err := i.verifyMigrationImportEnabled(ctx); err != nil {
+		return nil, err
+	}
 	result, err := i.proposeMigrationImport(ctx, req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -216,6 +227,16 @@ func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) erro
 	}
 	if req.GetBracketId() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions bracket_id is required"))
+	}
+	return nil
+}
+
+func (i *Internal) verifyMigrationImportEnabled(ctx context.Context) error {
+	if i.migrationImportGate == nil {
+		return nil
+	}
+	if err := i.migrationImportGate(ctx); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
@@ -275,6 +296,17 @@ func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) 
 	return nil
 }
 
+func defaultMigrationImportGate(context.Context) error {
+	if migrationImportOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration import opcode is disabled; enable after every voter is running a build that supports migration import"))
+}
+
+func migrationImportOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE")
+}
+
 func defaultMigrationPromoteGate(context.Context) error {
 	if migrationPromoteOpcodeEnabledFromEnv() {
 		return nil
@@ -283,7 +315,11 @@ func defaultMigrationPromoteGate(context.Context) error {
 }
 
 func migrationPromoteOpcodeEnabledFromEnv() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"))) {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE")
+}
+
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:

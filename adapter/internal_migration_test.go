@@ -397,6 +397,7 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
 		WithInternalStore(st),
 		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationImportGate(func(context.Context) error { return nil }),
 	)
 
 	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
@@ -422,6 +423,38 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(30), floor)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}
+
+func TestInternalImportRangeVersionsRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, clock),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationImportGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration import disabled for test")
+		}),
+	)
+
+	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
+		JobId:     7,
+		BracketId: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor-1"),
+		Versions: []*pb.MVCCVersion{
+			{Key: []byte("k"), CommitTs: 30, Value: []byte("v")},
+		},
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
 }
 
 func TestInternalImportRangeVersionsRejectsMissingIdentifiers(t *testing.T) {
