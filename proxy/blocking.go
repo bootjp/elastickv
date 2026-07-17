@@ -10,7 +10,23 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const blockingMultiPopMinArgs = 2
+const (
+	blockingMultiPopMinArgs        = 2
+	blockingListMoveMinArgs        = 3
+	blockingBLMoveArgs             = 6
+	blockingListMoveReplayKeyCount = int64(2)
+)
+
+const blockingListMoveReplayScript = `
+local removed = redis.call("LREM", KEYS[1], tonumber(ARGV[1]), ARGV[3])
+if removed == 0 then
+	return 0
+end
+if ARGV[2] == "LEFT" then
+	return redis.call("LPUSH", KEYS[2], ARGV[3])
+end
+return redis.call("RPUSH", KEYS[2], ARGV[3])
+`
 
 type blockingTimeoutBackend interface {
 	DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd
@@ -54,23 +70,18 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 	return time.Duration(millis) * time.Millisecond
 }
 
-func blockingReplayCommand(cmd string, _ [][]byte, resp any) (string, []any, bool) {
+func blockingReplayCommand(cmd string, args [][]byte, resp any) (string, []any, bool) {
 	switch strings.ToUpper(cmd) {
 	case "BLPOP":
 		return blockingListPopReplay(1, resp)
 	case "BRPOP":
 		return blockingListPopReplay(-1, resp)
+	case "BRPOPLPUSH":
+		return blockingListMoveReplay(args, resp, -1, "LEFT")
+	case "BLMOVE":
+		return blockingBLMoveReplay(args, resp)
 	case "BZPOPMIN", "BZPOPMAX":
-		parts, ok := redisArray(resp)
-		if !ok || len(parts) < 2 {
-			return "", nil, false
-		}
-		key, keyOK := redisArg(parts[0])
-		member, memberOK := redisArg(parts[1])
-		if !keyOK || !memberOK {
-			return "", nil, false
-		}
-		return "ZREM", []any{[]byte("ZREM"), key, member}, true
+		return blockingZSetPopReplay(resp)
 	default:
 		return "", nil, false
 	}
@@ -87,6 +98,61 @@ func blockingListPopReplay(count int64, resp any) (string, []any, bool) {
 		return "", nil, false
 	}
 	return "LREM", []any{[]byte("LREM"), key, count, value}, true
+}
+
+func blockingZSetPopReplay(resp any) (string, []any, bool) {
+	parts, ok := redisArray(resp)
+	if !ok || len(parts) < blockingMultiPopMinArgs {
+		return "", nil, false
+	}
+	key, keyOK := redisArg(parts[0])
+	member, memberOK := redisArg(parts[1])
+	if !keyOK || !memberOK {
+		return "", nil, false
+	}
+	return "ZREM", []any{[]byte("ZREM"), key, member}, true
+}
+
+func blockingBLMoveReplay(args [][]byte, resp any) (string, []any, bool) {
+	if len(args) < blockingBLMoveArgs {
+		return "", nil, false
+	}
+	var count int64
+	switch strings.ToUpper(string(args[3])) {
+	case "LEFT":
+		count = 1
+	case "RIGHT":
+		count = -1
+	default:
+		return "", nil, false
+	}
+	to := strings.ToUpper(string(args[4]))
+	if to != "LEFT" && to != "RIGHT" {
+		return "", nil, false
+	}
+	return blockingListMoveReplay(args, resp, count, to)
+}
+
+func blockingListMoveReplay(args [][]byte, resp any, count int64, to string) (string, []any, bool) {
+	if len(args) < blockingListMoveMinArgs {
+		return "", nil, false
+	}
+	value, ok := redisArg(resp)
+	if !ok {
+		return "", nil, false
+	}
+	source := append([]byte(nil), args[1]...)
+	destination := append([]byte(nil), args[2]...)
+	return "EVAL", []any{
+		[]byte("EVAL"),
+		blockingListMoveReplayScript,
+		blockingListMoveReplayKeyCount,
+		source,
+		destination,
+		count,
+		[]byte(to),
+		value,
+	}, true
 }
 
 func redisArray(v any) ([]any, bool) {

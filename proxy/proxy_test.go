@@ -717,6 +717,75 @@ func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
 	}
 }
 
+func TestDualWriter_Blocking_ReplaysListMoveAsEval(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		args [][]byte
+		resp any
+		want []any
+	}{
+		{
+			name: "BRPOPLPUSH removes source tail and pushes destination head",
+			cmd:  "BRPOPLPUSH",
+			args: [][]byte{[]byte("BRPOPLPUSH"), []byte("source"), []byte("dest"), []byte("5")},
+			resp: []byte("job-1"),
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(-1),
+				[]byte("LEFT"),
+				[]byte("job-1"),
+			},
+		},
+		{
+			name: "BLMOVE mirrors requested source and destination sides",
+			cmd:  "BLMOVE",
+			args: [][]byte{
+				[]byte("BLMOVE"), []byte("source"), []byte("dest"),
+				[]byte("LEFT"), []byte("RIGHT"), []byte("5"),
+			},
+			resp: "job-2",
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(1),
+				[]byte("RIGHT"),
+				[]byte("job-2"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: tc.resp,
+			}
+			secondary := newMockBackend("secondary")
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, tc.args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, [][]any{tc.want}, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("EVAL", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
 func TestDualWriter_Blocking_XReadDoesNotUseWriteSemaphore(t *testing.T) {
 	primary := &timeoutCapturingBackend{name: "primary", returnValue: []any{}}
 	secondary := newMockBackend("secondary")

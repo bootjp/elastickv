@@ -3417,12 +3417,30 @@ func (c *luaScriptContext) newLuaStreamDelta(key []byte) (*luaStreamDeltaState, 
 
 func (c *luaScriptContext) canUseLuaStreamDelta(key []byte, typ redisValueType, metaFound bool, legacyCleanup []*kv.Elem[kv.OP]) (bool, error) {
 	hasPhysicalStream := metaFound || len(legacyCleanup) != 0
+	var (
+		expired        bool
+		expiredChecked bool
+	)
+	if typ == redisTypeNone {
+		var err error
+		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
+		if err != nil {
+			return false, err
+		}
+		expiredChecked = true
+		if expired {
+			return false, nil
+		}
+	}
 	if !hasPhysicalStream {
 		return true, nil
 	}
-	expired, err := c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
-	if err != nil {
-		return false, err
+	if !expiredChecked {
+		var err error
+		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
+		if err != nil {
+			return false, err
+		}
 	}
 	if expired || typ == redisTypeNone {
 		return false, nil

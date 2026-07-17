@@ -271,6 +271,45 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
 	require.Equal(t, map[string]any{"event": "new"}, events[0].Values)
 }
 
+func TestRedis_LuaXAddRecreatesTTLExpiredHash(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const (
+		stream = "bull:test:events-expired-hash"
+		ttl    = 80 * time.Millisecond
+	)
+	require.NoError(t, rdb.HSet(ctx, stream, "event", "old").Err())
+	require.NoError(t, rdb.PExpire(ctx, stream, ttl).Err())
+	eventuallyExpired(t, ttl, func() bool {
+		hlen, err := rdb.HLen(ctx, stream).Result()
+		return err == nil && hlen == 0
+	}, "hash must be logically expired before Lua XADD recreates it")
+
+	id, err := rdb.Eval(ctx, `
+return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
+`, []string{stream}).Text()
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	xlen, err := rdb.XLen(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), xlen)
+	ttlAfter, err := rdb.TTL(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttlAfter)
+
+	events, err := rdb.XRange(ctx, stream, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, id, events[0].ID)
+	require.Equal(t, map[string]any{"event": "new"}, events[0].Values)
+}
+
 func TestRedis_LuaXAddHonorsScriptLocalStringType(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
