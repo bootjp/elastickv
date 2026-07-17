@@ -988,24 +988,19 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 
 func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool, error) {
 	valBytes := iter.Value()
-	tombstone, expireAt, encState, err := decodeValueHeader(valBytes)
+	sv, err := decodeValue(valBytes)
 	if err != nil {
 		return false, err
 	}
 
 	// Keep key-only scans on the same authenticated visibility path as ScanAt.
-	if encState == encStateEncrypted {
-		sv := storedValue{
-			Value:     valBytes[valueHeaderSize:],
-			Tombstone: tombstone,
-			ExpireAt:  expireAt,
-			EncState:  encState,
-		}
-		if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
-			return false, err
-		}
+	// This intentionally also runs for cleartext-labelled rows so the
+	// cleartext rebadge guard rejects encrypted envelopes whose encState bit
+	// was flipped before we branch on tombstone or expireAt.
+	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+		return false, err
 	}
-	return !tombstone && (expireAt == 0 || expireAt > ts), nil
+	return !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts), nil
 }
 
 func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
@@ -1364,10 +1359,13 @@ func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byt
 	if userKey == nil {
 		return false, false, nil
 	}
-	if stopOnPrefixExit && len(key) > 0 && !bytes.HasPrefix(userKey, key) {
-		return false, true, nil
+	if !bytes.Equal(userKey, key) {
+		if stopOnPrefixExit && len(key) > 0 && bytes.Compare(userKey, key) > 0 && !bytes.HasPrefix(userKey, key) {
+			return false, true, nil
+		}
+		return false, false, nil
 	}
-	if !bytes.Equal(userKey, key) || version > ts {
+	if version > ts {
 		return false, false, nil
 	}
 	_, err := s.readVisibleVersion(iter, key, ts)

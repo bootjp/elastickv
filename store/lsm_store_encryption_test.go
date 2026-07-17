@@ -713,6 +713,27 @@ func TestEncryptionScanKeysAtHeaderTamperRejected(t *testing.T) {
 	}
 }
 
+func TestEncryptionScanKeysAtRejectsRebadgedEnvelope(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 1060)
+	ctx := context.Background()
+	const writeTS uint64 = 100
+	const readTS uint64 = 200
+	if err := f.mvcc.PutAt(ctx, []byte("scan-rebadge"), []byte("payload"), writeTS, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+
+	f.tamperPebbleValue(t, []byte("scan-rebadge"), writeTS, func(raw []byte) []byte {
+		raw[0] &^= encStateMask
+		raw[0] |= tombstoneMask
+		return raw
+	})
+	_, err := f.mvcc.ScanKeysAt(ctx, []byte("scan-"), []byte("scan."), 10, readTS)
+	if !errors.Is(err, ErrEncryptedReadIntegrity) {
+		t.Fatalf("ScanKeysAt over a rebadged encrypted entry should fail integrity, got %v", err)
+	}
+}
+
 // TestEncryption_DeletePrefixHeaderTamperRejected covers the PR742
 // claude[bot] round-5 follow-up: isVisibleLiveKey is the write-side
 // counterpart to readVisibleVersion / processFoundValue (read paths

@@ -211,6 +211,25 @@ func TestPebbleStoreScanKeysAtPreservesExtensionAfterInvisiblePrefix(t *testing.
 	require.Equal(t, [][]byte{[]byte("a\x80")}, keys)
 }
 
+func TestPebbleStoreScanKeysAtFindsExtensionAfterShorterPrefixProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	shorterPrefix := []byte{0x01, 0x01, 0x01}
+	extension := []byte{0x01, 0x01, 0x01, 0xff}
+	require.NoError(t, st.PutAt(ctx, shorterPrefix, []byte("short"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, extension, []byte("future-extension"), 30, 0))
+	require.NoError(t, st.PutAt(ctx, extension, []byte("visible-extension"), 10, 0))
+
+	keys, err := st.ScanKeysAt(ctx, extension, nil, 1, 20)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{extension}, keys)
+}
+
 func TestPebbleStoreScanKeysAtKeepsAllFFKeyWithoutFiniteUpperBound(t *testing.T) {
 	t.Parallel()
 

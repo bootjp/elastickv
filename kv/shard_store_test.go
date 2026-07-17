@@ -556,6 +556,37 @@ func TestBackupScannerContinuesPastTxnInternalOnlyPage(t *testing.T) {
 	require.Nil(t, kvp)
 }
 
+func TestBackupScannerContinuesPastStaleOffRoutePage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("stale-old-owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("z"), []byte("visible-new-owner"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("z"), kvp.Key)
+	require.Equal(t, []byte("visible-new-owner"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
 func TestBackupScannerEmptyKeyContinuesAfterPage(t *testing.T) {
 	t.Parallel()
 

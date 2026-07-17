@@ -66,7 +66,10 @@ func (s *backupScanner) Next(ctx context.Context) (*store.KVPair, bool, error) {
 			return nil, false, err
 		}
 		if len(s.page) == 0 {
-			return nil, false, nil
+			if s.exhausted {
+				return nil, false, nil
+			}
+			continue
 		}
 	}
 	kvp := s.page[s.index]
