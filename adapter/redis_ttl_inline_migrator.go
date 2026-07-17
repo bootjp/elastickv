@@ -292,8 +292,7 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 		return nil, nil
 	}
 	if redisTTLMillisExpired(ttlMs) {
-		elems, _, err := server.deleteLogicalKeyElems(ctx, userKey, readTS)
-		return elems, err
+		return c.expiredTTLIndexedCollectionElems(ctx, server, userKey, readTS)
 	}
 	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
 	if err != nil || baseExists {
@@ -304,6 +303,26 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 		return elems, err
 	}
 	return c.legacyCollectionTTLInlineElems(ctx, userKey, typ, ttlMs, readTS)
+}
+
+func (c *DeltaCompactor) expiredTTLIndexedCollectionElems(
+	ctx context.Context,
+	server *RedisServer,
+	userKey []byte,
+	readTS uint64,
+) ([]*kv.Elem[kv.OP], error) {
+	inlineTTL, inlineFound, err := server.collectionTTLAt(ctx, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if inlineFound {
+		inlineMs := ttlMillis(inlineTTL)
+		if inlineMs == 0 || !redisTTLMillisExpired(inlineMs) {
+			return appendTTLIndexSyncElem(ctx, c.st, nil, userKey, inlineMs, readTS)
+		}
+	}
+	elems, _, err := server.deleteLogicalKeyElems(ctx, userKey, readTS)
+	return elems, err
 }
 
 func ttlIndexedCollectionMigrationType(typ redisValueType) bool {

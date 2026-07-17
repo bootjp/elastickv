@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ const (
 	defaultDeltaCompactorScanInterval   = 30 * time.Second
 	defaultDeltaCompactorTimeout        = 5 * time.Second
 	defaultDeltaCompactorTimeoutBackoff = time.Minute
+	metaDeltaCommitTSBytes              = 8
 
 	// deltaCompactorTickScanLimit is the maximum number of delta keys scanned
 	// per collection type per compaction tick. It bounds per-tick I/O while
@@ -625,11 +627,73 @@ func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, r
 	return meta, raw, errors.WithStack(err)
 }
 
-func compactedMetaExpireAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64, raw []byte, inlineSize int, expireAt uint64) (uint64, error) {
+func compactedMetaExpireAt(
+	ctx context.Context,
+	st store.MVCCStore,
+	userKey []byte,
+	readTS uint64,
+	raw []byte,
+	inlineSize int,
+	expireAt uint64,
+	deltaKVs []*store.KVPair,
+	deltaScanPrefix []byte,
+) (uint64, error) {
 	if len(raw) == inlineSize {
 		return expireAt, nil
 	}
-	return legacyTTLMillisAt(ctx, st, userKey, readTS)
+	ttlMs, ttlCommitTS, found, err := legacyTTLMillisWithCommitTSAt(ctx, st, userKey, readTS)
+	if err != nil || !found {
+		return 0, err
+	}
+	if len(raw) == 0 && legacyTTLPrecedesAllMetaDeltas(ttlCommitTS, deltaKVs, deltaScanPrefix) {
+		return 0, nil
+	}
+	return ttlMs, nil
+}
+
+func legacyTTLMillisWithCommitTSAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, uint64, bool, error) {
+	ttlKey := redisTTLKey(userKey)
+	raw, err := st.GetAt(ctx, ttlKey, readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, errors.WithStack(err)
+	}
+	ttl, err := decodeRedisTTL(raw)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	commitTS, ok, err := st.LatestCommitTS(ctx, ttlKey)
+	if err != nil {
+		return 0, 0, false, errors.WithStack(err)
+	}
+	return redisExpireAtMillis(ttl), commitTS, ok, nil
+}
+
+func legacyTTLPrecedesAllMetaDeltas(ttlCommitTS uint64, deltaKVs []*store.KVPair, deltaScanPrefix []byte) bool {
+	minDeltaTS, ok := minMetaDeltaCommitTS(deltaKVs, deltaScanPrefix)
+	return ok && ttlCommitTS < minDeltaTS
+}
+
+func minMetaDeltaCommitTS(deltaKVs []*store.KVPair, deltaScanPrefix []byte) (uint64, bool) {
+	var minTS uint64
+	found := false
+	for _, pair := range deltaKVs {
+		if pair == nil || !bytes.HasPrefix(pair.Key, deltaScanPrefix) {
+			continue
+		}
+		rest := pair.Key[len(deltaScanPrefix):]
+		if len(rest) < metaDeltaCommitTSBytes {
+			continue
+		}
+		ts := binary.BigEndian.Uint64(rest[:metaDeltaCommitTSBytes])
+		if !found || ts < minTS {
+			minTS = ts
+			found = true
+		}
+	}
+	return minTS, found
 }
 
 // sumListMetaDeltas aggregates HeadDelta and LenDelta across all delta KVPairs.
@@ -663,7 +727,10 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	if err != nil {
 		return nil, err
 	}
-	expireAt, err := compactedMetaExpireAt(ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt)
+	expireAt, err := compactedMetaExpireAt(
+		ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt,
+		deltaKVs, store.ListMetaDeltaScanPrefix(userKey),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -779,6 +846,7 @@ func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collecti
 		buildElems: func(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 			return c.buildSimpleCompactElems(ctx, userKey, deltaKVs, readTS,
 				p.metaKeyFn(userKey),
+				p.deltaKeyPrefixFn(userKey),
 				p.unmarshalBase,
 				p.unmarshalDelta,
 				p.marshalBase,
@@ -891,6 +959,7 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 	deltaKVs []*store.KVPair,
 	readTS uint64,
 	metaKey []byte,
+	deltaScanPrefix []byte,
 	unmarshalBase func([]byte) (int64, uint64, error),
 	unmarshalDelta func([]byte) (int64, error),
 	marshalBase func(int64, uint64) []byte,
@@ -907,7 +976,10 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 			return nil, errors.WithStack(err)
 		}
 	}
-	expireAt, err = compactedMetaExpireAt(ctx, c.st, userKey, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt)
+	expireAt, err = compactedMetaExpireAt(
+		ctx, c.st, userKey, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt,
+		deltaKVs, deltaScanPrefix,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -951,7 +1023,7 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 		baseLen = m.Len
 		expireAt = m.ExpireAt
 	}
-	expireAt, err = compactedMetaExpireAt(ctx, r.store, key, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt)
+	expireAt, err = compactedMetaExpireAt(ctx, r.store, key, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt, deltaKVs, prefix)
 	if err != nil {
 		return nil, false, err
 	}

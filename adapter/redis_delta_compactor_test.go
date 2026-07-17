@@ -859,6 +859,100 @@ func TestDeltaCompactor_PreservesLegacyTTLWhenCompactingDeltaOnlyCollections(t *
 	}
 }
 
+func TestDeltaCompactor_DoesNotInheritStaleTTLBeforeDeltaOnlyRecreate(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	staleExpireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name     string
+		key      []byte
+		metaKey  func([]byte) []byte
+		seed     func(*testing.T, store.MVCCStore, []byte)
+		build    func(*testing.T, *DeltaCompactor, store.MVCCStore, []byte, uint64) []*kv.Elem[kv.OP]
+		readMeta func(*testing.T, []byte) (int64, uint64)
+	}{
+		{
+			name:    "list",
+			key:     []byte("ttl:compact:recreate:list"),
+			metaKey: store.ListMetaKey,
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("a"), 3, 0))
+				deltaKey := store.ListMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+			},
+			build: func(t *testing.T, c *DeltaCompactor, st store.MVCCStore, key []byte, readTS uint64) []*kv.Elem[kv.OP] {
+				t.Helper()
+				prefix := store.ListMetaDeltaScanPrefix(key)
+				deltas, err := st.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), 10, readTS)
+				require.NoError(t, err)
+				elems, err := c.buildListCompactElems(ctx, key, deltas, readTS)
+				require.NoError(t, err)
+				return elems
+			},
+			readMeta: func(t *testing.T, raw []byte) (int64, uint64) {
+				t.Helper()
+				meta, err := store.UnmarshalListMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
+			name:    "hash",
+			key:     []byte("ttl:compact:recreate:hash"),
+			metaKey: store.HashMetaKey,
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("a")), []byte("1"), 3, 0))
+				deltaKey := store.HashMetaDeltaKey(key, 3, 0)
+				require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}), 3, 0))
+			},
+			build: func(t *testing.T, c *DeltaCompactor, st store.MVCCStore, key []byte, readTS uint64) []*kv.Elem[kv.OP] {
+				t.Helper()
+				prefix := store.HashMetaDeltaScanPrefix(key)
+				deltas, err := st.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), 10, readTS)
+				require.NoError(t, err)
+				elems, err := c.buildSimpleCompactElems(
+					ctx, key, deltas, readTS, store.HashMetaKey(key), prefix,
+					func(raw []byte) (int64, uint64, error) {
+						meta, err := store.UnmarshalHashMeta(raw)
+						return meta.Len, meta.ExpireAt, err
+					},
+					func(raw []byte) (int64, error) {
+						delta, err := store.UnmarshalHashMetaDelta(raw)
+						return delta.LenDelta, err
+					},
+					func(n int64, expireAt uint64) []byte {
+						return store.MarshalHashMeta(store.HashMeta{Len: n, ExpireAt: expireAt})
+					},
+				)
+				require.NoError(t, err)
+				return elems
+			},
+			readMeta: func(t *testing.T, raw []byte) (int64, uint64) {
+				t.Helper()
+				meta, err := store.UnmarshalHashMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, c := newDeltaCompactorTestFixture(t)
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(tc.key), encodeRedisTTL(staleExpireAt), 1, 0))
+			tc.seed(t, st, tc.key)
+
+			elems := tc.build(t, c, st, tc.key, st.LastCommitTS())
+			raw := elemValueForKey(t, elems, tc.metaKey(tc.key))
+			n, ttlMs := tc.readMeta(t, raw)
+			require.Equal(t, int64(1), n)
+			require.Zero(t, ttlMs)
+		})
+	}
+}
+
 func TestRedisZSetInlineMetaCompactionPreservesLegacyTTL(t *testing.T) {
 	t.Parallel()
 

@@ -490,6 +490,80 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 	}
 }
 
+func TestRedisCollectionExpireWritesInlineTTLForZeroLengthSimpleMeta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour)
+	cases := []struct {
+		name         string
+		typ          redisValueType
+		metaKey      func([]byte) []byte
+		metaValue    []byte
+		metaExpireAt func([]byte) (int64, uint64, error)
+	}{
+		{
+			name:      "hash",
+			typ:       redisTypeHash,
+			metaKey:   store.HashMetaKey,
+			metaValue: store.MarshalHashMeta(store.HashMeta{}),
+			metaExpireAt: func(raw []byte) (int64, uint64, error) {
+				meta, err := store.UnmarshalHashMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name:      "set",
+			typ:       redisTypeSet,
+			metaKey:   store.SetMetaKey,
+			metaValue: store.MarshalSetMeta(store.SetMeta{}),
+			metaExpireAt: func(raw []byte) (int64, uint64, error) {
+				meta, err := store.UnmarshalSetMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+		{
+			name:      "zset",
+			typ:       redisTypeZSet,
+			metaKey:   store.ZSetMetaKey,
+			metaValue: store.MarshalZSetMeta(store.ZSetMeta{}),
+			metaExpireAt: func(raw []byte) (int64, uint64, error) {
+				meta, err := store.UnmarshalZSetMeta(raw)
+				return meta.Len, meta.ExpireAt, err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			coord := newLocalAdapterCoordinator(st)
+			server := &RedisServer{store: st, coordinator: coord}
+			key := []byte("ttl:zero-len:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.metaValue, 1, 0))
+
+			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
+			require.NoError(t, err)
+			require.True(t, applied)
+
+			readTS := st.LastCommitTS()
+			raw, err := st.GetAt(ctx, tc.metaKey(key), readTS)
+			require.NoError(t, err)
+			n, expireAtMs, err := tc.metaExpireAt(raw)
+			require.NoError(t, err)
+			require.Zero(t, n)
+			require.Equal(t, redisExpireAtMillis(expireAt), expireAtMs)
+			rawTTL, err := st.GetAt(ctx, redisTTLKey(key), readTS)
+			require.NoError(t, err)
+			ttl, err := decodeRedisTTL(rawTTL)
+			require.NoError(t, err)
+			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
+		})
+	}
+}
+
 func TestRedisMultiExecStagedCollectionCreateWritesInlineTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
@@ -1001,6 +1075,24 @@ func TestRedisTTLInlineMigratorCleansExpiredLegacyTTLIndex(t *testing.T) {
 	}
 }
 
+func TestRedisTTLInlineMigratorKeepsLiveInlineMetaForExpiredTTLIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	compactor := NewDeltaCompactor(st, newLocalAdapterCoordinator(st))
+	key := []byte("ttl:migrator:expired-index-current-meta")
+	ttlKey := redisTTLKey(key)
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 10, 0))
+	require.NoError(t, st.PutAt(ctx, ttlKey, encodeRedisTTL(time.Now().Add(-time.Hour)), 11, 0))
+
+	elems, err := compactor.migrateTTLIndexedCollectionElems(ctx, &store.KVPair{Key: ttlKey, Value: encodeRedisTTL(time.Now().Add(-time.Hour))}, 11)
+	require.NoError(t, err)
+	require.True(t, elemDelKeysContain(elems, ttlKey))
+	requireNoDelElemByKey(t, elems, store.HashMetaKey(key))
+	requireNoDelElemByKey(t, elems, store.HashFieldKey(key, []byte("field")))
+}
+
 func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
 	t.Parallel()
 
@@ -1043,6 +1135,11 @@ func elemDelKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 		}
 	}
 	return false
+}
+
+func requireNoDelElemByKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) {
+	t.Helper()
+	require.False(t, elemDelKeysContain(elems, want), "unexpected Del elem for key %q", want)
 }
 
 func requireMissingAt(t *testing.T, st store.MVCCStore, key []byte, readTS uint64) {

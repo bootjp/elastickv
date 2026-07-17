@@ -365,7 +365,8 @@ func (r *RedisServer) simpleMetaExpireElems(
 		return nil, false, err
 	}
 	if newLen <= 0 {
-		return nil, false, nil
+		elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(0, expireAtMs)}}
+		return appendDeltaDeletes(elems, deltas), true, nil
 	}
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen, expireAtMs)}}
 	return appendDeltaDeletes(elems, deltas), true, nil
