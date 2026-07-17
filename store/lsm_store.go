@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1166,6 +1167,7 @@ func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, userKey []byte
 
 func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit int, ts uint64) ([][]byte, error) {
 	result := make([][]byte, 0, boundedScanResultCapacity(limit))
+	seen := make(map[string]struct{}, boundedScanResultCapacity(limit))
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
 		userKey, version, ok, err := s.nextForwardScanUserKeyContext(ctx, iter, start)
@@ -1185,7 +1187,11 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 			return nil, err
 		}
 		if visible {
-			result = append(result, userKey)
+			result = appendScanKeyResult(result, seen, userKey, limit)
+			result, err = s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if !s.skipToNextUserKey(iter, userKey) {
@@ -1194,6 +1200,64 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 	}
 
 	return result, nil
+}
+
+func appendScanKeyResult(result [][]byte, seen map[string]struct{}, key []byte, limit int) [][]byte {
+	if _, ok := seen[string(key)]; ok {
+		return result
+	}
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	seen[string(keyCopy)] = struct{}{}
+	result = append(result, keyCopy)
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i], result[j]) < 0
+	})
+	for len(result) > limit {
+		delete(seen, string(result[len(result)-1]))
+		result = result[:len(result)-1]
+	}
+	return result
+}
+
+func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
+	ctx context.Context,
+	result [][]byte,
+	seen map[string]struct{},
+	userKey []byte,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	for i := 0; i < len(userKey); i++ {
+		prefix := userKey[:i]
+		if _, ok := seen[string(prefix)]; ok {
+			continue
+		}
+		if beforeScanStart(prefix, start) || pastScanEnd(prefix, end) {
+			continue
+		}
+		visible, err := s.visibleExactKeyAt(ctx, prefix, ts)
+		if err != nil {
+			return nil, err
+		}
+		if visible {
+			result = appendScanKeyResult(result, seen, prefix, limit)
+		}
+	}
+	return result, nil
+}
+
+func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
+	_, err := s.getAt(ctx, key, ts)
+	if errors.Is(err, ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
