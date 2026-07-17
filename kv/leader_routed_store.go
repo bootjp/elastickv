@@ -392,6 +392,20 @@ func (s *LeaderRoutedStore) ReverseScanAtPhysicalLimit(ctx context.Context, star
 	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, true)
 }
 
+func (s *LeaderRoutedStore) AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, _ []byte, visibleLimit, physicalLimit int, _ uint64, _ bool) bool {
+	if s == nil || s.local == nil {
+		return false
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return false
+	}
+	if ok, _ := s.leaderFenceTS(ctx, start); !ok {
+		return false
+	}
+	_, ok := s.local.(physicalLimitedStore)
+	return ok
+}
+
 func (s *LeaderRoutedStore) scanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, false, nil

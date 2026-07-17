@@ -302,6 +302,36 @@ func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byt
 	return s.scanRouteAtDirectionPhysicalLimit(ctx, routes[0], start, end, visibleLimit, physicalLimit, ts, true)
 }
 
+func (s *ShardStore) AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, _ uint64, _ bool) bool {
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return false
+	}
+	g := s.exactFallbackPhysicalLimitGroup(start, end)
+	if g == nil {
+		return false
+	}
+	if _, ok := g.Store.(physicalLimitedStore); !ok {
+		return false
+	}
+	engine := engineForGroup(g)
+	return engine == nil || isLinearizableRaftLeader(ctx, engine)
+}
+
+func (s *ShardStore) exactFallbackPhysicalLimitGroup(start []byte, end []byte) *ShardGroup {
+	if s == nil || s.engine == nil {
+		return nil
+	}
+	routes, clampToRoutes := s.routesForScan(start, end)
+	if len(routes) != 1 || clampToRoutes {
+		return nil
+	}
+	g, ok := s.groupForID(routes[0].GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil
+	}
+	return g
+}
+
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false

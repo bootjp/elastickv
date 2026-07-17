@@ -127,6 +127,22 @@ type luaStreamState struct {
 	exists bool
 	dirty  bool
 	value  redisStreamValue
+	delta  *luaStreamDeltaState
+}
+
+type luaStreamDeltaState struct {
+	legacyCleanup []*kv.Elem[kv.OP]
+	meta          store.StreamMeta
+	metaFound     bool
+	appends       []luaStreamDeltaAppend
+	trimCount     int
+	selfDeletes   []redisStreamID
+	forceEmpty    bool
+}
+
+type luaStreamDeltaAppend struct {
+	id    redisStreamID
+	entry redisStreamEntry
 }
 
 type luaTTLState struct {
@@ -180,6 +196,14 @@ const (
 type luaPhysicalLimitedScanStore interface {
 	ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
 	ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error)
+}
+
+type luaExactScanFallbackDecider interface {
+	AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) bool
+}
+
+type luaRoutePinnedScanStore interface {
+	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
 }
 
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
@@ -395,6 +419,7 @@ func (c *luaScriptContext) deleteLogical(key []byte) {
 		st.exists = false
 		st.dirty = true
 		st.value = redisStreamValue{}
+		st.delta = nil
 	}
 }
 
@@ -455,7 +480,7 @@ func hasLoadedZSetValue(st *luaZSetState) bool {
 }
 
 func hasLoadedStreamValue(st *luaStreamState) bool {
-	return st != nil && st.loaded && st.exists
+	return st != nil && st.exists && (st.loaded || st.delta != nil)
 }
 
 // maxNegativeTypeCacheEntries caps the size of luaScriptContext.negativeType
@@ -939,7 +964,10 @@ func (c *luaScriptContext) zsetStateForRead(key []byte) (*luaZSetState, bool, er
 func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 	k := string(key)
 	if st, ok := c.streams[k]; ok {
-		return st, nil
+		if st.loaded {
+			return st, nil
+		}
+		return c.materializeStreamState(key, st)
 	}
 	st := &luaStreamState{}
 	c.streams[k] = st
@@ -968,6 +996,49 @@ func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 	st.exists = true
 	st.value = cloneStreamValue(value)
 	return st, nil
+}
+
+func (c *luaScriptContext) materializeStreamState(key []byte, st *luaStreamState) (*luaStreamState, error) {
+	value, err := c.server.loadStreamAt(context.Background(), key, c.startTS)
+	if err != nil {
+		return nil, err
+	}
+	if st.delta != nil {
+		value = applyLuaStreamDelta(value, st.delta)
+	}
+	st.loaded = true
+	st.exists = st.exists || len(value.Entries) > 0 || (st.delta != nil && st.delta.metaFound)
+	st.value = cloneStreamValue(value)
+	st.delta = nil
+	return st, nil
+}
+
+func applyLuaStreamDelta(value redisStreamValue, delta *luaStreamDeltaState) redisStreamValue {
+	if delta == nil {
+		return value
+	}
+	entries := append([]redisStreamEntry(nil), value.Entries...)
+	if delta.trimCount > 0 {
+		if delta.trimCount >= len(entries) {
+			entries = entries[:0]
+		} else {
+			entries = entries[delta.trimCount:]
+		}
+	}
+	selfDeleted := make(map[redisStreamID]struct{}, len(delta.selfDeletes))
+	for _, id := range delta.selfDeletes {
+		selfDeleted[id] = struct{}{}
+	}
+	for _, appendOp := range delta.appends {
+		if _, deleted := selfDeleted[appendOp.id]; deleted {
+			continue
+		}
+		entries = append(entries, appendOp.entry)
+	}
+	if delta.forceEmpty {
+		entries = entries[:0]
+	}
+	return redisStreamValue{Entries: entries}
 }
 
 func (c *luaScriptContext) markStringValue(key []byte, value []byte) {
@@ -1063,6 +1134,7 @@ func (c *luaScriptContext) markStreamValue(key []byte, value redisStreamValue) e
 	st.exists = true
 	st.dirty = true
 	st.value = cloneStreamValue(value)
+	st.delta = nil
 	c.markTouched(key)
 	c.deleted[string(key)] = false
 	return nil
@@ -2189,6 +2261,81 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
 	}
+	if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+		return item, true, nil
+	}
+	if physicalLimitReached {
+		if !c.allowExactListScanFallback(startKey, endKey, scanLimit, !left) {
+			return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+				"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
+		}
+		return c.scanListItemWindowExact(key, meta, startKey, endKey, left)
+	}
+	if len(kvs) >= scanLimit {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
+	}
+	return luaLazyListBoundaryItem{}, false, nil
+}
+
+func (c *luaScriptContext) allowExactListScanFallback(startKey, endKey []byte, scanLimit int, reverse bool) bool {
+	decider, ok := c.server.store.(luaExactScanFallbackDecider)
+	if !ok {
+		return true
+	}
+	return decider.AllowExactScanFallbackAfterPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS, reverse)
+}
+
+func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMeta, startKey, endKey []byte, left bool) (luaLazyListBoundaryItem, bool, error) {
+	routeStart, routeEnd := luaListRouteScanBounds(key)
+	for {
+		kvs, err := c.scanExactListPage(startKey, endKey, routeStart, routeEnd, left)
+		if err != nil {
+			return luaLazyListBoundaryItem{}, false, err
+		}
+		if len(kvs) == 0 {
+			return luaLazyListBoundaryItem{}, false, nil
+		}
+		if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+			return item, true, nil
+		}
+		if left {
+			startKey = scanStartAfterKey(kvs[0].Key)
+		} else {
+			endKey = append([]byte(nil), kvs[0].Key...)
+		}
+	}
+}
+
+func luaListRouteScanBounds(key []byte) ([]byte, []byte) {
+	return append([]byte(nil), key...), prefixScanEnd(key)
+}
+
+func (c *luaScriptContext) scanExactListPage(startKey, endKey, routeStart, routeEnd []byte, left bool) ([]*store.KVPair, error) {
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if scanner, ok := c.server.store.(luaRoutePinnedScanStore); ok {
+		kvs, err = scanner.ScanAtWithReadFence(c.ctx, startKey, endKey, 1, c.startTS, !left, 0, 0, routeStart, routeEnd)
+	} else if left {
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	} else {
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return kvs, nil
+}
+
+func scanStartAfterKey(key []byte) []byte {
+	next := make([]byte, len(key)+1)
+	copy(next, key)
+	return next
+}
+
+func luaListBoundaryItemFromKVs(key []byte, meta store.ListMeta, kvs []*store.KVPair) (luaLazyListBoundaryItem, bool) {
 	for _, kvp := range kvs {
 		seq, ok := store.ExtractListItemSeq(kvp.Key, key)
 		if !ok {
@@ -2197,17 +2344,9 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 		return luaLazyListBoundaryItem{
 			value: string(kvp.Value),
 			index: seq - meta.Head,
-		}, true, nil
+		}, true
 	}
-	if physicalLimitReached {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
-	}
-	if len(kvs) >= scanLimit {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
-	}
-	return luaLazyListBoundaryItem{}, false, nil
+	return luaLazyListBoundaryItem{}, false
 }
 
 func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
@@ -3150,6 +3289,17 @@ func (c *luaScriptContext) cmdXAdd(args []string) (luaReply, error) {
 	if err != nil {
 		return luaReply{}, err
 	}
+	deltaID, handled, err := c.cmdXAddDelta(parsed)
+	if err != nil {
+		return luaReply{}, err
+	}
+	if handled {
+		return luaStringReply(deltaID), nil
+	}
+	return c.cmdXAddMaterialized(parsed)
+}
+
+func (c *luaScriptContext) cmdXAddMaterialized(parsed luaXAddArgs) (luaReply, error) {
 	st, err := c.streamState(parsed.key)
 	if err != nil {
 		return luaReply{}, err
@@ -3173,6 +3323,151 @@ func (c *luaScriptContext) cmdXAdd(args []string) (luaReply, error) {
 	c.markTouched(parsed.key)
 	c.deleted[string(parsed.key)] = false
 	return luaStringReply(id), nil
+}
+
+func (c *luaScriptContext) cmdXAddDelta(parsed luaXAddArgs) (string, bool, error) {
+	st, handled, err := c.streamDeltaStateForXAdd(parsed.key)
+	if err != nil || !handled {
+		return "", handled, err
+	}
+
+	id, parsedID, err := resolveXAddID(st.delta.meta, st.delta.metaFound, parsed.id)
+	if err != nil {
+		return "", true, err
+	}
+	if err := xaddEnforceMaxWideColumn(parsed.key, st.delta.meta.Length, parsed.maxLen); err != nil {
+		return "", true, err
+	}
+	st.delta.appends = append(st.delta.appends, luaStreamDeltaAppend{
+		id:    parsedID,
+		entry: newRedisStreamEntry(id, append([]string(nil), parsed.fields...)),
+	})
+	c.applyLuaXAddDeltaTrim(st.delta, parsed.maxLen, parsedID)
+	st.delta.meta.LastMs = parsedID.ms
+	st.delta.meta.LastSeq = parsedID.seq
+	st.delta.metaFound = true
+	st.exists = true
+	st.dirty = true
+	c.markTouched(parsed.key)
+	c.deleted[string(parsed.key)] = false
+	return id, true, nil
+}
+
+func (c *luaScriptContext) streamDeltaStateForXAdd(key []byte) (*luaStreamState, bool, error) {
+	keyString := string(key)
+	st := c.streams[keyString]
+	if st != nil && st.loaded {
+		return nil, false, nil
+	}
+	if st != nil && st.delta != nil {
+		return nil, false, nil
+	}
+	if cached, handled, err := c.streamDeltaDecisionFromCachedType(key); cached {
+		return nil, handled, err
+	}
+	if st == nil {
+		st = &luaStreamState{}
+		c.streams[keyString] = st
+	}
+	delta, useDelta, err := c.newLuaStreamDelta(key)
+	if err != nil {
+		return nil, true, err
+	}
+	if !useDelta {
+		delete(c.streams, keyString)
+		return nil, false, nil
+	}
+	st.delta = delta
+	return st, true, nil
+}
+
+func (c *luaScriptContext) streamDeltaDecisionFromCachedType(key []byte) (bool, bool, error) {
+	typ, cached := c.cachedType(key)
+	if !cached {
+		return false, false, nil
+	}
+	if typ != redisTypeNone && typ != redisTypeStream {
+		return true, true, wrongTypeError()
+	}
+	return true, false, nil
+}
+
+func (c *luaScriptContext) newLuaStreamDelta(key []byte) (*luaStreamDeltaState, bool, error) {
+	typ, err := c.server.keyTypeAtExpect(c.scriptCtx(), key, c.startTS, redisTypeStream)
+	if err != nil {
+		return nil, false, err
+	}
+	if typ != redisTypeNone && typ != redisTypeStream {
+		return nil, false, wrongTypeError()
+	}
+	legacyCleanup, meta, metaFound, err := c.server.streamWriteBase(c.scriptCtx(), key, c.startTS)
+	if err != nil {
+		return nil, false, err
+	}
+	useDelta, err := c.canUseLuaStreamDelta(key, typ, metaFound, legacyCleanup)
+	if err != nil || !useDelta {
+		return nil, false, err
+	}
+	return &luaStreamDeltaState{
+		legacyCleanup: legacyCleanup,
+		meta:          meta,
+		metaFound:     metaFound,
+	}, true, nil
+}
+
+func (c *luaScriptContext) canUseLuaStreamDelta(key []byte, typ redisValueType, metaFound bool, legacyCleanup []*kv.Elem[kv.OP]) (bool, error) {
+	hasPhysicalStream := metaFound || len(legacyCleanup) != 0
+	var (
+		expired        bool
+		expiredChecked bool
+	)
+	if typ == redisTypeNone {
+		var err error
+		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, false)
+		if err != nil {
+			return false, err
+		}
+		expiredChecked = true
+		if expired {
+			return false, nil
+		}
+	}
+	if !hasPhysicalStream {
+		return true, nil
+	}
+	if !expiredChecked {
+		var err error
+		expired, err = c.server.hasExpired(c.scriptCtx(), key, c.startTS, true)
+		if err != nil {
+			return false, err
+		}
+	}
+	if expired || typ == redisTypeNone {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *luaScriptContext) applyLuaXAddDeltaTrim(delta *luaStreamDeltaState, maxLen int, appendedID redisStreamID) {
+	candidateLen := delta.meta.Length + 1
+	if maxLen < 0 || candidateLen <= int64(maxLen) {
+		delta.meta.Length = candidateLen
+		return
+	}
+	diff := candidateLen - int64(maxLen)
+	if diff > int64(maxWideColumnItems) {
+		diff = int64(maxWideColumnItems)
+	}
+	if diff > 0 {
+		delta.trimCount += int(diff)
+	}
+	if maxLen == 0 {
+		delta.meta.Length = 0
+		delta.selfDeletes = append(delta.selfDeletes, appendedID)
+		delta.forceEmpty = true
+		return
+	}
+	delta.meta.Length = candidateLen - diff
 }
 
 func parseLuaXAddArgs(args []string) (luaXAddArgs, error) {
@@ -3373,7 +3668,7 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		return luaKeyPlan{}, err
 	}
 
-	valuePlan, err := c.valueCommitPlan(key, finalType, commitTS)
+	valuePlan, err := c.valueCommitPlan(ctx, key, finalType, commitTS)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
@@ -3422,7 +3717,7 @@ func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType
 	return nil
 }
 
-func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
+func (c *luaScriptContext) valueCommitPlan(ctx context.Context, key string, finalType redisValueType, commitTS uint64) (luaCommitPlan, error) {
 	switch finalType {
 	case redisTypeNone:
 		return luaCommitPlan{}, nil
@@ -3440,8 +3735,7 @@ func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType,
 	case redisTypeZSet:
 		return c.zsetCommitPlan(key, commitTS)
 	case redisTypeStream:
-		elems, err := c.streamCommitElems(key)
-		return luaCommitPlan{elems: elems}, err
+		return c.streamCommitPlan(ctx, key)
 	default:
 		return luaCommitPlan{}, errors.New("ERR unsupported final redis type")
 	}
@@ -3785,6 +4079,71 @@ func (c *luaScriptContext) zsetDeltaMetaElems(key []byte, st *luaZSetState, comm
 		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
 		Value: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: st.lenDelta}),
 	}}
+}
+
+func (c *luaScriptContext) streamCommitPlan(ctx context.Context, key string) (luaCommitPlan, error) {
+	st := c.streams[key]
+	if st == nil || !st.dirty {
+		return luaCommitPlan{preserveExisting: true}, nil
+	}
+	if st.delta != nil && !st.loaded {
+		elems, err := c.streamDeltaCommitElems(ctx, key, st.delta)
+		return luaCommitPlan{preserveExisting: true, elems: elems}, err
+	}
+	elems, err := c.streamCommitElems(key)
+	return luaCommitPlan{elems: elems}, err
+}
+
+func (c *luaScriptContext) streamDeltaCommitElems(ctx context.Context, key string, delta *luaStreamDeltaState) ([]*kv.Elem[kv.OP], error) {
+	keyBytes := []byte(key)
+	trim, err := c.server.buildXTrimHeadElems(ctx, keyBytes, c.startTS, delta.trimCount)
+	if err != nil {
+		return nil, err
+	}
+
+	elems := make([]*kv.Elem[kv.OP], 0, len(delta.legacyCleanup)+len(delta.appends)+len(trim)+len(delta.selfDeletes)+1)
+	elems = append(elems, delta.legacyCleanup...)
+	for _, appendOp := range delta.appends {
+		entryValue, err := marshalStreamEntry(appendOp.entry)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.StreamEntryKey(keyBytes, appendOp.id.ms, appendOp.id.seq),
+			Value: entryValue,
+		})
+	}
+	elems = append(elems, trim...)
+	for _, id := range delta.selfDeletes {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:  kv.Del,
+			Key: store.StreamEntryKey(keyBytes, id.ms, id.seq),
+		})
+	}
+
+	meta := delta.meta
+	if delta.forceEmpty {
+		meta.Length = 0
+	} else {
+		meta.Length = int64(len(delta.appends)) + deltaBaseLength(delta) - int64(len(trim)) - int64(len(delta.selfDeletes))
+		if meta.Length < 0 {
+			meta.Length = 0
+		}
+	}
+	metaBytes, err := store.MarshalStreamMeta(meta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(keyBytes), Value: metaBytes})
+	return elems, nil
+}
+
+func deltaBaseLength(delta *luaStreamDeltaState) int64 {
+	if delta == nil {
+		return 0
+	}
+	return delta.meta.Length + int64(delta.trimCount) - int64(len(delta.appends))
 }
 
 // streamCommitElems writes the script's final stream state in the
