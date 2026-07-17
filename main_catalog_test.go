@@ -294,7 +294,8 @@ func startSplitMigrationCapabilityTestServer(t *testing.T, resp *pb.GetSplitMigr
 }
 
 type capabilityConfigEngine struct {
-	cfg raftengine.Configuration
+	cfg    raftengine.Configuration
+	leader raftengine.LeaderInfo
 }
 
 func (e capabilityConfigEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
@@ -310,7 +311,7 @@ func (e capabilityConfigEngine) State() raftengine.State {
 }
 
 func (e capabilityConfigEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{}
+	return e.leader
 }
 
 func (e capabilityConfigEngine) VerifyLeader(context.Context) error {

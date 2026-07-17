@@ -231,6 +231,23 @@ func TestDistributionServerGetSplitMigrationCapabilityReportsReadyWhenRunnerRead
 	require.Contains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
 }
 
+func TestDistributionServerGetSplitMigrationCapabilityRespectsReadinessGate(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithSplitJobRunnerReady(),
+		WithSplitJobRunnerReadinessGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration opcode disabled")
+		}),
+	)
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.False(t, resp.GetMigrationCapable())
+	require.NotContains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
 func TestDistributionServerStartSplitMigration_FailsClosedUntilCapabilityGate(t *testing.T) {
 	t.Parallel()
 

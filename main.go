@@ -1629,7 +1629,11 @@ func prepareDistributionRuntimeServer(
 			splitMigrationCapabilityProbeTimeout,
 			nil,
 		)),
-		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(coordinate, splitPromotionConnCache)),
+		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
+			splitPromotionTargetLeaderResolver(in.shardGroups),
+			splitPromotionConnCache,
+		)),
+		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		adapter.WithSplitJobRunnerReady(),
 	}
 	in.distServer = adapter.NewDistributionServer(engine, distCatalog, distOptions...)
@@ -1673,26 +1677,54 @@ func startDistributionRuntimeAfterTransport(in distributionRuntimeStartupInput) 
 	startMemoryWatchdog(in.runCtx, in.eg, in.cancel)
 	startMonitoringCollectors(in.runCtx, in.metricsRegistry, in.runtimes, in.clock)
 	startFSMCompactorIfEnabled(in.runCtx, in.eg, in.runtimes, in.readTracker)
-	startDistributionSplitJobRunner(in.runCtx, in.eg, prepared.serverInput.distServer)
 	return startPreparedServerAfterStartupRotation(
 		in.waitRotateOnStartup, prepared.serverInput, prepared.preparedServer)
 }
 
-func splitPromotionClientFactory(coordinate kv.Coordinator, connCache *kv.GRPCConnCache) adapter.SplitPromotionClientFactory {
+type splitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
+
+func splitPromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) splitPromotionLeaderResolver {
+	return func(job distribution.SplitJob) (string, error) {
+		sg := shardGroups[job.TargetGroupID]
+		if sg == nil || sg.Engine == nil {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		addr := strings.TrimSpace(sg.Engine.Leader().Address)
+		if addr == "" {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		return addr, nil
+	}
+}
+
+func splitPromotionClientFactory(resolve splitPromotionLeaderResolver, connCache *kv.GRPCConnCache) adapter.SplitPromotionClientFactory {
 	return func(_ context.Context, job distribution.SplitJob) (adapter.SplitPromotionClient, error) {
-		if coordinate == nil {
-			return nil, errors.New("distribution coordinator is not configured")
+		if resolve == nil {
+			return nil, errors.New("split promotion leader resolver is not configured")
 		}
 		if connCache == nil {
 			return nil, errors.New("split promotion gRPC connection cache is not configured")
 		}
-		addr := coordinate.RaftLeaderForKey(job.SplitKey)
+		addr, err := resolve(job)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 		conn, err := connCache.ConnFor(addr)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 		return pb.NewInternalClient(conn), nil
 	}
+}
+
+func splitMigrationLocalReadinessGate(context.Context) error {
+	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationImportOpcodeEnv)
+	}
+	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
+	}
+	return nil
 }
 
 func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
@@ -1844,6 +1876,7 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	runner.publicKVGate.markReady()
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}

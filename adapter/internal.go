@@ -17,6 +17,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	// MigrationImportOpcodeEnv enables the internal staged import opcode after
+	// every voter is running a compatible build.
+	MigrationImportOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE"
+	// MigrationPromoteOpcodeEnv enables the internal staged promotion opcode
+	// after every voter is running a compatible build.
+	MigrationPromoteOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"
+)
+
 type InternalOption func(*Internal)
 
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
@@ -341,7 +350,7 @@ func defaultMigrationImportGate(context.Context) error {
 }
 
 func migrationImportOpcodeEnabledFromEnv() bool {
-	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE")
+	return MigrationImportOpcodeEnabledFromEnv()
 }
 
 func defaultMigrationPromoteGate(context.Context) error {
@@ -352,7 +361,19 @@ func defaultMigrationPromoteGate(context.Context) error {
 }
 
 func migrationPromoteOpcodeEnabledFromEnv() bool {
-	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE")
+	return MigrationPromoteOpcodeEnabledFromEnv()
+}
+
+// MigrationImportOpcodeEnabledFromEnv reports whether the staged import opcode
+// is enabled for this process.
+func MigrationImportOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationImportOpcodeEnv)
+}
+
+// MigrationPromoteOpcodeEnabledFromEnv reports whether the staged promotion
+// opcode is enabled for this process.
+func MigrationPromoteOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationPromoteOpcodeEnv)
 }
 
 func envFlagEnabled(name string) bool {

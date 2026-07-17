@@ -32,6 +32,7 @@ type DistributionServer struct {
 	readBlocked                 func() bool
 	migrationCapabilityGate     SplitMigrationCapabilityGate
 	splitJobRunnerReady         bool
+	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
 	splitPromotionClientFactory SplitPromotionClientFactory
 	knownRaftGroups             map[uint64]struct{}
 	reloadRetry                 struct {
@@ -92,6 +93,14 @@ func WithSplitJobRunnerReady() DistributionServerOption {
 	}
 }
 
+// WithSplitJobRunnerReadinessGate configures local runtime gates that must be
+// open before this node advertises split migration capability.
+func WithSplitJobRunnerReadinessGate(gate SplitMigrationCapabilityGate) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitJobRunnerReadinessGate = gate
+	}
+}
+
 // WithSplitPromotionClientFactory configures the client factory used by the
 // split job runner to promote target-local staged versions.
 func WithSplitPromotionClientFactory(factory SplitPromotionClientFactory) DistributionServerOption {
@@ -143,16 +152,18 @@ const (
 	splitPromotionBytesPerMiB        = 1024 * 1024
 	splitPromotionMaxBytesMiB        = 4
 	splitPromotionMaxScannedMiB      = 16
+	splitPromotionAttemptTimeoutSecs = 2
 	promotionCompleteBaseOpCount     = 2
 )
 
 var (
-	defaultCatalogReloadRetryAttempts = 20
-	defaultCatalogReloadRetryInterval = 10 * time.Millisecond
-	defaultSplitJobRunnerInterval     = time.Second
-	defaultSplitPromotionMaxVersions  = uint32(splitPromotionDefaultMaxVersions)
-	defaultSplitPromotionMaxBytes     = uint64(splitPromotionMaxBytesMiB * splitPromotionBytesPerMiB)
-	defaultSplitPromotionMaxScanned   = uint64(splitPromotionMaxScannedMiB * splitPromotionBytesPerMiB)
+	defaultCatalogReloadRetryAttempts   = 20
+	defaultCatalogReloadRetryInterval   = 10 * time.Millisecond
+	defaultSplitJobRunnerInterval       = time.Second
+	defaultSplitPromotionMaxVersions    = uint32(splitPromotionDefaultMaxVersions)
+	defaultSplitPromotionMaxBytes       = uint64(splitPromotionMaxBytesMiB * splitPromotionBytesPerMiB)
+	defaultSplitPromotionMaxScanned     = uint64(splitPromotionMaxScannedMiB * splitPromotionBytesPerMiB)
+	defaultSplitPromotionAttemptTimeout = time.Duration(splitPromotionAttemptTimeoutSecs) * time.Second
 
 	errDistributionCatalogNotConfigured   = errors.New("route catalog is not configured")
 	errDistributionUnknownRoute           = errors.New("unknown route")
@@ -208,7 +219,9 @@ func (s *DistributionServer) RunSplitJobRunner(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		if err := s.RunSplitJobRunnerOnce(ctx); err != nil {
-			slog.Warn("split job runner tick failed", "err", err)
+			if !splitJobRunnerContextDone(err) {
+				slog.Warn("split job runner tick failed", "err", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -288,13 +301,15 @@ func (s *DistributionServer) promoteSplitJobTargetAndComplete(ctx context.Contex
 func promoteSplitJobTarget(ctx context.Context, client SplitPromotionClient, job distribution.SplitJob) error {
 	var cursor []byte
 	for {
-		resp, err := client.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+		attemptCtx, cancel := splitPromotionAttemptContext(ctx)
+		resp, err := client.PromoteStagedVersions(attemptCtx, &pb.PromoteStagedVersionsRequest{
 			JobId:           job.JobID,
 			Cursor:          cursor,
 			MaxVersions:     defaultSplitPromotionMaxVersions,
 			MaxBytes:        defaultSplitPromotionMaxBytes,
 			MaxScannedBytes: defaultSplitPromotionMaxScanned,
 		})
+		cancel()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -307,6 +322,20 @@ func promoteSplitJobTarget(ctx context.Context, client SplitPromotionClient, job
 		}
 		cursor = distribution.CloneBytes(next)
 	}
+}
+
+func splitPromotionAttemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if defaultSplitPromotionAttemptTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultSplitPromotionAttemptTimeout)
+}
+
+func splitJobRunnerContextDone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // UpdateRoute allows updating route information.
@@ -431,14 +460,24 @@ func (s *DistributionServer) StartSplitMigration(ctx context.Context, req *pb.St
 	}, nil
 }
 
-func (s *DistributionServer) GetSplitMigrationCapability(context.Context, *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
-	if !s.splitJobRunnerReady {
+func (s *DistributionServer) GetSplitMigrationCapability(ctx context.Context, _ *pb.GetSplitMigrationCapabilityRequest) (*pb.GetSplitMigrationCapabilityResponse, error) {
+	if !s.splitMigrationCapabilityReady(ctx) {
 		return &pb.GetSplitMigrationCapabilityResponse{}, nil
 	}
 	return &pb.GetSplitMigrationCapabilityResponse{
 		MigrationCapable: true,
 		Capabilities:     []string{splitMigrationCapabilityV2},
 	}, nil
+}
+
+func (s *DistributionServer) splitMigrationCapabilityReady(ctx context.Context) bool {
+	if !s.splitJobRunnerReady {
+		return false
+	}
+	if s.splitJobRunnerReadinessGate == nil {
+		return true
+	}
+	return s.splitJobRunnerReadinessGate(ctx) == nil
 }
 
 func (s *DistributionServer) verifyStartSplitMigrationPreflight(ctx context.Context, req *pb.StartSplitMigrationRequest) error {
