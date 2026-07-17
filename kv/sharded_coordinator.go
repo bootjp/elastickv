@@ -1240,11 +1240,18 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefixes(elems []*Elem[
 		if elem == nil {
 			continue
 		}
-		start, end := routePrefixRange(elem.Key)
-		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-			if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-				return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", elem.Key, start, end, commitTS, route.MinWriteTSExclusive)
-			}
+		if err := c.rejectWriteTimestampFloorDelPrefix(elem.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefix(prefix []byte, commitTS uint64) error {
+	start, end := routePrefixRange(prefix)
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive)
 		}
 	}
 	return nil
@@ -2342,7 +2349,16 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutat
 		return nil
 	}
 	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 {
+		if mut == nil {
+			continue
+		}
+		if mut.GetOp() == pb.Op_DEL_PREFIX {
+			if err := c.rejectWriteTimestampFloorDelPrefix(mut.Key, commitTS); err != nil {
+				return err
+			}
+			continue
+		}
+		if len(mut.Key) == 0 {
 			continue
 		}
 		if err := c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS); err != nil {

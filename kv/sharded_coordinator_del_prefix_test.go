@@ -172,6 +172,22 @@ func TestShardedCoordinatorRejectsDelPrefixAtMigrationTimestampFloor(t *testing.
 	require.Empty(t, g1Txn.requests, "coordinator must reject before broadcasting a floor-violating prefix delete")
 }
 
+func TestShardedCoordinatorRejectsRawDelPrefixMutationAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+
+	for _, mut := range []*pb.Mutation{
+		{Op: pb.Op_DEL_PREFIX, Key: []byte("z")},
+		{Op: pb.Op_DEL_PREFIX, Key: nil},
+	} {
+		err := coord.rejectWriteTimestampFloorMutations([]*pb.Mutation{mut}, 100)
+		require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	}
+}
+
 func TestShardedCoordinator_DelPrefixDoesNotAutoPinObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
