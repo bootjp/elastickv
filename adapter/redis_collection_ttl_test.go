@@ -1174,6 +1174,109 @@ func TestRedisTTLInlineMigratorDropsExpiredIndexBeforeDeltaOnlyRecreate(t *testi
 	requireNoDelElemByKey(t, elems, deltaKey)
 }
 
+func TestRedisExpiredCollectionCleanupDropsStaleTTLBeforeDeltaOnlyRecreate(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	expiredAt := time.Now().Add(-time.Hour)
+	cases := []struct {
+		name       string
+		typ        redisValueType
+		dataKey    func([]byte) []byte
+		dataValue  []byte
+		deltaKey   func([]byte) []byte
+		deltaValue []byte
+	}{
+		{
+			name:       "list",
+			typ:        redisTypeList,
+			dataKey:    func(key []byte) []byte { return listItemKey(key, 0) },
+			dataValue:  []byte("value"),
+			deltaKey:   func(key []byte) []byte { return store.ListMetaDeltaKey(key, 3, 0) },
+			deltaValue: store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "hash",
+			typ:        redisTypeHash,
+			dataKey:    func(key []byte) []byte { return store.HashFieldKey(key, []byte("field")) },
+			dataValue:  []byte("value"),
+			deltaKey:   func(key []byte) []byte { return store.HashMetaDeltaKey(key, 3, 0) },
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "set",
+			typ:        redisTypeSet,
+			dataKey:    func(key []byte) []byte { return store.SetMemberKey(key, []byte("member")) },
+			dataValue:  []byte{},
+			deltaKey:   func(key []byte) []byte { return store.SetMetaDeltaKey(key, 3, 0) },
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "zset",
+			typ:        redisTypeZSet,
+			dataKey:    func(key []byte) []byte { return store.ZSetMemberKey(key, []byte("member")) },
+			dataValue:  []byte("1"),
+			deltaKey:   func(key []byte) []byte { return store.ZSetMetaDeltaKey(key, 3, 0) },
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+			key := []byte("ttl:foreground-expired-index-before-delta-recreate:" + tc.name)
+			ttlKey := redisTTLKey(key)
+			dataKey := tc.dataKey(key)
+			deltaKey := tc.deltaKey(key)
+			require.NoError(t, st.PutAt(ctx, ttlKey, encodeRedisTTL(expiredAt), 1, 0))
+			require.NoError(t, st.PutAt(ctx, dataKey, tc.dataValue, 3, 0))
+			require.NoError(t, st.PutAt(ctx, deltaKey, tc.deltaValue, 3, 0))
+
+			typ, err := server.keyTypeOrEmptyAt(ctx, key, st.LastCommitTS(), tc.typ)
+			require.NoError(t, err)
+			require.Equal(t, redisTypeNone, typ)
+			elems, expiredRecreate, err := server.expiredCollectionCleanupForRecreate(ctx, key, st.LastCommitTS(), typ, tc.typ)
+			require.NoError(t, err)
+			require.False(t, expiredRecreate)
+			require.True(t, elemDelKeysContain(elems, ttlKey))
+			requireNoDelElemByKey(t, elems, dataKey)
+			requireNoDelElemByKey(t, elems, deltaKey)
+		})
+	}
+}
+
+func TestRedisHSetPreservesDeltaOnlyRecreateBehindStaleTTLIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("ttl:foreground-hset-delta-recreate")
+	ttlKey := redisTTLKey(key)
+	fieldKey := store.HashFieldKey(key, []byte("field"))
+	deltaKey := store.HashMetaDeltaKey(key, 3, 0)
+	require.NoError(t, st.PutAt(ctx, ttlKey, encodeRedisTTL(time.Now().Add(-time.Hour)), 1, 0))
+	require.NoError(t, st.PutAt(ctx, fieldKey, []byte("value"), 3, 0))
+	require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}), 3, 0))
+
+	added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("field2"), []byte("value2")})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, fieldKey, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), raw)
+	raw, err = st.GetAt(ctx, store.HashFieldKey(key, []byte("field2")), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value2"), raw)
+	_, err = st.GetAt(ctx, ttlKey, readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
 func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
 	t.Parallel()
 

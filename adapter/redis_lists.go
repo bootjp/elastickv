@@ -143,7 +143,7 @@ func (r *RedisServer) listPushSnapshot(ctx context.Context, key []byte, readTS u
 	if err != nil {
 		return store.ListMeta{}, false, redisTypeNone, nil, err
 	}
-	cleanup, expired, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+	cleanup, expired, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeList)
 	if err != nil {
 		return store.ListMeta{}, false, redisTypeNone, nil, err
 	}

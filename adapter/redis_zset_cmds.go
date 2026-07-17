@@ -662,7 +662,7 @@ func (r *RedisServer) prepareZSetWriteBase(ctx context.Context, key []byte, read
 	if err != nil {
 		return zsetWriteBase{}, err
 	}
-	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeZSet)
 	if err != nil {
 		return zsetWriteBase{}, err
 	}

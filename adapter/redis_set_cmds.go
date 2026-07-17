@@ -361,7 +361,7 @@ func (r *RedisServer) setWideMutationBase(
 	readTS uint64,
 	typ redisValueType,
 ) ([]*kv.Elem[kv.OP], []*kv.Elem[kv.OP], map[string]struct{}, bool, error) {
-	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeSet)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}

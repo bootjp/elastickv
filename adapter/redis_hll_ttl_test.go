@@ -151,7 +151,7 @@ func TestRedisExpiredCollectionCleanupForRecreateCleansExpiredHLLAnchor(t *testi
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 10, 0))
 
-	cleanup, expiredRecreate, err := server.expiredCollectionCleanupForRecreate(ctx, key, 10, redisTypeNone)
+	cleanup, expiredRecreate, err := server.expiredCollectionCleanupForRecreate(ctx, key, 10, redisTypeNone, redisTypeSet)
 	require.NoError(t, err)
 	require.True(t, expiredRecreate)
 	require.True(t, elemDelKeysContain(cleanup, redisHLLKey(key)))

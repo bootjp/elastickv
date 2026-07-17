@@ -160,7 +160,7 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		if err != nil {
 			return err
 		}
-		cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+		cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeHash)
 		if err != nil {
 			return err
 		}
@@ -755,7 +755,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	if err != nil {
 		return 0, err
 	}
-	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ)
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeHash)
 	if err != nil {
 		return 0, err
 	}

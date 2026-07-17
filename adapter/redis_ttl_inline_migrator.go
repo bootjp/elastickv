@@ -294,7 +294,7 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 	if redisTTLMillisExpired(ttlMs) {
 		return c.expiredTTLIndexedCollectionElems(ctx, server, userKey, typ, readTS)
 	}
-	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
+	baseExists, err := collectionBaseMetaExistsAt(ctx, c.st, userKey, typ, readTS)
 	if err != nil || baseExists {
 		return nil, err
 	}
@@ -340,7 +340,18 @@ func (c *DeltaCompactor) expiredTTLIndexPrecedesDeltaOnlyCollection(
 	typ redisValueType,
 	readTS uint64,
 ) (bool, error) {
-	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
+	return expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, c.st, server, userKey, typ, readTS)
+}
+
+func expiredTTLIndexPrecedesDeltaOnlyCollection(
+	ctx context.Context,
+	st store.MVCCStore,
+	scanner redisDeltaKVScanner,
+	userKey []byte,
+	typ redisValueType,
+	readTS uint64,
+) (bool, error) {
+	baseExists, err := collectionBaseMetaExistsAt(ctx, st, userKey, typ, readTS)
 	if err != nil || baseExists {
 		return false, err
 	}
@@ -348,11 +359,11 @@ func (c *DeltaCompactor) expiredTTLIndexPrecedesDeltaOnlyCollection(
 	if !ok {
 		return false, nil
 	}
-	_, ttlCommitTS, found, err := legacyTTLMillisWithCommitTSAt(ctx, c.st, userKey, readTS)
+	_, ttlCommitTS, found, err := legacyTTLMillisWithCommitTSAt(ctx, st, userKey, readTS)
 	if err != nil || !found {
 		return false, err
 	}
-	deltas, err := server.scanDeltaKVs(ctx, prefix, readTS)
+	deltas, err := scanner.scanDeltaKVs(ctx, prefix, readTS)
 	if err != nil {
 		return false, err
 	}
@@ -385,7 +396,7 @@ func ttlIndexedCollectionMigrationType(typ redisValueType) bool {
 	return false
 }
 
-func (c *DeltaCompactor) collectionBaseMetaExistsAt(ctx context.Context, userKey []byte, typ redisValueType, readTS uint64) (bool, error) {
+func collectionBaseMetaExistsAt(ctx context.Context, st store.MVCCStore, userKey []byte, typ redisValueType, readTS uint64) (bool, error) {
 	var metaKey []byte
 	switch typ {
 	case redisTypeNone, redisTypeString:
@@ -401,7 +412,7 @@ func (c *DeltaCompactor) collectionBaseMetaExistsAt(ctx context.Context, userKey
 	case redisTypeStream:
 		metaKey = store.StreamMetaKey(userKey)
 	}
-	exists, err := c.st.ExistsAt(ctx, metaKey, readTS)
+	exists, err := st.ExistsAt(ctx, metaKey, readTS)
 	return exists, errors.WithStack(err)
 }
 

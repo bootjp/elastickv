@@ -158,7 +158,13 @@ func (r *RedisServer) collectionExpireElems(
 	return r.legacyCollectionExpireFallback(ctx, key, readTS, typ)
 }
 
-func (r *RedisServer) expiredCollectionCleanupForRecreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+func (r *RedisServer) expiredCollectionCleanupForRecreate(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	typ redisValueType,
+	expected redisValueType,
+) ([]*kv.Elem[kv.OP], bool, error) {
 	if typ != redisTypeNone {
 		return nil, false, nil
 	}
@@ -167,6 +173,13 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(ctx context.Context, k
 		return nil, false, err
 	}
 	if expired {
+		staleDeltaOnly, err := r.expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, key, expected, readTS)
+		if err != nil {
+			return nil, false, err
+		}
+		if staleDeltaOnly {
+			return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey(key)}}, false, nil
+		}
 		return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
 	}
 	hllExpired, err := r.hllExpiredAt(ctx, key, readTS)
@@ -174,6 +187,15 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(ctx context.Context, k
 		return nil, false, err
 	}
 	return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
+}
+
+func (r *RedisServer) expiredTTLIndexPrecedesDeltaOnlyCollection(
+	ctx context.Context,
+	userKey []byte,
+	typ redisValueType,
+	readTS uint64,
+) (bool, error) {
+	return expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, r.store, r, userKey, typ, readTS)
 }
 
 func (r *RedisServer) deleteExpiredLogicalKeyForRecreate(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -453,6 +475,10 @@ func (r *RedisServer) scanDeltaKVs(ctx context.Context, prefix []byte, readTS ui
 		return nil, ErrDeltaScanTruncated
 	}
 	return deltas, nil
+}
+
+type redisDeltaKVScanner interface {
+	scanDeltaKVs(context.Context, []byte, uint64) ([]*store.KVPair, error)
 }
 
 func appendDeltaDeletes(elems []*kv.Elem[kv.OP], deltas []*store.KVPair) []*kv.Elem[kv.OP] {
