@@ -46,9 +46,11 @@ Implemented:
    `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
    until the TSO-leader redirect path exists.
 9. `TSOStateMachine` implements the dedicated-group FSM contract: it accepts
-   only HLC lease entries, snapshots/restores the physical ceiling as 8
-   big-endian bytes, and classifies full HLC lease entries as volatile-only so
-   post-snapshot ceiling raises are not lost on duplicate replay skip paths.
+   only HLC lease entries, halt-fails invalid entries, snapshots/restores the
+   physical ceiling as 8 big-endian bytes, advances the derived allocation
+   floor for the applied ceiling, and classifies full HLC lease entries as
+   volatile-only so post-snapshot ceiling raises are not lost on duplicate
+   replay skip paths.
 
 Remaining:
 
@@ -198,7 +200,9 @@ Node-3 ──┘         │
 ```go
 // TSOStateMachine implements raftengine.StateMachine. It is a minimal FSM
 // that only tracks the HLC physical ceiling; its entire persisted state is a
-// single int64 ceiling value.
+// single int64 ceiling value. On apply/restore, it also observes the end of
+// the ceiling millisecond as an in-memory allocation floor so a restarted or
+// newly elected TSO leader cannot reissue the previous leader's logical slots.
 //
 // Interface mapping (raftengine.StateMachine vs raw raft.FSM):
 //   Apply([]byte)             ← engine strips log envelope, passes raw payload
@@ -213,17 +217,15 @@ type TSOStateMachine struct {
 // raftengine.StateMachine.Apply([]byte) signature.
 func (f *TSOStateMachine) Apply(data []byte) any {
     if len(data) != hlcLeaseEntryLen {
-        return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
-            "expected %d bytes, got %d", hlcLeaseEntryLen, len(data))
+        return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+            "expected %d bytes, got %d", hlcLeaseEntryLen, len(data)))
     }
     if data[0] != raftEncodeHLCLease {
-        return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
-            "unexpected tag 0x%02x", data[0])
+        return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+            "unexpected tag 0x%02x", data[0]))
     }
     ceiling := int64(binary.BigEndian.Uint64(data[1:]))
-    if f.hlc != nil && ceiling > 0 {
-        f.hlc.SetPhysicalCeiling(ceiling)
-    }
+    applyTSOLeaseToHLC(f.hlc, ceiling)
     return nil
 }
 
@@ -245,9 +247,7 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
         return err
     }
     ceiling := int64(binary.BigEndian.Uint64(buf[:]))
-    if f.hlc != nil && ceiling > 0 {
-        f.hlc.SetPhysicalCeiling(ceiling)
-    }
+    applyTSOLeaseToHLC(f.hlc, ceiling)
     return nil
 }
 
@@ -648,7 +648,7 @@ least as large as the maximum shard ceiling.
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; TSO-leader-only timestamp issuance and the minimal `TSOStateMachine` remain open | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; the minimal `TSOStateMachine` is implemented, while runtime group-0 wiring and TSO-leader-only timestamp issuance remain open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---

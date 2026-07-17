@@ -15,7 +15,10 @@ var ErrTSOStateMachineInvalidEntry = errors.New("tso fsm: invalid entry")
 
 // TSOStateMachine is the minimal state machine for the dedicated timestamp
 // group. It accepts only HLC lease-renewal entries and snapshots the last
-// applied physical ceiling as an 8-byte big-endian value.
+// applied physical ceiling as an 8-byte big-endian value. Because the lease
+// entry does not carry the leader's in-memory logical counter, applying or
+// restoring a lease also observes the end of that physical millisecond so a
+// restarted or newly elected TSO leader cannot reissue the same logical window.
 type TSOStateMachine struct {
 	hlc *HLC
 }
@@ -26,14 +29,14 @@ func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
 
 func (f *TSOStateMachine) Apply(data []byte) any {
 	if len(data) != hlcLeaseEntryLen {
-		return errors.Wrapf(ErrTSOStateMachineInvalidEntry, "expected %d bytes, got %d", hlcLeaseEntryLen, len(data))
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry, "expected %d bytes, got %d", hlcLeaseEntryLen, len(data)))
 	}
 	if data[0] != raftEncodeHLCLease {
-		return errors.Wrapf(ErrTSOStateMachineInvalidEntry, "unexpected tag 0x%02x", data[0])
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry, "unexpected tag 0x%02x", data[0]))
 	}
 	ceilingMs := int64(binary.BigEndian.Uint64(data[1:])) //nolint:gosec // value is a Unix ms timestamp encoded as uint64.
-	if f != nil && f.hlc != nil && ceilingMs > 0 {
-		f.hlc.SetPhysicalCeiling(ceilingMs)
+	if f != nil {
+		applyTSOLeaseToHLC(f.hlc, ceilingMs)
 	}
 	return nil
 }
@@ -55,14 +58,26 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 		return errors.Wrap(err, "restore tso fsm snapshot")
 	}
 	ceilingMs := int64(binary.BigEndian.Uint64(buf[:])) //nolint:gosec // value is a Unix ms timestamp encoded as uint64.
-	if f != nil && f.hlc != nil && ceilingMs > 0 {
-		f.hlc.SetPhysicalCeiling(ceilingMs)
+	if f != nil {
+		applyTSOLeaseToHLC(f.hlc, ceilingMs)
 	}
 	return nil
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
 	return len(payload) == hlcLeaseEntryLen && payload[0] == raftEncodeHLCLease
+}
+
+func applyTSOLeaseToHLC(hlc *HLC, ceilingMs int64) {
+	if hlc == nil || ceilingMs <= 0 {
+		return
+	}
+	hlc.SetPhysicalCeiling(ceilingMs)
+	hlc.Observe(tsoLeaseAllocationFloor(ceilingMs))
+}
+
+func tsoLeaseAllocationFloor(ceilingMs int64) uint64 {
+	return (nonNegativeUint64(ceilingMs) << hlcLogicalBits) | hlcLogicalMask
 }
 
 type tsoFSMSnapshot struct {
