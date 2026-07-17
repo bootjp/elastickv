@@ -100,7 +100,8 @@ func isElasticKVNotLeaderError(err error) bool {
 	if upper == "NOTLEADER" || strings.HasPrefix(upper, "NOTLEADER ") {
 		return true
 	}
-	if strings.HasPrefix(upper, "ERR ") {
+	var redisErr redis.Error
+	if errors.As(err, &redisErr) {
 		return false
 	}
 	if msg == "etcd raft engine is not leader" ||
@@ -109,7 +110,8 @@ func isElasticKVNotLeaderError(err error) bool {
 	}
 	return msg == "leader not found" ||
 		strings.HasSuffix(msg, "desc = leader not found") ||
-		strings.HasSuffix(msg, "desc = raft engine: not leader")
+		strings.HasSuffix(msg, "desc = raft engine: not leader") ||
+		strings.HasSuffix(msg, "desc = etcd raft engine is not leader")
 }
 
 func refreshSecondaryLeader(ctx context.Context, backend Backend, err error) {

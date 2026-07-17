@@ -1445,7 +1445,10 @@ func TestIsElasticKVNotLeaderErrorClassifiesWireNotLeaderOnly(t *testing.T) {
 	}{
 		{name: "redis wire notleader", err: testRedisErr("NOTLEADER raft engine: not leader"), want: true},
 		{name: "grpc wrapped no redis err prefix", err: errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"), want: true},
+		{name: "grpc wrapped etcd sentinel no redis err prefix", err: errors.New("rpc error: code = FailedPrecondition desc = etcd raft engine is not leader"), want: true},
 		{name: "bare leader not found", err: errors.New("leader not found"), want: true},
+		{name: "lua user err bare raft phrase", err: testRedisErr("raft engine: not leader"), want: false},
+		{name: "lua user err bare etcd phrase", err: testRedisErr("etcd raft engine is not leader"), want: false},
 		{name: "lua user err exact raft phrase", err: testRedisErr("ERR raft engine: not leader"), want: false},
 		{name: "lua user err etcd phrase", err: testRedisErr("ERR etcd raft engine is not leader"), want: false},
 		{name: "lua user err leader not found", err: testRedisErr("ERR leader not found"), want: false},
