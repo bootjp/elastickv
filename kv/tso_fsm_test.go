@@ -3,7 +3,6 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
-	"io"
 	"testing"
 	"time"
 
@@ -20,10 +19,10 @@ func TestTSOStateMachineApplyHLCLeaseUpdatesCeiling(t *testing.T) {
 	result := fsm.Apply(marshalHLCLeaseRenew(ceilingMs))
 	require.Nil(t, result)
 	require.Equal(t, ceilingMs, hlc.PhysicalCeiling())
-	require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), hlc.Current())
+	require.Zero(t, hlc.Current())
 }
 
-func TestTSOStateMachineApplyHLCLeaseAdvancesAllocationFloor(t *testing.T) {
+func TestTSOStateMachineApplyAllocationFloorAdvancesHLC(t *testing.T) {
 	t.Parallel()
 
 	ceilingMs := time.Now().Add(time.Hour).UnixMilli()
@@ -32,6 +31,9 @@ func TestTSOStateMachineApplyHLCLeaseAdvancesAllocationFloor(t *testing.T) {
 
 	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(ceilingMs)))
 	floor := tsoLeaseAllocationFloor(ceilingMs)
+	require.Zero(t, hlc.Current())
+
+	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(floor)))
 	require.Equal(t, floor, hlc.Current())
 
 	base, err := hlc.NextBatchFenced(1)
@@ -62,10 +64,33 @@ func TestTSOStateMachineRejectsMalformedLease(t *testing.T) {
 	}
 }
 
+func TestTSOStateMachineRejectsNonPositiveLeaseCeiling(t *testing.T) {
+	t.Parallel()
+
+	for _, ceilingMs := range []int64{0, -1} {
+		err := requireTSOHaltError(t, NewTSOStateMachine(NewHLC()).Apply(marshalHLCLeaseRenew(ceilingMs)))
+		require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	}
+}
+
+func TestTSOStateMachineRejectsMalformedAllocationFloor(t *testing.T) {
+	t.Parallel()
+
+	for _, payload := range [][]byte{
+		{raftEncodeTSOAllocationFloor},
+		append([]byte{raftEncodeTSOAllocationFloor}, make([]byte, hlcLeasePayloadLen+1)...),
+		marshalTSOAllocationFloor(0),
+	} {
+		err := requireTSOHaltError(t, NewTSOStateMachine(NewHLC()).Apply(payload))
+		require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	}
+}
+
 func TestTSOStateMachineNilHLCDoesNotPanic(t *testing.T) {
 	t.Parallel()
 
 	require.Nil(t, NewTSOStateMachine(nil).Apply(marshalHLCLeaseRenew(1_700_000_123_456)))
+	require.Nil(t, NewTSOStateMachine(nil).Apply(marshalTSOAllocationFloor(1)))
 }
 
 func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
@@ -73,8 +98,10 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 
 	const ceilingMs = int64(1_700_000_654_321)
 	sourceHLC := NewHLC()
-	sourceHLC.SetPhysicalCeiling(ceilingMs)
 	source := NewTSOStateMachine(sourceHLC)
+	require.Nil(t, source.Apply(marshalHLCLeaseRenew(ceilingMs)))
+	floor := tsoLeaseAllocationFloor(ceilingMs)
+	require.Nil(t, source.Apply(marshalTSOAllocationFloor(floor)))
 
 	snap, err := source.Snapshot()
 	require.NoError(t, err)
@@ -83,21 +110,60 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	n, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
-	require.EqualValues(t, hlcLeasePayloadLen, n)
-	require.Len(t, buf.Bytes(), hlcLeasePayloadLen)
+	require.EqualValues(t, tsoSnapshotV2Len, n)
+	require.Len(t, buf.Bytes(), tsoSnapshotV2Len)
 
 	targetHLC := NewHLC()
 	target := NewTSOStateMachine(targetHLC)
 	require.NoError(t, target.Restore(bytes.NewReader(buf.Bytes())))
 	require.Equal(t, ceilingMs, targetHLC.PhysicalCeiling())
-	require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), targetHLC.Current())
+	require.Equal(t, floor, targetHLC.Current())
+}
+
+func TestTSOStateMachineSnapshotUsesTSOOwnedCeiling(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tsoCeiling       = int64(1_000)
+		unrelatedCeiling = int64(2_000)
+	)
+	sourceHLC := NewHLC()
+	source := NewTSOStateMachine(sourceHLC)
+	require.Nil(t, source.Apply(marshalHLCLeaseRenew(tsoCeiling)))
+	sourceHLC.SetPhysicalCeiling(unrelatedCeiling)
+
+	snap, err := source.Snapshot()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
+
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	targetHLC := NewHLC()
+	require.NoError(t, NewTSOStateMachine(targetHLC).Restore(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, tsoCeiling, targetHLC.PhysicalCeiling())
+	require.Zero(t, targetHLC.Current())
 }
 
 func TestTSOStateMachineRestoreRejectsTruncatedSnapshot(t *testing.T) {
 	t.Parallel()
 
 	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader([]byte{0x01, 0x02}))
-	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Error(t, err)
+}
+
+func TestTSOStateMachineRestoreLegacySnapshotPreservesCeilingWithoutFloor(t *testing.T) {
+	t.Parallel()
+
+	const ceilingMs = int64(1_700_000_654_321)
+	var buf [hlcLeasePayloadLen]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(ceilingMs))
+
+	hlc := NewHLC()
+	require.NoError(t, NewTSOStateMachine(hlc).Restore(bytes.NewReader(buf[:])))
+	require.Equal(t, ceilingMs, hlc.PhysicalCeiling())
+	require.Zero(t, hlc.Current())
 }
 
 func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
@@ -108,12 +174,14 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 		lowerCeiling  = int64(1_000)
 	)
 	hlc := NewHLC()
-	applyTSOLeaseToHLC(hlc, higherCeiling)
+	fsm := NewTSOStateMachine(hlc)
+	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(higherCeiling)))
+	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(tsoLeaseAllocationFloor(higherCeiling))))
 
-	var buf [hlcLeasePayloadLen]byte
+	var buf [tsoSnapshotV2Len]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(lowerCeiling))
 
-	require.NoError(t, NewTSOStateMachine(hlc).Restore(bytes.NewReader(buf[:])))
+	require.NoError(t, fsm.Restore(bytes.NewReader(buf[:])))
 	require.Equal(t, higherCeiling, hlc.PhysicalCeiling())
 	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), hlc.Current())
 }
@@ -123,7 +191,9 @@ func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {
 
 	fsm := NewTSOStateMachine(NewHLC())
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalHLCLeaseRenew(1_700_000_123_456)))
+	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOAllocationFloor(1)))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeHLCLease}))
+	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeTSOAllocationFloor}))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeSingle}))
 }
 
