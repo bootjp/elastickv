@@ -1181,15 +1181,13 @@ func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, seen map[strin
 	if _, ok := seen[string(userKey)]; ok {
 		return nil, s.skipToNextUserKey(iter, userKey), nil
 	}
+	seen[string(userKey)] = struct{}{}
 	if !s.seekToVisibleVersion(iter, userKey, version, ts) {
 		return nil, true, nil
 	}
 	kv, err := s.processFoundValue(iter, userKey, ts)
 	if err != nil {
 		return nil, false, err
-	}
-	if kv != nil {
-		seen[string(kv.Key)] = struct{}{}
 	}
 	return kv, s.skipToNextUserKey(iter, userKey), nil
 }

@@ -137,6 +137,47 @@ func TestPebbleStoreScanAtDoesNotRepeatPrefixKeyWithOlderVersion(t *testing.T) {
 	require.Equal(t, []byte("new-a"), kvs[0].Value)
 }
 
+func TestPebbleStoreScanAtDoesNotReturnOlderPrefixAfterInvisibleLatest(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		hide func(*testing.T, *pebbleStore)
+	}{
+		{
+			name: "tombstone",
+			hide: func(t *testing.T, st *pebbleStore) {
+				t.Helper()
+				require.NoError(t, st.DeleteAt(ctx, []byte("a"), 60))
+			},
+		},
+		{
+			name: "expired",
+			hide: func(t *testing.T, st *pebbleStore) {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("expired-a"), 60, 70))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := NewPebbleStore(t.TempDir())
+			require.NoError(t, err)
+			defer st.Close()
+
+			require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("old-a"), 1, 0))
+			require.NoError(t, st.PutAt(ctx, []byte("a\x80"), []byte("extension"), 65, 0))
+			ps, ok := st.(*pebbleStore)
+			require.True(t, ok)
+			tc.hide(t, ps)
+
+			kvs, err := st.ScanAt(ctx, []byte("a"), []byte("b"), 10, 80)
+			require.NoError(t, err)
+			require.Equal(t, [][]byte{[]byte("a\x80")}, keysFromStoreKVs(kvs))
+		})
+	}
+}
+
 func TestPebbleStoreScanKeysAtPreservesPrefixExtensionKeys(t *testing.T) {
 	t.Parallel()
 
