@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -476,7 +477,7 @@ func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordina
 // groups. When unset, the coordinator preserves the legacy behaviour and uses
 // every group it owns.
 func (c *ShardedCoordinator) WithAllShardGroups(groupIDs ...uint64) *ShardedCoordinator {
-	c.allShardGroupIDs = append([]uint64(nil), groupIDs...)
+	c.allShardGroupIDs = slices.Clone(groupIDs)
 	slices.Sort(c.allShardGroupIDs)
 	c.allShardGroupIDs = slices.Compact(c.allShardGroupIDs)
 	c.allShardGroupsConfigured = true
@@ -1792,11 +1793,7 @@ func (c *ShardedCoordinator) configuredAllShardGroups() ([]*ShardGroup, error) {
 }
 
 func (c *ShardedCoordinator) ownedAllShardGroups() ([]*ShardGroup, error) {
-	gids := make([]uint64, 0, len(c.groups))
-	for gid := range c.groups {
-		gids = append(gids, gid)
-	}
-	slices.Sort(gids)
+	gids := slices.Sorted(maps.Keys(c.groups))
 	out := make([]*ShardGroup, 0, len(gids))
 	for _, gid := range gids {
 		g := c.groups[gid]

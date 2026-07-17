@@ -308,25 +308,37 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
 	t.Parallel()
 
-	_, err := buildSQSFifoPartitionMap(
-		[]groupSpec{{id: 0}, {id: 1}},
-		"orders.fifo:2=1,0",
-	)
-	require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
-	require.Contains(t, err.Error(), "reserved for TSO")
-	require.Contains(t, err.Error(), "partition 1")
-}
-
-func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroupDeterministically(t *testing.T) {
-	t.Parallel()
-
-	_, err := buildSQSFifoPartitionMap(
-		[]groupSpec{{id: 0}, {id: 1}},
-		"zeta.fifo:1=0;alpha.fifo:1=0",
-	)
-	require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
-	require.Contains(t, err.Error(), "alpha.fifo")
-	require.NotContains(t, err.Error(), "zeta.fifo")
+	cases := []struct {
+		name            string
+		spec            string
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:         "partition pointer",
+			spec:         "orders.fifo:2=1,0",
+			wantContains: []string{"reserved for TSO", "partition 1"},
+		},
+		{
+			name:            "deterministic queue order",
+			spec:            "zeta.fifo:1=0;alpha.fifo:1=0",
+			wantContains:    []string{"alpha.fifo"},
+			wantNotContains: []string{"zeta.fifo"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := buildSQSFifoPartitionMap([]groupSpec{{id: 0}, {id: 1}}, tc.spec)
+			require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+			for _, want := range tc.wantContains {
+				require.Contains(t, err.Error(), want)
+			}
+			for _, notWant := range tc.wantNotContains {
+				require.NotContains(t, err.Error(), notWant)
+			}
+		})
+	}
 }
 
 func TestParseRaftBootstrapMembers(t *testing.T) {
