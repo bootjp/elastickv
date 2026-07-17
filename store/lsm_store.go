@@ -335,9 +335,10 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		s.cache = nil
 	}
 
-	// Initialize lastCommitTS by scanning specifically or persisting it separately.
-	// For simplicity, we scan on startup to find the max TS.
-	// In a production system, this should be stored in a separate meta key.
+	// Initialize lastCommitTS from the persisted meta key, then validate it
+	// against data versions. Older stores and crash windows can have missing or
+	// stale metadata while MVCC versions remain present; using the lower meta
+	// watermark for OCC would skip conflict scans incorrectly.
 	maxTS, err := s.findMaxCommitTS()
 	if err != nil {
 		cleanupOnInitFail()
@@ -595,7 +596,48 @@ func isPebbleMetaKey(rawKey []byte) bool {
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
-	return readPebbleUint64(s.db, metaLastCommitTSBytes)
+	metaTS, err := readPebbleUint64(s.db, metaLastCommitTSBytes)
+	if err != nil {
+		return 0, err
+	}
+	dataTS, err := s.findMaxDataCommitTS()
+	if err != nil {
+		return 0, err
+	}
+	if dataTS <= metaTS {
+		return metaTS, nil
+	}
+	if err := writePebbleUint64(s.db, metaLastCommitTSBytes, dataTS, pebble.Sync); err != nil {
+		return 0, err
+	}
+	return dataTS, nil
+}
+
+func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	var maxTS uint64
+	for iter.First(); iter.Valid(); iter.Next() {
+		rawKey := iter.Key()
+		if isPebbleMetaKey(rawKey) {
+			continue
+		}
+		userKey, ts := decodeKeyView(rawKey)
+		if userKey == nil {
+			continue
+		}
+		if ts > maxTS {
+			maxTS = ts
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return maxTS, nil
 }
 
 func (s *pebbleStore) findMinRetainedTS() (uint64, error) {
@@ -981,6 +1023,9 @@ func (s *pebbleStore) getAtBatchWithIter(ctx context.Context, iter *pebble.Itera
 		seekKey = appendEncodedKey(seekKey, key, ts)
 		upperBound = appendKeyUpperBound(upperBound, key)
 		if iter.SeekGEWithLimit(seekKey, upperBound) != pebble.IterValid {
+			if err := iter.Error(); err != nil {
+				return nil, errors.WithStack(err)
+			}
 			continue
 		}
 		value, err := s.readVisibleVersion(iter, key, ts)
@@ -991,6 +1036,9 @@ func (s *pebbleStore) getAtBatchWithIter(ctx context.Context, iter *pebble.Itera
 			return nil, err
 		}
 		values[string(key)] = bytes.Clone(value)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, errors.WithStack(err)
 	}
 	return values, nil
 }
@@ -1847,7 +1895,14 @@ func (s *pebbleStore) writeRaftApplyMetaLocked(newLastTS uint64, writeAppliedInd
 			return err
 		}
 	}
-	return errors.WithStack(b.Commit(writeOpts))
+	return errors.WithStack(b.Commit(raftApplyMetaWriteOpts(writeAppliedIndex, writeOpts)))
+}
+
+func raftApplyMetaWriteOpts(writeAppliedIndex bool, writeOpts *pebble.WriteOptions) *pebble.WriteOptions {
+	if writeAppliedIndex {
+		return pebble.Sync
+	}
+	return writeOpts
 }
 
 func (s *pebbleStore) markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex uint64, writeOpts *pebble.WriteOptions) error {

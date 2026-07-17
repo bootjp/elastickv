@@ -146,6 +146,36 @@ func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
 	require.Equal(t, uint64(42), reopened.LastCommitTS())
 }
 
+func TestPebbleStore_RebuildsStaleLastCommitTSOnOpen(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-last-ts-rebuild-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("v50"), 50, 0))
+	require.Equal(t, uint64(50), ps.LastCommitTS())
+	require.NoError(t, writePebbleUint64(ps.db, metaLastCommitTSBytes, 5, pebble.Sync))
+	require.NoError(t, ps.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	require.Equal(t, uint64(50), reopened.LastCommitTS())
+
+	err = reopened.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k"), Value: []byte("new")},
+	}, nil, 10, 60)
+	require.ErrorIs(t, err, ErrWriteConflict)
+
+	val, err := reopened.GetAt(ctx, []byte("k"), 55)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+}
+
 func TestPebbleStore_GetAtBatch(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-get-at-batch-test")
 	require.NoError(t, err)

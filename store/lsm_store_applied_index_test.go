@@ -223,6 +223,11 @@ func TestSetDurableAppliedIndex_UsesPebbleSync(t *testing.T) {
 	require.Equal(t, idx, got)
 }
 
+func TestRaftApplyMetaWriteOptsSyncsAppliedIndex(t *testing.T) {
+	require.Same(t, pebble.Sync, raftApplyMetaWriteOpts(true, pebble.NoSync))
+	require.Same(t, pebble.NoSync, raftApplyMetaWriteOpts(false, pebble.NoSync))
+}
+
 // TestSetDurableAppliedIndex_Monotonic guards the round-2 fix for
 // codex P2: a background snapshot persist (which is what
 // SetDurableAppliedIndex services) MUST NOT rewind metaAppliedIndex
