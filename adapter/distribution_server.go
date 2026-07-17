@@ -335,7 +335,11 @@ func splitPromotionAttemptContext(ctx context.Context) (context.Context, context
 }
 
 func splitJobRunnerContextDone(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	code := status.Code(errors.Cause(err))
+	return code == codes.Canceled || code == codes.DeadlineExceeded
 }
 
 // UpdateRoute allows updating route information.

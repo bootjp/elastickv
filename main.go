@@ -735,11 +735,21 @@ func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration
 	return peers
 }
 
-func newSplitMigrationCapabilityGate(source splitMigrationCapabilityPeerSource, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
+func newSplitMigrationCapabilityGate(
+	source splitMigrationCapabilityPeerSource,
+	timeout time.Duration,
+	probe splitMigrationCapabilityProbe,
+	localGate adapter.SplitMigrationCapabilityGate,
+) adapter.SplitMigrationCapabilityGate {
 	if probe == nil {
 		probe = probeSplitMigrationCapabilityPeer
 	}
 	return func(ctx context.Context) error {
+		if localGate != nil {
+			if err := localGate(ctx); err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration local readiness is not available: %v", err)
+			}
+		}
 		if source == nil {
 			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
 		}
@@ -1628,6 +1638,7 @@ func prepareDistributionRuntimeServer(
 			splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
 			splitMigrationCapabilityProbeTimeout,
 			nil,
+			splitMigrationLocalReadinessGate,
 		)),
 		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
 			splitPromotionTargetLeaderResolver(in.shardGroups),

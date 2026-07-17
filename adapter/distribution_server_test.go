@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	crdberrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -946,6 +947,16 @@ func TestDistributionServerRunSplitJobRunnerOnce_SkipsFollower(t *testing.T) {
 	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
 	require.Zero(t, client.calls)
 	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestSplitJobRunnerContextDoneRecognizesWrappedGRPCStatus(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, splitJobRunnerContextDone(context.Canceled))
+	require.True(t, splitJobRunnerContextDone(context.DeadlineExceeded))
+	require.True(t, splitJobRunnerContextDone(crdberrors.WithStack(status.Error(codes.Canceled, "stopping"))))
+	require.True(t, splitJobRunnerContextDone(crdberrors.WithStack(status.Error(codes.DeadlineExceeded, "stopping"))))
+	require.False(t, splitJobRunnerContextDone(crdberrors.WithStack(status.Error(codes.Unavailable, "not leader"))))
 }
 
 func TestPromoteSplitJobTargetRejectsNoCursorProgress(t *testing.T) {
