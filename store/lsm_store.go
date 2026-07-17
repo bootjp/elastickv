@@ -1174,32 +1174,81 @@ func (s *pebbleStore) collectScanKeys(ctx context.Context, iter *pebble.Iterator
 		if err != nil {
 			return nil, err
 		}
-		if forwardScanDone(userKey, end, ok) {
-			break
-		}
-
-		if !s.seekToVisibleVersion(iter, userKey, version, ts) {
-			continue
-		}
-
-		visible, err := s.foundValueVisible(iter, ts)
+		var done bool
+		result, done, err = s.appendEndPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts, ok)
 		if err != nil {
 			return nil, err
 		}
-		if visible {
-			result = appendScanKeyResult(result, seen, userKey, limit)
-			result, err = s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
-			if err != nil {
-				return nil, err
-			}
+		if done {
+			break
 		}
 
-		if !s.skipToNextUserKey(iter, userKey) {
+		var advance bool
+		result, advance, err = s.collectVisibleScanKey(ctx, iter, result, seen, userKey, version, start, end, limit, ts)
+		if err != nil {
+			return nil, err
+		}
+		if !advance {
 			break
 		}
 	}
 
 	return result, nil
+}
+
+func (s *pebbleStore) appendEndPrefixScanKeys(
+	ctx context.Context,
+	result [][]byte,
+	seen map[string]struct{},
+	userKey []byte,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	ok bool,
+) ([][]byte, bool, error) {
+	if !ok {
+		return result, true, nil
+	}
+	if !pastScanEnd(userKey, end) {
+		return result, false, nil
+	}
+	result, err := s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
+	if err != nil {
+		return nil, true, err
+	}
+	return result, true, nil
+}
+
+func (s *pebbleStore) collectVisibleScanKey(
+	ctx context.Context,
+	iter *pebble.Iterator,
+	result [][]byte,
+	seen map[string]struct{},
+	userKey []byte,
+	version uint64,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, bool, error) {
+	if !s.seekToVisibleVersion(iter, userKey, version, ts) {
+		return result, true, nil
+	}
+
+	visible, err := s.foundValueVisible(iter, ts)
+	if err != nil {
+		return nil, false, err
+	}
+	if visible {
+		result = appendScanKeyResult(result, seen, userKey, limit)
+		result, err = s.appendVisibleProperPrefixScanKeys(ctx, result, seen, userKey, start, end, limit, ts)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	return result, s.skipToNextUserKey(iter, userKey), nil
 }
 
 func appendScanKeyResult(result [][]byte, seen map[string]struct{}, key []byte, limit int) [][]byte {
