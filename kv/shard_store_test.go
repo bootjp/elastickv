@@ -347,6 +347,7 @@ func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
 	defer fake.mu.Unlock()
 	require.Equal(t, 1, fake.scanCalls)
 	require.Equal(t, uint64(42), fake.lastScanGroupID)
+	require.True(t, fake.lastScanKeysOnly)
 }
 
 func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {
@@ -582,6 +583,44 @@ func TestBackupScannerPebblePagingDoesNotRepeatLastKey(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, []byte("b"), kvp.Key)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerPagesPebbleKeysInLogicalOrder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	pebbleStore, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer pebbleStore.Close()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: pebbleStore},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("a\x80"), []byte("vax"), 20, 0))
+
+	sc := st.NewBackupScanner(nil, nil, 20, 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("va"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a\x80"), kvp.Key)
+	require.Equal(t, []byte("vax"), kvp.Value)
 
 	kvp, ok, err = sc.Next(ctx)
 	require.NoError(t, err)
@@ -853,4 +892,17 @@ func TestScanLockBoundsForKVs_EmptyUsesOriginalRange(t *testing.T) {
 	lockStart, lockEnd := scanLockBoundsForKVs(nil, []byte("a"), []byte("z"), 10)
 	require.Equal(t, []byte("a"), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_FullInternalPageUsesRawPageBound(t *testing.T) {
+	t.Parallel()
+
+	internalKey := txnCommitKey([]byte("primary"), 10)
+	kvs := []*store.KVPair{
+		{Key: internalKey, Value: []byte("commit")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte(""), nil, 1)
+	require.Equal(t, []byte(""), lockStart)
+	require.Equal(t, nextScanCursor(internalKey), lockEnd)
 }

@@ -158,6 +158,26 @@ func TestPebbleStoreScanKeysAtSortsPrefixBeforeLimit(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("\x00")}, keys)
 }
 
+func TestPebbleStoreScanKeysAtProbesExactPrefixPastBinaryExtension(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a\x80"), []byte("vax"), 20, 0))
+
+	keys, err := st.ScanKeysAt(ctx, nil, nil, 1, 20)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a")}, keys)
+
+	keys, err = st.ScanKeysAt(ctx, cursorAfterTestKey([]byte("a")), nil, 1, 20)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a\x80")}, keys)
+}
+
 func cursorAfterTestKey(key []byte) []byte {
 	cursor := make([]byte, len(key)+1)
 	copy(cursor, key)

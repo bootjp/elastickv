@@ -6,12 +6,13 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 )
 
 const defaultBackupScanPageSize = 1024
 
-// BackupScanner pages through ShardStore.ScanAt without holding store locks
-// across pages.
+// BackupScanner pages through ShardStore.ScanKeysAt without holding store locks
+// across pages, then materializes each key at the pinned read timestamp.
 type BackupScanner interface {
 	Next(ctx context.Context) (*store.KVPair, bool, error)
 	Close() error
@@ -89,21 +90,31 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		s.index = 0
 		return nil
 	}
-	page, err := s.store.scanRoutesAtSorted(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
+	keys, err := s.store.scanKeyRoutesAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
 	if err != nil {
 		return err
 	}
-	s.page = page
+	s.page = s.page[:0]
+	for _, key := range keys {
+		val, err := s.store.GetAt(ctx, key, s.ts)
+		if errors.Is(err, store.ErrKeyNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		s.page = append(s.page, &store.KVPair{Key: bytes.Clone(key), Value: bytes.Clone(val)})
+	}
 	s.index = 0
-	if len(page) == 0 {
+	if len(keys) == 0 {
 		s.exhausted = true
 		return nil
 	}
-	last := page[len(page)-1]
+	last := lastScanKey(keys)
 	if last == nil {
 		s.exhausted = true
 		return nil
 	}
-	s.cursor = nextScanCursor(last.Key)
+	s.cursor = nextScanCursor(last)
 	return nil
 }

@@ -1250,14 +1250,49 @@ func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
 }
 
 func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
-	_, err := s.getAt(ctx, key, ts)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: encodeKey(key, math.MaxUint64),
+		UpperBound: keyUpperBound(key),
+	})
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	for iter.SeekGE(encodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return false, errors.WithStack(err)
+		}
+		visible, stop, err := s.visibleExactIteratorEntry(iter, key, ts)
+		if err != nil {
+			return false, err
+		}
+		if stop {
+			return visible, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byte, ts uint64) (bool, bool, error) {
+	userKey, version := decodeKeyView(iter.Key())
+	if userKey == nil {
+		return false, false, nil
+	}
+	if len(key) > 0 && !bytes.HasPrefix(userKey, key) {
+		return false, true, nil
+	}
+	if !bytes.Equal(userKey, key) || version > ts {
+		return false, false, nil
+	}
+	_, err := s.readVisibleVersion(iter, key, ts)
 	if errors.Is(err, ErrKeyNotFound) {
-		return false, nil
+		return false, true, nil
 	}
 	if err != nil {
-		return false, err
+		return false, true, err
 	}
-	return true, nil
+	return true, true, nil
 }
 
 func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
