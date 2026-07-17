@@ -206,7 +206,11 @@ func Evaluate(cfg Config, state *DetectorState, in Input) Result {
 	state.gc(live)
 
 	latestHot := map[uint64]candidate{}
-	for _, window := range in.Windows {
+	windows := append([]ColumnWindow(nil), in.Windows...)
+	sort.SliceStable(windows, func(i, j int) bool {
+		return windows[i].Column.At.Before(windows[j].Column.At)
+	})
+	for _, window := range windows {
 		processWindow(cfg, state, active, window, in.Now, latestHot, &result)
 	}
 	selectDecisions(cfg, state, live, latestHot, &result)
@@ -244,6 +248,10 @@ func processWindow(
 ) {
 	if window.Duration <= 0 {
 		result.Events = append(result.Events, Event{Reason: SkipReasonInvalidWindow, At: window.Column.At})
+		for _, route := range active {
+			state.ResetConfidence(route.RouteID)
+			delete(latestHot, route.RouteID)
+		}
 		return
 	}
 	aggregated := aggregateColumn(window.Column)
@@ -267,7 +275,7 @@ func processRouteWindow(
 	result *Result,
 ) {
 	status := state.routes[route.RouteID]
-	if now.Before(status.CooldownUntil) {
+	if now.Before(status.CooldownUntil) || window.Column.At.Before(status.CooldownUntil) {
 		status.ConsecutiveOver = 0
 		state.routes[route.RouteID] = status
 		delete(latestHot, route.RouteID)

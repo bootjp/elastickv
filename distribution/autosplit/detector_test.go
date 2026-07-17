@@ -80,6 +80,55 @@ func TestInvalidWindowIsSkipped(t *testing.T) {
 	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
 }
 
+func TestInvalidWindowResetsActiveRouteConfidence(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(180, 0)
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 3
+
+	result := Evaluate(cfg, NewDetectorState(), Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at),
+			hotWindow(at.Add(time.Minute)),
+			testWindow(at.Add(2*time.Minute), 0,
+				testRow(1, 1, 0, 2, "a", "m", 100, 0),
+				testRow(1, 1, 1, 2, "m", "z", 100, 0),
+			),
+			hotWindow(at.Add(3 * time.Minute)),
+		},
+		Now: at.Add(3 * time.Minute),
+	})
+
+	require.Empty(t, result.Decisions)
+	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
+}
+
+func TestWindowsAreEvaluatedChronologicallyWithoutMutatingInput(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(190, 0)
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+	windows := []ColumnWindow{
+		hotWindow(at.Add(time.Minute)),
+		hotWindow(at.Add(2 * time.Minute)),
+		coldWindow(at),
+	}
+
+	result := Evaluate(cfg, NewDetectorState(), Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: windows,
+		Now:     at.Add(2 * time.Minute),
+	})
+
+	require.Len(t, result.Decisions, 1)
+	require.Equal(t, at.Add(time.Minute), windows[0].Column.At)
+	require.Equal(t, at.Add(2*time.Minute), windows[1].Column.At)
+	require.Equal(t, at, windows[2].Column.At)
+}
+
 func TestNonActiveRouteResetsConfidence(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(200, 0)
@@ -186,6 +235,45 @@ func TestCooldownBlocksPromotion(t *testing.T) {
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 0, state.RouteStatus(1).ConsecutiveOver)
 	requireEvent(t, result.Events, 1, SkipReasonCooldown)
+}
+
+func TestCooldownDropsBufferedWindowsFromCooldownPeriod(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(450, 0)
+	state := NewDetectorState()
+	state.SetCooldown(1, at.Add(3*time.Minute))
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+
+	result := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(time.Minute)),
+			hotWindow(at.Add(2 * time.Minute)),
+			hotWindow(at.Add(4 * time.Minute)),
+		},
+		Now: at.Add(4 * time.Minute),
+	})
+
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	requireEvent(t, result.Events, 1, SkipReasonCooldown)
+}
+
+func TestStateGCRemovesRetiredRoutes(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(475, 0)
+	state := NewDetectorState()
+	state.SetCooldown(2, at.Add(time.Hour))
+
+	Evaluate(testConfig(), state, Input{
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+		Windows: nil,
+		Now:     at,
+	})
+
+	require.True(t, state.RouteStatus(2).CooldownUntil.IsZero())
 }
 
 func TestRouteCapUsesCycleLocalReservation(t *testing.T) {
