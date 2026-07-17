@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -116,6 +117,24 @@ func TestPebbleStoreScanAtPreservesPrefixExtensionKeys(t *testing.T) {
 	kvs, err := st.ScanAt(ctx, []byte("a"), []byte("c"), 3, ^uint64(0))
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a"), []byte("a\x00"), []byte("b")}, keysFromStoreKVs(kvs))
+}
+
+func TestPebbleStoreScanAtDoesNotRepeatPrefixKeyWithOlderVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("new-a"), math.MaxUint64-1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a\x80"), []byte("extension"), 50, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("old-a"), 1, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte("a"), []byte("b"), 10, math.MaxUint64)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("a\x80")}, keysFromStoreKVs(kvs))
+	require.Equal(t, []byte("new-a"), kvs[0].Value)
 }
 
 func TestPebbleStoreScanKeysAtPreservesPrefixExtensionKeys(t *testing.T) {

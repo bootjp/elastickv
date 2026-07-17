@@ -491,6 +491,19 @@ func decodeValue(data []byte) (storedValue, error) {
 	}, nil
 }
 
+func decodeValueView(data []byte) (storedValue, error) {
+	tombstone, expireAt, encState, err := decodeValueHeader(data)
+	if err != nil {
+		return storedValue{}, err
+	}
+	return storedValue{
+		Value:     data[valueHeaderSize:],
+		Tombstone: tombstone,
+		EncState:  encState,
+		ExpireAt:  expireAt,
+	}, nil
+}
+
 func decodeValueHeader(data []byte) (bool, uint64, byte, error) {
 	if len(data) < valueHeaderSize {
 		return false, 0, 0, errors.New("invalid value length")
@@ -988,7 +1001,7 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 
 func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool, error) {
 	valBytes := iter.Value()
-	sv, err := decodeValue(valBytes)
+	sv, err := decodeValueView(valBytes)
 	if err != nil {
 		return false, err
 	}
@@ -1129,6 +1142,7 @@ func (s *pebbleStore) collectScanResults(ctx context.Context, iter *pebble.Itera
 
 func (s *pebbleStore) collectScanResultsWithPhysicalLimit(ctx context.Context, iter *pebble.Iterator, start, end []byte, limit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
 	result := make([]*KVPair, 0, boundedScanResultCapacity(limit))
+	seen := make(map[string]struct{}, boundedScanResultCapacity(limit))
 	visited := 0
 
 	for iter.SeekGE(encodeKey(start, math.MaxUint64)); iter.Valid() && len(result) < limit; {
@@ -1144,7 +1158,7 @@ func (s *pebbleStore) collectScanResultsWithPhysicalLimit(ctx context.Context, i
 		}
 		visited++
 
-		kv, advance, err := s.collectForwardScanKV(iter, userKey, version, ts)
+		kv, advance, err := s.collectForwardScanKV(iter, seen, userKey, version, ts)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1163,13 +1177,19 @@ func forwardScanDone(userKey, end []byte, ok bool) bool {
 	return !ok || pastScanEnd(userKey, end)
 }
 
-func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, userKey []byte, version uint64, ts uint64) (*KVPair, bool, error) {
+func (s *pebbleStore) collectForwardScanKV(iter *pebble.Iterator, seen map[string]struct{}, userKey []byte, version uint64, ts uint64) (*KVPair, bool, error) {
+	if _, ok := seen[string(userKey)]; ok {
+		return nil, s.skipToNextUserKey(iter, userKey), nil
+	}
 	if !s.seekToVisibleVersion(iter, userKey, version, ts) {
 		return nil, true, nil
 	}
 	kv, err := s.processFoundValue(iter, userKey, ts)
 	if err != nil {
 		return nil, false, err
+	}
+	if kv != nil {
+		seen[string(kv.Key)] = struct{}{}
 	}
 	return kv, s.skipToNextUserKey(iter, userKey), nil
 }
