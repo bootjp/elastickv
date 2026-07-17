@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -293,6 +294,47 @@ func TestFSMRejectsS3BucketAuxiliaryPointWriteBelowRouteFloor(t *testing.T) {
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: s3keys.BucketMetaKey(bucket), Value: []byte("v")}},
 	}, 100)
 	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+}
+
+func TestFSMIgnoresRawRouteFloorForS3BucketAuxiliaryPointWrite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	rawStart := []byte(s3keys.BucketMetaPrefix)
+	rawEnd := prefixScanEnd(rawStart)
+	require.Less(t, bytes.Compare(auxEnd, rawStart), 0)
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   auxStart,
+			End:     auxEnd,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+		{
+			RouteID:             2,
+			Start:               rawStart,
+			End:                 rawEnd,
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
+	}, 100)
+	require.NoError(t, err)
+	got, err := fsm.store.GetAt(ctx, key, 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
 }
 
 func TestFSMRejectsS3BucketAuxiliaryPointWriteWithoutTargetReadinessProof(t *testing.T) {

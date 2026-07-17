@@ -828,13 +828,16 @@ func (f *kvFSM) verifyRouteWriteFloorForKey(key []byte, commitTS uint64) error {
 	if !ok {
 		return nil
 	}
+	if err := f.verifyS3BucketAuxiliaryRouteWriteFloor(snap, key, commitTS); err != nil {
+		return err
+	}
+	if _, _, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		return nil
+	}
 	rkey := routeKey(key)
 	floor, ok := snap.WriteFloorForKey(rkey)
 	if ok && commitTS != 0 && commitTS <= floor {
 		return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d for key %q routeKey %q", commitTS, floor, key, rkey)
-	}
-	if err := f.verifyS3BucketAuxiliaryRouteWriteFloor(snap, key, commitTS); err != nil {
-		return err
 	}
 	return nil
 }

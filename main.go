@@ -1623,7 +1623,6 @@ func prepareDistributionRuntimeServer(
 			splitMigrationCapabilityProbeTimeout,
 			nil,
 		)),
-		adapter.WithSplitJobRunnerReady(),
 	)
 	preparedServer, err := prepareRuntimeServerRunner(waitRotateOnStartup, in)
 	if err != nil {
