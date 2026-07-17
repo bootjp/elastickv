@@ -308,7 +308,11 @@ func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]d
 	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
 		return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), true
 	}
-	routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, prefixScanEnd(fskeys.ChunkAllPrefix()))
+	chunkStart, chunkEnd, ok := filesystemChunkScanOverlap(start, end)
+	if !ok {
+		return nil, false
+	}
+	routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(chunkStart, chunkEnd)
 	if !ok {
 		return nil, false
 	}
@@ -318,6 +322,29 @@ func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]d
 	routes := s.engine.GetIntersectingRoutes(start, end)
 	routes = append(routes, s.engine.GetIntersectingRoutes(routeStart, routeEnd)...)
 	return dedupeRoutesByGroup(routes), true
+}
+
+func filesystemChunkScanOverlap(start []byte, end []byte) ([]byte, []byte, bool) {
+	chunkStart := fskeys.ChunkAllPrefix()
+	chunkEnd := prefixScanEnd(chunkStart)
+	if len(end) > 0 && bytes.Compare(end, chunkStart) <= 0 {
+		return nil, nil, false
+	}
+	if len(start) > 0 && bytes.Compare(start, chunkEnd) >= 0 {
+		return nil, nil, false
+	}
+	overlapStart := chunkStart
+	if len(start) > 0 && bytes.Compare(start, chunkStart) > 0 {
+		overlapStart = start
+	}
+	overlapEnd := chunkEnd
+	if len(end) > 0 && bytes.Compare(end, chunkEnd) < 0 {
+		overlapEnd = end
+	}
+	if bytes.Compare(overlapStart, overlapEnd) >= 0 {
+		return nil, nil, false
+	}
+	return overlapStart, overlapEnd, true
 }
 
 func dedupeRoutesByGroup(routes []distribution.Route) []distribution.Route {
