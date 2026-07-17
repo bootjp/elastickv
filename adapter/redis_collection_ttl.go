@@ -163,14 +163,33 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(ctx context.Context, k
 		return nil, false, nil
 	}
 	expired, err := r.hasExpired(ctx, key, readTS, true)
-	if err != nil || !expired {
+	if err != nil {
 		return nil, false, err
 	}
+	if expired {
+		return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
+	}
+	hllExpired, err := r.hllExpiredAt(ctx, key, readTS)
+	if err != nil || !hllExpired {
+		return nil, false, err
+	}
+	return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
+}
+
+func (r *RedisServer) deleteExpiredLogicalKeyForRecreate(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
 	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 	if err != nil {
 		return nil, false, err
 	}
 	return append(elems, redisTxnWideCollectionFenceElems(key)...), true, nil
+}
+
+func (r *RedisServer) hllExpiredAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	ttl, found, err := r.hllTTLAt(ctx, key, readTS)
+	if err != nil || !found || ttl == nil {
+		return false, err
+	}
+	return !ttl.After(time.Now()), nil
 }
 
 func (r *RedisServer) collectionMetaExpireElems(
@@ -365,6 +384,9 @@ func (r *RedisServer) simpleMetaExpireElems(
 		return nil, false, err
 	}
 	if newLen <= 0 {
+		if len(deltas) > 0 {
+			return nil, false, nil
+		}
 		elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: metaKey, Value: marshalBase(0, expireAtMs)}}
 		return appendDeltaDeletes(elems, deltas), true, nil
 	}

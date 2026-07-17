@@ -292,7 +292,7 @@ func (c *DeltaCompactor) migrateTTLIndexedCollectionElems(ctx context.Context, p
 		return nil, nil
 	}
 	if redisTTLMillisExpired(ttlMs) {
-		return c.expiredTTLIndexedCollectionElems(ctx, server, userKey, readTS)
+		return c.expiredTTLIndexedCollectionElems(ctx, server, userKey, typ, readTS)
 	}
 	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
 	if err != nil || baseExists {
@@ -309,6 +309,7 @@ func (c *DeltaCompactor) expiredTTLIndexedCollectionElems(
 	ctx context.Context,
 	server *RedisServer,
 	userKey []byte,
+	typ redisValueType,
 	readTS uint64,
 ) ([]*kv.Elem[kv.OP], error) {
 	inlineTTL, inlineFound, err := server.collectionTTLAt(ctx, userKey, readTS)
@@ -321,8 +322,57 @@ func (c *DeltaCompactor) expiredTTLIndexedCollectionElems(
 			return appendTTLIndexSyncElem(ctx, c.st, nil, userKey, inlineMs, readTS)
 		}
 	}
+	staleDeltaOnly, err := c.expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, server, userKey, typ, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if staleDeltaOnly {
+		return appendTTLIndexSyncElem(ctx, c.st, nil, userKey, 0, readTS)
+	}
 	elems, _, err := server.deleteLogicalKeyElems(ctx, userKey, readTS)
 	return elems, err
+}
+
+func (c *DeltaCompactor) expiredTTLIndexPrecedesDeltaOnlyCollection(
+	ctx context.Context,
+	server *RedisServer,
+	userKey []byte,
+	typ redisValueType,
+	readTS uint64,
+) (bool, error) {
+	baseExists, err := c.collectionBaseMetaExistsAt(ctx, userKey, typ, readTS)
+	if err != nil || baseExists {
+		return false, err
+	}
+	prefix, ok := collectionMetaDeltaScanPrefix(userKey, typ)
+	if !ok {
+		return false, nil
+	}
+	_, ttlCommitTS, found, err := legacyTTLMillisWithCommitTSAt(ctx, c.st, userKey, readTS)
+	if err != nil || !found {
+		return false, err
+	}
+	deltas, err := server.scanDeltaKVs(ctx, prefix, readTS)
+	if err != nil {
+		return false, err
+	}
+	return legacyTTLPrecedesAllMetaDeltas(ttlCommitTS, deltas, prefix), nil
+}
+
+func collectionMetaDeltaScanPrefix(userKey []byte, typ redisValueType) ([]byte, bool) {
+	switch typ {
+	case redisTypeList:
+		return store.ListMetaDeltaScanPrefix(userKey), true
+	case redisTypeHash:
+		return store.HashMetaDeltaScanPrefix(userKey), true
+	case redisTypeSet:
+		return store.SetMetaDeltaScanPrefix(userKey), true
+	case redisTypeZSet:
+		return store.ZSetMetaDeltaScanPrefix(userKey), true
+	case redisTypeNone, redisTypeString, redisTypeStream:
+		return nil, false
+	}
+	return nil, false
 }
 
 func ttlIndexedCollectionMigrationType(typ redisValueType) bool {
