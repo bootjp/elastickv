@@ -13,6 +13,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -787,6 +788,169 @@ func TestDistributionServerAbandonSplitJob_RecordsAbandoningViaCoordinator(t *te
 	require.Equal(t, distribution.SplitJobPhaseBackfill, got.AbandonFromPhase)
 }
 
+func TestDistributionServerCompleteSplitJobTargetPromotion_UsesCoordinatorCAS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := catalog.Save(ctx, 0, promotionCompleteDistributionRoutes())
+	require.NoError(t, err)
+	job := promotionCompleteDistributionJob()
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+	before, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+
+	snapshot, completed, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, saved.Version, job, 2000)
+	require.NoError(t, err)
+	require.Equal(t, saved.Version+1, snapshot.Version)
+	require.True(t, completed.TargetPromotionDone)
+	require.Greater(t, completed.PromotionCompletedTS, before.ReadTS)
+	require.Equal(t, int64(2000), completed.UpdatedAtMs)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+	require.Equal(t, before.ReadTS, coordinator.lastStartTS)
+	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogVersionKey())
+	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogSplitJobKey(job.JobID))
+
+	loadedJob, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, completed, loadedJob)
+
+	loaded, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	target := distributionRouteByID(t, loaded.Routes, 3)
+	require.False(t, target.StagedVisibilityActive)
+	require.Equal(t, uint64(0), target.MigrationJobID)
+	require.Equal(t, uint64(777), target.MinWriteTSExclusive)
+}
+
+func TestDistributionServerCompleteSplitJobTargetPromotion_RetryAfterCommitIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := catalog.Save(ctx, 0, promotionCompleteDistributionRoutes())
+	require.NoError(t, err)
+	job := promotionCompleteDistributionJob()
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+
+	firstSnapshot, firstCompleted, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, saved.Version, job, 2000)
+	require.NoError(t, err)
+	retrySnapshot, retryCompleted, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, saved.Version, job, 3000)
+	require.NoError(t, err)
+	require.Equal(t, firstSnapshot.Version, retrySnapshot.Version)
+	require.Equal(t, firstCompleted, retryCompleted)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := catalog.Save(ctx, 0, promotionCompleteDistributionRoutes())
+	require.NoError(t, err)
+	job := promotionCompleteDistributionJob()
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	client := &splitPromotionClientStub{
+		responses: []*pb.PromoteStagedVersionsResponse{
+			{NextCursor: []byte("cursor-1")},
+			{Done: true},
+		},
+	}
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return client, nil
+		}),
+	)
+
+	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+	require.Equal(t, 2, client.calls)
+	require.Equal(t, job.JobID, client.requests[0].GetJobId())
+	require.Empty(t, client.requests[0].GetCursor())
+	require.Equal(t, defaultSplitPromotionMaxVersions, client.requests[0].GetMaxVersions())
+	require.Equal(t, defaultSplitPromotionMaxBytes, client.requests[0].GetMaxBytes())
+	require.Equal(t, defaultSplitPromotionMaxScanned, client.requests[0].GetMaxScannedBytes())
+	require.Equal(t, []byte("cursor-1"), client.requests[1].GetCursor())
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	loadedJob, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, loadedJob.TargetPromotionDone)
+	require.NotZero(t, loadedJob.PromotionCompletedTS)
+
+	loaded, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, saved.Version+1, loaded.Version)
+	target := distributionRouteByID(t, loaded.Routes, 3)
+	require.False(t, target.StagedVisibilityActive)
+	require.Equal(t, uint64(0), target.MigrationJobID)
+	require.Equal(t, uint64(777), target.MinWriteTSExclusive)
+}
+
+func TestDistributionServerRunSplitJobRunnerOnce_SkipsFollower(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	_, err := catalog.Save(ctx, 0, promotionCompleteDistributionRoutes())
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(ctx, promotionCompleteDistributionJob()))
+
+	client := &splitPromotionClientStub{
+		responses: []*pb.PromoteStagedVersionsResponse{{Done: true}},
+	}
+	coordinator := newDistributionCoordinatorStub(baseStore, false)
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return client, nil
+		}),
+	)
+
+	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+	require.Zero(t, client.calls)
+	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestPromoteSplitJobTargetRejectsNoCursorProgress(t *testing.T) {
+	t.Parallel()
+
+	client := &splitPromotionClientStub{
+		responses: []*pb.PromoteStagedVersionsResponse{{NextCursor: []byte("same")}},
+	}
+	err := promoteSplitJobTarget(context.Background(), client, promotionCompleteDistributionJob())
+	require.NoError(t, err)
+
+	client = &splitPromotionClientStub{
+		responses: []*pb.PromoteStagedVersionsResponse{
+			{NextCursor: []byte("same")},
+			{NextCursor: []byte("same")},
+		},
+	}
+	err = promoteSplitJobTarget(context.Background(), client, promotionCompleteDistributionJob())
+	require.Error(t, err)
+	require.ErrorContains(t, err, "split promotion made no cursor progress")
+}
+
 func TestDistributionServerRetrySplitJob_RequiresCatalogLeader(t *testing.T) {
 	t.Parallel()
 
@@ -1546,6 +1710,51 @@ func sampleDistributionSplitJob(jobID uint64) distribution.SplitJob {
 	}
 }
 
+func promotionCompleteDistributionJob() distribution.SplitJob {
+	return distribution.SplitJob{
+		JobID:         99,
+		SourceRouteID: 42,
+		SplitKey:      []byte("m"),
+		TargetGroupID: 2,
+		Phase:         distribution.SplitJobPhaseCleanup,
+	}
+}
+
+func promotionCompleteDistributionRoutes() []distribution.RouteDescriptor {
+	return []distribution.RouteDescriptor{
+		{
+			RouteID:       2,
+			Start:         []byte(""),
+			End:           []byte("m"),
+			GroupID:       1,
+			State:         distribution.RouteStateActive,
+			ParentRouteID: 42,
+		},
+		{
+			RouteID:                3,
+			Start:                  []byte("m"),
+			End:                    nil,
+			GroupID:                2,
+			State:                  distribution.RouteStateActive,
+			ParentRouteID:          42,
+			StagedVisibilityActive: true,
+			MigrationJobID:         99,
+			MinWriteTSExclusive:    777,
+		},
+	}
+}
+
+func distributionRouteByID(t *testing.T, routes []distribution.RouteDescriptor, routeID uint64) distribution.RouteDescriptor {
+	t.Helper()
+	for _, route := range routes {
+		if route.RouteID == routeID {
+			return route
+		}
+	}
+	t.Fatalf("route %d not found in %+v", routeID, routes)
+	return distribution.RouteDescriptor{}
+}
+
 func splitJobIDs(jobs []*pb.SplitJob) []uint64 {
 	ids := make([]uint64, 0, len(jobs))
 	for _, job := range jobs {
@@ -1560,6 +1769,37 @@ func byteSliceStrings(in [][]byte) []string {
 		out = append(out, string(item))
 	}
 	return out
+}
+
+type splitPromotionClientStub struct {
+	responses []*pb.PromoteStagedVersionsResponse
+	err       error
+	requests  []*pb.PromoteStagedVersionsRequest
+	calls     int
+}
+
+func (s *splitPromotionClientStub) PromoteStagedVersions(
+	_ context.Context,
+	req *pb.PromoteStagedVersionsRequest,
+	_ ...grpc.CallOption,
+) (*pb.PromoteStagedVersionsResponse, error) {
+	s.calls++
+	s.requests = append(s.requests, &pb.PromoteStagedVersionsRequest{
+		JobId:           req.GetJobId(),
+		Cursor:          distribution.CloneBytes(req.GetCursor()),
+		MaxVersions:     req.GetMaxVersions(),
+		MaxBytes:        req.GetMaxBytes(),
+		MaxScannedBytes: req.GetMaxScannedBytes(),
+	})
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.responses) == 0 {
+		return &pb.PromoteStagedVersionsResponse{Done: true}, nil
+	}
+	resp := s.responses[0]
+	s.responses = s.responses[1:]
+	return resp, nil
 }
 
 type distributionCoordinatorStub struct {

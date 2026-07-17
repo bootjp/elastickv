@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -16,22 +17,24 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
-	mu                      sync.Mutex
-	engine                  *distribution.Engine
-	catalog                 *distribution.CatalogStore
-	coordinator             kv.Coordinator
-	readTracker             *kv.ActiveTimestampTracker
-	readBlocked             func() bool
-	migrationCapabilityGate SplitMigrationCapabilityGate
-	splitJobRunnerReady     bool
-	knownRaftGroups         map[uint64]struct{}
-	reloadRetry             struct {
+	mu                          sync.Mutex
+	engine                      *distribution.Engine
+	catalog                     *distribution.CatalogStore
+	coordinator                 kv.Coordinator
+	readTracker                 *kv.ActiveTimestampTracker
+	readBlocked                 func() bool
+	migrationCapabilityGate     SplitMigrationCapabilityGate
+	splitJobRunnerReady         bool
+	splitPromotionClientFactory SplitPromotionClientFactory
+	knownRaftGroups             map[uint64]struct{}
+	reloadRetry                 struct {
 		attempts int
 		interval time.Duration
 	}
@@ -44,6 +47,16 @@ type DistributionServerOption func(*DistributionServer)
 // SplitMigrationCapabilityGate reports whether this node can safely create
 // migration-only side effects. A nil gate keeps StartSplitMigration fail-closed.
 type SplitMigrationCapabilityGate func(context.Context) error
+
+// SplitPromotionClient is the subset of the internal gRPC client the split
+// job runner needs to promote target-local staged rows.
+type SplitPromotionClient interface {
+	PromoteStagedVersions(context.Context, *pb.PromoteStagedVersionsRequest, ...grpc.CallOption) (*pb.PromoteStagedVersionsResponse, error)
+}
+
+// SplitPromotionClientFactory dials the node currently leading a split job's
+// target range and returns the internal client used by the runner.
+type SplitPromotionClientFactory func(context.Context, distribution.SplitJob) (SplitPromotionClient, error)
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -76,6 +89,14 @@ func WithSplitMigrationCapabilityGate(gate SplitMigrationCapabilityGate) Distrib
 func WithSplitJobRunnerReady() DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.splitJobRunnerReady = true
+	}
+}
+
+// WithSplitPromotionClientFactory configures the client factory used by the
+// split job runner to promote target-local staged versions.
+func WithSplitPromotionClientFactory(factory SplitPromotionClientFactory) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitPromotionClientFactory = factory
 	}
 }
 
@@ -117,11 +138,21 @@ const (
 	splitJobListCursorEncodedBytes = splitJobListCursorJobIDOff + 8
 	SplitMigrationCapabilityV2     = "cap_migration_v2"
 	splitMigrationCapabilityV2     = SplitMigrationCapabilityV2
+
+	splitPromotionDefaultMaxVersions = 1024
+	splitPromotionBytesPerMiB        = 1024 * 1024
+	splitPromotionMaxBytesMiB        = 4
+	splitPromotionMaxScannedMiB      = 16
+	promotionCompleteBaseOpCount     = 2
 )
 
 var (
 	defaultCatalogReloadRetryAttempts = 20
 	defaultCatalogReloadRetryInterval = 10 * time.Millisecond
+	defaultSplitJobRunnerInterval     = time.Second
+	defaultSplitPromotionMaxVersions  = uint32(splitPromotionDefaultMaxVersions)
+	defaultSplitPromotionMaxBytes     = uint64(splitPromotionMaxBytesMiB * splitPromotionBytesPerMiB)
+	defaultSplitPromotionMaxScanned   = uint64(splitPromotionMaxScannedMiB * splitPromotionBytesPerMiB)
 
 	errDistributionCatalogNotConfigured   = errors.New("route catalog is not configured")
 	errDistributionUnknownRoute           = errors.New("unknown route")
@@ -167,6 +198,115 @@ func (s *DistributionServer) requireReadReady() error {
 		return status.Error(codes.Unavailable, "distribution startup has not completed")
 	}
 	return nil
+}
+
+func (s *DistributionServer) RunSplitJobRunner(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(defaultSplitJobRunnerInterval)
+	defer ticker.Stop()
+	for {
+		if err := s.RunSplitJobRunnerOnce(ctx); err != nil {
+			slog.Warn("split job runner tick failed", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
+	if !s.splitJobRunnerConfigured() {
+		return nil
+	}
+	leader, err := s.verifySplitJobRunnerLeader(ctx)
+	if err != nil || !leader {
+		return err
+	}
+	jobs, err := s.catalog.ListSplitJobs(ctx)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	if job, ok := nextCleanupSplitJob(jobs); ok {
+		return s.promoteSplitJobTargetAndComplete(ctx, job)
+	}
+	return nil
+}
+
+func (s *DistributionServer) splitJobRunnerConfigured() bool {
+	return s != nil && s.catalog != nil && s.coordinator != nil && s.splitPromotionClientFactory != nil
+}
+
+func (s *DistributionServer) verifySplitJobRunnerLeader(ctx context.Context) (bool, error) {
+	if !s.coordinator.IsLeaderForKey(distribution.CatalogVersionKey()) {
+		return false, nil
+	}
+	if err := s.coordinator.VerifyLeaderForKey(ctx, distribution.CatalogVersionKey()); err != nil {
+		return false, errors.WithStack(err)
+	}
+	return true, nil
+}
+
+func nextCleanupSplitJob(jobs []distribution.SplitJob) (distribution.SplitJob, bool) {
+	for _, job := range jobs {
+		if job.Phase == distribution.SplitJobPhaseCleanup && !job.TargetPromotionDone {
+			return job, true
+		}
+	}
+	return distribution.SplitJob{}, false
+}
+
+func (s *DistributionServer) promoteSplitJobTargetAndComplete(ctx context.Context, job distribution.SplitJob) error {
+	client, err := s.splitPromotionClientFactory(ctx, job)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if client == nil {
+		return errors.New("split promotion client is nil")
+	}
+	if err := promoteSplitJobTarget(ctx, client, job); err != nil {
+		return errors.WithStack(err)
+	}
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	current, found, err := s.catalog.SplitJobAt(ctx, job.JobID, snapshot.ReadTS)
+	if err != nil {
+		return splitJobPromotionStatusError(err)
+	}
+	if !found {
+		return splitJobPromotionStatusError(distribution.ErrCatalogSplitJobConflict)
+	}
+	_, _, err = s.completeSplitJobTargetPromotionViaCoordinator(ctx, snapshot.Version, current, time.Now().UnixMilli())
+	return err
+}
+
+func promoteSplitJobTarget(ctx context.Context, client SplitPromotionClient, job distribution.SplitJob) error {
+	var cursor []byte
+	for {
+		resp, err := client.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{
+			JobId:           job.JobID,
+			Cursor:          cursor,
+			MaxVersions:     defaultSplitPromotionMaxVersions,
+			MaxBytes:        defaultSplitPromotionMaxBytes,
+			MaxScannedBytes: defaultSplitPromotionMaxScanned,
+		})
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if resp.GetDone() {
+			return nil
+		}
+		next := resp.GetNextCursor()
+		if len(next) == 0 || bytes.Equal(next, cursor) {
+			return errors.New("split promotion made no cursor progress")
+		}
+		cursor = distribution.CloneBytes(next)
+	}
 }
 
 // UpdateRoute allows updating route information.
@@ -730,6 +870,226 @@ func (s *DistributionServer) updateSplitJobViaCoordinator(
 	return nil
 }
 
+func (s *DistributionServer) completeSplitJobTargetPromotionViaCoordinator(
+	ctx context.Context,
+	expectedVersion uint64,
+	expected distribution.SplitJob,
+	nowMs int64,
+) (distribution.CatalogSnapshot, distribution.SplitJob, error) {
+	if err := s.requirePromotionCompletionDeps(); err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, err
+	}
+	snapshot, current, alreadyDone, err := s.loadPromotionCompletionCandidate(ctx, expectedVersion, expected, nowMs)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, err
+	}
+	if alreadyDone {
+		return snapshot, current, nil
+	}
+	completion, err := distribution.CompleteTargetPromotionState(expected, snapshot.Routes, nowMs)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobPromotionStatusError(err)
+	}
+	return s.dispatchPromotionCompletion(ctx, snapshot, expectedVersion, expected.JobID, completion)
+}
+
+func (s *DistributionServer) requirePromotionCompletionDeps() error {
+	if s.catalog == nil {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	if s.coordinator == nil {
+		return grpcStatusError(codes.FailedPrecondition, errDistributionCoordinatorRequired.Error())
+	}
+	return nil
+}
+
+func (s *DistributionServer) loadPromotionCompletionCandidate(
+	ctx context.Context,
+	expectedVersion uint64,
+	expected distribution.SplitJob,
+	nowMs int64,
+) (distribution.CatalogSnapshot, distribution.SplitJob, bool, error) {
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, err
+	}
+	current, found, err := s.catalog.SplitJobAt(ctx, expected.JobID, snapshot.ReadTS)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(err)
+	}
+	if !found {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(distribution.ErrCatalogSplitJobConflict)
+	}
+	if snapshot.Version == expectedVersion && distribution.SplitJobsEquivalent(current, expected) {
+		return snapshot, current, false, nil
+	}
+	job, err := completedPromotionRetryJob(snapshot.Routes, expected, current, nowMs)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(err)
+	}
+	if job.TargetPromotionDone {
+		return snapshot, job, true, nil
+	}
+	if snapshot.Version != expectedVersion {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(distribution.ErrCatalogVersionMismatch)
+	}
+	return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(distribution.ErrCatalogSplitJobConflict)
+}
+
+func completedPromotionRetryJob(
+	routes []distribution.RouteDescriptor,
+	expected distribution.SplitJob,
+	current distribution.SplitJob,
+	nowMs int64,
+) (distribution.SplitJob, error) {
+	matches, err := splitJobPromotionMatchesExpected(expected, current)
+	if err != nil {
+		return distribution.SplitJob{}, errors.WithStack(err)
+	}
+	if !matches {
+		return distribution.SplitJob{}, nil
+	}
+	completion, err := distribution.CompleteTargetPromotionState(current, routes, nowMs)
+	if err != nil {
+		return distribution.SplitJob{}, errors.WithStack(err)
+	}
+	return completion.Job, nil
+}
+
+func (s *DistributionServer) dispatchPromotionCompletion(
+	ctx context.Context,
+	snapshot distribution.CatalogSnapshot,
+	expectedVersion uint64,
+	jobID uint64,
+	completion distribution.TargetPromotionCompletion,
+) (distribution.CatalogSnapshot, distribution.SplitJob, error) {
+	if !completion.Changed {
+		return snapshot, completion.Job, nil
+	}
+	commitTS, err := s.nextPromotionCompleteCommitTS(snapshot.ReadTS)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, err
+	}
+	completion.Job.PromotionCompletedTS = commitTS
+	ops, err := s.buildPromotionCompleteOps(expectedVersion, completion)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobPromotionStatusError(err)
+	}
+	jobKey := distribution.CatalogSplitJobKey(jobID)
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems:    ops,
+		IsTxn:    true,
+		StartTS:  snapshot.ReadTS,
+		CommitTS: commitTS,
+		ReadKeys: [][]byte{
+			distribution.CatalogVersionKey(),
+			jobKey,
+		},
+	}); err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobCoordinatorStatusError(err)
+	}
+	loaded, err := s.loadCatalogSnapshotAtLeastVersion(ctx, expectedVersion+1)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, err
+	}
+	return loaded, completion.Job, nil
+}
+
+func (s *DistributionServer) nextPromotionCompleteCommitTS(readTS uint64) (uint64, error) {
+	if readTS == math.MaxUint64 {
+		return 0, grpcStatusError(codes.Internal, distribution.ErrCatalogVersionOverflow.Error())
+	}
+	clock := s.coordinator.Clock()
+	if clock == nil {
+		return readTS + 1, nil
+	}
+	clock.Observe(readTS)
+	commitTS, err := clock.NextFenced()
+	if err != nil {
+		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate promotion completion timestamp: %v", err)
+	}
+	if commitTS > readTS {
+		return commitTS, nil
+	}
+	clock.Observe(readTS)
+	commitTS, err = clock.NextFenced()
+	if err != nil {
+		return 0, grpcStatusErrorf(codes.FailedPrecondition, "allocate promotion completion timestamp: %v", err)
+	}
+	if commitTS <= readTS {
+		return 0, grpcStatusError(codes.Internal, "promotion completion timestamp did not advance")
+	}
+	return commitTS, nil
+}
+
+func (s *DistributionServer) buildPromotionCompleteOps(
+	expectedVersion uint64,
+	completion distribution.TargetPromotionCompletion,
+) ([]*kv.Elem[kv.OP], error) {
+	if expectedVersion == math.MaxUint64 {
+		return nil, errors.WithStack(distribution.ErrCatalogVersionOverflow)
+	}
+	ops := make([]*kv.Elem[kv.OP], 0, len(completion.ClearedRouteIDs)+promotionCompleteBaseOpCount)
+	for _, routeID := range completion.ClearedRouteIDs {
+		route, ok := promotionCompleteRouteByID(completion.Routes, routeID)
+		if !ok {
+			return nil, errors.WithStack(distribution.ErrMigrationPromotionTargetAbsent)
+		}
+		encoded, err := distribution.EncodeRouteDescriptorForCatalogWrite(route, s.catalog.AllowsRouteDescriptorV2Writes())
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		ops = append(ops, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   distribution.CatalogRouteKey(route.RouteID),
+			Value: encoded,
+		})
+	}
+	ops = append(ops, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   distribution.CatalogVersionKey(),
+		Value: distribution.EncodeCatalogVersion(expectedVersion + 1),
+	})
+	encodedJob, err := distribution.EncodeSplitJob(completion.Job)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	ops = append(ops, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   distribution.CatalogSplitJobKey(completion.Job.JobID),
+		Value: encodedJob,
+	})
+	return ops, nil
+}
+
+func promotionCompleteRouteByID(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {
+	for _, route := range routes {
+		if route.RouteID == routeID {
+			return route, true
+		}
+	}
+	return distribution.RouteDescriptor{}, false
+}
+
+func splitJobPromotionMatchesExpected(expected, current distribution.SplitJob) (bool, error) {
+	if expected.TargetPromotionDone || !current.TargetPromotionDone || current.PromotionCompletedTS == 0 {
+		return false, nil
+	}
+	normalized := distribution.CloneSplitJob(current)
+	normalized.TargetPromotionDone = expected.TargetPromotionDone
+	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
+	normalized.UpdatedAtMs = expected.UpdatedAtMs
+	expectedRaw, err := distribution.EncodeSplitJob(expected)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	normalizedRaw, err := distribution.EncodeSplitJob(normalized)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return bytes.Equal(expectedRaw, normalizedRaw), nil
+}
+
 func (s *DistributionServer) verifyKnownTargetGroup(groupID uint64) error {
 	if len(s.knownRaftGroups) == 0 {
 		return grpcStatusError(codes.FailedPrecondition, errDistributionRaftGroupsNotKnown.Error())
@@ -980,6 +1340,23 @@ func splitJobCoordinatorStatusError(err error) error {
 		return grpcStatusError(codes.FailedPrecondition, errDistributionNotLeader.Error())
 	default:
 		return grpcStatusErrorf(codes.Internal, "commit split job mutation: %v", err)
+	}
+}
+
+func splitJobPromotionStatusError(err error) error {
+	switch {
+	case errors.Is(err, distribution.ErrCatalogVersionMismatch),
+		errors.Is(err, distribution.ErrCatalogSplitJobConflict),
+		errors.Is(err, store.ErrWriteConflict):
+		return grpcStatusError(codes.Aborted, err.Error())
+	case errors.Is(err, distribution.ErrMigrationPromotionNotReady),
+		errors.Is(err, distribution.ErrMigrationPromotionTargetAbsent):
+		return grpcStatusError(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, distribution.ErrMigrationInvalidRoute),
+		errors.Is(err, distribution.ErrCatalogRouteV2WriteDisabled):
+		return grpcStatusError(codes.InvalidArgument, err.Error())
+	default:
+		return splitJobCatalogStatusError(err)
 	}
 }
 

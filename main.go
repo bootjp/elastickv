@@ -1612,9 +1612,15 @@ func prepareDistributionRuntimeServer(
 	if err != nil {
 		return nil, err
 	}
-	in.distServer = adapter.NewDistributionServer(
-		engine,
-		distCatalog,
+	splitPromotionConnCache := &kv.GRPCConnCache{}
+	in.eg.Go(func() error {
+		<-in.ctx.Done()
+		if err := splitPromotionConnCache.Close(); err != nil {
+			return errors.Wrap(err, "close split promotion gRPC connection cache")
+		}
+		return nil
+	})
+	distOptions := []adapter.DistributionServerOption{
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(in.shardGroups)...),
@@ -1623,7 +1629,10 @@ func prepareDistributionRuntimeServer(
 			splitMigrationCapabilityProbeTimeout,
 			nil,
 		)),
-	)
+		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(coordinate, splitPromotionConnCache)),
+		adapter.WithSplitJobRunnerReady(),
+	}
+	in.distServer = adapter.NewDistributionServer(engine, distCatalog, distOptions...)
 	preparedServer, err := prepareRuntimeServerRunner(waitRotateOnStartup, in)
 	if err != nil {
 		return nil, err
@@ -1664,8 +1673,35 @@ func startDistributionRuntimeAfterTransport(in distributionRuntimeStartupInput) 
 	startMemoryWatchdog(in.runCtx, in.eg, in.cancel)
 	startMonitoringCollectors(in.runCtx, in.metricsRegistry, in.runtimes, in.clock)
 	startFSMCompactorIfEnabled(in.runCtx, in.eg, in.runtimes, in.readTracker)
+	startDistributionSplitJobRunner(in.runCtx, in.eg, prepared.serverInput.distServer)
 	return startPreparedServerAfterStartupRotation(
 		in.waitRotateOnStartup, prepared.serverInput, prepared.preparedServer)
+}
+
+func splitPromotionClientFactory(coordinate kv.Coordinator, connCache *kv.GRPCConnCache) adapter.SplitPromotionClientFactory {
+	return func(_ context.Context, job distribution.SplitJob) (adapter.SplitPromotionClient, error) {
+		if coordinate == nil {
+			return nil, errors.New("distribution coordinator is not configured")
+		}
+		if connCache == nil {
+			return nil, errors.New("split promotion gRPC connection cache is not configured")
+		}
+		addr := coordinate.RaftLeaderForKey(job.SplitKey)
+		conn, err := connCache.ConnFor(addr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return pb.NewInternalClient(conn), nil
+	}
+}
+
+func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
+	if eg == nil || server == nil {
+		return
+	}
+	eg.Go(func() error {
+		return server.RunSplitJobRunner(ctx)
+	})
 }
 
 func prepareRuntimeServerRunner(waitRotateOnStartup startupRotationWaiter, in serversInput) (*preparedRuntimeServer, error) {
