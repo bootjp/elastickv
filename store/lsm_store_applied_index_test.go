@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"testing"
 
@@ -112,7 +113,9 @@ func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.
 	)
 
 	require.NoError(t, ps.ApplyMutations(ctx, muts, nil, commitTS, commitTS))
-	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, []byte{0x01}, pebble.Sync))
+	var staleAppliedIndex [8]byte
+	binary.LittleEndian.PutUint64(staleAppliedIndex[:], entryIdx-1)
+	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, staleAppliedIndex[:], pebble.Sync))
 
 	require.NoError(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, startTS, commitTS, entryIdx))
 
