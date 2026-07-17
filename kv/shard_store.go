@@ -369,7 +369,8 @@ func (s *ShardStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end 
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
 	if routesContainStagedVisibility(routes) {
-		return nil, true, nil
+		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
 	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ScanAt(ctx, start, end, visibleLimit, ts)
@@ -459,7 +460,8 @@ func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byt
 	}
 	routes, clampToRoutes := s.routesForScan(start, end)
 	if routesContainStagedVisibility(routes) {
-		return nil, true, nil
+		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
+		return kvs, false, err
 	}
 	if len(routes) != 1 || clampToRoutes {
 		kvs, err := s.ReverseScanAt(ctx, start, end, visibleLimit, ts)
@@ -1144,7 +1146,8 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 
 	if engineForGroup(g) == nil {
 		if routeHasStagedVisibility(route) {
-			return nil, true, nil
+			kvs, err := s.scanRouteLocal(ctx, g, route, start, end, visibleLimit, ts, reverse)
+			return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), false, err
 		}
 		kvs, limitReached, err := scanLocalPhysicalLimit(ctx, g.Store, start, end, visibleLimit, physicalLimit, ts, reverse)
 		if err != nil {
@@ -1155,7 +1158,8 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		if routeHasStagedVisibility(route) {
-			return nil, true, nil
+			kvs, err := s.scanRouteAtLeader(ctx, g, route, start, end, visibleLimit, ts, reverse)
+			return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), false, err
 		}
 		kvs, limitReached, err := s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
 		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), limitReached, err

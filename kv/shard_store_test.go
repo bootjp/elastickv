@@ -762,21 +762,29 @@ func TestShardStoreApplyMutations_ValidatesStagedWriteKeys(t *testing.T) {
 	}
 }
 
-func TestShardStorePhysicalLimitFailsClosedBeforeStagedVisibilityFallback(t *testing.T) {
+func TestShardStorePhysicalLimitFallsBackToStagedVisibilityScan(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	st, _ := newStagedVisibilityShardStore(t)
+	st, group := newStagedVisibilityShardStore(t)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b/live"), []byte("live"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b/staged")), []byte("staged"), 20, 0))
 
 	kvs, limitReached, err := st.ScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
 	require.NoError(t, err)
-	require.True(t, limitReached)
-	require.Nil(t, kvs)
+	require.False(t, limitReached)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b/live"), Value: []byte("live")},
+		{Key: []byte("b/staged"), Value: []byte("staged")},
+	}, kvs)
 
 	kvs, limitReached, err = st.ReverseScanAtPhysicalLimit(ctx, []byte("b"), []byte("c"), 10, 10, 50)
 	require.NoError(t, err)
-	require.True(t, limitReached)
-	require.Nil(t, kvs)
+	require.False(t, limitReached)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b/staged"), Value: []byte("staged")},
+		{Key: []byte("b/live"), Value: []byte("live")},
+	}, kvs)
 }
 
 func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
