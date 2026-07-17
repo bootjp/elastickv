@@ -385,6 +385,42 @@ func TestInternalExportRangeVersionsPreservesS3BucketRawRouteMatches(t *testing.
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	resolver := NewSQSPartitionResolver(map[string][]uint64{
+		"orders.fifo": {10, 11},
+	})
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalStore(st),
+		WithInternalMigrationExportRouting(11, resolver),
+	)
+
+	p0 := sqsPartitionedMsgDataKey("orders.fifo", 0, 1, "msg-0")
+	p1 := sqsPartitionedMsgDataKey("orders.fifo", 1, 1, "msg-1")
+	unknown := sqsPartitionedMsgDataKey("unknown.fifo", 0, 1, "msg-unknown")
+	require.NoError(t, st.PutAt(ctx, p0, []byte("p0"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, p1, []byte("p1"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, unknown, []byte("unknown"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	prefix := []byte(SqsPartitionedMsgDataPrefix)
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		KeyFamily:       distribution.MigrationFamilySQSPartitionedMessageData,
+		RangeStart:      prefix,
+		RangeEnd:        testPrefixScanEnd(prefix),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: distribution.MigrationFamilySQSPartitionedMessageData},
+	}, stream.responses[0].GetVersions())
+}
+
 func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	t.Parallel()
 

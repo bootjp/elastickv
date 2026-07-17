@@ -705,7 +705,7 @@ func startRuntimeServersWithBoundListeners(
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, listeners.grpc); err != nil {
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
@@ -735,7 +735,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, listeners.grpc[rt.spec.id]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -754,6 +754,7 @@ func startBoundGRPCServer(
 	distServer *adapter.DistributionServer,
 	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
+	sqsPartitionResolver kv.PartitionResolver,
 	listener net.Listener,
 ) error {
 	if rt == nil || rt.engine == nil {
@@ -776,6 +777,7 @@ func startBoundGRPCServer(
 		adapter.WithInternalStore(rt.store),
 		adapter.WithInternalMigrationProposer(rt.engine),
 		adapter.WithInternalRouteEngine(routeEngine),
+		adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)

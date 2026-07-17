@@ -55,6 +55,13 @@ func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 	}
 }
 
+func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionResolver) InternalOption {
+	return func(i *Internal) {
+		i.migrationExportGroupID = groupID
+		i.migrationExportResolver = resolver
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:               leader,
@@ -71,16 +78,18 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader               raftengine.LeaderView
-	transactionManager   kv.Transactional
-	clock                *kv.HLC
-	tsAllocator          kv.TimestampAllocator
-	relay                *RedisPubSubRelay
-	store                store.MVCCStore
-	migrationProposer    raftengine.Proposer
-	migrationImportGate  func(context.Context) error
-	migrationPromoteGate func(context.Context) error
-	routeEngine          *distribution.Engine
+	leader                  raftengine.LeaderView
+	transactionManager      kv.Transactional
+	clock                   *kv.HLC
+	tsAllocator             kv.TimestampAllocator
+	relay                   *RedisPubSubRelay
+	store                   store.MVCCStore
+	migrationProposer       raftengine.Proposer
+	migrationImportGate     func(context.Context) error
+	migrationPromoteGate    func(context.Context) error
+	routeEngine             *distribution.Engine
+	migrationExportGroupID  uint64
+	migrationExportResolver kv.PartitionResolver
 
 	pb.UnimplementedInternalServer
 }
@@ -172,7 +181,7 @@ func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest
 }
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
-	opts := exportRangeVersionsOptions(req)
+	opts := i.exportRangeVersionsOptions(req)
 	for {
 		result, err := i.store.ExportVersions(stream.Context(), opts)
 		if err != nil {
@@ -410,7 +419,7 @@ func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, labe
 	return result.Response, nil
 }
 
-func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
+func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
 	chunkBytes := uint64(req.GetChunkBytes())
 	if chunkBytes == 0 {
 		chunkBytes = defaultMigrationExportChunkBytes
@@ -429,13 +438,13 @@ func exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.Export
 		MaxBytes:             chunkBytes,
 		MaxScannedBytes:      maxScannedBytes,
 		KeyFamily:            req.GetKeyFamily(),
-		AcceptKey:            migrationExportFilter(req),
+		AcceptKey:            i.migrationExportFilter(req),
 	}
 	return opts
 }
 
-func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
-	routeFilter := kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+func (i *Internal) migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	routeFilter := i.migrationExportRouteFilter(req)
 	if migrationFamilyRequiresDecodedS3(req.GetKeyFamily()) {
 		routeFilter = decodedS3BucketRouteFilter(req.GetKeyFamily(), req.GetRouteStart(), req.GetRouteEnd())
 	}
@@ -450,6 +459,13 @@ func migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool
 	return func(rawKey []byte) bool {
 		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
 	}
+}
+
+func (i *Internal) migrationExportRouteFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	if i != nil && i.migrationExportGroupID != 0 && i.migrationExportResolver != nil {
+		return kv.RouteKeyFilterForGroup(req.GetRouteStart(), req.GetRouteEnd(), i.migrationExportGroupID, i.migrationExportResolver)
+	}
+	return kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
 }
 
 func migrationFamilyRequiresDecodedS3(family uint32) bool {

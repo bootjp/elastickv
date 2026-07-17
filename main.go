@@ -2199,6 +2199,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	sqsPartitionResolver kv.PartitionResolver,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2237,6 +2238,7 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
+				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
@@ -2680,6 +2682,10 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		buckets: newBucketsSource(r.s3Server),
 		roles:   r.roleStore,
 	}
+	var sqsPartitionResolver kv.PartitionResolver
+	if r.sqsPartitionResolver != nil {
+		sqsPartitionResolver = r.sqsPartitionResolver
+	}
 	if err := startRaftServers(
 		r.ctx,
 		r.lc,
@@ -2700,6 +2706,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		sqsPartitionResolver,
 	); err != nil {
 		return r.startupFailure(err)
 	}
