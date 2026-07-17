@@ -703,3 +703,31 @@ func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
 		Armed:                  true,
 	}}, states)
 }
+
+func TestInternalApplyTargetStagedReadinessRejectsArmedZeroMinWriteTS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, nil),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+	)
+
+	resp, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
+		JobId:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobId:         7,
+		Armed:                  true,
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
+}

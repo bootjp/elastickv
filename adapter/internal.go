@@ -294,6 +294,9 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 	if req.GetMigrationJobId() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
 	}
+	if req.GetArmed() && req.GetMinWriteTsExclusive() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness min_write_ts_exclusive is required when armed"))
+	}
 	if i.migrationProposer == nil {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
 	}
