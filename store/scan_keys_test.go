@@ -211,6 +211,28 @@ func TestPebbleStoreScanKeysAtPreservesExtensionAfterInvisiblePrefix(t *testing.
 	require.Equal(t, [][]byte{[]byte("a\x80")}, keys)
 }
 
+func TestPebbleStoreScanKeysAtKeepsAllFFKeyWithoutFiniteUpperBound(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	key := []byte{0xff, 0xff}
+	require.NoError(t, st.PutAt(ctx, key, []byte("visible"), 18, 0))
+	require.NoError(t, st.PutAt(ctx, []byte(""), []byte("future-empty"), 45, 0))
+	require.NoError(t, st.DeleteAt(ctx, key, 47))
+
+	val, err := st.GetAt(ctx, key, 30)
+	require.NoError(t, err)
+	require.Equal(t, []byte("visible"), val)
+
+	keys, err := st.ScanKeysAt(ctx, nil, nil, 2, 30)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{key}, keys)
+}
+
 func cursorAfterTestKey(key []byte) []byte {
 	cursor := make([]byte, len(key)+1)
 	copy(cursor, key)

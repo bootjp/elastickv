@@ -476,21 +476,10 @@ func writeValueHeaderBytes(dst []byte, tombstone bool, expireAt uint64, encState
 }
 
 func decodeValue(data []byte) (storedValue, error) {
-	if len(data) < valueHeaderSize {
-		return storedValue{}, errors.New("invalid value length")
+	tombstone, expireAt, encState, err := decodeValueHeader(data)
+	if err != nil {
+		return storedValue{}, err
 	}
-	flags := data[0]
-	if flags&encStateReservedMask != 0 {
-		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
-			"value header byte = %#08b", flags)
-	}
-	encState := (flags & encStateMask) >> encStateShift
-	if encState != encStateCleartext && encState != encStateEncrypted {
-		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
-			"encryption_state=%#x is reserved", encState)
-	}
-	tombstone := (flags & tombstoneMask) != 0
-	expireAt := binary.LittleEndian.Uint64(data[1:])
 	val := make([]byte, len(data)-valueHeaderSize)
 	copy(val, data[valueHeaderSize:])
 
@@ -500,6 +489,23 @@ func decodeValue(data []byte) (storedValue, error) {
 		EncState:  encState,
 		ExpireAt:  expireAt,
 	}, nil
+}
+
+func decodeValueHeader(data []byte) (bool, uint64, byte, error) {
+	if len(data) < valueHeaderSize {
+		return false, 0, 0, errors.New("invalid value length")
+	}
+	flags := data[0]
+	if flags&encStateReservedMask != 0 {
+		return false, 0, 0, errors.Wrapf(ErrEncryptedValueReservedState,
+			"value header byte = %#08b", flags)
+	}
+	encState := (flags & encStateMask) >> encStateShift
+	if encState != encStateCleartext && encState != encStateEncrypted {
+		return false, 0, 0, errors.Wrapf(ErrEncryptedValueReservedState,
+			"encryption_state=%#x is reserved", encState)
+	}
+	return flags&tombstoneMask != 0, binary.LittleEndian.Uint64(data[1:]), encState, nil
 }
 
 type pebbleUint64Getter interface {
@@ -982,16 +988,24 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 
 func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool, error) {
 	valBytes := iter.Value()
-	sv, err := decodeValue(valBytes)
+	tombstone, expireAt, encState, err := decodeValueHeader(valBytes)
 	if err != nil {
 		return false, err
 	}
 
 	// Keep key-only scans on the same authenticated visibility path as ScanAt.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
-		return false, err
+	if encState == encStateEncrypted {
+		sv := storedValue{
+			Value:     valBytes[valueHeaderSize:],
+			Tombstone: tombstone,
+			ExpireAt:  expireAt,
+			EncState:  encState,
+		}
+		if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+			return false, err
+		}
 	}
-	return !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts), nil
+	return !tombstone && (expireAt == 0 || expireAt > ts), nil
 }
 
 func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte, currentVersion, ts uint64) bool {
@@ -1320,9 +1334,10 @@ func (s *pebbleStore) appendVisibleProperPrefixScanKeys(
 }
 
 func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIteratorProvider, key []byte, ts uint64) (bool, error) {
+	upperBound := keyUpperBound(key)
 	iter, err := reader.NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(key, math.MaxUint64),
-		UpperBound: keyUpperBound(key),
+		UpperBound: upperBound,
 	})
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -1333,7 +1348,7 @@ func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIterat
 		if err := ctx.Err(); err != nil {
 			return false, errors.WithStack(err)
 		}
-		visible, stop, err := s.visibleExactIteratorEntry(iter, key, ts)
+		visible, stop, err := s.visibleExactIteratorEntry(iter, key, ts, upperBound != nil)
 		if err != nil {
 			return false, err
 		}
@@ -1344,12 +1359,12 @@ func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIterat
 	return false, nil
 }
 
-func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byte, ts uint64) (bool, bool, error) {
+func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byte, ts uint64, stopOnPrefixExit bool) (bool, bool, error) {
 	userKey, version := decodeKeyView(iter.Key())
 	if userKey == nil {
 		return false, false, nil
 	}
-	if len(key) > 0 && !bytes.HasPrefix(userKey, key) {
+	if stopOnPrefixExit && len(key) > 0 && !bytes.HasPrefix(userKey, key) {
 		return false, true, nil
 	}
 	if !bytes.Equal(userKey, key) || version > ts {

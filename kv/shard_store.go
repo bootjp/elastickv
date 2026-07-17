@@ -62,6 +62,18 @@ func (s *ShardStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte,
 		return nil, store.ErrKeyNotFound
 	}
 
+	return s.getGroupAt(ctx, g, key, ts, groupID)
+}
+
+func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g.Store == nil {
+		return nil, store.ErrKeyNotFound
+	}
+	return s.getGroupAt(ctx, g, key, ts, route.GroupID)
+}
+
+func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64) ([]byte, error) {
 	if engineForGroup(g) == nil {
 		return s.localGetAt(ctx, g, key, ts)
 	}

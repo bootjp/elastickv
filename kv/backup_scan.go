@@ -96,7 +96,7 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	}
 	s.page = s.page[:0]
 	for _, key := range keys {
-		val, err := s.store.GetAt(ctx, key, s.ts)
+		val, err := s.getAtCapturedRoute(ctx, key)
 		if errors.Is(err, store.ErrKeyNotFound) {
 			continue
 		}
@@ -117,4 +117,21 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	}
 	s.cursor = nextScanCursor(last)
 	return nil
+}
+
+func (s *backupScanner) getAtCapturedRoute(ctx context.Context, key []byte) ([]byte, error) {
+	normalized := routeKey(key)
+	for _, route := range s.routes {
+		if routeContainsKey(route, normalized) {
+			return s.store.getRouteAt(ctx, route, key, s.ts)
+		}
+	}
+	return nil, store.ErrKeyNotFound
+}
+
+func routeContainsKey(route distribution.Route, key []byte) bool {
+	if bytes.Compare(key, route.Start) < 0 {
+		return false
+	}
+	return route.End == nil || bytes.Compare(key, route.End) < 0
 }
