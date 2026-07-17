@@ -136,7 +136,7 @@ func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readT
 		return wrongTypeError()
 	}
 
-	hllExists, err := r.hllAnchorExistsAt(context.Background(), key, readTS)
+	hllExists, err := r.hllExistsAt(key, readTS)
 	if err != nil {
 		return err
 	}

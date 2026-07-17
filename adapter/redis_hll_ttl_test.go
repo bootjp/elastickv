@@ -139,6 +139,21 @@ func TestRedisSetWideMutationBaseCleansExpiredHLLAnchor(t *testing.T) {
 	require.True(t, deletesHLL)
 }
 
+func TestRedisValidateExactSetTypeTreatsExpiredHLLAnchorAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("hll:expired:set-type")
+	expiredAt := time.Now().Add(-time.Minute)
+	payload, err := encodeRedisHLL(redisSetValue{Members: []string{"stale"}}, &expiredAt)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, 10, 0))
+
+	require.NoError(t, server.validateExactSetType(redisTypeNone, key, 10))
+}
+
 func TestRedisDispatchHLLExpireWritesInlineAnchorAndScanIndex(t *testing.T) {
 	t.Parallel()
 
