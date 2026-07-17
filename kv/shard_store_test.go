@@ -235,22 +235,40 @@ func TestShardStoreScanAtWithReadFence_ScansSameGroupSuppliedBoundsAcrossRouteIn
 	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
 
-	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), []byte("z"))
-	require.NoError(t, err)
-	require.Len(t, kvs, 1)
-	require.Equal(t, first, kvs[0].Key)
-
-	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), nil)
-	require.NoError(t, err)
-	require.Len(t, kvs, 2)
-	require.Equal(t, first, kvs[0].Key)
-	require.Equal(t, second, kvs[1].Key)
-
-	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, true, 0, 7, []byte("a"), nil)
-	require.NoError(t, err)
-	require.Len(t, kvs, 2)
-	require.Equal(t, second, kvs[0].Key)
-	require.Equal(t, first, kvs[1].Key)
+	for _, tc := range []struct {
+		name       string
+		reverse    bool
+		routeStart []byte
+		routeEnd   []byte
+		want       [][]byte
+	}{
+		{
+			name:       "left interval only",
+			routeStart: []byte("a"),
+			routeEnd:   []byte("z"),
+			want:       [][]byte{first},
+		},
+		{
+			name:       "forward across intervals",
+			routeStart: []byte("a"),
+			want:       [][]byte{first, second},
+		},
+		{
+			name:       "reverse across intervals",
+			reverse:    true,
+			routeStart: []byte("a"),
+			want:       [][]byte{second, first},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, tc.reverse, 0, 7, tc.routeStart, tc.routeEnd)
+			require.NoError(t, err)
+			require.Len(t, kvs, len(tc.want))
+			for i, want := range tc.want {
+				require.Equal(t, want, kvs[i].Key)
+			}
+		})
+	}
 }
 
 func TestShardStoreScanAtWithReadFence_FiltersWideRedisKeysByUserKey(t *testing.T) {

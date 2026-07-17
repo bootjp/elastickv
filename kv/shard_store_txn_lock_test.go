@@ -306,7 +306,7 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.NoError(t, st1.PutAt(ctx, right, []byte("right"), 1, 0))
 
 	startTS := uint64(2)
-	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
@@ -419,7 +419,7 @@ func TestShardStoreScanAtWithReadFence_ReverseBoundsLockScanToPage(t *testing.T)
 	require.NoError(t, st1.PutAt(ctx, right, []byte("right"), 1, 0))
 
 	startTS := uint64(2)
-	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), true, 1, shardStore.ReadRouteVersion(), []byte(""), nil)
