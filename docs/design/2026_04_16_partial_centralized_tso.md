@@ -2,10 +2,11 @@
 
 - Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
   bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
-  the minimal TSO-only FSM and follower redirect/admin exposure remain open
+  the minimal TSO-only FSM is implemented, while runtime wiring and follower
+  redirect/admin exposure remain open
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-11
+- Updated: 2026-07-17
 
 ---
 
@@ -44,11 +45,16 @@ Implemented:
    bridge still issues timestamps from the locally led data shard through
    `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
    until the TSO-leader redirect path exists.
+9. `TSOStateMachine` implements the dedicated-group FSM contract: it accepts
+   only HLC lease entries, snapshots/restores the physical ceiling as 8
+   big-endian bytes, and classifies full HLC lease entries as volatile-only so
+   post-snapshot ceiling raises are not lost on duplicate replay skip paths.
 
 Remaining:
 
-1. Replace the compatibility bridge FSM with the minimal TSO-only FSM that
-   persists only the HLC ceiling.
+1. Wire runtime bootstrap for `groupID = 0` to instantiate `TSOStateMachine`
+   instead of the compatibility key-value FSM once the redirect path can route
+   timestamp requests to that group.
 2. Add follower redirect/admin exposure for the dedicated TSO leader.
 3. Add Phase B shadow-read validation before making dedicated TSO the only
    production timestamp path.
@@ -206,10 +212,19 @@ type TSOStateMachine struct {
 // envelope and passes only the raw command bytes, matching the
 // raftengine.StateMachine.Apply([]byte) signature.
 func (f *TSOStateMachine) Apply(data []byte) any {
-    if len(data) == 0 || data[0] != raftEncodeHLCLease {
-        return nil
+    if len(data) != hlcLeaseEntryLen {
+        return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+            "expected %d bytes, got %d", hlcLeaseEntryLen, len(data))
     }
-    return f.applyHLCLease(data[1:])
+    if data[0] != raftEncodeHLCLease {
+        return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+            "unexpected tag 0x%02x", data[0])
+    }
+    ceiling := int64(binary.BigEndian.Uint64(data[1:]))
+    if f.hlc != nil && ceiling > 0 {
+        f.hlc.SetPhysicalCeiling(ceiling)
+    }
+    return nil
 }
 
 // Snapshot serialises the ceiling as 8 big-endian bytes.
