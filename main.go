@@ -236,7 +236,7 @@ var (
 	// HTTP endpoints (host:port or scheme://host:port). When set,
 	// the admin keyviz handler aggregates the local matrix with
 	// peer responses; when empty, behaviour is unchanged
-	// (single-node view). See docs/design/2026_04_27_proposed_keyviz_cluster_fanout.md.
+	// (single-node view). See docs/design/2026_04_27_implemented_keyviz_cluster_fanout.md.
 	keyvizFanoutNodes   = flag.String("keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
 	keyvizFanoutTimeout = flag.Duration("keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
 )
@@ -269,6 +269,11 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 // cadence. Accepts any time.ParseDuration string. Invalid values log a
 // warning and fall through to the default.
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
+
+const (
+	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+)
 
 const bytesPerMiB = 1024 * 1024
 
@@ -335,6 +340,45 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 		}
 	}
 	return cfg, true
+}
+
+func enabledEnv(name string) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("invalid "+name+"; using default",
+			"value", raw,
+			"default", true,
+		)
+		return true
+	}
+	return enabled
+}
+
+func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) {
+	if enabledEnv(lockResolverEnabledEnvVar) {
+		lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
+		cleanup.Add(func() { lockResolver.Close() })
+		return
+	}
+	slog.Info("background lock resolver disabled", "env", lockResolverEnabledEnvVar)
+}
+
+func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
+	if enabledEnv(fsmCompactorEnabledEnvVar) {
+		compactor := kv.NewFSMCompactor(
+			fsmCompactionRuntimes(runtimes),
+			kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+		)
+		eg.Go(func() error {
+			return compactor.Run(ctx)
+		})
+		return
+	}
+	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
 func run() error {
@@ -445,8 +489,7 @@ func run() error {
 		}
 	})
 	cleanup.Add(cancel)
-	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
-	cleanup.Add(func() { lockResolver.Close() })
+	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
 	sampler := buildKeyVizSampler()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
@@ -506,13 +549,7 @@ func run() error {
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
-	compactor := kv.NewFSMCompactor(
-		fsmCompactionRuntimes(runtimes),
-		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
-	)
-	eg.Go(func() error {
-		return compactor.Run(runCtx)
-	})
+	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete

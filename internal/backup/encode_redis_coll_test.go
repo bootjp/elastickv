@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -620,6 +621,68 @@ func TestRedisEncodeStreamRoundTripViaDecode(t *testing.T) {
 	}
 	if meta.ExpireAtMs == nil || *meta.ExpireAtMs != expireMs {
 		t.Fatalf("meta.expire_at_ms = %v, want %d", meta.ExpireAtMs, expireMs)
+	}
+}
+
+func TestRedisEncodeCollectionTTLsAreInlineInMeta(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const expireMs uint64 = 1_700_000_000_321
+	exp := expireMs
+
+	hashKey := []byte("hash-inline-ttl")
+	hashEnc := EncodeSegment(hashKey)
+	writeRedisFile(t, in, filepath.Join("hashes", hashEnc+".json"),
+		buildHashJSON(t, map[string]string{"field": "value"}, &exp))
+
+	setKey := []byte("set-inline-ttl")
+	setEnc := EncodeSegment(setKey)
+	writeRedisFile(t, in, filepath.Join("sets", setEnc+".json"),
+		buildSetJSON(t, []string{"member"}, &exp))
+
+	listKey := []byte("list-inline-ttl")
+	listEnc := EncodeSegment(listKey)
+	writeRedisFile(t, in, filepath.Join("lists", listEnc+".json"),
+		buildListJSON(t, []string{"a", "b"}, &exp))
+
+	zsetKey := []byte("zset-inline-ttl")
+	zsetEnc := EncodeSegment(zsetKey)
+	writeRedisFile(t, in, filepath.Join("zsets", zsetEnc+".json"),
+		buildZSetJSON(t, map[string]float64{"member": 1}, &exp))
+
+	streamKey := []byte("stream-inline-ttl")
+	streamEnc := EncodeSegment(streamKey)
+	entries := []streamTestEntry{{id: "1714400000000-0", fields: [][2]string{{"field", "value"}}}}
+	writeRedisFile(t, in, filepath.Join("streams", streamEnc+".jsonl"),
+		buildStreamJSONL(t, entries, 1714400000000, 0, &exp))
+
+	b := newSnapshotBuilder(redisEncTS)
+	if err := NewRedisEncoder(in, 0).Encode(b); err != nil {
+		t.Fatalf("RedisEncoder.Encode: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		metaKey   []byte
+		wantLen   int
+		ttlOffset int
+	}{
+		{name: "hash", metaKey: wideColMetaKey(RedisHashMetaPrefix, hashKey), wantLen: redisCountMetaInlineBytes, ttlOffset: redisUint64Bytes},
+		{name: "set", metaKey: wideColMetaKey(RedisSetMetaPrefix, setKey), wantLen: redisCountMetaInlineBytes, ttlOffset: redisUint64Bytes},
+		{name: "list", metaKey: buildListMetaKey(listKey), wantLen: listMetaInlineTTLSize, ttlOffset: listMetaBinarySize},
+		{name: "zset", metaKey: wideColMetaKey(RedisZSetMetaPrefix, zsetKey), wantLen: redisCountMetaInlineBytes, ttlOffset: redisUint64Bytes},
+		{name: "stream", metaKey: wideColMetaKey(RedisStreamMetaPrefix, streamKey), wantLen: redisStreamMetaInlineTTLSize, ttlOffset: redisStreamMetaSize},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := snapshotUserValueForKey(t, b, tc.metaKey)
+			if len(got) != tc.wantLen {
+				t.Fatalf("%s meta length = %d, want %d", tc.name, len(got), tc.wantLen)
+			}
+			if gotMs := binary.BigEndian.Uint64(got[tc.ttlOffset : tc.ttlOffset+redisUint64Bytes]); gotMs != expireMs {
+				t.Fatalf("%s meta ttl = %d, want %d", tc.name, gotMs, expireMs)
+			}
+		})
 	}
 }
 

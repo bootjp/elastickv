@@ -481,10 +481,11 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 	nonStringInternal := false
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
 		ttlKey = userKey
-		// Non-string internal keys (!redis|hash|, !redis|set|, …) can never
-		// carry an embedded-TTL payload, so we can skip the !redis|str| probe
-		// that ttlAt would otherwise make.
-		nonStringInternal = !bytes.HasPrefix(key, []byte(redisStrPrefix))
+		// Non-string internal keys (!redis|hash|, !redis|set|, …) can skip the
+		// embedded-TTL probe. HLL is reported as a Redis string and now carries
+		// inline TTL in its own anchor, so it must use ttlAt's full probe chain.
+		nonStringInternal = !bytes.HasPrefix(key, []byte(redisStrPrefix)) &&
+			!bytes.HasPrefix(key, []byte(redisHLLPrefix))
 	}
 	expired, err := r.hasExpired(ctx, ttlKey, readTS, nonStringInternal)
 	if err != nil {
