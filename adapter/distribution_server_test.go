@@ -323,38 +323,61 @@ func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *
 func TestDistributionServerSplitRange_DoesNotRecordNonFilesystemNormalizedBoundary(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	baseStore := store.NewMVCCStore()
-	catalog := distribution.NewCatalogStore(baseStore)
 	routeStart := []byte("queue")
-	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+	tests := []struct {
+		name     string
+		splitKey []byte
+	}{
 		{
-			RouteID: 1,
-			Start:   routeStart,
-			End:     []byte("queuez"),
-			GroupID: 1,
-			State:   distribution.RouteStateActive,
+			name:     "list item",
+			splitKey: store.ListItemKey(routeStart, 1),
 		},
-	})
-	require.NoError(t, err)
+		{
+			name:     "txn wrapped list item",
+			splitKey: append([]byte(kv.TxnKeyPrefix+"lock|"), store.ListItemKey(routeStart, 1)...),
+		},
+		{
+			name:     "txn wrapped redis internal key",
+			splitKey: []byte(kv.TxnKeyPrefix + "lock|!redis|string|queue"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	observer := &recordingDistributionFilesystemObserver{}
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		catalog,
-		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
-		WithDistributionFilesystemObserver(observer),
-	)
+			ctx := context.Background()
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+				{
+					RouteID: 1,
+					Start:   routeStart,
+					End:     []byte("queuez"),
+					GroupID: 1,
+					State:   distribution.RouteStateActive,
+				},
+			})
+			require.NoError(t, err)
 
-	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
-		ExpectedCatalogVersion: saved.Version,
-		RouteId:                1,
-		SplitKey:               store.ListItemKey(routeStart, 1),
-	})
-	require.Error(t, err)
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
-	require.Empty(t, observer.reasons)
+			observer := &recordingDistributionFilesystemObserver{}
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+				WithDistributionFilesystemObserver(observer),
+			)
+
+			_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               tt.splitKey,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+			require.Empty(t, observer.reasons)
+		})
+	}
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {

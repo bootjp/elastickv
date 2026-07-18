@@ -168,6 +168,34 @@ func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
 	}
 }
 
+func TestAdapterKeepsCreatedHandlesAliveWhileIdle(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{
+		createResult: filesystem.CreateResult{Inode: 7, FH: 9},
+		refreshCh:    make(chan openHandleRefresh, 4),
+	}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(10*time.Millisecond))
+	t.Cleanup(adapter.Close)
+
+	result, errno := adapter.Create(ctx, filesystem.RootInode, []byte("file"), filesystem.CreateOptions{
+		Mode: 0o644,
+		UID:  1000,
+		GID:  1000,
+	})
+	require.Zero(t, errno)
+	require.EqualValues(t, 7, result.Inode)
+	require.EqualValues(t, 9, result.FH)
+
+	select {
+	case got := <-core.refreshCh:
+		require.EqualValues(t, 7, got.inode)
+		require.EqualValues(t, 9, got.fh)
+		require.Equal(t, []byte("fuse-session"), got.clientID)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for created handle keepalive")
+	}
+}
+
 func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {
 	ctx := context.Background()
 	core := &fakeCore{
@@ -202,6 +230,18 @@ func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {
 			t.Fatalf("timed out waiting for refreshes: blocked=%v second=%v", sawBlocked, sawSecond)
 		}
 	}
+}
+
+func TestAdapterKeepaliveUntracksMissingHandles(t *testing.T) {
+	ctx := context.Background()
+	core := &fakeCore{refreshErr: filesystem.ErrNotFound}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(time.Hour))
+	t.Cleanup(adapter.Close)
+	adapter.trackOpenHandle(7, 9)
+
+	adapter.refreshTrackedOpenHandles(ctx)
+
+	require.Empty(t, adapter.openHandleSnapshot())
 }
 
 type openHandleRefresh struct {
