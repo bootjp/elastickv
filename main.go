@@ -1672,6 +1672,7 @@ func setupAdminService(
 	srv, icept, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
+		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
 	)
@@ -1829,6 +1830,14 @@ func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	return 0
 }
 
+func (c startupGatedCoordinator) RaftMembers(ctx context.Context) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembers(ctx) //nolint:wrapcheck // Preserve membership lookup errors.
+}
+
 func (c startupGatedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]kv.RaftMember, error) {
 	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
 	if !ok {
@@ -1918,6 +1927,7 @@ func startupRotationGatedMethod(fullMethod string) bool {
 func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
+	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
@@ -1936,7 +1946,10 @@ func configureAdminService(
 		token = loaded
 	}
 	srv := adapter.NewAdminServer(self, members)
-	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability() && token != "")
+	srv.SetCapability(
+		adapter.S3BlobOffloadCapabilityName,
+		s3BlobOffloadAdminCapability(token, s3BlobOffloadEnabled),
+	)
 	unary, stream := adapter.AdminTokenAuth(token)
 	var icept adminGRPCInterceptors
 	if unary != nil {
@@ -1947,6 +1960,10 @@ func configureAdminService(
 	}
 	icept.s3BlobFetchEnabled = token != ""
 	return srv, icept, nil
+}
+
+func s3BlobOffloadAdminCapability(token string, enabled bool) bool {
+	return adapter.S3BlobOffloadLocalCapability() && enabled && token != ""
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound

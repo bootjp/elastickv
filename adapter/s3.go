@@ -352,7 +352,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		leaderS3:           cloneLeaderAddrMap(leaderS3),
 		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
 		putAdmission:       newS3PutAdmissionFromEnv(),
-		blobOffloadEnabled: newS3BlobOffloadEnabledFromEnv(),
+		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
 	}
 	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
 		s.blobLocalStores = localStores

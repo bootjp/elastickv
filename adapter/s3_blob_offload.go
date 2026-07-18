@@ -131,7 +131,9 @@ func S3BlobMinReplicasFromEnv() (int, error) {
 	return minReplicas, nil
 }
 
-func newS3BlobOffloadEnabledFromEnv() bool {
+// S3BlobOffloadEnabledFromEnv returns the local rollout flag used by both the
+// S3 write path and the Admin capability advertisement.
+func S3BlobOffloadEnabledFromEnv() bool {
 	raw, ok := os.LookupEnv(s3BlobOffloadEnvVar)
 	if !ok {
 		return false

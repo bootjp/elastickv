@@ -309,6 +309,17 @@ func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, cluster.Close()) })
 	require.True(t, cluster.AllPeersSupportS3BlobOffload(context.Background()))
 
+	mixedGroups := staticS3BlobMembership{
+		members: members.members,
+		allMembers: append(append([]kv.RaftMember(nil), members.members...), kv.RaftMember{
+			NodeID: "n3", Address: "127.0.0.1:1", Suffrage: "voter",
+		}),
+	}
+	mixedCluster := NewGRPCS3BlobCluster("n1", mixedGroups, "peer-secret")
+	t.Cleanup(func() { require.NoError(t, mixedCluster.Close()) })
+	require.False(t, mixedCluster.AllPeersSupportS3BlobOffload(context.Background()),
+		"a peer outside the chunk's sample group must keep rollout fail-closed")
+
 	payload := []byte("authenticated-peer-transfer")
 	digest := sha256.Sum256(payload)
 	replica := S3BlobReplica{NodeID: "n2", Address: listener.Addr().String(), Suffrage: "voter"}
@@ -323,8 +334,92 @@ func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 }
 
+func TestGRPCS3BlobClusterCapabilityPollHasPerPeerTimeout(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterAdminServer(server, blockingS3BlobAdminServer{})
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		serveErr := <-serveDone
+		require.True(t, serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped))
+	})
+
+	members := staticS3BlobMembership{members: []kv.RaftMember{
+		{NodeID: "n1", Address: "127.0.0.1:1", Suffrage: "voter"},
+		{NodeID: "n2", Address: listener.Addr().String(), Suffrage: "voter"},
+	}}
+	cluster := requireGRPCS3BlobCluster(t, "peer-secret")
+	cluster.members = members
+	cluster.capTimeout = 50 * time.Millisecond
+	start := time.Now()
+	require.False(t, cluster.AllPeersSupportS3BlobOffload(context.Background()))
+	require.Less(t, time.Since(start), time.Second)
+}
+
+func TestGRPCS3BlobClusterFetchHasPeerTimeout(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterS3BlobFetchServer(server, blockingS3BlobFetchServer{})
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		serveErr := <-serveDone
+		require.True(t, serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped))
+	})
+
+	cluster := requireGRPCS3BlobCluster(t, "peer-secret")
+	cluster.rpcTimeout = 50 * time.Millisecond
+	start := time.Now()
+	_, err = cluster.FetchChunkBlob(context.Background(), S3BlobReplica{
+		NodeID: "n2", Address: listener.Addr().String(), Suffrage: "voter",
+	}, sha256.Sum256([]byte("missing")))
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Less(t, time.Since(start), time.Second)
+}
+
+type blockingS3BlobAdminServer struct {
+	pb.UnimplementedAdminServer
+}
+
+func (blockingS3BlobAdminServer) GetClusterOverview(
+	ctx context.Context,
+	_ *pb.GetClusterOverviewRequest,
+) (*pb.GetClusterOverviewResponse, error) {
+	<-ctx.Done()
+	return nil, errors.WithStack(ctx.Err())
+}
+
+type blockingS3BlobFetchServer struct {
+	pb.UnimplementedS3BlobFetchServer
+}
+
+func (blockingS3BlobFetchServer) FetchChunkBlob(
+	_ *pb.FetchChunkBlobRequest,
+	stream pb.S3BlobFetch_FetchChunkBlobServer,
+) error {
+	<-stream.Context().Done()
+	return errors.WithStack(stream.Context().Err())
+}
+
 type staticS3BlobMembership struct {
-	members []kv.RaftMember
+	members    []kv.RaftMember
+	allMembers []kv.RaftMember
+}
+
+func (m staticS3BlobMembership) RaftMembers(context.Context) ([]kv.RaftMember, error) {
+	if m.allMembers != nil {
+		return append([]kv.RaftMember(nil), m.allMembers...), nil
+	}
+	return append([]kv.RaftMember(nil), m.members...), nil
 }
 
 func (m staticS3BlobMembership) RaftMembersForKey(context.Context, []byte) ([]kv.RaftMember, error) {

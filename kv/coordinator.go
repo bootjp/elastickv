@@ -332,10 +332,11 @@ type RaftMember struct {
 }
 
 // RaftMembershipCoordinator is the optional capability implemented by
-// coordinators that can expose the current membership of a key's owning Raft
-// group. It does not establish a read fence; callers must use it only for peer
+// coordinators that can expose both cluster-wide and per-key Raft membership.
+// It does not establish a read fence; callers must use it only for peer
 // discovery and keep correctness decisions behind their own quorum checks.
 type RaftMembershipCoordinator interface {
+	RaftMembers(ctx context.Context) ([]RaftMember, error)
 	RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error)
 }
 

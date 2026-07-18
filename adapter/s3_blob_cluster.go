@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal"
-	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -22,7 +21,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const s3BlobCapabilityRefreshInterval = 30 * time.Second
+const (
+	s3BlobCapabilityRefreshInterval = 30 * time.Second
+	s3BlobCapabilityPollTimeout     = 3 * time.Second
+	s3BlobPeerRPCTimeout            = 30 * time.Second
+)
 
 // S3BlobReplica is a peer endpoint in the Raft group that owns a chunkblob.
 type S3BlobReplica struct {
@@ -55,6 +58,8 @@ type grpcS3BlobCluster struct {
 	members    kv.RaftMembershipCoordinator
 	adminToken string
 	now        func() time.Time
+	capTimeout time.Duration
+	rpcTimeout time.Duration
 
 	mu          sync.Mutex
 	conns       map[string]*grpc.ClientConn
@@ -77,6 +82,8 @@ func NewGRPCS3BlobCluster(selfNodeID string, members kv.RaftMembershipCoordinato
 		members:    members,
 		adminToken: adminToken,
 		now:        time.Now,
+		capTimeout: s3BlobCapabilityPollTimeout,
+		rpcTimeout: s3BlobPeerRPCTimeout,
 		conns:      map[string]*grpc.ClientConn{},
 	}
 }
@@ -118,11 +125,14 @@ func (c *grpcS3BlobCluster) ReplicasForChunk(ctx context.Context, chunkKey []byt
 }
 
 func (c *grpcS3BlobCluster) AllPeersSupportS3BlobOffload(ctx context.Context) bool {
-	if c == nil || c.adminToken == "" || !S3BlobOffloadLocalCapability() {
+	if c == nil || c.adminToken == "" || c.members == nil || !S3BlobOffloadLocalCapability() {
 		return false
 	}
-	var zeroDigest [s3ChunkBlobSHA256Bytes]byte
-	replicas, err := c.ReplicasForChunk(ctx, s3keys.ChunkBlobKey(zeroDigest))
+	members, err := c.members.RaftMembers(ctx)
+	if err != nil {
+		return false
+	}
+	replicas, err := s3BlobCapabilityReplicas(members)
 	if err != nil {
 		return false
 	}
@@ -134,6 +144,34 @@ func (c *grpcS3BlobCluster) AllPeersSupportS3BlobOffload(ctx context.Context) bo
 	allSupport := c.pollCapabilities(ctx, replicas)
 	c.storeCapability(fingerprint, now.Add(s3BlobCapabilityRefreshInterval), allSupport)
 	return allSupport
+}
+
+func s3BlobCapabilityReplicas(members []kv.RaftMember) ([]S3BlobReplica, error) {
+	seen := make(map[string]struct{}, len(members))
+	replicas := make([]S3BlobReplica, 0, len(members))
+	for _, member := range members {
+		nodeID := strings.TrimSpace(member.NodeID)
+		address := strings.TrimSpace(member.Address)
+		if nodeID == "" || address == "" {
+			return nil, errors.New("s3 blob cluster membership contains an empty node id or address")
+		}
+		endpoint := nodeID + "\x00" + address
+		if _, duplicate := seen[endpoint]; duplicate {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		replicas = append(replicas, S3BlobReplica{NodeID: nodeID, Address: address, Suffrage: member.Suffrage})
+	}
+	if len(replicas) == 0 {
+		return nil, errors.New("s3 blob cluster membership is empty")
+	}
+	sort.Slice(replicas, func(i, j int) bool {
+		if replicas[i].NodeID == replicas[j].NodeID {
+			return replicas[i].Address < replicas[j].Address
+		}
+		return replicas[i].NodeID < replicas[j].NodeID
+	})
+	return replicas, nil
 }
 
 func s3BlobReplicaFingerprint(replicas []S3BlobReplica) string {
@@ -165,21 +203,39 @@ func (c *grpcS3BlobCluster) storeCapability(fingerprint string, expiresAt time.T
 }
 
 func (c *grpcS3BlobCluster) pollCapabilities(ctx context.Context, replicas []S3BlobReplica) bool {
+	remote := make([]S3BlobReplica, 0, len(replicas))
 	for _, replica := range replicas {
-		if replica.NodeID == c.selfNodeID {
-			continue
+		if replica.NodeID != c.selfNodeID {
+			remote = append(remote, replica)
 		}
-		conn, err := c.connFor(replica.Address)
-		if err != nil {
-			return false
-		}
-		callCtx := c.authorizedContext(ctx)
-		resp, err := pb.NewAdminClient(conn).GetClusterOverview(callCtx, &pb.GetClusterOverviewRequest{})
-		if err != nil || resp.GetSelf().GetNodeId() != replica.NodeID || !resp.GetCapabilities()[S3BlobOffloadCapabilityName] {
+	}
+	results := make(chan bool, len(remote))
+	for _, replica := range remote {
+		go func() {
+			results <- c.peerSupportsS3BlobOffload(ctx, replica)
+		}()
+	}
+	for range remote {
+		if !<-results {
 			return false
 		}
 	}
 	return true
+}
+
+func (c *grpcS3BlobCluster) peerSupportsS3BlobOffload(ctx context.Context, replica S3BlobReplica) bool {
+	conn, err := c.connFor(replica.Address)
+	if err != nil {
+		return false
+	}
+	timeout := c.capTimeout
+	if timeout <= 0 {
+		timeout = s3BlobCapabilityPollTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := pb.NewAdminClient(conn).GetClusterOverview(c.authorizedContext(callCtx), &pb.GetClusterOverviewRequest{})
+	return err == nil && resp.GetSelf().GetNodeId() == replica.NodeID && resp.GetCapabilities()[S3BlobOffloadCapabilityName]
 }
 
 func (c *grpcS3BlobCluster) PushChunkBlob(ctx context.Context, replica S3BlobReplica, digest [s3ChunkBlobSHA256Bytes]byte, payload []byte, commitTS uint64) error {
@@ -190,7 +246,9 @@ func (c *grpcS3BlobCluster) PushChunkBlob(ctx context.Context, replica S3BlobRep
 	if err != nil {
 		return err
 	}
-	stream, err := pb.NewS3BlobFetchClient(conn).PushChunkBlob(c.authorizedContext(ctx))
+	callCtx, cancel := c.peerRPCContext(ctx)
+	defer cancel()
+	stream, err := pb.NewS3BlobFetchClient(conn).PushChunkBlob(c.authorizedContext(callCtx))
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -236,7 +294,9 @@ func (c *grpcS3BlobCluster) FetchChunkBlob(ctx context.Context, replica S3BlobRe
 	if err != nil {
 		return nil, err
 	}
-	stream, err := pb.NewS3BlobFetchClient(conn).FetchChunkBlob(c.authorizedContext(ctx), &pb.FetchChunkBlobRequest{ContentSha256: digest[:]})
+	callCtx, cancel := c.peerRPCContext(ctx)
+	defer cancel()
+	stream, err := pb.NewS3BlobFetchClient(conn).FetchChunkBlob(c.authorizedContext(callCtx), &pb.FetchChunkBlobRequest{ContentSha256: digest[:]})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -267,6 +327,14 @@ func (c *grpcS3BlobCluster) FetchChunkBlob(ctx context.Context, replica S3BlobRe
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "s3 chunkblob fetch sha256 mismatch"))
 	}
 	return payload, nil
+}
+
+func (c *grpcS3BlobCluster) peerRPCContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.rpcTimeout
+	if timeout <= 0 {
+		timeout = s3BlobPeerRPCTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (c *grpcS3BlobCluster) authorizedContext(ctx context.Context) context.Context {

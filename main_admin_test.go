@@ -33,7 +33,7 @@ import (
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", false, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, adapter.NodeIdentity{}, nil); err == nil {
+	if _, _, err := configureAdminService(tokPath, true, false, adapter.NodeIdentity{}, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -61,7 +61,7 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService(tokPath, false, true, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
@@ -75,11 +75,41 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if !icept.s3BlobFetchEnabled {
 		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
 	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if !overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("enabled authenticated configuration should advertise S3 blob offload")
+	}
+}
+
+func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "t")
+	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, icept, err := configureAdminService(tokPath, false, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	if err != nil {
+		t.Fatalf("configureAdminService: %v", err)
+	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("rollback mode must retain authenticated blob reads")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("disabled rollout flag must remove S3 blob offload capability")
+	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", true, true, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
