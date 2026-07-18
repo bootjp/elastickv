@@ -223,6 +223,10 @@ func TestServiceWriteReadAtSaturatedFinalChunkBoundary(t *testing.T) {
 	got, err := svc.Read(ctx, created.Inode, 0, offset, uint64(len(want)))
 	require.NoError(t, err)
 	require.Equal(t, want, got)
+
+	got, err = svc.Read(ctx, created.Inode, 0, offset+1, uint64(len(want))+1)
+	require.NoError(t, err)
+	require.Equal(t, want[1:], got)
 }
 
 func TestServiceReadTSUsesMVCCTimestampAfterLinearizableFence(t *testing.T) {

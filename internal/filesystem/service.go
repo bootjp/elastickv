@@ -574,10 +574,7 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	if offset >= meta.Size || size == 0 {
 		return []byte{}, nil
 	}
-	end, err := boundedEnd(offset, size, meta.Size)
-	if err != nil {
-		return nil, err
-	}
+	end := boundedEnd(offset, size, meta.Size)
 	outLen, err := checkedInt(end - offset)
 	if err != nil {
 		return nil, err
@@ -2548,15 +2545,12 @@ func (m InodeMeta) effectiveChunkSize(fallback uint64) uint64 {
 	return fallback
 }
 
-func boundedEnd(offset uint64, size uint64, fileSize uint64) (uint64, error) {
-	end, overflow := addUint64(offset, size)
-	if overflow {
-		return 0, ErrInvalid
-	}
+func boundedEnd(offset uint64, size uint64, fileSize uint64) uint64 {
+	end := saturatingAddUint64(offset, size)
 	if end > fileSize {
 		end = fileSize
 	}
-	return end, nil
+	return end
 }
 
 func addUint64(a uint64, b uint64) (uint64, bool) {

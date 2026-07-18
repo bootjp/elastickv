@@ -402,6 +402,7 @@ func filesystemChunkScanOverlap(start []byte, end []byte) ([]byte, []byte, bool)
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	seenGroups := make(map[uint64]struct{})
+	filterUsageOwners := !clampToRoutes && filesystemUsageScanOverlap(start, end)
 	for _, route := range routes {
 		if !clampToRoutes {
 			if _, seen := seenGroups[route.GroupID]; seen {
@@ -420,6 +421,9 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, explicitGroup)
 		if err != nil {
 			return nil, err
+		}
+		if filterUsageOwners {
+			kvs = s.filterFilesystemUsageKVsForGroup(kvs, route.GroupID)
 		}
 		if clampToRoutes {
 			out = append(out, kvs...)
@@ -451,6 +455,7 @@ func (s *ShardStore) scanRoutesAtSorted(ctx context.Context, routes []distributi
 func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([][]byte, error) {
 	out := make([][]byte, 0)
 	seenGroups := make(map[uint64]struct{})
+	filterUsageOwners := !clampToRoutes && filesystemUsageScanOverlap(start, end)
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
@@ -468,6 +473,9 @@ func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.
 		if err != nil {
 			return nil, err
 		}
+		if filterUsageOwners {
+			keys = s.filterFilesystemUsageKeysForGroup(keys, route.GroupID)
+		}
 		if clampToRoutes {
 			out = mergeAndTrimScanKeys(out, keys, limit)
 			if len(out) >= limit {
@@ -478,6 +486,35 @@ func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.
 		out = mergeAndTrimScanKeys(out, keys, limit)
 	}
 	return out, nil
+}
+
+func (s *ShardStore) filterFilesystemUsageKVsForGroup(kvs []*store.KVPair, groupID uint64) []*store.KVPair {
+	write := 0
+	for _, pair := range kvs {
+		if pair == nil || !fskeys.IsUsageRouteKey(pair.Key) || s.filesystemUsageKeyOwnedByGroup(pair.Key, groupID) {
+			kvs[write] = pair
+			write++
+		}
+	}
+	clear(kvs[write:])
+	return kvs[:write]
+}
+
+func (s *ShardStore) filterFilesystemUsageKeysForGroup(keys [][]byte, groupID uint64) [][]byte {
+	write := 0
+	for _, key := range keys {
+		if !fskeys.IsUsageRouteKey(key) || s.filesystemUsageKeyOwnedByGroup(key, groupID) {
+			keys[write] = key
+			write++
+		}
+	}
+	clear(keys[write:])
+	return keys[:write]
+}
+
+func (s *ShardStore) filesystemUsageKeyOwnedByGroup(key []byte, groupID uint64) bool {
+	owner, ok := s.engine.GetRoute(routeKey(key))
+	return ok && owner.GroupID == groupID
 }
 
 func (s *ShardStore) reverseScanRoutesAt(
@@ -491,6 +528,7 @@ func (s *ShardStore) reverseScanRoutesAt(
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
 	seenGroups := make(map[uint64]struct{})
+	filterUsageOwners := !clampToRoutes && filesystemUsageScanOverlap(start, end)
 	for i := len(routes) - 1; i >= 0; i-- {
 		route := routes[i]
 		if clampToRoutes {
@@ -518,6 +556,9 @@ func (s *ShardStore) reverseScanRoutesAt(
 		kvs, err := s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true, true)
 		if err != nil {
 			return nil, err
+		}
+		if filterUsageOwners {
+			kvs = s.filterFilesystemUsageKVsForGroup(kvs, route.GroupID)
 		}
 		out = mergeAndTrimReverseScanResults(out, kvs, limit)
 	}

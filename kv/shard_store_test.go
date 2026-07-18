@@ -926,14 +926,26 @@ func TestShardStoreScanAt_RoutesFilesystemUsageCountersAcrossRouteGroups(t *test
 	st := NewShardStore(engine, groups)
 
 	key := fskeys.UsageRouteKey(fskeys.InodeKey(22))
+	staleOnlyKey := fskeys.UsageRouteKey(fskeys.InodeKey(23))
 	require.NoError(t, st.PutAt(ctx, key, []byte("usage"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("stale"), 2, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, staleOnlyKey, []byte("stale-only"), 2, 0))
 
-	_, err := groups[2].Store.GetAt(ctx, key, ^uint64(0))
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	kvs, err := st.ScanAt(ctx, usagePrefix, prefixScanEnd(usagePrefix), 10, ^uint64(0))
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, []byte("usage"), kvs[0].Value)
+
+	keys, err := st.ScanKeysAt(ctx, usagePrefix, prefixScanEnd(usagePrefix), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{key}, keys)
+
+	kvs, err = st.ReverseScanAt(ctx, usagePrefix, prefixScanEnd(usagePrefix), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, []byte("usage"), kvs[0].Value)
 }
 
 func TestShardStoreScanAt_RoutesFilesystemChunkSubrangeByChunkRouteKey(t *testing.T) {
