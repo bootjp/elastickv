@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -195,6 +196,47 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 	require.EqualValues(t, tsoSnapshotV2Len, n)
 	require.Equal(t, uint64(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[:hlcLeasePayloadLen]))
 	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[hlcLeasePayloadLen:]))
+}
+
+func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
+	const ceilingMs = int64(1_700_000_123_456)
+	tests := []struct {
+		name string
+		opts []FSMOption
+	}{
+		{name: "v1"},
+		{name: "v2", opts: []FSMOption{WithCutoverSource(&staticCutoverSource{v: 42})}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyClock := NewHLC()
+			legacyClock.SetPhysicalCeiling(ceilingMs)
+			legacyFSM := NewKvFSMWithHLC(store.NewMVCCStore(), legacyClock, tc.opts...)
+			legacySnapshot, err := legacyFSM.Snapshot()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, legacySnapshot.Close()) })
+
+			var legacy bytes.Buffer
+			_, err = legacySnapshot.WriteTo(&legacy)
+			require.NoError(t, err)
+
+			targetClock := NewHLC()
+			target := NewTSOStateMachine(targetClock)
+			require.NoError(t, target.Restore(bytes.NewReader(legacy.Bytes())))
+			require.Equal(t, ceilingMs, targetClock.PhysicalCeiling())
+			require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), targetClock.Current())
+
+			got, err := target.Snapshot()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, got.Close()) })
+			var payload bytes.Buffer
+			_, err = got.WriteTo(&payload)
+			require.NoError(t, err)
+			require.Len(t, payload.Bytes(), tsoSnapshotV2Len)
+			require.Equal(t, uint64(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[:hlcLeasePayloadLen]))
+			require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[hlcLeasePayloadLen:]))
+		})
+	}
 }
 
 func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {

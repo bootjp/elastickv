@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
 	"sync/atomic"
@@ -94,9 +95,31 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	if r == nil {
 		return errors.New("tso fsm snapshot: reader is nil")
 	}
-	payload, err := io.ReadAll(io.LimitReader(r, tsoSnapshotV2Len+1))
+	br := tsoSnapshotReader(r)
+	if legacy, err := restoreLegacyKVFSMSnapshot(f, br); legacy || err != nil {
+		return err
+	}
+	ceilingMs, allocationFloor, err := readTSOSnapshotState(br)
 	if err != nil {
-		return errors.Wrap(err, "restore tso fsm snapshot")
+		return err
+	}
+	if f != nil {
+		f.restoreSnapshotState(ceilingMs, allocationFloor)
+	}
+	return nil
+}
+
+func tsoSnapshotReader(r io.Reader) *bufio.Reader {
+	if br, ok := r.(*bufio.Reader); ok {
+		return br
+	}
+	return bufio.NewReader(r)
+}
+
+func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, error) {
+	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV2Len+1))
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "restore tso fsm snapshot")
 	}
 	var ceilingMs int64
 	var allocationFloor uint64
@@ -109,18 +132,59 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
 		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:])
 	default:
-		return errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: expected %d or %d bytes, got %d", tsoSnapshotV1Len, tsoSnapshotV2Len, len(payload))
+		return 0, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: expected %d or %d bytes, got %d", tsoSnapshotV1Len, tsoSnapshotV2Len, len(payload))
 	}
 	if ceilingMs < 0 {
-		return errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+		return 0, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
 	}
 	if legacySnapshot && ceilingMs > 0 {
 		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
 	}
-	if f != nil {
-		f.restoreSnapshotState(ceilingMs, allocationFloor)
+	return ceilingMs, allocationFloor, nil
+}
+
+// restoreLegacyKVFSMSnapshot migrates snapshots produced while reserved group
+// 0 still used kvFSM as a compatibility bridge. Only the HLC header is TSO
+// state; the empty MVCC payload is drained so the raft engine can verify the
+// complete snapshot CRC. Non-kvFSM snapshots are left untouched in br.
+func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, error) {
+	legacy, err := hasLegacyKVFSMSnapshotHeader(br)
+	if err != nil || !legacy {
+		return legacy, err
 	}
-	return nil
+	ceiling, _, err := ReadSnapshotHeader(br)
+	if err != nil {
+		return true, errors.Wrap(err, "tso fsm snapshot: read legacy kv fsm header")
+	}
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return true, errors.Wrap(err, "tso fsm snapshot: drain legacy kv fsm payload")
+	}
+	ceilingMs := int64(ceiling) //nolint:gosec // validated below before use.
+	if ceilingMs < 0 {
+		return true, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative legacy ceiling %d", ceilingMs)
+	}
+	if f == nil || ceilingMs == 0 {
+		return true, nil
+	}
+	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs))
+	return true, nil
+}
+
+func hasLegacyKVFSMSnapshotHeader(br *bufio.Reader) (bool, error) {
+	peeked, err := br.Peek(len(hlcSnapshotMagic))
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, errors.Wrap(err, "tso fsm snapshot: peek legacy header")
+	}
+	switch {
+	case isV1Magic(peeked):
+		return true, nil
+	case isV2Magic(peeked):
+		return true, nil
+	case isUnknownEKVTHLC(peeked):
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {

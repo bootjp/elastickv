@@ -1054,104 +1054,147 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
 	multi = effectiveMultiDataDirs(groups, multi)
+	builder := shardGroupBuilder{
+		raftID:                   raftID,
+		raftDir:                  raftDir,
+		multi:                    multi,
+		bootstrap:                bootstrap,
+		bootstrapCfg:             bootstrapCfg,
+		factory:                  factory,
+		proposalObserverForGroup: proposalObserverForGroup,
+		clock:                    clock,
+		kekWrapper:               kekWrapper,
+		keystore:                 keystore,
+		sidecarPath:              sidecarPath,
+		encWiring:                encWiring,
+		routeEngine:              routeEngine,
+		applyObservers:           applyObservers,
+	}
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
-		dir := groupDataDir(raftDir, raftID, g.id, multi)
-		if err := os.MkdirAll(dir, dirPerm); err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", g.id)
-		}
-		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), encWiring.pebbleOptions()...)
+		runtime, sg, err := builder.build(g)
 		if err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
-		}
-		// Each shard FSM shares the same HLC so any shard's lease renewal advances
-		// the global physicalCeiling. The logical counter remains in-memory only.
-		//
-		// §6.3 EncryptionApplier wiring (Stage 6A). Constructs an
-		// Applier backed by the FSM's Pebble store and threads it
-		// into the FSM dispatch via kv.WithEncryption. The applier's
-		// ApplyBootstrap / ApplyRotation paths return ErrKEKNotConfigured
-		// until Stage 6B threads in the KEK plumbing; only
-		// ApplyRegistration is fully functional in 6A, but the gRPC
-		// mutator gate (registerEncryptionAdminServer, Stage 5D
-		// posture) keeps the operator surface inert until 6B re-enables
-		// it gated on (--encryption-enabled AND KEKConfigured()).
-		reg, err := store.WriterRegistryFor(st)
-		if err != nil {
-			for _, rt := range runtimes {
-				rt.Close()
-			}
-			_ = st.Close()
-			return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", g.id)
-		}
-		// Stage 6B-2: thread WithKEK + WithKeystore + WithSidecarPath
-		// into the Applier when all three are supplied. Without
-		// any of them the applier stays in the Stage 6A posture
-		// (ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured)
-		// which is exactly the desired apply-time fail-closed
-		// behaviour when an operator has not opted in to encryption.
-		//
-		// Stage 6D-6c-1: WithStateCache threads the process-shared
-		// StateCache so an encryption apply landing on this shard's
-		// FSM updates the atomics every shard's storage layer reads.
-		// Stage 7b' §3.1: WithLocalEpoch threads this process load's
-		// pinned storage write-path w.epoch into the Applier so
-		// applyRotateDEK (PurposeStorage) can write each node's own
-		// highest-emitted local_epoch into Keys[newDEK].LocalEpoch
-		// rather than the proposer's 0. Stage 6E does the same for
-		// raft rotations through WithRaftLocalEpoch using the raft
-		// DEK's separate per-process epoch.
-		applierOpts := encryptionApplierOptionsFor(kekWrapper, keystore, sidecarPath, encWiring)
-		applier, err := encryption.NewApplier(reg, applierOpts...)
-		if err != nil {
-			for _, rt := range runtimes {
-				rt.Close()
-			}
-			_ = st.Close()
-			return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", g.id)
-		}
-		// Composed-1 M2 plumbing: wire the shared route catalog
-		// engine and this shard's owning group ID so M3's
-		// verifyComposed1 apply-time gate can resolve the
-		// observed-version owner-of-key without further plumbing
-		// work. At M2 the FSM stores both but does not consult them;
-		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
-		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
-		groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(bootstrapCfg, g.id, bootstrap)
-		runtime, err := buildRuntimeForGroup(
-			raftID, g, raftDir, multi, groupBootstrap,
-			groupBootstrapServers, groupBootstrapSeed,
-			st, sm, factory, *raftJoinAsLearner)
-		if err != nil {
-			for _, rt := range runtimes {
-				rt.Close()
-			}
-			_ = st.Close()
-			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
+			closeRaftGroupRuntimes(runtimes)
+			return nil, nil, err
 		}
 		runtimes = append(runtimes, runtime)
-		// Stage 6E-2c: route every shard group's TransactionManager
-		// through NewLeaderProxyForShardGroup so the proposer chain
-		// consults sg.raftPayloadWrap on every Propose / ProposeAdmin.
-		// The cell is nil at startup (the Stage 3 default — payloads
-		// pass through cleartext); Stage 6E-2d's EnableRaftEnvelope
-		// handler will publish the active wrap closure the instant
-		// the cutover entry commits. Going through this constructor
-		// for every group avoids a future "I forgot to wire wrap on
-		// this code path" regression — if a new shard group bypasses
-		// this helper, the wrap install would silently no-op on
-		// proposals for that group.
-		sg := &kv.ShardGroup{
-			Engine: runtime.engine,
-			Store:  st,
-		}
-		sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id)))
 		shardGroups[g.id] = sg
 		encWiring.attachRaftEnvelopeGroup(g.id, sg)
 	}
 	return runtimes, shardGroups, nil
+}
+
+type shardGroupBuilder struct {
+	raftID                   string
+	raftDir                  string
+	multi                    bool
+	bootstrap                bool
+	bootstrapCfg             raftBootstrapConfig
+	factory                  raftengine.Factory
+	proposalObserverForGroup func(uint64) kv.ProposalObserver
+	clock                    *kv.HLC
+	kekWrapper               kek.Wrapper
+	keystore                 *encryption.Keystore
+	sidecarPath              string
+	encWiring                encryptionWriteWiring
+	routeEngine              *distribution.Engine
+	applyObservers           []kv.ApplyObserver
+}
+
+func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
+	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(b.bootstrapCfg, group.id, b.bootstrap)
+	observer := observerForGroup(b.proposalObserverForGroup, group.id)
+	if group.id == dedicatedTSORaftGroupID {
+		runtime, sg, err := buildDedicatedTSOGroup(
+			b.raftID, group, b.raftDir, b.multi, groupBootstrap,
+			groupBootstrapServers, groupBootstrapSeed,
+			b.factory, b.clock, observer,
+		)
+		return runtime, sg, errors.Wrap(err, "failed to start dedicated TSO group")
+	}
+	return b.buildDataGroup(group, groupBootstrap, groupBootstrapServers, groupBootstrapSeed, observer)
+}
+
+func (b shardGroupBuilder) buildDataGroup(
+	group groupSpec,
+	bootstrap bool,
+	bootstrapServers []raftengine.Server,
+	bootstrapSeed []raftengine.Server,
+	proposalObserver kv.ProposalObserver,
+) (*raftGroupRuntime, *kv.ShardGroup, error) {
+	dir := groupDataDir(b.raftDir, b.raftID, group.id, b.multi)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.id)
+	}
+	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.pebbleOptions()...)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.id)
+	}
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", group.id)
+	}
+	applierOpts := encryptionApplierOptionsFor(b.kekWrapper, b.keystore, b.sidecarPath, b.encWiring)
+	applier, err := encryption.NewApplier(reg, applierOpts...)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.id)
+	}
+	sm := kv.NewKvFSMWithHLC(st, b.clock, fsmOptionsForGroup(applier, b.routeEngine, group.id, b.encWiring, b.applyObservers...)...)
+	runtime, err := buildRuntimeForGroup(
+		b.raftID, group, b.raftDir, b.multi, bootstrap,
+		bootstrapServers, bootstrapSeed,
+		st, sm, b.factory, *raftJoinAsLearner,
+	)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, errors.Wrapf(err, "failed to start raft group %d", group.id)
+	}
+	// Every group goes through the wrap-aware proposer so HLC renewals and
+	// transactional proposals observe raft-envelope cutovers uniformly.
+	sg := &kv.ShardGroup{Engine: runtime.engine, Store: st}
+	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
+	return runtime, sg, nil
+}
+
+func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {
+	for _, runtime := range runtimes {
+		runtime.Close()
+	}
+}
+
+// buildDedicatedTSOGroup constructs group 0 with the minimal TSO state machine.
+// It intentionally does not open an MVCC store: shard routing validation keeps
+// user data out of group 0, while the state machine persists only its ceiling
+// and allocation floor in Raft snapshots. The ShardGroup still receives the
+// normal proposer wrapper so lease renewals participate in raft-envelope
+// cutovers exactly like data-group proposals.
+func buildDedicatedTSOGroup(
+	raftID string,
+	group groupSpec,
+	baseDir string,
+	multi bool,
+	bootstrap bool,
+	bootstrapServers []raftengine.Server,
+	bootstrapSeed []raftengine.Server,
+	factory raftengine.Factory,
+	clock *kv.HLC,
+	proposalObserver kv.ProposalObserver,
+) (*raftGroupRuntime, *kv.ShardGroup, error) {
+	sm := kv.NewTSOStateMachine(clock)
+	runtime, err := buildRuntimeForGroup(
+		raftID, group, baseDir, multi, bootstrap,
+		bootstrapServers, bootstrapSeed,
+		nil, sm, factory, *raftJoinAsLearner,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	sg := &kv.ShardGroup{Engine: runtime.engine}
+	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
+	return runtime, sg, nil
 }
 
 func bootstrapSettingsForGroup(

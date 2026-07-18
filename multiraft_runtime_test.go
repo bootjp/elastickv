@@ -70,8 +70,12 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 	})
 	require.Contains(t, shardGroups, uint64(dedicatedTSORaftGroupID))
 	require.Contains(t, shardGroups, uint64(1))
+	require.Nil(t, shardGroups[dedicatedTSORaftGroupID].Store)
+	require.IsType(t, &kv.TSOStateMachine{}, runtimes[0].stateMachine)
+	require.Nil(t, runtimes[0].store)
 	require.DirExists(t, filepath.Join(legacyDir, "fsm.db"))
-	require.DirExists(t, filepath.Join(legacyDir, "group-0", "fsm.db"))
+	require.DirExists(t, filepath.Join(legacyDir, "group-0"))
+	require.NoDirExists(t, filepath.Join(legacyDir, "group-0", "fsm.db"))
 	if _, err := os.Stat(filepath.Join(legacyDir, "group-1")); !os.IsNotExist(err) {
 		require.NoError(t, err)
 		t.Fatalf("group 1 should stay in legacy dir, but group-1 dir exists")
@@ -79,6 +83,41 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 	got, err := os.ReadFile(legacyMarker)
 	require.NoError(t, err)
 	require.Equal(t, []byte("keep"), got)
+}
+
+func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testing.T) {
+	baseDir := t.TempDir()
+	legacyStoreDir := filepath.Join(baseDir, "n1", "group-0", "fsm.db")
+	require.NoError(t, os.MkdirAll(legacyStoreDir, raftDirPerm))
+	legacyMarker := filepath.Join(legacyStoreDir, "legacy.marker")
+	require.NoError(t, os.WriteFile(legacyMarker, []byte("preserve"), 0o600))
+
+	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	require.NoError(t, err)
+	runtimes, shardGroups, err := buildShardGroups(
+		"n1",
+		baseDir,
+		[]groupSpec{{id: dedicatedTSORaftGroupID, address: "127.0.0.1:17002"}},
+		true,
+		true,
+		raftBootstrapConfig{},
+		factory,
+		nil,
+		kv.NewHLC(),
+		nil,
+		nil,
+		"",
+		encryptionWriteWiring{},
+		nil,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { closeRaftGroupRuntimes(runtimes) })
+	require.Nil(t, shardGroups[dedicatedTSORaftGroupID].Store)
+	require.Nil(t, runtimes[0].store)
+
+	got, err := os.ReadFile(legacyMarker)
+	require.NoError(t, err)
+	require.Equal(t, []byte("preserve"), got)
 }
 
 func TestParseRaftEngineType(t *testing.T) {

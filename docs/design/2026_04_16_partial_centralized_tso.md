@@ -2,11 +2,11 @@
 
 - Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
   bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
-  the minimal TSO-only FSM is implemented, while runtime wiring and follower
-  redirect/admin exposure remain open
+  the minimal TSO-only FSM and runtime group-0 wiring are implemented, while
+  follower redirect/admin exposure and shadow validation remain open
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-17
+- Updated: 2026-07-18
 
 ---
 
@@ -50,14 +50,17 @@ Implemented:
    entries, snapshots/restores TSO-owned ceiling/floor state, and classifies
    full ceiling/floor mirror entries as volatile-only so post-snapshot HLC
    mirror raises are not lost on duplicate replay skip paths.
+10. Runtime bootstrap instantiates `TSOStateMachine` for `groupID = 0` without
+    opening an MVCC store. Group 0 retains the normal wrap-aware proposer path
+    for Raft-envelope cutovers, while route validation keeps all user data out
+    of the control group. Restore accepts snapshots written by the earlier
+    compatibility `kvFSM`, imports their HLC ceiling, derives a safe allocation
+    floor, and drains the legacy MVCC payload for full CRC verification.
 
 Remaining:
 
-1. Wire runtime bootstrap for `groupID = 0` to instantiate `TSOStateMachine`
-   instead of the compatibility key-value FSM once the redirect path can route
-   timestamp requests to that group.
-2. Add follower redirect/admin exposure for the dedicated TSO leader.
-3. Add Phase B shadow-read validation before making dedicated TSO the only
+1. Add follower redirect/admin exposure for the dedicated TSO leader.
+2. Add Phase B shadow-read validation before making dedicated TSO the only
    production timestamp path.
 
 ### 1.1 Original Limitation
@@ -687,7 +690,7 @@ least as large as the maximum shard ceiling.
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; the minimal `TSOStateMachine` persists TSO-owned ceiling/floor state, while runtime group-0 wiring and TSO-leader-only timestamp issuance remain open | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable, warmed by the HLC renewal bridge, and runs the minimal `TSOStateMachine` without an MVCC store; TSO-leader redirect/admin exposure and TSO-leader-only timestamp issuance remain open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---
@@ -708,6 +711,8 @@ least as large as the maximum shard ceiling.
    leader via gRPC, or support follower reads with a known-safe timestamp
    bound?
 
-5. **Backward compatibility:** Existing snapshots and Raft logs store ceiling
-   values inline in shard FSMs. Migration to a dedicated TSO FSM requires a
-   coordinated snapshot + compaction pass.
+5. **Backward compatibility (resolved for group 0):** Existing group-0 Raft
+   logs already carry compatible HLC lease entries. `TSOStateMachine.Restore`
+   recognizes legacy `kvFSM` snapshot headers, imports the ceiling, derives the
+   allocation floor, and drains the old store payload before Raft resumes log
+   replay, so runtime wiring does not require deleting group-0 state.
