@@ -340,7 +340,9 @@ func (s *ShardStore) routesForFilesystemUsageScan(start []byte, end []byte) ([]d
 	if !filesystemUsageScanOverlap(start, end) {
 		return nil, false
 	}
-	return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(nil, nil)), true
+	// Keep every captured range so backup materialization remains pinned to the
+	// catalog snapshot. Unclamped scan dispatch de-duplicates these by group.
+	return s.engine.GetIntersectingRoutes(nil, nil), true
 }
 
 func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]distribution.Route, bool) {

@@ -291,6 +291,45 @@ func TestBackupScannerDeduplicatesUnclampedGroups(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, got)
 }
 
+func TestBackupScannerRetainsAllCapturedRangesForUnclampedGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("z"), []byte("vz"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 10)
+	defer sc.Close()
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 10,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, got)
+}
+
 func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T) {
 	t.Parallel()
 

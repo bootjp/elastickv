@@ -973,7 +973,7 @@ func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
 }
 
-func TestServiceUnlinkLargeFileGCIsRecoverableAfterPagedDeleteFailure(t *testing.T) {
+func TestServiceUnlinkLargeFileSucceedsAfterPagedDeleteFailure(t *testing.T) {
 	ctx := context.Background()
 	const (
 		chunkCount             = chunkDeleteTxnPageSize + 1
@@ -998,7 +998,7 @@ func TestServiceUnlinkLargeFileGCIsRecoverableAfterPagedDeleteFailure(t *testing
 	svc.dispatch = failSecond
 
 	err = svc.Unlink(ctx, RootInode, []byte("large"))
-	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, err)
 	_, err = svc.Resolve(ctx, RootInode, []byte("large"))
 	require.ErrorIs(t, err, ErrNotFound)
 	raw, err := svc.store.GetAt(ctx, fskeys.InodeKey(file.Inode), svc.store.LastCommitTS())
@@ -1022,6 +1022,52 @@ func TestServiceUnlinkLargeFileGCIsRecoverableAfterPagedDeleteFailure(t *testing
 	require.NoError(t, err)
 	require.EqualValues(t, 1, fsStats.Files)
 	require.EqualValues(t, 0, fsStats.Capacity-fsStats.Free)
+}
+
+func TestServiceRenameLargeReplacementSucceedsAfterPagedDeleteFailure(t *testing.T) {
+	ctx := context.Background()
+	const (
+		chunkCount             = chunkDeleteTxnPageSize + 1
+		largeChunkPayloadBytes = chunkCount * 4
+	)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithCapacity(uint64(largeChunkPayloadBytes)))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	source, err := svc.Create(ctx, RootInode, []byte("source"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	target, err := svc.Create(ctx, RootInode, []byte("target"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte{'x'}, largeChunkPayloadBytes)
+	_, err = svc.Write(ctx, target.Inode, 0, 0, payload)
+	require.NoError(t, err)
+
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	svc.dispatch = &failNthDispatchCoordinator{
+		inner:  inner,
+		failAt: 2,
+		err:    context.Canceled,
+	}
+
+	require.NoError(t, svc.Rename(ctx, RootInode, []byte("source"), RootInode, []byte("target")))
+	_, err = svc.Resolve(ctx, RootInode, []byte("source"))
+	require.ErrorIs(t, err, ErrNotFound)
+	inode, err := svc.Resolve(ctx, RootInode, []byte("target"))
+	require.NoError(t, err)
+	require.Equal(t, source.Inode, inode)
+	raw, err := svc.store.GetAt(ctx, fskeys.InodeKey(target.Inode), svc.store.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := decodeJSON[InodeMeta](raw)
+	require.NoError(t, err)
+	require.True(t, meta.Orphaned)
+	require.Zero(t, meta.Nlink)
+
+	svc.dispatch = inner
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	_, err = svc.store.GetAt(ctx, fskeys.InodeKey(target.Inode), svc.store.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) {

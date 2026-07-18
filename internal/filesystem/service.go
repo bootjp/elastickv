@@ -878,7 +878,8 @@ func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, 
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
 	}
-	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
+	s.reclaimCommittedOrphanBestEffort(ctx, chunkDeletes)
+	return nil
 }
 
 func (s *Service) renameTargetTxnParts(
@@ -1822,7 +1823,15 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
 	}
-	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
+	s.reclaimCommittedOrphanBestEffort(ctx, chunkDeletes)
+	return nil
+}
+
+func (s *Service) reclaimCommittedOrphanBestEffort(ctx context.Context, plan *chunkDeletePlan) {
+	// The namespace mutation is already committed. An unfinished orphan remains
+	// discoverable by the lease reaper, so cleanup failure must not turn the
+	// visible rename or unlink into a failed operation that cannot be retried.
+	_ = s.deleteChunkPagesAndFinalize(ctx, plan)
 }
 
 func (s *Service) unlinkFileTxnParts(
