@@ -253,6 +253,29 @@ func TestColdStartReplayTarget(t *testing.T) {
 	}
 }
 
+func TestColdStartCommittedGaps(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		target     uint64
+		have       uint64
+		wantAhead  uint64
+		wantBehind uint64
+	}{
+		{name: "ahead", target: 100, have: 150, wantAhead: 50},
+		{name: "equal", target: 100, have: 100},
+		{name: "replay tail remains", target: 150, have: 100, wantBehind: 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ahead, behind := coldStartCommittedGaps(tc.target, tc.have)
+			require.Equal(t, tc.wantAhead, ahead)
+			require.Equal(t, tc.wantBehind, behind)
+		})
+	}
+}
+
 // TestSkipGate_SkipsWhenWALCarriesPostSnapshotTail verifies a node can skip
 // the multi-GiB snapshot restore even when the committed WAL has entries past
 // the FSM's durable applied index. Engine.Open seeds e.applied with `have`,
