@@ -18,6 +18,13 @@ func encodeHashMetaValue(fieldCount int64) []byte {
 	return v
 }
 
+func encodeHashMetaInlineValue(fieldCount int64, expireAtMs uint64) []byte {
+	v := encodeHashMetaValue(fieldCount)
+	ttl := make([]byte, 8)
+	binary.BigEndian.PutUint64(ttl, expireAtMs)
+	return append(v, ttl...)
+}
+
 // hashMetaKey is the test-side key constructor for !hs|meta|<len><userKey>.
 // Mirrors store.HashMetaKey.
 func hashMetaKey(userKey string) []byte {
@@ -182,6 +189,27 @@ func TestRedisDB_HashTTLInlinedFromScanIndex(t *testing.T) {
 	// And no hashes_ttl.jsonl should ever be emitted.
 	if _, err := os.Stat(filepath.Join(root, "redis", "db_0", "hashes_ttl.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("unexpected hash TTL sidecar: stat err=%v", err)
+	}
+}
+
+func TestRedisDB_HashInlineTTLIgnoresStaleScanIndex(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleHashMeta(hashMetaKey("k"), encodeHashMetaInlineValue(1, fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleHashField(hashFieldKey("k", "f"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", "k.json"))
+	if hashFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("expire_at_ms = %v want inline %d", got["expire_at_ms"], fixedExpireMs)
 	}
 }
 

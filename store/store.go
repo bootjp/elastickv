@@ -93,6 +93,7 @@ type ExportVersionsOptions struct {
 	MaxScannedBytes      uint64
 	KeyFamily            uint32
 	AcceptKey            func([]byte) bool
+	AcceptVersion        func(key []byte, value []byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.
@@ -223,6 +224,8 @@ type MVCCStore interface {
 	ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error)
 	// ScanAt returns versions visible at the given timestamp.
 	ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
+	// ScanKeysAt returns keys with visible versions at the given timestamp.
+	ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error)
 	// ReverseScanAt returns visible versions in descending key order for keys in [start, end).
 	ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error)
 	// PutAt commits a value at the provided commit timestamp and optional expireAt.

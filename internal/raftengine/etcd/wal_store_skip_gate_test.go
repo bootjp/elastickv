@@ -375,10 +375,9 @@ func TestApplyHeaderStateOnSkip_WrongTokenCRC(t *testing.T) {
 	require.False(t, fsm.restoredHeader, "FSM state MUST NOT mutate on verification failure")
 }
 
-// TestApplyHeaderStateOnSkip_DoesNotScanBody asserts skip startup cost is
-// bounded by the header, not the snapshot body. Body corruption is still
-// caught by the full restore path, where the body is actually consumed.
-func TestApplyHeaderStateOnSkip_DoesNotScanBody(t *testing.T) {
+// TestApplyHeaderStateOnSkip_VerifiesPayloadBeforeHeaderApply asserts the skip
+// path checks payload integrity before applying header side-effects.
+func TestApplyHeaderStateOnSkip_VerifiesPayloadBeforeHeaderApply(t *testing.T) {
 	dir := t.TempDir()
 	const ceilingMs uint64 = 1700_000_000_001
 	payload := make([]byte, 16, 16+len("payload-bytes"))
@@ -387,25 +386,22 @@ func TestApplyHeaderStateOnSkip_DoesNotScanBody(t *testing.T) {
 	payload = append(payload, []byte("payload-bytes")...)
 	crc, path := writeFSMFileForTest(t, dir, 1, payload)
 
-	// Flip a byte after the fixed 16-byte header. The footer still
-	// reads as `crc`, but the on-the-wire content no longer matches
-	// it. The skip path should still succeed because it never uses body
-	// bytes; the full restore path remains responsible for body CRC.
+	// Flip a byte in the fixed 16-byte header. The footer still reads as `crc`,
+	// but the bytes used to derive header side-effects no longer match it.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	require.NoError(t, err)
 	defer f.Close()
 	var b [1]byte
-	_, err = f.ReadAt(b[:], 16)
+	_, err = f.ReadAt(b[:], 8)
 	require.NoError(t, err)
 	b[0] ^= 0x01
-	_, err = f.WriteAt(b[:], 16)
+	_, err = f.WriteAt(b[:], 8)
 	require.NoError(t, err)
 
 	fsm := &skipGateFSM{}
 	err = applyHeaderStateOnSkip(fsm, path, crc)
-	require.NoError(t, err)
-	require.True(t, fsm.restoredHeader)
-	require.Equal(t, ceilingMs, fsm.appliedCeiling)
+	require.ErrorIs(t, err, ErrFSMSnapshotFileCRC)
+	require.False(t, fsm.restoredHeader)
 }
 
 // --- kvFSM header preservation contract ---

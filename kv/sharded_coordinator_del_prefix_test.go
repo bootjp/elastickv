@@ -390,6 +390,31 @@ func TestShardedCoordinatorRejectsPointWriteOnWriteFencedRoute(t *testing.T) {
 	require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the fenced shard")
 }
 
+func TestShardedCoordinatorRejectsEmptyKeyWriteOnLeadingWriteFencedRoute(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateWriteFenced},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte{}, Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.Empty(t, g1Txn.requests, "coordinator must reject the empty key before proposing to the fenced shard")
+}
+
 func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(t *testing.T) {
 	t.Parallel()
 

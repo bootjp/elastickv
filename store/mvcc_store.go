@@ -347,6 +347,28 @@ func collectScanResultsWithPhysicalLimit(ctx context.Context, it *treemap.Iterat
 	return result, false, nil
 }
 
+func (s *mvccStore) collectScanKeys(ctx context.Context, it *treemap.Iterator, end []byte, limit, capHint int, ts uint64) ([][]byte, error) {
+	result := make([][]byte, 0, capHint)
+	for ok := true; ok && len(result) < limit; ok = it.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if end != nil && bytes.Compare(k, end) >= 0 {
+			break
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		if _, visible := visibleValue(versions, ts); !visible {
+			continue
+		}
+		result = append(result, bytes.Clone(k))
+	}
+	return result, nil
+}
+
 func (s *mvccStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
@@ -394,6 +416,31 @@ func (s *mvccStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end [
 		return make([]*KVPair, 0, capHint), false, nil
 	}
 	return collectScanResultsWithPhysicalLimit(ctx, &it, end, visibleLimit, physicalLimit, capHint, ts)
+}
+
+func (s *mvccStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return nil, ErrReadTSCompacted
+	}
+
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+
+	capHint := computeScanCapHint(s.tree.Size(), limit)
+	it := s.tree.Iterator()
+	if !seekForwardIteratorStart(s.tree, &it, start) {
+		return make([][]byte, 0, capHint), nil
+	}
+	return s.collectScanKeys(ctx, &it, end, limit, capHint, ts)
 }
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.
@@ -612,8 +659,10 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
-		return err
+	if s.lastCommitTS > startTS {
+		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
+			return err
+		}
 	}
 
 	commitTS = s.alignCommitTS(commitTS)

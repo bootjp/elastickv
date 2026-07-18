@@ -280,15 +280,25 @@ func TestMigrationBracketContainsRoutedKeyUsesLegacyListDeltaUserKey(t *testing.
 	require.NoError(t, err)
 	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
 	raw := legacyListMetaDeltaKey([]byte("target-list"), 10, 0)
+	value := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
 
-	require.True(t, legacy.ContainsRoutedKey(
+	require.True(t, legacy.ContainsRoutedVersion(
 		raw,
+		value,
 		[]byte("target"),
 		[]byte("target-list\x00"),
 		store.ExtractListUserKey,
 	))
-	require.False(t, legacy.ContainsRoutedKey(
+	require.False(t, legacy.ContainsRoutedVersion(
 		raw,
+		value,
+		[]byte("d|"),
+		[]byte("d}"),
+		store.ExtractListUserKey,
+	))
+	require.False(t, legacy.ContainsRoutedVersion(
+		raw,
+		value,
 		[]byte("zzz"),
 		nil,
 		store.ExtractListUserKey,
@@ -303,15 +313,51 @@ func TestMigrationBracketContainsRoutedKeyRoutesAmbiguousLegacyListMetaByBaseKey
 	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
 	userKey := deltaLookingListMetaUserKey([]byte("target-list"), 10, 0)
 	raw := store.ListMetaKey(userKey)
+	value, err := store.MarshalListMeta(store.ListMeta{Head: 1, Tail: 2, Len: 1})
+	require.NoError(t, err)
 
-	require.True(t, legacy.ContainsRoutedKey(
+	require.True(t, legacy.ContainsRoutedVersion(
 		raw,
+		value,
 		[]byte("d|"),
 		[]byte("d}"),
 		store.ExtractListUserKey,
 	))
-	require.False(t, legacy.ContainsRoutedKey(
+	require.False(t, legacy.ContainsRoutedVersion(
 		raw,
+		value,
+		[]byte("zzz"),
+		nil,
+		store.ExtractListUserKey,
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyRoutesAmbiguousListMetaTombstoneConservatively(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("a"), []byte("z"))
+	require.NoError(t, err)
+	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
+	baseUserKey := deltaLookingListMetaUserKey([]byte("target-list"), 10, 0)
+	raw := store.ListMetaKey(baseUserKey)
+
+	require.True(t, legacy.ContainsRoutedVersion(
+		raw,
+		nil,
+		[]byte("d|"),
+		[]byte("d}"),
+		store.ExtractListUserKey,
+	))
+	require.True(t, legacy.ContainsRoutedVersion(
+		raw,
+		nil,
+		[]byte("target"),
+		[]byte("target-list\x00"),
+		store.ExtractListUserKey,
+	))
+	require.False(t, legacy.ContainsRoutedVersion(
+		raw,
+		nil,
 		[]byte("zzz"),
 		nil,
 		store.ExtractListUserKey,

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -814,6 +815,49 @@ func TestShardStoreRaftApplyRejectsMigrationTimestampFloor(t *testing.T) {
 	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2), ErrRouteWriteTimestampTooLow)
 }
 
+type followerProxyEngine struct {
+	leader string
+}
+
+func (e *followerProxyEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, ErrLeaderNotFound
+}
+
+func (e *followerProxyEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, ErrLeaderNotFound
+}
+
+func (e *followerProxyEngine) State() raftengine.State {
+	return raftengine.StateFollower
+}
+
+func (e *followerProxyEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{Address: e.leader}
+}
+
+func (e *followerProxyEngine) VerifyLeader(context.Context) error {
+	return ErrLeaderNotFound
+}
+
+func (e *followerProxyEngine) LinearizableRead(context.Context) (uint64, error) {
+	return 0, ErrLeaderNotFound
+}
+
+func (e *followerProxyEngine) Status() raftengine.Status {
+	return raftengine.Status{
+		State:  raftengine.StateFollower,
+		Leader: raftengine.LeaderInfo{Address: e.leader},
+	}
+}
+
+func (e *followerProxyEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+
+func (e *followerProxyEngine) Close() error {
+	return nil
+}
+
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 
@@ -1182,22 +1226,40 @@ func TestShardStoreScanAtWithReadFence_ScansSameGroupSuppliedBoundsAcrossRouteIn
 	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
 
-	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), []byte("z"))
-	require.NoError(t, err)
-	require.Len(t, kvs, 1)
-	require.Equal(t, first, kvs[0].Key)
-
-	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, 7, []byte("a"), nil)
-	require.NoError(t, err)
-	require.Len(t, kvs, 2)
-	require.Equal(t, first, kvs[0].Key)
-	require.Equal(t, second, kvs[1].Key)
-
-	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, true, 0, 7, []byte("a"), nil)
-	require.NoError(t, err)
-	require.Len(t, kvs, 2)
-	require.Equal(t, second, kvs[0].Key)
-	require.Equal(t, first, kvs[1].Key)
+	for _, tc := range []struct {
+		name       string
+		reverse    bool
+		routeStart []byte
+		routeEnd   []byte
+		want       [][]byte
+	}{
+		{
+			name:       "left interval only",
+			routeStart: []byte("a"),
+			routeEnd:   []byte("z"),
+			want:       [][]byte{first},
+		},
+		{
+			name:       "forward across intervals",
+			routeStart: []byte("a"),
+			want:       [][]byte{first, second},
+		},
+		{
+			name:       "reverse across intervals",
+			reverse:    true,
+			routeStart: []byte("a"),
+			want:       [][]byte{second, first},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, tc.reverse, 0, 7, tc.routeStart, tc.routeEnd)
+			require.NoError(t, err)
+			require.Len(t, kvs, len(tc.want))
+			for i, want := range tc.want {
+				require.Equal(t, want, kvs[i].Key)
+			}
+		})
+	}
 }
 
 func TestShardStoreScanAtWithReadFence_FiltersWideRedisKeysByUserKey(t *testing.T) {
@@ -1351,6 +1413,542 @@ func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
 	require.Len(t, kvs, 2)
 	require.Equal(t, k1, kvs[0].Key)
 	require.Equal(t, k2, kvs[1].Key)
+}
+
+func TestShardStoreScanKeysAt_IncludesKeysAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 2, 0))
+	require.NoError(t, st.DeleteAt(ctx, []byte("b"), 3))
+	require.NoError(t, st.PutAt(ctx, []byte("x"), []byte("vx"), 4, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 5, 0))
+
+	keys, err := st.ScanKeysAt(ctx, []byte(""), nil, 2, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("x")}, keys)
+}
+
+func TestShardStoreScanKeysAt_DeduplicatesUnclampedGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 2, 0))
+
+	keys, err := st.ScanKeysAt(ctx, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, keys)
+}
+
+func TestShardStoreScanAt_DeduplicatesUnclampedGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 2, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, []byte("a"), kvs[0].Key)
+	require.Equal(t, []byte("z"), kvs[1].Key)
+}
+
+func TestBackupScannerDeduplicatesUnclampedGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("z"), []byte("vz"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 10)
+	defer sc.Close()
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, got)
+}
+
+func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	g := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{1: g})
+
+	require.NoError(t, g.Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
+	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
+
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a")}, keys)
+}
+
+func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	g := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{1: g})
+
+	require.NoError(t, g.Store.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
+	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
+
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, nil, nil, 2, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
+}
+
+func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{
+			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 42)
+	g := &ShardGroup{
+		Engine: &followerProxyEngine{leader: addr},
+		Store:  store.NewMVCCStore(),
+	}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: g})
+
+	keys, err := st.scanKeyRouteAt(ctx, distribution.Route{GroupID: 42}, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("k")}, keys)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, 1, fake.scanCalls)
+	require.Equal(t, uint64(42), fake.lastScanGroupID)
+	require.True(t, fake.lastScanKeysOnly)
+}
+
+func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{
+			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 42)
+	g := &ShardGroup{
+		Engine: &followerProxyEngine{leader: addr},
+		Store:  store.NewMVCCStore(),
+	}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: g})
+
+	kvs, err := st.ScanAt(ctx, []byte(""), nil, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("k"), kvs[0].Key)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, 1, fake.scanCalls)
+	require.Equal(t, uint64(42), fake.lastScanGroupID)
+}
+
+func TestShardStoreProxyForwardPageAdvancesFromRawPage(t *testing.T) {
+	t.Parallel()
+
+	internalKey := txnCommitKey([]byte("primary"), 10)
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{
+			Kv: []*pb.RawKVPair{
+				{Key: []byte("a"), Value: []byte("va")},
+				{Key: internalKey, Value: []byte("commit")},
+			},
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	ctx := context.Background()
+	g := &ShardGroup{
+		Engine: &followerProxyEngine{leader: addr},
+		Store:  store.NewMVCCStore(),
+	}
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{42: g})
+
+	page, err := st.scanRouteAtForwardPage(ctx, distribution.Route{GroupID: 42}, g, []byte(""), nil, 2, ^uint64(0), true, 0, nil, nil)
+	require.NoError(t, err)
+	require.True(t, page.full)
+	require.Equal(t, internalKey, page.advanceKey)
+	require.Len(t, page.kvs, 1)
+	require.Equal(t, []byte("a"), page.kvs[0].Key)
+}
+
+func TestKeyOnlyScanHelpersPreserveEmptyKey(t *testing.T) {
+	t.Parallel()
+
+	keys := keysFromKVs(kvPairsFromKeys([][]byte{nil, []byte(""), []byte("a")}))
+	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
+}
+
+func TestMergeAndTrimScanKeysSortsBeforeTruncating(t *testing.T) {
+	t.Parallel()
+
+	keys := mergeAndTrimScanKeys(nil, [][]byte{[]byte("c"), []byte("d"), []byte("b")}, 2)
+	require.Equal(t, [][]byte{[]byte("b"), []byte("c")}, keys)
+}
+
+func TestBackupScannerPaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	var commitTS uint64 = 1
+	for _, key := range [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")} {
+		require.NoError(t, st.PutAt(ctx, key, []byte("v"), commitTS, 0))
+		commitTS++
+	}
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 2)
+	defer sc.Close()
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
+}
+
+func TestBackupScannerMaterializesFromCapturedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("old-owner"), 1, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("old-owner"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerMaterializesFromEnumeratedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale-first-route"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("enumerated-route"), 2, 0))
+
+	sc := &backupScanner{
+		store:         st,
+		routes:        []distribution.Route{{RouteID: 1, Start: []byte(""), GroupID: 1}, {RouteID: 2, Start: []byte(""), GroupID: 2}},
+		clampToRoutes: false,
+		cursor:        []byte(""),
+		ts:            ^uint64(0),
+		pageSize:      1,
+	}
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("enumerated-route"), kvp.Value)
+}
+
+func TestBackupScannerPreservesFullRoutingAfterListKeyCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	listKey := store.ListItemKey([]byte("x"), 0)
+	require.NoError(t, st.PutAt(ctx, listKey, []byte("list"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("plain"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{listKey, []byte("a")}, got)
+}
+
+func TestBackupScannerContinuesPastTxnInternalOnlyPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerContinuesPastStaleOffRoutePage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("stale-old-owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("z"), []byte("visible-new-owner"), 2, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("z"), kvp.Key)
+	require.Equal(t, []byte("visible-new-owner"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerEmptyKeyContinuesAfterPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, st.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("later"), 2, 0))
+
+	sc := st.NewBackupScanner(nil, nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte(""), kvp.Key)
+	require.Equal(t, []byte("empty"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("later"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerPebblePagingDoesNotRepeatLastKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	pebbleStore, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pebbleStore.Close()) })
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: pebbleStore},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("a"), []byte("va"), 1, 0))
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("b"), []byte("vb"), 2, 0))
+
+	sc := st.NewBackupScanner(nil, nil, ^uint64(0), 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("b"), kvp.Key)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
+func TestBackupScannerPagesPebbleKeysInLogicalOrder(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	pebbleStore, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer pebbleStore.Close()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: pebbleStore},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+	require.NoError(t, pebbleStore.PutAt(ctx, []byte("a\x80"), []byte("vax"), 20, 0))
+
+	sc := st.NewBackupScanner(nil, nil, 20, 1)
+	defer sc.Close()
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), kvp.Key)
+	require.Equal(t, []byte("va"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a\x80"), kvp.Key)
+	require.Equal(t, []byte("vax"), kvp.Value)
+
+	kvp, ok, err = sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
 }
 
 func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) {
@@ -1629,5 +2227,31 @@ func TestScanLockBoundsForKVs_EmptyUsesOriginalRange(t *testing.T) {
 
 	lockStart, lockEnd := scanLockBoundsForKVs(nil, []byte("a"), []byte("z"), 10)
 	require.Equal(t, []byte("a"), lockStart)
+	require.Equal(t, []byte("z"), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_FullInternalPageUsesRawPageBound(t *testing.T) {
+	t.Parallel()
+
+	internalKey := txnCommitKey([]byte("primary"), 10)
+	kvs := []*store.KVPair{
+		{Key: internalKey, Value: []byte("commit")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte(""), nil, 1)
+	require.Equal(t, []byte(""), lockStart)
+	require.Equal(t, nextScanCursor(internalKey), lockEnd)
+}
+
+func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testing.T) {
+	t.Parallel()
+
+	internalKey := txnCommitKey([]byte("primary"), 10)
+	kvs := []*store.KVPair{
+		{Key: internalKey, Value: []byte("commit")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte(""), []byte("z"), 1, true)
+	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
 }

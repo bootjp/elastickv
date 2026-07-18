@@ -233,6 +233,100 @@ func TestShardedCoordinatorGroupMutationsUsesExplicitElemGroup(t *testing.T) {
 	require.Equal(t, []byte("a-key"), grouped[2][0].Key)
 }
 
+func TestShardedCoordinatorDispatchTxn_CommitPrimaryUsesPinnedGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},
+			{CommitIndex: 11},
+		},
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 5},
+			{CommitIndex: 27},
+		},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	startTS := uint64(10)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*Elem[OP]{
+			{Op: Del, Key: []byte("a-key"), GroupID: 2},
+			{Op: Put, Key: []byte("z-key"), Value: []byte("v"), GroupID: 1},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 2)
+	require.Len(t, g2Txn.requests, 2)
+
+	g1Commit := g1Txn.requests[1]
+	g2Commit := g2Txn.requests[1]
+	require.Equal(t, [][]byte{[]byte("z-key")}, g1Txn.requests[0].WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("z-key")}, g1Commit.WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("a-key")}, g2Txn.requests[0].WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("a-key")}, g2Commit.WriteFenceBypassKeys)
+	require.Equal(t, pb.Phase_COMMIT, g1Commit.Phase)
+	require.Equal(t, pb.Phase_COMMIT, g2Commit.Phase)
+	require.Equal(t, []byte("z-key"), g1Commit.Mutations[1].Key)
+	require.Equal(t, pb.Op_PUT, g1Commit.Mutations[1].Op)
+	require.Equal(t, []byte("a-key"), g2Commit.Mutations[1].Key)
+	require.Equal(t, pb.Op_PUT, g2Commit.Mutations[1].Op)
+
+	primaryCommitMeta := requestTxnMeta(t, g2Commit)
+	require.Equal(t, []byte("a-key"), primaryCommitMeta.PrimaryKey)
+	require.Greater(t, primaryCommitMeta.CommitTS, startTS)
+}
+
+func TestShardedCoordinatorPinnedWritesBypassLogicalRouteFence(t *testing.T) {
+	t.Parallel()
+
+	for _, isTxn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "raw", true: "txn"}[isTxn], func(t *testing.T) {
+			t.Parallel()
+
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 1,
+				Routes: []distribution.RouteDescriptor{
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+					{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
+				},
+			}))
+
+			g1Txn := &recordingTransactional{}
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: g1Txn},
+				2: {Txn: &recordingTransactional{}},
+			}, 1, NewHLC(), nil)
+			key := []byte("z-key")
+			reqs := &OperationGroup[OP]{
+				IsTxn: isTxn,
+				Elems: []*Elem[OP]{{Op: Del, Key: key, GroupID: 1}},
+			}
+			if isTxn {
+				reqs.StartTS = 10
+			}
+
+			_, err := coord.Dispatch(context.Background(), reqs)
+			require.NoError(t, err)
+			require.Len(t, g1Txn.requests, 1)
+			require.Equal(t, [][]byte{key}, g1Txn.requests[0].WriteFenceBypassKeys)
+			require.Equal(t, key, g1Txn.requests[0].Mutations[len(g1Txn.requests[0].Mutations)-1].Key)
+		})
+	}
+}
+
 func requestTxnMeta(t *testing.T, req *pb.Request) TxnMeta {
 	t.Helper()
 	require.NotNil(t, req)
@@ -799,6 +893,35 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 	// eliminating the TOCTOU window that exists between the adapter's
 	// pre-Raft validateReadSet call and FSM application.
 	require.Equal(t, [][]byte{[]byte("rk1"), []byte("rk2")}, g1Txn.requests[0].ReadKeys)
+}
+
+func TestShardedCoordinatorCommitPrimaryUsesPinnedMutationGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 2)
+
+	g1Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 7}}}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 2, NewHLC(), nil)
+
+	primaryKey := []byte("!lst|meta|d|pinned")
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_DEL, Key: primaryKey}},
+		2: {{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
+	}
+	primaryGid, commitIndex, err := coord.commitPrimaryTxn(context.Background(), 10, primaryKey, grouped, []uint64{1, 2}, 20, 0, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), primaryGid)
+	require.Equal(t, uint64(7), commitIndex)
+	require.Len(t, g1Txn.requests, 1)
+	require.Empty(t, g2Txn.requests)
+	require.Equal(t, pb.Phase_COMMIT, g1Txn.requests[0].Phase)
+	require.Len(t, g1Txn.requests[0].Mutations, 2)
+	require.Equal(t, primaryKey, g1Txn.requests[0].Mutations[1].Key)
 }
 
 // TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion

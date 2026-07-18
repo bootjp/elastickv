@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/proxy"
 	"github.com/stretchr/testify/assert"
@@ -16,6 +17,33 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryConcurrency(t *testing.T) {
 	_, err = parseRuntimeOptions("dual-write", 128, 4, 0, -1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary-script-concurrency")
+}
+
+func TestNewBackendsAllowsRedisOnlyWithoutSecondarySeeds(t *testing.T) {
+	cfg := proxy.DefaultConfig()
+	cfg.Mode = proxy.ModeRedisOnly
+	cfg.PrimaryAddr = "127.0.0.1:6379"
+	cfg.SecondaryAddr = ""
+
+	primary, secondary, err := newBackends(cfg, 2, 2, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, primary.Close())
+		require.NoError(t, secondary.Close())
+	})
+	assert.Equal(t, "redis", primary.Name())
+	assert.Equal(t, "elastickv", secondary.Name())
+}
+
+func TestNewBackendsRejectsDualWriteWithoutSecondarySeeds(t *testing.T) {
+	cfg := proxy.DefaultConfig()
+	cfg.Mode = proxy.ModeDualWrite
+	cfg.PrimaryAddr = "127.0.0.1:6379"
+	cfg.SecondaryAddr = ""
+
+	_, _, err := newBackends(cfg, 2, 2, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary address")
 }
 
 func TestDeriveSecondaryConcurrency(t *testing.T) {
@@ -43,7 +71,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:       128,
 			elasticKVPoolSize:     8,
 			wantWriteConcurrency:  4,
-			wantScriptConcurrency: 2,
+			wantScriptConcurrency: 1,
 		},
 		{
 			name:                  "ElasticKV primary derives from Redis secondary pool",
@@ -60,7 +88,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:     4,
 			writeConcurrency:      5,
 			wantWriteConcurrency:  5,
-			wantScriptConcurrency: 2,
+			wantScriptConcurrency: 1,
 		},
 		{
 			name:                  "explicit values win",
@@ -95,4 +123,35 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			assert.Equal(t, tt.wantScriptConcurrency, scriptConcurrency)
 		})
 	}
+}
+
+func TestAlignElasticKVBackendTimeouts(t *testing.T) {
+	t.Run("uses ElasticKV dispatch floor by default", func(t *testing.T) {
+		opts := proxy.DefaultElasticKVBackendOptions()
+
+		alignElasticKVBackendTimeouts(&opts, 5*time.Second)
+
+		assert.Equal(t, 11*time.Second, opts.ReadTimeout)
+		assert.Equal(t, 11*time.Second, opts.WriteTimeout)
+	})
+
+	t.Run("follows longer secondary timeout", func(t *testing.T) {
+		opts := proxy.DefaultElasticKVBackendOptions()
+
+		alignElasticKVBackendTimeouts(&opts, 15*time.Second)
+
+		assert.Equal(t, 16*time.Second, opts.ReadTimeout)
+		assert.Equal(t, 16*time.Second, opts.WriteTimeout)
+	})
+
+	t.Run("keeps explicit larger timeout", func(t *testing.T) {
+		opts := proxy.DefaultElasticKVBackendOptions()
+		opts.ReadTimeout = 30 * time.Second
+		opts.WriteTimeout = 31 * time.Second
+
+		alignElasticKVBackendTimeouts(&opts, 15*time.Second)
+
+		assert.Equal(t, 30*time.Second, opts.ReadTimeout)
+		assert.Equal(t, 31*time.Second, opts.WriteTimeout)
+	})
 }

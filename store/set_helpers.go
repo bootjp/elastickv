@@ -10,7 +10,7 @@ import (
 
 // Set wide-column key layout:
 //
-//	Base Metadata: !st|meta|<userKeyLen(4)><userKey>                 → [Len(8)]
+//	Base Metadata: !st|meta|<userKeyLen(4)><userKey>                 → [Len(8)][ExpireAtMs(8)]
 //	Member Key:    !st|mem|<userKeyLen(4)><userKey><member>           → (empty value)
 //	Delta Key:     !st|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
 const (
@@ -18,13 +18,18 @@ const (
 	SetMemberPrefix    = "!st|mem|"
 	SetMetaDeltaPrefix = "!st|meta|d|"
 
-	// setMetaSizeBytes is the fixed binary size of a SetMeta or SetMetaDelta (one int64).
-	setMetaSizeBytes = 8
+	// setMetaLegacySizeBytes is the pre-inline-TTL binary size of a SetMeta.
+	setMetaLegacySizeBytes = 8
+	// setMetaSizeBytes is the current binary size of a SetMeta (Len + ExpireAtMs).
+	setMetaSizeBytes = 16
+	// setMetaDeltaSizeBytes is the fixed binary size of a SetMetaDelta (one int64).
+	setMetaDeltaSizeBytes = 8
 )
 
 // SetMeta is the base metadata for a set collection.
 type SetMeta struct {
-	Len int64
+	Len      int64
+	ExpireAt uint64
 }
 
 // SetMetaDelta holds a signed change in member count.
@@ -32,31 +37,36 @@ type SetMetaDelta struct {
 	LenDelta int64
 }
 
-// MarshalSetMeta encodes SetMeta into a fixed 8-byte binary format.
+// MarshalSetMeta encodes SetMeta into a fixed 16-byte binary format.
 func MarshalSetMeta(m SetMeta) []byte {
 	buf := make([]byte, setMetaSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(m.Len)) //nolint:gosec
+	binary.BigEndian.PutUint64(buf[8:16], m.ExpireAt)
 	return buf
 }
 
-// UnmarshalSetMeta decodes SetMeta from the fixed 8-byte binary format.
+// UnmarshalSetMeta decodes SetMeta from the legacy 8-byte or current 16-byte binary format.
 func UnmarshalSetMeta(b []byte) (SetMeta, error) {
-	if len(b) != setMetaSizeBytes {
+	if len(b) != setMetaLegacySizeBytes && len(b) != setMetaSizeBytes {
 		return SetMeta{}, errors.WithStack(errors.Newf("invalid set meta length: %d", len(b)))
 	}
-	return SetMeta{Len: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
+	meta := SetMeta{Len: int64(binary.BigEndian.Uint64(b[0:8]))} //nolint:gosec
+	if len(b) == setMetaSizeBytes {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[8:16])
+	}
+	return meta, nil
 }
 
 // MarshalSetMetaDelta encodes SetMetaDelta into a fixed 8-byte binary format.
 func MarshalSetMetaDelta(d SetMetaDelta) []byte {
-	buf := make([]byte, setMetaSizeBytes)
+	buf := make([]byte, setMetaDeltaSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(d.LenDelta)) //nolint:gosec
 	return buf
 }
 
 // UnmarshalSetMetaDelta decodes SetMetaDelta from the fixed 8-byte binary format.
 func UnmarshalSetMetaDelta(b []byte) (SetMetaDelta, error) {
-	if len(b) != setMetaSizeBytes {
+	if len(b) != setMetaDeltaSizeBytes {
 		return SetMetaDelta{}, errors.WithStack(errors.Newf("invalid set meta delta length: %d", len(b)))
 	}
 	return SetMetaDelta{LenDelta: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
