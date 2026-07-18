@@ -3,9 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -172,6 +170,25 @@ func (e *s3ResponseError) Error() string {
 		return ""
 	}
 	return e.Message
+}
+
+func newS3ResponseError(statusCode int, code, message, bucket, objectKey string) error {
+	return &s3ResponseError{
+		Status:  statusCode,
+		Code:    code,
+		Message: message,
+		Bucket:  bucket,
+		Key:     objectKey,
+	}
+}
+
+func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
+	var responseErr *s3ResponseError
+	if errors.As(err, &responseErr) {
+		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
+		return
+	}
+	writeS3InternalError(w, err)
 }
 
 type s3ErrorResponse struct {
@@ -847,44 +864,15 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
-	readTS := s.readTS()
-	startTS, err := s.txnStartTS(r.Context(), readTS)
+	state, err := s.prepareS3PutObject(r.Context(), r, bucket, objectKey)
 	if err != nil {
-		writeS3InternalError(w, err)
+		writeS3ResponseOrInternalError(w, err)
 		return
 	}
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
+	defer state.readPin.Release()
 
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
-		return
-	}
-
-	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
-	previous, _, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	if err := validateS3PutPreconditions(r, previous); err != nil {
-		writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed", err.Error(), bucket, objectKey)
-		return
-	}
-
-	uploadID := newS3UploadID(s.clock())
-	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
-	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
-	admissionProtocol := s3PutAdmissionProtocolForPayload(expectedPayloadSHA)
 	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
@@ -894,192 +882,25 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return
 	}
 	s.observeS3BlobOffloadDecision(r.Context())
-	part := s3ObjectPart{PartNo: 1}
-	sizeBytes := int64(0)
-	chunkNo := uint64(0)
-	buf := make([]byte, s3ChunkSize)
-	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
-	pendingChunkSizes := make([]uint64, 0, s3ChunkBatchOps)
-	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
-	releasePendingAdmission := func() {
-		for _, release := range pendingAdmission {
-			release()
-		}
-		pendingAdmission = pendingAdmission[:0]
-	}
-	defer releasePendingAdmission()
-	nextReadBuffer := func() ([]byte, bool) {
-		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
-	}
-	uploadedManifest := func() *s3ObjectManifest {
-		if len(part.ChunkSizes) == 0 {
-			return &s3ObjectManifest{UploadID: uploadID}
-		}
-		clonedPart := part
-		clonedPart.ChunkSizes = append([]uint64(nil), part.ChunkSizes...)
-		clonedPart.ChunkCount = uint64(len(clonedPart.ChunkSizes))
-		return &s3ObjectManifest{
-			UploadID: uploadID,
-			Parts:    []s3ObjectPart{clonedPart},
-		}
-	}
-	flushBatch := func() error {
-		if len(pendingBatch) == 0 {
-			return nil
-		}
-		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
-		releasePendingAdmission()
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		part.ChunkSizes = append(part.ChunkSizes, pendingChunkSizes...)
-		part.ChunkCount = uint64(len(part.ChunkSizes))
-		pendingBatch = pendingBatch[:0]
-		pendingChunkSizes = pendingChunkSizes[:0]
-		return nil
-	}
-	for {
-		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
-			if err := flushBatch(); err != nil {
-				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-				writeS3InternalError(w, err)
-				return
-			}
-		}
-		readBuf, finalRead := nextReadBuffer()
-		if len(readBuf) == 0 {
-			break
-		}
-		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, streamBody, sizeBytes)
-		if admissionErr != nil {
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-			return
-		}
-		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
-		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			releaseAdmission()
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			if be, ok := classifyS3BodyReadErr(readErr, "object exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
-		}
-		if n > 0 {
-			pendingAdmission = append(pendingAdmission, releaseAdmission)
-			chunk := append([]byte(nil), readBuf[:n]...)
-			if _, err := hasher.Write(chunk); err != nil {
-				writeS3InternalError(w, err)
-				return
-			}
-			if validatePayloadSHA {
-				if _, err := sha256Hasher.Write(chunk); err != nil {
-					writeS3InternalError(w, err)
-					return
-				}
-			}
-			streamBody.writeDecoded(chunk)
-			chunkKey := s3keys.BlobKey(bucket, meta.Generation, objectKey, uploadID, part.PartNo, chunkNo)
-			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
-			chunkSize, err := uint64FromInt(n)
-			if err != nil {
-				s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-				writeS3InternalError(w, err)
-				return
-			}
-			pendingChunkSizes = append(pendingChunkSizes, chunkSize)
-			if len(pendingBatch) >= s3ChunkBatchOps {
-				if err := flushBatch(); err != nil {
-					s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-					writeS3InternalError(w, err)
-					return
-				}
-			}
-			sizeBytes += int64(n)
-			chunkNo++
-		} else {
-			releaseAdmission()
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-	}
-	if err := flushBatch(); err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3InternalError(w, err)
+	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(
+		r.Context(), r, streamBody, state, bucket, objectKey, expectedPayloadSHA,
+	)
+	if uploadErr != nil || uploadBodyErr != nil {
+		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
+		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
 		return
 	}
-	if validatePayloadSHA {
-		actualPayloadSHA := hex.EncodeToString(sha256Hasher.Sum(nil))
-		if !strings.EqualFold(actualPayloadSHA, expectedPayloadSHA) {
-			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "payload SHA256 does not match x-amz-content-sha256", bucket, objectKey)
-			return
-		}
-	}
-	if err := streamBody.verifyTrailer(); err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
+	mutationAttempted, err := s.commitS3PutObject(r.Context(), r, state, upload, bucket)
+	if err != nil {
+		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
+		writeS3PutObjectCommitError(w, err, mutationAttempted, bucket, objectKey)
 		return
 	}
 
-	etag := hex.EncodeToString(hasher.Sum(nil))
-	part.ETag = etag
-	part.SizeBytes = sizeBytes
-	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
-	if err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3InternalError(w, err)
-		return
+	if state.previous != nil {
+		s.cleanupManifestBlobsAsync(bucket, state.meta.Generation, objectKey, state.previous)
 	}
-	manifest := &s3ObjectManifest{
-		UploadID:           uploadID,
-		ETag:               etag,
-		SizeBytes:          sizeBytes,
-		LastModifiedHLC:    commitTS,
-		ContentType:        headerOrDefault(r.Header.Get("Content-Type"), "application/octet-stream"),
-		ContentEncoding:    cleanStoredContentEncoding(r.Header.Get("Content-Encoding")),
-		CacheControl:       r.Header.Get("Cache-Control"),
-		ContentDisposition: r.Header.Get("Content-Disposition"),
-		UserMetadata:       collectS3UserMetadata(r.Header),
-	}
-	if sizeBytes > 0 {
-		manifest.Parts = []s3ObjectPart{part}
-	}
-	body, err := encodeS3ObjectManifest(manifest)
-	if err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3InternalError(w, err)
-		return
-	}
-	bucketFence, err := encodeS3BucketMeta(meta)
-	if err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3InternalError(w, err)
-		return
-	}
-	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  startTS,
-		CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-			{Op: kv.Put, Key: headKey, Value: body},
-		},
-	}); err != nil {
-		s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
-		writeS3MutationError(w, err, bucket, objectKey)
-		return
-	}
-
-	if previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, meta.Generation, objectKey, previous)
-	}
-	w.Header().Set("ETag", quoteS3ETag(etag))
+	w.Header().Set("ETag", quoteS3ETag(upload.ETag))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -1394,43 +1215,17 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-//nolint:cyclop,gocognit,gocyclo // Upload part is intentionally linear and maps directly to protocol steps.
-func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string, partNumberStr string) {
-	partNumber, err := strconv.Atoi(partNumberStr)
-	if err != nil || partNumber < s3MinPartNumber || partNumber > s3MaxPartNumber {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "part number must be between 1 and 10000", bucket, objectKey)
-		return
-	}
-	partNo := uint64(partNumber)
-
-	readTS := s.readTS()
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string, partNumberRaw string) {
+	state, err := s.prepareS3UploadPart(r.Context(), bucket, objectKey, uploadID, partNumberRaw)
 	if err != nil {
-		writeS3InternalError(w, err)
+		writeS3ResponseOrInternalError(w, err)
 		return
 	}
-	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
-		return
-	}
+	defer state.readPin.Release()
 
-	// Verify upload exists.
-	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
-			return
-		}
-		writeS3InternalError(w, err)
-		return
-	}
-
-	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	admissionProtocol := s3PutAdmissionProtocolForPayload(partPayloadSHA)
-	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
+	payloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
+	admissionProtocol := s3PutAdmissionProtocolForPayload(payloadSHA)
+	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, payloadSHA, "part exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
 		return
@@ -1439,426 +1234,50 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	s.observeS3BlobOffloadDecision(r.Context())
-
-	// Pre-allocate the part's commit timestamp before writing any blob chunks so
-	// that the same version identifier is used for every chunk in this attempt.
-	// Embedding partCommitTS as PartVersion in the blob keys isolates each
-	// UploadPart attempt in its own key space: a concurrent or retried request
-	// for the same partNo receives a different timestamp and therefore writes to
-	// different keys, leaving the chunk data referenced by an in-progress
-	// CompleteMultipartUpload untouched.
-	partReadTS := s.readTS()
-	partStartTS, err := s.txnStartTS(r.Context(), partReadTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	partCommitTS, err := s.nextTxnCommitTS(r.Context(), partStartTS)
-	if err != nil {
-		writeS3InternalError(w, err)
+	upload, previous, uploadBodyErr, uploadErr := s.storeS3UploadPart(
+		r.Context(), r, streamBody, state, bucket, objectKey, uploadID, admissionProtocol,
+	)
+	if uploadErr != nil || uploadBodyErr != nil {
+		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
 		return
 	}
 
-	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
-	sizeBytes := int64(0)
-	chunkNo := uint64(0)
-	buf := make([]byte, s3ChunkSize)
-	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
-	chunkSizes := make([]uint64, 0, s3ChunkBatchOps)
-	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
-	releasePendingAdmission := func() {
-		for _, release := range pendingAdmission {
-			release()
-		}
-		pendingAdmission = pendingAdmission[:0]
+	if previous != nil {
+		s.cleanupPartBlobsAsync(
+			bucket, state.meta.Generation, objectKey, uploadID,
+			previous.PartNo, previous.ChunkCount, previous.PartVersion,
+		)
 	}
-	defer releasePendingAdmission()
-	nextReadBuffer := func() ([]byte, bool) {
-		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
-	}
-	partCommitted := false
-	defer func() {
-		if !partCommitted && chunkNo > 0 {
-			s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
-		}
-	}()
-
-	flushBatch := func() error {
-		if len(pendingBatch) == 0 {
-			return nil
-		}
-		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
-		releasePendingAdmission()
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		pendingBatch = pendingBatch[:0]
-		return nil
-	}
-
-	for {
-		if s.shouldFlushS3PutBatchBeforeRead(admissionProtocol, len(pendingAdmission)) {
-			if err := flushBatch(); err != nil {
-				writeS3InternalError(w, err)
-				return
-			}
-		}
-		readBuf, finalRead := nextReadBuffer()
-		if len(readBuf) == 0 {
-			break
-		}
-		releaseAdmission, admissionErr := s.acquireS3PutAdmissionForRead(r.Context(), len(readBuf), admissionProtocol, partStreamBody, sizeBytes)
-		if admissionErr != nil {
-			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
-			return
-		}
-		allowFinalPartial := s3PutReadAllowsFinalPartial(admissionProtocol, r.ContentLength)
-		n, readErr := readS3PutChunk(r.Body, readBuf, allowFinalPartial, finalRead)
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			releaseAdmission()
-			if be, ok := classifyS3BodyReadErr(readErr, "part exceeds maximum allowed size"); ok {
-				writeS3Error(w, be.Status, be.Code, be.Message, bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, readErr)
-			return
-		}
-		if n == 0 {
-			releaseAdmission()
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			continue
-		}
-		pendingAdmission = append(pendingAdmission, releaseAdmission)
-		chunk := append([]byte(nil), readBuf[:n]...)
-		if _, err := hasher.Write(chunk); err != nil {
-			writeS3InternalError(w, err)
-			return
-		}
-		partStreamBody.writeDecoded(chunk)
-		chunkKey := s3keys.VersionedBlobKey(bucket, meta.Generation, objectKey, uploadID, partNo, chunkNo, partCommitTS)
-		pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
-		cs, err := uint64FromInt(n)
-		if err != nil {
-			writeS3InternalError(w, err)
-			return
-		}
-		chunkSizes = append(chunkSizes, cs)
-		if len(pendingBatch) >= s3ChunkBatchOps {
-			if err := flushBatch(); err != nil {
-				writeS3InternalError(w, err)
-				return
-			}
-		}
-		sizeBytes += int64(n)
-		chunkNo++
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-	}
-	if err := flushBatch(); err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	if err := partStreamBody.verifyTrailer(); err != nil {
-		writeS3Error(w, http.StatusBadRequest, "BadDigest", err.Error(), bucket, objectKey)
-		return
-	}
-
-	etag := hex.EncodeToString(hasher.Sum(nil))
-	partDesc := &s3PartDescriptor{
-		PartNo:      partNo,
-		ETag:        etag,
-		SizeBytes:   sizeBytes,
-		ChunkCount:  chunkNo,
-		ChunkSizes:  chunkSizes,
-		PartVersion: partCommitTS,
-	}
-	descBody, err := json.Marshal(partDesc)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, partNo)
-
-	// Load previous part descriptor (if any) so we can clean up its blobs after overwrite.
-	var prevDesc *s3PartDescriptor
-	if prevRaw, err := s.store.GetAt(r.Context(), partKey, readTS); err == nil {
-		var pd s3PartDescriptor
-		if json.Unmarshal(prevRaw, &pd) == nil {
-			prevDesc = &pd
-		}
-	}
-
-	// Re-verify upload still exists at a fresh snapshot before committing.
-	// This narrows the race window with concurrent Abort/Complete.
-	freshTS := s.readTS()
-	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, freshTS); err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
-			return
-		}
-		writeS3InternalError(w, err)
-		return
-	}
-
-	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  partStartTS,
-		CommitTS: partCommitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: partKey, Value: descBody},
-		},
-	}); err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	partCommitted = true
-
-	// Clean up blobs from the previous version of this part (if overwritten).
-	if prevDesc != nil {
-		s.cleanupPartBlobsAsync(bucket, meta.Generation, objectKey, uploadID, prevDesc.PartNo, prevDesc.ChunkCount, prevDesc.PartVersion)
-	}
-
-	w.Header().Set("ETag", quoteS3ETag(etag))
+	w.Header().Set("ETag", quoteS3ETag(upload.ETag))
 	w.WriteHeader(http.StatusOK)
 }
 
-//nolint:cyclop,gocognit,gocyclo // CompleteMultipartUpload validates parts, computes composite ETag, and commits atomically.
 func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, s3ChunkSize))
+	request, err := parseS3MultipartCompletion(r.Body, bucket, objectKey)
 	if err != nil {
-		writeS3InternalError(w, err)
+		writeS3ResponseOrInternalError(w, err)
 		return
 	}
-	var completionReq s3CompleteMultipartUploadRequest
-	if err := xml.Unmarshal(bodyBytes, &completionReq); err != nil {
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "request body is not valid XML", bucket, objectKey)
-		return
-	}
-	if len(completionReq.Parts) == 0 {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "at least one part is required", bucket, objectKey)
-		return
-	}
-	if len(completionReq.Parts) > s3MaxPartsPerUpload {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument",
-			fmt.Sprintf("too many parts in CompleteMultipartUpload request (maximum %d)", s3MaxPartsPerUpload), bucket, objectKey)
-		return
-	}
-
-	// Parts must be in ascending order, within allowed part number range.
-	for i, part := range completionReq.Parts {
-		if part.PartNumber < s3MinPartNumber || part.PartNumber > s3MaxPartNumber {
-			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "part number out of allowed range", bucket, objectKey)
-			return
-		}
-		if i > 0 && part.PartNumber <= completionReq.Parts[i-1].PartNumber {
-			writeS3Error(w, http.StatusBadRequest, "InvalidPartOrder", "parts must be in ascending order", bucket, objectKey)
-			return
-		}
-	}
-
-	// Phase 1: Read and validate parts (outside retry — idempotent, avoids O(parts) re-reads).
-	readTS := s.readTS()
-	readPin := s.pinReadTS(readTS)
-
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	completion, err := s.loadS3MultipartCompletion(r.Context(), bucket, objectKey, uploadID, request)
 	if err != nil {
-		readPin.Release()
-		writeS3InternalError(w, err)
+		writeS3ResponseOrInternalError(w, err)
 		return
 	}
-	if !exists || meta == nil {
-		readPin.Release()
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
-		return
-	}
-	generation := meta.Generation
-
-	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-	uploadMetaRaw, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS)
-	if err != nil {
-		readPin.Release()
-		if errors.Is(err, store.ErrKeyNotFound) {
-			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
-			return
-		}
-		writeS3InternalError(w, err)
-		return
-	}
-	var uploadMeta s3UploadMeta
-	if err := json.Unmarshal(uploadMetaRaw, &uploadMeta); err != nil {
-		readPin.Release()
-		writeS3InternalError(w, err)
-		return
-	}
-
-	manifestParts := make([]s3ObjectPart, 0, len(completionReq.Parts))
-	md5Concat := md5.New() //nolint:gosec // S3 composite ETag requires MD5.
-	totalSize := int64(0)
-
-	for i, reqPart := range completionReq.Parts {
-		partKey := s3keys.UploadPartKey(bucket, meta.Generation, objectKey, uploadID, uint64(reqPart.PartNumber)) //nolint:gosec // G115: PartNumber validated in [1,10000].
-		raw, err := s.store.GetAt(r.Context(), partKey, readTS)
-		if err != nil {
-			readPin.Release()
-			if errors.Is(err, store.ErrKeyNotFound) {
-				writeS3Error(w, http.StatusBadRequest, "InvalidPart", fmt.Sprintf("part %d not found", reqPart.PartNumber), bucket, objectKey)
-				return
-			}
-			writeS3InternalError(w, err)
-			return
-		}
-		var desc s3PartDescriptor
-		if err := json.Unmarshal(raw, &desc); err != nil {
-			readPin.Release()
-			writeS3InternalError(w, err)
-			return
-		}
-		reqETag := strings.Trim(reqPart.ETag, `"`)
-		if reqETag != desc.ETag {
-			readPin.Release()
-			writeS3Error(w, http.StatusBadRequest, "InvalidPart",
-				fmt.Sprintf("part %d ETag mismatch: got %q, want %q", reqPart.PartNumber, reqETag, desc.ETag), bucket, objectKey)
-			return
-		}
-		if i < len(completionReq.Parts)-1 && desc.SizeBytes < int64(s3MinPartSize) {
-			readPin.Release()
-			writeS3Error(w, http.StatusBadRequest, "EntityTooSmall",
-				fmt.Sprintf("part %d is too small (%d bytes)", reqPart.PartNumber, desc.SizeBytes), bucket, objectKey)
-			return
-		}
-
-		partMD5, err := hex.DecodeString(desc.ETag)
-		if err != nil {
-			readPin.Release()
-			writeS3InternalError(w, err)
-			return
-		}
-		if _, err := md5Concat.Write(partMD5); err != nil {
-			readPin.Release()
-			writeS3InternalError(w, err)
-			return
-		}
-
-		manifestParts = append(manifestParts, s3ObjectPart(desc))
-		totalSize += desc.SizeBytes
-	}
-	readPin.Release()
-
-	compositeETag := hex.EncodeToString(md5Concat.Sum(nil)) + fmt.Sprintf("-%d", len(completionReq.Parts))
-
-	// Phase 2: Commit (inside retry — only fencing + manifest write).
-	var previous *s3ObjectManifest
-
-	err = s.retryS3Mutation(r.Context(), func() error {
-		retryReadTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), retryReadTS)
-		if err != nil {
-			return errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
-		}
-		retryPin := s.pinReadTS(retryReadTS)
-		defer retryPin.Release()
-
-		// Re-verify bucket generation hasn't changed (fence against delete+recreate).
-		retryMeta, retryExists, err := s.loadBucketMetaAt(r.Context(), bucket, retryReadTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !retryExists || retryMeta == nil {
-			return &s3ResponseError{
-				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
-				Bucket:  bucket,
-				Key:     objectKey,
-			}
-		}
-		if retryMeta.Generation != generation {
-			return &s3ResponseError{
-				Status:  http.StatusNotFound,
-				Code:    "NoSuchUpload",
-				Message: "upload not found (bucket was recreated)",
-				Bucket:  bucket,
-				Key:     objectKey,
-			}
-		}
-
-		// Re-verify upload still exists (fence against concurrent Abort).
-		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, retryReadTS); err != nil {
-			if errors.Is(err, store.ErrKeyNotFound) {
-				return &s3ResponseError{
-					Status:  http.StatusNotFound,
-					Code:    "NoSuchUpload",
-					Message: "upload not found",
-					Bucket:  bucket,
-					Key:     objectKey,
-				}
-			}
-			return errors.WithStack(err)
-		}
-
-		commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		headKey := s3keys.ObjectManifestKey(bucket, retryMeta.Generation, objectKey)
-		previous, _, err = s.loadObjectManifestAt(r.Context(), headKey, retryReadTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		manifest := &s3ObjectManifest{
-			UploadID:        uploadID,
-			ETag:            compositeETag,
-			SizeBytes:       totalSize,
-			LastModifiedHLC: commitTS,
-			ContentType:     uploadMeta.ContentType,
-			UserMetadata:    uploadMeta.Metadata,
-			Parts:           manifestParts,
-		}
-		manifestBody, err := encodeS3ObjectManifest(manifest)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		bucketFence, err := encodeS3BucketMeta(retryMeta)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
-		// Atomically: fence bucket (conflict with DELETE bucket), write manifest,
-		// delete UploadMeta + GCUpload (fence against Abort).
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
-			IsTxn:    true,
-			StartTS:  startTS,
-			CommitTS: commitTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-				{Op: kv.Put, Key: headKey, Value: manifestBody},
-				{Op: kv.Del, Key: uploadMetaKey},
-				{Op: kv.Del, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID)},
-			},
-		})
-		return errors.WithStack(err)
-	})
+	previous, err := s.commitS3MultipartCompletion(r.Context(), completion)
 	if err != nil {
 		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}
 
 	if previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, previous)
+		s.cleanupManifestBlobsAsync(bucket, completion.generation, objectKey, previous)
 	}
-	s.cleanupUploadPartsAsync(bucket, generation, objectKey, uploadID)
-
+	s.cleanupUploadPartsAsync(bucket, completion.generation, objectKey, uploadID)
 	writeS3XML(w, http.StatusOK, s3CompleteMultipartUploadResult{
 		XMLNS:  s3XMLNamespace,
 		Bucket: bucket,
 		Key:    objectKey,
-		ETag:   quoteS3ETag(compositeETag),
+		ETag:   quoteS3ETag(completion.compositeETag),
 	})
 }
 
@@ -2430,15 +1849,23 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 		return true
 	}
 	target := &url.URL{Scheme: "http", Host: targetHost}
-	originalHost := r.Host
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	origDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = originalHost
-	}
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		writeS3InternalError(rw, err)
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			// ReverseProxy removes unparsable query parameters before Rewrite.
+			// Preserve the exact client query because SigV4 signs the raw value.
+			req.Out.URL.RawQuery = req.In.URL.RawQuery
+			// SigV4 includes Host in the canonical request, so the leader must see
+			// the same Host value that the client signed for the follower endpoint.
+			req.Out.Host = req.In.Host
+			// Rewrite strips forwarding headers before this callback. Rebuild them
+			// explicitly to preserve the legacy Director behavior.
+			req.Out.Header["X-Forwarded-For"] = req.In.Header["X-Forwarded-For"]
+			req.SetXForwarded()
+		},
+		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			writeS3InternalError(rw, err)
+		},
 	}
 	proxy.ServeHTTP(w, r)
 	return true

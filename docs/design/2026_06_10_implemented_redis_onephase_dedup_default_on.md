@@ -117,9 +117,9 @@ sub-gate because `txnContext.applySet` did not yet match legacy
 `executeSet` semantics for SET-over-collection. That parity gap is now
 closed in the parent design: `applySet` stages a final string replacement
 and uses logical-key cleanup before writing the new string, so standalone
-SET follows `onePhaseTxnDedup` directly. `RedisServer.standaloneSetDedup`,
-`WithStandaloneSetDedup`, and `ELASTICKV_REDIS_ONEPHASE_DEDUP_SET` remain
-as compatibility no-ops for older deployments and tests that still set them.
+SET follows `onePhaseTxnDedup` directly. The former standalone SET sub-gate
+and its `ELASTICKV_REDIS_ONEPHASE_DEDUP_SET` compatibility no-op were removed
+after the rollout because they no longer affected routing.
 
 Regression coverage:
 `TestRedis_SET_OverwritesList_UnderDefaultGate` verifies `RPUSH k x` followed

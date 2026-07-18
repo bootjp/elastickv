@@ -187,31 +187,35 @@ func TestDynamoDB_DeleteItem_Condition(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestDynamoDB_DeleteItem_RequestBodyTooLarge(t *testing.T) {
+func TestDynamoDB_RequestBodyTooLarge(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 
-	reqBody := strings.Repeat("a", dynamoMaxRequestBodyBytes+1)
-	req, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodPost,
-		"http://"+nodes[0].dynamoAddress+"/",
-		strings.NewReader(reqBody),
-	)
-	require.NoError(t, err)
-	req.Header.Set("X-Amz-Target", deleteItemTarget)
-	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	for _, target := range []string{deleteItemTarget, putItemTarget} {
+		t.Run(target, func(t *testing.T) {
+			reqBody := strings.Repeat("a", dynamoMaxRequestBodyBytes+1)
+			req, err := http.NewRequestWithContext(
+				context.Background(),
+				http.MethodPost,
+				"http://"+nodes[0].dynamoAddress+"/",
+				strings.NewReader(reqBody),
+			)
+			require.NoError(t, err)
+			req.Header.Set("X-Amz-Target", target)
+			req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
 
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Contains(t, string(body), dynamoErrValidation)
-	require.Contains(t, string(body), "too large")
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(body), dynamoErrValidation)
+			require.Contains(t, string(body), "too large")
+		})
+	}
 }
 
 func TestDynamoDB_Healthz(t *testing.T) {
@@ -282,33 +286,6 @@ func TestDynamoDB_LeaderHealthz(t *testing.T) {
 			require.Equal(t, tc.body, string(body))
 		})
 	}
-}
-
-func TestDynamoDB_PutItem_RequestBodyTooLarge(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 1)
-	defer shutdown(nodes)
-
-	reqBody := strings.Repeat("a", dynamoMaxRequestBodyBytes+1)
-	req, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodPost,
-		"http://"+nodes[0].dynamoAddress+"/",
-		strings.NewReader(reqBody),
-	)
-	require.NoError(t, err)
-	req.Header.Set("X-Amz-Target", putItemTarget)
-	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Contains(t, string(body), dynamoErrValidation)
-	require.Contains(t, string(body), "too large")
 }
 
 func TestDynamoDB_TransactWriteItems(t *testing.T) {
