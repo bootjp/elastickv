@@ -60,18 +60,30 @@ const (
 	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
 	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
 
-	// defaultPebbleCacheBytes is the default process-wide Pebble block-cache
-	// capacity. Pebble's built-in EnsureDefaults() supplies only 8 MiB, which
-	// is far too small for our workloads: production observed a block-cache
-	// hit rate of 0.003% (1.8B misses vs 58k hits) because the working set
-	// evicted faster than it filled. 256 MiB is a conservative baseline per
-	// node; operators can override via ELASTICKV_PEBBLE_CACHE_MB.
+	// defaultPebbleCacheBytes is the fallback process-wide Pebble block-cache
+	// capacity when the node's effective memory budget cannot be discovered.
+	// Pebble's built-in EnsureDefaults() supplies only 8 MiB, which is far too
+	// small for our workloads: production observed a block-cache hit rate of
+	// 0.003% (1.8B misses vs 58k hits) because the working set evicted faster
+	// than it filled. Operators can set ELASTICKV_PEBBLE_CACHE_MB to override
+	// the percentage-based default with an absolute capacity.
 	defaultPebbleCacheBytes int64 = 256 << 20
 
 	// pebbleCacheMBEnv is the env var operators use to override the
 	// process-wide Pebble block-cache capacity. Units are MiB, integer only.
-	// Malformed or out-of-range values fall back to the default.
+	// Malformed or out-of-range values fall through to percentage sizing.
 	pebbleCacheMBEnv = "ELASTICKV_PEBBLE_CACHE_MB"
+
+	// pebbleCachePercentEnv controls the percentage (1..90) of the node's
+	// effective memory budget reserved for the shared cache when no absolute
+	// MiB override is set. The effective budget is the smallest discovered
+	// GOMEMLIMIT, cgroup limit, or physical-memory size.
+	pebbleCachePercentEnv = "ELASTICKV_PEBBLE_CACHE_PERCENT"
+
+	defaultPebbleCachePercent = 25
+	pebbleCachePercentMin     = 1
+	pebbleCachePercentMax     = 90
+	percentScale              = 100
 
 	// pebbleCacheMBMin / pebbleCacheMBMax define the accepted range for the
 	// env override. Values below the 8 MiB floor or above the 64 GiB ceiling
@@ -137,7 +149,11 @@ var (
 )
 
 func init() {
-	pebbleCacheBytes = resolvePebbleCacheBytes(os.Getenv(pebbleCacheMBEnv))
+	pebbleCacheBytes = resolvePebbleCacheBytes(
+		os.Getenv(pebbleCacheMBEnv),
+		os.Getenv(pebbleCachePercentEnv),
+		effectiveMemoryBudgetBytes(),
+	)
 }
 
 // resolveFSMApplyWriteOpts parses an ELASTICKV_FSM_SYNC_MODE value and
@@ -157,23 +173,42 @@ func resolveFSMApplyWriteOpts(envVal string) (*pebble.WriteOptions, string) {
 	}
 }
 
-// resolvePebbleCacheBytes parses an ELASTICKV_PEBBLE_CACHE_MB value and
-// returns the resolved cache size in bytes. Empty, malformed, or
-// out-of-range values are rejected and fall back to the default rather
-// than being clamped to the nearest bound. "0" is below the 8 MiB floor
-// and therefore also falls back to the default.
-func resolvePebbleCacheBytes(envVal string) int64 {
-	if envVal == "" {
+// resolvePebbleCacheBytes resolves the process-wide cache capacity. A valid
+// absolute MiB override wins. Otherwise the configured percentage (25% by
+// default) is applied to the node's effective memory budget. Malformed or
+// out-of-range settings fall back to the percentage default, and an unknown
+// memory budget falls back to defaultPebbleCacheBytes.
+func resolvePebbleCacheBytes(mbEnvVal, percentEnvVal string, memoryBudgetBytes int64) int64 {
+	if absoluteBytes := resolvePebbleCacheAbsoluteBytes(mbEnvVal); absoluteBytes > 0 {
+		return absoluteBytes
+	}
+
+	if memoryBudgetBytes <= 0 {
 		return defaultPebbleCacheBytes
 	}
+
+	cacheBytes := memoryBudgetBytes / percentScale * int64(resolvePebbleCachePercent(percentEnvVal))
+	minimumBytes := int64(pebbleCacheMBMin) << mebibyteShift
+	if cacheBytes < minimumBytes {
+		return minimumBytes
+	}
+	return cacheBytes
+}
+
+func resolvePebbleCacheAbsoluteBytes(envVal string) int64 {
 	mb, err := strconv.Atoi(envVal)
-	if err != nil {
-		return defaultPebbleCacheBytes
-	}
-	if mb < pebbleCacheMBMin || mb > pebbleCacheMBMax {
-		return defaultPebbleCacheBytes
+	if envVal == "" || err != nil || mb < pebbleCacheMBMin || mb > pebbleCacheMBMax {
+		return 0
 	}
 	return int64(mb) << mebibyteShift
+}
+
+func resolvePebbleCachePercent(envVal string) int {
+	configured, err := strconv.Atoi(envVal)
+	if envVal == "" || err != nil || configured < pebbleCachePercentMin || configured > pebbleCachePercentMax {
+		return defaultPebbleCachePercent
+	}
+	return configured
 }
 
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
@@ -358,11 +393,9 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	s.db = db
 	s.cache = cache
 
-	// cleanupOnInitFail closes the just-opened DB and releases our creator
-	// reference on the cache so that a partially corrupt store (where the
-	// metadata scans below fail) does not leak the ~256 MiB cache
-	// allocation. Also nil's out the store pointers so a zero-valued
-	// pebbleStore does not linger with stale refs.
+	// cleanupOnInitFail closes the just-opened DB and releases this open's
+	// borrowed cache reference when a metadata scan fails. Also nil out the
+	// store pointers so a zero-valued pebbleStore does not retain stale refs.
 	cleanupOnInitFail := func() {
 		_ = db.Close()
 		cache.Unref()
@@ -3164,8 +3197,8 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 		return errors.WithStack(err)
 	}
 	// The tmpDB is discarded once swapInTempDB renames its directory over
-	// s.dir (which reopens with a fresh cache), so release our creator ref
-	// as soon as we're done writing to avoid leaking per-snapshot caches.
+	// s.dir, so release this temporary open's borrowed cache reference when
+	// the helper returns. The destination reopen borrows its own reference.
 	defer cache.Unref()
 
 	if err := restoreBatchLoopInto(r, tmpDB); err != nil {
@@ -3215,8 +3248,8 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 		return "", errors.WithStack(err)
 	}
 	// As in writeNativeSnapshotToTempDir, the tmpDB is discarded once the
-	// directory is renamed, so drop our creator ref when this helper
-	// returns. swapInTempDB reopens with a fresh cache.
+	// directory is renamed, so drop this temporary open's borrowed cache
+	// reference when the helper returns. swapInTempDB borrows its own ref.
 	defer cache.Unref()
 	cleanupTmp := func() {
 		_ = tmpDB.Close()
@@ -3388,11 +3421,10 @@ func (s *pebbleStore) Close() error {
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
 	err := s.db.Close()
-	// Release our creator reference on the block cache so the memory is
-	// freed once pebble has also dropped its internal reference (which
-	// Close does). Safe to call after a Close error: Unref is
-	// idempotent-friendly in that s.cache is only nilled out here, and
-	// Close() is not expected to be called twice.
+	// Release this store's borrowed block-cache reference after Pebble has
+	// dropped its internal handle. The process base reference keeps the shared
+	// cache alive for other stores; nil prevents a second Close from unrefing
+	// this store's reference twice.
 	if s.cache != nil {
 		s.cache.Unref()
 		s.cache = nil

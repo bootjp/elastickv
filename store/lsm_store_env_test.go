@@ -1,6 +1,9 @@
 package store
 
 import (
+	"bytes"
+	"context"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -9,8 +12,8 @@ import (
 
 // setSmallPebbleCacheForTest swaps the package-level pebbleCacheBytes value
 // to 16 MiB for the duration of a single test and restores it during
-// t.Cleanup. The real override happens in init() from
-// ELASTICKV_PEBBLE_CACHE_MB; tests use this helper without relying on process
+// t.Cleanup. The real sizing happens in init() from the node memory budget and
+// ELASTICKV_PEBBLE_CACHE_*; tests use this helper without relying on process
 // env state.
 func setSmallPebbleCacheForTest(t *testing.T) {
 	t.Helper()
@@ -19,51 +22,94 @@ func setSmallPebbleCacheForTest(t *testing.T) {
 	t.Cleanup(func() { pebbleCacheBytes = prev })
 }
 
-// TestPebbleCacheEnvOverride covers the ELASTICKV_PEBBLE_CACHE_MB parsing
-// contract directly against resolvePebbleCacheBytes, which is what init()
-// calls. We deliberately avoid mutating os.Environ here so parallel test
-// binaries remain isolated.
+// TestPebbleCacheEnvOverride covers the absolute and percentage-based cache
+// sizing contract directly against resolvePebbleCacheBytes, which is what
+// init() calls. We deliberately avoid mutating os.Environ here so parallel
+// test binaries remain isolated.
 func TestPebbleCacheEnvOverride(t *testing.T) {
+	const memoryBudgetBytes int64 = 4000 << 20
+
 	t.Run("valid value is parsed and converted to bytes", func(t *testing.T) {
-		got := resolvePebbleCacheBytes("64")
+		got := resolvePebbleCacheBytes("64", "", memoryBudgetBytes)
 		require.Equal(t, int64(64)<<20, got)
 	})
 
-	t.Run("empty string falls back to default", func(t *testing.T) {
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes(""))
+	t.Run("empty string uses twenty five percent of memory budget", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("", "", memoryBudgetBytes))
 	})
 
-	t.Run("garbage input falls back to default", func(t *testing.T) {
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("garbage"))
+	t.Run("explicit percentage is applied", func(t *testing.T) {
+		require.Equal(t, int64(400)<<20, resolvePebbleCacheBytes("", "10", memoryBudgetBytes))
 	})
 
-	t.Run("zero is rejected and default is applied", func(t *testing.T) {
+	t.Run("absolute override wins over percentage", func(t *testing.T) {
+		require.Equal(t, int64(64)<<20, resolvePebbleCacheBytes("64", "10", memoryBudgetBytes))
+	})
+
+	t.Run("garbage absolute input falls back to percentage default", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("garbage", "", memoryBudgetBytes))
+	})
+
+	t.Run("garbage percentage falls back to twenty five percent", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("", "garbage", memoryBudgetBytes))
+	})
+
+	t.Run("percentage boundaries are enforced", func(t *testing.T) {
+		require.Equal(t, int64(40)<<20, resolvePebbleCacheBytes("", "1", memoryBudgetBytes))
+		require.Equal(t, int64(3600)<<20, resolvePebbleCacheBytes("", "90", memoryBudgetBytes))
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("", "0", memoryBudgetBytes))
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("", "91", memoryBudgetBytes))
+	})
+
+	t.Run("zero is rejected and percentage default is applied", func(t *testing.T) {
 		// "0" is below the 8 MiB floor, so we fall back to the default
 		// rather than silently clamping. Documented behaviour: only
 		// values inside [8, 65536] MiB are accepted; everything else
 		// falls back.
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("0"))
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("0", "", memoryBudgetBytes))
 	})
 
-	t.Run("below floor falls back to default", func(t *testing.T) {
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("4"))
+	t.Run("below floor falls back to percentage default", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("4", "", memoryBudgetBytes))
 	})
 
 	t.Run("at floor is accepted", func(t *testing.T) {
-		require.Equal(t, int64(8)<<20, resolvePebbleCacheBytes("8"))
+		require.Equal(t, int64(8)<<20, resolvePebbleCacheBytes("8", "", memoryBudgetBytes))
 	})
 
 	t.Run("at ceiling is accepted", func(t *testing.T) {
-		require.Equal(t, int64(65536)<<20, resolvePebbleCacheBytes("65536"))
+		require.Equal(t, int64(65536)<<20, resolvePebbleCacheBytes("65536", "", memoryBudgetBytes))
 	})
 
-	t.Run("above ceiling falls back to default", func(t *testing.T) {
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("65537"))
+	t.Run("above ceiling falls back to percentage default", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("65537", "", memoryBudgetBytes))
 	})
 
-	t.Run("negative falls back to default", func(t *testing.T) {
-		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("-1"))
+	t.Run("negative falls back to percentage default", func(t *testing.T) {
+		require.Equal(t, int64(1000)<<20, resolvePebbleCacheBytes("-1", "", memoryBudgetBytes))
 	})
+
+	t.Run("unknown memory budget uses fixed fallback", func(t *testing.T) {
+		require.Equal(t, defaultPebbleCacheBytes, resolvePebbleCacheBytes("", "", 0))
+	})
+
+	t.Run("percentage result observes cache floor", func(t *testing.T) {
+		require.Equal(t, int64(8)<<20, resolvePebbleCacheBytes("", "", 16<<20))
+	})
+}
+
+func TestMemoryBudgetHelpers(t *testing.T) {
+	require.Equal(t, int64(512), minPositiveMemoryBytes(0, 1024, -1, 512, 2048))
+	require.Equal(t, int64(0), minPositiveMemoryBytes(0, -1))
+	require.Equal(t, int64(1024), parseMemoryLimitBytes([]byte("1024\n")))
+	require.Equal(t, int64(0), parseMemoryLimitBytes([]byte("max\n")))
+	require.Equal(t, int64(0), parseMemoryLimitBytes([]byte("invalid")))
+	require.Equal(t, []string{
+		"/sys/fs/cgroup/system.slice/elastickv.service/memory.max",
+	}, cgroupMemoryLimitPaths([]byte("0::/system.slice/elastickv.service\n")))
+	require.Equal(t, []string{
+		"/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+	}, cgroupMemoryLimitPaths([]byte("5:cpu,memory:/docker/abc\n")))
 }
 
 // TestSetSmallPebbleCacheForTestRestores verifies the helper reinstates the
@@ -102,12 +148,44 @@ func TestDefaultPebbleOptionsSharesProcessCache(t *testing.T) {
 	require.Same(t, cache1, opts2.Cache)
 }
 
+func TestDefaultPebbleOptionsSharesProcessCacheConcurrently(t *testing.T) {
+	setSmallPebbleCacheForTest(t)
+
+	const borrowers = 16
+	caches := make(chan *pebble.Cache, borrowers)
+	var wg sync.WaitGroup
+	wg.Add(borrowers)
+	for range borrowers {
+		go func() {
+			defer wg.Done()
+			_, cache := defaultPebbleOptionsWithCache()
+			caches <- cache
+		}()
+	}
+	wg.Wait()
+	close(caches)
+
+	var shared *pebble.Cache
+	for cache := range caches {
+		if shared == nil {
+			shared = cache
+		}
+		require.Same(t, shared, cache)
+		cache.Unref()
+	}
+}
+
 func TestNewPebbleStoreSharesProcessCache(t *testing.T) {
 	setSmallPebbleCacheForTest(t)
 
 	s1, err := NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
-	defer s1.Close()
+	closed1 := false
+	t.Cleanup(func() {
+		if !closed1 {
+			_ = s1.Close()
+		}
+	})
 	ps1, ok := s1.(*pebbleStore)
 	require.True(t, ok)
 
@@ -121,6 +199,49 @@ func TestNewPebbleStoreSharesProcessCache(t *testing.T) {
 	require.Same(t, ps1.cache, ps2.cache)
 	require.Equal(t, int64(16)<<20, ps1.BlockCacheCapacityBytes())
 	require.Equal(t, ps1.BlockCacheCapacityBytes(), ps2.BlockCacheCapacityBytes())
+
+	require.NoError(t, s1.Close())
+	closed1 = true
+	require.NoError(t, s2.PutAt(context.Background(), []byte("still-open"), []byte("value"), 1, 0))
+	value, err := s2.GetAt(context.Background(), []byte("still-open"), 1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+}
+
+func TestPebbleStoreRestoreKeepsProcessCache(t *testing.T) {
+	setSmallPebbleCacheForTest(t)
+	ctx := context.Background()
+
+	src := NewMVCCStore()
+	require.NoError(t, src.PutAt(ctx, []byte("key"), []byte("value"), 1, 0))
+	snapshot, err := src.Snapshot()
+	require.NoError(t, err)
+	var streaming bytes.Buffer
+	_, err = snapshot.WriteTo(&streaming)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	dst, err := NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	defer dst.Close()
+	ps, ok := dst.(*pebbleStore)
+	require.True(t, ok)
+	cache := ps.cache
+
+	require.NoError(t, dst.Restore(bytes.NewReader(streaming.Bytes())))
+	require.Same(t, cache, ps.cache, "streaming restore must reopen on the process cache")
+
+	nativeSnapshot, err := dst.Snapshot()
+	require.NoError(t, err)
+	var native bytes.Buffer
+	_, err = nativeSnapshot.WriteTo(&native)
+	require.NoError(t, err)
+	require.NoError(t, nativeSnapshot.Close())
+	require.NoError(t, dst.Restore(bytes.NewReader(native.Bytes())))
+	require.Same(t, cache, ps.cache, "native restore must reopen on the process cache")
+
+	require.NoError(t, dst.Restore(bytes.NewReader(nil)))
+	require.Same(t, cache, ps.cache, "empty restore must reopen on the process cache")
 }
 
 // newPebbleStoreWithFSMApplyWriteOptsForTest constructs a pebbleStore

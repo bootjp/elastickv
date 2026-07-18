@@ -110,9 +110,10 @@ Multi-region blockers:
 ### 2.3 Storage tier (Pebble)
 
 `store/lsm_store.go`: per-shard `pebble.Open`, process-wide shared block cache
-`defaultPebbleCacheBytes = 256 MiB` **per node** (shared by all stores in the
-process). WAL sync via `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM
-apply; `nosync` opt-in).
+sized to 25% of the node's effective memory budget by default and shared by all
+stores in the process. `ELASTICKV_PEBBLE_CACHE_PERCENT` changes that fraction;
+`ELASTICKV_PEBBLE_CACHE_MB` is the absolute-capacity override. WAL sync via
+`ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM apply; `nosync` opt-in).
 
 `store/mvcc_store.go`: encoded as `UserKey ++ 0x00 ++ inverted_TS`,
 `maxSnapshotVersionCount = 1 M`, `maxSnapshotValueSize = 256 MiB`.
@@ -378,7 +379,8 @@ control-plane (`*_proposed_*` doc TBD).**
 **M2 — Shared block-cache follow-ups + per-shard tuning (`*_proposed_*` doc
 TBD).**
 - M1 shared block cache has landed: one `pebble.Cache` per process is shared
-  across all shards' stores and sized by `ELASTICKV_PEBBLE_CACHE_MB`.
+  across all shards' stores, defaults to 25% of the node's effective memory
+  budget, and supports percentage or absolute-MiB operator overrides.
 - Add shared memtable / compaction concurrency budgets across stores.
 - Surface `L0CompactionThreshold`, `LBaseMaxBytes`,
   `MaxConcurrentCompactions` as per-shard config so a write-heavy
