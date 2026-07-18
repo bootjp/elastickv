@@ -103,6 +103,20 @@ func TestActiveTimestampTrackerBackupPinExtendExpiredIsInvalid(t *testing.T) {
 	require.Equal(t, uint64(0), tracker.Oldest())
 }
 
+func TestActiveTimestampTrackerApplyExtendReplaysAfterLocalExpiry(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	pinID := backupTrackerTestPinID(1)
+	now := time.Now()
+
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 20, now.Add(-time.Millisecond)))
+	require.NoError(t, tracker.ApplyExtendForGroup(pinID, 7, now.Add(time.Hour)))
+
+	deadline, ok := tracker.BackupPinDeadlineForGroup(pinID, 7)
+	require.True(t, ok)
+	require.Equal(t, now.Add(time.Hour), deadline)
+	require.Equal(t, uint64(20), tracker.OldestForGroup(7))
+}
+
 func TestActiveTimestampTrackerBackupPinReleaseIsIdempotent(t *testing.T) {
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
@@ -128,7 +142,7 @@ func TestActiveTimestampTrackerBackupPinLimit(t *testing.T) {
 	require.NoError(t, tracker.PinWithDeadline(first, 25, now.Add(2*time.Hour)))
 	require.ErrorIs(t, tracker.PinWithDeadline(second, 30, now.Add(3*time.Hour)), ErrTooManyActiveBackups)
 	require.Equal(t, 1, tracker.ActiveBackupPinCount())
-	require.Equal(t, uint64(25), tracker.Oldest())
+	require.Equal(t, uint64(20), tracker.Oldest())
 }
 
 func TestActiveTimestampTrackerBackupPinLimitCountsLogicalPinIDs(t *testing.T) {
@@ -177,6 +191,36 @@ func TestActiveTimestampTrackerBackupPinsAreScopedByRaftGroup(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, deadline, got)
 	require.Equal(t, 1, tracker.ActiveBackupPinCount())
+}
+
+func TestActiveTimestampTrackerDuplicatePinApplyIsMonotonic(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	pinID := backupTrackerTestPinID(1)
+	now := time.Now()
+	laterDeadline := now.Add(2 * time.Hour)
+
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 40, laterDeadline))
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 50, now.Add(time.Hour)))
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 30, now.Add(time.Hour)))
+
+	deadline, ok := tracker.BackupPinDeadlineForGroup(pinID, 7)
+	require.True(t, ok)
+	require.Equal(t, laterDeadline, deadline)
+	require.Equal(t, uint64(30), tracker.OldestForGroup(7))
+}
+
+func TestActiveTimestampTrackerOldestForGroupKeepsReadPinsGlobal(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	readPin := tracker.Pin(25)
+	defer readPin.Release()
+	deadline := time.Now().Add(time.Hour)
+
+	require.NoError(t, tracker.PinWithDeadlineForGroup(backupTrackerTestPinID(1), 1, 10, deadline))
+	require.NoError(t, tracker.PinWithDeadlineForGroup(backupTrackerTestPinID(2), 2, 20, deadline))
+
+	require.Equal(t, uint64(10), tracker.OldestForGroup(1))
+	require.Equal(t, uint64(20), tracker.OldestForGroup(2))
+	require.Equal(t, uint64(25), tracker.OldestForGroup(3))
 }
 
 func TestActiveTimestampTrackerRejectsInvalidBackupPins(t *testing.T) {

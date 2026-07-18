@@ -110,7 +110,7 @@ func TestApplyBackupMissingExtendIsNoop(t *testing.T) {
 	require.Equal(t, 0, tracker.ActiveBackupPinCount())
 }
 
-func TestApplyBackupExpiredExtendIsNoop(t *testing.T) {
+func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 	pinID := backupTrackerTestPinID(1)
@@ -123,7 +123,8 @@ func TestApplyBackupExpiredExtendIsNoop(t *testing.T) {
 
 	require.NoError(t, haltApplyOf(resp))
 	require.Nil(t, resp)
-	require.Equal(t, 0, tracker.ActiveBackupPinCount())
+	require.Equal(t, 1, tracker.ActiveBackupPinCount())
+	require.Equal(t, uint64(42), tracker.Oldest())
 }
 
 func TestApplyBackupZeroDeadlineReturnsNonFatalError(t *testing.T) {
