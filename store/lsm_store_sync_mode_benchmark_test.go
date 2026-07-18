@@ -110,7 +110,10 @@ func BenchmarkApplyMutationsRaft_Encryption(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				key := []byte(fmt.Sprintf("enc-bench-%010d", i))
-				startTS := uint64(i) * 2 //nolint:gosec // benchmark loop index is non-negative.
+				if i < 0 {
+					b.Fatalf("unexpected negative iteration counter: %d", i)
+				}
+				startTS := uint64(i) * 2
 				muts := []*KVPairMutation{{Op: OpTypePut, Key: key, Value: value}}
 				if err := s.ApplyMutationsRaft(context.Background(), muts, nil, startTS, startTS+1); err != nil {
 					b.Fatalf("ApplyMutationsRaft: %v", err)
