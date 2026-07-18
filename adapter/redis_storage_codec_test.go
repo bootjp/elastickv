@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,35 @@ func TestStoredRedisSetCodec_RoundTripProto(t *testing.T) {
 	decoded, err := unmarshalSetValue(body)
 	require.NoError(t, err)
 	require.Equal(t, redisSetValue{Members: []string{"a", "b"}}, decoded)
+}
+
+func TestStoredRedisHLLCodec_RoundTripInlineTTL(t *testing.T) {
+	t.Parallel()
+
+	ttl := time.UnixMilli(123_456)
+	body, err := encodeRedisHLL(redisSetValue{Members: []string{"b", "a"}}, &ttl)
+	require.NoError(t, err)
+	require.True(t, isNewRedisHLLFormat(body))
+
+	decoded, gotTTL, embedded, err := decodeRedisHLL(body)
+	require.NoError(t, err)
+	require.True(t, embedded)
+	require.Equal(t, redisSetValue{Members: []string{"a", "b"}}, decoded)
+	require.NotNil(t, gotTTL)
+	require.Equal(t, redisExpireAtMillis(ttl), redisExpireAtMillis(*gotTTL))
+}
+
+func TestStoredRedisHLLCodec_LegacySetPayloadFallback(t *testing.T) {
+	t.Parallel()
+
+	body, err := marshalSetValue(redisSetValue{Members: []string{"legacy"}})
+	require.NoError(t, err)
+
+	decoded, ttl, embedded, err := decodeRedisHLL(body)
+	require.NoError(t, err)
+	require.False(t, embedded)
+	require.Nil(t, ttl)
+	require.Equal(t, redisSetValue{Members: []string{"legacy"}}, decoded)
 }
 
 func TestStoredRedisZSetCodec_RoundTripProto(t *testing.T) {

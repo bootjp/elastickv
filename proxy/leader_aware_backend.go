@@ -179,6 +179,13 @@ func (b *LeaderAwareRedisBackend) TriggerRefresh() {
 	}
 }
 
+// RefreshLeaderNow re-probes the cluster before returning. It is used by
+// callers that already observed a not-leader response and need the next retry
+// to use a fresh target instead of waiting for the background loop.
+func (b *LeaderAwareRedisBackend) RefreshLeaderNow(ctx context.Context) {
+	b.refreshLeader(ctx)
+}
+
 // refreshLeader probes INFO replication on the current leader first, then on
 // each seed, and adopts the first advertised leader address. The current
 // leader's Redis address is returned by the leader node itself when it's
@@ -353,8 +360,19 @@ func (b *LeaderAwareRedisBackend) currentClient() *redis.Client {
 	return b.clients[b.leader]
 }
 
-// Do forwards a single command to the current leader.
+// Do forwards a single command to the current leader. A not-leader Redis reply
+// means the command was rejected before applying, so it is safe to refresh the
+// leader and retry once.
 func (b *LeaderAwareRedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
+	cmd := b.doOnce(ctx, args...)
+	if !isNotLeaderError(cmd.Err()) {
+		return cmd
+	}
+	b.RefreshLeaderNow(ctx)
+	return b.doOnce(ctx, args...)
+}
+
+func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redis.Cmd {
 	cli := b.currentClient()
 	if cli == nil {
 		cmd := redis.NewCmd(ctx, args...)
@@ -365,7 +383,17 @@ func (b *LeaderAwareRedisBackend) Do(ctx context.Context, args ...any) *redis.Cm
 }
 
 // DoWithTimeout forwards a blocking command with a per-call socket timeout.
+// Like Do, a not-leader rejection is refreshed and retried once.
 func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	cmd := b.doWithTimeoutOnce(ctx, timeout, args...)
+	if !isNotLeaderError(cmd.Err()) {
+		return cmd
+	}
+	b.RefreshLeaderNow(ctx)
+	return b.doWithTimeoutOnce(ctx, timeout, args...)
+}
+
+func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
 	cli := b.currentClient()
 	if cli == nil {
 		cmd := redis.NewCmd(ctx, args...)
@@ -375,8 +403,19 @@ func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout tim
 	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
-// Pipeline forwards a batch to the current leader.
+// Pipeline forwards a batch to the current leader. A not-leader Redis reply in
+// any result means the leader rejected the batch before applying it, so retrying
+// once after synchronous discovery is safe.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	results, err := b.pipelineOnce(ctx, cmds)
+	if err != nil || !pipelineHasElasticKVNotLeader(results) {
+		return results, err
+	}
+	b.RefreshLeaderNow(ctx)
+	return b.pipelineOnce(ctx, cmds)
+}
+
+func (b *LeaderAwareRedisBackend) pipelineOnce(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	cli := b.currentClient()
 	if cli == nil {
 		return nil, ErrNoLeaderBackend
@@ -395,6 +434,15 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil
+}
+
+func pipelineHasElasticKVNotLeader(results []*redis.Cmd) bool {
+	for _, result := range results {
+		if result != nil && isElasticKVNotLeaderError(result.Err()) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewPubSub opens a subscribe connection on the current leader.

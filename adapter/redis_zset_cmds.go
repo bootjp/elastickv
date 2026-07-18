@@ -60,13 +60,20 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 			},
 		)
 	}
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return legacyExpiredCollectionCleanupElems(key, redisZSetKey(key)), nil
+	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
 	// Write a base meta so that resolveZSetMeta starts from an accurate count.
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.ZSetMetaKey(key),
-		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries))}),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries)), ExpireAt: ttlMs}),
 	})
 	return elems, nil
 }
@@ -540,9 +547,12 @@ func buildZSetMigrationView(migrationElems []*kv.Elem[kv.OP], key []byte) map[st
 // resolveZSetMemberScore returns the current score and existence for a ZSet
 // member. It checks inTxnView first (covers migration elems and earlier pairs
 // in the same ZADD call), then falls back to a store GetAt.
-func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []byte, member string, readTS uint64, inTxnView map[string]float64) (score float64, exists bool, err error) {
+func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []byte, member string, readTS uint64, inTxnView map[string]float64, ignoreExisting bool) (score float64, exists bool, err error) {
 	if s, ok := inTxnView[member]; ok {
 		return s, true, nil
+	}
+	if ignoreExisting {
+		return 0, false, nil
 	}
 	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
 	if getErr == nil {
@@ -565,9 +575,9 @@ func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []by
 // inTxnView provides an in-transaction view of member→score for members written
 // in the same transaction (migration or earlier pairs); checked before GetAt so
 // migrated and duplicate members are handled correctly.
-func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP], inTxnView map[string]float64) ([]*kv.Elem[kv.OP], int, int64, error) {
+func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair, flags zaddFlags, readTS uint64, elems []*kv.Elem[kv.OP], inTxnView map[string]float64, ignoreExisting bool) ([]*kv.Elem[kv.OP], int, int64, error) {
 	memberKey := store.ZSetMemberKey(key, []byte(p.member))
-	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, p.member, readTS, inTxnView)
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, p.member, readTS, inTxnView, ignoreExisting)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -591,7 +601,7 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	base, err := r.prepareZSetWriteBase(ctx, key, readTS, len(pairs))
 	if err != nil {
 		return 0, err
 	}
@@ -602,33 +612,18 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		return 0, cockerrors.WithStack(err)
 	}
 
-	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
-	if err != nil {
-		return 0, err
-	}
 	// Capacity: each pair may produce 3 ops (del old score + put member + put score index),
 	// plus migration elems and a delta key.
-	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
-	elems = append(elems, migrationElems...)
-
-	// Seed the in-transaction view from migration elems so that migrated
-	// members are not incorrectly counted as new by applyZAddPair.
-	inTxnView := buildZSetMigrationView(migrationElems, key)
-
-	// For large batches, mergeZSetBulkScores performs one prefix scan that
-	// eliminates O(N) GetAt calls inside applyZAddPair; it is a no-op for
-	// batches below wideColumnBulkScanThreshold.
-	inTxnView, err = r.mergeZSetBulkScores(ctx, key, readTS, len(pairs), inTxnView)
-	if err != nil {
-		return 0, err
-	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(base.cleanupElems)+len(base.migrationElems)+len(pairs)*3+setWideColOverhead) //nolint:mnd // 3 ops per pair
+	elems = append(elems, base.cleanupElems...)
+	elems = append(elems, base.migrationElems...)
 
 	added := 0
 	lenDelta := int64(0)
 	for _, p := range pairs {
 		var c int
 		var d int64
-		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems, inTxnView)
+		elems, c, d, err = r.applyZAddPair(ctx, key, p, flags, readTS, elems, base.inTxnView, base.expiredRecreate)
 		if err != nil {
 			return 0, err
 		}
@@ -651,7 +646,48 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 	}
 
 	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
-		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey))
+		redisTxnWideCreateReadKeys(key, base.typ, redisTxnWideZSetFenceKey))
+}
+
+type zsetWriteBase struct {
+	typ             redisValueType
+	cleanupElems    []*kv.Elem[kv.OP]
+	migrationElems  []*kv.Elem[kv.OP]
+	inTxnView       map[string]float64
+	expiredRecreate bool
+}
+
+func (r *RedisServer) prepareZSetWriteBase(ctx context.Context, key []byte, readTS uint64, bulkMembers int) (zsetWriteBase, error) {
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
+		return zsetWriteBase{}, err
+	}
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeZSet)
+	if err != nil {
+		return zsetWriteBase{}, err
+	}
+	var migrationElems []*kv.Elem[kv.OP]
+	skipLegacy := cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeZSet)
+	if !expiredRecreate && !skipLegacy {
+		migrationElems, err = r.buildZSetLegacyMigrationElems(ctx, key, readTS)
+		if err != nil {
+			return zsetWriteBase{}, err
+		}
+	}
+	inTxnView := buildZSetMigrationView(migrationElems, key)
+	if !expiredRecreate && bulkMembers > 0 {
+		inTxnView, err = r.mergeZSetBulkScores(ctx, key, readTS, bulkMembers, inTxnView)
+		if err != nil {
+			return zsetWriteBase{}, err
+		}
+	}
+	return zsetWriteBase{
+		typ:             typ,
+		cleanupElems:    cleanupElems,
+		migrationElems:  migrationElems,
+		inTxnView:       inTxnView,
+		expiredRecreate: expiredRecreate,
+	}, nil
 }
 
 // dispatchAndSignalZSet dispatches the elems through the coordinator
@@ -687,7 +723,7 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeZSet)
+	base, err := r.prepareZSetWriteBase(ctx, key, readTS, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -699,15 +735,7 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 		return 0, cockerrors.WithStack(err)
 	}
 
-	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
-	if migErr != nil {
-		return 0, migErr
-	}
-
-	// Check in-txn migration view before falling back to the store
-	// (migrated keys are not yet visible at readTS).
-	inTxnView := buildZSetMigrationView(migrationElems, key)
-	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, member, readTS, inTxnView)
+	oldScore, memberExists, err := r.resolveZSetMemberScore(ctx, memberKey, member, readTS, base.inTxnView, base.expiredRecreate)
 	if err != nil {
 		return 0, err
 	}
@@ -716,8 +744,9 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	if math.IsNaN(newScore) {
 		return 0, errors.New("ERR resulting score is not a number (NaN)")
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+3) //nolint:mnd // del old score + put member + put score index
-	elems = append(elems, migrationElems...)
+	elems := make([]*kv.Elem[kv.OP], 0, len(base.cleanupElems)+len(base.migrationElems)+3) //nolint:mnd // del old score + put member + put score index
+	elems = append(elems, base.cleanupElems...)
+	elems = append(elems, base.migrationElems...)
 	if memberExists {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, oldScore, []byte(member))})
 	}
@@ -735,7 +764,7 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 		})
 	}
 	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
-		redisTxnWideCreateReadKeys(key, typ, redisTxnWideZSetFenceKey)); err != nil {
+		redisTxnWideCreateReadKeys(key, base.typ, redisTxnWideZSetFenceKey)); err != nil {
 		return 0, err
 	}
 	return newScore, nil

@@ -80,10 +80,11 @@ message RawScanAtRequest {
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
   bool reverse = 5;
   uint64 group_id = 6; // optional explicit Raft group for non-range-owned keyspaces
-  uint64 read_route_version = 7; // stamped by server-side routing for migration read fences
-  bytes route_start = 8; // route-key-normalized inclusive start, when already known
-  bytes route_end = 9; // route-key-normalized exclusive end; empty means +infinity
-  bool route_bounds_present = 10; // true when route_start/route_end were supplied, including ["", +infinity)
+  bool keys_only = 7; // when true, response kv entries omit values
+  uint64 read_route_version = 8; // stamped by server-side routing for migration read fences
+  bytes route_start = 9; // route-key-normalized inclusive start, when already known
+  bytes route_end = 10; // route-key-normalized exclusive end; empty means +infinity
+  bool route_bounds_present = 11; // true when route_start/route_end were supplied, including ["", +infinity)
 }
 
 message RawKVPair {

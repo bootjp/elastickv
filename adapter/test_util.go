@@ -764,7 +764,7 @@ func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, m
 // it safe to call from worker goroutines in parallel tests.
 //
 // Use cases: mid-test leader churn under CI load (e.g. grpc_test.go's
-// 9999-iteration consistency loops). The startup window — leader-churn
+// sequence consistency loops). The startup window — leader-churn
 // between createNode returning and the first write — is closed at the
 // readiness layer instead (waitForWriteableLeader, PR #898), so first-
 // write callers should NOT wrap in retryNotLeader; direct calls suffice

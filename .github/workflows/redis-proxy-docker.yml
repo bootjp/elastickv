@@ -45,13 +45,29 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}/redis-proxy
-          tags: |
-            type=sha
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/redis-proxy
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          ref_tag="$(printf '%s' "$GITHUB_REF_NAME" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^-+//; s/-+$//')"
+          ref_tag="${ref_tag:0:128}"
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:sha-${short_sha}"
+            if [[ "${GITHUB_EVENT_NAME}" != "pull_request" && -n "${ref_tag}" ]]; then
+              echo "${IMAGE}:${ref_tag}"
+            fi
+            if [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" ]]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+            echo "labels<<EOF"
+            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v7

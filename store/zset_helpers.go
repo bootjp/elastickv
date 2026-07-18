@@ -10,7 +10,7 @@ import (
 
 // ZSet wide-column key layout:
 //
-//	Base Metadata: !zs|meta|<userKeyLen(4)><userKey>                               → [Len(8)]
+//	Base Metadata: !zs|meta|<userKeyLen(4)><userKey>                               → [Len(8)][ExpireAtMs(8)]
 //	Member Key:    !zs|mem|<userKeyLen(4)><userKey><member>                         → [Score(8)] IEEE 754
 //	Score Index:   !zs|scr|<userKeyLen(4)><userKey><sortableScore(8)><member>       → (empty)
 //	Delta Key:     !zs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>   → [LenDelta(8)]
@@ -20,13 +20,18 @@ const (
 	ZSetScorePrefix     = "!zs|scr|"
 	ZSetMetaDeltaPrefix = "!zs|meta|d|"
 
-	// zsetMetaSizeBytes is the fixed binary size of a ZSetMeta, ZSetMetaDelta, or ZSet score (one int64/float64).
-	zsetMetaSizeBytes = 8
+	// zsetScalarSizeBytes is the fixed binary size of a ZSetMetaDelta or ZSet score.
+	zsetScalarSizeBytes = 8
+	// zsetMetaLegacySizeBytes is the pre-inline-TTL binary size of a ZSetMeta.
+	zsetMetaLegacySizeBytes = 8
+	// zsetMetaSizeBytes is the current binary size of a ZSetMeta (Len + ExpireAtMs).
+	zsetMetaSizeBytes = 16
 )
 
 // ZSetMeta is the base metadata for a sorted set collection.
 type ZSetMeta struct {
-	Len int64
+	Len      int64
+	ExpireAt uint64
 }
 
 // ZSetMetaDelta holds a signed change in member count.
@@ -34,31 +39,36 @@ type ZSetMetaDelta struct {
 	LenDelta int64
 }
 
-// MarshalZSetMeta encodes ZSetMeta into a fixed 8-byte binary format.
+// MarshalZSetMeta encodes ZSetMeta into a fixed 16-byte binary format.
 func MarshalZSetMeta(m ZSetMeta) []byte {
 	buf := make([]byte, zsetMetaSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(m.Len)) //nolint:gosec
+	binary.BigEndian.PutUint64(buf[8:16], m.ExpireAt)
 	return buf
 }
 
-// UnmarshalZSetMeta decodes ZSetMeta from the fixed 8-byte binary format.
+// UnmarshalZSetMeta decodes ZSetMeta from the legacy 8-byte or current 16-byte binary format.
 func UnmarshalZSetMeta(b []byte) (ZSetMeta, error) {
-	if len(b) != zsetMetaSizeBytes {
+	if len(b) != zsetMetaLegacySizeBytes && len(b) != zsetMetaSizeBytes {
 		return ZSetMeta{}, errors.WithStack(errors.Newf("invalid zset meta length: %d", len(b)))
 	}
-	return ZSetMeta{Len: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
+	meta := ZSetMeta{Len: int64(binary.BigEndian.Uint64(b[0:8]))} //nolint:gosec
+	if len(b) == zsetMetaSizeBytes {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[8:16])
+	}
+	return meta, nil
 }
 
 // MarshalZSetMetaDelta encodes ZSetMetaDelta into a fixed 8-byte binary format.
 func MarshalZSetMetaDelta(d ZSetMetaDelta) []byte {
-	buf := make([]byte, zsetMetaSizeBytes)
+	buf := make([]byte, zsetScalarSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(d.LenDelta)) //nolint:gosec
 	return buf
 }
 
 // UnmarshalZSetMetaDelta decodes ZSetMetaDelta from the fixed 8-byte binary format.
 func UnmarshalZSetMetaDelta(b []byte) (ZSetMetaDelta, error) {
-	if len(b) != zsetMetaSizeBytes {
+	if len(b) != zsetScalarSizeBytes {
 		return ZSetMetaDelta{}, errors.WithStack(errors.Newf("invalid zset meta delta length: %d", len(b)))
 	}
 	return ZSetMetaDelta{LenDelta: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
@@ -66,14 +76,14 @@ func UnmarshalZSetMetaDelta(b []byte) (ZSetMetaDelta, error) {
 
 // MarshalZSetScore encodes a float64 score in IEEE 754 big-endian format.
 func MarshalZSetScore(score float64) []byte {
-	buf := make([]byte, zsetMetaSizeBytes)
+	buf := make([]byte, zsetScalarSizeBytes)
 	binary.BigEndian.PutUint64(buf, math.Float64bits(score))
 	return buf
 }
 
 // UnmarshalZSetScore decodes a float64 score from IEEE 754 big-endian format.
 func UnmarshalZSetScore(b []byte) (float64, error) {
-	if len(b) != zsetMetaSizeBytes {
+	if len(b) != zsetScalarSizeBytes {
 		return 0, errors.WithStack(errors.Newf("invalid zset score length: %d", len(b)))
 	}
 	return math.Float64frombits(binary.BigEndian.Uint64(b)), nil
@@ -162,7 +172,7 @@ func ExtractZSetMemberName(key, userKey []byte) []byte {
 // Layout: !zs|scr|<userKeyLen(4)><userKey><sortableScore(8)><member>
 func ZSetScoreKey(userKey []byte, score float64, member []byte) []byte {
 	sortable := EncodeSortableFloat64(score)
-	buf := make([]byte, 0, len(ZSetScorePrefix)+wideColKeyLenSize+len(userKey)+zsetMetaSizeBytes+len(member))
+	buf := make([]byte, 0, len(ZSetScorePrefix)+wideColKeyLenSize+len(userKey)+zsetScalarSizeBytes+len(member))
 	buf = append(buf, ZSetScorePrefix...)
 	var kl [4]byte
 	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey))) //nolint:gosec // len is bounded by max slice size
@@ -187,7 +197,7 @@ func ZSetScoreScanPrefix(userKey []byte) []byte {
 // ZSetScoreRangeScanPrefix returns the prefix for scanning scores in [minScore, maxScore].
 func ZSetScoreRangeScanPrefix(userKey []byte, score float64) []byte {
 	sortable := EncodeSortableFloat64(score)
-	buf := make([]byte, 0, len(ZSetScorePrefix)+wideColKeyLenSize+len(userKey)+zsetMetaSizeBytes)
+	buf := make([]byte, 0, len(ZSetScorePrefix)+wideColKeyLenSize+len(userKey)+zsetScalarSizeBytes)
 	buf = append(buf, ZSetScorePrefix...)
 	var kl [4]byte
 	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey))) //nolint:gosec // len is bounded by max slice size
@@ -204,13 +214,13 @@ func ExtractZSetScoreAndMember(key, userKey []byte) (score float64, member []byt
 		return 0, nil, false
 	}
 	rest := key[len(prefix):]
-	if len(rest) < zsetMetaSizeBytes {
+	if len(rest) < zsetScalarSizeBytes {
 		return 0, nil, false
 	}
-	var sortable [zsetMetaSizeBytes]byte
-	copy(sortable[:], rest[:zsetMetaSizeBytes])
+	var sortable [zsetScalarSizeBytes]byte
+	copy(sortable[:], rest[:zsetScalarSizeBytes])
 	score = DecodeSortableFloat64(sortable)
-	member = rest[zsetMetaSizeBytes:]
+	member = rest[zsetScalarSizeBytes:]
 	return score, member, true
 }
 
@@ -279,7 +289,7 @@ func ExtractZSetUserKeyFromMember(key []byte) []byte {
 
 // ExtractZSetUserKeyFromScore extracts the logical user key from a zset score index key.
 func ExtractZSetUserKeyFromScore(key []byte) []byte {
-	return extractWideColumnUserKey(key, []byte(ZSetScorePrefix), zsetMetaSizeBytes, false)
+	return extractWideColumnUserKey(key, []byte(ZSetScorePrefix), zsetScalarSizeBytes, false)
 }
 
 // ExtractZSetUserKeyFromScoreScanPrefix extracts the user key from a zset

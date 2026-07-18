@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -281,14 +281,8 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 	defer func() { _ = rdb.Close() }()
 	ctx := t.Context()
 
-	const (
-		total  = 10_000
-		probes = 100
-	)
-	lastID := ""
-	for i := range total {
-		lastID = xaddStreamLatencySeed(t, ctx, rdb, fmt.Sprint(i))
-	}
+	const probes = 100
+	lastID := seedStreamEntriesForXReadLatency(t, nodes[0].redisServer, ctx, "stream-lat")
 
 	measure := func() time.Duration {
 		var (
@@ -351,32 +345,29 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 		baseline, median, p95)
 }
 
-func xaddStreamLatencySeed(t *testing.T, ctx context.Context, rdb *redis.Client, value string) string {
+func seedStreamEntriesForXReadLatency(t *testing.T, server *RedisServer, ctx context.Context, key string) string {
 	t.Helper()
 
-	const maxAttempts = 10
-	for attempt := range maxAttempts {
-		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: "stream-lat",
-			ID:     "*",
-			Values: []string{"i", value},
-		}).Result()
-		if err == nil {
-			return id
-		}
-		if attempt == maxAttempts-1 || !isRetryableStreamLatencySeedErr(err) {
-			require.NoError(t, err)
-		}
-		time.Sleep(time.Duration(attempt+1) * leaderChurnRetryInterval)
-	}
-	return ""
-}
+	const entryCount = 10_000
+	commitTS, err := server.coordinator.Clock().NextFenced()
+	require.NoError(t, err)
 
-func isRetryableStreamLatencySeedErr(err error) bool {
-	if err == nil || isTransientNotLeaderErr(err) {
-		return err != nil
+	userKey := []byte(key)
+	for ms := uint64(1); ms <= entryCount; ms++ {
+		id := fmt.Sprintf("%d-0", ms)
+		value, err := marshalStreamEntry(newRedisStreamEntry(id, []string{"i", fmt.Sprint(ms - 1)}))
+		require.NoError(t, err)
+		require.NoError(t, server.store.PutAt(ctx, store.StreamEntryKey(userKey, ms, 0), value, commitTS, 0))
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "write conflict")
+
+	meta, err := store.MarshalStreamMeta(store.StreamMeta{
+		Length:  entryCount,
+		LastMs:  entryCount,
+		LastSeq: 0,
+	})
+	require.NoError(t, err)
+	require.NoError(t, server.store.PutAt(ctx, store.StreamMetaKey(userKey), meta, commitTS, 0))
+	return fmt.Sprintf("%d-0", entryCount)
 }
 
 func TestRedis_StreamXTrimMaxLen(t *testing.T) {
@@ -729,6 +720,49 @@ func TestRedis_StreamMultiExecDelRemovesWideColumnLayout(t *testing.T) {
 	entries, err := rdb.XRange(ctx, key, "-", "+").Result()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
+}
+
+func TestRedis_StreamXAddRecreatesExpiredStreamWithoutStaleEntriesOrTTL(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	key := "stream-expired-xadd"
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1700000000000-0",
+		Values: []string{"old", "value"},
+	}).Result()
+	require.NoError(t, err)
+	require.NoError(t, rdb.PExpire(ctx, key, time.Millisecond).Err())
+	require.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, key).Result()
+		return err == nil && exists == 0
+	}, time.Second, 10*time.Millisecond)
+
+	id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1800000000000-0",
+		Values: []string{"fresh", "value"},
+	}).Result()
+	require.NoError(t, err)
+	require.Equal(t, "1800000000000-0", id)
+
+	ttl, err := rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+	entries, err := rdb.XRange(ctx, key, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "1800000000000-0", entries[0].ID)
+	require.Equal(t, "value", entries[0].Values["fresh"])
+
+	server := nodes[0].redisServer
+	requireMissingAt(t, server.store, redisTTLKey([]byte(key)), server.readTS())
 }
 
 // nowNanos returns the current UnixNano timestamp as uint64, failing the

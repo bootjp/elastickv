@@ -166,6 +166,30 @@ func TestFSMWriteFenceBypassAllowsMarkedRawPointWrite(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
+func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	key := []byte("z")
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn:                true,
+		Phase:                pb.Phase_PREPARE,
+		Ts:                   10,
+		ObservedRouteVersion: 1,
+		WriteFenceBypassKeys: [][]byte{key},
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_DEL, Key: key},
+		},
+	}, 10)
+	require.NoError(t, err)
+}
+
 func TestFSMWriteFenceBypassDoesNotAllowDelPrefix(t *testing.T) {
 	t.Parallel()
 

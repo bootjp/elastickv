@@ -336,7 +336,7 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.NoError(t, st1.PutAt(ctx, right, []byte("right"), 1, 0))
 
 	startTS := uint64(2)
-	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
@@ -346,7 +346,7 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
-func TestShardStoreScanAtWithReadFence_BoundsOutOfRouteLockScan(t *testing.T) {
+func TestShardStoreScanAtWithReadFence_SkipsManyOutOfRouteLocks(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -379,9 +379,31 @@ func TestShardStoreScanAtWithReadFence_BoundsOutOfRouteLockScan(t *testing.T) {
 		require.NoError(t, st1.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
 	}
 
-	_, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
+	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+}
+
+func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	rawPrefix := []byte("!redis|meta|")
+	rawEnd := prefixScanEnd(rawPrefix)
+	for i := uint64(0); i <= lockPageLimit; i++ {
+		key := []byte(fmt.Sprintf("!redis|meta|z%04d", i))
+		lock := encodeTxnLock(txnLock{
+			StartTS:     10 + i,
+			TTLExpireAt: ^uint64(0),
+			PrimaryKey:  key,
+		})
+		require.NoError(t, st.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
+	}
+
+	_, err := scanTxnLockPagesAtWithRouteFilter(ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0), lockPageLimit, []byte("m"), nil)
+	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
 func TestShardStoreScanAtWithReadFence_BoundsLockScanToCurrentRawPage(t *testing.T) {
@@ -449,13 +471,75 @@ func TestShardStoreScanAtWithReadFence_ReverseBoundsLockScanToPage(t *testing.T)
 	require.NoError(t, st1.PutAt(ctx, right, []byte("right"), 1, 0))
 
 	startTS := uint64(2)
-	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, left, []byte("left"), left)})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), true, 1, shardStore.ReadRouteVersion(), []byte(""), nil)
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, right, kvs[0].Key)
+}
+
+func TestShardStoreScanKeysAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	st1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "g1", NewKvFSMWithHLC(st1, NewHLC()))
+	defer stop1()
+
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: r1, Store: st1, Txn: NewLeaderProxyWithEngine(r1)},
+	}
+	shardStore := NewShardStore(engine, groups)
+
+	key := []byte("k")
+	startTS := uint64(1)
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
+	require.NoError(t, err)
+
+	_, err = shardStore.ScanKeysAt(ctx, []byte("k"), []byte("l"), 100, ^uint64(0))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
+}
+
+func TestShardStoreScanKeysAt_ResolvesCommittedSecondaryLockWithoutCommittedValue(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	shardStore, groups, cleanup := setupTwoShardStore(t)
+	defer cleanup()
+
+	startTS := uint64(1)
+	commitTS := uint64(2)
+	primaryKey := []byte("b")
+	secondaryKey := []byte("x")
+
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	require.NoError(t, err)
+	_, err = groups[2].Txn.Commit(ctx, []*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
+	require.NoError(t, err)
+
+	commitPrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
+		},
+	}
+	_, err = groups[1].Txn.Commit(ctx, []*pb.Request{commitPrimary})
+	require.NoError(t, err)
+
+	keys, err := shardStore.ScanKeysAt(ctx, []byte("x"), []byte("z"), 100, commitTS)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{secondaryKey}, keys)
 }
 
 func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *testing.T) {

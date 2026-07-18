@@ -259,15 +259,15 @@ memory each group's private cache/memtable pins.
 ### (f) Operational scaling
 
 - **keyviz** — the per-route load sampler is wired and allocation-free on the
-  write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
-  with proposed extensions for cluster fan-out
-  (`2026_04_27_implemented_keyviz_cluster_fanout.md`),
-  subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
-  hot-key top-K (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell
-  conflict (implemented). It is the detection signal M3 reuses. Current
-  adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
-  coordinator sampler, so read-heavy hotspots remain invisible until read-path
-  sampling or an equivalent adapter read observation path is added.
+  write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`).
+  Shipped extensions include cluster fan-out
+  (`2026_04_27_implemented_keyviz_cluster_fanout.md`), subrange sampling
+  (`2026_05_25_implemented_keyviz_subrange_sampling.md`), hot-key top-K
+  (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell conflict. It
+  is the detection signal M3 reuses. Current adapter-direct
+  Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this coordinator
+  sampler, so read-heavy hotspots remain invisible until read-path sampling or
+  an equivalent adapter read observation path is added.
 - **admin** — admin dashboard / data browser / purge-queue are implemented
   (`2026_04_24_implemented_admin_dashboard.md`,
   `2026_05_22_implemented_admin_data_browser.md`,
