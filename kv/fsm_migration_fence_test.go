@@ -98,6 +98,92 @@ func applyTargetReadinessToFSM(t *testing.T, fsm *kvFSM, state store.TargetStage
 	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
 }
 
+func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, writeFence, readFence bool) {
+	t.Helper()
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    writeFence,
+		SourceReadFence:     readFence,
+		RetentionPinTS:      40,
+	})
+}
+
+func newMigrationWriteTrackerFSM(t *testing.T) *kvFSM {
+	t.Helper()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:               11,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      11,
+		MinWriteTSExclusive: 1,
+		Armed:               true,
+		RetentionPinTS:      1,
+		TrackWrites:         true,
+	})
+	return fsm
+}
+
+func migrationTrackerMinimum(t *testing.T, fsm *kvFSM) uint64 {
+	t.Helper()
+	reader, ok := fsm.store.(store.MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(context.Background())
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	return states[0].MinAdmittedTS
+}
+
+func TestFSMMigrationWriteTrackerCoversAllAdmissionPaths(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newMigrationWriteTrackerFSM(t)
+	require.NoError(t, fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("raw")}},
+	}, 80))
+	require.Equal(t, uint64(80), migrationTrackerMinimum(t, fsm))
+
+	require.NoError(t, fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("m")}},
+	}, 70))
+	require.Equal(t, uint64(70), migrationTrackerMinimum(t, fsm))
+
+	require.NoError(t, fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Ts:    50,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("o"), CommitTS: 60})},
+			{Op: pb.Op_PUT, Key: []byte("o"), Value: []byte("one-phase")},
+		},
+	}, 60))
+	require.Equal(t, uint64(60), migrationTrackerMinimum(t, fsm))
+
+	require.NoError(t, fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    40,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("p"), CommitTS: 55, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: []byte("p"), Value: []byte("prepared")},
+		},
+	}, 40))
+	require.Equal(t, uint64(55), migrationTrackerMinimum(t, fsm))
+}
+
 func newReadinessReadKeyFSM(t *testing.T) *kvFSM {
 	t.Helper()
 
@@ -154,7 +240,7 @@ func TestFSMWriteFenceBypassAllowsMarkedRawPointWrite(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-	key := []byte("z")
+	key := []byte("n")
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
@@ -164,6 +250,30 @@ func TestFSMWriteFenceBypassAllowsMarkedRawPointWrite(t *testing.T) {
 	got, err := fsm.store.GetAt(context.Background(), key, 10)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMDurableSourceFenceRejectsRawWriteDespiteCatalogBypass(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFencedFSM(t)
+	applySourceMigrationControlToFSM(t, fsm, true, false)
+	key := []byte("n")
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		WriteFenceBypassKeys: [][]byte{key},
+		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
+	}, 60)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMDurableSourceFenceRejectsPrefixWrite(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFencedFSM(t)
+	applySourceMigrationControlToFSM(t, fsm, true, false)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("m")}},
+	}, 60)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
 func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
@@ -215,6 +325,24 @@ func TestFSMWriteFenceBypassAllowsPinnedOnePhaseTxnOnNonOwningGroup(t *testing.T
 	got, err := fsm.store.GetAt(context.Background(), key, 20)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), got)
+}
+
+func TestFSMDurableSourceFenceRejectsPinnedOnePhaseTxn(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFencedFSM(t)
+	applySourceMigrationControlToFSM(t, fsm, true, false)
+	key := []byte("n")
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn:                true,
+		Ts:                   50,
+		WriteFenceBypassKeys: [][]byte{key},
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key})},
+			{Op: pb.Op_PUT, Key: key, Value: []byte("v")},
+		},
+	}, 60)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
 func TestFSMWriteFenceBypassDoesNotAllowDelPrefix(t *testing.T) {

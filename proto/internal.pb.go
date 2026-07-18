@@ -1097,8 +1097,15 @@ type TargetStagedReadinessRequest struct {
 	MigrationJobId         uint64                 `protobuf:"varint,5,opt,name=migration_job_id,json=migrationJobId,proto3" json:"migration_job_id,omitempty"`
 	MinWriteTsExclusive    uint64                 `protobuf:"varint,6,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
 	Armed                  bool                   `protobuf:"varint,7,opt,name=armed,proto3" json:"armed,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Source-side controls reuse the same Raft-replicated durable record. They
+	// are ignored by target staged-readiness checks.
+	SourceWriteFence bool   `protobuf:"varint,8,opt,name=source_write_fence,json=sourceWriteFence,proto3" json:"source_write_fence,omitempty"`
+	SourceReadFence  bool   `protobuf:"varint,9,opt,name=source_read_fence,json=sourceReadFence,proto3" json:"source_read_fence,omitempty"`
+	RetentionPinTs   uint64 `protobuf:"varint,10,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
+	TrackWrites      bool   `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
+	MinAdmittedTs    uint64 `protobuf:"varint,12,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *TargetStagedReadinessRequest) Reset() {
@@ -1180,8 +1187,44 @@ func (x *TargetStagedReadinessRequest) GetArmed() bool {
 	return false
 }
 
+func (x *TargetStagedReadinessRequest) GetSourceWriteFence() bool {
+	if x != nil {
+		return x.SourceWriteFence
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetSourceReadFence() bool {
+	if x != nil {
+		return x.SourceReadFence
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetRetentionPinTs() uint64 {
+	if x != nil {
+		return x.RetentionPinTs
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetTrackWrites() bool {
+	if x != nil {
+		return x.TrackWrites
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
 type TargetStagedReadinessResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	MinAdmittedTs uint64                 `protobuf:"varint,1,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1214,6 +1257,117 @@ func (x *TargetStagedReadinessResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use TargetStagedReadinessResponse.ProtoReflect.Descriptor instead.
 func (*TargetStagedReadinessResponse) Descriptor() ([]byte, []int) {
 	return file_internal_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *TargetStagedReadinessResponse) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+type ProbeMigrationLocksRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RouteStart    []byte                 `protobuf:"bytes,1,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd      []byte                 `protobuf:"bytes,2,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	Limit         uint32                 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationLocksRequest) Reset() {
+	*x = ProbeMigrationLocksRequest{}
+	mi := &file_internal_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationLocksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationLocksRequest) ProtoMessage() {}
+
+func (x *ProbeMigrationLocksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationLocksRequest.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationLocksRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ProbeMigrationLocksRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *ProbeMigrationLocksRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *ProbeMigrationLocksRequest) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type ProbeMigrationLocksResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PendingCount  uint32                 `protobuf:"varint,1,opt,name=pending_count,json=pendingCount,proto3" json:"pending_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationLocksResponse) Reset() {
+	*x = ProbeMigrationLocksResponse{}
+	mi := &file_internal_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationLocksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationLocksResponse) ProtoMessage() {}
+
+func (x *ProbeMigrationLocksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationLocksResponse.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationLocksResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ProbeMigrationLocksResponse) GetPendingCount() uint32 {
+	if x != nil {
+		return x.PendingCount
+	}
+	return 0
 }
 
 var File_internal_proto protoreflect.FileDescriptor
@@ -1297,7 +1451,7 @@ const file_internal_proto_rawDesc = "" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
 	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
-	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xa2\x02\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xf1\x03\n" +
 	"\x1cTargetStagedReadinessRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x1f\n" +
 	"\vroute_start\x18\x02 \x01(\fR\n" +
@@ -1306,8 +1460,22 @@ const file_internal_proto_rawDesc = "" +
 	"\x18expected_cutover_version\x18\x04 \x01(\x04R\x16expectedCutoverVersion\x12(\n" +
 	"\x10migration_job_id\x18\x05 \x01(\x04R\x0emigrationJobId\x123\n" +
 	"\x16min_write_ts_exclusive\x18\x06 \x01(\x04R\x13minWriteTsExclusive\x12\x14\n" +
-	"\x05armed\x18\a \x01(\bR\x05armed\"\x1f\n" +
-	"\x1dTargetStagedReadinessResponse*&\n" +
+	"\x05armed\x18\a \x01(\bR\x05armed\x12,\n" +
+	"\x12source_write_fence\x18\b \x01(\bR\x10sourceWriteFence\x12*\n" +
+	"\x11source_read_fence\x18\t \x01(\bR\x0fsourceReadFence\x12(\n" +
+	"\x10retention_pin_ts\x18\n" +
+	" \x01(\x04R\x0eretentionPinTs\x12!\n" +
+	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12&\n" +
+	"\x0fmin_admitted_ts\x18\f \x01(\x04R\rminAdmittedTs\"G\n" +
+	"\x1dTargetStagedReadinessResponse\x12&\n" +
+	"\x0fmin_admitted_ts\x18\x01 \x01(\x04R\rminAdmittedTs\"p\n" +
+	"\x1aProbeMigrationLocksRequest\x12\x1f\n" +
+	"\vroute_start\x18\x01 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x02 \x01(\fR\brouteEnd\x12\x14\n" +
+	"\x05limit\x18\x03 \x01(\rR\x05limit\"B\n" +
+	"\x1bProbeMigrationLocksResponse\x12#\n" +
+	"\rpending_count\x18\x01 \x01(\rR\fpendingCount*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -1318,14 +1486,15 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xdc\x03\n" +
+	"\x05ABORT\x10\x032\xb0\x04\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
 	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00\x12]\n" +
-	"\x1aApplyTargetStagedReadiness\x12\x1d.TargetStagedReadinessRequest\x1a\x1e.TargetStagedReadinessResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x1aApplyTargetStagedReadiness\x12\x1d.TargetStagedReadinessRequest\x1a\x1e.TargetStagedReadinessResponse\"\x00\x12R\n" +
+	"\x13ProbeMigrationLocks\x12\x1b.ProbeMigrationLocksRequest\x1a\x1c.ProbeMigrationLocksResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -1340,7 +1509,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                               // 0: Op
 	(Phase)(0),                            // 1: Phase
@@ -1360,6 +1529,8 @@ var file_internal_proto_goTypes = []any{
 	(*PromoteStagedVersionsResponse)(nil), // 15: PromoteStagedVersionsResponse
 	(*TargetStagedReadinessRequest)(nil),  // 16: TargetStagedReadinessRequest
 	(*TargetStagedReadinessResponse)(nil), // 17: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),    // 18: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),   // 19: ProbeMigrationLocksResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -1375,14 +1546,16 @@ var file_internal_proto_depIdxs = []int32{
 	12, // 10: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
 	14, // 11: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
 	16, // 12: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	6,  // 13: Internal.Forward:output_type -> ForwardResponse
-	8,  // 14: Internal.RelayPublish:output_type -> RelayPublishResponse
-	10, // 15: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	13, // 16: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	15, // 17: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	17, // 18: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	13, // [13:19] is the sub-list for method output_type
-	7,  // [7:13] is the sub-list for method input_type
+	18, // 13: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	6,  // 14: Internal.Forward:output_type -> ForwardResponse
+	8,  // 15: Internal.RelayPublish:output_type -> RelayPublishResponse
+	10, // 16: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	13, // 17: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	15, // 18: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	17, // 19: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	19, // 20: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	14, // [14:21] is the sub-list for method output_type
+	7,  // [7:14] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
@@ -1399,7 +1572,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

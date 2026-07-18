@@ -11,6 +11,7 @@ service Internal {
   rpc ImportRangeVersions(ImportRangeVersionsRequest) returns (ImportRangeVersionsResponse) {}
   rpc PromoteStagedVersions(PromoteStagedVersionsRequest) returns (PromoteStagedVersionsResponse) {}
   rpc ApplyTargetStagedReadiness(TargetStagedReadinessRequest) returns (TargetStagedReadinessResponse) {}
+  rpc ProbeMigrationLocks(ProbeMigrationLocksRequest) returns (ProbeMigrationLocksResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -160,6 +161,25 @@ message TargetStagedReadinessRequest {
   uint64 migration_job_id = 5;
   uint64 min_write_ts_exclusive = 6;
   bool armed = 7;
+  // Source-side controls reuse the same Raft-replicated durable record. They
+  // are ignored by target staged-readiness checks.
+  bool source_write_fence = 8;
+  bool source_read_fence = 9;
+  uint64 retention_pin_ts = 10;
+  bool track_writes = 11;
+  uint64 min_admitted_ts = 12;
 }
 
-message TargetStagedReadinessResponse {}
+message TargetStagedReadinessResponse {
+  uint64 min_admitted_ts = 1;
+}
+
+message ProbeMigrationLocksRequest {
+  bytes route_start = 1;
+  bytes route_end = 2;
+  uint32 limit = 3;
+}
+
+message ProbeMigrationLocksResponse {
+  uint32 pending_count = 1;
+}

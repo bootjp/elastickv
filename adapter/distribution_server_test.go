@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -981,6 +982,81 @@ func TestDistributionServerRunSplitJobRunnerOnce_TerminalizesPromotedCleanupJob(
 	require.Equal(t, saved.Version+1, s.engine.Version())
 }
 
+func TestDistributionServerRunSplitJobRunnerOnce_CompletesCrossGroupMigration(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	require.NoError(t, err)
+	job, err := distribution.InitializeSplitJobPlan(distribution.SplitJob{
+		JobID:         1,
+		SourceRouteID: 1,
+		SplitKey:      []byte("m"),
+		TargetGroupID: 2,
+	}, saved.Routes[0], time.Now().UnixMilli())
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(saved))
+	source := &splitMigrationClientStub{}
+	target := &splitMigrationClientStub{}
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(
+		engine,
+		catalog,
+		WithDistributionCoordinator(coordinator),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return target, nil
+		}),
+		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			return source, target, nil
+		}),
+	)
+
+	for range 200 {
+		require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+		current, found, loadErr := catalog.SplitJob(ctx, job.JobID)
+		require.NoError(t, loadErr)
+		require.True(t, found)
+		if current.Phase == distribution.SplitJobPhaseDone {
+			break
+		}
+	}
+
+	completed, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, distribution.SplitJobPhaseDone, completed.Phase)
+	require.True(t, completed.WriteTrackerArmed)
+	require.True(t, completed.PostFenceDrainCompleted)
+	require.NotZero(t, completed.SnapshotTS)
+	require.NotZero(t, completed.FenceTS)
+	require.NotZero(t, completed.CutoverVersion)
+	require.True(t, completed.TargetPromotionDone)
+	require.NotEmpty(t, source.controls)
+	require.NotEmpty(t, target.controls)
+	require.NotEmpty(t, source.exports)
+	require.Len(t, target.imports, len(source.exports))
+
+	finalSnapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, finalSnapshot.Routes, 2)
+	right := distributionRouteByID(t, finalSnapshot.Routes, 3)
+	require.Equal(t, uint64(2), right.GroupID)
+	require.Equal(t, distribution.RouteStateActive, right.State)
+	require.False(t, right.StagedVisibilityActive)
+	require.Equal(t, completed.FenceTS, right.MinWriteTSExclusive)
+}
+
 func TestDistributionServerRunSplitJobRunnerOnce_SkipsFollower(t *testing.T) {
 	t.Parallel()
 
@@ -1864,6 +1940,94 @@ type splitPromotionClientStub struct {
 	err       error
 	requests  []*pb.PromoteStagedVersionsRequest
 	calls     int
+}
+
+type splitMigrationClientStub struct {
+	splitPromotionClientStub
+	exports  []*pb.ExportRangeVersionsRequest
+	imports  []*pb.ImportRangeVersionsRequest
+	controls []*pb.TargetStagedReadinessRequest
+}
+
+func (s *splitMigrationClientStub) ExportRangeVersions(
+	_ context.Context,
+	req *pb.ExportRangeVersionsRequest,
+	_ ...grpc.CallOption,
+) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
+	cloned := &pb.ExportRangeVersionsRequest{
+		RangeStart:           distribution.CloneBytes(req.GetRangeStart()),
+		RangeEnd:             distribution.CloneBytes(req.GetRangeEnd()),
+		MaxCommitTs:          req.GetMaxCommitTs(),
+		MinCommitTs:          req.GetMinCommitTs(),
+		Cursor:               distribution.CloneBytes(req.GetCursor()),
+		ChunkBytes:           req.GetChunkBytes(),
+		RouteStart:           distribution.CloneBytes(req.GetRouteStart()),
+		RouteEnd:             distribution.CloneBytes(req.GetRouteEnd()),
+		MaxScannedBytes:      req.GetMaxScannedBytes(),
+		KeyFamily:            req.GetKeyFamily(),
+		ExcludeKnownInternal: req.GetExcludeKnownInternal(),
+		ExcludePrefixes:      req.GetExcludePrefixes(),
+	}
+	s.exports = append(s.exports, cloned)
+	phaseByte := byte(0)
+	if req.GetMinCommitTs() != 0 {
+		phaseByte = 1
+	}
+	cursor := []byte{byte(req.GetKeyFamily()), phaseByte}
+	return &splitMigrationStreamStub{responses: []*pb.ExportRangeVersionsResponse{{
+		Versions: []*pb.MVCCVersion{{
+			Key:       []byte("n"),
+			CommitTs:  10,
+			Value:     []byte("v"),
+			KeyFamily: req.GetKeyFamily(),
+		}},
+		NextCursor: cursor,
+		Done:       true,
+	}}}, nil
+}
+
+func (s *splitMigrationClientStub) ImportRangeVersions(
+	_ context.Context,
+	req *pb.ImportRangeVersionsRequest,
+	_ ...grpc.CallOption,
+) (*pb.ImportRangeVersionsResponse, error) {
+	s.imports = append(s.imports, req)
+	return &pb.ImportRangeVersionsResponse{AckedCursor: distribution.CloneBytes(req.GetCursor())}, nil
+}
+
+func (s *splitMigrationClientStub) ApplyTargetStagedReadiness(
+	_ context.Context,
+	req *pb.TargetStagedReadinessRequest,
+	_ ...grpc.CallOption,
+) (*pb.TargetStagedReadinessResponse, error) {
+	s.controls = append(s.controls, req)
+	minAdmittedTS := uint64(0)
+	if req.GetTrackWrites() {
+		minAdmittedTS = 10
+	}
+	return &pb.TargetStagedReadinessResponse{MinAdmittedTs: minAdmittedTS}, nil
+}
+
+func (s *splitMigrationClientStub) ProbeMigrationLocks(
+	context.Context,
+	*pb.ProbeMigrationLocksRequest,
+	...grpc.CallOption,
+) (*pb.ProbeMigrationLocksResponse, error) {
+	return &pb.ProbeMigrationLocksResponse{}, nil
+}
+
+type splitMigrationStreamStub struct {
+	grpc.ClientStream
+	responses []*pb.ExportRangeVersionsResponse
+}
+
+func (s *splitMigrationStreamStub) Recv() (*pb.ExportRangeVersionsResponse, error) {
+	if len(s.responses) == 0 {
+		return nil, io.EOF
+	}
+	resp := s.responses[0]
+	s.responses = s.responses[1:]
+	return resp, nil
 }
 
 func (s *splitPromotionClientStub) PromoteStagedVersions(

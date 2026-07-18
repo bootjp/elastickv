@@ -34,6 +34,7 @@ type DistributionServer struct {
 	splitJobRunnerReady         bool
 	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
 	splitPromotionClientFactory SplitPromotionClientFactory
+	splitMigrationClientFactory SplitMigrationClientFactory
 	knownRaftGroups             map[uint64]struct{}
 	reloadRetry                 struct {
 		attempts int
@@ -58,6 +59,19 @@ type SplitPromotionClient interface {
 // SplitPromotionClientFactory dials the node currently leading a split job's
 // target range and returns the internal client used by the runner.
 type SplitPromotionClientFactory func(context.Context, distribution.SplitJob) (SplitPromotionClient, error)
+
+// SplitMigrationClient is the internal data-plane client used for a split
+// job's source export, target import, and durable source/target guards.
+type SplitMigrationClient interface {
+	SplitPromotionClient
+	ExportRangeVersions(context.Context, *pb.ExportRangeVersionsRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error)
+	ImportRangeVersions(context.Context, *pb.ImportRangeVersionsRequest, ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error)
+	ApplyTargetStagedReadiness(context.Context, *pb.TargetStagedReadinessRequest, ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error)
+	ProbeMigrationLocks(context.Context, *pb.ProbeMigrationLocksRequest, ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error)
+}
+
+// SplitMigrationClientFactory resolves both participating group leaders.
+type SplitMigrationClientFactory func(context.Context, distribution.SplitJob, uint64) (source SplitMigrationClient, target SplitMigrationClient, err error)
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -106,6 +120,14 @@ func WithSplitJobRunnerReadinessGate(gate SplitMigrationCapabilityGate) Distribu
 func WithSplitPromotionClientFactory(factory SplitPromotionClientFactory) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.splitPromotionClientFactory = factory
+	}
+}
+
+// WithSplitMigrationClientFactory configures the source/target clients used by
+// the production split job state machine.
+func WithSplitMigrationClientFactory(factory SplitMigrationClientFactory) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitMigrationClientFactory = factory
 	}
 }
 
@@ -243,8 +265,8 @@ func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
 	if err != nil {
 		return splitJobCatalogStatusError(err)
 	}
-	if job, ok := nextCleanupSplitJob(jobs); ok {
-		return s.promoteSplitJobTargetAndComplete(ctx, job)
+	if job, ok := nextRunnableSplitJob(jobs); ok {
+		return s.runSplitJobPhase(ctx, job)
 	}
 	return nil
 }
@@ -263,10 +285,22 @@ func (s *DistributionServer) verifySplitJobRunnerLeader(ctx context.Context) (bo
 	return true, nil
 }
 
-func nextCleanupSplitJob(jobs []distribution.SplitJob) (distribution.SplitJob, bool) {
+func nextRunnableSplitJob(jobs []distribution.SplitJob) (distribution.SplitJob, bool) {
 	for _, job := range jobs {
-		if job.Phase == distribution.SplitJobPhaseCleanup {
+		switch job.Phase {
+		case distribution.SplitJobPhasePlanned,
+			distribution.SplitJobPhaseBackfill,
+			distribution.SplitJobPhaseFence,
+			distribution.SplitJobPhaseDeltaCopy,
+			distribution.SplitJobPhaseCutover,
+			distribution.SplitJobPhaseCleanup,
+			distribution.SplitJobPhaseAbandoning:
 			return job, true
+		case distribution.SplitJobPhaseNone,
+			distribution.SplitJobPhaseDone,
+			distribution.SplitJobPhaseFailed,
+			distribution.SplitJobPhaseAbandoned:
+			continue
 		}
 	}
 	return distribution.SplitJob{}, false

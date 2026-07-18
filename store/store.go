@@ -174,6 +174,11 @@ type TargetStagedReadinessState struct {
 	MigrationJobID         uint64
 	MinWriteTSExclusive    uint64
 	Armed                  bool
+	SourceWriteFence       bool
+	SourceReadFence        bool
+	RetentionPinTS         uint64
+	TrackWrites            bool
+	MinAdmittedTS          uint64
 }
 
 // MigrationPromoter is implemented by stores that can promote staged range

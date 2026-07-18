@@ -11,8 +11,12 @@ import (
 )
 
 const (
-	targetReadinessCodecVersion byte = 1
-	targetReadinessArmedFlag    byte = 1
+	targetReadinessCodecVersionV1 byte = 1
+	targetReadinessCodecVersion   byte = 2
+	targetReadinessArmedFlag      byte = 1
+	targetReadinessSourceWrite    byte = 1
+	targetReadinessSourceRead     byte = 2
+	targetReadinessTrackWrites    byte = 4
 )
 
 func validateTargetStagedReadinessState(state TargetStagedReadinessState) error {
@@ -25,9 +29,21 @@ func validateTargetStagedReadinessState(state TargetStagedReadinessState) error 
 		return errors.New("target staged readiness min_write_ts_exclusive is required when armed")
 	case state.RouteEnd != nil && bytes.Compare(state.RouteStart, state.RouteEnd) >= 0:
 		return errors.New("target staged readiness route range is invalid")
-	default:
-		return nil
 	}
+	return validateSourceMigrationControlState(state)
+}
+
+func validateSourceMigrationControlState(state TargetStagedReadinessState) error {
+	if state.SourceReadFence && !state.SourceWriteFence {
+		return errors.New("source read fence requires source write fence")
+	}
+	if (state.SourceWriteFence || state.SourceReadFence) && state.RetentionPinTS == 0 {
+		return errors.New("source migration control retention pin is required")
+	}
+	if state.TrackWrites && state.RetentionPinTS == 0 {
+		return errors.New("migration write tracker retention pin is required")
+	}
+	return nil
 }
 
 func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetStagedReadinessState) error {
@@ -110,10 +126,23 @@ func encodeTargetStagedReadinessState(state TargetStagedReadinessState) []byte {
 	} else {
 		buf = append(buf, 0)
 	}
+	var sourceFlags byte
+	if state.SourceWriteFence {
+		sourceFlags |= targetReadinessSourceWrite
+	}
+	if state.SourceReadFence {
+		sourceFlags |= targetReadinessSourceRead
+	}
+	if state.TrackWrites {
+		sourceFlags |= targetReadinessTrackWrites
+	}
+	buf = append(buf, sourceFlags)
 	buf = binary.BigEndian.AppendUint64(buf, state.JobID)
 	buf = binary.BigEndian.AppendUint64(buf, state.ExpectedCutoverVersion)
 	buf = binary.BigEndian.AppendUint64(buf, state.MigrationJobID)
 	buf = binary.BigEndian.AppendUint64(buf, state.MinWriteTSExclusive)
+	buf = binary.BigEndian.AppendUint64(buf, state.RetentionPinTS)
+	buf = binary.BigEndian.AppendUint64(buf, state.MinAdmittedTS)
 	buf = appendVarBytes(buf, state.RouteStart)
 	if state.RouteEnd == nil {
 		buf = append(buf, 0)
@@ -138,10 +167,46 @@ func decodeTargetStagedReadinessState(data []byte) (TargetStagedReadinessState, 
 }
 
 func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byte, bool) {
-	if len(data) < 2+4*migrationUint64Bytes || data[0] != targetReadinessCodecVersion {
+	if len(data) == 0 {
+		return TargetStagedReadinessState{}, nil, false
+	}
+	if data[0] == targetReadinessCodecVersionV1 {
+		return decodeTargetReadinessHeaderV1(data)
+	}
+	if len(data) < 3+6*migrationUint64Bytes || data[0] != targetReadinessCodecVersion {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	if data[1] != 0 && data[1] != targetReadinessArmedFlag {
+		return TargetStagedReadinessState{}, nil, false
+	}
+	sourceFlags := data[2]
+	if sourceFlags & ^(targetReadinessSourceWrite|targetReadinessSourceRead|targetReadinessTrackWrites) != 0 {
+		return TargetStagedReadinessState{}, nil, false
+	}
+	state := TargetStagedReadinessState{
+		Armed:            data[1] == targetReadinessArmedFlag,
+		SourceWriteFence: sourceFlags&targetReadinessSourceWrite != 0,
+		SourceReadFence:  sourceFlags&targetReadinessSourceRead != 0,
+		TrackWrites:      sourceFlags&targetReadinessTrackWrites != 0,
+	}
+	rest := data[3:]
+	state.JobID = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	state.ExpectedCutoverVersion = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	state.MigrationJobID = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	state.MinWriteTSExclusive = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	state.RetentionPinTS = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	state.MinAdmittedTS = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+	rest = rest[migrationUint64Bytes:]
+	return state, rest, true
+}
+
+func decodeTargetReadinessHeaderV1(data []byte) (TargetStagedReadinessState, []byte, bool) {
+	if len(data) < 2+4*migrationUint64Bytes || data[1] != 0 && data[1] != targetReadinessArmedFlag {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	state := TargetStagedReadinessState{Armed: data[1] == targetReadinessArmedFlag}
@@ -153,8 +218,7 @@ func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byt
 	state.MigrationJobID = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
 	rest = rest[migrationUint64Bytes:]
 	state.MinWriteTSExclusive = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
-	rest = rest[migrationUint64Bytes:]
-	return state, rest, true
+	return state, rest[migrationUint64Bytes:], true
 }
 
 func decodeTargetReadinessRange(state *TargetStagedReadinessState, data []byte) bool {
@@ -176,7 +240,7 @@ func decodeTargetReadinessRange(state *TargetStagedReadinessState, data []byte) 
 }
 
 func targetReadinessEncodedSize(state TargetStagedReadinessState) int {
-	size := 2 + 4*migrationUint64Bytes + binary.MaxVarintLen64 + len(state.RouteStart) + 1
+	size := 3 + 6*migrationUint64Bytes + binary.MaxVarintLen64 + len(state.RouteStart) + 1
 	if state.RouteEnd != nil {
 		size += binary.MaxVarintLen64 + len(state.RouteEnd)
 	}
@@ -209,6 +273,11 @@ func cloneTargetStagedReadinessState(state TargetStagedReadinessState) TargetSta
 		MigrationJobID:         state.MigrationJobID,
 		MinWriteTSExclusive:    state.MinWriteTSExclusive,
 		Armed:                  state.Armed,
+		SourceWriteFence:       state.SourceWriteFence,
+		SourceReadFence:        state.SourceReadFence,
+		RetentionPinTS:         state.RetentionPinTS,
+		TrackWrites:            state.TrackWrites,
+		MinAdmittedTS:          state.MinAdmittedTS,
 	}
 }
 

@@ -240,6 +240,9 @@ func (s *ShardStore) targetReadyRoutesForRouteRange(ctx context.Context, g *Shar
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
 	applicable := targetReadinessApplicableStates(states, route, routeStart, routeEnd)
 	if len(applicable) == 0 {
 		return []distribution.Route{route}, nil
@@ -263,11 +266,23 @@ func targetReadinessApplicableStates(
 ) []store.TargetStagedReadinessState {
 	applicable := make([]store.TargetStagedReadinessState, 0, len(states))
 	for _, ready := range states {
+		if ready.SourceWriteFence || ready.SourceReadFence || ready.TrackWrites {
+			continue
+		}
 		if targetReadinessAppliesToRoute(route, routeStart, routeEnd, ready) {
 			applicable = append(applicable, ready)
 		}
 	}
 	return applicable
+}
+
+func sourceReadFenceApplies(states []store.TargetStagedReadinessState, routeStart []byte, routeEnd []byte) bool {
+	for _, state := range states {
+		if state.Armed && state.SourceReadFence && routeRangeIntersects(routeStart, routeEnd, state.RouteStart, state.RouteEnd) {
+			return true
+		}
+	}
+	return false
 }
 
 func readinessProofSatisfiesStates(

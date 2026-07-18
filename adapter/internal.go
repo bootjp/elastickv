@@ -294,17 +294,8 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 }
 
 func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
-	if req == nil {
-		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness request is nil"))
-	}
-	if req.GetJobId() == 0 {
-		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness job_id is required"))
-	}
-	if req.GetMigrationJobId() == 0 {
-		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
-	}
-	if req.GetArmed() && req.GetMinWriteTsExclusive() == 0 {
-		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness min_write_ts_exclusive is required when armed"))
+	if err := validateTargetStagedReadinessRequest(req); err != nil {
+		return nil, err
 	}
 	if i.migrationProposer == nil {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
@@ -318,7 +309,65 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &pb.TargetStagedReadinessResponse{}, nil
+	return &pb.TargetStagedReadinessResponse{MinAdmittedTs: i.migrationMinAdmittedTS(ctx, req.GetJobId())}, nil
+}
+
+func (i *Internal) migrationMinAdmittedTS(ctx context.Context, jobID uint64) uint64 {
+	reader, ok := i.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return 0
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return 0
+	}
+	for _, state := range states {
+		if state.JobID == jobID {
+			return state.MinAdmittedTS
+		}
+	}
+	return 0
+}
+
+func validateTargetStagedReadinessRequest(req *pb.TargetStagedReadinessRequest) error {
+	switch {
+	case req == nil:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness request is nil"))
+	case req.GetJobId() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness job_id is required"))
+	case req.GetMigrationJobId() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
+	case req.GetArmed() && req.GetMinWriteTsExclusive() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness min_write_ts_exclusive is required when armed"))
+	}
+	return validateSourceMigrationControlRequest(req)
+}
+
+func validateSourceMigrationControlRequest(req *pb.TargetStagedReadinessRequest) error {
+	if req.GetSourceReadFence() && !req.GetSourceWriteFence() {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "source read fence requires source write fence"))
+	}
+	if (req.GetSourceWriteFence() || req.GetSourceReadFence()) && req.GetRetentionPinTs() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "source migration control retention_pin_ts is required"))
+	}
+	return nil
+}
+
+func (i *Internal) ProbeMigrationLocks(ctx context.Context, req *pb.ProbeMigrationLocksRequest) (*pb.ProbeMigrationLocksResponse, error) {
+	if req == nil || len(req.GetRouteStart()) == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration lock probe route_start is required"))
+	}
+	if i.store == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration lock probe store is not configured"))
+	}
+	if err := i.verifyInternalLeaderApplied(ctx); err != nil {
+		return nil, err
+	}
+	locks, err := kv.PendingTxnLocksInRoute(ctx, i.store, req.GetRouteStart(), req.GetRouteEnd(), ^uint64(0), int(req.GetLimit()))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.ProbeMigrationLocksResponse{PendingCount: uint32(len(locks))}, nil //nolint:gosec // result is bounded by uint32 wire limit
 }
 
 func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {

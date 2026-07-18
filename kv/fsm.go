@@ -536,6 +536,9 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	if err := f.validateRawMutationsForApply(ctx, r, commitTS); err != nil {
 		return err
 	}
+	if err := f.recordMigrationWrite(ctx, r.Mutations, commitTS); err != nil {
+		return err
+	}
 
 	muts, err := toStoreMutations(r.Mutations)
 	if err != nil {
@@ -568,8 +571,11 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 	if isTxnInternalKey(mut.Key) {
 		return errors.WithStack(ErrInvalidRequest)
 	}
+	if err := f.verifySourceWriteFenceForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+		return err
+	}
 	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+		if err := f.verifyRouteNotFencedForKey(ctx, mut.Key); err != nil {
 			return err
 		}
 	}
@@ -599,13 +605,16 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
+	if err := f.verifyRouteNotFencedForPrefix(ctx, prefix); err != nil {
 		return err
 	}
 	if err := f.verifyTargetReadinessForPrefix(ctx, prefix); err != nil {
 		return err
 	}
 	if err := f.verifyRouteWriteFloorForPrefix(prefix, commitTS); err != nil {
+		return err
+	}
+	if err := f.recordMigrationWrite(ctx, []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: prefix}}, commitTS); err != nil {
 		return err
 	}
 	routes := f.stagedVisibilityRoutesForPrefix(prefix)
@@ -641,22 +650,25 @@ func (f *kvFSM) stagedVisibilityRoutesForPrefix(prefix []byte) []distribution.Ro
 	return out
 }
 
-func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation, bypassKeys map[string]struct{}) error {
+func (f *kvFSM) verifyRouteNotFencedForMutations(ctx context.Context, muts []*pb.Mutation, bypassKeys map[string]struct{}) error {
 	for _, mut := range muts {
 		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
 			continue
 		}
+		if err := f.verifySourceWriteFenceForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+			return err
+		}
 		if _, bypass := bypassKeys[string(mut.Key)]; bypass {
 			continue
 		}
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+		if err := f.verifyRouteNotFencedForKey(ctx, mut.Key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
+func (f *kvFSM) verifyRouteNotFencedForKey(_ context.Context, key []byte) error {
 	if f.routes == nil {
 		return nil
 	}
@@ -674,7 +686,11 @@ func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
 	return nil
 }
 
-func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
+func (f *kvFSM) verifyRouteNotFencedForPrefix(ctx context.Context, prefix []byte) error {
+	start, end := routePrefixRange(prefix)
+	if err := f.verifySourceWriteFenceForRouteRange(ctx, start, end); err != nil {
+		return err
+	}
 	if f.routes == nil {
 		return nil
 	}
@@ -682,11 +698,32 @@ func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
 	if !ok {
 		return nil
 	}
-	start, end := routePrefixRange(prefix)
 	if !snap.WriteFencedIntersects(start, end) {
 		return nil
 	}
 	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
+}
+
+func (f *kvFSM) verifySourceWriteFenceForRange(ctx context.Context, start []byte, end []byte) error {
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	return f.verifySourceWriteFenceForRouteRange(ctx, routeStart, routeEnd)
+}
+
+func (f *kvFSM) verifySourceWriteFenceForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) error {
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for _, state := range states {
+		if state.Armed && state.SourceWriteFence && routeRangeIntersects(routeStart, routeEnd, state.RouteStart, state.RouteEnd) {
+			return errors.Wrapf(ErrRouteWriteFenced, "source migration fence job %d route range [%q,%q)", state.JobID, routeStart, routeEnd)
+		}
+	}
+	return nil
 }
 
 func (f *kvFSM) verifyRouteWriteFloorForMutations(muts []*pb.Mutation, commitTS uint64) error {
@@ -804,7 +841,8 @@ func targetReadinessStatesSatisfied(
 	proof bool,
 ) bool {
 	for _, ready := range states {
-		if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+		if !ready.Armed || ready.SourceWriteFence || ready.SourceReadFence || ready.TrackWrites ||
+			!routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
 			continue
 		}
 		if !proof || !routesSatisfyTargetReadiness(routes, ready, groupID, catalogVersion) {
@@ -1469,8 +1507,14 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
+	return f.recordAndApplyPrepare(ctx, uniq, storeMuts, r.ReadKeys, floorTS, startTS)
+}
 
-	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, startTS, f.pendingApplyIdx); err != nil {
+func (f *kvFSM) recordAndApplyPrepare(ctx context.Context, muts []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, floorTS, startTS uint64) error {
+	if err := f.recordMigrationWrite(ctx, muts, floorTS); err != nil {
+		return err
+	}
+	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, readKeys, startTS, startTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -1536,6 +1580,9 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
+	if err := f.recordMigrationWrite(ctx, uniq, commitTS); err != nil {
+		return err
+	}
 	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1575,7 +1622,7 @@ func (f *kvFSM) uniqueMutationsNotFenced(
 	if err != nil {
 		return nil, err
 	}
-	if err := f.verifyRouteNotFencedForMutations(uniq, writeFenceBypassKeySet(writeFenceBypassKeys)); err != nil {
+	if err := f.verifyRouteNotFencedForMutations(ctx, uniq, writeFenceBypassKeySet(writeFenceBypassKeys)); err != nil {
 		return nil, err
 	}
 	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
