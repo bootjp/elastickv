@@ -641,9 +641,12 @@ func (f *kvFSM) stagedVisibilityRoutesForPrefix(prefix []byte) []distribution.Ro
 	return out
 }
 
-func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation) error {
+func (f *kvFSM) verifyRouteNotFencedForMutations(muts []*pb.Mutation, bypassKeys map[string]struct{}) error {
 	for _, mut := range muts {
 		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if _, bypass := bypassKeys[string(mut.Key)]; bypass {
 			continue
 		}
 		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
@@ -1452,7 +1455,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, nil); err != nil {
 		return err
 	}
-	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, floorTS)
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, r.GetWriteFenceBypassKeys(), floorTS)
 	if err != nil {
 		return err
 	}
@@ -1522,7 +1525,14 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, storeMuts, err := f.onePhaseStoreMutations(ctx, muts, r.ReadKeys, startTS, commitTS)
+	uniq, storeMuts, err := f.onePhaseStoreMutations(
+		ctx,
+		muts,
+		r.ReadKeys,
+		r.GetWriteFenceBypassKeys(),
+		startTS,
+		commitTS,
+	)
 	if err != nil {
 		return err
 	}
@@ -1537,10 +1547,11 @@ func (f *kvFSM) onePhaseStoreMutations(
 	ctx context.Context,
 	muts []*pb.Mutation,
 	readKeys [][]byte,
+	writeFenceBypassKeys [][]byte,
 	startTS uint64,
 	commitTS uint64,
 ) ([]*pb.Mutation, []*store.KVPairMutation, error) {
-	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, commitTS)
+	uniq, err := f.uniqueMutationsNotFenced(ctx, muts, writeFenceBypassKeys, commitTS)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1554,12 +1565,17 @@ func (f *kvFSM) onePhaseStoreMutations(
 	return uniq, storeMuts, nil
 }
 
-func (f *kvFSM) uniqueMutationsNotFenced(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+func (f *kvFSM) uniqueMutationsNotFenced(
+	ctx context.Context,
+	muts []*pb.Mutation,
+	writeFenceBypassKeys [][]byte,
+	commitTS uint64,
+) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.verifyRouteNotFencedForMutations(uniq); err != nil {
+	if err := f.verifyRouteNotFencedForMutations(uniq, writeFenceBypassKeySet(writeFenceBypassKeys)); err != nil {
 		return nil, err
 	}
 	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
