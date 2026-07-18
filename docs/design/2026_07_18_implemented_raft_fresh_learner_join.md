@@ -102,7 +102,9 @@ existing leader commits `AddLearner`.
 9. **Discovery does not become durable membership.** Snapshot and ConfChange
    persistence filter the address cache to IDs present in `ConfState`; stale
    discovery-only peers cannot cause the next restart to fail membership
-   validation.
+   validation. Every authoritative member must also have a non-empty address in
+   the cache; snapshot or ConfChange apply fails before publishing unusable peer
+   metadata when the join inventory omitted a member.
 10. **Public protocols wait for membership readiness.** Raft transport and
     RaftAdmin start first, but user-facing listeners remain closed until the
     local ID is a learner or voter, a leader is known, no ConfChange is pending,
@@ -248,10 +250,11 @@ Durability then follows the existing configuration-change path:
 
 Both ConfChange and received-snapshot paths derive the persisted peer list by
 iterating the authoritative voters and learners in `ConfState`. Addresses are
-reused from the discovery cache when present; an ID missing from the cache gets
-a non-dialable placeholder rather than being omitted. Discovery-only IDs not in
-`ConfState` are dropped. This keeps peer metadata and snapshot membership
-cardinality aligned on the next open.
+reused from the discovery cache. An ID missing from the cache, or one with an
+empty address, aborts the apply path before FSM snapshot restore or peer
+metadata publication. Discovery-only IDs not in `ConfState` are dropped. This
+keeps peer metadata and snapshot membership cardinality aligned on the next
+open without allowing a node to restart with a quorum member it cannot dial.
 
 Peer metadata may be published just before the matching local Raft snapshot;
 restart recovery tolerates this ordering and replays the committed conf change
@@ -269,6 +272,7 @@ discovery.
 | Promotion is rejected as not caught up | Wait for leader-side progress to reach the chosen bound and retry. Do not bypass the check in normal production recovery. |
 | Joiner was added as a voter | Treat the role alarm as a failed procedure. Preserve quorum, then remove the node and repeat the learner workflow after the removal commits. |
 | Joiner crashes after `AddLearner` or promotion | Restart first from its existing data dir. Once membership has persisted, do not wipe it merely to repeat the join command. |
+| Snapshot or ConfChange reports `etcd raft peer address is required` | The join inventory omitted an authoritative voter or learner. Stop the joiner, supply the complete current membership plus the local joiner, and restart from the same data dir unless the membership operation itself must first be rolled back. |
 | Remaining cluster loses quorum | Stop replacement work. `--raftJoinMembers` cannot recover quorum or create a replacement cluster. Use a separately reviewed quorum-recovery procedure. |
 | Deployment must roll back to an older binary | Remove the learner before downgrade if it has not been promoted. If it is already a voter, first verify that the target version can read the current WAL, snapshot, and peers metadata; do not erase durable state as a rollback mechanism. |
 
@@ -317,6 +321,10 @@ existing cluster.
 catch-up, pending ConfChange rejection, and configuration-read errors for the
 public-service gate.
 
+`TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready`
+locks down startup ordering: join readiness is checked before any public
+listener preparation callback can bind a socket.
+
 ### 11.2 Engine end-to-end test
 
 `TestFreshLearnerJoinPromotesAndRestartsFromPersistedMembership` exercises the
@@ -332,6 +340,10 @@ engine lifecycle with real transports:
 8. stop both voters; and
 9. reopen both without join peers or learner intent, elect a leader from the
    recovered two-member configuration, and commit another application write.
+
+`TestApplyReadySnapshotRejectsMissingPeerAddressBeforeRestore` verifies that a
+snapshot containing an authoritative member absent from discovery fails before
+restoring FSM state or advancing the local Raft snapshot.
 
 This test protects the central invariant that an explicit peer list can support
 transport discovery without creating an initial voter `ConfState`, and that the

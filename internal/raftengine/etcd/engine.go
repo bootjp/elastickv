@@ -2472,6 +2472,13 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if len(snapshot.GetData()) == 0 {
 		return errors.WithStack(errSnapshotRequired)
 	}
+	confState := confStateValue(snapshot.GetMetadata().GetConfState())
+	e.mu.RLock()
+	peers, err := peerListForConfState(e.peers, confState)
+	e.mu.RUnlock()
+	if err != nil {
+		return errors.Wrapf(err, "validate snapshot peers index=%d", snapshot.GetMetadata().GetIndex())
+	}
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
@@ -2512,8 +2519,8 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	// further conf-change entries arrive. Mirrors the apply-loop
 	// sequence in applyConfigChange. The order matches §4.6:
 	// voterCache first, then config.Servers.
-	e.refreshVoterCache(confStateValue(snapshot.GetMetadata().GetConfState()))
-	e.setConfigurationFromConfState(confStateValue(snapshot.GetMetadata().GetConfState()), snapshot.GetMetadata().GetIndex())
+	e.refreshVoterCache(confState)
+	e.setConfigurationFromConfState(confState, snapshot.GetMetadata().GetIndex())
 	// Persist the post-snapshot peers file with suffrage drawn from
 	// the snapshot's ConfState so a learner that received catch-up
 	// state via snapshot (the common case for fresh joiners) writes
@@ -2521,21 +2528,17 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	// snapshot path bypasses the apply-loop's nextPeersAfterConfigChange
 	// hook, so without this the joiner's peers file would carry the
 	// pre-AddLearner suffrage forever. See learner design doc §4.3.
-	if err := e.savePeersFileForSnapshot(snapshot); err != nil {
+	if err := e.savePeersFileForSnapshot(snapshot, peers); err != nil {
 		return err
 	}
-	e.alarmIfJoinedAsVoter(confStateValue(snapshot.GetMetadata().GetConfState()))
+	e.alarmIfJoinedAsVoter(confState)
 	return nil
 }
 
 // savePeersFileForSnapshot writes the v2 peers file with suffrage
 // drawn from the snapshot's ConfState. Idempotent: savePersistedPeers
 // short-circuits when the on-disk index already covers `index`.
-func (e *Engine) savePeersFileForSnapshot(snapshot *raftpb.Snapshot) error {
-	confState := confStateValue(snapshot.GetMetadata().GetConfState())
-	e.mu.RLock()
-	peers := peerListForConfState(e.peers, confState)
-	e.mu.RUnlock()
+func (e *Engine) savePeersFileForSnapshot(snapshot *raftpb.Snapshot, peers []Peer) error {
 	if len(peers) == 0 {
 		return nil
 	}
@@ -2782,7 +2785,10 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 		return errors.WithStack(err)
 	}
 	confState := e.rawNode.ApplyConfChange(&cc)
-	nextPeers := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
+	nextPeers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
+	if err != nil {
+		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -2800,7 +2806,10 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 		return errors.WithStack(err)
 	}
 	confState := e.rawNode.ApplyConfChange(&cc)
-	nextPeers := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
+	nextPeers, err := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
+	if err != nil {
+		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -4710,7 +4719,7 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
-func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) ([]Peer, error) {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
@@ -4718,7 +4727,7 @@ func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, no
 	return peerListForConfState(next, confState)
 }
 
-func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) ([]Peer, error) {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()

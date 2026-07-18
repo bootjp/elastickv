@@ -113,6 +113,9 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 		persist:    &recordingPersistStorage{saveStarted: saveStarted, saveRelease: releaseSave},
 		dataDir:    t.TempDir(),
 		fsmSnapDir: t.TempDir(),
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
 	}
 	e.protectReceivedFSMSnapshot(7)
 	readySnapshot := appliedIndexTestSnapshot(7, []byte("payload"))

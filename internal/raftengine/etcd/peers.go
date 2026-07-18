@@ -274,24 +274,29 @@ func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
 	delete(peers, nodeID)
 }
 
-func peerListForConfState(peers map[uint64]Peer, conf raftpb.ConfState) []Peer {
+func peerListForConfState(peers map[uint64]Peer, conf raftpb.ConfState) ([]Peer, error) {
 	if len(conf.Voters) == 0 && len(conf.Learners) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]Peer, 0, len(conf.Voters)+len(conf.Learners))
-	appendPeer := func(nodeID uint64, suffrage string) {
+	appendPeer := func(nodeID uint64, suffrage string) error {
 		peer, ok := peers[nodeID]
-		if !ok {
-			peer = Peer{NodeID: nodeID, ID: strconv.FormatUint(nodeID, 10)}
+		if !ok || strings.TrimSpace(peer.Address) == "" {
+			return errors.Wrapf(errPeerAddressRequired, "conf state node id=%d", nodeID)
 		}
 		peer.Suffrage = suffrage
 		out = append(out, peer)
+		return nil
 	}
 	for _, nodeID := range conf.Voters {
-		appendPeer(nodeID, SuffrageVoter)
+		if err := appendPeer(nodeID, SuffrageVoter); err != nil {
+			return nil, err
+		}
 	}
 	for _, nodeID := range conf.Learners {
-		appendPeer(nodeID, SuffrageLearner)
+		if err := appendPeer(nodeID, SuffrageLearner); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }

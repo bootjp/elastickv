@@ -1557,8 +1557,9 @@ type serversInput struct {
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
-// per-group Raft listeners needed for quorum traffic, waits for any requested
-// startup rotation, then opens the public service listeners.
+// per-group Raft listeners needed for quorum traffic, waits for a fresh join
+// to catch up, prepares the public listeners, waits for any requested startup
+// rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
@@ -1658,7 +1659,13 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	if err := runner.preparePublicServices(); err != nil {
+	if err := preparePublicServicesAfterRaftJoinReady(
+		in.ctx,
+		in.runtimes,
+		*raftId,
+		strings.TrimSpace(*raftJoinMembers) != "",
+		runner.preparePublicServices,
+	); err != nil {
 		return runner.startupFailure(err)
 	}
 	// runner.startRaftTransport() has populated runner.dynamoServer for the
@@ -1686,9 +1693,6 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
-	if err := waitForRaftJoinReady(in.ctx, in.runtimes, *raftId, strings.TrimSpace(*raftJoinMembers) != ""); err != nil {
-		return runner.startupFailure(errors.Wrap(err, "wait for fresh raft join before serving"))
-	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	publicKVGate.markReady()
 	if err := runner.startPublicServices(); err != nil {
@@ -1699,6 +1703,19 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 }
 
 const raftJoinReadyPollInterval = 100 * time.Millisecond
+
+func preparePublicServicesAfterRaftJoinReady(
+	ctx context.Context,
+	runtimes []*raftGroupRuntime,
+	localID string,
+	enabled bool,
+	prepare func() error,
+) error {
+	if err := waitForRaftJoinReady(ctx, runtimes, localID, enabled); err != nil {
+		return errors.Wrap(err, "wait for fresh raft join before binding public services")
+	}
+	return prepare()
+}
 
 func waitForRaftJoinReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string, enabled bool) error {
 	if !enabled {

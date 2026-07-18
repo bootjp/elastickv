@@ -87,3 +87,44 @@ func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
 func TestWaitForRaftJoinReadyDisabled(t *testing.T) {
 	require.NoError(t, waitForRaftJoinReady(context.Background(), nil, "n2", false))
 }
+
+func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prepared := false
+
+	err := preparePublicServicesAfterRaftJoinReady(
+		ctx,
+		[]*raftGroupRuntime{{
+			spec: groupSpec{id: 1},
+			engine: &raftJoinReadyEngineStub{
+				status: raftengine.Status{Leader: raftengine.LeaderInfo{ID: "n1"}},
+			},
+		}},
+		"n2",
+		true,
+		func() error {
+			prepared = true
+			return nil
+		},
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, prepared)
+}
+
+func TestPreparePublicServicesAfterRaftJoinReadyBindsWhenJoinIsDisabled(t *testing.T) {
+	prepared := false
+	err := preparePublicServicesAfterRaftJoinReady(
+		context.Background(),
+		nil,
+		"n2",
+		false,
+		func() error {
+			prepared = true
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, prepared)
+}
