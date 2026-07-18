@@ -112,6 +112,7 @@ type S3Server struct {
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
 	blobOffloadEnabled   bool
+	blobOffloadGCReady   bool
 	blobOffloadChecker   S3BlobOffloadCapabilityChecker
 	blobOffloadObserver  S3BlobOffloadObserver
 	blobCluster          S3BlobCluster

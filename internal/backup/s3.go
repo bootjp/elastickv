@@ -246,6 +246,7 @@ type s3PartKey struct {
 // rather than a silently-truncated body (Codex P1 #729).
 type s3DeclaredPart struct {
 	chunkCount uint64
+	chunkSizes []uint64
 }
 
 // s3PublicBucket is the dump-format projection of s3BucketMeta.
@@ -436,10 +437,16 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 	for _, p := range live.Parts {
 		partVersion := p.PartVersion
 		if p.Offloaded {
+			if uint64(len(p.ChunkSizes)) != p.ChunkCount { //nolint:gosec // Chunk count is bounded by the object size limit.
+				return errors.Wrapf(ErrS3InvalidManifest,
+					"offloaded part %d declares %d chunks but has %d chunk sizes",
+					p.PartNo, p.ChunkCount, len(p.ChunkSizes))
+			}
 			partVersion = p.ChunkRefVersion
 		}
 		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: partVersion, offloaded: p.Offloaded}] = s3DeclaredPart{
 			chunkCount: p.ChunkCount,
+			chunkSizes: append([]uint64(nil), p.ChunkSizes...),
 		}
 	}
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
@@ -826,7 +833,8 @@ func (s *S3Encoder) resolveOffloadedChunkPaths(obj *s3ObjectState) error {
 			continue
 		}
 		partKey := s3PartKey{partNo: key.partNo, partVersion: key.partVersion, offloaded: true}
-		if _, declared := obj.declaredParts[partKey]; !declared {
+		declared, ok := obj.declaredParts[partKey]
+		if !ok {
 			continue
 		}
 		path, ok := s.chunkBlobPaths[ref.ContentSHA256]
@@ -841,6 +849,11 @@ func (s *S3Encoder) resolveOffloadedChunkPaths(obj *s3ObjectState) error {
 			return errors.Wrapf(ErrS3InvalidChunkRef,
 				"partNo=%d chunkNo=%d version=%d declared size=%d actual size=%d",
 				key.partNo, key.chunkNo, key.partVersion, ref.Size, info.Size())
+		}
+		if key.chunkNo >= uint64(len(declared.chunkSizes)) || declared.chunkSizes[key.chunkNo] != ref.Size { //nolint:gosec // Manifest validation bounds len to chunkCount.
+			return errors.Wrapf(ErrS3InvalidChunkRef,
+				"partNo=%d chunkNo=%d version=%d ref size=%d does not match manifest chunk size",
+				key.partNo, key.chunkNo, key.partVersion, ref.Size)
 		}
 		obj.chunkPaths[key] = path
 	}

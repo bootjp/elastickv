@@ -172,23 +172,22 @@ func (s *S3Server) s3BlobDurableTarget(replicas []S3BlobReplica, selfNodeID stri
 	if err != nil {
 		return 0, 0, false, err
 	}
-	quorum := voters/s3BlobQuorumDivisor + 1
-	voterTarget = quorum
-	target = quorum
-	if s != nil && s.blobMinReplicas > target {
-		target = s.blobMinReplicas
-	}
+	// M1 has no follower apply/backfill worker yet. Requiring every current
+	// member keeps each node's offline logical backup self-contained; M2 can
+	// restore quorum acknowledgement after it guarantees eventual local fetch.
+	voterTarget = voters
+	target = len(replicas)
 	if target < s3BlobMinimumDurableCopies {
 		return 0, 0, false, errors.New("s3 chunkblob durable target is below two")
 	}
-	if target <= len(replicas) {
+	if s == nil || s.blobMinReplicas <= len(replicas) {
 		return target, voterTarget, false, nil
 	}
 	// Membership has already shrunk below a previously configured target.
-	// Use the current Raft quorum and emit the degradation signal. A mere
-	// unreachable peer does not reduce len(replicas), so explicit full
-	// replication still fails closed during transient outages.
-	return quorum, voterTarget, true, nil
+	// Require every remaining member and emit the degradation signal. A mere
+	// unreachable peer does not reduce len(replicas), so M1 still fails closed
+	// during transient outages.
+	return target, voterTarget, true, nil
 }
 
 func validateS3BlobMembership(replicas []S3BlobReplica, selfNodeID string) (int, error) {

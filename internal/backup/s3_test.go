@@ -199,7 +199,7 @@ func TestS3_OffloadedObjectAssemblesFromChunkRefs(t *testing.T) {
 		"upload_id": uploadID, "size_bytes": 11, "parts": []map[string]any{
 			{
 				"part_no": 1, "size_bytes": 11, "chunk_count": 2,
-				"offloaded": true, "chunk_ref_version": chunkRefVersion,
+				"chunk_sizes": []uint64{6, 5}, "offloaded": true, "chunk_ref_version": chunkRefVersion,
 			},
 		},
 	})); err != nil {
@@ -235,13 +235,49 @@ func TestS3_OffloadedObjectFailsClosedWhenChunkBlobIsMissing(t *testing.T) {
 	}
 	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), encodeS3ManifestValue(t, map[string]any{
 		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
-			{"part_no": 1, "chunk_count": 1, "offloaded": true},
+			{"part_no": 1, "chunk_count": 1, "chunk_sizes": []uint64{uint64(len(body))}, "offloaded": true},
 		},
 	})); err != nil {
 		t.Fatal(err)
 	}
 	if err := enc.Finalize(); !errors.Is(err, ErrS3IncompleteBlobChunks) {
 		t.Fatalf("Finalize error = %v, want ErrS3IncompleteBlobChunks", err)
+	}
+}
+
+func TestS3_OffloadedObjectRejectsManifestChunkSizeMismatch(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	body := []byte("content")
+	const chunkRefVersion = uint64(7)
+	const mismatchedChunkSize = uint64(8)
+	emitOffloadedChunk(t, enc, "b", 1, "o", "u", 1, 0, chunkRefVersion, body)
+	manifest := encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
+			{
+				"part_no": 1, "chunk_count": 1, "chunk_sizes": []uint64{mismatchedChunkSize},
+				"offloaded": true, "chunk_ref_version": chunkRefVersion,
+			},
+		},
+	})
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); !errors.Is(err, ErrS3InvalidChunkRef) {
+		t.Fatalf("Finalize error = %v, want ErrS3InvalidChunkRef", err)
+	}
+}
+
+func TestS3_OffloadedObjectRejectsMissingManifestChunkSizes(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	manifest := encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": 1, "parts": []map[string]any{
+			{"part_no": 1, "chunk_count": 1, "offloaded": true},
+		},
+	})
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), manifest); !errors.Is(err, ErrS3InvalidManifest) {
+		t.Fatalf("HandleObjectManifest error = %v, want ErrS3InvalidManifest", err)
 	}
 }
 

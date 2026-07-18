@@ -120,7 +120,7 @@ func TestDecodeSnapshot_RoutesS3OffloadRecords(t *testing.T) {
 	}
 	manifest := encodeS3ManifestValue(t, map[string]any{
 		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
-			{"part_no": 1, "chunk_count": 1, "offloaded": true},
+			{"part_no": 1, "chunk_count": 1, "chunk_sizes": []uint64{uint64(len(body))}, "offloaded": true},
 		},
 	})
 	b.WriteEntry(s3keys.BucketMetaKey("b"), 1, encodeS3BucketMetaValue(t, map[string]any{

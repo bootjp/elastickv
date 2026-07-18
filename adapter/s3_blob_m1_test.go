@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,7 @@ func TestS3BlobOffloadPutAndProxyOnMissGet(t *testing.T) {
 		WithS3BlobOffloadEnabled(true),
 		WithS3BlobCluster(cluster),
 		WithS3BlobLocalStoreResolver(localResolver),
+		withS3BlobOffloadGCReadyForTest(),
 	)
 
 	rec := httptest.NewRecorder()
@@ -58,8 +60,7 @@ func TestS3BlobOffloadPutAndProxyOnMissGet(t *testing.T) {
 	for _, pair := range refs {
 		ref, ok := s3keys.DecodeChunkRefValue(pair.Value)
 		require.True(t, ok)
-		require.GreaterOrEqual(t, len(ref.ReplicaPeers), 2)
-		require.LessOrEqual(t, len(ref.ReplicaPeers), len(cluster.replicas))
+		require.Len(t, ref.ReplicaPeers, len(cluster.replicas))
 		for _, peer := range ref.ReplicaPeers {
 			require.NotEmpty(t, peer.NodeID)
 			require.NotEmpty(t, peer.Address)
@@ -68,7 +69,7 @@ func TestS3BlobOffloadPutAndProxyOnMissGet(t *testing.T) {
 	blobs, err := metadataStore.ScanAt(context.Background(), []byte(s3keys.ChunkBlobPrefix), prefixScanEnd([]byte(s3keys.ChunkBlobPrefix)), 10, readTS)
 	require.NoError(t, err)
 	require.Len(t, blobs, 2)
-	require.GreaterOrEqual(t, cluster.pushCount(), 2)
+	require.GreaterOrEqual(t, cluster.pushCount(), 4)
 
 	// Simulate a follower that applied metadata but has no local chunkblobs.
 	// GET must fetch from peers, verify the SHA, persist locally, and only then
@@ -96,6 +97,7 @@ func TestS3BlobOffloadFailsPutWithoutTwoDurableCopies(t *testing.T) {
 		WithS3BlobOffloadEnabled(true),
 		WithS3BlobCluster(cluster),
 		WithS3BlobLocalStoreResolver(&mutableS3BlobLocalStore{store: st}),
+		withS3BlobOffloadGCReadyForTest(),
 	)
 
 	rec := httptest.NewRecorder()
@@ -335,15 +337,15 @@ func TestS3BlobDurableTarget(t *testing.T) {
 	server := &S3Server{}
 	target, voterTarget, degraded, err := server.s3BlobDurableTarget(replicas, "n1")
 	require.NoError(t, err)
-	require.Equal(t, 2, target)
-	require.Equal(t, 2, voterTarget)
+	require.Equal(t, 3, target)
+	require.Equal(t, 3, voterTarget)
 	require.False(t, degraded)
 
 	server.blobMinReplicas = 3
 	target, voterTarget, degraded, err = server.s3BlobDurableTarget(replicas, "n1")
 	require.NoError(t, err)
 	require.Equal(t, 3, target)
-	require.Equal(t, 2, voterTarget)
+	require.Equal(t, 3, voterTarget)
 	require.False(t, degraded)
 
 	target, voterTarget, degraded, err = server.s3BlobDurableTarget(replicas[:2], "n1")
@@ -359,14 +361,23 @@ func TestS3BlobDurableTarget(t *testing.T) {
 	server.blobMinReplicas = 0
 	target, voterTarget, degraded, err = server.s3BlobDurableTarget(five, "n1")
 	require.NoError(t, err)
-	require.Equal(t, 3, target)
-	require.Equal(t, 3, voterTarget)
+	require.Equal(t, 5, target)
+	require.Equal(t, 5, voterTarget)
 	require.False(t, degraded)
 
 	server.blobMinReplicas = 2
 	target, voterTarget, degraded, err = server.s3BlobDurableTarget(five, "n1")
 	require.NoError(t, err)
-	require.Equal(t, 3, target, "configuration must not lower the voter quorum target")
+	require.Equal(t, 5, target, "M1 requires every current member")
+	require.Equal(t, 5, voterTarget)
+	require.False(t, degraded)
+
+	withLearner := append(append([]S3BlobReplica(nil), replicas...),
+		S3BlobReplica{NodeID: "n4", Address: "n4:50051", Suffrage: "learner"},
+	)
+	target, voterTarget, degraded, err = server.s3BlobDurableTarget(withLearner, "n1")
+	require.NoError(t, err)
+	require.Equal(t, 4, target)
 	require.Equal(t, 3, voterTarget)
 	require.False(t, degraded)
 }
@@ -386,11 +397,32 @@ func TestS3BlobReplicationDoesNotCountLearnerTowardVoterQuorum(t *testing.T) {
 		replica: S3BlobReplica{NodeID: "n2", Address: "n2:50051", Suffrage: "voter"},
 	}
 
-	summary := (*S3Server)(nil).collectS3BlobReplication(context.Background(), results, 3, 2, 2)
+	summary := (*S3Server)(nil).collectS3BlobReplication(context.Background(), results, 3, 3, 2)
 	require.Equal(t, 3, summary.durable)
 	require.Equal(t, 2, summary.voterDurable)
 	require.True(t, summary.localDurable)
 	require.Len(t, summary.replicas, 3)
+}
+
+func TestS3BlobOffloadAdminGetUsesProxyOnMiss(t *testing.T) {
+	t.Parallel()
+
+	server, cluster, localResolver := newS3BlobM1TestServer(t, nil)
+	payload := bytes.Repeat([]byte("admin-offload"), s3ChunkSize/len("admin-offload")+10)
+	putS3BlobM1Object(t, server, "/bucket-admin/object", payload)
+
+	localResolver.set(store.NewMVCCStore())
+	body, meta, err := server.AdminGetObject(
+		context.Background(), fullAdminBucketsPrincipal(), "bucket-admin", "object",
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, body.Close()) })
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+	require.Equal(t, int64(len(payload)), meta.Size)
+	require.GreaterOrEqual(t, cluster.fetchCount(), 2)
 }
 
 func TestGRPCS3BlobClusterRequiresAndForwardsBearerToken(t *testing.T) {
@@ -572,6 +604,7 @@ func newS3BlobM1TestServer(
 		WithS3BlobCluster(cluster),
 		WithS3BlobLocalStoreResolver(localResolver),
 		WithS3BlobOffloadObserver(observer),
+		withS3BlobOffloadGCReadyForTest(),
 	)
 	return server, cluster, localResolver
 }

@@ -22,11 +22,11 @@ const (
 	s3BlobOffloadModeOffload = "offload"
 
 	s3BlobMinimumDurableCopies = 2
-	s3BlobQuorumDivisor        = 2
 
 	s3BlobOffloadReasonFlagDisabled      = "flag_disabled"
 	s3BlobOffloadReasonCapabilityMissing = "capability_missing"
 	s3BlobOffloadReasonDataPathDisabled  = "data_path_disabled"
+	s3BlobOffloadReasonGCNotReady        = "gc_not_ready"
 	s3BlobOffloadReasonEnabled           = "enabled"
 )
 
@@ -159,6 +159,13 @@ func (s *S3Server) s3BlobOffloadDecision(ctx context.Context) s3BlobOffloadDecis
 	}
 	if !S3BlobOffloadLocalCapability() {
 		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonDataPathDisabled}
+	}
+	// M1 has a complete PUT/GET path, but content-addressed chunkblobs cannot
+	// be enabled operationally until M3 installs reference counting, the grace
+	// queue, and the orphan scanner. M3 sets this readiness only after those
+	// workers are wired into the server lifecycle.
+	if !s.blobOffloadGCReady {
+		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonGCNotReady}
 	}
 	return s3BlobOffloadDecision{mode: s3BlobOffloadModeOffload, reason: s3BlobOffloadReasonEnabled}
 }

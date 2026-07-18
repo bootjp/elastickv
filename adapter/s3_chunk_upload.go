@@ -227,6 +227,9 @@ func (u *s3ChunkUploader) flushBatch() error {
 	if len(u.pendingBatch) == 0 {
 		return nil
 	}
+	// Full offloaded batches are immutable staged refs. Object readers cannot
+	// discover them until the final manifest or part descriptor transaction;
+	// that final metadata commit remains the public linearization point.
 	_, err := u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
 	u.releasePendingAdmission()
 	if err != nil {
