@@ -333,13 +333,14 @@ func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), ReadRouteVersion: 98})
 	require.NoError(t, err)
 	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey:         []byte("a"),
-		EndKey:           []byte("z"),
-		Limit:            10,
-		Ts:               10,
-		ReadRouteVersion: 97,
-		RouteStart:       []byte("m"),
-		RouteEnd:         []byte("z"),
+		StartKey:           []byte("a"),
+		EndKey:             []byte("z"),
+		Limit:              10,
+		Ts:                 10,
+		ReadRouteVersion:   97,
+		RouteStart:         []byte("m"),
+		RouteEnd:           []byte("z"),
+		RouteBoundsPresent: true,
 	})
 	require.NoError(t, err)
 
@@ -383,6 +384,28 @@ func TestGRPCServer_RawScanAt_PreservesFullRangeRouteBoundsPresence(t *testing.T
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteStart)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_IgnoresRouteBoundsWithoutPresence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:         []byte("!redis|meta|"),
+		EndKey:           []byte("!redis|meta}"),
+		Limit:            10,
+		Ts:               10,
+		ReadRouteVersion: 97,
+		RouteStart:       []byte("m"),
+		RouteEnd:         []byte("z"),
+	})
+	require.NoError(t, err)
+	require.False(t, st.scanRouteBoundsPresent)
+	require.Nil(t, st.scanReadRouteStart)
+	require.Nil(t, st.scanReadRouteEnd)
 }
 
 func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {
@@ -457,6 +480,26 @@ func TestGRPCServer_RawScanAt_KeysOnlyWithRouteBoundsUsesReadFence(t *testing.T)
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyStampsReadFenceWithoutCallerFields(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+	require.False(t, st.scanRouteBoundsPresent)
 }
 
 func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {

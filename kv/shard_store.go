@@ -15,7 +15,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const proxyForwardTimeout = 5 * time.Second
+const (
+	proxyForwardTimeout          = 5 * time.Second
+	readRouteVersionWaitTimeout  = 200 * time.Millisecond
+	readRouteVersionPollInterval = 2 * time.Millisecond
+)
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -25,7 +29,10 @@ type ShardStore struct {
 	connCache GRPCConnCache
 }
 
-var ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+var (
+	ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+	ErrReadRouteVersionUnavailable         = errors.New("read route version is not locally available")
+)
 
 // NewShardStore creates a sharded MVCC store wrapper.
 func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *ShardStore {
@@ -42,11 +49,36 @@ func (s *ShardStore) ReadRouteVersion() uint64 {
 	return s.engine.Version()
 }
 
+func (s *ShardStore) awaitReadRouteVersion(ctx context.Context, requested uint64) error {
+	if requested == 0 || s.ReadRouteVersion() >= requested {
+		return nil
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, readRouteVersionWaitTimeout)
+	defer cancel()
+	ticker := time.NewTicker(readRouteVersionPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return errors.Wrapf(ErrReadRouteVersionUnavailable, "requested=%d current=%d: %v", requested, s.ReadRouteVersion(), waitCtx.Err())
+		case <-ticker.C:
+			if s.ReadRouteVersion() >= requested {
+				return nil
+			}
+		}
+	}
+}
+
 func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	return s.GetAtWithReadFence(ctx, key, ts, 0, 0)
 }
 
 func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
+	}
 	if groupID != 0 {
 		return s.getGroupAtWithReadFence(ctx, groupID, key, ts, readRouteVersion)
 	}
@@ -221,6 +253,9 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
+	}
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
 	}
 	if reverse {
 		if groupID != 0 {
@@ -1518,6 +1553,9 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 }
 
 func (s *ShardStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte, readRouteVersion uint64) (uint64, bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return 0, false, err
+	}
 	g, ok := s.groupForKey(key)
 	if !ok || g.Store == nil {
 		return 0, false, nil
@@ -1885,13 +1923,11 @@ func scanTxnLockPagesAt(ctx context.Context, st store.MVCCStore, start []byte, e
 func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, start []byte, end []byte, ts uint64, limit int, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
 	cursor := start
-	scanned := 0
 	for {
 		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
 		if err != nil {
 			return nil, err
 		}
-		scanned += len(lockKVs)
 		for _, kvp := range lockKVs {
 			if kvp == nil || !routeKeyInScanBounds(kvp.Key, routeStart, routeEnd) {
 				continue
@@ -1903,9 +1939,6 @@ func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, 
 		}
 		if done {
 			return out, nil
-		}
-		if scanned >= limit {
-			return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
 		}
 		cursor = nextCursor
 	}

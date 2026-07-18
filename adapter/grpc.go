@@ -205,7 +205,8 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 }
 
 func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
-	if req.GetRouteBoundsPresent() || req.GetReadRouteVersion() != 0 {
+	_, readFenceAware := r.store.(rawReadFenceScanner)
+	if readFenceAware || req.GetRouteBoundsPresent() || req.GetReadRouteVersion() != 0 {
 		return r.rawScanKeysAtWithReadFence(ctx, req, limit, readTS)
 	}
 	if groupID := req.GetGroupId(); groupID != 0 {
@@ -293,18 +294,16 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 }
 
 func rawScanRouteBounds(req *pb.RawScanAtRequest) ([]byte, []byte) {
-	if req == nil {
+	if req == nil || !req.GetRouteBoundsPresent() {
 		return nil, nil
 	}
 	routeStart := req.GetRouteStart()
 	routeEnd := req.GetRouteEnd()
-	if req.GetRouteBoundsPresent() {
-		if routeStart == nil {
-			routeStart = []byte{}
-		}
-		if routeEnd == nil {
-			routeEnd = []byte{}
-		}
+	if routeStart == nil {
+		routeStart = []byte{}
+	}
+	if routeEnd == nil {
+		routeEnd = []byte{}
 	}
 	return routeStart, routeEnd
 }

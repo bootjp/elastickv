@@ -316,7 +316,7 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
-func TestShardStoreScanAtWithReadFence_BoundsOutOfRouteLockScan(t *testing.T) {
+func TestShardStoreScanAtWithReadFence_SkipsManyOutOfRouteLocks(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -349,9 +349,31 @@ func TestShardStoreScanAtWithReadFence_BoundsOutOfRouteLockScan(t *testing.T) {
 		require.NoError(t, st1.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
 	}
 
-	_, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
+	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+}
+
+func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	rawPrefix := []byte("!redis|meta|")
+	rawEnd := prefixScanEnd(rawPrefix)
+	for i := uint64(0); i <= lockPageLimit; i++ {
+		key := []byte(fmt.Sprintf("!redis|meta|z%04d", i))
+		lock := encodeTxnLock(txnLock{
+			StartTS:     10 + i,
+			TTLExpireAt: ^uint64(0),
+			PrimaryKey:  key,
+		})
+		require.NoError(t, st.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
+	}
+
+	_, err := scanTxnLockPagesAtWithRouteFilter(ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0), lockPageLimit, []byte("m"), nil)
+	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
 func TestShardStoreScanAtWithReadFence_BoundsLockScanToCurrentRawPage(t *testing.T) {
