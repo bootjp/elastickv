@@ -26,6 +26,8 @@ func TestEncryption_CompressesOnlyWhenSmaller(t *testing.T) {
 		compressed bool
 	}{
 		{name: "compressible", value: bytes.Repeat([]byte("json-field:"), 512), compressed: true},
+		{name: "below threshold", value: bytes.Repeat([]byte("a"), minEncryptionCompressionSize-1), compressed: false},
+		{name: "at threshold", value: bytes.Repeat([]byte("a"), minEncryptionCompressionSize), compressed: true},
 		{name: "empty", value: []byte{}, compressed: false},
 		{name: "small", value: []byte("value"), compressed: false},
 		{name: "high entropy", value: incompressible, compressed: false},
@@ -139,6 +141,57 @@ func TestEncryption_RejectsAuthenticatedMalformedSnappy(t *testing.T) {
 
 	if _, err := f.mvcc.GetAt(context.Background(), key, commitTS); !errors.Is(err, ErrEncryptedReadCompression) {
 		t.Fatalf("malformed authenticated Snappy: expected ErrEncryptedReadCompression, got %v", err)
+	}
+}
+
+func TestEncryption_RejectsAuthenticatedOversizedSnappyBeforeDecode(t *testing.T) {
+	previousMax := maxSnapshotValueSize
+	maxSnapshotValueSize = 64
+	t.Cleanup(func() { maxSnapshotValueSize = previousMax })
+
+	f := newEncryptedStoreFixture(t, 106)
+	key := []byte("oversized-snappy")
+	const commitTS uint64 = 100
+	pebbleKey := encodeKey(key, commitTS)
+	var header [valueHeaderSize]byte
+	writeValueHeaderBytes(header[:], false, 0, encStateEncrypted)
+	aad := buildStorageAAD(encryption.EnvelopeVersionV1, encryption.FlagCompressed, f.keyID, header[:], pebbleKey)
+	compressed := snappy.Encode(nil, bytes.Repeat([]byte("a"), maxSnapshotValueSize+1))
+	var nonce [encryption.NonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatalf("rand.Read nonce: %v", err)
+	}
+	body, err := f.cipher.Encrypt(compressed, aad, f.keyID, nonce[:])
+	if err != nil {
+		t.Fatalf("Encrypt oversized payload: %v", err)
+	}
+	envelopeBytes, err := (&encryption.Envelope{
+		Version: encryption.EnvelopeVersionV1,
+		Flag:    encryption.FlagCompressed,
+		KeyID:   f.keyID,
+		Nonce:   nonce,
+		Body:    body,
+	}).Encode()
+	if err != nil {
+		t.Fatalf("Envelope.Encode: %v", err)
+	}
+
+	f.closeIfOpen(t)
+	pdb, err := pebble.Open(f.dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+	if err := pdb.Set(pebbleKey, encodeValue(envelopeBytes, false, 0, encStateEncrypted), pebble.Sync); err != nil {
+		_ = pdb.Close()
+		t.Fatalf("pdb.Set: %v", err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatalf("pdb.Close: %v", err)
+	}
+	f.reopen(t)
+
+	if _, err := f.mvcc.GetAt(context.Background(), key, commitTS); !errors.Is(err, ErrEncryptedReadCompression) {
+		t.Fatalf("oversized authenticated Snappy: expected ErrEncryptedReadCompression, got %v", err)
 	}
 }
 

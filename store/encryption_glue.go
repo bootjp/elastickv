@@ -111,6 +111,8 @@ var ErrEncryptedReadIntegrity = errors.New("store: encrypted value failed integr
 // closed instead of surfacing the compressed bytes as user data.
 var ErrEncryptedReadCompression = errors.New("store: authenticated encrypted value contains an invalid Snappy payload")
 
+const minEncryptionCompressionSize = 32
+
 // NonceFactory produces unique 12-byte AES-GCM nonces for the storage
 // envelope (§4.1). The factory is responsible for the cluster-wide
 // uniqueness invariant across `(node_id, local_epoch, write_count)` —
@@ -420,13 +422,9 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 		}
 		return nil, errors.Wrap(err, "store: decrypt value")
 	}
-	if env.Flag&encryption.FlagCompressed != 0 {
-		plain, err = snappy.Decode(nil, plain)
-		if err != nil {
-			return nil, errors.Wrap(
-				errors.WithSecondaryError(ErrEncryptedReadCompression, err),
-				"store: decompress encrypted value")
-		}
+	plain, err = decompressAuthenticatedValue(plain, env.Flag)
+	if err != nil {
+		return nil, err
 	}
 	// AES-GCM Open returns a nil dst slice for an empty plaintext;
 	// upstream callers (notably ExistsAt) distinguish "key absent"
@@ -439,11 +437,43 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 	return plain, nil
 }
 
+// decompressAuthenticatedValue inspects the Snappy length prefix before any
+// output allocation. Callers must authenticate the envelope before reaching
+// this helper; the compressed bytes are otherwise attacker-controlled.
+func decompressAuthenticatedValue(plain []byte, flag byte) ([]byte, error) {
+	if flag&encryption.FlagCompressed == 0 {
+		return plain, nil
+	}
+	decodedLen, err := snappy.DecodedLen(plain)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.WithSecondaryError(ErrEncryptedReadCompression, err),
+			"store: inspect compressed encrypted value")
+	}
+	if decodedLen > maxSnapshotValueSize {
+		return nil, errors.Wrapf(
+			ErrEncryptedReadCompression,
+			"store: compressed encrypted value expands to %d bytes, maximum is %d",
+			decodedLen,
+			maxSnapshotValueSize)
+	}
+	decoded, err := snappy.Decode(nil, plain)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.WithSecondaryError(ErrEncryptedReadCompression, err),
+			"store: decompress encrypted value")
+	}
+	return decoded, nil
+}
+
 // compressForEncryption applies §6.4's compress-then-encrypt policy. Snappy
 // output is used only when it is strictly smaller than the original bytes;
 // already-compressed and small payloads stay uncompressed so encryption never
 // increases CPU and storage cost for a larger intermediate representation.
 func compressForEncryption(plaintext []byte) ([]byte, byte) {
+	if len(plaintext) < minEncryptionCompressionSize {
+		return plaintext, 0
+	}
 	compressed := snappy.Encode(nil, plaintext)
 	if len(compressed) >= len(plaintext) {
 		return plaintext, 0
