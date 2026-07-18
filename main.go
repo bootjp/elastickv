@@ -297,6 +297,7 @@ const bytesPerMiB = 1024 * 1024
 
 func main() {
 	flag.Parse()
+	recordExplicitRuntimeFlags(flag.CommandLine)
 
 	err := run()
 	if memoryPressureExit.Load() {
@@ -525,6 +526,11 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+	autoSplitCfg, err := configureRuntimeAutoSplit(coordinate)
+	if err != nil {
+		return err
+	}
+
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -585,6 +591,7 @@ func run() error {
 		}),
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
+	startAutoSplitScheduler(runCtx, eg, distCatalog, distServer, coordinate, sampler, autoSplitCfg)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
 
@@ -3426,20 +3433,26 @@ func (r *runtimeServerRunner) startAdminHTTP() {
 }
 
 // buildKeyVizSampler constructs the in-memory keyviz sampler from
-// flag-supplied options, or returns nil when --keyvizEnabled is
-// false. The coordinator's WithSampler and AdminServer's
+// flag-supplied options, or returns nil when neither --keyvizEnabled nor
+// --autoSplit is set. The coordinator's WithSampler and AdminServer's
 // RegisterSampler both treat a nil receiver as "keyviz disabled," so
 // this is the single decision point.
 func buildKeyVizSampler() *keyviz.MemSampler {
-	if !*keyvizEnabled {
+	if !*keyvizEnabled && !*autoSplit {
 		return nil
 	}
+	keyBucketsPerRoute := effectiveKeyVizBucketsPerRoute(
+		*autoSplit,
+		keyvizKeyBucketsPerRouteExplicit,
+		*keyvizKeyBucketsPerRoute,
+		*autoSplitDefaultBuckets,
+	)
 	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
 		Step:                   *keyvizStep,
 		HistoryColumns:         *keyvizHistoryColumns,
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
-		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		KeyBucketsPerRoute:     keyBucketsPerRoute,
 		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
 		HotKeysEnabled:         *keyvizHotKeysEnabled,
 		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
@@ -3461,12 +3474,9 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 	return s
 }
 
-// seedKeyVizRoutes copies the engine's current route catalogue into
-// the sampler so the first matrix snapshots have non-empty metadata.
-// No-op when the sampler is disabled. The coordinator's
-// distribution.Engine handles route mutations after this point;
-// route-watch propagation into the sampler is a follow-up (the
-// design's Phase 3 persistence work).
+// seedKeyVizRoutes copies the engine's current route catalogue into the sampler
+// so the first matrix snapshots have non-empty metadata. The auto-split
+// scheduler keeps membership reconciled after catalog changes.
 func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 	if s == nil || engine == nil {
 		return

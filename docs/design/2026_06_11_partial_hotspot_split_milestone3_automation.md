@@ -2,11 +2,15 @@
 
 Status: Partial - M3-PR1a is implemented: the dead `RecordAccess` /
 `splitRange` / threshold constructor path is removed, and the route-catalog
-decoder now keeps v1 strict while accepting forward-version tails. M3-PR2a adds
-the pure autosplit detector core. M3-PR2b-a adds the committed-window
-`MemSampler.Snapshot` reader and observe-only detector bridge. M3-PR1b, the
-remaining M3-PR2b Top-K / leadership-watermark work, and scheduler wiring remain
-open.
+decoder now keeps v1 strict while accepting forward-version tails. M3-PR1b adds
+the durable `SplitAtHLC` route lineage. M3-PR2a adds the pure autosplit detector
+core. M3-PR2b-a adds the committed-window `MemSampler.Snapshot` reader and
+observe-only detector bridge. The current M3-PR3 branch wires the p50 same-group
+scheduler to `SplitRange` behind `--autoSplit`, including implied KeyViz
+buckets, the runtime kill switch, sampler membership reconciliation, and
+`SplitAtHLC`-seeded cooldown reconstruction. The remaining M3-PR2b Top-K /
+compound isolation and leadership-watermark work, plus M3-PR4 cross-group target
+selection, remain open.
 Author: bootjp
 Date: 2026-06-11
 Updated: 2026-07-22
@@ -621,6 +625,6 @@ Per the design-doc-first workflow this section **converges**: where review (or t
 This document begins as `*_proposed_*`. Per CLAUDE.md / `docs/design/README.md`:
 
 - Renamed to `*_partial_*` after M3-PR1a; track per-PR landing under §8.1 and update the parent partial doc's M3 row.
-- Rename to `*_implemented_*` after M3-PR3 ships (standalone auto-split complete), with M3-PR4 (cross-group target selection, depends on M2) tracked as the cross-group follow-on.
+- Rename to `*_implemented_*` after standalone auto-split includes the remaining M3-PR2b detector output and M3-PR3 compound finalization path; keep M3-PR4 (cross-group target selection, depends on M2) tracked as the cross-group follow-on.
 
 Use `git mv` so history follows the rename. The propose date (2026-06-11) and slug stay fixed.
