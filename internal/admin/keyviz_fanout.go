@@ -71,7 +71,7 @@ const keyVizMergeBucketHint = 64
 // a stable row order; Responded counts ok=true entries; Expected is
 // the configured peer count plus self.
 //
-// See docs/design/2026_04_27_proposed_keyviz_cluster_fanout.md 5.
+// See docs/design/2026_04_27_implemented_keyviz_cluster_fanout.md 5.
 type FanoutResult struct {
 	Nodes     []FanoutNodeStatus `json:"nodes"`
 	Responded int                `json:"responded"`

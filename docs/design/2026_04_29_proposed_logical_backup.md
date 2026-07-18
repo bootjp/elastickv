@@ -1570,7 +1570,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 - Concurrent multi-cluster fan-out (one logical backup spanning shards
   on different physical clusters) — depends on the `Distribution`
   control plane being fan-out-aware (see
-  `2026_04_27_proposed_keyviz_cluster_fanout.md`).
+  `2026_04_27_implemented_keyviz_cluster_fanout.md`).
 
 ## Required Tests
 

@@ -35,9 +35,9 @@ import (
 // deltas), which is the post-compaction steady state the read path
 // accepts — and which the decoder already drops on the way in.
 //
-// Collection TTL is NOT inline (unlike strings): it lives in a
-// !redis|ttl|<userKey> scan-index row, matching buildTTLElems for
-// non-string types.
+// Collection TTL is stored in two places: inline in the collection
+// meta value (the live read path's source of truth) and in the
+// !redis|ttl|<userKey> scan-index row used for expiry scans.
 
 // ErrRedisEncodeInvalidJSON is returned when a collection JSON file in
 // the dump cannot be parsed into its expected shape.
@@ -98,7 +98,7 @@ func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
 		// Base meta: element count = number of fields (consolidated,
 		// no deltas).
 		if err := b.Add(wideColMetaKey(RedisHashMetaPrefix, rawKey),
-			marshalCount8BE(uint64(len(rec.Fields))), 0); err != nil {
+			marshalCountMeta(uint64(len(rec.Fields)), rec.ExpireAtMs), 0); err != nil {
 			return err
 		}
 		for _, f := range rec.Fields {
@@ -140,7 +140,7 @@ func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
 		if err := b.Add(wideColMetaKey(RedisSetMetaPrefix, rawKey),
-			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {
+			marshalCountMeta(uint64(len(rec.Members)), rec.ExpireAtMs), 0); err != nil {
 			return err
 		}
 		for _, mRaw := range rec.Members {
@@ -184,7 +184,7 @@ func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
 		if rec.FormatVersion != redisCollectionFormatVersion {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
-		if err := b.Add(buildListMetaKey(rawKey), marshalListMetaHead0(uint64(len(rec.Items))), 0); err != nil {
+		if err := b.Add(buildListMetaKey(rawKey), marshalListMetaHead0(uint64(len(rec.Items)), rec.ExpireAtMs), 0); err != nil {
 			return err
 		}
 		for i, itemRaw := range rec.Items {
@@ -206,17 +206,6 @@ func buildListMetaKey(userKey []byte) []byte {
 	out := make([]byte, 0, len(ListMetaPrefix)+len(userKey))
 	out = append(out, ListMetaPrefix...)
 	return append(out, userKey...)
-}
-
-// marshalListMetaHead0 encodes the 24-byte [Head][Tail][Len] meta with
-// Head=0, Len=n, Tail=n — the canonical restore form (mirror of
-// store.marshalListMeta with Head=0).
-func marshalListMetaHead0(n uint64) []byte {
-	buf := make([]byte, listMetaBinarySize)
-	binary.BigEndian.PutUint64(buf[0:8], 0)   // Head
-	binary.BigEndian.PutUint64(buf[8:16], n)  // Tail = Head + Len
-	binary.BigEndian.PutUint64(buf[16:24], n) // Len
-	return buf
 }
 
 // buildListItemKey builds !lst|itm|<userKey><sortableInt64(seq)>
@@ -259,7 +248,7 @@ func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
 		if err := b.Add(wideColMetaKey(RedisZSetMetaPrefix, rawKey),
-			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {
+			marshalCountMeta(uint64(len(rec.Members)), rec.ExpireAtMs), 0); err != nil {
 			return err
 		}
 		for _, m := range rec.Members {
@@ -386,7 +375,7 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 			return err
 		}
 		if err := b.Add(wideColMetaKey(RedisStreamMetaPrefix, rawKey),
-			marshalStreamMeta(meta.Length, meta.LastMs, meta.LastSeq), 0); err != nil {
+			marshalStreamMeta(meta.Length, meta.LastMs, meta.LastSeq, meta.ExpireAtMs), 0); err != nil {
 			return err
 		}
 		return e.addCollectionTTL(b, rawKey, meta.ExpireAtMs)
@@ -494,13 +483,20 @@ func buildStreamEntryKey(userKey []byte, ms, seq uint64) []byte {
 	return wideColElemKey(RedisStreamEntryPrefix, userKey, id[:])
 }
 
-// marshalStreamMeta encodes the 24-byte [Length][LastMs][LastSeq] meta
-// value (mirror of store.MarshalStreamMeta).
-func marshalStreamMeta(length int64, lastMs, lastSeq uint64) []byte {
-	buf := make([]byte, redisStreamMetaSize)
+// marshalStreamMeta encodes [Length][LastMs][LastSeq], optionally with
+// trailing ExpireAtMs (mirror of store.MarshalStreamMeta).
+func marshalStreamMeta(length int64, lastMs, lastSeq uint64, expireMs *uint64) []byte {
+	size := redisStreamMetaSize
+	if expireMs != nil && *expireMs != 0 {
+		size = redisStreamMetaInlineTTLSize
+	}
+	buf := make([]byte, size)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(length)) //nolint:gosec // length is a non-negative count from the dump's _meta line
 	binary.BigEndian.PutUint64(buf[8:16], lastMs)
 	binary.BigEndian.PutUint64(buf[16:24], lastSeq)
+	if size == redisStreamMetaInlineTTLSize {
+		binary.BigEndian.PutUint64(buf[24:32], *expireMs)
+	}
 	return buf
 }
 
@@ -532,7 +528,7 @@ func buildStreamEntryValue(id string, interleaved []string) ([]byte, error) {
 // addCollectionTTL emits the !redis|ttl|<userKey> scan-index row for a
 // non-string collection with an expiry. A nil expiry is a no-op.
 func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expireMs *uint64) error {
-	if expireMs == nil {
+	if expireMs == nil || *expireMs == 0 {
 		return nil
 	}
 	key := append([]byte(RedisTTLPrefix), rawKey...)
@@ -635,11 +631,35 @@ func wideColElemKey(prefix string, userKey, suffix []byte) []byte {
 	return append(out, suffix...)
 }
 
-// marshalCount8BE encodes a collection element count as the 8-byte
-// big-endian value store.MarshalHashMeta writes.
-func marshalCount8BE(n uint64) []byte {
-	buf := make([]byte, redisUint64Bytes)
+// marshalCountMeta encodes a collection count, optionally followed by
+// inline ExpireAtMs. This mirrors store.MarshalHashMeta/SetMeta/ZSetMeta.
+func marshalCountMeta(n uint64, expireMs *uint64) []byte {
+	size := redisUint64Bytes
+	if expireMs != nil && *expireMs != 0 {
+		size = redisCountMetaInlineBytes
+	}
+	buf := make([]byte, size)
 	binary.BigEndian.PutUint64(buf, n)
+	if size == redisCountMetaInlineBytes {
+		binary.BigEndian.PutUint64(buf[redisUint64Bytes:redisCountMetaInlineBytes], *expireMs)
+	}
+	return buf
+}
+
+// marshalListMetaHead0 encodes [Head][Tail][Len], optionally with
+// trailing ExpireAtMs. Head=0, Len=n, Tail=n is the canonical restore form.
+func marshalListMetaHead0(n uint64, expireMs *uint64) []byte {
+	size := listMetaBinarySize
+	if expireMs != nil && *expireMs != 0 {
+		size = listMetaInlineTTLSize
+	}
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint64(buf[0:8], 0)   // Head
+	binary.BigEndian.PutUint64(buf[8:16], n)  // Tail = Head + Len
+	binary.BigEndian.PutUint64(buf[16:24], n) // Len
+	if size == listMetaInlineTTLSize {
+		binary.BigEndian.PutUint64(buf[24:32], *expireMs)
+	}
 	return buf
 }
 
