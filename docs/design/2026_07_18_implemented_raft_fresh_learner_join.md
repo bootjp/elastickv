@@ -338,6 +338,13 @@ transport discovery without creating an initial voter `ConfState`, and that the
 post-promotion membership survives a full-cluster restart rather than depending
 on one still-running member's in-memory view.
 
+`TestFreshLearnerJoinReusesRemovedVoterID` exercises the production replacement
+shape with three voters: it stops and removes one voter while the remaining two
+retain quorum, wipes only that node, rejoins the same ID as a learner, promotes
+it, restarts all three voters without join settings, and commits another write.
+The three-voter fixture is required because removing a stopped member from a
+two-voter cluster cannot commit after the remaining voter loses quorum.
+
 ### 11.3 Operational validation
 
 The rolling-update script is syntax-checked and dry-run with `RAFT_JOIN_NODE` to
