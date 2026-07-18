@@ -653,8 +653,10 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
-		return err
+	if s.lastCommitTS > startTS {
+		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
+			return err
+		}
 	}
 
 	commitTS = s.alignCommitTS(commitTS)

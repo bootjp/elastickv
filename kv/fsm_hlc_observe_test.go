@@ -1,6 +1,8 @@
 package kv
 
 import (
+	"bytes"
+	"io"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -81,14 +83,14 @@ func TestApplyObservesCommitTSIntoHLC(t *testing.T) {
 		"HLC.last must never regress, even on a stale-ts Apply")
 }
 
-// TestApplyHLCObserveAfterRestart simulates the new-leader handoff
-// scenario the spec doc §5.1 HLC-4 (ii) describes: a follower whose
-// HLC was reset (e.g. process restart, all in-memory `last` lost)
-// catches up by replaying applied log entries through the FSM.  By
-// the time the catchup is complete, HLC.last must dominate every
-// previously committed timestamp — otherwise a subsequent election
+// TestNewKvFSMWithHLCObservesStoreLastCommitTS simulates the new-leader
+// handoff scenario the spec doc §5.1 HLC-4 (ii) describes: a follower
+// whose HLC was reset (e.g. process restart, all in-memory `last` lost)
+// may skip WAL replay when the durable FSM is already past the snapshot
+// pointer.  By the time the FSM is constructed, HLC.last must dominate
+// every previously committed timestamp — otherwise a subsequent election
 // could let this node issue an HLC strictly less than a prior commit.
-func TestApplyHLCObserveAfterRestart(t *testing.T) {
+func TestNewKvFSMWithHLCObservesStoreLastCommitTS(t *testing.T) {
 	st := store.NewMVCCStore()
 
 	// Pre-populate the store with a write at commit_ts = 12345 — the
@@ -97,33 +99,42 @@ func TestApplyHLCObserveAfterRestart(t *testing.T) {
 	const priorCommit uint64 = 12345
 	require.NoError(t, st.PutAt(t.Context(), []byte("k"), []byte("v"), priorCommit, 0))
 
-	// Construct a fresh HLC + FSM: hlc.last starts at 0 — this is the
-	// post-restart state.
+	// Construct a fresh HLC + FSM: hlc.last starts at 0 before the
+	// FSM wires it to the store.
 	hlc := NewHLC()
 	fsm, ok := NewKvFSMWithHLC(st, hlc).(*kvFSM)
 	require.True(t, ok)
-	require.Equal(t, uint64(0), hlc.Current(),
-		"freshly constructed HLC starts at last = 0")
 
-	// Simulate Raft catchup: re-apply the prior leader's write through
-	// the FSM.  This is what etcd/raft does on a node coming up — log
-	// entries are re-applied to the FSM via StateMachine.Apply.
-	replay := &pb.Request{
-		Ts: priorCommit,
-		Mutations: []*pb.Mutation{
-			{Op: pb.Op_PUT, Key: []byte("k2"), Value: []byte("vr")},
-		},
-	}
-	data, err := proto.Marshal(replay)
-	require.NoError(t, err)
-	require.Nil(t, fsm.Apply(data))
-
-	// After replay, HLC.last must dominate the prior commit.  The
-	// first Next() this node issues — for example, if it now wins a
-	// leader election — therefore returns a value strictly greater
-	// than priorCommit, closing the HLC-4 logical-handoff gap.
 	require.GreaterOrEqual(t, hlc.Current(), priorCommit,
-		"post-replay HLC.last must dominate the prior leader's max commit_ts")
+		"post-restart HLC.last must dominate the prior leader's max commit_ts before replay")
 	require.Greater(t, hlc.Next(), priorCommit,
-		"first Next() after replay must be strictly above the prior commit")
+		"first Next() after cold-start skip must be strictly above the prior commit")
+	require.NotNil(t, fsm)
+}
+
+// TestRestoreObservesStoreLastCommitTSIntoHLC covers the snapshot-install path
+// that bypasses Apply replay: after Restore succeeds, a node's fresh HLC must
+// still dominate the restored store's max commit timestamp before it can serve.
+func TestRestoreObservesStoreLastCommitTSIntoHLC(t *testing.T) {
+	src := store.NewMVCCStore()
+	const restoredCommit uint64 = 67890
+	require.NoError(t, src.PutAt(t.Context(), []byte("restored"), []byte("v"), restoredCommit, 0))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+
+	hlc := NewHLC()
+	fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), hlc).(*kvFSM)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), hlc.Current(), "fresh target HLC starts below the snapshot data")
+
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
+	require.GreaterOrEqual(t, hlc.Current(), restoredCommit,
+		"Restore must observe the restored store LastCommitTS into HLC.last")
+	require.Greater(t, hlc.Next(), restoredCommit,
+		"first Next() after Restore must be strictly above restored commit_ts")
 }

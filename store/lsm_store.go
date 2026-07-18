@@ -110,6 +110,18 @@ const (
 	// fsmSyncModeEnv. Any other value falls back to the default.
 	fsmSyncModeSync   = "sync"
 	fsmSyncModeNoSync = "nosync"
+
+	// conflictCheckSmallLinearAdvanceLimit bounds the number of physical Pebble
+	// keys we scan with Next before falling back to SeekGE during small batched
+	// OCC checks.
+	conflictCheckSmallLinearAdvanceLimit = 64
+
+	// conflictCheckLargeLinearAdvanceLimit stays intentionally small: large
+	// replay batches often touch sparse key ranges, where broad Next scans burn
+	// CPU before the server starts listening. Fallback seeks are bounded to the
+	// target key range with SeekGEWithLimit.
+	conflictCheckLargeLinearAdvanceLimit = 16
+	conflictCheckLargeBatchThreshold     = 1024
 )
 
 // pebbleCacheBytes is the effective per-store Pebble block-cache capacity,
@@ -323,9 +335,10 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		s.cache = nil
 	}
 
-	// Initialize lastCommitTS by scanning specifically or persisting it separately.
-	// For simplicity, we scan on startup to find the max TS.
-	// In a production system, this should be stored in a separate meta key.
+	// Initialize lastCommitTS from the persisted meta key, then validate it
+	// against data versions. Older stores and crash windows can have missing or
+	// stale metadata while MVCC versions remain present; using the lower meta
+	// watermark for OCC would skip conflict scans incorrectly.
 	maxTS, err := s.findMaxCommitTS()
 	if err != nil {
 		cleanupOnInitFail()
@@ -366,6 +379,17 @@ func encodeKey(key []byte, ts uint64) []byte {
 	return k
 }
 
+func appendEncodedKey(dst []byte, key []byte, ts uint64) []byte {
+	needed := encodedKeyLen(key)
+	if cap(dst) < needed {
+		dst = make([]byte, needed)
+	} else {
+		dst = dst[:needed]
+	}
+	fillEncodedKey(dst, key, ts)
+	return dst
+}
+
 func encodedKeyLen(key []byte) int {
 	return len(key) + timestampSize
 }
@@ -391,6 +415,22 @@ func keyUpperBound(key []byte) []byte {
 		}
 	}
 	return nil // key is all 0xFF; no finite upper bound
+}
+
+func appendKeyUpperBound(dst []byte, key []byte) []byte {
+	if cap(dst) < len(key) {
+		dst = make([]byte, len(key))
+	} else {
+		dst = dst[:len(key)]
+	}
+	copy(dst, key)
+	for i := len(dst) - 1; i >= 0; i-- {
+		dst[i]++
+		if dst[i] != 0 {
+			return dst[:i+1]
+		}
+	}
+	return nil
 }
 
 func decodeKey(k []byte) ([]byte, uint64) {
@@ -574,8 +614,59 @@ func isPebbleMetaKey(rawKey []byte) bool {
 		bytes.Equal(rawKey, metaAppliedIndexBytes)
 }
 
+func isPebbleOperationalKey(rawKey []byte) bool {
+	return isPebbleMetaKey(rawKey) ||
+		isPebbleWriterRegistryKey(rawKey)
+}
+
+func isPebbleWriterRegistryKey(rawKey []byte) bool {
+	_, _, err := encryption.DecodeRegistryKey(rawKey)
+	return err == nil
+}
+
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
-	return readPebbleUint64(s.db, metaLastCommitTSBytes)
+	metaTS, err := readPebbleUint64(s.db, metaLastCommitTSBytes)
+	if err != nil {
+		return 0, err
+	}
+	dataTS, err := s.findMaxDataCommitTS()
+	if err != nil {
+		return 0, err
+	}
+	if dataTS <= metaTS {
+		return metaTS, nil
+	}
+	if err := writePebbleUint64(s.db, metaLastCommitTSBytes, dataTS, pebble.Sync); err != nil {
+		return 0, err
+	}
+	return dataTS, nil
+}
+
+func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	var maxTS uint64
+	for iter.First(); iter.Valid(); iter.Next() {
+		rawKey := iter.Key()
+		if isPebbleOperationalKey(rawKey) {
+			continue
+		}
+		userKey, ts := decodeKeyView(rawKey)
+		if userKey == nil {
+			continue
+		}
+		if ts > maxTS {
+			maxTS = ts
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return maxTS, nil
 }
 
 func (s *pebbleStore) findMinRetainedTS() (uint64, error) {
@@ -923,6 +1014,81 @@ func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 	return s.getAt(ctx, key, ts)
 }
 
+func (s *pebbleStore) GetAtBatch(ctx context.Context, keys [][]byte, ts uint64) (map[string][]byte, error) {
+	if len(keys) == 0 {
+		return map[string][]byte{}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
+		return nil, ErrReadTSCompacted
+	}
+
+	sortedKeys := uniqueSortedKeys(keys)
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	return s.getAtBatchWithIter(ctx, iter, sortedKeys, ts)
+}
+
+func (s *pebbleStore) getAtBatchWithIter(ctx context.Context, iter *pebble.Iterator, sortedKeys [][]byte, ts uint64) (map[string][]byte, error) {
+	values := make(map[string][]byte, len(sortedKeys))
+	var seekKey []byte
+	var upperBound []byte
+	for _, key := range sortedKeys {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		seekKey = appendEncodedKey(seekKey, key, ts)
+		upperBound = appendKeyUpperBound(upperBound, key)
+		if !iter.SeekGE(seekKey) {
+			if err := iter.Error(); err != nil {
+				return nil, errors.WithStack(err)
+			}
+			continue
+		}
+		value, err := s.readVisibleVersion(iter, key, ts)
+		if err != nil {
+			if errors.Is(err, ErrKeyNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		values[string(key)] = bytes.Clone(value)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return values, nil
+}
+
+func uniqueSortedKeys(keys [][]byte) [][]byte {
+	sortedKeys := make([][]byte, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		keyString := string(key)
+		if _, ok := seen[keyString]; ok {
+			continue
+		}
+		seen[keyString] = struct{}{}
+		sortedKeys = append(sortedKeys, key)
+	}
+	sort.Slice(sortedKeys, func(i, j int) bool {
+		return bytes.Compare(sortedKeys[i], sortedKeys[j]) < 0
+	})
+	return sortedKeys
+}
+
 func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
@@ -961,6 +1127,10 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	return s.committedVersionAtLocked(key, commitTS)
+}
+
+func (s *pebbleStore) committedVersionAtLocked(key []byte, commitTS uint64) (bool, error) {
 	_, closer, err := s.db.Get(encodeKey(key, commitTS))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -1057,7 +1227,7 @@ func beforeScanStart(userKey, start []byte) bool {
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Next() {
 				return nil, 0, false
 			}
@@ -1096,7 +1266,7 @@ func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]
 			return nil, 0, false, errors.WithStack(err)
 		}
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Next() {
 				return nil, 0, false, nil
 			}
@@ -1117,7 +1287,7 @@ func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
 	for iter.Valid() {
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			if !iter.Prev() {
 				return nil, false
 			}
@@ -1723,36 +1893,163 @@ func (s *pebbleStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, b
 	return s.latestCommitTS(ctx, key)
 }
 
-func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMutation, startTS uint64) error {
-	for _, mut := range mutations {
-		// Use the internal latestCommitTS to avoid re-acquiring dbMu (the caller
-		// – ApplyMutations – already holds dbMu.RLock()).
-		ts, exists, err := s.latestCommitTS(ctx, mut.Key)
+type conflictCheckKey struct {
+	key   []byte
+	index int
+}
+
+func sortConflictCheckKeys(keys []conflictCheckKey) {
+	sort.Slice(keys, func(i, j int) bool {
+		if c := bytes.Compare(keys[i].key, keys[j].key); c != 0 {
+			return c < 0
+		}
+		return keys[i].index < keys[j].index
+	})
+}
+
+func sortedMutationConflictKeys(mutations []*KVPairMutation) []conflictCheckKey {
+	keys := make([]conflictCheckKey, len(mutations))
+	for i, mut := range mutations {
+		keys[i] = conflictCheckKey{key: mut.Key, index: i}
+	}
+	sortConflictCheckKeys(keys)
+	return keys
+}
+
+func sortedReadConflictKeys(readKeys [][]byte) []conflictCheckKey {
+	keys := make([]conflictCheckKey, len(readKeys))
+	for i, key := range readKeys {
+		keys[i] = conflictCheckKey{key: key, index: i}
+	}
+	sortConflictCheckKeys(keys)
+	return keys
+}
+
+func conflictTSFromCurrentIter(iter *pebble.Iterator, key []byte, limit int) (uint64, bool, bool, error) {
+	for steps := 0; steps < limit && iter.Valid(); steps++ {
+		userKey, version := decodeKeyView(iter.Key())
+		switch c := bytes.Compare(userKey, key); {
+		case c < 0:
+			iter.Next()
+			continue
+		case c == 0:
+			return version, true, true, nil
+		default:
+			return 0, false, false, nil
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, false, true, errors.WithStack(err)
+	}
+	if !iter.Valid() {
+		return 0, false, true, nil
+	}
+	return 0, false, false, nil
+}
+
+func conflictCheckLinearAdvanceLimitFor(keyCount int) int {
+	if keyCount >= conflictCheckLargeBatchThreshold {
+		return conflictCheckLargeLinearAdvanceLimit
+	}
+	return conflictCheckSmallLinearAdvanceLimit
+}
+
+func (s *pebbleStore) latestCommitTSWithIter(ctx context.Context, iter *pebble.Iterator, key []byte, seekKey, upperBound *[]byte, preferNext bool, linearAdvanceLimit int) (uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	if preferNext {
+		ts, exists, decided, err := conflictTSFromCurrentIter(iter, key, linearAdvanceLimit)
+		if err != nil || decided {
+			return ts, exists, err
+		}
+	}
+	*seekKey = appendEncodedKey(*seekKey, key, math.MaxUint64)
+	*upperBound = appendKeyUpperBound(*upperBound, key)
+	if iter.SeekGEWithLimit(*seekKey, *upperBound) == pebble.IterValid {
+		userKey, version := decodeKeyView(iter.Key())
+		if bytes.Equal(userKey, key) {
+			return version, true, nil
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return 0, false, nil
+}
+
+func nextConflictCheckKeyGroup(keys []conflictCheckKey, start int) ([]byte, int, int) {
+	current := keys[start].key
+	minOriginalIndex := keys[start].index
+	next := start + 1
+	for next < len(keys) && bytes.Equal(keys[next].key, current) {
+		if keys[next].index < minOriginalIndex {
+			minOriginalIndex = keys[next].index
+		}
+		next++
+	}
+	return current, minOriginalIndex, next
+}
+
+func (s *pebbleStore) firstConflictKey(ctx context.Context, keys []conflictCheckKey, startTS uint64) ([]byte, bool, error) {
+	if len(keys) == 0 {
+		return nil, false, nil
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	firstConflictIndex := len(keys)
+	var firstConflictKey []byte
+	var seekKey []byte
+	var upperBound []byte
+	preferNext := false
+	linearAdvanceLimit := conflictCheckLinearAdvanceLimitFor(len(keys))
+	for i := 0; i < len(keys); {
+		current, minOriginalIndex, next := nextConflictCheckKeyGroup(keys, i)
+		ts, exists, err := s.latestCommitTSWithIter(ctx, iter, current, &seekKey, &upperBound, preferNext, linearAdvanceLimit)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
-		if exists && ts > startTS {
-			// Record the first conflicting key's bucket only — a single
-			// failing ApplyMutations corresponds to one OCC conflict
-			// regardless of how many subsequent mutations would also
-			// collide, which matches the Prometheus rate semantics.
-			s.writeConflicts.record(WriteConflictKindWrite, classifyWriteConflictKey(mut.Key))
-			return NewWriteConflictError(mut.Key)
+		preferNext = iter.Valid()
+		if exists && ts > startTS && minOriginalIndex < firstConflictIndex {
+			firstConflictIndex = minOriginalIndex
+			firstConflictKey = current
 		}
+		i = next
+	}
+	if firstConflictKey == nil {
+		return nil, false, nil
+	}
+	return firstConflictKey, true, nil
+}
+
+func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMutation, startTS uint64) error {
+	conflictKey, found, err := s.firstConflictKey(ctx, sortedMutationConflictKeys(mutations), startTS)
+	if err != nil {
+		return err
+	}
+	if found {
+		// Record the first conflicting key's bucket only — a single
+		// failing ApplyMutations corresponds to one OCC conflict
+		// regardless of how many subsequent mutations would also
+		// collide, which matches the Prometheus rate semantics.
+		s.writeConflicts.record(WriteConflictKindWrite, classifyWriteConflictKey(conflictKey))
+		return NewWriteConflictError(conflictKey)
 	}
 	return nil
 }
 
 func (s *pebbleStore) checkReadConflicts(ctx context.Context, readKeys [][]byte, startTS uint64) error {
-	for _, key := range readKeys {
-		ts, exists, err := s.latestCommitTS(ctx, key)
-		if err != nil {
-			return err
-		}
-		if exists && ts > startTS {
-			s.writeConflicts.record(WriteConflictKindRead, classifyWriteConflictKey(key))
-			return NewWriteConflictError(key)
-		}
+	conflictKey, found, err := s.firstConflictKey(ctx, sortedReadConflictKeys(readKeys), startTS)
+	if err != nil {
+		return err
+	}
+	if found {
+		s.writeConflicts.record(WriteConflictKindRead, classifyWriteConflictKey(conflictKey))
+		return NewWriteConflictError(conflictKey)
 	}
 	return nil
 }
@@ -1873,6 +2170,106 @@ func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVP
 	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
 }
 
+func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, commitTS uint64) (bool, error) {
+	if len(mutations) == 0 {
+		return false, nil
+	}
+	probed := false
+	for _, mut := range mutations {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		landed, err := s.committedVersionAtLocked(mut.Key, commitTS)
+		if err != nil || !landed {
+			return false, err
+		}
+		probed = true
+	}
+	return probed, nil
+}
+
+func (s *pebbleStore) shouldWriteAppliedIndexLocked(appliedIndex uint64) (bool, error) {
+	if appliedIndex == 0 {
+		return false, nil
+	}
+	existing, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return false, err
+	}
+	return !present || existing < appliedIndex, nil
+}
+
+func (s *pebbleStore) writeRaftApplyMetaLocked(newLastTS uint64, writeAppliedIndex bool, appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	b := s.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		return err
+	}
+	if writeAppliedIndex {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+	return errors.WithStack(b.Commit(raftApplyMetaWriteOpts(writeAppliedIndex, writeOpts)))
+}
+
+func raftApplyMetaWriteOpts(writeAppliedIndex bool, writeOpts *pebble.WriteOptions) *pebble.WriteOptions {
+	if writeAppliedIndex {
+		return pebble.Sync
+	}
+	return writeOpts
+}
+
+func (s *pebbleStore) markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	writeAppliedIndex, err := s.shouldWriteAppliedIndexLocked(appliedIndex)
+	if err != nil {
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if !writeAppliedIndex && newLastTS == s.lastCommitTS {
+		return nil
+	}
+	if err := s.writeRaftApplyMetaLocked(newLastTS, writeAppliedIndex, appliedIndex, writeOpts); err != nil {
+		return err
+	}
+	s.updateLastCommitTS(newLastTS)
+	return nil
+}
+
+func (s *pebbleStore) staleRaftApplyFastPathLocked(mutations []*KVPairMutation, commitTS, appliedIndex uint64, writeOpts *pebble.WriteOptions) (bool, error) {
+	if appliedIndex == 0 {
+		return false, nil
+	}
+	landed, err := s.raftApplyAlreadyLandedLocked(mutations, commitTS)
+	if err != nil || !landed {
+		return false, err
+	}
+	return true, s.markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex, writeOpts)
+}
+
+func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.lastCommitTS > startTS
+}
+
+func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
+	if !s.hasCommitsAfter(startTS) {
+		return nil
+	}
+	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
+		return err
+	}
+	return s.checkReadConflicts(ctx, readKeys, startTS)
+}
+
 func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
@@ -1882,13 +2279,21 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
+	fastPathDone, err := s.staleRaftApplyFastPathLocked(mutations, commitTS, appliedIndex, writeOpts)
+	if err != nil {
+		return err
+	}
+	if fastPathDone {
+		return nil
+	}
+
 	b := s.db.NewBatch()
 	defer b.Close()
 
-	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
-		return err
-	}
-	if err := s.checkReadConflicts(ctx, readKeys, startTS); err != nil {
+	// Keep OCC at the store boundary: callers pass the read snapshot via
+	// startTS/readKeys, and leader-issued commit timestamps alone do not prove
+	// the read set is still current.
+	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS); err != nil {
 		return err
 	}
 
@@ -2217,7 +2622,7 @@ func (s *pebbleStore) scanCompactionDeletes(ctx context.Context, minTS uint64, i
 		}
 
 		rawKey := iter.Key()
-		if isPebbleMetaKey(rawKey) {
+		if isPebbleOperationalKey(rawKey) {
 			continue
 		}
 		if !shouldDeleteCompactionVersion(rawKey, minTS, &currentUserKey, &keptVisibleAtMinTS, &changedCurrentKey) {

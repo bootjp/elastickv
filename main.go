@@ -270,6 +270,11 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 // warning and fall through to the default.
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
+const (
+	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+)
+
 const bytesPerMiB = 1024 * 1024
 
 func main() {
@@ -335,6 +340,45 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 		}
 	}
 	return cfg, true
+}
+
+func enabledEnv(name string) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("invalid "+name+"; using default",
+			"value", raw,
+			"default", true,
+		)
+		return true
+	}
+	return enabled
+}
+
+func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) {
+	if enabledEnv(lockResolverEnabledEnvVar) {
+		lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
+		cleanup.Add(func() { lockResolver.Close() })
+		return
+	}
+	slog.Info("background lock resolver disabled", "env", lockResolverEnabledEnvVar)
+}
+
+func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
+	if enabledEnv(fsmCompactorEnabledEnvVar) {
+		compactor := kv.NewFSMCompactor(
+			fsmCompactionRuntimes(runtimes),
+			kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+		)
+		eg.Go(func() error {
+			return compactor.Run(ctx)
+		})
+		return
+	}
+	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
 func run() error {
@@ -445,8 +489,7 @@ func run() error {
 		}
 	})
 	cleanup.Add(cancel)
-	lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
-	cleanup.Add(func() { lockResolver.Close() })
+	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
 	sampler := buildKeyVizSampler()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
@@ -505,13 +548,7 @@ func run() error {
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
-	compactor := kv.NewFSMCompactor(
-		fsmCompactionRuntimes(runtimes),
-		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
-	)
-	eg.Go(func() error {
-		return compactor.Run(runCtx)
-	})
+	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
