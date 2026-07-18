@@ -392,6 +392,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] == raftEncodeTargetReadiness:
 		return f.applyTargetStagedReadiness(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationCleanup:
+		return f.applyMigrationCleanup(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -435,6 +437,9 @@ const (
 	// guard. It must be replicated through the target Raft group before the
 	// migration controller can treat a target as fail-closed for cutover.
 	raftEncodeTargetReadiness byte = 0x0c
+	// raftEncodeMigrationCleanup carries one bounded source/target physical
+	// cleanup chunk or a per-job proof-record cleanup.
+	raftEncodeMigrationCleanup byte = 0x0d
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {

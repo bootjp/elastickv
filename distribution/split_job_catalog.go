@@ -168,6 +168,7 @@ type SplitJob struct {
 	StartedAtMs                      int64
 	UpdatedAtMs                      int64
 	TerminalAtMs                     int64
+	CapabilityRegressed              bool
 }
 
 // CatalogNextSplitJobIDKey returns the reserved key used for split-job ID allocation.
@@ -589,12 +590,12 @@ func (p SplitJobPhase) retryable() bool {
 
 func (p SplitJobPhase) abandonable() bool {
 	switch p {
-	case SplitJobPhaseBackfill,
+	case SplitJobPhasePlanned,
+		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy:
 		return true
 	case SplitJobPhaseNone,
-		SplitJobPhasePlanned,
 		SplitJobPhaseCutover,
 		SplitJobPhaseCleanup,
 		SplitJobPhaseDone,
@@ -906,6 +907,7 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
 	}
 }
 
@@ -950,6 +952,7 @@ func splitJobToProto(job SplitJob) *pb.SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
 	}
 }
 
@@ -1015,6 +1018,7 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		StartedAtMs:                      msg.GetStartedAtMs(),
 		UpdatedAtMs:                      msg.GetUpdatedAtMs(),
 		TerminalAtMs:                     msg.GetTerminalAtMs(),
+		CapabilityRegressed:              msg.GetCapabilityRegressed(),
 	}, nil
 }
 

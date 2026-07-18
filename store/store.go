@@ -163,6 +163,32 @@ type PromotionState struct {
 	LastError     string
 }
 
+// CleanupVersionsOptions physically removes exact committed versions selected
+// by the migration bracket filter. It is cursor-resumable and is used only
+// after ownership has moved or while abandoning an unpublished migration.
+type CleanupVersionsOptions struct {
+	JobID           uint64
+	AppliedIndex    uint64
+	StartKey        []byte
+	EndKey          []byte
+	Cursor          []byte
+	MaxCommitTS     uint64
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptVersion   func(key, value []byte) bool
+}
+
+// CleanupVersionsResult reports one bounded physical-delete chunk.
+type CleanupVersionsResult struct {
+	NextCursor   []byte
+	Done         bool
+	DeletedRows  uint64
+	DeletedBytes uint64
+	ScannedBytes uint64
+}
+
 // TargetStagedReadinessState is a target-local guard that makes a target voter
 // fail closed for a moving route until it has either the staged descriptor or
 // the cleared descriptor with the retained write timestamp floor.
@@ -185,6 +211,13 @@ type TargetStagedReadinessState struct {
 // migration data into the live keyspace.
 type MigrationPromoter interface {
 	PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error)
+}
+
+// MigrationCleaner removes source or abandoned target versions and the
+// per-job migration proof records through the Raft apply path.
+type MigrationCleaner interface {
+	CleanupVersions(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error)
+	ClearMigrationState(ctx context.Context, jobID, appliedIndex uint64) error
 }
 
 // MigrationPromotionStateReader reads target-local staged promotion state.

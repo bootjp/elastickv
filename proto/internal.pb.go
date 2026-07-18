@@ -128,6 +128,113 @@ func (Phase) EnumDescriptor() ([]byte, []int) {
 	return file_internal_proto_rawDescGZIP(), []int{1}
 }
 
+type MigrationCleanupMode int32
+
+const (
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED MigrationCleanupMode = 0
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS    MigrationCleanupMode = 1
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA    MigrationCleanupMode = 2
+)
+
+// Enum value maps for MigrationCleanupMode.
+var (
+	MigrationCleanupMode_name = map[int32]string{
+		0: "MIGRATION_CLEANUP_MODE_UNSPECIFIED",
+		1: "MIGRATION_CLEANUP_MODE_VERSIONS",
+		2: "MIGRATION_CLEANUP_MODE_METADATA",
+	}
+	MigrationCleanupMode_value = map[string]int32{
+		"MIGRATION_CLEANUP_MODE_UNSPECIFIED": 0,
+		"MIGRATION_CLEANUP_MODE_VERSIONS":    1,
+		"MIGRATION_CLEANUP_MODE_METADATA":    2,
+	}
+)
+
+func (x MigrationCleanupMode) Enum() *MigrationCleanupMode {
+	p := new(MigrationCleanupMode)
+	*p = x
+	return p
+}
+
+func (x MigrationCleanupMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationCleanupMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[2].Descriptor()
+}
+
+func (MigrationCleanupMode) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[2]
+}
+
+func (x MigrationCleanupMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationCleanupMode.Descriptor instead.
+func (MigrationCleanupMode) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{2}
+}
+
+type MigrationStateProbeKind int32
+
+const (
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED               MigrationStateProbeKind = 0
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED           MigrationStateProbeKind = 1
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED MigrationStateProbeKind = 2
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED      MigrationStateProbeKind = 3
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED       MigrationStateProbeKind = 4
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED          MigrationStateProbeKind = 5
+)
+
+// Enum value maps for MigrationStateProbeKind.
+var (
+	MigrationStateProbeKind_name = map[int32]string{
+		0: "MIGRATION_STATE_PROBE_KIND_UNSPECIFIED",
+		1: "MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED",
+		2: "MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED",
+		3: "MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED",
+		4: "MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED",
+		5: "MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED",
+	}
+	MigrationStateProbeKind_value = map[string]int32{
+		"MIGRATION_STATE_PROBE_KIND_UNSPECIFIED":               0,
+		"MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED":           1,
+		"MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED": 2,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED":      3,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED":       4,
+		"MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED":          5,
+	}
+)
+
+func (x MigrationStateProbeKind) Enum() *MigrationStateProbeKind {
+	p := new(MigrationStateProbeKind)
+	*p = x
+	return p
+}
+
+func (x MigrationStateProbeKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationStateProbeKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[3].Descriptor()
+}
+
+func (MigrationStateProbeKind) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[3]
+}
+
+func (x MigrationStateProbeKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationStateProbeKind.Descriptor instead.
+func (MigrationStateProbeKind) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{3}
+}
+
 type Mutation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Op            Op                     `protobuf:"varint,1,opt,name=op,proto3,enum=Op" json:"op,omitempty"`
@@ -1370,6 +1477,534 @@ func (x *ProbeMigrationLocksResponse) GetPendingCount() uint32 {
 	return 0
 }
 
+type CleanupMigrationRequest struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	JobId                 uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Mode                  MigrationCleanupMode   `protobuf:"varint,2,opt,name=mode,proto3,enum=MigrationCleanupMode" json:"mode,omitempty"`
+	RangeStart            []byte                 `protobuf:"bytes,3,opt,name=range_start,json=rangeStart,proto3" json:"range_start,omitempty"`
+	RangeEnd              []byte                 `protobuf:"bytes,4,opt,name=range_end,json=rangeEnd,proto3" json:"range_end,omitempty"`
+	Cursor                []byte                 `protobuf:"bytes,5,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	MaxCommitTs           uint64                 `protobuf:"varint,6,opt,name=max_commit_ts,json=maxCommitTs,proto3" json:"max_commit_ts,omitempty"`
+	MaxVersions           uint32                 `protobuf:"varint,7,opt,name=max_versions,json=maxVersions,proto3" json:"max_versions,omitempty"`
+	MaxBytes              uint64                 `protobuf:"varint,8,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	MaxScannedBytes       uint64                 `protobuf:"varint,9,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	KeyFamily             uint32                 `protobuf:"varint,10,opt,name=key_family,json=keyFamily,proto3" json:"key_family,omitempty"`
+	RouteStart            []byte                 `protobuf:"bytes,11,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd              []byte                 `protobuf:"bytes,12,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExcludeKnownInternal  bool                   `protobuf:"varint,13,opt,name=exclude_known_internal,json=excludeKnownInternal,proto3" json:"exclude_known_internal,omitempty"`
+	ExcludePrefixes       [][]byte               `protobuf:"bytes,14,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
+	RequiresRouteKeyCheck bool                   `protobuf:"varint,15,opt,name=requires_route_key_check,json=requiresRouteKeyCheck,proto3" json:"requires_route_key_check,omitempty"`
+	RequiresDecodedS3     bool                   `protobuf:"varint,16,opt,name=requires_decoded_s3,json=requiresDecodedS3,proto3" json:"requires_decoded_s3,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *CleanupMigrationRequest) Reset() {
+	*x = CleanupMigrationRequest{}
+	mi := &file_internal_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupMigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupMigrationRequest) ProtoMessage() {}
+
+func (x *CleanupMigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupMigrationRequest.ProtoReflect.Descriptor instead.
+func (*CleanupMigrationRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *CleanupMigrationRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMode() MigrationCleanupMode {
+	if x != nil {
+		return x.Mode
+	}
+	return MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED
+}
+
+func (x *CleanupMigrationRequest) GetRangeStart() []byte {
+	if x != nil {
+		return x.RangeStart
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRangeEnd() []byte {
+	if x != nil {
+		return x.RangeEnd
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetMaxCommitTs() uint64 {
+	if x != nil {
+		return x.MaxCommitTs
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxVersions() uint32 {
+	if x != nil {
+		return x.MaxVersions
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxBytes() uint64 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxScannedBytes() uint64 {
+	if x != nil {
+		return x.MaxScannedBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetKeyFamily() uint32 {
+	if x != nil {
+		return x.KeyFamily
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetExcludeKnownInternal() bool {
+	if x != nil {
+		return x.ExcludeKnownInternal
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetExcludePrefixes() [][]byte {
+	if x != nil {
+		return x.ExcludePrefixes
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRequiresRouteKeyCheck() bool {
+	if x != nil {
+		return x.RequiresRouteKeyCheck
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetRequiresDecodedS3() bool {
+	if x != nil {
+		return x.RequiresDecodedS3
+	}
+	return false
+}
+
+type CleanupMigrationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NextCursor    []byte                 `protobuf:"bytes,1,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	Done          bool                   `protobuf:"varint,2,opt,name=done,proto3" json:"done,omitempty"`
+	DeletedRows   uint64                 `protobuf:"varint,3,opt,name=deleted_rows,json=deletedRows,proto3" json:"deleted_rows,omitempty"`
+	DeletedBytes  uint64                 `protobuf:"varint,4,opt,name=deleted_bytes,json=deletedBytes,proto3" json:"deleted_bytes,omitempty"`
+	ScannedBytes  uint64                 `protobuf:"varint,5,opt,name=scanned_bytes,json=scannedBytes,proto3" json:"scanned_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CleanupMigrationResponse) Reset() {
+	*x = CleanupMigrationResponse{}
+	mi := &file_internal_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupMigrationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupMigrationResponse) ProtoMessage() {}
+
+func (x *CleanupMigrationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupMigrationResponse.ProtoReflect.Descriptor instead.
+func (*CleanupMigrationResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *CleanupMigrationResponse) GetNextCursor() []byte {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+func (x *CleanupMigrationResponse) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *CleanupMigrationResponse) GetDeletedRows() uint64 {
+	if x != nil {
+		return x.DeletedRows
+	}
+	return 0
+}
+
+func (x *CleanupMigrationResponse) GetDeletedBytes() uint64 {
+	if x != nil {
+		return x.DeletedBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationResponse) GetScannedBytes() uint64 {
+	if x != nil {
+		return x.ScannedBytes
+	}
+	return 0
+}
+
+type ProbeMigrationStateRequest struct {
+	state                  protoimpl.MessageState  `protogen:"open.v1"`
+	JobId                  uint64                  `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Kind                   MigrationStateProbeKind `protobuf:"varint,2,opt,name=kind,proto3,enum=MigrationStateProbeKind" json:"kind,omitempty"`
+	RouteStart             []byte                  `protobuf:"bytes,3,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd               []byte                  `protobuf:"bytes,4,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExpectedCatalogVersion uint64                  `protobuf:"varint,5,opt,name=expected_catalog_version,json=expectedCatalogVersion,proto3" json:"expected_catalog_version,omitempty"`
+	ExpectedGroupId        uint64                  `protobuf:"varint,6,opt,name=expected_group_id,json=expectedGroupId,proto3" json:"expected_group_id,omitempty"`
+	MigrationJobId         uint64                  `protobuf:"varint,7,opt,name=migration_job_id,json=migrationJobId,proto3" json:"migration_job_id,omitempty"`
+	MinWriteTsExclusive    uint64                  `protobuf:"varint,8,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	SourceWriteFence       bool                    `protobuf:"varint,9,opt,name=source_write_fence,json=sourceWriteFence,proto3" json:"source_write_fence,omitempty"`
+	SourceReadFence        bool                    `protobuf:"varint,10,opt,name=source_read_fence,json=sourceReadFence,proto3" json:"source_read_fence,omitempty"`
+	TrackWrites            bool                    `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
+	RetentionPinTs         uint64                  `protobuf:"varint,12,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
+	ReadDrainNotBeforeMs   int64                   `protobuf:"varint,13,opt,name=read_drain_not_before_ms,json=readDrainNotBeforeMs,proto3" json:"read_drain_not_before_ms,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationStateRequest) Reset() {
+	*x = ProbeMigrationStateRequest{}
+	mi := &file_internal_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationStateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationStateRequest) ProtoMessage() {}
+
+func (x *ProbeMigrationStateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationStateRequest.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationStateRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ProbeMigrationStateRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetKind() MigrationStateProbeKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED
+}
+
+func (x *ProbeMigrationStateRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedCatalogVersion() uint64 {
+	if x != nil {
+		return x.ExpectedCatalogVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedGroupId() uint64 {
+	if x != nil {
+		return x.ExpectedGroupId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetMigrationJobId() uint64 {
+	if x != nil {
+		return x.MigrationJobId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetMinWriteTsExclusive() uint64 {
+	if x != nil {
+		return x.MinWriteTsExclusive
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetSourceWriteFence() bool {
+	if x != nil {
+		return x.SourceWriteFence
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetSourceReadFence() bool {
+	if x != nil {
+		return x.SourceReadFence
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetTrackWrites() bool {
+	if x != nil {
+		return x.TrackWrites
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetRetentionPinTs() uint64 {
+	if x != nil {
+		return x.RetentionPinTs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetReadDrainNotBeforeMs() int64 {
+	if x != nil {
+		return x.ReadDrainNotBeforeMs
+	}
+	return 0
+}
+
+type ProbeMigrationStateResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Ready          bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	CatalogVersion uint64                 `protobuf:"varint,2,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	MinAdmittedTs  uint64                 `protobuf:"varint,3,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationStateResponse) Reset() {
+	*x = ProbeMigrationStateResponse{}
+	mi := &file_internal_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationStateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationStateResponse) ProtoMessage() {}
+
+func (x *ProbeMigrationStateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationStateResponse.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationStateResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ProbeMigrationStateResponse) GetReady() bool {
+	if x != nil {
+		return x.Ready
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateResponse) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+type IssueMigrationTimestampRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueMigrationTimestampRequest) Reset() {
+	*x = IssueMigrationTimestampRequest{}
+	mi := &file_internal_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueMigrationTimestampRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueMigrationTimestampRequest) ProtoMessage() {}
+
+func (x *IssueMigrationTimestampRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueMigrationTimestampRequest.ProtoReflect.Descriptor instead.
+func (*IssueMigrationTimestampRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{22}
+}
+
+type IssueMigrationTimestampResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	LastCommitTs  uint64                 `protobuf:"varint,2,opt,name=last_commit_ts,json=lastCommitTs,proto3" json:"last_commit_ts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueMigrationTimestampResponse) Reset() {
+	*x = IssueMigrationTimestampResponse{}
+	mi := &file_internal_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueMigrationTimestampResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueMigrationTimestampResponse) ProtoMessage() {}
+
+func (x *IssueMigrationTimestampResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueMigrationTimestampResponse.ProtoReflect.Descriptor instead.
+func (*IssueMigrationTimestampResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *IssueMigrationTimestampResponse) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
+	if x != nil {
+		return x.LastCommitTs
+	}
+	return 0
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -1475,7 +2110,59 @@ const file_internal_proto_rawDesc = "" +
 	"\troute_end\x18\x02 \x01(\fR\brouteEnd\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\rR\x05limit\"B\n" +
 	"\x1bProbeMigrationLocksResponse\x12#\n" +
-	"\rpending_count\x18\x01 \x01(\rR\fpendingCount*&\n" +
+	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xe8\x04\n" +
+	"\x17CleanupMigrationRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12)\n" +
+	"\x04mode\x18\x02 \x01(\x0e2\x15.MigrationCleanupModeR\x04mode\x12\x1f\n" +
+	"\vrange_start\x18\x03 \x01(\fR\n" +
+	"rangeStart\x12\x1b\n" +
+	"\trange_end\x18\x04 \x01(\fR\brangeEnd\x12\x16\n" +
+	"\x06cursor\x18\x05 \x01(\fR\x06cursor\x12\"\n" +
+	"\rmax_commit_ts\x18\x06 \x01(\x04R\vmaxCommitTs\x12!\n" +
+	"\fmax_versions\x18\a \x01(\rR\vmaxVersions\x12\x1b\n" +
+	"\tmax_bytes\x18\b \x01(\x04R\bmaxBytes\x12*\n" +
+	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\x12\x1d\n" +
+	"\n" +
+	"key_family\x18\n" +
+	" \x01(\rR\tkeyFamily\x12\x1f\n" +
+	"\vroute_start\x18\v \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\f \x01(\fR\brouteEnd\x124\n" +
+	"\x16exclude_known_internal\x18\r \x01(\bR\x14excludeKnownInternal\x12)\n" +
+	"\x10exclude_prefixes\x18\x0e \x03(\fR\x0fexcludePrefixes\x127\n" +
+	"\x18requires_route_key_check\x18\x0f \x01(\bR\x15requiresRouteKeyCheck\x12.\n" +
+	"\x13requires_decoded_s3\x18\x10 \x01(\bR\x11requiresDecodedS3\"\xbc\x01\n" +
+	"\x18CleanupMigrationResponse\x12\x1f\n" +
+	"\vnext_cursor\x18\x01 \x01(\fR\n" +
+	"nextCursor\x12\x12\n" +
+	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
+	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
+	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xc3\x04\n" +
+	"\x1aProbeMigrationStateRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
+	"\vroute_start\x18\x03 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x04 \x01(\fR\brouteEnd\x128\n" +
+	"\x18expected_catalog_version\x18\x05 \x01(\x04R\x16expectedCatalogVersion\x12*\n" +
+	"\x11expected_group_id\x18\x06 \x01(\x04R\x0fexpectedGroupId\x12(\n" +
+	"\x10migration_job_id\x18\a \x01(\x04R\x0emigrationJobId\x123\n" +
+	"\x16min_write_ts_exclusive\x18\b \x01(\x04R\x13minWriteTsExclusive\x12,\n" +
+	"\x12source_write_fence\x18\t \x01(\bR\x10sourceWriteFence\x12*\n" +
+	"\x11source_read_fence\x18\n" +
+	" \x01(\bR\x0fsourceReadFence\x12!\n" +
+	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12(\n" +
+	"\x10retention_pin_ts\x18\f \x01(\x04R\x0eretentionPinTs\x126\n" +
+	"\x18read_drain_not_before_ms\x18\r \x01(\x03R\x14readDrainNotBeforeMs\"\x84\x01\n" +
+	"\x1bProbeMigrationStateResponse\x12\x14\n" +
+	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
+	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
+	"\x0fmin_admitted_ts\x18\x03 \x01(\x04R\rminAdmittedTs\" \n" +
+	"\x1eIssueMigrationTimestampRequest\"e\n" +
+	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -1486,7 +2173,18 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xb0\x04\n" +
+	"\x05ABORT\x10\x03*\x88\x01\n" +
+	"\x14MigrationCleanupMode\x12&\n" +
+	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
+	"\x1fMIGRATION_CLEANUP_MODE_METADATA\x10\x02*\xc9\x02\n" +
+	"\x17MigrationStateProbeKind\x12*\n" +
+	"&MIGRATION_STATE_PROBE_KIND_UNSPECIFIED\x10\x00\x12.\n" +
+	"*MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED\x10\x01\x128\n" +
+	"4MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED\x10\x02\x123\n" +
+	"/MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED\x10\x03\x122\n" +
+	".MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED\x10\x04\x12/\n" +
+	"+MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED\x10\x052\xaf\x06\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
@@ -1494,7 +2192,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
 	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00\x12]\n" +
 	"\x1aApplyTargetStagedReadiness\x12\x1d.TargetStagedReadinessRequest\x1a\x1e.TargetStagedReadinessResponse\"\x00\x12R\n" +
-	"\x13ProbeMigrationLocks\x12\x1b.ProbeMigrationLocksRequest\x1a\x1c.ProbeMigrationLocksResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x13ProbeMigrationLocks\x12\x1b.ProbeMigrationLocksRequest\x1a\x1c.ProbeMigrationLocksResponse\"\x00\x12I\n" +
+	"\x10CleanupMigration\x12\x18.CleanupMigrationRequest\x1a\x19.CleanupMigrationResponse\"\x00\x12R\n" +
+	"\x13ProbeMigrationState\x12\x1b.ProbeMigrationStateRequest\x1a\x1c.ProbeMigrationStateResponse\"\x00\x12^\n" +
+	"\x17IssueMigrationTimestamp\x12\x1f.IssueMigrationTimestampRequest\x1a .IssueMigrationTimestampResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -1508,57 +2209,73 @@ func file_internal_proto_rawDescGZIP() []byte {
 	return file_internal_proto_rawDescData
 }
 
-var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                               // 0: Op
-	(Phase)(0),                            // 1: Phase
-	(*Mutation)(nil),                      // 2: Mutation
-	(*Request)(nil),                       // 3: Request
-	(*RaftCommand)(nil),                   // 4: RaftCommand
-	(*ForwardRequest)(nil),                // 5: ForwardRequest
-	(*ForwardResponse)(nil),               // 6: ForwardResponse
-	(*RelayPublishRequest)(nil),           // 7: RelayPublishRequest
-	(*RelayPublishResponse)(nil),          // 8: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),    // 9: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),   // 10: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                   // 11: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),    // 12: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),   // 13: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),  // 14: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil), // 15: PromoteStagedVersionsResponse
-	(*TargetStagedReadinessRequest)(nil),  // 16: TargetStagedReadinessRequest
-	(*TargetStagedReadinessResponse)(nil), // 17: TargetStagedReadinessResponse
-	(*ProbeMigrationLocksRequest)(nil),    // 18: ProbeMigrationLocksRequest
-	(*ProbeMigrationLocksResponse)(nil),   // 19: ProbeMigrationLocksResponse
+	(Op)(0),                                 // 0: Op
+	(Phase)(0),                              // 1: Phase
+	(MigrationCleanupMode)(0),               // 2: MigrationCleanupMode
+	(MigrationStateProbeKind)(0),            // 3: MigrationStateProbeKind
+	(*Mutation)(nil),                        // 4: Mutation
+	(*Request)(nil),                         // 5: Request
+	(*RaftCommand)(nil),                     // 6: RaftCommand
+	(*ForwardRequest)(nil),                  // 7: ForwardRequest
+	(*ForwardResponse)(nil),                 // 8: ForwardResponse
+	(*RelayPublishRequest)(nil),             // 9: RelayPublishRequest
+	(*RelayPublishResponse)(nil),            // 10: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),      // 11: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),     // 12: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                     // 13: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),      // 14: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),     // 15: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),    // 16: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil),   // 17: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),    // 18: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil),   // 19: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),      // 20: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),     // 21: ProbeMigrationLocksResponse
+	(*CleanupMigrationRequest)(nil),         // 22: CleanupMigrationRequest
+	(*CleanupMigrationResponse)(nil),        // 23: CleanupMigrationResponse
+	(*ProbeMigrationStateRequest)(nil),      // 24: ProbeMigrationStateRequest
+	(*ProbeMigrationStateResponse)(nil),     // 25: ProbeMigrationStateResponse
+	(*IssueMigrationTimestampRequest)(nil),  // 26: IssueMigrationTimestampRequest
+	(*IssueMigrationTimestampResponse)(nil), // 27: IssueMigrationTimestampResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
 	1,  // 1: Request.phase:type_name -> Phase
-	2,  // 2: Request.mutations:type_name -> Mutation
-	3,  // 3: RaftCommand.requests:type_name -> Request
-	3,  // 4: ForwardRequest.requests:type_name -> Request
-	11, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
-	11, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
-	5,  // 7: Internal.Forward:input_type -> ForwardRequest
-	7,  // 8: Internal.RelayPublish:input_type -> RelayPublishRequest
-	9,  // 9: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	12, // 10: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	14, // 11: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	16, // 12: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	18, // 13: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	6,  // 14: Internal.Forward:output_type -> ForwardResponse
-	8,  // 15: Internal.RelayPublish:output_type -> RelayPublishResponse
-	10, // 16: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	13, // 17: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	15, // 18: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	17, // 19: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	19, // 20: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	14, // [14:21] is the sub-list for method output_type
-	7,  // [7:14] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	4,  // 2: Request.mutations:type_name -> Mutation
+	5,  // 3: RaftCommand.requests:type_name -> Request
+	5,  // 4: ForwardRequest.requests:type_name -> Request
+	13, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
+	13, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
+	2,  // 7: CleanupMigrationRequest.mode:type_name -> MigrationCleanupMode
+	3,  // 8: ProbeMigrationStateRequest.kind:type_name -> MigrationStateProbeKind
+	7,  // 9: Internal.Forward:input_type -> ForwardRequest
+	9,  // 10: Internal.RelayPublish:input_type -> RelayPublishRequest
+	11, // 11: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	14, // 12: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	16, // 13: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	18, // 14: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	20, // 15: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	22, // 16: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	24, // 17: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	26, // 18: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	8,  // 19: Internal.Forward:output_type -> ForwardResponse
+	10, // 20: Internal.RelayPublish:output_type -> RelayPublishResponse
+	12, // 21: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	15, // 22: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	17, // 23: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	19, // 24: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	21, // 25: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	23, // 26: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	25, // 27: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	27, // 28: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	19, // [19:29] is the sub-list for method output_type
+	9,  // [9:19] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -1571,8 +2288,8 @@ func file_internal_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   18,
+			NumEnums:      4,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

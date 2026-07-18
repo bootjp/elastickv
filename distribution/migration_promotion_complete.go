@@ -52,8 +52,6 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 	out.Changed = true
 	out.ClearedRouteIDs = cleared
 	out.Job.TargetPromotionDone = true
-	out.Job.Phase = SplitJobPhaseDone
-	out.Job.TerminalAtMs = nowMs
 	out.Job.UpdatedAtMs = nowMs
 	return out, nil
 }
@@ -62,11 +60,10 @@ func completeAlreadyPromotedTarget(out TargetPromotionCompletion, nowMs int64) (
 	if !targetClearedDescriptorPresent(out.Job, out.Routes) {
 		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
 	}
-	if out.Job.Phase != SplitJobPhaseDone {
-		out.Changed = true
-		out.Job.Phase = SplitJobPhaseDone
-	}
-	if out.Job.TerminalAtMs <= 0 {
+	// Preserve compatibility for jobs terminalized by older binaries, but do
+	// not move a current CLEANUP job to DONE until source and target cleanup
+	// proofs have been removed by the runner.
+	if out.Job.Phase == SplitJobPhaseDone && out.Job.TerminalAtMs <= 0 {
 		out.Changed = true
 		out.Job.TerminalAtMs = nowMs
 	}
@@ -250,7 +247,7 @@ func promotionCompleteJobMatchesExpected(expected SplitJob, expectedRaw []byte, 
 	if expected.TargetPromotionDone ||
 		!current.TargetPromotionDone ||
 		current.PromotionCompletedTS == 0 ||
-		current.Phase != SplitJobPhaseDone {
+		(current.Phase != expected.Phase && current.Phase != SplitJobPhaseDone) {
 		return false, nil
 	}
 	normalized := CloneSplitJob(current)

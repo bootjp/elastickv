@@ -119,6 +119,7 @@ func TestSplitJobCodecValidatesRestartPhases(t *testing.T) {
 	}
 
 	for _, phase := range []SplitJobPhase{
+		SplitJobPhasePlanned,
 		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy,

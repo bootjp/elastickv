@@ -679,6 +679,7 @@ type SplitJob struct {
 	StartedAtMs                      int64                      `protobuf:"varint,31,opt,name=started_at_ms,json=startedAtMs,proto3" json:"started_at_ms,omitempty"`
 	UpdatedAtMs                      int64                      `protobuf:"varint,32,opt,name=updated_at_ms,json=updatedAtMs,proto3" json:"updated_at_ms,omitempty"`
 	TerminalAtMs                     int64                      `protobuf:"varint,33,opt,name=terminal_at_ms,json=terminalAtMs,proto3" json:"terminal_at_ms,omitempty"`
+	CapabilityRegressed              bool                       `protobuf:"varint,34,opt,name=capability_regressed,json=capabilityRegressed,proto3" json:"capability_regressed,omitempty"`
 	unknownFields                    protoimpl.UnknownFields
 	sizeCache                        protoimpl.SizeCache
 }
@@ -942,6 +943,13 @@ func (x *SplitJob) GetTerminalAtMs() int64 {
 		return x.TerminalAtMs
 	}
 	return 0
+}
+
+func (x *SplitJob) GetCapabilityRegressed() bool {
+	if x != nil {
+		return x.CapabilityRegressed
+	}
+	return false
 }
 
 type ListRoutesRequest struct {
@@ -1985,7 +1993,7 @@ const file_distribution_proto_rawDesc = "" +
 	"\x04done\x18\x05 \x01(\bR\x04done\x12#\n" +
 	"\rscanned_bytes\x18\x06 \x01(\x04R\fscannedBytes\x12#\n" +
 	"\raccepted_rows\x18\a \x01(\x04R\facceptedRows\x12/\n" +
-	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xe9\f\n" +
+	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\x9c\r\n" +
 	"\bSplitJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12&\n" +
 	"\x0fsource_route_id\x18\x02 \x01(\x04R\rsourceRouteId\x12\x1b\n" +
@@ -2024,7 +2032,8 @@ const file_distribution_proto_rawDesc = "" +
 	"last_error\x18\x1e \x01(\tR\tlastError\x12\"\n" +
 	"\rstarted_at_ms\x18\x1f \x01(\x03R\vstartedAtMs\x12\"\n" +
 	"\rupdated_at_ms\x18  \x01(\x03R\vupdatedAtMs\x12$\n" +
-	"\x0eterminal_at_ms\x18! \x01(\x03R\fterminalAtMs\"\x13\n" +
+	"\x0eterminal_at_ms\x18! \x01(\x03R\fterminalAtMs\x121\n" +
+	"\x14capability_regressed\x18\" \x01(\bR\x13capabilityRegressed\"\x13\n" +
 	"\x11ListRoutesRequest\"g\n" +
 	"\x12ListRoutesResponse\x12'\n" +
 	"\x0fcatalog_version\x18\x01 \x01(\x04R\x0ecatalogVersion\x12(\n" +

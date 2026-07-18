@@ -35,7 +35,9 @@ type DistributionServer struct {
 	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
 	splitPromotionClientFactory SplitPromotionClientFactory
 	splitMigrationClientFactory SplitMigrationClientFactory
+	splitMigrationVoterFactory  SplitMigrationVoterFactory
 	knownRaftGroups             map[uint64]struct{}
+	splitJobHistoryGCLast       time.Time
 	reloadRetry                 struct {
 		attempts int
 		interval time.Duration
@@ -68,10 +70,23 @@ type SplitMigrationClient interface {
 	ImportRangeVersions(context.Context, *pb.ImportRangeVersionsRequest, ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error)
 	ApplyTargetStagedReadiness(context.Context, *pb.TargetStagedReadinessRequest, ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error)
 	ProbeMigrationLocks(context.Context, *pb.ProbeMigrationLocksRequest, ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error)
+	CleanupMigration(context.Context, *pb.CleanupMigrationRequest, ...grpc.CallOption) (*pb.CleanupMigrationResponse, error)
+	ProbeMigrationState(context.Context, *pb.ProbeMigrationStateRequest, ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error)
+	IssueMigrationTimestamp(context.Context, *pb.IssueMigrationTimestampRequest, ...grpc.CallOption) (*pb.IssueMigrationTimestampResponse, error)
 }
 
 // SplitMigrationClientFactory resolves both participating group leaders.
 type SplitMigrationClientFactory func(context.Context, distribution.SplitJob, uint64) (source SplitMigrationClient, target SplitMigrationClient, err error)
+
+type SplitMigrationVoter struct {
+	ID      string
+	Address string
+	Client  SplitMigrationClient
+}
+
+// SplitMigrationVoterFactory resolves the current voter set and a direct
+// client for each voter. The runner re-resolves it before every barrier.
+type SplitMigrationVoterFactory func(context.Context, uint64) ([]SplitMigrationVoter, error)
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -128,6 +143,12 @@ func WithSplitPromotionClientFactory(factory SplitPromotionClientFactory) Distri
 func WithSplitMigrationClientFactory(factory SplitMigrationClientFactory) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.splitMigrationClientFactory = factory
+	}
+}
+
+func WithSplitMigrationVoterFactory(factory SplitMigrationVoterFactory) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitMigrationVoterFactory = factory
 	}
 }
 
@@ -266,13 +287,52 @@ func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
 		return splitJobCatalogStatusError(err)
 	}
 	if job, ok := nextRunnableSplitJob(jobs); ok {
+		if job.Phase != distribution.SplitJobPhaseAbandoning {
+			ready, gateErr := s.splitJobCapabilityReady(ctx, job)
+			if gateErr != nil || !ready {
+				return gateErr
+			}
+		}
 		return s.runSplitJobPhase(ctx, job)
 	}
-	return nil
+	return s.gcSplitJobHistory(ctx, jobs, time.Now())
+}
+
+func (s *DistributionServer) splitJobCapabilityReady(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	if s.migrationCapabilityGate == nil {
+		return true, nil
+	}
+	gateErr := s.migrationCapabilityGate(ctx)
+	if gateErr != nil {
+		if job.CapabilityRegressed {
+			return false, nil
+		}
+		err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+			if current.Phase == job.Phase {
+				current.CapabilityRegressed = true
+				current.LastError = "cluster migration capability regressed: " + gateErr.Error()
+				current.UpdatedAtMs = time.Now().UnixMilli()
+			}
+			return current, nil
+		})
+		return false, err
+	}
+	if !job.CapabilityRegressed {
+		return true, nil
+	}
+	err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+		if current.Phase == job.Phase && current.CapabilityRegressed {
+			current.CapabilityRegressed = false
+			current.LastError = ""
+			current.UpdatedAtMs = time.Now().UnixMilli()
+		}
+		return current, nil
+	})
+	return false, err
 }
 
 func (s *DistributionServer) splitJobRunnerConfigured() bool {
-	return s != nil && s.catalog != nil && s.coordinator != nil && s.splitPromotionClientFactory != nil
+	return s != nil && s.catalog != nil && s.coordinator != nil && s.splitPromotionClientFactory != nil && s.splitMigrationClientFactory != nil
 }
 
 func (s *DistributionServer) verifySplitJobRunnerLeader(ctx context.Context) (bool, error) {
@@ -1146,7 +1206,7 @@ func splitJobPromotionMatchesExpected(expected, current distribution.SplitJob) (
 	if expected.TargetPromotionDone ||
 		!current.TargetPromotionDone ||
 		current.PromotionCompletedTS == 0 ||
-		current.Phase != distribution.SplitJobPhaseDone {
+		(current.Phase != expected.Phase && current.Phase != distribution.SplitJobPhaseDone) {
 		return false, nil
 	}
 	normalized := distribution.CloneSplitJob(current)

@@ -1677,6 +1677,10 @@ func prepareDistributionRuntimeServer(
 			splitMigrationGroupLeaderResolver(in.shardGroups),
 			splitPromotionConnCache,
 		)),
+		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
+			in.shardGroups,
+			splitPromotionConnCache,
+		)),
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		adapter.WithSplitJobRunnerReady(),
 	}
@@ -1802,6 +1806,49 @@ func splitMigrationClientFactory(resolve splitMigrationLeaderResolver, connCache
 		}
 		return pb.NewInternalClient(sourceConn), pb.NewInternalClient(targetConn), nil
 	}
+}
+
+func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnCache) adapter.SplitMigrationVoterFactory {
+	return func(ctx context.Context, groupID uint64) ([]adapter.SplitMigrationVoter, error) {
+		sg := shardGroups[groupID]
+		if sg == nil || sg.Engine == nil {
+			return nil, errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		if connCache == nil {
+			return nil, errors.New("split migration voter gRPC connection cache is not configured")
+		}
+		cfg, err := sg.Engine.Configuration(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
+		for _, member := range cfg.Servers {
+			if member.Suffrage != "voter" {
+				continue
+			}
+			voter, err := splitMigrationVoter(groupID, member, connCache)
+			if err != nil {
+				return nil, err
+			}
+			voters = append(voters, voter)
+		}
+		if len(voters) == 0 {
+			return nil, errors.Errorf("split migration group %d has no voters", groupID)
+		}
+		return voters, nil
+	}
+}
+
+func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv.GRPCConnCache) (adapter.SplitMigrationVoter, error) {
+	addr := strings.TrimSpace(member.Address)
+	if member.ID == "" || addr == "" {
+		return adapter.SplitMigrationVoter{}, errors.Errorf("split migration group %d has voter with missing id/address", groupID)
+	}
+	conn, err := connCache.ConnFor(addr)
+	if err != nil {
+		return adapter.SplitMigrationVoter{}, errors.WithStack(err)
+	}
+	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: pb.NewInternalClient(conn)}, nil
 }
 
 func splitMigrationLocalReadinessGate(context.Context) error {
@@ -2483,6 +2530,7 @@ func startRaftServers(
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
+	readTracker *kv.ActiveTimestampTracker,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2521,6 +2569,7 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
+				adapter.WithInternalActiveTimestampTracker(readTracker),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,
 		))
@@ -2990,6 +3039,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 		sqsPartitionResolver,
+		r.readTracker,
 	); err != nil {
 		return r.startupFailure(err)
 	}

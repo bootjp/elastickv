@@ -142,25 +142,24 @@ func (s *mvccStore) MigrationPromotionState(_ context.Context, jobID uint64) (Pr
 	return clonePromotionState(state), ok, nil
 }
 
-func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) bool {
+func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) {
 	existing, ok := s.tree.Get(key)
 	if !ok {
-		return false
+		return
 	}
 	versions, _ := existing.([]VersionedValue)
 	idx := findVersionIndex(versions, commitTS)
 	if idx < 0 {
-		return false
+		return
 	}
 	next := make([]VersionedValue, len(versions)-1)
 	copy(next, versions[:idx])
 	copy(next[idx:], versions[idx+1:])
 	if len(next) == 0 {
 		s.tree.Remove(key)
-		return true
+		return
 	}
 	s.tree.Put(bytes.Clone(key), next)
-	return true
 }
 
 func findVersionIndex(versions []VersionedValue, commitTS uint64) int {
