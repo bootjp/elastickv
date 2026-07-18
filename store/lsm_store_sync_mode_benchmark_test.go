@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
 )
 
@@ -73,4 +75,72 @@ func BenchmarkApplyMutationsRaft_SyncMode(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkApplyMutationsRaft_Encryption compares the Stage 9
+// compress-then-encrypt path against the legacy cleartext path with 1 KiB
+// values. NoSync isolates encryption/compression CPU from fsync latency; the
+// merge gate is evaluated with benchstat on the paired results.
+func BenchmarkApplyMutationsRaft_Encryption(b *testing.B) {
+	value := make([]byte, 1024)
+	if _, err := rand.Read(value); err != nil {
+		b.Fatalf("rand.Read value: %v", err)
+	}
+	for _, tc := range []struct {
+		name      string
+		encrypted bool
+	}{
+		{name: "cleartext", encrypted: false},
+		{name: "encrypted", encrypted: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			s, err := NewPebbleStore(b.TempDir(), benchmarkEncryptionOptions(b, tc.encrypted)...)
+			if err != nil {
+				b.Fatalf("NewPebbleStore: %v", err)
+			}
+			defer s.Close()
+			ps, ok := s.(*pebbleStore)
+			if !ok {
+				b.Fatalf("NewPebbleStore returned non-*pebbleStore type: %T", s)
+			}
+			ps.fsmApplyWriteOpts = pebble.NoSync
+			ps.fsmApplySyncModeLabel = fsmSyncModeNoSync
+			b.SetBytes(int64(len(value)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := []byte(fmt.Sprintf("enc-bench-%010d", i))
+				startTS := uint64(i) * 2 //nolint:gosec // benchmark loop index is non-negative.
+				muts := []*KVPairMutation{{Op: OpTypePut, Key: key, Value: value}}
+				if err := s.ApplyMutationsRaft(context.Background(), muts, nil, startTS, startTS+1); err != nil {
+					b.Fatalf("ApplyMutationsRaft: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkEncryptionOptions(b *testing.B, enabled bool) []PebbleStoreOption {
+	b.Helper()
+	if !enabled {
+		return nil
+	}
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	if _, err := rand.Read(dek); err != nil {
+		b.Fatalf("rand.Read DEK: %v", err)
+	}
+	const keyID uint32 = 1
+	if err := ks.Set(keyID, dek); err != nil {
+		b.Fatalf("Keystore.Set: %v", err)
+	}
+	cipher, err := encryption.NewCipher(ks)
+	if err != nil {
+		b.Fatalf("NewCipher: %v", err)
+	}
+	return []PebbleStoreOption{WithEncryption(
+		cipher,
+		NewCounterNonceFactory(1, 1),
+		func() (uint32, bool) { return keyID, true },
+	)}
 }

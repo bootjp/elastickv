@@ -327,7 +327,7 @@ func (s *pebbleSSTIngestSnapshot) Close() error {
 }
 
 func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64) (*pebbleSSTIngestBundle, error) {
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(false)
 	opts.ReadOnly = true
 	db, err := pebble.Open(checkpointDir, opts)
 	if err != nil {
@@ -761,7 +761,7 @@ func metadataFromSSTIngestManifest(manifest pebbleSSTIngestManifest) pebbleSnaps
 }
 
 func ingestSSTSnapshotIntoTempDB(tmpDir string, paths []string, metadata pebbleSnapshotMetadata) error {
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(false)
 	db, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()

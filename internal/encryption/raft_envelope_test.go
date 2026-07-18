@@ -172,6 +172,33 @@ func TestRaftEnvelope_RejectsRetiredKey(t *testing.T) {
 	}
 }
 
+func TestRaftEnvelope_RejectsStorageCompressionFlag(t *testing.T) {
+	t.Parallel()
+	c, keyID := raftFixture(t)
+	nonce := newRandomNonce(t)
+	payload := []byte("raft payload")
+	aad := encryption.BuildRaftAAD(encryption.EnvelopeVersionV1, keyID)
+	body, err := c.Encrypt(payload, aad, keyID, nonce)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	var nonceArray [encryption.NonceSize]byte
+	copy(nonceArray[:], nonce)
+	encoded, err := (&encryption.Envelope{
+		Version: encryption.EnvelopeVersionV1,
+		Flag:    encryption.FlagCompressed,
+		KeyID:   keyID,
+		Nonce:   nonceArray,
+		Body:    body,
+	}).Encode()
+	if err != nil {
+		t.Fatalf("Envelope.Encode: %v", err)
+	}
+	if _, err := encryption.UnwrapRaftPayload(c, encoded); !errors.Is(err, encryption.ErrEnvelopeFlag) {
+		t.Fatalf("expected ErrEnvelopeFlag, got %v", err)
+	}
+}
+
 // TestRaftEnvelope_ShortInputRejected covers DecodeEnvelope's
 // length precondition (HeaderSize + TagSize = 34 bytes minimum).
 func TestRaftEnvelope_ShortInputRejected(t *testing.T) {

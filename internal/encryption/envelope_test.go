@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -35,7 +36,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 			name: "max key_id",
 			env: encryption.Envelope{
 				Version: encryption.EnvelopeVersionV1,
-				Flag:    0xff,
+				Flag:    encryption.FlagCompressed,
 				KeyID:   0xFFFF_FFFF,
 				Body:    bytes.Repeat([]byte{0x77}, 1024+encryption.TagSize),
 			},
@@ -126,6 +127,30 @@ func TestEnvelope_Decode_RejectsUnknownVersion(t *testing.T) {
 		if !errors.Is(err, encryption.ErrEnvelopeVersion) {
 			t.Fatalf("version=0x%02x: expected ErrEnvelopeVersion, got %v", version, err)
 		}
+	}
+}
+
+func TestEnvelope_RejectsUnknownFlagBits(t *testing.T) {
+	t.Parallel()
+	for _, flag := range []byte{0x02, 0x80, 0xff} {
+		t.Run(fmt.Sprintf("flag_%02x", flag), func(t *testing.T) {
+			env := encryption.Envelope{
+				Version: encryption.EnvelopeVersionV1,
+				Flag:    flag,
+				KeyID:   1,
+				Body:    bytes.Repeat([]byte{0x55}, encryption.TagSize),
+			}
+			if _, err := env.Encode(); !errors.Is(err, encryption.ErrEnvelopeFlag) {
+				t.Fatalf("Encode flag=%#x: expected ErrEnvelopeFlag, got %v", flag, err)
+			}
+
+			buf := make([]byte, encryption.HeaderSize+encryption.TagSize)
+			buf[0] = encryption.EnvelopeVersionV1
+			buf[1] = flag
+			if _, err := encryption.DecodeEnvelope(buf); !errors.Is(err, encryption.ErrEnvelopeFlag) {
+				t.Fatalf("DecodeEnvelope flag=%#x: expected ErrEnvelopeFlag, got %v", flag, err)
+			}
+		})
 	}
 }
 
