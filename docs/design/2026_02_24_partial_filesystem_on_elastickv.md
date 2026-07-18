@@ -387,12 +387,18 @@ Writers include `(inode_id, epoch)` from home mapping.
 All move/create/delete recovery steps are idempotent through atomic namespace
 transactions, epoch validation, key overwrite/delete semantics, and durable job
 cursor checkpoints. Concurrent move recovery treats OCC write conflict as a
-signal to reload the current phase.
+signal to reload the current phase. Before exposing a FUSE mount, startup drains
+bounded recovery batches until no durable job or intent remains. A move in
+source cleanup may continue from its durable source prefix when both inode and
+home records have already been removed by a concurrent unlink after the switch.
+Recovery removes completed move-job records so an earlier batch cannot hide
+later unfinished jobs.
 
 ### 9.4 Open-handle lease recovery
 
 1. `!fs|ref|...` has TTL and must be heartbeated by active clients.
-2. Lease reaper clears expired refs.
+2. The mounted-server lifecycle runs a periodic lease reaper that clears expired
+   refs and retries orphan cleanup after interrupted namespace GC.
 3. Orphan inode GC checks active refs after reaping to preserve FUSE remove-while-open behavior.
 
 ## 10. APIs
@@ -517,6 +523,8 @@ Phase 3:
    - same-file operations stay on one shard
    - restart recovery with unfinished intents
    - recovery scan limits bound each startup batch
+   - startup drains more than one recovery batch before serving requests
+   - source cleanup completes when unlink removes inode/home after the switch
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
    - concurrent append + read under node failure

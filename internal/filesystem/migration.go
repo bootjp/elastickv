@@ -478,21 +478,37 @@ func (s *Service) switchMoveHome(ctx context.Context, job *MoveJob) error {
 }
 
 func (s *Service) validateMoveState(ctx context.Context, job *MoveJob, ts uint64) error {
-	meta, err := s.inodeAt(ctx, job.Inode, ts)
-	if err != nil {
-		return err
-	}
-	home, err := s.homeAt(ctx, job.Inode, ts)
-	if err != nil {
-		return err
-	}
+	meta, metaErr := s.inodeAt(ctx, job.Inode, ts)
+	home, homeErr := s.homeAt(ctx, job.Inode, ts)
 	if job.Phase == MovePhaseSourceCleanup || job.Phase == MovePhaseCompleted {
-		if !switchedMoveFenceMatches(meta, home, job) {
-			return ErrMoveFenceLost
-		}
-		return nil
+		return validateSwitchedMoveState(meta, metaErr, home, homeErr, job)
+	}
+	if metaErr != nil {
+		return metaErr
+	}
+	if homeErr != nil {
+		return homeErr
 	}
 	if !moveFenceMatches(meta, home, job) {
+		return ErrMoveFenceLost
+	}
+	return nil
+}
+
+func validateSwitchedMoveState(meta *InodeMeta, metaErr error, home Home, homeErr error, job *MoveJob) error {
+	// The namespace may be unlinked after the home switch. Both records being
+	// absent proves no live file state remains to fence; the durable job still
+	// identifies the old physical prefix that must be removed.
+	if errors.Is(metaErr, ErrNotFound) && errors.Is(homeErr, ErrNotFound) {
+		return nil
+	}
+	if metaErr != nil {
+		return metaErr
+	}
+	if homeErr != nil {
+		return homeErr
+	}
+	if !switchedMoveFenceMatches(meta, home, job) {
 		return ErrMoveFenceLost
 	}
 	return nil

@@ -81,6 +81,49 @@ func TestServiceRecoverIntentsHonorsScanLimit(t *testing.T) {
 	assertIntentCount(t, ctx, svc, 0)
 }
 
+func TestServiceRecoverIntentsPagesPastCompletedMoveJobs(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2)
+	records := []MoveJob{
+		{ID: []byte{1}, Inode: 100, Phase: MovePhaseCompleted},
+		{ID: []byte{2}, Inode: 101, Phase: MovePhaseCompleted},
+		{
+			ID:         []byte{3},
+			Inode:      102,
+			SourceHome: 10,
+			TargetHome: 20,
+			Phase:      MovePhaseSourceCleanup,
+			Cursor:     fskeys.ChunkPrefix(10, 102),
+		},
+	}
+	for _, job := range records {
+		key := fskeys.MoveJobKey(job.ID)
+		elem, err := putElem(key, job)
+		require.NoError(t, err)
+		require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{key}))
+	}
+
+	stats, err := svc.RecoverIntents(ctx, 2)
+	require.NoError(t, err)
+	require.Zero(t, stats.MoveJobsResumed)
+	require.EqualValues(t, 2, stats.MoveJobsCleared)
+
+	stats, err = svc.RecoverIntents(ctx, 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.MoveJobsResumed)
+	require.EqualValues(t, 1, stats.MoveJobsCleared)
+
+	jobs, err := svc.store.ScanAt(
+		ctx,
+		fskeys.MoveJobAllPrefix(),
+		prefixEnd(fskeys.MoveJobAllPrefix()),
+		1,
+		svc.store.LastCommitTS(),
+	)
+	require.NoError(t, err)
+	require.Empty(t, jobs)
+}
+
 func assertIntentCount(t *testing.T, ctx context.Context, svc *Service, want int) {
 	t.Helper()
 	prefix := fskeys.IntentAllPrefix()

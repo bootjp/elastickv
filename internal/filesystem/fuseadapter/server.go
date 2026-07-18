@@ -23,6 +23,7 @@ const (
 	rootDirHandle          = 1
 	permissionModeMask     = 0o7777
 	startupRecoveryTimeout = 5 * time.Minute
+	startupRecoveryBatch   = 256
 	filesystemName         = "elastickv"
 )
 
@@ -504,7 +505,7 @@ func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Se
 	opts := defaultMountOptions(options)
 	if recoverer, ok := adapter.core.(intentRecoverer); ok {
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
-		_, recoveryErr := recoverer.RecoverIntents(recoveryCtx, 0)
+		recoveryErr := recoverIntentsBeforeMount(recoveryCtx, recoverer)
 		cancel()
 		if recoveryErr != nil {
 			return nil, errors.Wrap(recoveryErr, "recover filesystem intents before FUSE mount")
@@ -515,6 +516,18 @@ func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Se
 		return nil, errors.Wrap(err, "mount filesystem FUSE server")
 	}
 	return &Server{inner: inner, adapter: adapter}, nil
+}
+
+func recoverIntentsBeforeMount(ctx context.Context, recoverer intentRecoverer) error {
+	for {
+		stats, err := recoverer.RecoverIntents(ctx, startupRecoveryBatch)
+		if err != nil {
+			return errors.Wrap(err, "drain filesystem recovery batch")
+		}
+		if stats.MoveJobsResumed == 0 && stats.MoveJobsCleared == 0 && stats.IntentsCleared == 0 {
+			return nil
+		}
+	}
 }
 
 func defaultMountOptions(options *fuse.MountOptions) *fuse.MountOptions {

@@ -58,6 +58,7 @@ const (
 
 	defaultFilesystemRootMode              = 0o755
 	defaultFilesystemPlacementScanInterval = 30 * time.Second
+	defaultFilesystemLeaseReapInterval     = 30 * time.Second
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -113,6 +114,7 @@ var (
 	filesystemRootUID               = flag.Uint("filesystemRootUID", 0, "Root directory owner UID for first initialization")
 	filesystemRootGID               = flag.Uint("filesystemRootGID", 0, "Root directory owner GID for first initialization")
 	filesystemPlacementScanInterval = flag.Duration("filesystemPlacementScanInterval", defaultFilesystemPlacementScanInterval, "Interval for filesystem placement and recovery-state metrics; non-positive disables periodic scans")
+	filesystemLeaseReapInterval     = flag.Duration("filesystemLeaseReapInterval", defaultFilesystemLeaseReapInterval, "Interval for reclaiming expired filesystem open-handle leases; non-positive disables periodic reaping")
 	raftId                          = flag.String("raftId", "", "Node id used by Raft")
 	raftEngineName                  = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
 	raftDir                         = flag.String("raftDataDir", "data/", "Raft data dir")
@@ -718,6 +720,7 @@ func startFilesystemIfEnabled(
 	}
 	installFilesystemServerLifecycle(ctx, eg, cleanup, server, serveDone, config.mountPoint)
 	startFilesystemPlacementCollector(ctx, eg, service, *filesystemPlacementScanInterval)
+	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
 	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
 	return nil
 }
@@ -796,6 +799,50 @@ func startFilesystemPlacementCollector(
 			}
 		}
 	})
+}
+
+type filesystemLeaseReaper interface {
+	ReapExpiredOpenHandleLeases(context.Context, int) (filesystem.LeaseReapStats, error)
+}
+
+func startFilesystemLeaseReaper(
+	ctx context.Context,
+	eg *errgroup.Group,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) {
+	if eg == nil || reaper == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		return runFilesystemLeaseReaper(ctx, reaper, interval)
+	})
+}
+
+func runFilesystemLeaseReaper(
+	ctx context.Context,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		stats, err := reaper.ReapExpiredOpenHandleLeases(ctx, 0)
+		if err != nil && ctx.Err() == nil {
+			slog.WarnContext(ctx, "filesystem lease reaper failed", "err", err)
+		}
+		if stats.ExpiredRefs > 0 || stats.OrphanedInodesGCed > 0 {
+			slog.InfoContext(ctx, "filesystem lease reaper reclaimed state",
+				"expired_refs", stats.ExpiredRefs,
+				"orphaned_inodes_gced", stats.OrphanedInodesGCed,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {

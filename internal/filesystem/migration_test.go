@@ -93,12 +93,49 @@ func TestServiceResumeMoveFileAfterSwitchFailure(t *testing.T) {
 	stats, err := recovered.RecoverIntents(ctx, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, stats.MoveJobsResumed)
-	completed, err := recovered.moveJob(ctx, persisted.ID)
-	require.NoError(t, err)
-	require.Equal(t, MovePhaseCompleted, completed.Phase)
+	require.EqualValues(t, 1, stats.MoveJobsCleared)
+	_, err = recovered.moveJob(ctx, persisted.ID)
+	require.ErrorIs(t, err, ErrMoveJobNotFound)
 	got, err := recovered.Read(ctx, created.Inode, 0, 0, 7)
 	require.NoError(t, err)
 	require.Equal(t, []byte("payload"), got)
+}
+
+func TestServiceResumeMoveSourceCleanupAfterConcurrentUnlink(t *testing.T) {
+	ctx := context.Background()
+	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, created.Inode, 0, 0, bytes.Repeat([]byte("x"), int(testChunkSize*2)))
+	require.NoError(t, err)
+
+	ts, meta, home, err := svc.activeMoveSource(ctx, created.Inode)
+	require.NoError(t, err)
+	jobID, err := svc.newRecoveryID()
+	require.NoError(t, err)
+	job, intent := svc.newMoveState(jobID, created.Inode, 2, 20, home)
+	require.NoError(t, svc.persistMovePreparation(ctx, ts, meta, home, job, intent))
+	for {
+		job, err = svc.moveJob(ctx, jobID)
+		require.NoError(t, err)
+		if job.Phase == MovePhaseSourceCleanup {
+			break
+		}
+		completed, stepErr := svc.advanceMoveStep(ctx, &job)
+		require.NoError(t, stepErr)
+		require.False(t, completed)
+	}
+
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("file")))
+	_, err = svc.GetAttr(ctx, created.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+	assertChunkPrefixCount(t, ctx, placement, fskeys.ChunkPrefix(job.SourceHome, created.Inode), 2)
+
+	completed, err := svc.ResumeMoveFile(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, MovePhaseCompleted, completed.Phase)
+	assertChunkPrefixEmpty(t, ctx, placement, fskeys.ChunkPrefix(job.SourceHome, created.Inode))
 }
 
 func TestServiceMoveFileRetriesConcurrentRecoveryConflict(t *testing.T) {

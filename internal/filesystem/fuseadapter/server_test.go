@@ -2,6 +2,7 @@ package fuseadapter
 
 import (
 	"context"
+	"errors"
 	"math"
 	"syscall"
 	"testing"
@@ -11,6 +12,32 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )
+
+type recoverySequence struct {
+	stats  []filesystem.RecoveryStats
+	limits []int
+}
+
+func (r *recoverySequence) RecoverIntents(_ context.Context, limit int) (filesystem.RecoveryStats, error) {
+	r.limits = append(r.limits, limit)
+	if len(r.stats) == 0 {
+		return filesystem.RecoveryStats{}, errors.New("unexpected recovery call")
+	}
+	stats := r.stats[0]
+	r.stats = r.stats[1:]
+	return stats, nil
+}
+
+func TestRecoverIntentsBeforeMountDrainsEveryBatch(t *testing.T) {
+	recoverer := &recoverySequence{stats: []filesystem.RecoveryStats{
+		{MoveJobsResumed: startupRecoveryBatch, MoveJobsCleared: startupRecoveryBatch},
+		{IntentsCleared: 1},
+		{},
+	}}
+
+	require.NoError(t, recoverIntentsBeforeMount(context.Background(), recoverer))
+	require.Equal(t, []int{startupRecoveryBatch, startupRecoveryBatch, startupRecoveryBatch}, recoverer.limits)
+}
 
 func TestRawFileSystemLookupMapsStableInodeAndAttributes(t *testing.T) {
 	core := &fakeCore{

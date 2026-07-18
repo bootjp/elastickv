@@ -19,6 +19,7 @@ const (
 
 type RecoveryStats struct {
 	MoveJobsResumed uint64
+	MoveJobsCleared uint64
 	IntentsCleared  uint64
 }
 
@@ -100,37 +101,42 @@ func (s *Service) RecoverIntents(ctx context.Context, limit int) (RecoveryStats,
 		limit = defaultIntentRecoveryLimit
 	}
 	var stats RecoveryStats
-	resumed, err := s.recoverMoveJobs(ctx, limit)
-	stats.MoveJobsResumed += resumed
+	moveStats, err := s.recoverMoveJobs(ctx, limit)
+	stats.MoveJobsResumed += moveStats.MoveJobsResumed
+	stats.MoveJobsCleared += moveStats.MoveJobsCleared
 	if err != nil {
 		return stats, err
 	}
 	intentStats, err := s.recoverIntentRecords(ctx, limit)
 	stats.MoveJobsResumed += intentStats.MoveJobsResumed
+	stats.MoveJobsCleared += intentStats.MoveJobsCleared
 	stats.IntentsCleared += intentStats.IntentsCleared
 	return stats, err
 }
 
-func (s *Service) recoverMoveJobs(ctx context.Context, limit int) (uint64, error) {
+func (s *Service) recoverMoveJobs(ctx context.Context, limit int) (RecoveryStats, error) {
 	jobs, err := s.scanRecoveryPrefix(ctx, fskeys.MoveJobAllPrefix(), limit)
 	if err != nil {
-		return 0, err
+		return RecoveryStats{}, err
 	}
-	var resumed uint64
+	var stats RecoveryStats
 	for _, pair := range jobs {
 		job, decodeErr := decodeJSON[MoveJob](pair.Value)
 		if decodeErr != nil {
-			return resumed, decodeErr
+			return stats, decodeErr
 		}
-		if job.Phase == MovePhaseCompleted {
-			continue
+		if job.Phase != MovePhaseCompleted {
+			if _, resumeErr := s.ResumeMoveFile(ctx, job.ID); resumeErr != nil {
+				return stats, resumeErr
+			}
+			stats.MoveJobsResumed++
 		}
-		if _, resumeErr := s.ResumeMoveFile(ctx, job.ID); resumeErr != nil {
-			return resumed, resumeErr
+		if clearErr := s.clearMoveJob(ctx, job.ID); clearErr != nil {
+			return stats, clearErr
 		}
-		resumed++
+		stats.MoveJobsCleared++
 	}
-	return resumed, nil
+	return stats, nil
 }
 
 func (s *Service) recoverIntentRecords(ctx context.Context, limit int) (RecoveryStats, error) {
@@ -144,9 +150,12 @@ func (s *Service) recoverIntentRecords(ctx context.Context, limit int) (Recovery
 		if decodeErr != nil {
 			return stats, decodeErr
 		}
-		resumed, resumeErr := s.recoverMoveIntent(ctx, intent)
+		resumed, jobCleared, resumeErr := s.recoverMoveIntent(ctx, intent)
 		if resumeErr != nil {
 			return stats, resumeErr
+		}
+		if jobCleared {
+			stats.MoveJobsCleared++
 		}
 		if resumed {
 			stats.MoveJobsResumed++
@@ -160,22 +169,27 @@ func (s *Service) recoverIntentRecords(ctx context.Context, limit int) (Recovery
 	return stats, nil
 }
 
-func (s *Service) recoverMoveIntent(ctx context.Context, intent IntentState) (bool, error) {
+func (s *Service) recoverMoveIntent(ctx context.Context, intent IntentState) (bool, bool, error) {
 	if intent.Kind != IntentKindMove {
-		return false, nil
+		return false, false, nil
 	}
 	job, err := s.moveJob(ctx, intent.JobID)
 	if errors.Is(err, ErrMoveJobNotFound) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	if job.Phase == MovePhaseCompleted {
-		return false, nil
+	resumed := job.Phase != MovePhaseCompleted
+	if resumed {
+		if _, err = s.ResumeMoveFile(ctx, job.ID); err != nil {
+			return false, false, err
+		}
 	}
-	_, err = s.ResumeMoveFile(ctx, job.ID)
-	return err == nil, err
+	if err = s.clearMoveJob(ctx, job.ID); err != nil {
+		return resumed, false, err
+	}
+	return resumed, true, nil
 }
 
 func (s *Service) scanRecoveryPrefix(ctx context.Context, prefix []byte, limit int) ([]*store.KVPair, error) {
@@ -207,6 +221,14 @@ func (s *Service) scanRecoveryPrefix(ctx context.Context, prefix []byte, limit i
 }
 
 func (s *Service) clearIntent(ctx context.Context, key []byte) error {
+	return s.clearRecoveryRecord(ctx, key)
+}
+
+func (s *Service) clearMoveJob(ctx context.Context, jobID []byte) error {
+	return s.clearRecoveryRecord(ctx, fskeys.MoveJobKey(jobID))
+}
+
+func (s *Service) clearRecoveryRecord(ctx context.Context, key []byte) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {
 		return err
