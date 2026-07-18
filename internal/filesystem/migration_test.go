@@ -162,6 +162,39 @@ func TestServiceMoveFileRetriesConcurrentRecoveryConflict(t *testing.T) {
 	require.Greater(t, conflicting.calls, 2)
 }
 
+func TestServiceMoveFileRejectsOverlappingSourceCleanup(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, created.Inode, 0, 0, []byte("payload"))
+	require.NoError(t, err)
+
+	ts, meta, home, err := svc.activeMoveSource(ctx, created.Inode)
+	require.NoError(t, err)
+	jobID, err := svc.newRecoveryID()
+	require.NoError(t, err)
+	job, intent := svc.newMoveState(jobID, created.Inode, 2, 20, home)
+	require.NoError(t, svc.persistMovePreparation(ctx, ts, meta, home, job, intent))
+	for {
+		job, err = svc.moveJob(ctx, jobID)
+		require.NoError(t, err)
+		if job.Phase == MovePhaseSourceCleanup {
+			break
+		}
+		completed, stepErr := svc.advanceMoveStep(ctx, &job)
+		require.NoError(t, stepErr)
+		require.False(t, completed)
+	}
+
+	_, err = svc.MoveFile(ctx, created.Inode, 1)
+	require.ErrorIs(t, err, ErrStaleHome)
+	completed, err := svc.ResumeMoveFile(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, MovePhaseCompleted, completed.Phase)
+}
+
 func TestServiceResumeMoveFileClearsActiveObservationOnFailure(t *testing.T) {
 	observer := &recordingMoveObserver{}
 	svc := newTestServiceWithOptions(t, nil, WithOperationalObserver(observer))

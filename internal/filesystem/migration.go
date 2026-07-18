@@ -121,17 +121,50 @@ func (s *Service) activeMoveSource(ctx context.Context, inode uint64) (uint64, *
 	if err != nil {
 		return 0, nil, Home{}, err
 	}
-	if meta.Type != TypeFile || meta.Orphaned || meta.Nlink == 0 {
-		return 0, nil, Home{}, ErrInvalid
-	}
 	home, err := s.homeAt(ctx, inode, ts)
 	if err != nil {
 		return 0, nil, Home{}, err
 	}
-	if home.State != HomeStateActive || home.HomeSlot != meta.HomeSlot || home.Epoch != meta.Epoch {
+	if err := validateActiveMoveSource(meta, home); err != nil {
+		return 0, nil, Home{}, err
+	}
+	inflight, err := s.hasInflightMoveForInodeAt(ctx, inode, ts)
+	if err != nil {
+		return 0, nil, Home{}, err
+	}
+	if inflight {
 		return 0, nil, Home{}, ErrStaleHome
 	}
 	return ts, meta, home, nil
+}
+
+func validateActiveMoveSource(meta *InodeMeta, home Home) error {
+	if meta.Type != TypeFile || meta.Orphaned || meta.Nlink == 0 {
+		return ErrInvalid
+	}
+	if home.State != HomeStateActive || home.HomeSlot != meta.HomeSlot || home.Epoch != meta.Epoch {
+		return ErrStaleHome
+	}
+	return nil
+}
+
+func (s *Service) hasInflightMoveForInodeAt(ctx context.Context, inode uint64, ts uint64) (bool, error) {
+	found := false
+	err := s.scanVisiblePrefix(ctx, fskeys.MoveJobAllPrefix(), ts, func(pair *store.KVPair) error {
+		if found {
+			return nil
+		}
+		job, err := decodeJSON[MoveJob](pair.Value)
+		if err != nil {
+			return err
+		}
+		found = job.Inode == inode && job.Phase != MovePhaseCompleted
+		return nil
+	})
+	if err != nil {
+		return false, errors.Wrap(err, "filesystem scan active move jobs")
+	}
+	return found, nil
 }
 
 func completedMove(inode uint64, homeSlot uint64, targetGroup uint64) MoveJob {

@@ -341,6 +341,8 @@ Recovery replays unfinished intents idempotently.
 1. `truncate` shrink: delete chunks above new EOF and patch tail chunk.
 2. `unlink`: remove dentry and decrement `nlink`; when `nlink==0`, mark inode as orphaned.
 3. Physical chunk GC runs only when `nlink==0` and no open-handle lease exists (`!fs|ref|...` empty).
+4. After a size transaction commits, paged chunk cleanup no longer inherits
+   request cancellation, so usage and beyond-EOF chunks converge before return.
 
 ### 8.6 Open, flush, fsync, release
 
@@ -395,6 +397,9 @@ Recovery removes completed move-job records so an earlier batch cannot hide
 later unfinished jobs. Normal migration completion removes its job record before
 returning, and concurrent startup drainers treat an already-cleared job as
 success. Move-job active observations are balanced on every resume exit path.
+Root initialization retries OCC conflicts so simultaneous empty-store mounts
+converge on the atomic winner. A second move for an inode is rejected while any
+durable move job remains unfinished, including the post-switch cleanup phase.
 
 ### 9.4 Open-handle lease recovery
 
@@ -530,6 +535,9 @@ Phase 3:
    - normal migration completion does not retain completed job records
    - concurrent startup recovery tolerates another drainer completing the job
    - failed resume paths clear active migration observations
+   - concurrent root initialization converges after OCC conflict
+   - overlapping migration is rejected through source cleanup completion
+   - committed Truncate/SetAttr shrink cleanup survives caller cancellation
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
    - concurrent append + read under node failure

@@ -39,6 +39,7 @@ const (
 	chunkDeleteWriteConflictBackoff        = 10 * time.Millisecond
 	openRefScanLimit                       = 2
 	openTxnRetryLimit                      = 4
+	rootInitializationRetryLimit           = 4
 )
 
 var (
@@ -332,6 +333,18 @@ func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Servi
 }
 
 func (s *Service) InitializeRoot(ctx context.Context, mode uint32, uid uint32, gid uint32) error {
+	var lastErr error
+	for range rootInitializationRetryLimit {
+		err := s.initializeRootOnce(ctx, mode, uid, gid)
+		if !errors.Is(err, store.ErrWriteConflict) {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func (s *Service) initializeRootOnce(ctx context.Context, mode uint32, uid uint32, gid uint32) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {
 		return err
@@ -481,7 +494,7 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		}
 		return Stat{}, err
 	}
-	if err := s.deleteChunkPagesAndFinalize(ctx, chunkDeletes); err != nil {
+	if err := s.finishCommittedChunkDeletes(ctx, chunkDeletes); err != nil {
 		return Stat{}, err
 	}
 	return meta.Stat(), nil
@@ -837,7 +850,7 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return s.translateHomeConflict(ctx, meta, err)
 	}
-	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
+	return s.finishCommittedChunkDeletes(ctx, chunkDeletes)
 }
 
 func (s *Service) Unlink(ctx context.Context, parent uint64, name []byte) error {
@@ -1117,7 +1130,7 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
 	}
-	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
+	return s.finishCommittedChunkDeletes(ctx, chunkDeletes)
 }
 
 func (s *Service) releaseRefTxnParts(
@@ -1323,7 +1336,7 @@ func (s *Service) dispatchUsageTxnAndDeleteChunks(
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
 	}
-	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
+	return s.finishCommittedChunkDeletes(ctx, chunkDeletes)
 }
 
 func (d usageDelta) empty() bool {
@@ -1898,7 +1911,7 @@ func (s *Service) reclaimCommittedOrphanBestEffort(ctx context.Context, plan *ch
 	// The namespace mutation is already committed. An unfinished orphan remains
 	// discoverable by the lease reaper, so cleanup failure must not turn the
 	// visible rename or unlink into a failed operation that cannot be retried.
-	_ = s.deleteChunkPagesAndFinalize(ctx, plan)
+	_ = s.finishCommittedChunkDeletes(ctx, plan)
 }
 
 func (s *Service) unlinkFileTxnParts(
@@ -2157,6 +2170,10 @@ func (s *Service) deleteChunkPagesAndFinalize(ctx context.Context, plan *chunkDe
 	}
 	_, err := s.finalizeOrphanedFileGC(ctx, plan)
 	return err
+}
+
+func (s *Service) finishCommittedChunkDeletes(ctx context.Context, plan *chunkDeletePlan) error {
+	return s.deleteChunkPagesAndFinalize(context.WithoutCancel(ctx), plan)
 }
 
 func (s *Service) finalizeOrphanedFileGC(ctx context.Context, plan *chunkDeletePlan) (bool, error) {

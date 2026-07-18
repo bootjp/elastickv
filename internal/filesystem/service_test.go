@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,29 @@ const (
 
 type testCoordinator struct {
 	st store.MVCCStore
+}
+
+type rootRaceCoordinator struct {
+	inner     *testCoordinator
+	once      sync.Once
+	winnerErr error
+}
+
+func (c *rootRaceCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *rootRaceCoordinator) Dispatch(
+	ctx context.Context,
+	req *kv.OperationGroup[kv.OP],
+) (*kv.CoordinateResponse, error) {
+	c.once.Do(func() {
+		_, c.winnerErr = c.inner.Dispatch(ctx, req)
+	})
+	if c.winnerErr != nil {
+		return nil, c.winnerErr
+	}
+	return c.inner.Dispatch(ctx, req)
 }
 
 func (c *testCoordinator) LinearizableRead(context.Context) (uint64, error) {
@@ -224,6 +248,24 @@ func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 	got, err = svc.Read(ctx, created.Inode, created.FH, 0, 16)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0, 0, 'a', 'b', 'c', 0, 0, 0, 0}, got)
+}
+
+func TestServiceInitializeRootToleratesConcurrentWinner(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	inner := &testCoordinator{st: st}
+	coord := &rootRaceCoordinator{inner: inner}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	require.NoError(t, coord.winnerErr)
+	root, err := svc.GetAttr(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, TypeDirectory, root.Type)
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.Files)
 }
 
 func TestServiceWriteReadAtSaturatedFinalChunkBoundary(t *testing.T) {
@@ -1031,6 +1073,48 @@ func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
 	stats, err := svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
 	require.EqualValues(t, 0, stats.Capacity-stats.Free)
+}
+
+func TestServiceSizeShrinkFinishesCleanupAfterCallerCancellation(t *testing.T) {
+	operations := map[string]func(context.Context, *Service, uint64) error{
+		"truncate": func(ctx context.Context, svc *Service, inode uint64) error {
+			return svc.Truncate(ctx, inode, 0)
+		},
+		"setattr": func(ctx context.Context, svc *Service, inode uint64) error {
+			_, err := svc.SetAttr(ctx, inode, SetAttrMask{Size: true}, SetAttr{Size: 0})
+			return err
+		},
+	}
+	for name, shrink := range operations {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			const payloadBytes = (chunkDeleteTxnPageSize + 1) * 4
+			svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(payloadBytes))
+			require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+			file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+			require.NoError(t, err)
+			_, err = svc.Write(ctx, file.Inode, 0, 0, bytes.Repeat([]byte{'x'}, payloadBytes))
+			require.NoError(t, err)
+
+			inner, ok := svc.dispatch.(*testCoordinator)
+			require.True(t, ok)
+			svc.dispatch = &afterSuccessfulDispatchCoordinator{
+				inner: inner,
+				after: func(context.Context) {
+					cancel()
+				},
+			}
+			require.NoError(t, shrink(ctx, svc, file.Inode))
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+
+			stats, err := svc.StatFS(context.Background(), RootInode)
+			require.NoError(t, err)
+			require.EqualValues(t, 0, stats.Capacity-stats.Free)
+			meta, err := svc.inodeAt(context.Background(), file.Inode, svc.store.LastCommitTS())
+			require.NoError(t, err)
+			assertChunkPrefixEmpty(t, context.Background(), svc.store, fskeys.ChunkPrefix(meta.HomeSlot, file.Inode))
+		})
+	}
 }
 
 func TestServiceUnlinkLargeFileSucceedsAfterPagedDeleteFailure(t *testing.T) {
