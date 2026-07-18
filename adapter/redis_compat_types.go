@@ -23,6 +23,13 @@ const (
 	redisStrBaseHeader = 3 // magic(1) + version(1) + flags(1)
 )
 
+const (
+	redisHLLMagic      = byte(0xFF)
+	redisHLLVersion    = byte(0x02)
+	redisHLLHasTTL     = byte(0x01)
+	redisHLLBaseHeader = 3 // magic(1) + version(1) + flags(1)
+)
+
 // encodeRedisStr encodes a Redis string value with optional TTL.
 // New format: [0xFF 0x01][flags][expireAtMs(8, optional)][user value]
 func encodeRedisStr(value []byte, expireAt *time.Time) []byte {
@@ -73,6 +80,58 @@ func decodeRedisStr(raw []byte) (value []byte, expireAt *time.Time, err error) {
 // isNewRedisStrFormat reports whether raw uses the new magic+version prefix.
 func isNewRedisStrFormat(raw []byte) bool {
 	return len(raw) >= 2 && raw[0] == redisStrMagic && raw[1] == redisStrVersion
+}
+
+func encodeRedisHLL(value redisSetValue, expireAt *time.Time) ([]byte, error) {
+	payload, err := marshalSetValue(value)
+	if err != nil {
+		return nil, err
+	}
+	flags := byte(0)
+	headerLen := redisHLLBaseHeader
+	if expireAt != nil {
+		flags = redisHLLHasTTL
+		headerLen += redisUint64Bytes
+	}
+	buf := make([]byte, headerLen+len(payload))
+	buf[0] = redisHLLMagic
+	buf[1] = redisHLLVersion
+	buf[2] = flags
+	if expireAt != nil {
+		ms := max(expireAt.UnixMilli(), 0)
+		binary.BigEndian.PutUint64(buf[redisHLLBaseHeader:redisHLLBaseHeader+redisUint64Bytes], uint64(ms)) // #nosec G115
+		copy(buf[redisHLLBaseHeader+redisUint64Bytes:], payload)
+	} else {
+		copy(buf[redisHLLBaseHeader:], payload)
+	}
+	return buf, nil
+}
+
+func decodeRedisHLL(raw []byte) (value redisSetValue, expireAt *time.Time, embedded bool, err error) {
+	if !isNewRedisHLLFormat(raw) {
+		value, err := unmarshalSetValue(raw)
+		return value, nil, false, err
+	}
+	if len(raw) < redisHLLBaseHeader {
+		return redisSetValue{}, nil, true, errors.New("invalid encoded hll: too short")
+	}
+	flags := raw[2]
+	rest := raw[redisHLLBaseHeader:]
+	if flags&redisHLLHasTTL != 0 {
+		if len(rest) < redisUint64Bytes {
+			return redisSetValue{}, nil, true, errors.New("invalid encoded hll: missing TTL bytes")
+		}
+		ms := min(binary.BigEndian.Uint64(rest[:redisUint64Bytes]), math.MaxInt64)
+		t := time.UnixMilli(int64(ms)) // #nosec G115
+		expireAt = &t
+		rest = rest[redisUint64Bytes:]
+	}
+	value, err = unmarshalSetValue(rest)
+	return value, expireAt, true, err
+}
+
+func isNewRedisHLLFormat(raw []byte) bool {
+	return len(raw) >= 2 && raw[0] == redisHLLMagic && raw[1] == redisHLLVersion
 }
 
 const (
@@ -341,7 +400,39 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 		return nil, errors.WithStack(err)
 	}
 
+	if ttl, found, hllErr := r.hllTTLAt(ctx, userKey, readTS); hllErr != nil || found {
+		return ttl, hllErr
+	}
+	if ttl, found, collErr := r.collectionTTLAt(ctx, userKey, readTS); collErr != nil || found {
+		return ttl, collErr
+	}
+	if r.disableLegacyTTLReadFallback {
+		return nil, nil
+	}
 	return r.legacyIndexTTLAt(ctx, userKey, readTS)
+}
+
+func (r *RedisServer) hllTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, bool, error) {
+	raw, err := r.store.GetAt(ctx, redisHLLKey(userKey), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, errors.WithStack(err)
+	}
+	newFormat := isNewRedisHLLFormat(raw)
+	_, ttl, embedded, err := decodeRedisHLL(raw)
+	if err != nil {
+		return nil, true, err
+	}
+	if embedded || newFormat {
+		return ttl, true, nil
+	}
+	if r.disableLegacyTTLReadFallback {
+		return nil, true, nil
+	}
+	ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+	return ttl, true, err
 }
 
 // legacyIndexTTLAt reads the TTL from the !redis|ttl| secondary index only.
@@ -361,16 +452,20 @@ func (r *RedisServer) legacyIndexTTLAt(ctx context.Context, userKey []byte, read
 	return &ttl, nil
 }
 
-// hasExpired checks TTL expiry. When nonStringOnly is true, the embedded-TTL
-// probe is skipped and only the !redis|ttl| index is consulted, avoiding a
-// wasted GetAt on !redis|str|<key> for non-string types.
+// hasExpired checks TTL expiry. When nonStringOnly is true, string and HLL
+// probes are skipped; collection metadata is checked first, then the legacy
+// !redis|ttl| index is used for old metadata during the migration window.
 func (r *RedisServer) hasExpired(ctx context.Context, userKey []byte, readTS uint64, nonStringOnly bool) (bool, error) {
 	var (
 		ttl *time.Time
 		err error
 	)
 	if nonStringOnly {
-		ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+		var found bool
+		ttl, found, err = r.collectionTTLAt(ctx, userKey, readTS)
+		if err == nil && !found && !r.disableLegacyTTLReadFallback {
+			ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+		}
 	} else {
 		ttl, err = r.ttlAt(ctx, userKey, readTS)
 	}

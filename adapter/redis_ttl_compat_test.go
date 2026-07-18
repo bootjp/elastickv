@@ -234,6 +234,82 @@ func TestRedis_MultiExec_ExpireNXUsesStagedSetTTL(t *testing.T) {
 	require.LessOrEqual(t, ttl, 20*time.Second)
 }
 
+func TestRedis_MultiExec_ExpireRecreatedListKeepsStagedMeta(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	key := "multi:recreated-list-expire"
+	require.NoError(t, rdb.RPush(ctx, key, "old-a", "old-b").Err())
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", key).Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", key, "fresh").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "EXPIRE", key, "60").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{int64(1), int64(1), int64(1)}, execRes)
+
+	got, err := rdb.LRange(ctx, key, 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"fresh"}, got)
+
+	ttl, err := rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 60*time.Second)
+
+	readTS := nodes[0].redisServer.readTS()
+	raw, err := nodes[0].redisServer.store.GetAt(ctx, store.ListMetaKey([]byte(key)), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalListMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.NotZero(t, meta.ExpireAt)
+}
+
+func TestRedis_MultiExec_ExpireRecreatedHashKeepsStagedMeta(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	key := "multi:recreated-hash-expire"
+	require.NoError(t, rdb.HSet(ctx, key, "old-a", "1", "old-b", "2").Err())
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", key).Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", key, "fresh", "new").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "EXPIRE", key, "60").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{int64(1), int64(1), int64(1)}, execRes)
+
+	got, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"fresh": "new"}, got)
+
+	ttl, err := rdb.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 60*time.Second)
+
+	readTS := nodes[0].redisServer.readTS()
+	raw, err := nodes[0].redisServer.store.GetAt(ctx, store.HashMetaKey([]byte(key)), readTS)
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.NotZero(t, meta.ExpireAt)
+}
+
 func TestRedis_MultiExec_HSetRecreatesExpiredHash(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
@@ -293,7 +369,7 @@ func TestRedis_MultiExec_HSetRecreatesExpiredListAsHash(t *testing.T) {
 	require.ErrorContains(t, rdb.LRange(ctx, "multi:expired-list-hset", 0, -1).Err(), "WRONGTYPE")
 }
 
-func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
+func TestRedis_SAddRecreatesExpiredHLLPayload(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
@@ -309,11 +385,13 @@ func TestRedis_SAddRejectsExpiredHLLPayload(t *testing.T) {
 		return err == nil && exists == 0
 	}, time.Second, 10*time.Millisecond)
 
-	err := rdb.SAdd(ctx, "set:expired-hll", "member").Err()
-	require.ErrorContains(t, err, "WRONGTYPE")
-	count, err := rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Int64()
+	added, err := rdb.SAdd(ctx, "set:expired-hll", "member").Result()
 	require.NoError(t, err)
-	require.Equal(t, int64(1), count)
+	require.Equal(t, int64(1), added)
+	members, err := rdb.SMembers(ctx, "set:expired-hll").Result()
+	require.NoError(t, err)
+	require.Equal(t, []string{"member"}, members)
+	require.ErrorContains(t, rdb.Do(ctx, "PFCOUNT", "set:expired-hll").Err(), "WRONGTYPE")
 }
 
 func TestRedis_MultiExec_IncrRecreatesExpiredStringWithoutTTLIndex(t *testing.T) {

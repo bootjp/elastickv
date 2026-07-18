@@ -10,7 +10,7 @@ import (
 
 // Hash wide-column key layout:
 //
-//	Base Metadata: !hs|meta|<userKeyLen(4)><userKey>               → [Len(8)]
+//	Base Metadata: !hs|meta|<userKeyLen(4)><userKey>               → [Len(8)][ExpireAtMs(8)]
 //	Field Key:     !hs|fld|<userKeyLen(4)><userKey><fieldName>     → field value bytes
 //	Delta Key:     !hs|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)> → [LenDelta(8)]
 const (
@@ -18,13 +18,18 @@ const (
 	HashFieldPrefix     = "!hs|fld|"
 	HashMetaDeltaPrefix = "!hs|meta|d|"
 
-	// hashMetaSizeBytes is the fixed binary size of a HashMeta or HashMetaDelta (one int64).
-	hashMetaSizeBytes = 8
+	// hashMetaLegacySizeBytes is the pre-inline-TTL binary size of a HashMeta.
+	hashMetaLegacySizeBytes = 8
+	// hashMetaSizeBytes is the current binary size of a HashMeta (Len + ExpireAtMs).
+	hashMetaSizeBytes = 16
+	// hashMetaDeltaSizeBytes is the fixed binary size of a HashMetaDelta (one int64).
+	hashMetaDeltaSizeBytes = 8
 )
 
 // HashMeta is the base metadata for a hash collection.
 type HashMeta struct {
-	Len int64
+	Len      int64
+	ExpireAt uint64
 }
 
 // HashMetaDelta holds a signed change in field count.
@@ -32,31 +37,36 @@ type HashMetaDelta struct {
 	LenDelta int64
 }
 
-// MarshalHashMeta encodes HashMeta into a fixed 8-byte binary format.
+// MarshalHashMeta encodes HashMeta into a fixed 16-byte binary format.
 func MarshalHashMeta(m HashMeta) []byte {
 	buf := make([]byte, hashMetaSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(m.Len)) //nolint:gosec
+	binary.BigEndian.PutUint64(buf[8:16], m.ExpireAt)
 	return buf
 }
 
-// UnmarshalHashMeta decodes HashMeta from the fixed 8-byte binary format.
+// UnmarshalHashMeta decodes HashMeta from the legacy 8-byte or current 16-byte binary format.
 func UnmarshalHashMeta(b []byte) (HashMeta, error) {
-	if len(b) != hashMetaSizeBytes {
+	if len(b) != hashMetaLegacySizeBytes && len(b) != hashMetaSizeBytes {
 		return HashMeta{}, errors.WithStack(errors.Newf("invalid hash meta length: %d", len(b)))
 	}
-	return HashMeta{Len: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
+	meta := HashMeta{Len: int64(binary.BigEndian.Uint64(b[0:8]))} //nolint:gosec
+	if len(b) == hashMetaSizeBytes {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[8:16])
+	}
+	return meta, nil
 }
 
 // MarshalHashMetaDelta encodes HashMetaDelta into a fixed 8-byte binary format.
 func MarshalHashMetaDelta(d HashMetaDelta) []byte {
-	buf := make([]byte, hashMetaSizeBytes)
+	buf := make([]byte, hashMetaDeltaSizeBytes)
 	binary.BigEndian.PutUint64(buf, uint64(d.LenDelta)) //nolint:gosec
 	return buf
 }
 
 // UnmarshalHashMetaDelta decodes HashMetaDelta from the fixed 8-byte binary format.
 func UnmarshalHashMetaDelta(b []byte) (HashMetaDelta, error) {
-	if len(b) != hashMetaSizeBytes {
+	if len(b) != hashMetaDeltaSizeBytes {
 		return HashMetaDelta{}, errors.WithStack(errors.Newf("invalid hash meta delta length: %d", len(b)))
 	}
 	return HashMetaDelta{LenDelta: int64(binary.BigEndian.Uint64(b))}, nil //nolint:gosec
