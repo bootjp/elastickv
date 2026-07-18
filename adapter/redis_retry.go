@@ -5,11 +5,14 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -41,14 +44,55 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
-	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+	return errors.Is(err, store.ErrWriteConflict) ||
+		errors.Is(err, kv.ErrTxnLocked) ||
+		wireRedisTxnErrKind(err) != redisTxnWireErrNone
 }
 
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
-	if errors.Is(err, kv.ErrTxnLocked) {
+	if errors.Is(err, kv.ErrTxnLocked) || wireRedisTxnErrKind(err) == redisTxnWireErrLocked {
 		return redisTxnLockedRetryPolicy
 	}
 	return redisWriteConflictRetryPolicy
+}
+
+type redisTxnWireErrKind uint8
+
+const (
+	redisTxnWireErrNone redisTxnWireErrKind = iota
+	redisTxnWireErrWriteConflict
+	redisTxnWireErrLocked
+)
+
+// wireRedisTxnErrKind restores retry classification after an internal leader
+// redirect crosses gRPC. Forward currently returns transaction failures as a
+// codes.Unknown status, which strips the typed ErrWriteConflict / ErrTxnLocked
+// chain. Match only the exact server-generated key error envelope so unrelated
+// Unknown statuses that happen to mention a conflict remain terminal.
+func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
+	type grpcStatusCarrier interface {
+		GRPCStatus() *status.Status
+	}
+	var carrier grpcStatusCarrier
+	if !errors.As(err, &carrier) {
+		return redisTxnWireErrNone
+	}
+	st := carrier.GRPCStatus()
+	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
+		return redisTxnWireErrNone
+	}
+	msg := st.Message()
+	if !strings.HasPrefix(msg, "key: ") {
+		return redisTxnWireErrNone
+	}
+	switch {
+	case strings.HasSuffix(msg, ": "+store.ErrWriteConflict.Error()):
+		return redisTxnWireErrWriteConflict
+	case strings.HasSuffix(msg, ": "+kv.ErrTxnLocked.Error()):
+		return redisTxnWireErrLocked
+	default:
+		return redisTxnWireErrNone
+	}
 }
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
