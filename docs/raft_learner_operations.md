@@ -259,7 +259,7 @@ voter.
 | `add learner: rpc error: ... has too many pending config changes` | A previous conf change is still in flight. | Wait for it to commit; retry. |
 | `flag --raftJoinMembers requires --raftJoinAsLearner` | Join discovery was configured without learner intent. | Pass both flags for a fresh join, or neither for a normal restart. |
 | `flag --raftJoinMembers cannot be combined with raft bootstrap flags` | Join and new-cluster creation were requested together. | Remove every bootstrap flag; a replacement joins the surviving cluster. |
-| `etcd raft peer address is required: conf state node id=...` | The join list omitted a voter or learner present in the authoritative `ConfState`. | Stop the joiner and restart it with the complete current member inventory plus its own ID/address. Do not insert an empty or guessed address. |
+| `conf state node id=...: etcd raft peer address is required` | The join list omitted a voter or learner present in the authoritative `ConfState`. | Stop the joiner and restart it with the complete current member inventory plus its own ID/address. Do not insert an empty or guessed address. |
 
 ## Observability
 
