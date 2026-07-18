@@ -19,9 +19,11 @@ gen:
 # both MCHLC.cfg (correct design — expected PASS) and MCHLC_gap.cfg
 # (preconditions disabled — expected FAIL on HLC-4 with a counterexample
 # that motivates the implementation gaps).
-TLA_VERSION  := v1.8.0
+# v1.8.0 is a rolling pre-release whose asset is replaced on every upstream
+# build. Pin the latest stable release so the checksum remains reproducible.
+TLA_VERSION  := v1.7.4
 TLA_JAR      := .cache/tla/tla2tools.jar
-TLA_SHA256   := 33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e
+TLA_SHA256   := 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 TLA_URL      := https://github.com/tlaplus/tlaplus/releases/download/$(TLA_VERSION)/tla2tools.jar
 TLA_LIB      := ../lib
 
