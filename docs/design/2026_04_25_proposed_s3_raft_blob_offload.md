@@ -142,12 +142,25 @@ client ─► HTTP PUT body
                 fsync-acks have returned (= chunkBlobMinReplicas
                 durable copies including the leader)
              5. queue ChunkRef into pendingBatch
-        ─► flushBatch:
-             coordinator.Dispatch(OperationGroup{
-                 Elems: [ chunkref Puts ... + manifest Put ],
+             6. dispatch each full s3MetaBatchOps chunkref batch
+                through Raft under immutable attempt-versioned keys
+        ─► final flushBatch:
+             coordinator.Dispatch(Transaction{
+                 Elems: [ final partial chunkref batch + manifest Put ],
              })
         ─► HTTP 200 OK once Dispatch acks
 ```
+
+The full chunkref batches in step 6 are staged metadata: readers
+cannot discover them until the final manifest transaction commits,
+so the manifest remains the linearisation point. Attempt-versioned
+multipart keys prevent a retry from overwriting references selected
+by an older committed part descriptor. A failed request schedules
+best-effort deletion of staged chunkrefs by their unique attempt
+prefix; chunkblobs that were already fsynced remain content-addressed
+orphans for the M3 orphan scan in §3.5. Batching at `s3MetaBatchOps`
+keeps every Raft proposal below `MaxSizePerMsg` even for
+multi-terabyte objects.
 
 Step 3 — synchronous chunkblob replication before the chunkref
 commit — is the difference between "Raft-equivalent durability"

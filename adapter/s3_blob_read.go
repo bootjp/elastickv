@@ -70,7 +70,10 @@ func (s *S3Server) readS3ObjectChunk(
 	if !part.Offloaded {
 		return s.readLegacyS3ObjectChunk(ctx, bucket, generation, objectKey, uploadID, part, chunkIndex, readTS)
 	}
-	ref, refCommitTS, err := s.loadS3ChunkRef(ctx, bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, expectedSize, readTS)
+	ref, refCommitTS, err := s.loadS3ChunkRef(
+		ctx, bucket, generation, objectKey, uploadID,
+		part.PartNo, chunkIndex, part.ChunkRefVersion, expectedSize, readTS,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +107,11 @@ func (s *S3Server) loadS3ChunkRef(
 	uploadID string,
 	partNo uint64,
 	chunkIndex uint64,
+	chunkRefVersion uint64,
 	expectedSize uint64,
 	readTS uint64,
 ) (s3keys.ChunkRefValue, uint64, error) {
-	refKey := s3keys.ChunkRefKey(bucket, generation, objectKey, uploadID, partNo, chunkIndex)
+	refKey := s3keys.VersionedChunkRefKey(bucket, generation, objectKey, uploadID, partNo, chunkIndex, chunkRefVersion)
 	rawRef, err := s.store.GetAt(ctx, refKey, readTS)
 	if err != nil {
 		return s3keys.ChunkRefValue{}, 0, errors.Wrap(err, "read s3 chunkref")
@@ -182,11 +186,12 @@ func (s *S3Server) fetchS3ChunkBlob(ctx context.Context, ref s3keys.ChunkRefValu
 		return nil, s3BlobUnavailable("s3 chunkblob peer client is not configured")
 	}
 	key := s3keys.ChunkBlobKey(ref.ContentSHA256)
-	replicas, err := s.blobCluster.ReplicasForChunk(ctx, key)
-	if err != nil {
-		return nil, errors.Wrap(err, "resolve s3 chunkblob fetch replicas")
+	currentReplicas, discoveryErr := s.blobCluster.ReplicasForChunk(ctx, key)
+	writeReplicas := writeTimeS3BlobReplicas(ref.ReplicaPeers)
+	if discoveryErr != nil && len(writeReplicas) == 0 {
+		return nil, errors.Wrap(discoveryErr, "resolve s3 chunkblob fetch replicas")
 	}
-	peers := orderedS3BlobPeers(replicas, s.blobCluster.SelfNodeID(), ref.SourcePeer)
+	peers := orderedS3BlobPeers(writeReplicas, currentReplicas, s.blobCluster.SelfNodeID(), ref.SourcePeer)
 	payload, err := s.fetchS3ChunkBlobFromPeers(ctx, peers, ref.ContentSHA256)
 	if err == nil {
 		return payload, nil
@@ -197,17 +202,38 @@ func (s *S3Server) fetchS3ChunkBlob(ctx context.Context, ref s3keys.ChunkRefValu
 	return nil, err
 }
 
-func orderedS3BlobPeers(replicas []S3BlobReplica, selfNodeID, sourcePeer string) []S3BlobReplica {
-	peers := make([]S3BlobReplica, 0, len(replicas))
+func writeTimeS3BlobReplicas(peers []s3keys.ChunkRefPeer) []S3BlobReplica {
+	replicas := make([]S3BlobReplica, 0, len(peers))
+	for _, peer := range peers {
+		if peer.NodeID == "" || peer.Address == "" {
+			continue
+		}
+		replicas = append(replicas, S3BlobReplica{NodeID: peer.NodeID, Address: peer.Address})
+	}
+	return replicas
+}
+
+func orderedS3BlobPeers(writeReplicas []S3BlobReplica, currentReplicas []S3BlobReplica, selfNodeID, sourcePeer string) []S3BlobReplica {
+	peers := make([]S3BlobReplica, 0, len(writeReplicas)+len(currentReplicas))
+	seen := make(map[string]struct{}, len(writeReplicas)+len(currentReplicas))
 	var source *S3BlobReplica
-	for i := range replicas {
-		replica := replicas[i]
+	replicas := make([]S3BlobReplica, 0, len(writeReplicas)+len(currentReplicas))
+	replicas = append(replicas, writeReplicas...)
+	replicas = append(replicas, currentReplicas...)
+	for _, replica := range replicas {
 		if replica.NodeID == selfNodeID {
 			continue
 		}
+		identity := replica.NodeID + "\x00" + replica.Address
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
 		if replica.NodeID == sourcePeer {
-			copyReplica := replica
-			source = &copyReplica
+			if source == nil {
+				copyReplica := replica
+				source = &copyReplica
+			}
 			continue
 		}
 		peers = append(peers, replica)

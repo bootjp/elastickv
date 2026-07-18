@@ -77,10 +77,11 @@ func (s *S3Server) uploadS3ObjectData(ctx context.Context, request *http.Request
 }
 
 func (s *S3Server) cleanupS3PutObjectChunks(ctx context.Context, state *s3PutObjectState, upload s3ChunkUploadResult, bucket, objectKey string) {
-	if upload.Offloaded {
-		return
+	chunkSizes := upload.ChunkSizes
+	if !upload.Offloaded {
+		chunkSizes = upload.ChunkSizes[:upload.PersistedChunks]
 	}
-	part := s3ObjectPart{PartNo: 1, ChunkSizes: upload.ChunkSizes[:upload.PersistedChunks]}
+	part := s3ObjectPart{PartNo: 1, ChunkSizes: chunkSizes, Offloaded: upload.Offloaded}
 	manifest := &s3ObjectManifest{UploadID: state.uploadID}
 	if len(part.ChunkSizes) > 0 {
 		manifest.Parts = []s3ObjectPart{part}

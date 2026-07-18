@@ -55,6 +55,16 @@ func TestS3BlobOffloadPutAndProxyOnMissGet(t *testing.T) {
 	refs, err := metadataStore.ScanAt(context.Background(), []byte(s3keys.ChunkRefPrefix), prefixScanEnd([]byte(s3keys.ChunkRefPrefix)), 10, readTS)
 	require.NoError(t, err)
 	require.Len(t, refs, 2)
+	for _, pair := range refs {
+		ref, ok := s3keys.DecodeChunkRefValue(pair.Value)
+		require.True(t, ok)
+		require.GreaterOrEqual(t, len(ref.ReplicaPeers), 2)
+		require.LessOrEqual(t, len(ref.ReplicaPeers), len(cluster.replicas))
+		for _, peer := range ref.ReplicaPeers {
+			require.NotEmpty(t, peer.NodeID)
+			require.NotEmpty(t, peer.Address)
+		}
+	}
 	blobs, err := metadataStore.ScanAt(context.Background(), []byte(s3keys.ChunkBlobPrefix), prefixScanEnd([]byte(s3keys.ChunkBlobPrefix)), 10, readTS)
 	require.NoError(t, err)
 	require.Len(t, blobs, 2)
@@ -192,6 +202,66 @@ func TestS3BlobOffloadAllPeersMissingReturnsInternalError(t *testing.T) {
 	require.Equal(t, 1, observer.unrecoverable)
 }
 
+func TestS3BlobFetchUsesWriteTimeReplicaAfterMembershipChange(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("write-time replica survives membership replacement")
+	digest := sha256.Sum256(payload)
+	cluster := newFakeS3BlobCluster()
+	cluster.self = "n4"
+	cluster.replicas = []S3BlobReplica{
+		{NodeID: "n4", Address: "n4:50051", Suffrage: "voter"},
+		{NodeID: "n5", Address: "n5:50051", Suffrage: "voter"},
+		{NodeID: "n6", Address: "n6:50051", Suffrage: "voter"},
+	}
+	cluster.blobs["n2"] = map[[sha256.Size]byte][]byte{digest: bytes.Clone(payload)}
+	server := &S3Server{blobCluster: cluster}
+
+	got, err := server.fetchS3ChunkBlob(context.Background(), s3keys.ChunkRefValue{
+		ContentSHA256: digest,
+		Size:          uint64(len(payload)),
+		SourcePeer:    "n2",
+		ReplicaPeers: []s3keys.ChunkRefPeer{
+			{NodeID: "n1", Address: "n1:50051"},
+			{NodeID: "n2", Address: "n2:50051"},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestS3BlobReadUsesManifestChunkRefVersion(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	oldDigest := sha256.Sum256([]byte("old part"))
+	newDigest := sha256.Sum256([]byte("new part"))
+	oldValue, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: oldDigest,
+		Size:          uint64(len("old part")),
+		SourcePeer:    "n1",
+	})
+	require.NoError(t, err)
+	newValue, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: newDigest,
+		Size:          uint64(len("new part")),
+		SourcePeer:    "n1",
+	})
+	require.NoError(t, err)
+	oldKey := s3keys.VersionedChunkRefKey("bucket", 1, "object", "upload", 1, 0, 100)
+	newKey := s3keys.VersionedChunkRefKey("bucket", 1, "object", "upload", 1, 0, 200)
+	require.NoError(t, st.PutAt(context.Background(), oldKey, oldValue, 101, 0))
+	require.NoError(t, st.PutAt(context.Background(), newKey, newValue, 201, 0))
+
+	server := &S3Server{store: st}
+	ref, _, err := server.loadS3ChunkRef(
+		context.Background(), "bucket", 1, "object", "upload",
+		1, 0, 100, uint64(len("old part")), ^uint64(0),
+	)
+	require.NoError(t, err)
+	require.Equal(t, oldDigest, ref.ContentSHA256)
+}
+
 func TestS3BlobOffloadMultipartRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -241,20 +311,23 @@ func TestS3BlobDurableTarget(t *testing.T) {
 
 	replicas := newFakeS3BlobCluster().replicas
 	server := &S3Server{}
-	target, degraded, err := server.s3BlobDurableTarget(replicas, "n1")
+	target, voterTarget, degraded, err := server.s3BlobDurableTarget(replicas, "n1")
 	require.NoError(t, err)
 	require.Equal(t, 2, target)
+	require.Equal(t, 2, voterTarget)
 	require.False(t, degraded)
 
 	server.blobMinReplicas = 3
-	target, degraded, err = server.s3BlobDurableTarget(replicas, "n1")
+	target, voterTarget, degraded, err = server.s3BlobDurableTarget(replicas, "n1")
 	require.NoError(t, err)
 	require.Equal(t, 3, target)
+	require.Equal(t, 2, voterTarget)
 	require.False(t, degraded)
 
-	target, degraded, err = server.s3BlobDurableTarget(replicas[:2], "n1")
+	target, voterTarget, degraded, err = server.s3BlobDurableTarget(replicas[:2], "n1")
 	require.NoError(t, err)
 	require.Equal(t, 2, target)
+	require.Equal(t, 2, voterTarget)
 	require.True(t, degraded)
 
 	five := append(append([]S3BlobReplica(nil), replicas...),
@@ -262,10 +335,40 @@ func TestS3BlobDurableTarget(t *testing.T) {
 		S3BlobReplica{NodeID: "n5", Address: "n5:50051", Suffrage: "voter"},
 	)
 	server.blobMinReplicas = 0
-	target, degraded, err = server.s3BlobDurableTarget(five, "n1")
+	target, voterTarget, degraded, err = server.s3BlobDurableTarget(five, "n1")
 	require.NoError(t, err)
 	require.Equal(t, 3, target)
+	require.Equal(t, 3, voterTarget)
 	require.False(t, degraded)
+
+	server.blobMinReplicas = 2
+	target, voterTarget, degraded, err = server.s3BlobDurableTarget(five, "n1")
+	require.NoError(t, err)
+	require.Equal(t, 3, target, "configuration must not lower the voter quorum target")
+	require.Equal(t, 3, voterTarget)
+	require.False(t, degraded)
+}
+
+func TestS3BlobReplicationDoesNotCountLearnerTowardVoterQuorum(t *testing.T) {
+	t.Parallel()
+
+	results := make(chan s3BlobReplicationResult, 3)
+	results <- s3BlobReplicationResult{
+		replica: S3BlobReplica{NodeID: "n1", Address: "n1:50051", Suffrage: "voter"},
+		local:   true,
+	}
+	results <- s3BlobReplicationResult{
+		replica: S3BlobReplica{NodeID: "n4", Address: "n4:50051", Suffrage: "learner"},
+	}
+	results <- s3BlobReplicationResult{
+		replica: S3BlobReplica{NodeID: "n2", Address: "n2:50051", Suffrage: "voter"},
+	}
+
+	summary := (*S3Server)(nil).collectS3BlobReplication(context.Background(), results, 3, 2, 2)
+	require.Equal(t, 3, summary.durable)
+	require.Equal(t, 2, summary.voterDurable)
+	require.True(t, summary.localDurable)
+	require.Len(t, summary.replicas, 3)
 }
 
 func TestGRPCS3BlobClusterRequiresAndForwardsBearerToken(t *testing.T) {

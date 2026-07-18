@@ -75,14 +75,17 @@ func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request,
 			return s3keys.VersionedBlobKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo, commitTS)
 		},
 		chunkRefKey: func(chunkNo uint64) []byte {
-			return s3keys.ChunkRefKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo)
+			return s3keys.VersionedChunkRefKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo, startTS)
 		},
 		offloaded: offloaded,
 	})
 	committed := false
 	defer func() {
-		if !committed && upload.ChunkCount > 0 && !upload.Offloaded {
-			s.cleanupPartBlobsAsync(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, upload.ChunkCount, commitTS)
+		if !committed && upload.ChunkCount > 0 {
+			s.cleanupPartBlobsAsync(
+				bucket, state.meta.Generation, objectKey, uploadID,
+				state.partNo, upload.ChunkCount, commitTS, startTS, upload.Offloaded,
+			)
 		}
 	}()
 	if err != nil || bodyErr != nil {
@@ -137,7 +140,8 @@ func (s *S3Server) allocateS3UploadPartVersion(ctx context.Context) (uint64, uin
 func (s *S3Server) commitS3UploadPart(ctx context.Context, state *s3UploadPartState, upload s3ChunkUploadResult, bucket, objectKey, uploadID string, startTS, commitTS uint64) (*s3PartDescriptor, error) {
 	descriptor := &s3PartDescriptor{
 		PartNo: state.partNo, ETag: upload.ETag, SizeBytes: upload.SizeBytes,
-		ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes, PartVersion: commitTS, Offloaded: upload.Offloaded,
+		ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes, PartVersion: commitTS,
+		ChunkRefVersion: startTS, Offloaded: upload.Offloaded,
 	}
 	body, err := json.Marshal(descriptor)
 	if err != nil {
