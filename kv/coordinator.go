@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -121,12 +122,25 @@ func (c *Coordinate) WithSampler(s keyviz.Sampler, routeID uint64) *Coordinate {
 		return c
 	}
 	if routeID == 0 {
-		c.sampler = nil
-		c.samplerRouteID = 0
+		c.samplerConfig.Store(nil)
 		return c
 	}
-	c.sampler = s
-	c.samplerRouteID = routeID
+	c.samplerConfig.Store(&samplerConfig{sampler: s, routeID: routeID})
+	return c
+}
+
+// WithSamplerRouteResolver wires keyviz sampling with a route lookup evaluated
+// for every observed key. Single-group deployments need this after a range
+// split, when one fixed startup RouteID no longer covers the keyspace.
+func (c *Coordinate) WithSamplerRouteResolver(s keyviz.Sampler, resolve func(key []byte) (uint64, bool)) *Coordinate {
+	if c == nil {
+		return c
+	}
+	if s == nil || resolve == nil {
+		c.samplerConfig.Store(nil)
+		return c
+	}
+	c.samplerConfig.Store(&samplerConfig{sampler: s, resolve: resolve})
 	return c
 }
 
@@ -246,12 +260,19 @@ type Coordinate struct {
 	// (nil when no observer is attached; LeaseRead short-circuits the
 	// nil check so production does not pay an interface call when
 	// monitoring is disabled).
-	leaseObserver  LeaseReadObserver
-	sampler        keyviz.Sampler
-	samplerRouteID uint64
+	leaseObserver LeaseReadObserver
+	samplerConfig atomic.Pointer[samplerConfig]
 }
 
 var _ Coordinator = (*Coordinate)(nil)
+
+type samplerRouteResolveFunc func(key []byte) (uint64, bool)
+
+type samplerConfig struct {
+	sampler keyviz.Sampler
+	routeID uint64
+	resolve samplerRouteResolveFunc
+}
 
 type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)
@@ -915,6 +936,17 @@ func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
 	return c.IsLeader()
 }
 
+// LeadershipForKey reports local leadership and the current Raft term for the
+// single group that owns every key handled by Coordinate.
+func (c *Coordinate) LeadershipForKey(_ []byte) (bool, uint64) {
+	return leadershipForEngine(c.engine)
+}
+
+// GroupLeadership reports leadership for Coordinate's single Raft group.
+func (c *Coordinate) GroupLeadership(_ uint64) (bool, uint64) {
+	return leadershipForEngine(c.engine)
+}
+
 func (c *Coordinate) VerifyLeaderForKey(ctx context.Context, _ []byte) error {
 	return c.VerifyLeader(ctx)
 }
@@ -1194,7 +1226,7 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 }
 
 func (c *Coordinate) observeElems(elems []*Elem[OP]) {
-	if c == nil || c.sampler == nil || c.samplerRouteID == 0 {
+	if c == nil {
 		return
 	}
 	for _, elem := range elems {
@@ -1202,18 +1234,64 @@ func (c *Coordinate) observeElems(elems []*Elem[OP]) {
 	}
 }
 
-func (c *Coordinate) observeMutation(mut *pb.Mutation) {
-	if c == nil || c.sampler == nil || c.samplerRouteID == 0 || mut == nil {
+// ObserveForwardedRequests records leader-side sampling evidence for writes
+// that entered through a follower and were committed via Internal.Forward.
+func (c *Coordinate) ObserveForwardedRequests(reqs []*pb.Request) {
+	if c == nil {
 		return
 	}
-	c.sampler.Observe(c.samplerRouteID, mut.Key, keyviz.OpWrite, len(mut.Value), keyviz.LabelLegacy)
+	for _, req := range reqs {
+		if req == nil {
+			continue
+		}
+		for _, mut := range req.Mutations {
+			c.observeMutation(mut)
+		}
+	}
+}
+
+func (c *Coordinate) observeMutation(mut *pb.Mutation) {
+	cfg := c.samplerSnapshot()
+	if cfg == nil || mut == nil {
+		return
+	}
+	routeID, sampleKey, ok := cfg.routeForKey(mut.Key)
+	if !ok {
+		return
+	}
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpWrite, len(mut.Value), keyviz.LabelLegacy)
 }
 
 func (c *Coordinate) observeRead(key []byte) {
-	if c == nil || c.sampler == nil || c.samplerRouteID == 0 {
+	cfg := c.samplerSnapshot()
+	if cfg == nil {
 		return
 	}
-	c.sampler.Observe(c.samplerRouteID, key, keyviz.OpRead, 0, keyviz.LabelLegacy)
+	routeID, sampleKey, ok := cfg.routeForKey(key)
+	if !ok {
+		return
+	}
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpRead, 0, keyviz.LabelLegacy)
+}
+
+func (c *Coordinate) samplerSnapshot() *samplerConfig {
+	if c == nil {
+		return nil
+	}
+	cfg := c.samplerConfig.Load()
+	if cfg == nil || cfg.sampler == nil {
+		return nil
+	}
+	return cfg
+}
+
+func (cfg *samplerConfig) routeForKey(key []byte) (uint64, []byte, bool) {
+	sampleKey := RouteKey(key)
+	if cfg.resolve != nil {
+		routeID, ok := cfg.resolve(sampleKey)
+		return routeID, sampleKey, ok && routeID != 0
+	}
+	return cfg.routeID, sampleKey, cfg.routeID != 0
 }
 
 // toRawRequest builds a forwarded raw Request for the redirect path

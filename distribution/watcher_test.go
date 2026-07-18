@@ -121,6 +121,34 @@ func TestCatalogWatcherNoOpWhenVersionUnchanged(t *testing.T) {
 	require.True(t, bytes.Equal(before[1].Start, after[1].Start))
 }
 
+func TestCatalogWatcherNotifiesAfterApplyingSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := NewCatalogStore(store.NewMVCCStore())
+	_, err := catalog.Save(ctx, 0, []RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte(""),
+		End:     nil,
+		GroupID: 1,
+		State:   RouteStateActive,
+	}})
+	require.NoError(t, err)
+
+	var observed CatalogSnapshot
+	watcher := NewCatalogWatcher(
+		catalog,
+		NewEngine(),
+		WithCatalogWatcherSnapshotObserver(func(snapshot CatalogSnapshot) {
+			observed = snapshot
+		}),
+	)
+	require.NoError(t, watcher.SyncOnce(ctx))
+	require.Equal(t, uint64(1), observed.Version)
+	require.Len(t, observed.Routes, 1)
+	require.Equal(t, uint64(1), observed.Routes[0].RouteID)
+}
+
 func TestCatalogWatcherRetriesOnTransientReadError(t *testing.T) {
 	t.Parallel()
 

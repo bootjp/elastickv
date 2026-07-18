@@ -2,12 +2,24 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAutoSplitCanonicalFlagsAreRegistered(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"autoSplitCooldown", "autoSplitThreshold", "autoSplitMaxPerCycle"} {
+		require.NotNil(t, flag.CommandLine.Lookup(name), name)
+	}
+	for _, name := range []string{"autoSplitSplitCooldown", "autoSplitThresholdOpsMin", "autoSplitMaxSplitsPerCycle"} {
+		require.Nil(t, flag.CommandLine.Lookup(name), name)
+	}
+}
 
 func TestEffectiveKeyVizBucketsPerRouteAutoSplitImpliedDefault(t *testing.T) {
 	t.Parallel()

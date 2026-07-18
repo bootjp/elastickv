@@ -110,7 +110,7 @@ memory each group's private cache/memtable pins.
   over-full node. Actual per-node volume relief therefore also depends on Gap 1
   plus the replica-placement / region-balance work in Gap 4. Auto-detection /
   scheduling is **PR #951**
-  (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`,
+  (`docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md`,
   branch `design/hotspot-split-m3-automation`), which drives detection off the
   already-wired keyviz sampler rather than the dead `RecordAccess` counters.
 - **Range MERGE — missing, no design exists.** The inverse of split. Both the

@@ -1717,6 +1717,24 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
+// LeadershipForKey reports local leadership and Raft term for key's group.
+func (c *ShardedCoordinator) LeadershipForKey(key []byte) (bool, uint64) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
+// GroupLeadership reports local leadership and Raft term for groupID.
+func (c *ShardedCoordinator) GroupLeadership(groupID uint64) (bool, uint64) {
+	g, ok := c.groups[groupID]
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
 func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
 	g, ok := c.groupForKey(key)
 	if !ok {

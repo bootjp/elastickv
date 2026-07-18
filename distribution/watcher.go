@@ -19,6 +19,11 @@ var (
 // CatalogWatcherOption customizes CatalogWatcher behavior.
 type CatalogWatcherOption func(*CatalogWatcher)
 
+// CatalogSnapshotObserver receives each snapshot successfully applied by the
+// watcher. Implementations run synchronously on the watcher goroutine and must
+// not block.
+type CatalogSnapshotObserver func(CatalogSnapshot)
+
 // WithCatalogWatcherInterval sets the catalog polling interval.
 func WithCatalogWatcherInterval(interval time.Duration) CatalogWatcherOption {
 	return func(w *CatalogWatcher) {
@@ -47,13 +52,21 @@ func WithCatalogWatcherBatchSize(batchSize int) CatalogWatcherOption {
 	}
 }
 
+// WithCatalogWatcherSnapshotObserver installs a post-apply snapshot callback.
+func WithCatalogWatcherSnapshotObserver(observer CatalogSnapshotObserver) CatalogWatcherOption {
+	return func(w *CatalogWatcher) {
+		w.snapshotObserver = observer
+	}
+}
+
 // CatalogWatcher periodically refreshes Engine from durable catalog snapshots.
 type CatalogWatcher struct {
-	catalog   *CatalogStore
-	engine    *Engine
-	interval  time.Duration
-	batchSize int
-	logger    *slog.Logger
+	catalog          *CatalogStore
+	engine           *Engine
+	interval         time.Duration
+	batchSize        int
+	logger           *slog.Logger
+	snapshotObserver CatalogSnapshotObserver
 }
 
 // NewCatalogWatcher creates a watcher that polls the durable route catalog and
@@ -75,11 +88,12 @@ func NewCatalogWatcher(catalog *CatalogStore, engine *Engine, opts ...CatalogWat
 }
 
 // RunCatalogWatcher runs CatalogWatcher with optional logger override.
-func RunCatalogWatcher(ctx context.Context, catalog *CatalogStore, engine *Engine, logger *slog.Logger) error {
+func RunCatalogWatcher(ctx context.Context, catalog *CatalogStore, engine *Engine, logger *slog.Logger, opts ...CatalogWatcherOption) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	catalogWatcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherLogger(logger))
+	opts = append(opts, WithCatalogWatcherLogger(logger))
+	catalogWatcher := NewCatalogWatcher(catalog, engine, opts...)
 	return catalogWatcher.Run(ctx)
 }
 
@@ -133,8 +147,10 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 			}
 			return err
 		}
+		w.notifySnapshotObserver(*changes.Reset)
 		return nil
 	}
+	applied := false
 	for _, delta := range changes.Deltas {
 		if err := w.engine.ApplyDelta(delta); err != nil {
 			if errors.Is(err, ErrEngineSnapshotVersionStale) {
@@ -142,7 +158,34 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 			}
 			return err
 		}
+		applied = true
 	}
+	if applied {
+		if err := w.notifyLatestSnapshotObserver(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *CatalogWatcher) notifySnapshotObserver(snapshot CatalogSnapshot) {
+	if w.snapshotObserver != nil {
+		w.snapshotObserver(snapshot)
+	}
+}
+
+func (w *CatalogWatcher) notifyLatestSnapshotObserver(ctx context.Context) error {
+	if w.snapshotObserver == nil {
+		return nil
+	}
+	snapshot, err := w.catalog.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.Version != w.engine.Version() {
+		return nil
+	}
+	w.snapshotObserver(snapshot)
 	return nil
 }
 

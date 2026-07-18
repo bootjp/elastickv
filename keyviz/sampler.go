@@ -31,6 +31,7 @@ package keyviz
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"math"
@@ -201,6 +202,10 @@ type MemSamplerOptions struct {
 type MemSampler struct {
 	opts MemSamplerOptions
 	now  func() time.Time
+	// flushMu serializes explicit and background flushes and protects the
+	// committed window lower boundary.
+	flushMu     sync.Mutex
+	lastFlushAt time.Time
 
 	// table holds the immutable map of currently-tracked routes. The
 	// hot path Observe() does a single Load + map lookup; mutations
@@ -212,19 +217,10 @@ type MemSampler struct {
 	// Held only by non-hot-path callers.
 	routesMu sync.Mutex
 
-	// flushMu serialises the full Flush flow from timestamp capture
-	// through history append. That keeps column order and window
-	// boundaries aligned when callers accidentally run concurrent
-	// flushers.
-	flushMu sync.Mutex
-
 	// historyMu guards the ring buffer. Reads (Snapshot) and writes
 	// (Flush) acquire it; Observe never touches it.
 	historyMu sync.Mutex
 	history   *ringBuffer
-	// lastFlushAt is the lower boundary for the next committed matrix
-	// column. Guarded by historyMu with history.
-	lastFlushAt time.Time
 
 	// retiredSlots holds slots that RemoveRoute removed from the live
 	// table. Each entry is drained for `remaining` Flushes — a grace
@@ -437,10 +433,12 @@ func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members [
 // MatrixColumn is one committed heatmap window.
 type MatrixColumn struct {
 	// WindowStart and At delimit the committed half-open sampler
-	// interval. Rows contain counters drained for (WindowStart, At].
+	// interval. Rows and HotKeys contain evidence drained for
+	// (WindowStart, At].
 	WindowStart time.Time
 	At          time.Time
 	Rows        []MatrixRow
+	HotKeys     []KeyvizHotKeysSnapshot
 }
 
 // MatrixRow is a single route or virtual bucket's counter snapshot
@@ -524,8 +522,8 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		opts:        opts,
 		now:         now,
 		history:     newRingBuffer(opts.HistoryColumns),
-		lastFlushAt: now(),
 		groupTerms:  map[uint64]uint64{},
+		lastFlushAt: now(),
 	}
 	s.table.Store(newEmptyRouteTable())
 	if opts.HotKeysEnabled {
@@ -1220,8 +1218,35 @@ func (s *MemSampler) Flush() {
 	}
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
+	s.flushAtLocked(s.now(), nil)
+}
 
-	col := MatrixColumn{At: s.now()}
+func (s *MemSampler) flushWindow(ctx context.Context, at time.Time) bool {
+	if s == nil {
+		return true
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	var hotKeys []KeyvizHotKeysSnapshot
+	if s.hotKeys != nil {
+		var ok bool
+		hotKeys, ok = s.hotKeys.snapshotWindow(ctx, s.lastFlushAt, at)
+		if !ok {
+			return false
+		}
+	}
+	s.flushAtLocked(at, hotKeys)
+	return true
+}
+
+func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot) {
+	col := MatrixColumn{
+		WindowStart: s.lastFlushAt,
+		At:          at,
+		HotKeys:     hotKeys,
+	}
+	s.lastFlushAt = at
 	// Snapshot the per-group leader-term map once at the top of
 	// Flush so every row in this column sees a consistent view, even
 	// if SetLeaderTerm fires concurrently. Later rows can never
@@ -1245,11 +1270,9 @@ func (s *MemSampler) Flush() {
 	})
 
 	s.historyMu.Lock()
-	col.WindowStart = s.lastFlushAt
 	if !col.WindowStart.Before(col.At) {
 		col.WindowStart = col.At.Add(-s.opts.Step)
 	}
-	s.lastFlushAt = col.At
 	s.history.Push(col)
 	s.historyMu.Unlock()
 }

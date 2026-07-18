@@ -61,6 +61,34 @@ func TestReadWeightContributesToScore(t *testing.T) {
 	require.InDelta(t, 40, result.Decisions[0].ScoreOpsMin, 0.0001)
 }
 
+func TestDecisionReportsSmoothedScoreWithoutChangingPerColumnPromotion(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(160, 0)
+	route := testRoute(2, 3, "a", "z")
+	windows := []ColumnWindow{
+		testWindow(start.Add(time.Minute), time.Minute,
+			testRow(2, 3, 0, 2, "a", "m", 50, 0),
+			testRow(2, 3, 1, 2, "m", "z", 50, 0),
+		),
+		testWindow(start.Add(3*time.Minute), 2*time.Minute,
+			testRow(2, 3, 0, 2, "a", "m", 200, 0),
+			testRow(2, 3, 1, 2, "m", "z", 200, 0),
+		),
+	}
+
+	result := Evaluate(Config{
+		WriteWeight:       1,
+		ReadWeight:        0,
+		ThresholdOpsMin:   50,
+		CandidateWindows:  2,
+		MaxSplitsPerCycle: 1,
+	}, NewDetectorState(), Input{Routes: []distribution.RouteDescriptor{route}, Windows: windows, Now: start.Add(3 * time.Minute)})
+
+	require.Len(t, result.Decisions, 1)
+	require.InDelta(t, 200, result.Decisions[0].PerColumnScoreOpsMin, 0.0001)
+	require.InDelta(t, 500.0/3.0, result.Decisions[0].ScoreOpsMin, 0.0001)
+}
+
 func TestInvalidWindowIsSkipped(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(175, 0)
@@ -625,6 +653,214 @@ func TestP50CoalescesDuplicateSubBucketRows(t *testing.T) {
 	require.InDelta(t, 100, result.Decisions[0].RightLoad, 0.0001)
 }
 
+func TestTopKeyIsolationUsesAlignedLowerBoundBeforeP50(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(900, 0)
+	route := testRoute(1, 1, "a", "z")
+
+	for _, sample := range []struct {
+		rate   int
+		writes uint64
+	}{{rate: 1, writes: 100}, {rate: 16, writes: 1600}} {
+		t.Run("sample_rate_"+time.Duration(sample.rate).String(), func(t *testing.T) {
+			t.Parallel()
+			window := topKeyWindow(at, time.Minute, route, sample.writes, keyviz.KeyvizHotKeysSnapshot{
+				SampledN:   100,
+				SampleRate: sample.rate,
+				Capacity:   100,
+				Entries: []keyviz.KeyvizHotKeyEntry{
+					{Key: []byte("m"), Count: 91},
+				},
+			})
+			cfg := testConfig()
+			cfg.TopKeyAbsoluteFloor = 50 * float64(sample.rate)
+
+			result := Evaluate(cfg, NewDetectorState(), Input{
+				Routes: []distribution.RouteDescriptor{route}, Windows: []ColumnWindow{window}, Now: at,
+			})
+
+			require.Len(t, result.Decisions, 1)
+			require.Equal(t, SplitOriginIsolationCompound, result.Decisions[0].SplitOrigin)
+			require.Equal(t, []byte("m"), result.Decisions[0].SplitKey)
+			require.Equal(t, []byte{'m', 0}, result.Decisions[0].SecondSplitKey)
+			require.Equal(t, 2, result.Decisions[0].RouteDelta)
+			require.Empty(t, result.Events)
+		})
+	}
+}
+
+func TestTopKeyIsolationDeclinesConservativelyAndFallsBackToP50(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1000, 0)
+	route := testRoute(1, 1, "a", "z")
+
+	tests := []struct {
+		name       string
+		snapshot   keyviz.KeyvizHotKeysSnapshot
+		floor      float64
+		wantReason IsolationDeclineReason
+	}{
+		{
+			name: "absolute floor",
+			snapshot: keyviz.KeyvizHotKeysSnapshot{SampledN: 100, SampleRate: 1, Capacity: 100,
+				Entries: []keyviz.KeyvizHotKeyEntry{{Key: []byte("m"), Count: 91}}},
+			floor:      100,
+			wantReason: IsolationDeclineAbsoluteFloor,
+		},
+		{
+			name: "space saving uncertainty",
+			snapshot: keyviz.KeyvizHotKeysSnapshot{SampledN: 100, SampleRate: 1, Capacity: 10,
+				Entries: []keyviz.KeyvizHotKeyEntry{{Key: []byte("m"), Count: 85}}},
+			floor:      50,
+			wantReason: IsolationDeclineTopKErrorBound,
+		},
+		{
+			name: "degraded queue",
+			snapshot: keyviz.KeyvizHotKeysSnapshot{SampledN: 100, SampleRate: 1, Capacity: 100, DroppedSamples: 1,
+				Entries: []keyviz.KeyvizHotKeyEntry{{Key: []byte("m"), Count: 100}}},
+			floor:      50,
+			wantReason: IsolationDeclineTopKDegraded,
+		},
+		{
+			name:       "empty sketch",
+			snapshot:   keyviz.KeyvizHotKeysSnapshot{SampleRate: 1, Capacity: 100},
+			floor:      50,
+			wantReason: IsolationDeclineTopKInsufficient,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			window := topKeyWindow(at, time.Minute, route, 100, tc.snapshot)
+			cfg := testConfig()
+			cfg.TopKeyAbsoluteFloor = tc.floor
+
+			result := Evaluate(cfg, NewDetectorState(), Input{
+				Routes: []distribution.RouteDescriptor{route}, Windows: []ColumnWindow{window}, Now: at,
+			})
+
+			require.Len(t, result.Decisions, 1)
+			require.Equal(t, SplitOriginP50FirstBucketHi, result.Decisions[0].SplitOrigin)
+			requireIsolationEvent(t, result.Events, 1, tc.wantReason)
+		})
+	}
+}
+
+func TestTopKeySnapshotRequiresExactCommittedWindow(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1100, 0)
+	route := testRoute(1, 1, "a", "z")
+	window := topKeyWindow(at, time.Minute, route, 100, keyviz.KeyvizHotKeysSnapshot{
+		SampledN: 100, SampleRate: 1, Capacity: 100,
+		Entries: []keyviz.KeyvizHotKeyEntry{{Key: []byte("m"), Count: 91}},
+	})
+	window.Column.HotKeys[0].WindowStart = window.Column.WindowStart.Add(time.Second)
+
+	result := Evaluate(testConfig(), NewDetectorState(), Input{
+		Routes: []distribution.RouteDescriptor{route}, Windows: []ColumnWindow{window}, Now: at,
+	})
+
+	require.Len(t, result.Decisions, 1)
+	require.Equal(t, SplitOriginP50FirstBucketHi, result.Decisions[0].SplitOrigin)
+}
+
+func TestTopKeyIsolationBoundaryForms(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1200, 0)
+	tests := []struct {
+		name       string
+		route      distribution.RouteDescriptor
+		hotKey     []byte
+		wantOrigin SplitOrigin
+		wantKey    []byte
+		wantSecond []byte
+		wantDelta  int
+		wantNone   bool
+	}{
+		{name: "compound", route: testRoute(1, 1, "a", "z"), hotKey: []byte("m"),
+			wantOrigin: SplitOriginIsolationCompound, wantKey: []byte("m"), wantSecond: []byte{'m', 0}, wantDelta: 2},
+		{name: "lower edge", route: testRoute(1, 1, "m", "z"), hotKey: []byte("m"),
+			wantOrigin: SplitOriginIsolationSingleLowerEdge, wantKey: []byte{'m', 0}, wantDelta: 1},
+		{name: "lower edge unbounded", route: testRouteNilEnd(1, 1, "m"), hotKey: []byte("m"),
+			wantOrigin: SplitOriginIsolationSingleLowerEdge, wantKey: []byte{'m', 0}, wantDelta: 1},
+		{name: "upper edge", route: testRoute(1, 1, "a", "m\x00"), hotKey: []byte("m"),
+			wantOrigin: SplitOriginIsolationSingleUpperEdge, wantKey: []byte("m"), wantDelta: 1},
+		{name: "already isolated", route: testRoute(1, 1, "m", "m\x00"), hotKey: []byte("m"), wantNone: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			window := topKeyOnlyWindow(at, time.Minute, tc.route, 100, tc.hotKey)
+			result := Evaluate(testConfig(), NewDetectorState(), Input{
+				Routes: []distribution.RouteDescriptor{tc.route}, Windows: []ColumnWindow{window}, Now: at,
+			})
+			if tc.wantNone {
+				require.Empty(t, result.Decisions)
+				return
+			}
+			require.Len(t, result.Decisions, 1)
+			require.Equal(t, tc.wantOrigin, result.Decisions[0].SplitOrigin)
+			require.Equal(t, tc.wantKey, result.Decisions[0].SplitKey)
+			require.Equal(t, tc.wantSecond, result.Decisions[0].SecondSplitKey)
+			require.Equal(t, tc.wantDelta, result.Decisions[0].RouteDelta)
+		})
+	}
+}
+
+func TestCompoundIsolationHonorsActualRouteDelta(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1300, 0)
+	routes := []distribution.RouteDescriptor{
+		testRoute(1, 1, "a", "m"),
+		testRoute(2, 1, "m", "z"),
+	}
+	window := topKeyOnlyWindow(at, time.Minute, routes[0], 100, []byte("g"))
+	cfg := testConfig()
+	cfg.MaxRoutes = 3
+
+	result := Evaluate(cfg, NewDetectorState(), Input{Routes: routes, Windows: []ColumnWindow{window}, Now: at})
+
+	require.Empty(t, result.Decisions)
+	requireEvent(t, result.Events, 1, SkipReasonRouteCap)
+}
+
+func TestEvidenceFenceRejectsPreLeadershipAndStraddlingWindows(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1400, 0)
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+	fence := EvidenceFence{
+		ProcessedThrough:     base,
+		WindowStartNotBefore: base.Add(30 * time.Second),
+	}
+	windows := []ColumnWindow{
+		hotWindowWithStart(base, base.Add(-time.Minute)),
+		hotWindowWithStart(base.Add(time.Minute), base),
+		hotWindowWithStart(base.Add(2*time.Minute), base.Add(time.Minute)),
+	}
+	state := NewDetectorState()
+
+	first := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route}, Windows: windows,
+		EvidenceFences: map[uint64]EvidenceFence{1: fence}, Now: base.Add(2 * time.Minute),
+	})
+
+	require.Empty(t, first.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	requireEvent(t, first.Events, 1, SkipReasonLeadershipFence)
+
+	final := Evaluate(cfg, state, Input{
+		Routes:         []distribution.RouteDescriptor{route},
+		Windows:        []ColumnWindow{hotWindowWithStart(base.Add(3*time.Minute), base.Add(2*time.Minute))},
+		EvidenceFences: map[uint64]EvidenceFence{1: fence}, Now: base.Add(3 * time.Minute),
+	})
+
+	require.Len(t, final.Decisions, 1)
+}
+
 func testConfig() Config {
 	return Config{
 		WriteWeight:       1,
@@ -664,11 +900,57 @@ func testWindow(at time.Time, duration time.Duration, rows ...keyviz.MatrixRow) 
 	}
 }
 
+func topKeyWindow(
+	at time.Time,
+	duration time.Duration,
+	route distribution.RouteDescriptor,
+	writes uint64,
+	snapshot keyviz.KeyvizHotKeysSnapshot,
+) ColumnWindow {
+	window := testWindow(at, duration,
+		testRow(route.RouteID, route.GroupID, 0, 2, string(route.Start), "m", writes/2, 0),
+		testRow(route.RouteID, route.GroupID, 1, 2, "m", string(route.End), writes-writes/2, 0),
+	)
+	window.Column.WindowStart = at.Add(-duration)
+	snapshot.RouteID = route.RouteID
+	snapshot.WindowStart = window.Column.WindowStart
+	snapshot.WindowEnd = at
+	window.Column.HotKeys = []keyviz.KeyvizHotKeysSnapshot{snapshot}
+	return window
+}
+
+func topKeyOnlyWindow(
+	at time.Time,
+	duration time.Duration,
+	route distribution.RouteDescriptor,
+	writes uint64,
+	hotKey []byte,
+) ColumnWindow {
+	window := testWindow(at, duration, keyviz.MatrixRow{
+		RouteID: route.RouteID, RaftGroupID: route.GroupID, Start: route.Start, End: route.End,
+		SubBucketCount: 1, Writes: writes,
+	})
+	window.Column.WindowStart = at.Add(-duration)
+	window.Column.HotKeys = []keyviz.KeyvizHotKeysSnapshot{{
+		RouteID: route.RouteID, WindowStart: window.Column.WindowStart, WindowEnd: at,
+		SampledN: 100, SampleRate: 1, Capacity: 100,
+		Entries: []keyviz.KeyvizHotKeyEntry{{Key: hotKey, Count: 91}},
+	}}
+	return window
+}
+
 func hotWindow(at time.Time) ColumnWindow {
 	return testWindow(at, time.Minute,
 		testRow(1, 1, 0, 2, "a", "m", 60, 0),
 		testRow(1, 1, 1, 2, "m", "z", 60, 0),
 	)
+}
+
+func hotWindowWithStart(at, start time.Time) ColumnWindow {
+	window := hotWindow(at)
+	window.Column.WindowStart = start
+	window.Duration = at.Sub(start)
+	return window
 }
 
 func coldWindow(at time.Time) ColumnWindow {
@@ -711,4 +993,14 @@ func requireEvent(t *testing.T, events []Event, routeID uint64, reason SkipReaso
 		}
 	}
 	t.Fatalf("missing event route_id=%d reason=%s in %#v", routeID, reason, events)
+}
+
+func requireIsolationEvent(t *testing.T, events []Event, routeID uint64, reason IsolationDeclineReason) {
+	t.Helper()
+	for _, event := range events {
+		if event.RouteID == routeID && event.IsolationReason == reason {
+			return
+		}
+	}
+	t.Fatalf("missing isolation event route_id=%d reason=%s in %#v", routeID, reason, events)
 }

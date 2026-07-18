@@ -2,6 +2,7 @@ package autosplit
 
 import (
 	"bytes"
+	"math"
 	"sort"
 	"time"
 
@@ -10,56 +11,78 @@ import (
 )
 
 const (
-	defaultWriteWeight       = 4
-	defaultReadWeight        = 1
-	defaultThresholdOpsMin   = 50_000
-	defaultCandidateWindows  = 3
-	defaultMaxRoutes         = 1024
-	defaultMaxSplitsPerCycle = 1
-	opsPerMinute             = 60
+	defaultWriteWeight        = 4
+	defaultReadWeight         = 1
+	defaultThresholdOpsMin    = 50_000
+	defaultCandidateWindows   = 3
+	defaultMaxRoutes          = 1024
+	defaultMaxSplitsPerCycle  = 1
+	defaultTopKeyShare        = 0.8
+	defaultTopKeyFloorDivisor = 2
+	opsPerMinute              = 60
 )
 
 // SplitOrigin describes how an automatic split key was selected.
 type SplitOrigin string
 
 const (
-	SplitOriginP50Mid           SplitOrigin = "p50_mid"
-	SplitOriginP50LastBucketLo  SplitOrigin = "p50_last_bucket_lo"
-	SplitOriginP50FirstBucketHi SplitOrigin = "p50_first_bucket_hi"
+	SplitOriginP50Mid                   SplitOrigin = "p50_mid"
+	SplitOriginP50LastBucketLo          SplitOrigin = "p50_last_bucket_lo"
+	SplitOriginP50FirstBucketHi         SplitOrigin = "p50_first_bucket_hi"
+	SplitOriginIsolationCompound        SplitOrigin = "isolation_compound"
+	SplitOriginIsolationSingleLowerEdge SplitOrigin = "isolation_single_lower_edge"
+	SplitOriginIsolationSingleUpperEdge SplitOrigin = "isolation_single_upper_edge"
+)
+
+// IsolationDeclineReason explains why aligned Top-K evidence fell through to
+// the sub-range p50 selector.
+type IsolationDeclineReason string
+
+const (
+	IsolationDeclineAbsoluteFloor    IsolationDeclineReason = "absolute_floor"
+	IsolationDeclineTopKDegraded     IsolationDeclineReason = "topk_degraded"
+	IsolationDeclineTopKInsufficient IsolationDeclineReason = "topk_insufficient"
+	IsolationDeclineTopKErrorBound   IsolationDeclineReason = "topk_error_bound"
 )
 
 // SkipReason explains why a route did not produce a split decision.
 type SkipReason string
 
 const (
-	SkipReasonNoSplitKey      SkipReason = "no_split_key"
-	SkipReasonRouteCap        SkipReason = "route_cap"
-	SkipReasonBudgetExhausted SkipReason = "budget_exhausted"
-	SkipReasonNonActiveState  SkipReason = "non_active_state"
-	SkipReasonAggregateRow    SkipReason = "aggregate_row"
-	SkipReasonCooldown        SkipReason = "cooldown"
-	SkipReasonInvalidWindow   SkipReason = "invalid_window"
+	SkipReasonNoSplitKey         SkipReason = "no_split_key"
+	SkipReasonRouteCap           SkipReason = "route_cap"
+	SkipReasonBudgetExhausted    SkipReason = "budget_exhausted"
+	SkipReasonNonActiveState     SkipReason = "non_active_state"
+	SkipReasonAggregateRow       SkipReason = "aggregate_row"
+	SkipReasonCooldown           SkipReason = "cooldown"
+	SkipReasonInvalidWindow      SkipReason = "invalid_window"
+	SkipReasonLeadershipFence    SkipReason = "leadership_fence"
+	SkipReasonUnsplittableHotKey SkipReason = "unsplittable_hot_key"
 )
 
 // Config controls the pure detector and scheduler admission checks.
 type Config struct {
-	WriteWeight       float64
-	ReadWeight        float64
-	ThresholdOpsMin   float64
-	CandidateWindows  int
-	MaxRoutes         int
-	MaxSplitsPerCycle int
+	WriteWeight         float64
+	ReadWeight          float64
+	ThresholdOpsMin     float64
+	CandidateWindows    int
+	MaxRoutes           int
+	MaxSplitsPerCycle   int
+	TopKeyShare         float64
+	TopKeyAbsoluteFloor float64
 }
 
 // DefaultConfig returns the M3 detector defaults from the design doc.
 func DefaultConfig() Config {
 	return Config{
-		WriteWeight:       defaultWriteWeight,
-		ReadWeight:        defaultReadWeight,
-		ThresholdOpsMin:   defaultThresholdOpsMin,
-		CandidateWindows:  defaultCandidateWindows,
-		MaxRoutes:         defaultMaxRoutes,
-		MaxSplitsPerCycle: defaultMaxSplitsPerCycle,
+		WriteWeight:         defaultWriteWeight,
+		ReadWeight:          defaultReadWeight,
+		ThresholdOpsMin:     defaultThresholdOpsMin,
+		CandidateWindows:    defaultCandidateWindows,
+		MaxRoutes:           defaultMaxRoutes,
+		MaxSplitsPerCycle:   defaultMaxSplitsPerCycle,
+		TopKeyShare:         defaultTopKeyShare,
+		TopKeyAbsoluteFloor: defaultThresholdOpsMin / defaultTopKeyFloorDivisor,
 	}
 }
 
@@ -82,7 +105,8 @@ type RouteLoad struct {
 // Runtime integration passes only committed windows with a proven duration.
 // keyviz.MatrixColumn.WindowStart is authoritative when present; legacy
 // in-memory rows may be accepted only when the previous contiguous column proves
-// the lower boundary.
+// the lower boundary. MatrixColumn carries the exact committed (WindowStart,
+// At] boundary used to align route load and Top-K evidence.
 type ColumnWindow struct {
 	Column   keyviz.MatrixColumn
 	Duration time.Duration
@@ -90,36 +114,52 @@ type ColumnWindow struct {
 
 // Input is one pure detector evaluation.
 type Input struct {
-	Routes  []distribution.RouteDescriptor
-	Windows []ColumnWindow
-	Now     time.Time
+	Routes         []distribution.RouteDescriptor
+	Windows        []ColumnWindow
+	EvidenceFences map[uint64]EvidenceFence
+	Now            time.Time
+	LiveRouteCount int
+}
+
+// EvidenceFence excludes sampler history that was not collected wholly while
+// this node held the relevant default-group and shard-group leadership.
+type EvidenceFence struct {
+	ProcessedThrough     time.Time
+	WindowStartNotBefore time.Time
 }
 
 // Decision is a scheduler-ready automatic split decision.
 type Decision struct {
-	RouteID       uint64
-	SplitKey      []byte
-	SplitOrigin   SplitOrigin
-	TargetGroupID uint64
-	RouteDelta    int
+	RouteID        uint64
+	SplitKey       []byte
+	SecondSplitKey []byte
+	SplitOrigin    SplitOrigin
+	TargetGroupID  uint64
+	RouteDelta     int
+	RouteStart     []byte
+	RouteEnd       []byte
+	RouteGroupID   uint64
 
-	ScoreOpsMin     float64
-	ConsecutiveOver int
-	LeftLoad        float64
-	RightLoad       float64
+	ScoreOpsMin          float64
+	PerColumnScoreOpsMin float64
+	ConsecutiveOver      int
+	LeftLoad             float64
+	RightLoad            float64
 }
 
 // Event records a deterministic skip or reset reason from an evaluation.
 type Event struct {
-	RouteID uint64
-	Reason  SkipReason
-	At      time.Time
+	RouteID         uint64
+	Reason          SkipReason
+	IsolationReason IsolationDeclineReason
+	At              time.Time
 }
 
 // Result is the complete output of one detector evaluation.
 type Result struct {
 	Decisions []Decision
 	Events    []Event
+	Promoted  int
 }
 
 // RouteStatus is the observable detector state for one route.
@@ -131,12 +171,16 @@ type RouteStatus struct {
 
 // DetectorState carries leader-local confidence and cooldown state.
 type DetectorState struct {
-	routes map[uint64]RouteStatus
+	routes       map[uint64]RouteStatus
+	scoreHistory map[uint64][]scoreSample
 }
 
 // NewDetectorState creates empty detector state.
 func NewDetectorState() *DetectorState {
-	return &DetectorState{routes: map[uint64]RouteStatus{}}
+	return &DetectorState{
+		routes:       map[uint64]RouteStatus{},
+		scoreHistory: map[uint64][]scoreSample{},
+	}
 }
 
 // RouteStatus returns the current detector state for routeID.
@@ -156,6 +200,7 @@ func (s *DetectorState) ResetConfidence(routeID uint64) {
 	status := s.routes[routeID]
 	status.ConsecutiveOver = 0
 	s.routes[routeID] = status
+	delete(s.scoreHistory, routeID)
 }
 
 // ApplyRouteState applies a catalog state transition to the detector state.
@@ -178,6 +223,7 @@ func (s *DetectorState) SetCooldown(routeID uint64, until time.Time) {
 	status.CooldownUntil = until
 	status.ConsecutiveOver = 0
 	s.routes[routeID] = status
+	delete(s.scoreHistory, routeID)
 }
 
 // AggregateColumnRows groups all non-aggregate rows by (RouteID, RaftGroupID).
@@ -216,9 +262,13 @@ func Evaluate(cfg Config, state *DetectorState, in Input) Result {
 	state.gc(live)
 
 	for _, window := range windows {
-		processWindow(cfg, state, active, window, in.Now, latestHot, &result)
+		processWindow(cfg, state, active, window, in.EvidenceFences, in.Now, latestHot, &result)
 	}
-	selectDecisions(cfg, state, live, latestHot, &result)
+	liveRouteCount := in.LiveRouteCount
+	if liveRouteCount <= 0 || liveRouteCount < len(live) {
+		liveRouteCount = len(live)
+	}
+	selectDecisions(cfg, state, liveRouteCount, latestHot, &result)
 
 	return result
 }
@@ -255,6 +305,7 @@ func processWindow(
 	state *DetectorState,
 	active []distribution.RouteDescriptor,
 	window ColumnWindow,
+	fences map[uint64]EvidenceFence,
 	now time.Time,
 	latestHot map[uint64]candidate,
 	result *Result,
@@ -274,7 +325,7 @@ func processWindow(
 	}
 
 	for _, route := range active {
-		processRouteWindow(cfg, state, route, window, now, aggregated, latestHot, result)
+		processRouteWindow(cfg, state, route, window, fences[route.RouteID], now, aggregated, latestHot, result)
 	}
 }
 
@@ -283,6 +334,7 @@ func processRouteWindow(
 	state *DetectorState,
 	route distribution.RouteDescriptor,
 	window ColumnWindow,
+	fence EvidenceFence,
 	now time.Time,
 	aggregated columnAggregation,
 	latestHot map[uint64]candidate,
@@ -290,6 +342,22 @@ func processRouteWindow(
 ) {
 	status := state.routes[route.RouteID]
 	if !window.Column.At.After(status.LastProcessedAt) {
+		return
+	}
+	windowStart := window.Column.WindowStart
+	if windowStart.IsZero() {
+		windowStart = window.Column.At.Add(-window.Duration)
+	}
+	if !fence.ProcessedThrough.IsZero() && !window.Column.At.After(fence.ProcessedThrough) {
+		state.resetConfidenceThrough(route.RouteID, window.Column.At)
+		delete(latestHot, route.RouteID)
+		result.Events = append(result.Events, Event{RouteID: route.RouteID, Reason: SkipReasonLeadershipFence, At: window.Column.At})
+		return
+	}
+	if !fence.WindowStartNotBefore.IsZero() && windowStart.Before(fence.WindowStartNotBefore) {
+		state.resetConfidenceThrough(route.RouteID, window.Column.At)
+		delete(latestHot, route.RouteID)
+		result.Events = append(result.Events, Event{RouteID: route.RouteID, Reason: SkipReasonLeadershipFence, At: window.Column.At})
 		return
 	}
 	if now.Before(status.CooldownUntil) || windowOverlapsCooldown(window, status.CooldownUntil) {
@@ -304,6 +372,8 @@ func processRouteWindow(
 	key := RouteKey{RouteID: route.RouteID, RaftGroupID: route.GroupID}
 	load := aggregated.loads[key]
 	score := scoreOpsPerMinute(load, window.Duration, cfg)
+	state.recordScore(route.RouteID, load, window.Duration, cfg.CandidateWindows)
+	smoothedScore := state.smoothedScore(route.RouteID, cfg)
 	if score < cfg.ThresholdOpsMin {
 		status.ConsecutiveOver = 0
 		status.LastProcessedAt = window.Column.At
@@ -316,17 +386,21 @@ func processRouteWindow(
 	status.LastProcessedAt = window.Column.At
 	state.routes[route.RouteID] = status
 	latestHot[route.RouteID] = candidate{
-		route:           route,
-		rows:            aggregated.rows[key],
-		scoreOpsMin:     score,
-		consecutiveOver: status.ConsecutiveOver,
+		route:                route,
+		rows:                 aggregated.rows[key],
+		load:                 load,
+		duration:             window.Duration,
+		hotKeys:              alignedHotKeys(window.Column, route.RouteID),
+		perColumnScoreOpsMin: score,
+		smoothedScoreOpsMin:  smoothedScore,
+		consecutiveOver:      status.ConsecutiveOver,
 	}
 }
 
 func selectDecisions(
 	cfg Config,
 	state *DetectorState,
-	live map[uint64]distribution.RouteDescriptor,
+	liveRouteCount int,
 	latestHot map[uint64]candidate,
 	result *Result,
 ) {
@@ -337,30 +411,55 @@ func selectDecisions(
 		}
 	}
 	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].scoreOpsMin == ordered[j].scoreOpsMin {
+		if ordered[i].perColumnScoreOpsMin == ordered[j].perColumnScoreOpsMin {
 			return ordered[i].route.RouteID < ordered[j].route.RouteID
 		}
-		return ordered[i].scoreOpsMin > ordered[j].scoreOpsMin
+		return ordered[i].perColumnScoreOpsMin > ordered[j].perColumnScoreOpsMin
 	})
 
 	reservedDelta := 0
+	result.Promoted = len(ordered)
 	for _, candidate := range ordered {
 		if len(result.Decisions) >= cfg.MaxSplitsPerCycle {
 			result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: SkipReasonBudgetExhausted})
 			continue
 		}
-		decision, ok := selectP50Decision(cfg, candidate)
+		decision, ok := admitCandidate(cfg, liveRouteCount, reservedDelta, candidate, result)
 		if !ok {
-			result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: SkipReasonNoSplitKey})
-			continue
-		}
-		if cfg.MaxRoutes > 0 && len(live)+reservedDelta+decision.RouteDelta > cfg.MaxRoutes {
-			result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: SkipReasonRouteCap})
 			continue
 		}
 		reservedDelta += decision.RouteDelta
 		result.Decisions = append(result.Decisions, decision)
 	}
+}
+
+func admitCandidate(
+	cfg Config,
+	liveRoutes int,
+	reservedDelta int,
+	candidate candidate,
+	result *Result,
+) (Decision, bool) {
+	decision, isolationReason, terminalReason, ok := selectDecision(cfg, candidate)
+	if isolationReason != "" {
+		result.Events = append(result.Events, Event{
+			RouteID:         candidate.route.RouteID,
+			IsolationReason: isolationReason,
+		})
+	}
+	if terminalReason != "" {
+		result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: terminalReason})
+		return Decision{}, false
+	}
+	if !ok {
+		result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: SkipReasonNoSplitKey})
+		return Decision{}, false
+	}
+	if cfg.MaxRoutes > 0 && liveRoutes+reservedDelta+decision.RouteDelta > cfg.MaxRoutes {
+		result.Events = append(result.Events, Event{RouteID: candidate.route.RouteID, Reason: SkipReasonRouteCap})
+		return Decision{}, false
+	}
+	return decision, true
 }
 
 func windowOverlapsCooldown(window ColumnWindow, cooldownUntil time.Time) bool {
@@ -371,10 +470,19 @@ func windowOverlapsCooldown(window ColumnWindow, cooldownUntil time.Time) bool {
 }
 
 type candidate struct {
-	route           distribution.RouteDescriptor
-	rows            []keyviz.MatrixRow
-	scoreOpsMin     float64
-	consecutiveOver int
+	route                distribution.RouteDescriptor
+	rows                 []keyviz.MatrixRow
+	load                 RouteLoad
+	duration             time.Duration
+	hotKeys              []keyviz.KeyvizHotKeysSnapshot
+	perColumnScoreOpsMin float64
+	smoothedScoreOpsMin  float64
+	consecutiveOver      int
+}
+
+type scoreSample struct {
+	load     RouteLoad
+	duration time.Duration
 }
 
 type columnAggregation struct {
@@ -386,6 +494,9 @@ type columnAggregation struct {
 func (s *DetectorState) ensure() {
 	if s.routes == nil {
 		s.routes = map[uint64]RouteStatus{}
+	}
+	if s.scoreHistory == nil {
+		s.scoreHistory = map[uint64][]scoreSample{}
 	}
 }
 
@@ -400,6 +511,7 @@ func (s *DetectorState) resetConfidenceThrough(routeID uint64, through time.Time
 		status.LastProcessedAt = through
 	}
 	s.routes[routeID] = status
+	delete(s.scoreHistory, routeID)
 }
 
 func (s *DetectorState) resetConfidenceAt(routeID uint64, at time.Time) bool {
@@ -414,6 +526,7 @@ func (s *DetectorState) resetConfidenceAt(routeID uint64, at time.Time) bool {
 	status.ConsecutiveOver = 0
 	status.LastProcessedAt = at
 	s.routes[routeID] = status
+	delete(s.scoreHistory, routeID)
 	return true
 }
 
@@ -421,8 +534,34 @@ func (s *DetectorState) gc(live map[uint64]distribution.RouteDescriptor) {
 	for routeID := range s.routes {
 		if _, ok := live[routeID]; !ok {
 			delete(s.routes, routeID)
+			delete(s.scoreHistory, routeID)
 		}
 	}
+}
+
+func (s *DetectorState) recordScore(routeID uint64, load RouteLoad, duration time.Duration, limit int) {
+	if duration <= 0 || limit <= 0 {
+		return
+	}
+	history := s.scoreHistory[routeID]
+	history = append(history, scoreSample{load: load, duration: duration})
+	if len(history) > limit {
+		history = history[len(history)-limit:]
+	}
+	s.scoreHistory[routeID] = history
+}
+
+func (s *DetectorState) smoothedScore(routeID uint64, cfg Config) float64 {
+	var load RouteLoad
+	var duration time.Duration
+	for _, sample := range s.scoreHistory[routeID] {
+		load.Reads += sample.load.Reads
+		load.Writes += sample.load.Writes
+		load.ReadBytes += sample.load.ReadBytes
+		load.WriteBytes += sample.load.WriteBytes
+		duration += sample.duration
+	}
+	return scoreOpsPerMinute(load, duration, cfg)
 }
 
 func (cfg Config) withDefaults() Config {
@@ -442,6 +581,12 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.MaxSplitsPerCycle <= 0 {
 		cfg.MaxSplitsPerCycle = defaults.MaxSplitsPerCycle
+	}
+	if cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
+		cfg.TopKeyShare = defaults.TopKeyShare
+	}
+	if cfg.TopKeyAbsoluteFloor <= 0 {
+		cfg.TopKeyAbsoluteFloor = cfg.ThresholdOpsMin / defaultTopKeyFloorDivisor
 	}
 	return cfg
 }
@@ -478,22 +623,193 @@ func scoreOpsPerMinute(load RouteLoad, duration time.Duration, cfg Config) float
 	return writeRate*cfg.WriteWeight + readRate*cfg.ReadWeight
 }
 
+func alignedHotKeys(col keyviz.MatrixColumn, routeID uint64) []keyviz.KeyvizHotKeysSnapshot {
+	out := make([]keyviz.KeyvizHotKeysSnapshot, 0, len(col.HotKeys))
+	for _, snapshot := range col.HotKeys {
+		if snapshot.RouteID != routeID ||
+			!snapshot.WindowStart.Equal(col.WindowStart) ||
+			!snapshot.WindowEnd.Equal(col.At) {
+			continue
+		}
+		out = append(out, snapshot)
+	}
+	return out
+}
+
+func selectDecision(cfg Config, candidate candidate) (Decision, IsolationDeclineReason, SkipReason, bool) {
+	decision, reason, terminalReason, considered, ok := selectTopKeyDecision(cfg, candidate)
+	if ok {
+		return decision, "", "", true
+	}
+	if terminalReason != "" {
+		return Decision{}, reason, terminalReason, false
+	}
+	p50, p50OK := selectP50Decision(cfg, candidate)
+	if considered {
+		return p50, reason, "", p50OK
+	}
+	return p50, "", "", p50OK
+}
+
+type hotKeyEstimate struct {
+	key   []byte
+	lower float64
+	upper float64
+}
+
+func selectTopKeyDecision(cfg Config, candidate candidate) (Decision, IsolationDeclineReason, SkipReason, bool, bool) {
+	if len(candidate.hotKeys) == 0 || candidate.load.Writes == 0 || candidate.duration <= 0 {
+		return Decision{}, "", "", false, false
+	}
+
+	estimates, reason := buildHotKeyEstimates(candidate.hotKeys)
+	if reason != "" {
+		return Decision{}, reason, "", true, false
+	}
+	if len(estimates) == 0 {
+		return Decision{}, IsolationDeclineTopKInsufficient, "", true, false
+	}
+
+	seconds := candidate.duration.Seconds()
+	writes := float64(candidate.load.Writes)
+	for _, estimate := range sortedHotKeyEstimates(estimates) {
+		decision, isolationReason, terminalReason, matched, ok := evaluateHotKeyEstimate(
+			cfg, candidate, estimate, writes, seconds,
+		)
+		if matched {
+			return decision, isolationReason, terminalReason, true, ok
+		}
+	}
+	return Decision{}, "", "", true, false
+}
+
+func buildHotKeyEstimates(
+	snapshots []keyviz.KeyvizHotKeysSnapshot,
+) (map[string]hotKeyEstimate, IsolationDeclineReason) {
+	estimates := make(map[string]hotKeyEstimate)
+	for _, snapshot := range snapshots {
+		if snapshot.DroppedSamples > 0 || snapshot.SkippedLongKeys > 0 {
+			return nil, IsolationDeclineTopKDegraded
+		}
+		if snapshot.Capacity <= 0 || snapshot.SampledN == 0 || snapshot.SampleRate <= 0 {
+			return nil, IsolationDeclineTopKInsufficient
+		}
+		errorBound := uint64(math.Ceil(float64(snapshot.SampledN) / float64(snapshot.Capacity)))
+		for _, entry := range snapshot.Entries {
+			lowerCount := uint64(0)
+			if entry.Count > errorBound {
+				lowerCount = entry.Count - errorBound
+			}
+			key := string(entry.Key)
+			estimate := estimates[key]
+			if estimate.key == nil {
+				estimate.key = distribution.CloneBytes(entry.Key)
+			}
+			estimate.lower += float64(lowerCount) * float64(snapshot.SampleRate)
+			estimate.upper += float64(entry.Count) * float64(snapshot.SampleRate)
+			estimates[key] = estimate
+		}
+	}
+	return estimates, ""
+}
+
+func sortedHotKeyEstimates(estimates map[string]hotKeyEstimate) []hotKeyEstimate {
+	ordered := make([]hotKeyEstimate, 0, len(estimates))
+	for _, estimate := range estimates {
+		ordered = append(ordered, estimate)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].lower == ordered[j].lower {
+			return bytes.Compare(ordered[i].key, ordered[j].key) < 0
+		}
+		return ordered[i].lower > ordered[j].lower
+	})
+	return ordered
+}
+
+func evaluateHotKeyEstimate(
+	cfg Config,
+	candidate candidate,
+	estimate hotKeyEstimate,
+	writes float64,
+	seconds float64,
+) (Decision, IsolationDeclineReason, SkipReason, bool, bool) {
+	lowerShare := math.Min(estimate.lower, writes) / writes
+	upperShare := math.Min(estimate.upper, writes) / writes
+	lowerContribution := estimate.lower / seconds * opsPerMinute * cfg.WriteWeight
+	upperContribution := estimate.upper / seconds * opsPerMinute * cfg.WriteWeight
+	if lowerShare < cfg.TopKeyShare {
+		if upperShare >= cfg.TopKeyShare && upperContribution >= cfg.TopKeyAbsoluteFloor {
+			return Decision{}, IsolationDeclineTopKErrorBound, "", true, false
+		}
+		return Decision{}, "", "", false, false
+	}
+	if lowerContribution < cfg.TopKeyAbsoluteFloor {
+		return Decision{}, IsolationDeclineAbsoluteFloor, "", true, false
+	}
+	decision, ok := isolationDecision(candidate, estimate.key)
+	if !ok {
+		return Decision{}, "", SkipReasonUnsplittableHotKey, true, false
+	}
+	return decision, "", "", true, true
+}
+
+func isolationDecision(candidate candidate, hotKey []byte) (Decision, bool) {
+	route := candidate.route
+	successor := append(distribution.CloneBytes(hotKey), 0)
+	decision := baseDecision(candidate)
+
+	switch {
+	case bytes.Equal(hotKey, route.Start):
+		if route.End != nil && bytes.Compare(successor, route.End) >= 0 {
+			return Decision{}, false
+		}
+		decision.SplitKey = successor
+		decision.SplitOrigin = SplitOriginIsolationSingleLowerEdge
+		decision.RouteDelta = 1
+	case !splitKeyInsideRoute(route, hotKey):
+		return Decision{}, false
+	case route.End != nil && bytes.Compare(successor, route.End) >= 0:
+		decision.SplitKey = distribution.CloneBytes(hotKey)
+		decision.SplitOrigin = SplitOriginIsolationSingleUpperEdge
+		decision.RouteDelta = 1
+	default:
+		decision.SplitKey = distribution.CloneBytes(hotKey)
+		decision.SecondSplitKey = successor
+		decision.SplitOrigin = SplitOriginIsolationCompound
+		decision.RouteDelta = 2
+	}
+	if !splitKeyInsideRoute(route, decision.SplitKey) {
+		return Decision{}, false
+	}
+	return decision, true
+}
+
+func baseDecision(candidate candidate) Decision {
+	return Decision{
+		RouteID:              candidate.route.RouteID,
+		RouteStart:           distribution.CloneBytes(candidate.route.Start),
+		RouteEnd:             distribution.CloneBytes(candidate.route.End),
+		RouteGroupID:         candidate.route.GroupID,
+		TargetGroupID:        0,
+		ScoreOpsMin:          candidate.smoothedScoreOpsMin,
+		PerColumnScoreOpsMin: candidate.perColumnScoreOpsMin,
+		ConsecutiveOver:      candidate.consecutiveOver,
+	}
+}
+
 func selectP50Decision(cfg Config, candidate candidate) (Decision, bool) {
 	key, origin, leftLoad, rightLoad, ok := selectP50SplitKey(cfg, candidate.route, candidate.rows)
 	if !ok {
 		return Decision{}, false
 	}
-	return Decision{
-		RouteID:         candidate.route.RouteID,
-		SplitKey:        key,
-		SplitOrigin:     origin,
-		TargetGroupID:   0,
-		RouteDelta:      1,
-		ScoreOpsMin:     candidate.scoreOpsMin,
-		ConsecutiveOver: candidate.consecutiveOver,
-		LeftLoad:        leftLoad,
-		RightLoad:       rightLoad,
-	}, true
+	decision := baseDecision(candidate)
+	decision.SplitKey = key
+	decision.SplitOrigin = origin
+	decision.RouteDelta = 1
+	decision.LeftLoad = leftLoad
+	decision.RightLoad = rightLoad
+	return decision, true
 }
 
 func selectP50SplitKey(cfg Config, route distribution.RouteDescriptor, rows []keyviz.MatrixRow) ([]byte, SplitOrigin, float64, float64, bool) {

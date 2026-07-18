@@ -20,6 +20,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -526,11 +527,6 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	autoSplitCfg, err := configureRuntimeAutoSplit(coordinate)
-	if err != nil {
-		return err
-	}
-
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -567,11 +563,6 @@ func run() error {
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
 
-	// The local durable watcher is the 100 ms fallback required when the
-	// best-effort leader stream is unavailable or reconnecting.
-	eg.Go(func() error {
-		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
-	})
 	catalogWatchConns := &kv.GRPCConnCache{}
 	cleanup.Add(func() { _ = catalogWatchConns.Close() })
 	eg.Go(func() error {
@@ -591,7 +582,19 @@ func run() error {
 		}),
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
-	startAutoSplitScheduler(runCtx, eg, distCatalog, distServer, coordinate, sampler, autoSplitCfg)
+	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
+		runCtx,
+		eg,
+		distCatalog,
+		cfg.engine,
+		distServer,
+		coordinate,
+		sampler,
+		autosplit.NewPrometheusObserver(metricsRegistry.Registerer()),
+	)
+	if err != nil {
+		return err
+	}
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
 
@@ -627,6 +630,7 @@ func run() error {
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
+		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
 		return err
@@ -1813,6 +1817,9 @@ type serversInput struct {
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
 	keyvizSampler *keyviz.MemSampler
+	// autoSplitRuntime is registered on the authenticated Admin gRPC service
+	// when automatic splitting was configured at process startup.
+	autoSplitRuntime adapter.AutoSplitRuntime
 	// encryptionConfChangeInterceptor is the Stage 7c §3.1
 	// pre-register hook for raftadmin AddVoter/AddLearner.
 	// Constructed in run() where concrete *kv.ShardedCoordinator and
@@ -1827,7 +1834,14 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
+	adminServer, adminGRPCOpts, err := setupAdminService(
+		*raftId,
+		*myAddr,
+		in.runtimes,
+		in.bootstrapServers,
+		in.keyvizSampler,
+		in.autoSplitRuntime,
+	)
 	if err != nil {
 		return err
 	}
@@ -2099,6 +2113,7 @@ func setupAdminService(
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
 	keyvizSampler *keyviz.MemSampler,
+	autoSplitRuntime adapter.AutoSplitRuntime,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -2130,6 +2145,9 @@ func setupAdminService(
 	// operators want the explicit "keyviz disabled" signal.
 	if keyvizSampler != nil {
 		srv.RegisterSampler(keyvizSampler)
+	}
+	if autoSplitRuntime != nil {
+		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
 	}
 	if *adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
@@ -2770,10 +2788,14 @@ func startRaftServers(
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
+	var opts []adapter.InternalOption
 	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
-		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
+		opts = append(opts, adapter.WithInternalTimestampAllocator(alloc))
 	}
-	return nil
+	if observer, ok := coordinate.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
+		opts = append(opts, adapter.WithInternalForwardWriteObserver(observer.ObserveForwardedRequests))
+	}
+	return opts
 }
 
 func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
@@ -3010,8 +3032,23 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 	return route.GroupID, nil
 }
 
-func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
-	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
+func runDistributionCatalogWatcher(
+	ctx context.Context,
+	catalog *distribution.CatalogStore,
+	engine *distribution.Engine,
+	observers ...distribution.CatalogSnapshotObserver,
+) error {
+	var opts []distribution.CatalogWatcherOption
+	if len(observers) > 0 {
+		opts = append(opts, distribution.WithCatalogWatcherSnapshotObserver(func(snapshot distribution.CatalogSnapshot) {
+			for _, observer := range observers {
+				if observer != nil {
+					observer(snapshot)
+				}
+			}
+		}))
+	}
+	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil, opts...); err != nil {
 		return errors.Wrapf(err, "catalog watcher failed")
 	}
 	return nil

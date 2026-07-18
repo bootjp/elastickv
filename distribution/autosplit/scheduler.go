@@ -8,12 +8,15 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -22,14 +25,13 @@ const (
 	DefaultSplitTimeout         = 5 * time.Second
 	DefaultSamplerBuckets       = 16
 	defaultSnapshotLookbackCols = 6
-	minCommittedWindowColumns   = 2
 	snapshotLookbackPaddingCols = 2
 	maxLoggedSplitKeyBytes      = 64
 )
 
-// SnapshotSource supplies the latest route catalog snapshot used for one
+// CatalogSnapshotSource supplies the latest route catalog snapshot used for one
 // detector/scheduler cycle.
-type SnapshotSource interface {
+type CatalogSnapshotSource interface {
 	Snapshot(ctx context.Context) (distribution.CatalogSnapshot, error)
 }
 
@@ -46,11 +48,17 @@ type SplitRequest struct {
 	RouteID                uint64
 	SplitKey               []byte
 	TargetGroupID          uint64
+	ParentStart            []byte
+	ParentEnd              []byte
+	ParentGroupID          uint64
 }
 
-// SplitResult contains the committed catalog version when SplitRange succeeds.
+// SplitResult contains the committed catalog version and children when
+// SplitRange succeeds.
 type SplitResult struct {
 	CatalogVersion uint64
+	Left           distribution.RouteDescriptor
+	Right          distribution.RouteDescriptor
 }
 
 // MatrixSampler is the keyviz surface the scheduler consumes.
@@ -73,17 +81,29 @@ type RouteRegistrar interface {
 // SplitRange calls.
 type KillSwitch func(ctx context.Context) bool
 
+// LeadershipSnapshot reports whether this node owns the catalog key and the
+// current Raft term for that group.
+type LeadershipSnapshot func() (bool, uint64)
+
+// GroupLeadershipSnapshot reports local leadership and term for one shard
+// group.
+type GroupLeadershipSnapshot func(groupID uint64) (bool, uint64)
+
 // SchedulerConfig controls background auto-split execution.
 type SchedulerConfig struct {
-	Enabled        bool
-	Detector       Config
-	EvalInterval   time.Duration
-	SplitCooldown  time.Duration
-	SplitTimeout   time.Duration
-	KillSwitchFile string
-	KillSwitch     KillSwitch
-	IsLeader       func() bool
-	Logger         *slog.Logger
+	Enabled         bool
+	Detector        Config
+	EvalInterval    time.Duration
+	SplitCooldown   time.Duration
+	SplitTimeout    time.Duration
+	KillSwitchFile  string
+	KillSwitch      KillSwitch
+	IsLeader        func() bool
+	Leadership      LeadershipSnapshot
+	GroupLeadership GroupLeadershipSnapshot
+	Logger          *slog.Logger
+	Reconciler      *RouteReconciler
+	Observer        Observer
 }
 
 // SchedulerResult describes one scheduler tick.
@@ -100,15 +120,31 @@ type SchedulerResult struct {
 // SplitRange.
 type Scheduler struct {
 	cfg              SchedulerConfig
-	source           SnapshotSource
+	source           CatalogSnapshotSource
 	splitter         Splitter
 	sampler          MatrixSampler
-	registrar        RouteRegistrar
+	reconciler       *RouteReconciler
 	state            *DetectorState
-	registeredRoutes map[uint64]registeredRoute
 	wasLeader        bool
+	leaderTerm       uint64
 	leaderStartedAt  time.Time
 	leaderWatermark  time.Time
+	catalogVersion   uint64
+	pendingCompounds map[uint64]pendingCompound
+	groupLeadership  map[uint64]groupLeadershipState
+}
+
+type groupLeadershipState struct {
+	leader    bool
+	term      uint64
+	startedAt time.Time
+	watermark time.Time
+}
+
+type pendingCompound struct {
+	parentRouteID uint64
+	intermediate  distribution.RouteDescriptor
+	splitKey      []byte
 }
 
 type registeredRoute struct {
@@ -117,19 +153,45 @@ type registeredRoute struct {
 	groupID uint64
 }
 
+// RouteReconciler keeps a sampler's registered route descriptors synchronized
+// with catalog snapshots. It is safe for the catalog watcher and scheduler to
+// share across goroutines.
+type RouteReconciler struct {
+	mu         sync.Mutex
+	registrar  RouteRegistrar
+	registered map[uint64]registeredRoute
+}
+
+// NewRouteReconciler creates a catalog-to-sampler membership reconciler.
+func NewRouteReconciler(registrar RouteRegistrar) *RouteReconciler {
+	return &RouteReconciler{
+		registrar:  registrar,
+		registered: make(map[uint64]registeredRoute),
+	}
+}
+
 // NewScheduler builds a leader-local scheduler. It is inert when cfg.Enabled is
 // false; callers may still construct it in tests.
-func NewScheduler(cfg SchedulerConfig, source SnapshotSource, splitter Splitter, sampler MatrixSampler, registrar RouteRegistrar) *Scheduler {
+func NewScheduler(cfg SchedulerConfig, source CatalogSnapshotSource, splitter Splitter, sampler MatrixSampler, registrar RouteRegistrar) *Scheduler {
 	cfg = cfg.withDefaults()
-	return &Scheduler{
+	reconciler := cfg.Reconciler
+	if reconciler == nil {
+		reconciler = NewRouteReconciler(registrar)
+	}
+	scheduler := &Scheduler{
 		cfg:              cfg,
 		source:           source,
 		splitter:         splitter,
 		sampler:          sampler,
-		registrar:        registrar,
+		reconciler:       reconciler,
 		state:            NewDetectorState(),
-		registeredRoutes: make(map[uint64]registeredRoute),
+		pendingCompounds: make(map[uint64]pendingCompound),
+		groupLeadership:  make(map[uint64]groupLeadershipState),
 	}
+	if cfg.Observer != nil {
+		cfg.Observer.ObserveState(cfg.Enabled, 0, 0, 0)
+	}
+	return scheduler
 }
 
 // Run ticks until ctx is canceled. Per-cycle errors are logged and retried; a
@@ -153,6 +215,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 // Tick executes one scheduler cycle. Tests call this directly.
 func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, error) {
+	cycleStarted := time.Now()
+	runtimeEnabled := false
+	defer func() {
+		if s != nil && s.cfg.Observer != nil {
+			tracked, cooldown := s.stateCounts(now)
+			s.cfg.Observer.ObserveState(runtimeEnabled, tracked, cooldown, time.Since(cycleStarted))
+		}
+	}()
 	out := SchedulerResult{}
 	if s == nil || !s.cfg.Enabled {
 		return out, nil
@@ -160,45 +230,181 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !s.isLeader() {
-		s.wasLeader = false
+	runtimeEnabled = !s.killSwitchActive(ctx)
+	if !s.ensureLeadership(now) {
 		return out, nil
 	}
-	out.Leader = true
-	if !s.wasLeader {
+	prep, err := s.prepareTick(ctx, now, runtimeEnabled)
+	if err != nil {
+		return out, err
+	}
+	prep.result.Detector = s.evaluateTick(now, prep)
+	return s.finishTick(ctx, runtimeEnabled, prep), nil
+}
+
+type tickPreparation struct {
+	snapshot   distribution.CatalogSnapshot
+	routes     []distribution.RouteDescriptor
+	fences     map[uint64]EvidenceFence
+	usedBudget int
+	catalogGap bool
+	result     SchedulerResult
+}
+
+func (s *Scheduler) ensureLeadership(now time.Time) bool {
+	leader, leaderTerm := s.leadership()
+	if !leader {
+		s.wasLeader = false
+		return false
+	}
+	if !s.wasLeader || (leaderTerm != 0 && leaderTerm != s.leaderTerm) {
 		s.resetForLeadership(now)
 		s.wasLeader = true
 	}
+	s.leaderTerm = leaderTerm
+	return true
+}
 
+func (s *Scheduler) prepareTick(
+	ctx context.Context,
+	now time.Time,
+	runtimeEnabled bool,
+) (tickPreparation, error) {
 	snapshot, err := s.source.Snapshot(ctx)
 	if err != nil {
-		return out, errors.Wrap(err, "autosplit: load catalog snapshot")
+		return tickPreparation{}, errors.Wrap(err, "autosplit: load catalog snapshot")
 	}
-	out.CatalogVersion = snapshot.Version
+	prep := tickPreparation{
+		snapshot:   snapshot,
+		catalogGap: s.catalogVersion != 0 && snapshot.Version != s.catalogVersion,
+		result: SchedulerResult{
+			CatalogVersion: snapshot.Version,
+			Leader:         true,
+		},
+	}
+	prep.routes, prep.fences = s.syncCatalogSnapshot(snapshot, now)
+	if runtimeEnabled {
+		var pendingScheduled, pendingFailed int
+		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget = s.finalizePendingCompounds(ctx, snapshot)
+		prep.result.CatalogVersion = prep.snapshot.Version
+		prep.result.Scheduled += pendingScheduled
+		prep.result.Failed += pendingFailed
+		prep.routes, prep.fences = s.syncCatalogSnapshot(prep.snapshot, now)
+	}
+	s.catalogVersion = prep.snapshot.Version
+	return prep, nil
+}
+
+func (s *Scheduler) syncCatalogSnapshot(
+	snapshot distribution.CatalogSnapshot,
+	now time.Time,
+) ([]distribution.RouteDescriptor, map[uint64]EvidenceFence) {
 	s.reconcileSamplerRoutes(snapshot.Routes)
 	SeedCooldownsFromRoutes(s.state, snapshot.Routes, s.cfg.SplitCooldown, now)
+	return s.routesLedLocally(snapshot.Routes, now)
+}
 
-	windows := s.committedWindows(snapshot.Routes, now)
-	out.Detector = Evaluate(s.cfg.Detector, s.state, Input{
-		Routes:  snapshot.Routes,
-		Windows: windows,
-		Now:     now,
-	})
-	for _, event := range out.Detector.Events {
-		s.logEvent(event)
-	}
-
-	if s.killSwitchActive(ctx) {
-		out.KillSwitch = true
-		if len(out.Detector.Decisions) > 0 {
-			s.cfg.Logger.InfoContext(ctx, "autosplit: kill switch active; skipping splits",
-				slog.Int("decisions", len(out.Detector.Decisions)))
+func (s *Scheduler) evaluateTick(now time.Time, prep tickPreparation) Result {
+	windows := s.committedWindows(prep.routes, now)
+	s.resetConfidenceForHistoryGaps(prep.routes, windows)
+	if prep.catalogGap {
+		if prep.fences == nil {
+			prep.fences = make(map[uint64]EvidenceFence, len(prep.routes))
 		}
-		return out, nil
+		s.fenceUnprovenCatalogGap(prep.routes, prep.fences, newestWindowAt(windows))
+	}
+	result := Evaluate(s.cfg.Detector, s.state, Input{
+		Routes:         prep.routes,
+		Windows:        windows,
+		EvidenceFences: prep.fences,
+		Now:            now,
+		LiveRouteCount: len(prep.snapshot.Routes),
+	})
+	s.observeDetectorResult(result)
+	return result
+}
+
+func (s *Scheduler) observeDetectorResult(result Result) {
+	for _, event := range result.Events {
+		s.logEvent(event)
+		if s.cfg.Observer != nil {
+			s.cfg.Observer.ObserveSkipped(event.Reason)
+			s.cfg.Observer.ObserveIsolationDeclined(event.IsolationReason)
+		}
+	}
+	if s.cfg.Observer != nil {
+		s.cfg.Observer.ObserveCandidatesPromoted(result.Promoted)
+	}
+}
+
+func (s *Scheduler) finishTick(
+	ctx context.Context,
+	runtimeEnabled bool,
+	prep tickPreparation,
+) SchedulerResult {
+	if !runtimeEnabled {
+		prep.result.KillSwitch = true
+		if len(prep.result.Detector.Decisions) > 0 {
+			s.cfg.Logger.InfoContext(ctx, "autosplit: kill switch active; skipping splits",
+				slog.Int("decisions", len(prep.result.Detector.Decisions)))
+		}
+		return prep.result
 	}
 
-	out.Scheduled, out.Failed = s.executeDecisions(ctx, snapshot.Version, out.Detector.Decisions)
-	return out, nil
+	remainingBudget := s.cfg.Detector.MaxSplitsPerCycle - prep.usedBudget
+	if remainingBudget <= 0 {
+		return prep.result
+	}
+	decisions := prep.result.Detector.Decisions
+	if len(decisions) > remainingBudget {
+		decisions = decisions[:remainingBudget]
+	}
+	scheduled, failed, catalogVersion := s.executeDecisions(ctx, prep.snapshot.Version, decisions)
+	prep.result.Scheduled += scheduled
+	prep.result.Failed += failed
+	prep.result.CatalogVersion = catalogVersion
+	s.catalogVersion = catalogVersion
+	return prep.result
+}
+
+func (s *Scheduler) resetConfidenceForHistoryGaps(
+	routes []distribution.RouteDescriptor,
+	windows []ColumnWindow,
+) {
+	for _, route := range routes {
+		processedThrough := s.state.RouteStatus(route.RouteID).LastProcessedAt
+		if processedThrough.IsZero() {
+			continue
+		}
+		for _, window := range windows {
+			if !window.Column.At.After(processedThrough) {
+				continue
+			}
+			windowStart := window.Column.WindowStart
+			if windowStart.IsZero() {
+				windowStart = window.Column.At.Add(-window.Duration)
+			}
+			if windowStart.After(processedThrough) {
+				s.state.ResetConfidence(route.RouteID)
+			}
+			break
+		}
+	}
+}
+
+func (s *Scheduler) fenceUnprovenCatalogGap(
+	routes []distribution.RouteDescriptor,
+	fences map[uint64]EvidenceFence,
+	processedThrough time.Time,
+) {
+	for _, route := range routes {
+		s.state.ResetConfidence(route.RouteID)
+		fence := fences[route.RouteID]
+		if processedThrough.After(fence.ProcessedThrough) {
+			fence.ProcessedThrough = processedThrough
+		}
+		fences[route.RouteID] = fence
+	}
 }
 
 func (s *Scheduler) tickAndLog(ctx context.Context, now time.Time) {
@@ -207,37 +413,58 @@ func (s *Scheduler) tickAndLog(ctx context.Context, now time.Time) {
 	}
 }
 
-func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) (uint64, error) {
+func (s *Scheduler) executeSplit(
+	ctx context.Context,
+	catalogVersion uint64,
+	routeID uint64,
+	splitKey []byte,
+	targetGroupID uint64,
+	parentStart []byte,
+	parentEnd []byte,
+	parentGroupID uint64,
+	splitOrigin SplitOrigin,
+	score float64,
+	consecutiveOver int,
+) (SplitResult, error) {
 	execCtx, cancel := context.WithTimeout(ctx, s.cfg.SplitTimeout)
 	defer cancel()
 
 	s.cfg.Logger.InfoContext(ctx, "autosplit: scheduling split",
-		slog.Uint64("route_id", decision.RouteID),
+		slog.Uint64("route_id", routeID),
 		slog.Uint64("catalog_version", catalogVersion),
-		slog.String("split_key", loggedSplitKey(decision.SplitKey)),
-		slog.String("split_origin", string(decision.SplitOrigin)),
-		slog.Float64("score", decision.ScoreOpsMin),
-		slog.Int("consecutive_over", decision.ConsecutiveOver),
-		slog.Uint64("target_group_id", decision.TargetGroupID))
+		slog.String("split_key", loggedSplitKey(splitKey)),
+		slog.String("split_origin", string(splitOrigin)),
+		slog.Float64("score", score),
+		slog.Int("consecutive_over", consecutiveOver),
+		slog.Uint64("target_group_id", targetGroupID))
 
 	result, err := s.splitter.SplitRange(execCtx, SplitRequest{
 		ExpectedCatalogVersion: catalogVersion,
-		RouteID:                decision.RouteID,
-		SplitKey:               distribution.CloneBytes(decision.SplitKey),
-		TargetGroupID:          decision.TargetGroupID,
+		RouteID:                routeID,
+		SplitKey:               distribution.CloneBytes(splitKey),
+		TargetGroupID:          targetGroupID,
+		ParentStart:            distribution.CloneBytes(parentStart),
+		ParentEnd:              distribution.CloneBytes(parentEnd),
+		ParentGroupID:          parentGroupID,
 	})
+	if s.cfg.Observer != nil {
+		s.cfg.Observer.ObserveSplitScheduled()
+	}
 	if err != nil {
-		return catalogVersion, errors.Wrap(err, "autosplit: split range")
+		if s.cfg.Observer != nil {
+			s.cfg.Observer.ObserveSplitFailed(splitFailureReason(err, targetGroupID))
+		}
+		return SplitResult{}, errors.Wrap(err, "autosplit: split range")
 	}
 	s.cfg.Logger.InfoContext(ctx, "autosplit: split committed",
-		slog.Uint64("route_id", decision.RouteID),
+		slog.Uint64("route_id", routeID),
 		slog.Uint64("catalog_version", result.CatalogVersion),
-		slog.String("split_key", loggedSplitKey(decision.SplitKey)),
-		slog.String("split_origin", string(decision.SplitOrigin)))
-	return result.CatalogVersion, nil
+		slog.String("split_key", loggedSplitKey(splitKey)),
+		slog.String("split_origin", string(splitOrigin)))
+	return result, nil
 }
 
-func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64, decisions []Decision) (int, int) {
+func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64, decisions []Decision) (int, int, uint64) {
 	scheduled := 0
 	failed := 0
 	for _, decision := range decisions {
@@ -251,12 +478,157 @@ func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64,
 				slog.String("split_origin", string(decision.SplitOrigin)),
 				slog.Uint64("target_group_id", decision.TargetGroupID),
 				slog.Any("err", err))
+			if nextCatalogVersion > catalogVersion {
+				catalogVersion = nextCatalogVersion
+			}
 			continue
 		}
 		catalogVersion = nextCatalogVersion
 		scheduled++
 	}
-	return scheduled, failed
+	return scheduled, failed, catalogVersion
+}
+
+func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) (uint64, error) {
+	first, err := s.executeSplit(
+		ctx,
+		catalogVersion,
+		decision.RouteID,
+		decision.SplitKey,
+		decision.TargetGroupID,
+		decision.RouteStart,
+		decision.RouteEnd,
+		decision.RouteGroupID,
+		decision.SplitOrigin,
+		decision.ScoreOpsMin,
+		decision.ConsecutiveOver,
+	)
+	if err != nil {
+		return catalogVersion, err
+	}
+	if decision.SplitOrigin != SplitOriginIsolationCompound {
+		return first.CatalogVersion, nil
+	}
+	if !validIntermediateChild(first.Right, decision) {
+		return first.CatalogVersion, errors.New("autosplit: split response did not contain the expected compound intermediate child")
+	}
+
+	pending := pendingCompound{
+		parentRouteID: decision.RouteID,
+		intermediate:  distribution.CloneRouteDescriptor(first.Right),
+		splitKey:      distribution.CloneBytes(decision.SecondSplitKey),
+	}
+	s.pendingCompounds[decision.RouteID] = pending
+	second, err := s.executePendingCompound(ctx, first.CatalogVersion, pending)
+	if err != nil {
+		if s.cfg.Observer != nil {
+			s.cfg.Observer.ObserveCompoundPartial()
+		}
+		return first.CatalogVersion, err
+	}
+	delete(s.pendingCompounds, decision.RouteID)
+	return second.CatalogVersion, nil
+}
+
+func validIntermediateChild(route distribution.RouteDescriptor, decision Decision) bool {
+	return route.RouteID != 0 &&
+		route.State == distribution.RouteStateActive &&
+		route.GroupID == decision.RouteGroupID &&
+		bytes.Equal(route.Start, decision.SplitKey) &&
+		bytes.Equal(route.End, decision.RouteEnd) &&
+		splitKeyInsideRoute(route, decision.SecondSplitKey)
+}
+
+func (s *Scheduler) executePendingCompound(
+	ctx context.Context,
+	catalogVersion uint64,
+	pending pendingCompound,
+) (SplitResult, error) {
+	return s.executeSplit(
+		ctx,
+		catalogVersion,
+		pending.intermediate.RouteID,
+		pending.splitKey,
+		0,
+		pending.intermediate.Start,
+		pending.intermediate.End,
+		pending.intermediate.GroupID,
+		SplitOriginIsolationCompound,
+		0,
+		0,
+	)
+}
+
+func (s *Scheduler) finalizePendingCompounds(
+	ctx context.Context,
+	snapshot distribution.CatalogSnapshot,
+) (distribution.CatalogSnapshot, int, int, int) {
+	if len(s.pendingCompounds) == 0 {
+		return snapshot, 0, 0, 0
+	}
+	parentIDs := make([]uint64, 0, len(s.pendingCompounds))
+	for parentID := range s.pendingCompounds {
+		parentIDs = append(parentIDs, parentID)
+	}
+	sort.Slice(parentIDs, func(i, j int) bool { return parentIDs[i] < parentIDs[j] })
+
+	scheduled := 0
+	failed := 0
+	attempted := 0
+	for _, parentID := range parentIDs {
+		if attempted >= s.cfg.Detector.MaxSplitsPerCycle {
+			break
+		}
+		pending := s.pendingCompounds[parentID]
+		intermediate, ok := findActiveRoute(snapshot.Routes, pending.intermediate.RouteID)
+		if !ok || !samePendingIntermediate(intermediate, pending) ||
+			len(snapshot.Routes)+1 > s.cfg.Detector.MaxRoutes {
+			delete(s.pendingCompounds, parentID)
+			s.cfg.Logger.WarnContext(ctx, "autosplit: dropping invalid compound finalization",
+				slog.Uint64("parent_route_id", parentID),
+				slog.Uint64("intermediate_route_id", pending.intermediate.RouteID))
+			continue
+		}
+		pending.intermediate = intermediate
+		s.pendingCompounds[parentID] = pending
+		attempted++
+		result, err := s.executePendingCompound(ctx, snapshot.Version, pending)
+		if err != nil {
+			failed++
+			s.cfg.Logger.WarnContext(ctx, "autosplit: compound finalization failed",
+				slog.Uint64("parent_route_id", parentID),
+				slog.Uint64("intermediate_route_id", pending.intermediate.RouteID),
+				slog.Any("err", err))
+			continue
+		}
+		delete(s.pendingCompounds, parentID)
+		scheduled++
+		snapshot.Version = result.CatalogVersion
+		refreshed, refreshErr := s.source.Snapshot(ctx)
+		if refreshErr != nil {
+			s.cfg.Logger.WarnContext(ctx, "autosplit: refresh after compound finalization failed",
+				slog.Any("err", refreshErr))
+			break
+		}
+		snapshot = refreshed
+	}
+	return snapshot, scheduled, failed, attempted
+}
+
+func findActiveRoute(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {
+	for _, route := range routes {
+		if route.RouteID == routeID && route.State == distribution.RouteStateActive {
+			return route, true
+		}
+	}
+	return distribution.RouteDescriptor{}, false
+}
+
+func samePendingIntermediate(route distribution.RouteDescriptor, pending pendingCompound) bool {
+	return route.GroupID == pending.intermediate.GroupID &&
+		bytes.Equal(route.Start, pending.intermediate.Start) &&
+		bytes.Equal(route.End, pending.intermediate.End) &&
+		splitKeyInsideRoute(route, pending.splitKey)
 }
 
 func (s *Scheduler) committedWindows(routes []distribution.RouteDescriptor, now time.Time) []ColumnWindow {
@@ -269,7 +641,7 @@ func (s *Scheduler) committedWindows(routes []distribution.RouteDescriptor, now 
 	}
 	from := s.snapshotStart(routes, now, step)
 	cols := s.sampler.Snapshot(from, now.Add(time.Nanosecond))
-	windows := CommittedWindowsFromColumns(cols)
+	windows, _, _ := CommittedWindowsFromColumns(cols, s.oldestProcessedAt(routes))
 	if s.leaderWatermark.IsZero() && s.leaderStartedAt.IsZero() {
 		return windows
 	}
@@ -287,7 +659,7 @@ func (s *Scheduler) committedWindows(routes []distribution.RouteDescriptor, now 
 	return filtered
 }
 
-func (s *Scheduler) snapshotStart(routes []distribution.RouteDescriptor, now time.Time, step time.Duration) time.Time {
+func (s *Scheduler) oldestProcessedAt(routes []distribution.RouteDescriptor) time.Time {
 	oldest := time.Time{}
 	for _, route := range routes {
 		status := s.state.RouteStatus(route.RouteID)
@@ -298,6 +670,11 @@ func (s *Scheduler) snapshotStart(routes []distribution.RouteDescriptor, now tim
 			oldest = status.LastProcessedAt
 		}
 	}
+	return oldest
+}
+
+func (s *Scheduler) snapshotStart(routes []distribution.RouteDescriptor, now time.Time, step time.Duration) time.Time {
+	oldest := s.oldestProcessedAt(routes)
 	if !oldest.IsZero() {
 		return oldest.Add(-step)
 	}
@@ -312,29 +689,40 @@ func (s *Scheduler) snapshotStart(routes []distribution.RouteDescriptor, now tim
 }
 
 func (s *Scheduler) reconcileSamplerRoutes(routes []distribution.RouteDescriptor) {
-	if s.registrar == nil {
+	if s.reconciler == nil {
 		return
 	}
+	s.reconciler.Reconcile(routes)
+}
+
+// Reconcile applies one complete live catalog snapshot to sampler membership.
+func (r *RouteReconciler) Reconcile(routes []distribution.RouteDescriptor) {
+	if r == nil || r.registrar == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	live := make(map[uint64]struct{}, len(routes))
 	for _, route := range routes {
 		live[route.RouteID] = struct{}{}
-		registered, ok := s.registeredRoutes[route.RouteID]
+		registered, ok := r.registered[route.RouteID]
 		next := registeredRouteFromDescriptor(route)
 		if ok && registered.equal(next) {
 			continue
 		}
 		if ok {
-			s.registrar.RemoveRoute(route.RouteID)
+			r.registrar.RemoveRoute(route.RouteID)
 		}
-		s.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID)
-		s.registeredRoutes[route.RouteID] = next
+		r.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID)
+		r.registered[route.RouteID] = next
 	}
-	for routeID := range s.registeredRoutes {
+	for routeID := range r.registered {
 		if _, ok := live[routeID]; ok {
 			continue
 		}
-		s.registrar.RemoveRoute(routeID)
-		delete(s.registeredRoutes, routeID)
+		r.registrar.RemoveRoute(routeID)
+		delete(r.registered, routeID)
 	}
 }
 
@@ -352,8 +740,91 @@ func (r registeredRoute) equal(other registeredRoute) bool {
 		bytes.Equal(r.end, other.end)
 }
 
+func (s *Scheduler) routesLedLocally(
+	routes []distribution.RouteDescriptor,
+	now time.Time,
+) ([]distribution.RouteDescriptor, map[uint64]EvidenceFence) {
+	if s.cfg.GroupLeadership == nil {
+		return routes, nil
+	}
+	groupRoutes := make(map[uint64][]distribution.RouteDescriptor)
+	for _, route := range routes {
+		groupRoutes[route.GroupID] = append(groupRoutes[route.GroupID], route)
+	}
+	eligible := make([]distribution.RouteDescriptor, 0, len(routes))
+	fences := make(map[uint64]EvidenceFence, len(routes))
+	watermark := time.Time{}
+	watermarkLoaded := false
+	for groupID, ownedRoutes := range groupRoutes {
+		state, ledLocally := s.locallyLedGroupState(groupID, now, &watermark, &watermarkLoaded)
+		if !ledLocally {
+			continue
+		}
+		for _, route := range ownedRoutes {
+			eligible = append(eligible, route)
+			fences[route.RouteID] = EvidenceFence{
+				ProcessedThrough:     state.watermark,
+				WindowStartNotBefore: state.startedAt,
+			}
+		}
+	}
+	for groupID := range s.groupLeadership {
+		if _, ok := groupRoutes[groupID]; !ok {
+			delete(s.groupLeadership, groupID)
+			s.dropPendingCompoundsForGroup(groupID)
+		}
+	}
+	return eligible, fences
+}
+
+func (s *Scheduler) locallyLedGroupState(
+	groupID uint64,
+	now time.Time,
+	watermark *time.Time,
+	watermarkLoaded *bool,
+) (groupLeadershipState, bool) {
+	leader, term := s.cfg.GroupLeadership(groupID)
+	previous, known := s.groupLeadership[groupID]
+	if !leader {
+		previous.leader = false
+		previous.term = term
+		s.groupLeadership[groupID] = previous
+		s.dropPendingCompoundsForGroup(groupID)
+		return previous, false
+	}
+	transition := !known || !previous.leader || (term != 0 && term != previous.term)
+	if transition {
+		if !*watermarkLoaded {
+			*watermark = s.freshestColumnAt(now)
+			*watermarkLoaded = true
+		}
+		previous = groupLeadershipState{
+			leader:    true,
+			term:      term,
+			startedAt: now,
+			watermark: *watermark,
+		}
+		s.dropPendingCompoundsForGroup(groupID)
+	} else {
+		previous.leader = true
+		previous.term = term
+	}
+	s.groupLeadership[groupID] = previous
+	return previous, true
+}
+
+func (s *Scheduler) dropPendingCompoundsForGroup(groupID uint64) {
+	for parentID, pending := range s.pendingCompounds {
+		if pending.intermediate.GroupID == groupID {
+			delete(s.pendingCompounds, parentID)
+		}
+	}
+}
+
 func (s *Scheduler) resetForLeadership(now time.Time) {
 	s.state = NewDetectorState()
+	s.pendingCompounds = make(map[uint64]pendingCompound)
+	s.catalogVersion = 0
 	s.leaderStartedAt = now
 	s.leaderWatermark = s.freshestColumnAt(now)
 	s.cfg.Logger.Info("autosplit: leadership acquired; detector state reset",
@@ -383,11 +854,40 @@ func (s *Scheduler) freshestColumnAt(now time.Time) time.Time {
 	return cols[len(cols)-1].At
 }
 
-func (s *Scheduler) isLeader() bool {
-	if s.cfg.IsLeader == nil {
-		return true
+func (s *Scheduler) leadership() (bool, uint64) {
+	if s.cfg.Leadership != nil {
+		return s.cfg.Leadership()
 	}
-	return s.cfg.IsLeader()
+	if s.cfg.IsLeader == nil {
+		return true, 0
+	}
+	return s.cfg.IsLeader(), 0
+}
+
+func (s *Scheduler) stateCounts(now time.Time) (int, int) {
+	if s == nil || s.state == nil {
+		return 0, 0
+	}
+	tracked := len(s.state.routes)
+	cooldown := 0
+	for _, route := range s.state.routes {
+		if now.Before(route.CooldownUntil) {
+			cooldown++
+		}
+	}
+	return tracked, cooldown
+}
+
+func splitFailureReason(err error, targetGroupID uint64) string {
+	if status.Code(err) == codes.Aborted {
+		return "cas_conflict"
+	}
+	code := status.Code(err)
+	if targetGroupID != 0 &&
+		(code == codes.FailedPrecondition || code == codes.NotFound || code == codes.Unavailable) {
+		return "target_unavailable"
+	}
+	return "rpc_error"
 }
 
 func (s *Scheduler) killSwitchActive(ctx context.Context) bool {
@@ -411,6 +911,13 @@ func (s *Scheduler) killSwitchActive(ctx context.Context) bool {
 }
 
 func (s *Scheduler) logEvent(event Event) {
+	if event.IsolationReason != "" {
+		args := []any{slog.String("reason", string(event.IsolationReason))}
+		if event.RouteID != 0 {
+			args = append(args, slog.Uint64("route_id", event.RouteID))
+		}
+		s.cfg.Logger.Debug("autosplit: isolation declined", args...)
+	}
 	if event.Reason == "" {
 		return
 	}
@@ -441,31 +948,6 @@ func (cfg SchedulerConfig) withDefaults() SchedulerConfig {
 		cfg.Logger = slog.Default()
 	}
 	return cfg
-}
-
-// CommittedWindowsFromColumns derives committed window durations from adjacent
-// flushed keyviz columns. The first column is history only because its lower
-// boundary is not proven by MatrixColumn itself.
-func CommittedWindowsFromColumns(cols []keyviz.MatrixColumn) []ColumnWindow {
-	if len(cols) < minCommittedWindowColumns {
-		return nil
-	}
-	cols = append([]keyviz.MatrixColumn(nil), cols...)
-	sort.SliceStable(cols, func(i, j int) bool {
-		return cols[i].At.Before(cols[j].At)
-	})
-	windows := make([]ColumnWindow, 0, len(cols)-1)
-	for i := 1; i < len(cols); i++ {
-		duration := cols[i].At.Sub(cols[i-1].At)
-		if duration <= 0 {
-			continue
-		}
-		windows = append(windows, ColumnWindow{
-			Column:   cols[i],
-			Duration: duration,
-		})
-	}
-	return windows
 }
 
 // SeedCooldownsFromRoutes rebuilds leader-local cooldown state from durable

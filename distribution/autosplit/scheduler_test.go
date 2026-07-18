@@ -9,7 +9,11 @@ import (
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestCommittedWindowsFromColumnsDerivesDurations(t *testing.T) {
@@ -21,19 +25,37 @@ func TestCommittedWindowsFromColumnsDerivesDurations(t *testing.T) {
 		{At: base.Add(time.Minute)},
 	}
 
-	windows := CommittedWindowsFromColumns(cols)
+	windows, _, skipped := CommittedWindowsFromColumns(cols, time.Time{})
 
-	require.Len(t, windows, 2)
-	require.Equal(t, base.Add(time.Minute), windows[0].Column.At)
-	require.Equal(t, time.Minute, windows[0].Duration)
-	require.Equal(t, base.Add(2*time.Minute), windows[1].Column.At)
+	require.Equal(t, 1, skipped)
+	require.Len(t, windows, 3)
+	require.Equal(t, base, windows[0].Column.At)
+	require.Zero(t, windows[0].Duration)
+	require.Equal(t, base.Add(time.Minute), windows[1].Column.At)
 	require.Equal(t, time.Minute, windows[1].Duration)
+	require.Equal(t, base.Add(2*time.Minute), windows[2].Column.At)
+	require.Equal(t, time.Minute, windows[2].Duration)
+}
+
+func TestCommittedWindowsUsesStoredWindowStart(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1_700_000_000, 0)
+	cols := []keyviz.MatrixColumn{{
+		WindowStart: base,
+		At:          base.Add(90 * time.Second),
+	}}
+
+	windows, _, skipped := CommittedWindowsFromColumns(cols, time.Time{})
+
+	require.Zero(t, skipped)
+	require.Len(t, windows, 1)
+	require.Equal(t, 90*time.Second, windows[0].Duration)
 }
 
 func TestSchedulerTickSchedulesSplitRange(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
 	}}
@@ -55,7 +77,7 @@ func TestSchedulerTickSchedulesSplitRange(t *testing.T) {
 func TestSchedulerUsesCommittedCatalogVersionBetweenSplits(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes: []distribution.RouteDescriptor{
 			testRoute(1, 1, "a", "m"),
@@ -74,12 +96,13 @@ func TestSchedulerUsesCommittedCatalogVersionBetweenSplits(t *testing.T) {
 	require.Len(t, splitter.requests, 2)
 	require.Equal(t, uint64(7), splitter.requests[0].ExpectedCatalogVersion)
 	require.Equal(t, uint64(8), splitter.requests[1].ExpectedCatalogVersion)
+	require.Equal(t, uint64(9), result.CatalogVersion)
 }
 
 func TestSchedulerKillSwitchSkipsSplitRange(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
 	}}
@@ -87,6 +110,10 @@ func TestSchedulerKillSwitchSkipsSplitRange(t *testing.T) {
 	scheduler := newTestScheduler(source, splitter, hotColumns(now, 2), func(context.Context) bool {
 		return true
 	})
+	registry := prometheus.NewRegistry()
+	observer, ok := NewPrometheusObserver(registry).(*prometheusObserver)
+	require.True(t, ok)
+	scheduler.cfg.Observer = observer
 	scheduler.wasLeader = true
 
 	result, err := scheduler.Tick(context.Background(), now.Add(2*time.Minute))
@@ -94,13 +121,93 @@ func TestSchedulerKillSwitchSkipsSplitRange(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.KillSwitch)
 	require.Equal(t, 0, result.Scheduled)
+	require.Equal(t, float64(0), testutil.ToFloat64(observer.enabled))
 	require.Empty(t, splitter.requests)
+}
+
+func TestSchedulerCatalogVersionGapConsumesBufferedEvidence(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	scheduler := newTestScheduler(source, &fakeSplitter{}, hotColumns(now, 1), nil)
+	scheduler.wasLeader = true
+
+	first, err := scheduler.Tick(context.Background(), now.Add(time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, first.Detector.Decisions)
+	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+
+	source.snapshot.Version = 8
+	sampler := requireFakeSampler(t, scheduler)
+	sampler.cols = append(sampler.cols, hotColumn(now.Add(2*time.Minute)))
+	gap, err := scheduler.Tick(context.Background(), now.Add(2*time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, gap.Detector.Decisions)
+	require.Equal(t, 0, scheduler.state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, now.Add(2*time.Minute), scheduler.state.RouteStatus(1).LastProcessedAt)
+
+	sampler.cols = append(sampler.cols, hotColumn(now.Add(3*time.Minute)))
+	after, err := scheduler.Tick(context.Background(), now.Add(3*time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, after.Detector.Decisions)
+	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+}
+
+func TestSchedulerHistoryGapClearsPriorConfidence(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	scheduler := newTestScheduler(source, &fakeSplitter{}, hotColumns(now, 1), nil)
+	scheduler.wasLeader = true
+
+	first, err := scheduler.Tick(context.Background(), now.Add(time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, first.Detector.Decisions)
+	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+
+	sampler := requireFakeSampler(t, scheduler)
+	sampler.cols = []keyviz.MatrixColumn{
+		hotMatrixColumn(now.Add(5*time.Minute), now.Add(4*time.Minute)),
+	}
+	afterGap, err := scheduler.Tick(context.Background(), now.Add(5*time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, afterGap.Detector.Decisions)
+	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+}
+
+func TestSplitFailureReasonUsesBoundedLabels(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		err           error
+		targetGroupID uint64
+		want          string
+	}{
+		{name: "catalog CAS", err: status.Error(codes.Aborted, "version"), want: "cas_conflict"},
+		{name: "wrapped catalog CAS", err: errors.Wrap(status.Error(codes.Aborted, "version"), "split"), want: "cas_conflict"},
+		{name: "target unavailable", err: status.Error(codes.FailedPrecondition, "target"), targetGroupID: 2, want: "target_unavailable"},
+		{name: "same-group precondition", err: status.Error(codes.FailedPrecondition, "route"), want: "rpc_error"},
+		{name: "other RPC", err: status.Error(codes.Internal, "failed"), targetGroupID: 2, want: "rpc_error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, splitFailureReason(tt.err, tt.targetGroupID))
+		})
+	}
 }
 
 func TestSchedulerFailedSplitDoesNotSeedCooldown(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
 	}}
@@ -129,7 +236,7 @@ func TestSchedulerSeedsCooldownFromSplitAtHLC(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	route := testRoute(2, 1, "a", "z")
 	route.SplitAtHLC = packTestHLC(now.Add(-time.Minute))
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 8,
 		Routes:  []distribution.RouteDescriptor{route},
 	}}
@@ -164,7 +271,7 @@ func TestRemainingCooldownUsesHLCPhysicalMillis(t *testing.T) {
 func TestSchedulerLeadershipResetIgnoresPreStartHistory(t *testing.T) {
 	t.Parallel()
 	start := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
 	}}
@@ -193,13 +300,13 @@ func TestSchedulerLeadershipResetIgnoresPreStartHistory(t *testing.T) {
 func TestSchedulerReconcilesSamplerRoutes(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 1,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "m")},
 	}}
 	registrar := &fakeRegistrar{}
 	scheduler := newTestScheduler(source, &fakeSplitter{}, nil, nil)
-	scheduler.registrar = registrar
+	scheduler.reconciler = NewRouteReconciler(registrar)
 	scheduler.wasLeader = true
 
 	_, err := scheduler.Tick(context.Background(), now)
@@ -220,13 +327,13 @@ func TestSchedulerReconcilesSamplerRoutes(t *testing.T) {
 func TestSchedulerReregistersChangedSamplerRoute(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 1,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "m")},
 	}}
 	registrar := &fakeRegistrar{}
 	scheduler := newTestScheduler(source, &fakeSplitter{}, nil, nil)
-	scheduler.registrar = registrar
+	scheduler.reconciler = NewRouteReconciler(registrar)
 	scheduler.wasLeader = true
 
 	_, err := scheduler.Tick(context.Background(), now)
@@ -247,7 +354,184 @@ func TestSchedulerReregistersChangedSamplerRoute(t *testing.T) {
 	require.Equal(t, []byte("z"), registrar.registrations[1].end)
 }
 
-func newTestScheduler(source *fakeSnapshotSource, splitter *fakeSplitter, cols []keyviz.MatrixColumn, killSwitch KillSwitch) *Scheduler {
+func TestSchedulerExecutesCompoundIsolationBackToBack(t *testing.T) {
+	t.Parallel()
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	splitter.onSuccess = func(req SplitRequest, result SplitResult) {
+		applyFakeSplit(source, req, result)
+	}
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+
+	version, err := scheduler.executeDecision(context.Background(), 7, testCompoundDecision())
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), version)
+	require.Len(t, splitter.requests, 2)
+	require.Equal(t, uint64(7), splitter.requests[0].ExpectedCatalogVersion)
+	require.Equal(t, uint64(8), splitter.requests[1].ExpectedCatalogVersion)
+	require.Equal(t, uint64(1), splitter.requests[0].RouteID)
+	require.Equal(t, splitter.requests[0].SplitKey, splitter.requests[1].ParentStart)
+	require.Equal(t, []byte("m"), splitter.requests[0].SplitKey)
+	require.Equal(t, []byte{'m', 0}, splitter.requests[1].SplitKey)
+	require.Zero(t, splitter.requests[0].TargetGroupID)
+	require.Zero(t, splitter.requests[1].TargetGroupID)
+	require.Empty(t, scheduler.pendingCompounds)
+	require.Equal(t, uint64(9), source.snapshot.Version)
+	require.Len(t, source.snapshot.Routes, 3)
+}
+
+func TestSchedulerRetriesPendingCompoundWithoutNewSamplerColumn(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	killed := true
+	splitter := &fakeSplitter{failAt: map[int]error{2: errors.New("temporary")}}
+	splitter.onSuccess = func(req SplitRequest, result SplitResult) {
+		applyFakeSplit(source, req, result)
+	}
+	scheduler := newTestScheduler(source, splitter, nil, func(context.Context) bool { return killed })
+	scheduler.wasLeader = true
+
+	version, err := scheduler.executeDecision(context.Background(), 7, testCompoundDecision())
+	require.Error(t, err)
+	require.Equal(t, uint64(8), version)
+	require.Len(t, scheduler.pendingCompounds, 1)
+	require.Len(t, splitter.requests, 2)
+	require.Equal(t, uint64(8), source.snapshot.Version)
+	require.Len(t, source.snapshot.Routes, 2)
+
+	blocked, err := scheduler.Tick(context.Background(), now)
+	require.NoError(t, err)
+	require.True(t, blocked.KillSwitch)
+	require.Len(t, splitter.requests, 2)
+	require.Len(t, scheduler.pendingCompounds, 1)
+
+	killed = false
+	delete(splitter.failAt, 2)
+	result, err := scheduler.Tick(context.Background(), now.Add(time.Second))
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Scheduled)
+	require.Zero(t, result.Failed)
+	require.Len(t, splitter.requests, 3)
+	require.Equal(t, uint64(8), splitter.requests[2].ExpectedCatalogVersion)
+	require.Equal(t, []byte{'m', 0}, splitter.requests[2].SplitKey)
+	require.Empty(t, scheduler.pendingCompounds)
+	require.Equal(t, uint64(9), source.snapshot.Version)
+	require.Len(t, source.snapshot.Routes, 3)
+}
+
+func TestSchedulerCatalogTermChangeClearsLeaderLocalState(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	term := uint64(2)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7, Routes: []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	scheduler := newTestScheduler(source, &fakeSplitter{}, nil, nil)
+	scheduler.cfg.Leadership = func() (bool, uint64) { return true, term }
+	scheduler.wasLeader = true
+	scheduler.leaderTerm = 1
+	scheduler.state.routes[1] = RouteStatus{ConsecutiveOver: 2, LastProcessedAt: now.Add(-time.Minute)}
+	scheduler.pendingCompounds[1] = pendingCompound{
+		parentRouteID: 1,
+		intermediate:  testRoute(10, 1, "m", "z"),
+		splitKey:      []byte{'m', 0},
+	}
+
+	result, err := scheduler.Tick(context.Background(), now)
+
+	require.NoError(t, err)
+	require.True(t, result.Leader)
+	require.Equal(t, term, scheduler.leaderTerm)
+	require.Zero(t, scheduler.state.RouteStatus(1).ConsecutiveOver)
+	require.Empty(t, scheduler.pendingCompounds)
+}
+
+func TestSchedulerShardTermChangeReearnsPostTransferWindows(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1_700_000_000, 0)
+	groupTerm := uint64(10)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7, Routes: []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	scheduler := newTestScheduler(source, splitter, []keyviz.MatrixColumn{
+		hotMatrixColumn(base, base.Add(-time.Minute)),
+	}, func(context.Context) bool { return true })
+	scheduler.wasLeader = true
+	scheduler.cfg.GroupLeadership = func(groupID uint64) (bool, uint64) {
+		return groupID == 1, groupTerm
+	}
+
+	first, err := scheduler.Tick(context.Background(), base)
+	require.NoError(t, err)
+	require.Empty(t, first.Detector.Decisions)
+
+	sampler := requireFakeSampler(t, scheduler)
+	sampler.cols = append(sampler.cols,
+		hotMatrixColumn(base.Add(time.Minute), base),
+		hotMatrixColumn(base.Add(2*time.Minute), base.Add(time.Minute)),
+		hotMatrixColumn(base.Add(3*time.Minute), base.Add(2*time.Minute)),
+	)
+	promoted, err := scheduler.Tick(context.Background(), base.Add(3*time.Minute))
+	require.NoError(t, err)
+	require.Len(t, promoted.Detector.Decisions, 1)
+
+	groupTerm++
+	_, err = scheduler.Tick(context.Background(), base.Add(3*time.Minute+30*time.Second))
+	require.NoError(t, err)
+	sampler.cols = append(sampler.cols,
+		hotMatrixColumn(base.Add(4*time.Minute), base.Add(3*time.Minute)),
+		hotMatrixColumn(base.Add(5*time.Minute), base.Add(4*time.Minute)),
+	)
+	notYet, err := scheduler.Tick(context.Background(), base.Add(5*time.Minute))
+	require.NoError(t, err)
+	require.Empty(t, notYet.Detector.Decisions)
+	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+
+	sampler.cols = append(sampler.cols,
+		hotMatrixColumn(base.Add(6*time.Minute), base.Add(5*time.Minute)),
+	)
+	reearned, err := scheduler.Tick(context.Background(), base.Add(6*time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, 2, scheduler.state.RouteStatus(1).ConsecutiveOver)
+	require.Len(t, reearned.Detector.Decisions, 1)
+}
+
+func testCompoundDecision() Decision {
+	return Decision{
+		RouteID:        1,
+		SplitKey:       []byte("m"),
+		SecondSplitKey: []byte{'m', 0},
+		SplitOrigin:    SplitOriginIsolationCompound,
+		RouteDelta:     2,
+		RouteStart:     []byte("a"),
+		RouteEnd:       []byte("z"),
+		RouteGroupID:   1,
+	}
+}
+
+func applyFakeSplit(source *fakeCatalogSnapshotSource, req SplitRequest, result SplitResult) {
+	routes := make([]distribution.RouteDescriptor, 0, len(source.snapshot.Routes)+1)
+	for _, route := range source.snapshot.Routes {
+		if route.RouteID == req.RouteID {
+			continue
+		}
+		routes = append(routes, route)
+	}
+	routes = append(routes, result.Left, result.Right)
+	source.snapshot = distribution.CatalogSnapshot{Version: result.CatalogVersion, Routes: routes}
+}
+
+func newTestScheduler(source *fakeCatalogSnapshotSource, splitter *fakeSplitter, cols []keyviz.MatrixColumn, killSwitch KillSwitch) *Scheduler {
 	cfg := SchedulerConfig{
 		Enabled: true,
 		Detector: Config{
@@ -295,6 +579,12 @@ func hotColumn(at time.Time) keyviz.MatrixColumn {
 	}
 }
 
+func hotMatrixColumn(at, start time.Time) keyviz.MatrixColumn {
+	column := hotColumn(at)
+	column.WindowStart = start
+	return column
+}
+
 func dualRouteHotColumn(at time.Time) keyviz.MatrixColumn {
 	return keyviz.MatrixColumn{
 		At: at,
@@ -322,12 +612,12 @@ func requireFakeSampler(t *testing.T, scheduler *Scheduler) *fakeSampler {
 	return sampler
 }
 
-type fakeSnapshotSource struct {
+type fakeCatalogSnapshotSource struct {
 	snapshot distribution.CatalogSnapshot
 	err      error
 }
 
-func (f *fakeSnapshotSource) Snapshot(context.Context) (distribution.CatalogSnapshot, error) {
+func (f *fakeCatalogSnapshotSource) Snapshot(context.Context) (distribution.CatalogSnapshot, error) {
 	if f.err != nil {
 		return distribution.CatalogSnapshot{}, f.err
 	}
@@ -335,8 +625,10 @@ func (f *fakeSnapshotSource) Snapshot(context.Context) (distribution.CatalogSnap
 }
 
 type fakeSplitter struct {
-	requests []SplitRequest
-	err      error
+	requests  []SplitRequest
+	err       error
+	failAt    map[int]error
+	onSuccess func(SplitRequest, SplitResult)
 }
 
 func (f *fakeSplitter) SplitRange(_ context.Context, req SplitRequest) (SplitResult, error) {
@@ -344,7 +636,25 @@ func (f *fakeSplitter) SplitRange(_ context.Context, req SplitRequest) (SplitRes
 	if f.err != nil {
 		return SplitResult{}, f.err
 	}
-	return SplitResult{CatalogVersion: req.ExpectedCatalogVersion + 1}, nil
+	if err := f.failAt[len(f.requests)]; err != nil {
+		return SplitResult{}, err
+	}
+	baseID := req.RouteID*100 + uint64(len(f.requests))*2
+	result := SplitResult{
+		CatalogVersion: req.ExpectedCatalogVersion + 1,
+		Left: distribution.RouteDescriptor{
+			RouteID: baseID, Start: distribution.CloneBytes(req.ParentStart), End: distribution.CloneBytes(req.SplitKey),
+			GroupID: req.ParentGroupID, State: distribution.RouteStateActive,
+		},
+		Right: distribution.RouteDescriptor{
+			RouteID: baseID + 1, Start: distribution.CloneBytes(req.SplitKey), End: distribution.CloneBytes(req.ParentEnd),
+			GroupID: req.ParentGroupID, State: distribution.RouteStateActive,
+		},
+	}
+	if f.onSuccess != nil {
+		f.onSuccess(req, result)
+	}
+	return result, nil
 }
 
 type fakeSampler struct {

@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -225,6 +226,39 @@ func TestCoordinateSamplerObservesRawTxnAndRead(t *testing.T) {
 	require.Equal(t, uint64(2), row.Writes)
 	require.Equal(t, uint64(1), row.Reads)
 	require.Equal(t, expectedWriteBytes, row.WriteBytes)
+}
+
+func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
+	t.Parallel()
+
+	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 8,
+	})
+	require.True(t, sampler.RegisterRoute(7, []byte(""), []byte("m"), 1))
+	require.True(t, sampler.RegisterRoute(8, []byte("m"), nil, 1))
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	c := (&Coordinate{
+		transactionManager: &stubTransactional{},
+		engine:             stubLeaderEngine{},
+		clock:              clock,
+	}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
+		if bytes.Compare(key, []byte("m")) < 0 {
+			return 7, true
+		}
+		return 8, true
+	})
+
+	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
+		{Op: Put, Key: []byte("a"), Value: []byte("left")},
+		{Op: Put, Key: []byte("z"), Value: []byte("right")},
+	}})
+	require.NoError(t, err)
+	sampler.Flush()
+	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 7).Writes)
+	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 8).Writes)
 }
 
 // TestToRawRequestLeavesTsForLeaderStamping is the regression for the

@@ -37,6 +37,17 @@ func isLeaderEngine(engine raftengine.LeaderView) bool {
 	return engine != nil && engine.State() == raftengine.StateLeader
 }
 
+func leadershipForEngine(engine interface {
+	raftengine.LeaderView
+	raftengine.StatusReader
+}) (bool, uint64) {
+	if engine == nil {
+		return false, 0
+	}
+	status := engine.Status()
+	return status.State == raftengine.StateLeader, status.Term
+}
+
 // isLeaderAcceptingWrites reports whether the engine is currently the leader
 // AND not mid leadership-transfer. During transfer, etcd/raft silently drops
 // proposals; callers that poll on a timer (HLC lease, lock resolver) should
