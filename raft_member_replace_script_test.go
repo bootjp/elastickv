@@ -28,10 +28,16 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 		"RAFT_PORT=50051",
 		"SSH_USER=tester",
 		"CONTAINER_NAME=elastickv",
-		"DATA_DIR=/var/lib/elastickv",
+		"DATA_DIR=/var/lib/elastickv/",
 		"TARGET_NODE=n3",
 		"REPLACEMENT_CONFIRM=n3",
 		"REPLACEMENT_VERIFY_COMMAND=false",
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=999",
+		"REPLACEMENT_STABILITY_SECONDS=999",
+		"REPLACEMENT_TIMEOUT_SECONDS=999",
+		"REPLACEMENT_POLL_SECONDS=999",
+		"REPLACEMENT_KEEP_STATE=false",
+		"DRY_RUN=true",
 	}, "\n")+"\n"), 0o600))
 
 	stateFile := filepath.Join(stateDir, "replace.state")
@@ -60,10 +66,16 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 	state := mustReadTestFile(t, stateFile)
 	require.Contains(t, state, "stage=9\n")
 	require.Contains(t, state, "expected_voters=n1,n2,n3\n")
+	require.Contains(t, state, "expected_members=n1|127.0.0.1:50051|voter,n2|127.0.0.2:50051|voter,n3|127.0.0.3:50051|voter\n")
+	require.Contains(t, state, "expected_config_index=13\n")
 	require.Contains(t, state, "min_catch_up_index=100\n")
 	require.Contains(t, state, "data_mode=archive\n")
+	require.Contains(t, state, "archive_path=/var/lib/elastickv.replacement-n2-")
+	require.NotContains(t, state, "archive_path=/var/lib/elastickv/.replacement")
 
-	resumeOutput := runReplacementScript(t, repoRoot, []string{
+	resumeCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	resumeCmd.Dir = repoRoot
+	resumeCmd.Env = append(os.Environ(),
 		"TARGET_NODE=n2",
 		"REPLACEMENT_CONFIRM=n2",
 		"REPLACEMENT_FENCE_MODE=container",
@@ -72,15 +84,81 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 		"REPLACEMENT_STABILITY_SECONDS=1",
 		"REPLACEMENT_TIMEOUT_SECONDS=5",
 		"REPLACEMENT_POLL_SECONDS=1",
-		"REPLACEMENT_STATE_FILE=" + stateFile,
-		"ROLLING_UPDATE_ENV_FILE=" + envFile,
-		"ROLLING_UPDATE_SCRIPT=" + rolling,
-		"RAFTADMIN_BIN=" + raftadmin,
-		"SSH_BIN=" + ssh,
-		"FAKE_STATE_DIR=" + stateDir,
-	})
-	require.Contains(t, resumeOutput, "resuming operation")
+		"REPLACEMENT_STATE_FILE="+stateFile,
+		"ROLLING_UPDATE_ENV_FILE="+envFile,
+		"ROLLING_UPDATE_SCRIPT="+rolling,
+		"RAFTADMIN_BIN="+raftadmin,
+		"SSH_BIN="+ssh,
+		"FAKE_STATE_DIR="+stateDir,
+	)
+	resumeOutput, resumeErr := resumeCmd.CombinedOutput()
+	require.Error(t, resumeErr)
+	require.Contains(t, string(resumeOutput), "replacement state is already complete")
 	require.Equal(t, "n2:n2\nnormal:n2\n", mustReadTestFile(t, filepath.Join(stateDir, "rollouts")), "completed resume must not repeat deployment")
+}
+
+func TestRaftMemberReplaceScriptRequiresInvocationControls(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	rolling := writeExecutableTestFile(t, stateDir, "rolling-update", "#!/usr/bin/env bash\nexit 0\n")
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte(strings.Join([]string{
+		"NODES=n1=127.0.0.1,n2=127.0.0.2,n3=127.0.0.3",
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=container",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+	}, "\n")+"\n"), 0o600))
+
+	cmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"ROLLING_UPDATE_ENV_FILE="+envFile,
+		"ROLLING_UPDATE_SCRIPT="+rolling,
+	)
+	output, err := cmd.CombinedOutput()
+	require.Error(t, err)
+	require.Contains(t, string(output), "TARGET_NODE is required")
+}
+
+func TestRaftMemberReplaceScriptRejectsConfigChangeAfterPreflight(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	fakeBin := filepath.Join(stateDir, "bin")
+	require.NoError(t, os.Mkdir(fakeBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "member"), []byte("voter\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "config-index"), []byte("10\n"), 0o600))
+
+	raftadmin := writeExecutableTestFile(t, fakeBin, "raftadmin", fakeRaftadminScript)
+	ssh := writeExecutableTestFile(t, fakeBin, "ssh", fakeReplacementSSHScript)
+	rolling := writeExecutableTestFile(t, fakeBin, "rolling-update", fakeReplacementRollingScript)
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("NODES=n1=127.0.0.1,n2=127.0.0.2,n3=127.0.0.3\n"), 0o600))
+
+	cmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(),
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=container",
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=1",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+		"REPLACEMENT_TIMEOUT_SECONDS=5",
+		"REPLACEMENT_POLL_SECONDS=1",
+		"REPLACEMENT_STATE_FILE="+filepath.Join(stateDir, "replace.state"),
+		"ROLLING_UPDATE_ENV_FILE="+envFile,
+		"ROLLING_UPDATE_SCRIPT="+rolling,
+		"RAFTADMIN_BIN="+raftadmin,
+		"SSH_BIN="+ssh,
+		"FAKE_STATE_DIR="+stateDir,
+		"FAKE_BUMP_CONFIG_ON_FENCE=true",
+	)
+	output, err := cmd.CombinedOutput()
+	require.Error(t, err)
+	require.Contains(t, string(output), "remove_server configuration index changed: expected=10 actual=11")
+	require.Equal(t, "voter\n", mustReadTestFile(t, filepath.Join(stateDir, "member")))
 }
 
 func TestRaftMemberReplaceScriptRejectsInsufficientSurvivingQuorum(t *testing.T) {
@@ -320,7 +398,13 @@ while [[ "$#" -gt 0 && "$1" != "--" ]]; do shift; done
 [[ "$#" -ge 2 ]]
 action="$2"
 case "$action" in
-  stop) touch "$FAKE_STATE_DIR/down-n2" ;;
+  stop)
+    touch "$FAKE_STATE_DIR/down-n2"
+    if [[ "${FAKE_BUMP_CONFIG_ON_FENCE:-false}" == "true" ]]; then
+      current="$(cat "$FAKE_STATE_DIR/config-index")"
+      printf '%s\n' "$((current + 1))" > "$FAKE_STATE_DIR/config-index"
+    fi
+    ;;
   reset-data) touch "$FAKE_STATE_DIR/data-reset" ;;
   *) echo "unexpected SSH action: $action" >&2; exit 1 ;;
 esac
@@ -328,6 +412,7 @@ esac
 
 const fakeReplacementRollingScript = `#!/usr/bin/env bash
 set -euo pipefail
+[[ "${DRY_RUN:-}" == "false" ]]
 printf '%s:%s\n' "${RAFT_JOIN_NODE:-normal}" "$ROLLING_ORDER" >> "$FAKE_STATE_DIR/rollouts"
 if [[ "${RAFT_JOIN_NODE:-}" == "n2" ]]; then
   rm -f "$FAKE_STATE_DIR/down-n2"

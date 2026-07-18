@@ -246,10 +246,15 @@ REPLACEMENT_VERIFY_COMMAND='verify-a-real-write-and-read' \
 ```
 
 Run the same command with `--dry-run` first. The wrapper verifies surviving
-quorum before fencing, passes `configuration_index` to every membership RPC,
-records a non-zero learner catch-up floor, restarts without join flags, and
-requires the application verification command to succeed. It supports one
+quorum before fencing, records the complete member signature and
+`configuration_index`, records a non-zero learner catch-up floor, restarts
+without join flags, and requires the application verification command to
+succeed. Any unrelated membership change aborts the operation. It supports one
 Raft group with a surviving quorum; it is not a forced no-quorum recovery tool.
+Supply `TARGET_NODE` and all `REPLACEMENT_*` values on the invocation, not in
+`deploy.env`; the deployment env is inventory only. A retained completed state
+file is audit evidence, so archive it or choose a new state path for a later
+incident.
 See
 `docs/design/2026_07_18_implemented_fenced_raft_member_replacement.md` for the
 state machine, fencing contract, and failure handling.

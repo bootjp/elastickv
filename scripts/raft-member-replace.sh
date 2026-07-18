@@ -39,6 +39,8 @@ Fencing:
 
 Optional environment:
   ROLLING_UPDATE_ENV_FILE       Env file used by rolling-update.sh.
+                                It supplies inventory only; replacement
+                                controls from this file are ignored.
   ROLLING_UPDATE_SCRIPT         Default: scripts/rolling-update.sh.
   RAFTADMIN_BIN                 Default: build ./cmd/raftadmin locally.
   SSH_BIN                       Default: ssh.
@@ -62,6 +64,8 @@ Optional environment:
 
 The state file makes the sequence resumable. A resumed run validates the live
 membership against its recorded stage and fails closed on conflicting changes.
+An existing completed state is rejected; archive it or choose a new state path
+before authorizing a later replacement of the same node.
 No-quorum recovery and multi-group replacement are outside this command.
 EOF
 }
@@ -113,6 +117,16 @@ INPUT_REPLACEMENT_FENCE_COMMAND_SET="${REPLACEMENT_FENCE_COMMAND+x}"
 INPUT_REPLACEMENT_FENCE_COMMAND="${REPLACEMENT_FENCE_COMMAND:-}"
 INPUT_REPLACEMENT_VERIFY_COMMAND_SET="${REPLACEMENT_VERIFY_COMMAND+x}"
 INPUT_REPLACEMENT_VERIFY_COMMAND="${REPLACEMENT_VERIFY_COMMAND:-}"
+INPUT_REPLACEMENT_FENCE_VERIFY_SECONDS_SET="${REPLACEMENT_FENCE_VERIFY_SECONDS+x}"
+INPUT_REPLACEMENT_FENCE_VERIFY_SECONDS="${REPLACEMENT_FENCE_VERIFY_SECONDS:-}"
+INPUT_REPLACEMENT_STABILITY_SECONDS_SET="${REPLACEMENT_STABILITY_SECONDS+x}"
+INPUT_REPLACEMENT_STABILITY_SECONDS="${REPLACEMENT_STABILITY_SECONDS:-}"
+INPUT_REPLACEMENT_TIMEOUT_SECONDS_SET="${REPLACEMENT_TIMEOUT_SECONDS+x}"
+INPUT_REPLACEMENT_TIMEOUT_SECONDS="${REPLACEMENT_TIMEOUT_SECONDS:-}"
+INPUT_REPLACEMENT_POLL_SECONDS_SET="${REPLACEMENT_POLL_SECONDS+x}"
+INPUT_REPLACEMENT_POLL_SECONDS="${REPLACEMENT_POLL_SECONDS:-}"
+INPUT_REPLACEMENT_KEEP_STATE_SET="${REPLACEMENT_KEEP_STATE+x}"
+INPUT_REPLACEMENT_KEEP_STATE="${REPLACEMENT_KEEP_STATE:-}"
 
 if [[ -n "${ROLLING_UPDATE_ENV_FILE:-}" ]]; then
   if [[ ! -f "$ROLLING_UPDATE_ENV_FILE" ]]; then
@@ -123,13 +137,31 @@ if [[ -n "${ROLLING_UPDATE_ENV_FILE:-}" ]]; then
   source "$ROLLING_UPDATE_ENV_FILE"
 fi
 
-[[ -z "$INPUT_TARGET_NODE_SET" ]] || TARGET_NODE="$INPUT_TARGET_NODE"
-[[ -z "$INPUT_REPLACEMENT_CONFIRM_SET" ]] || REPLACEMENT_CONFIRM="$INPUT_REPLACEMENT_CONFIRM"
-[[ -z "$INPUT_REPLACEMENT_STATE_FILE_SET" ]] || REPLACEMENT_STATE_FILE="$INPUT_REPLACEMENT_STATE_FILE"
-[[ -z "$INPUT_REPLACEMENT_DATA_MODE_SET" ]] || REPLACEMENT_DATA_MODE="$INPUT_REPLACEMENT_DATA_MODE"
-[[ -z "$INPUT_REPLACEMENT_FENCE_MODE_SET" ]] || REPLACEMENT_FENCE_MODE="$INPUT_REPLACEMENT_FENCE_MODE"
-[[ -z "$INPUT_REPLACEMENT_FENCE_COMMAND_SET" ]] || REPLACEMENT_FENCE_COMMAND="$INPUT_REPLACEMENT_FENCE_COMMAND"
-[[ -z "$INPUT_REPLACEMENT_VERIFY_COMMAND_SET" ]] || REPLACEMENT_VERIFY_COMMAND="$INPUT_REPLACEMENT_VERIFY_COMMAND"
+restore_invocation_control() {
+  local name="$1"
+  local was_set="$2"
+  local value="$3"
+  if [[ -n "$was_set" ]]; then
+    printf -v "$name" '%s' "$value"
+  else
+    unset "$name"
+  fi
+}
+
+# Replacement controls are never inherited from the deployment inventory.
+# An unset invocation value therefore resolves to the script default below.
+restore_invocation_control TARGET_NODE "$INPUT_TARGET_NODE_SET" "$INPUT_TARGET_NODE"
+restore_invocation_control REPLACEMENT_CONFIRM "$INPUT_REPLACEMENT_CONFIRM_SET" "$INPUT_REPLACEMENT_CONFIRM"
+restore_invocation_control REPLACEMENT_STATE_FILE "$INPUT_REPLACEMENT_STATE_FILE_SET" "$INPUT_REPLACEMENT_STATE_FILE"
+restore_invocation_control REPLACEMENT_DATA_MODE "$INPUT_REPLACEMENT_DATA_MODE_SET" "$INPUT_REPLACEMENT_DATA_MODE"
+restore_invocation_control REPLACEMENT_FENCE_MODE "$INPUT_REPLACEMENT_FENCE_MODE_SET" "$INPUT_REPLACEMENT_FENCE_MODE"
+restore_invocation_control REPLACEMENT_FENCE_COMMAND "$INPUT_REPLACEMENT_FENCE_COMMAND_SET" "$INPUT_REPLACEMENT_FENCE_COMMAND"
+restore_invocation_control REPLACEMENT_VERIFY_COMMAND "$INPUT_REPLACEMENT_VERIFY_COMMAND_SET" "$INPUT_REPLACEMENT_VERIFY_COMMAND"
+restore_invocation_control REPLACEMENT_FENCE_VERIFY_SECONDS "$INPUT_REPLACEMENT_FENCE_VERIFY_SECONDS_SET" "$INPUT_REPLACEMENT_FENCE_VERIFY_SECONDS"
+restore_invocation_control REPLACEMENT_STABILITY_SECONDS "$INPUT_REPLACEMENT_STABILITY_SECONDS_SET" "$INPUT_REPLACEMENT_STABILITY_SECONDS"
+restore_invocation_control REPLACEMENT_TIMEOUT_SECONDS "$INPUT_REPLACEMENT_TIMEOUT_SECONDS_SET" "$INPUT_REPLACEMENT_TIMEOUT_SECONDS"
+restore_invocation_control REPLACEMENT_POLL_SECONDS "$INPUT_REPLACEMENT_POLL_SECONDS_SET" "$INPUT_REPLACEMENT_POLL_SECONDS"
+restore_invocation_control REPLACEMENT_KEEP_STATE "$INPUT_REPLACEMENT_KEEP_STATE_SET" "$INPUT_REPLACEMENT_KEEP_STATE"
 
 TARGET_NODE="${TARGET_NODE:-}"
 NODES="${NODES:-}"
@@ -138,6 +170,9 @@ SSH_USER="${SSH_USER:-${USER:-$(id -un)}}"
 RAFT_PORT="${RAFT_PORT:-50051}"
 CONTAINER_NAME="${CONTAINER_NAME:-elastickv}"
 DATA_DIR="${DATA_DIR:-/var/lib/elastickv}"
+while [[ "$DATA_DIR" != "/" && "$DATA_DIR" == */ ]]; do
+  DATA_DIR="${DATA_DIR%/}"
+done
 RAFTADMIN_BIN="${RAFTADMIN_BIN:-}"
 RAFTADMIN_ALLOW_INSECURE="${RAFTADMIN_ALLOW_INSECURE:-true}"
 RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-5}"
@@ -164,8 +199,16 @@ STATE_TARGET_ADDRESS=""
 STATE_OPERATION_ID=""
 STATE_ARCHIVE_PATH=""
 STATE_EXPECTED_VOTERS=""
+STATE_EXPECTED_MEMBERS=""
+STATE_EXPECTED_CONFIG_INDEX=0
 STATE_MIN_CATCH_UP_INDEX=0
 STATE_DATA_MODE=""
+VIEW_LEADER_ID=""
+VIEW_LEADER_ADDRESS=""
+VIEW_CONFIG_INDEX=0
+VIEW_COMMIT_INDEX=0
+VIEW_APPLIED_INDEX=0
+VIEW_CONFIGURATION=""
 RAFTADMIN_TMP_DIR=""
 LOCK_DIR=""
 LOCK_ACQUIRED=false
@@ -188,6 +231,7 @@ validate_settings() {
   [[ "$TARGET_NODE" =~ ^[A-Za-z0-9._-]+$ ]] || fail "TARGET_NODE contains unsupported characters"
   [[ -n "$NODES" ]] || fail "NODES is required"
   [[ "$DATA_DIR" == /* ]] || fail "DATA_DIR must be absolute"
+  [[ "$DATA_DIR" != "/" ]] || fail "DATA_DIR must not be the filesystem root"
   state_value_valid "$DATA_DIR" || fail "DATA_DIR contains characters unsupported by the resume state"
   [[ -x "$ROLLING_UPDATE_SCRIPT" ]] || fail "ROLLING_UPDATE_SCRIPT is not executable: $ROLLING_UPDATE_SCRIPT"
   is_uint "$RAFT_PORT" || fail "RAFT_PORT must be an unsigned integer"
@@ -212,8 +256,16 @@ validate_settings() {
     *) fail "REPLACEMENT_DATA_MODE must be archive or delete" ;;
   esac
   if [[ "$MODE" == "execute" ]]; then
+    [[ -n "$INPUT_TARGET_NODE_SET" && -n "$INPUT_TARGET_NODE" ]] || fail "TARGET_NODE must be supplied explicitly for --execute"
+    [[ -n "$INPUT_REPLACEMENT_CONFIRM_SET" ]] || fail "REPLACEMENT_CONFIRM must be supplied explicitly for --execute"
+    [[ -n "$INPUT_REPLACEMENT_VERIFY_COMMAND_SET" && -n "$INPUT_REPLACEMENT_VERIFY_COMMAND" ]] || \
+      fail "REPLACEMENT_VERIFY_COMMAND must be supplied explicitly for --execute"
     [[ "$REPLACEMENT_CONFIRM" == "$TARGET_NODE" ]] || fail "REPLACEMENT_CONFIRM must exactly match TARGET_NODE"
     [[ -n "$REPLACEMENT_VERIFY_COMMAND" ]] || fail "REPLACEMENT_VERIFY_COMMAND is required for --execute"
+    if [[ "$REPLACEMENT_FENCE_MODE" == "external" ]]; then
+      [[ -n "$INPUT_REPLACEMENT_FENCE_COMMAND_SET" && -n "$INPUT_REPLACEMENT_FENCE_COMMAND" ]] || \
+        fail "REPLACEMENT_FENCE_COMMAND must be supplied explicitly for external fencing"
+    fi
   fi
 }
 
@@ -338,8 +390,97 @@ configuration_rows() {
   '
 }
 
+configuration_signature() {
+  local config="$1"
+  printf '%s\n' "$config" | configuration_rows | LC_ALL=C sort | \
+    awk 'NF { if (result != "") result=result ","; result=result $0 } END { print result }'
+}
+
+configuration_signature_with_target() {
+  local signature="$1"
+  local desired="$2"
+  local entry id
+  local -a entries=()
+  {
+    IFS=',' read -r -a entries <<< "$signature"
+    for entry in "${entries[@]}"; do
+      [[ -n "$entry" ]] || continue
+      id="${entry%%|*}"
+      [[ "$id" == "$TARGET_NODE" ]] || printf '%s\n' "$entry"
+    done
+    if [[ "$desired" != "absent" ]]; then
+      printf '%s|%s|%s\n' "$TARGET_NODE" "$STATE_TARGET_ADDRESS" "$desired"
+    fi
+  } | LC_ALL=C sort | awk 'NF { if (result != "") result=result ","; result=result $0 } END { print result }'
+}
+
 status_for() {
   raftadmin "$1" status 2>/dev/null
+}
+
+load_leader_view() {
+  local leader before_ready after_ready before_index after_index
+  local after_commit after_applied
+  local before_status after_status
+
+  leader="$(wait_for_leader)" || return 1
+  VIEW_LEADER_ID="${leader%%|*}"
+  VIEW_LEADER_ADDRESS="${leader#*|}"
+  before_status="$(status_for "$VIEW_LEADER_ADDRESS")" || return 1
+  [[ "$(printf '%s\n' "$before_status" | field_value state)" == "LEADER" ]] || return 1
+  before_ready="$(status_ready_fields "$before_status")" || return 1
+  before_index="${before_ready%%|*}"
+  VIEW_CONFIGURATION="$(raftadmin "$VIEW_LEADER_ADDRESS" configuration)" || return 1
+  after_status="$(status_for "$VIEW_LEADER_ADDRESS")" || return 1
+  [[ "$(printf '%s\n' "$after_status" | field_value state)" == "LEADER" ]] || return 1
+  after_ready="$(status_ready_fields "$after_status")" || return 1
+  IFS='|' read -r after_index after_commit after_applied <<< "$after_ready"
+  [[ "$before_index" == "$after_index" ]] || return 1
+  VIEW_CONFIG_INDEX="$after_index"
+  VIEW_COMMIT_INDEX="$after_commit"
+  VIEW_APPLIED_INDEX="$after_applied"
+}
+
+assert_expected_configuration() {
+  local context="$1"
+  local actual_signature
+  actual_signature="$(configuration_signature "$VIEW_CONFIGURATION")"
+  [[ "$VIEW_CONFIG_INDEX" == "$STATE_EXPECTED_CONFIG_INDEX" ]] || \
+    fail "$context configuration index changed: expected=$STATE_EXPECTED_CONFIG_INDEX actual=$VIEW_CONFIG_INDEX"
+  [[ "$actual_signature" == "$STATE_EXPECTED_MEMBERS" ]] || \
+    fail "$context membership changed outside this operation"
+}
+
+adopt_committed_target_change() {
+  local desired="$1"
+  local context="$2"
+  local expected_signature actual_signature
+  expected_signature="$(configuration_signature_with_target "$STATE_EXPECTED_MEMBERS" "$desired")"
+  actual_signature="$(configuration_signature "$VIEW_CONFIGURATION")"
+  [[ "$actual_signature" == "$expected_signature" ]] || \
+    fail "$context observed an unexpected membership after a lost response"
+  (( VIEW_CONFIG_INDEX > STATE_EXPECTED_CONFIG_INDEX )) || \
+    fail "$context did not advance the configuration index"
+  STATE_EXPECTED_MEMBERS="$actual_signature"
+  STATE_EXPECTED_CONFIG_INDEX="$VIEW_CONFIG_INDEX"
+  write_state
+}
+
+record_committed_target_change() {
+  local desired="$1"
+  local change_index="$2"
+  local context="$3"
+  local expected_signature actual_signature
+  load_leader_view || fail "cannot read stable leader view after $context"
+  expected_signature="$(configuration_signature_with_target "$STATE_EXPECTED_MEMBERS" "$desired")"
+  actual_signature="$(configuration_signature "$VIEW_CONFIGURATION")"
+  [[ "$VIEW_CONFIG_INDEX" == "$change_index" ]] || \
+    fail "$context configuration index was superseded: committed=$change_index actual=$VIEW_CONFIG_INDEX"
+  [[ "$actual_signature" == "$expected_signature" ]] || \
+    fail "$context committed an unexpected membership"
+  STATE_EXPECTED_MEMBERS="$actual_signature"
+  STATE_EXPECTED_CONFIG_INDEX="$VIEW_CONFIG_INDEX"
+  write_state
 }
 
 discover_leader() {
@@ -414,10 +555,9 @@ same_csv_set() {
      "$(printf '%s' "$right" | tr ',' '\n' | sed '/^$/d' | sort | tr '\n' ',')" ]]
 }
 
-leader_status_ready() {
-  local address="$1"
-  local status pending config_index commit applied
-  status="$(status_for "$address")" || return 1
+status_ready_fields() {
+  local status="$1"
+  local pending config_index commit applied
   pending="$(printf '%s\n' "$status" | field_value pending_conf_change)"
   config_index="$(printf '%s\n' "$status" | field_value configuration_index)"
   commit="$(printf '%s\n' "$status" | field_value commit_index)"
@@ -426,6 +566,13 @@ leader_status_ready() {
   is_uint "$config_index" && (( config_index > 0 )) || return 1
   is_uint "$commit" && is_uint "$applied" && (( applied >= commit )) || return 1
   printf '%s|%s|%s\n' "$config_index" "$commit" "$applied"
+}
+
+leader_status_ready() {
+  local address="$1"
+  local status
+  status="$(status_for "$address")" || return 1
+  status_ready_fields "$status"
 }
 
 select_transfer_candidate() {
@@ -450,16 +597,19 @@ select_transfer_candidate() {
 }
 
 preflight() {
-  local leader leader_id leader_address config target_address target_suffrage
-  local ready config_index commit applied voters quorum reachable=0
+  local leader_id leader_address config target_address target_suffrage
+  local config_index commit applied voters quorum reachable=0
   local id address suffrage voter_status voter_state voter_leader
+  local initial_signature
 
-  leader="$(discover_leader)" || fail "no reachable Raft leader; no-quorum recovery is not supported"
-  leader_id="${leader%%|*}"
-  leader_address="${leader#*|}"
-  ready="$(leader_status_ready "$leader_address")" || fail "leader is not fully applied or has a pending configuration change"
-  IFS='|' read -r config_index commit applied <<< "$ready"
-  config="$(raftadmin "$leader_address" configuration)" || fail "cannot read leader configuration"
+  load_leader_view || fail "no stable fully-applied Raft leader; no-quorum recovery is not supported"
+  leader_id="$VIEW_LEADER_ID"
+  leader_address="$VIEW_LEADER_ADDRESS"
+  config_index="$VIEW_CONFIG_INDEX"
+  commit="$VIEW_COMMIT_INDEX"
+  applied="$VIEW_APPLIED_INDEX"
+  config="$VIEW_CONFIGURATION"
+  initial_signature="$(configuration_signature "$config")"
   target_suffrage="$(member_suffrage "$TARGET_NODE" "$config" || true)"
   target_address="$(member_address "$TARGET_NODE" "$config" || true)"
   [[ "$target_suffrage" == "voter" ]] || fail "target must be a current voter; got ${target_suffrage:-absent}"
@@ -490,9 +640,15 @@ preflight() {
     log "transferring leadership from $TARGET_NODE to $candidate_id"
     raftadmin "$leader_address" leadership_transfer_to_server "$candidate_id" "$candidate_address" >/dev/null
     wait_for_leader "$candidate_id" >/dev/null || fail "leadership did not transfer to $candidate_id"
+    load_leader_view || fail "cannot read stable leader view after leadership transfer"
+    [[ "$VIEW_CONFIG_INDEX" == "$config_index" ]] || fail "membership changed during leadership transfer"
+    [[ "$(configuration_signature "$VIEW_CONFIGURATION")" == "$initial_signature" ]] || \
+      fail "membership changed during leadership transfer"
   fi
 
   STATE_EXPECTED_VOTERS="$(voter_csv "$config")"
+  STATE_EXPECTED_MEMBERS="$initial_signature"
+  STATE_EXPECTED_CONFIG_INDEX="$config_index"
   STATE_TARGET_ADDRESS="$target_address"
   log "preflight passed: leader=$leader_id leader_applied=$applied voters=$voters non_target_reachable=$reachable quorum=$quorum config_index=$config_index"
 }
@@ -687,26 +843,27 @@ wait_configuration_index() {
 }
 
 remove_target() {
-  local config current leader address config_index output change_index
-  config="$(configuration_from_leader)" || fail "cannot read configuration before removal"
+  local config current output change_index
+  load_leader_view || fail "cannot read stable leader view before removal"
+  config="$VIEW_CONFIGURATION"
   current="$(member_suffrage "$TARGET_NODE" "$config" || true)"
   if [[ -z "$current" ]]; then
+    adopt_committed_target_change absent "remove_server"
     log "target is already absent; resuming after committed removal"
     return 0
   fi
   [[ "$current" == "voter" ]] || fail "target changed from voter to $current before removal"
+  assert_expected_configuration "remove_server"
   ! status_for "$STATE_TARGET_ADDRESS" >/dev/null || fail "target returned after fencing"
-  leader="$(wait_for_leader)" || fail "no leader available for removal"
-  address="${leader#*|}"
-  config_index="$(config_index_from_leader)" || fail "leader is not ready for removal"
-  log "removing $TARGET_NODE at configuration index $config_index"
-  output="$(raftadmin "$address" remove_server "$TARGET_NODE" "$config_index")"
+  log "removing $TARGET_NODE at configuration index $STATE_EXPECTED_CONFIG_INDEX"
+  output="$(raftadmin "$VIEW_LEADER_ADDRESS" remove_server "$TARGET_NODE" "$STATE_EXPECTED_CONFIG_INDEX")"
   change_index="$(printf '%s\n' "$output" | field_value index)"
-  if ! is_uint "$change_index" || (( change_index <= config_index )); then
+  if ! is_uint "$change_index" || (( change_index <= STATE_EXPECTED_CONFIG_INDEX )); then
     fail "remove_server returned an invalid configuration index"
   fi
   wait_member_state absent || fail "remove_server did not commit"
   wait_configuration_index "$change_index" || fail "leader status did not publish committed removal index $change_index"
+  record_committed_target_change absent "$change_index" "remove_server"
 }
 
 run_rollout() {
@@ -722,43 +879,41 @@ run_rollout() {
     unset ROLLING_UPDATE_ENV_FILE RAFT_BOOTSTRAP_MEMBERS
     export ROLLING_ORDER="$rollout_target"
     export RAFT_JOIN_NODE="$join_node"
+    export DRY_RUN=false
     exec "$ROLLING_UPDATE_SCRIPT"
   )
 }
 
 add_learner() {
-  local config current leader address status commit config_index output change_index
-  config="$(configuration_from_leader)" || fail "cannot read configuration before learner add"
+  local config current commit output change_index
+  load_leader_view || fail "cannot read stable leader view before learner add"
+  config="$VIEW_CONFIGURATION"
   current="$(member_suffrage "$TARGET_NODE" "$config" || true)"
   if [[ "$current" == "learner" ]]; then
     (( STATE_MIN_CATCH_UP_INDEX > 0 )) || fail "learner committed but catch-up floor is missing from replacement state"
+    adopt_committed_target_change learner "add_learner"
     log "target is already a learner; resuming after committed add"
     return 0
   fi
   [[ -z "$current" ]] || fail "target unexpectedly has suffrage $current before learner add"
   wait_target_up || fail "join deployment did not expose the target RaftAdmin endpoint"
-  leader="$(wait_for_leader)" || fail "no leader available for learner add"
-  address="${leader#*|}"
-  status="$(status_for "$address")" || fail "cannot read leader status before learner add"
-  commit="$(printf '%s\n' "$status" | field_value commit_index)"
-  config_index="$(printf '%s\n' "$status" | field_value configuration_index)"
-  [[ "$(printf '%s\n' "$status" | field_value pending_conf_change)" == "false" ]] || fail "a configuration change is pending"
-  if ! is_uint "$commit" || ! is_uint "$config_index" || (( config_index == 0 )); then
-    fail "invalid leader indexes before learner add"
-  fi
+  load_leader_view || fail "cannot read stable leader view before learner add"
+  assert_expected_configuration "add_learner"
+  commit="$VIEW_COMMIT_INDEX"
   STATE_MIN_CATCH_UP_INDEX="$commit"
   # Persist the floor before proposing. If the RPC commits but the control
   # process exits before advancing its stage, promotion still has a durable,
   # non-zero catch-up bound on resume.
   write_state
-  log "adding learner $TARGET_NODE at configuration index $config_index; catch-up floor=$commit"
-  output="$(raftadmin "$address" add_learner "$TARGET_NODE" "$STATE_TARGET_ADDRESS" "$config_index")"
+  log "adding learner $TARGET_NODE at configuration index $STATE_EXPECTED_CONFIG_INDEX; catch-up floor=$commit"
+  output="$(raftadmin "$VIEW_LEADER_ADDRESS" add_learner "$TARGET_NODE" "$STATE_TARGET_ADDRESS" "$STATE_EXPECTED_CONFIG_INDEX")"
   change_index="$(printf '%s\n' "$output" | field_value index)"
-  if ! is_uint "$change_index" || (( change_index <= config_index )); then
+  if ! is_uint "$change_index" || (( change_index <= STATE_EXPECTED_CONFIG_INDEX )); then
     fail "add_learner returned an invalid configuration index"
   fi
   wait_member_state learner || fail "add_learner did not commit"
   wait_configuration_index "$change_index" || fail "leader status did not publish committed learner index $change_index"
+  record_committed_target_change learner "$change_index" "add_learner"
 }
 
 wait_for_catch_up() {
@@ -779,31 +934,34 @@ wait_for_catch_up() {
 }
 
 promote_learner() {
-  local config current leader address config_index output change_index
-  config="$(configuration_from_leader)" || fail "cannot read configuration before promotion"
+  local config current output change_index
+  load_leader_view || fail "cannot read stable leader view before promotion"
+  config="$VIEW_CONFIGURATION"
   current="$(member_suffrage "$TARGET_NODE" "$config" || true)"
   if [[ "$current" == "voter" ]]; then
+    adopt_committed_target_change voter "promote_learner"
     log "target is already a voter; resuming after committed promotion"
     return 0
   fi
   [[ "$current" == "learner" ]] || fail "target must be a learner before promotion; got ${current:-absent}"
   (( STATE_MIN_CATCH_UP_INDEX > 0 )) || fail "catch-up floor is missing from replacement state"
+  assert_expected_configuration "promote_learner"
   wait_for_catch_up || fail "learner did not reach catch-up floor"
-  leader="$(wait_for_leader)" || fail "no leader available for promotion"
-  address="${leader#*|}"
-  config_index="$(config_index_from_leader)" || fail "leader is not ready for promotion"
-  log "promoting $TARGET_NODE at configuration index $config_index"
-  output="$(raftadmin "$address" promote_learner "$TARGET_NODE" "$config_index" "$STATE_MIN_CATCH_UP_INDEX" false)"
+  load_leader_view || fail "cannot read stable leader view after learner catch-up"
+  assert_expected_configuration "promote_learner"
+  log "promoting $TARGET_NODE at configuration index $STATE_EXPECTED_CONFIG_INDEX"
+  output="$(raftadmin "$VIEW_LEADER_ADDRESS" promote_learner "$TARGET_NODE" "$STATE_EXPECTED_CONFIG_INDEX" "$STATE_MIN_CATCH_UP_INDEX" false)"
   change_index="$(printf '%s\n' "$output" | field_value index)"
-  if ! is_uint "$change_index" || (( change_index <= config_index )); then
+  if ! is_uint "$change_index" || (( change_index <= STATE_EXPECTED_CONFIG_INDEX )); then
     fail "promote_learner returned an invalid configuration index"
   fi
   wait_member_state voter || fail "promote_learner did not commit"
   wait_configuration_index "$change_index" || fail "leader status did not publish committed promotion index $change_index"
+  record_committed_target_change voter "$change_index" "promote_learner"
 }
 
 verify_cluster_once() {
-  local leader leader_id address status pending config voters id member_address suffrage member_status state member_leader applied commit
+  local leader leader_id address status pending config voters signature id member_address suffrage member_status state member_leader applied commit
   leader="$(discover_leader)" || return 1
   leader_id="${leader%%|*}"
   address="${leader#*|}"
@@ -811,6 +969,8 @@ verify_cluster_once() {
   pending="$(printf '%s\n' "$status" | field_value pending_conf_change)"
   [[ "$pending" == "false" ]] || return 1
   config="$(raftadmin "$address" configuration 2>/dev/null)" || return 1
+  signature="$(configuration_signature "$config")"
+  [[ "$signature" == "$STATE_EXPECTED_MEMBERS" ]] || return 1
   voters="$(voter_csv "$config")"
   same_csv_set "$voters" "$STATE_EXPECTED_VOTERS" || return 1
   while IFS='|' read -r id member_address suffrage; do
@@ -853,13 +1013,14 @@ verify_stability() {
 }
 
 state_value_valid() {
-  [[ "$1" =~ ^[A-Za-z0-9_./,:@-]*$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9_./,:@|-]*$ ]]
 }
 
 write_state() {
   local tmp value
   for value in "$STATE_STAGE" "$STATE_TARGET" "$STATE_TARGET_ADDRESS" "$STATE_OPERATION_ID" \
-    "$STATE_ARCHIVE_PATH" "$STATE_EXPECTED_VOTERS" "$STATE_MIN_CATCH_UP_INDEX" "$STATE_DATA_MODE"; do
+    "$STATE_ARCHIVE_PATH" "$STATE_EXPECTED_VOTERS" "$STATE_EXPECTED_MEMBERS" \
+    "$STATE_EXPECTED_CONFIG_INDEX" "$STATE_MIN_CATCH_UP_INDEX" "$STATE_DATA_MODE"; do
     state_value_valid "$value" || fail "replacement state contains an unsupported value"
   done
   mkdir -p "$(dirname "$REPLACEMENT_STATE_FILE")"
@@ -871,6 +1032,8 @@ write_state() {
     printf 'operation_id=%s\n' "$STATE_OPERATION_ID"
     printf 'archive_path=%s\n' "$STATE_ARCHIVE_PATH"
     printf 'expected_voters=%s\n' "$STATE_EXPECTED_VOTERS"
+    printf 'expected_members=%s\n' "$STATE_EXPECTED_MEMBERS"
+    printf 'expected_config_index=%s\n' "$STATE_EXPECTED_CONFIG_INDEX"
     printf 'min_catch_up_index=%s\n' "$STATE_MIN_CATCH_UP_INDEX"
     printf 'data_mode=%s\n' "$STATE_DATA_MODE"
   } > "$tmp"
@@ -890,20 +1053,26 @@ load_state() {
       operation_id) STATE_OPERATION_ID="$value" ;;
       archive_path) STATE_ARCHIVE_PATH="$value" ;;
       expected_voters) STATE_EXPECTED_VOTERS="$value" ;;
+      expected_members) STATE_EXPECTED_MEMBERS="$value" ;;
+      expected_config_index) STATE_EXPECTED_CONFIG_INDEX="$value" ;;
       min_catch_up_index) STATE_MIN_CATCH_UP_INDEX="$value" ;;
       data_mode) STATE_DATA_MODE="$value" ;;
       "") ;;
       *) fail "unknown key in state file: $key" ;;
     esac
   done < "$REPLACEMENT_STATE_FILE"
-  if ! is_uint "$STATE_STAGE" || ! is_uint "$STATE_MIN_CATCH_UP_INDEX"; then
+  if ! is_uint "$STATE_STAGE" || ! is_uint "$STATE_EXPECTED_CONFIG_INDEX" || \
+    ! is_uint "$STATE_MIN_CATCH_UP_INDEX"; then
     fail "invalid numeric value in state file"
   fi
   (( STATE_STAGE <= 9 )) || fail "state stage is outside the implemented range: $STATE_STAGE"
   [[ "$STATE_TARGET" == "$TARGET_NODE" ]] || fail "state file belongs to target $STATE_TARGET, not $TARGET_NODE"
   [[ "$STATE_TARGET_ADDRESS" == "$(node_host_by_id "$TARGET_NODE"):${RAFT_PORT}" ]] || fail "state target address no longer matches NODES"
-  [[ -n "$STATE_OPERATION_ID" && -n "$STATE_ARCHIVE_PATH" && -n "$STATE_EXPECTED_VOTERS" ]] || fail "state file is incomplete"
+  [[ -n "$STATE_OPERATION_ID" && -n "$STATE_ARCHIVE_PATH" && -n "$STATE_EXPECTED_VOTERS" && \
+    -n "$STATE_EXPECTED_MEMBERS" ]] || fail "state file is incomplete"
+  (( STATE_EXPECTED_CONFIG_INDEX > 0 )) || fail "state file has no expected configuration index"
   [[ "$STATE_DATA_MODE" == "$REPLACEMENT_DATA_MODE" ]] || fail "REPLACEMENT_DATA_MODE changed from $STATE_DATA_MODE to $REPLACEMENT_DATA_MODE"
+  (( STATE_STAGE < 9 )) || fail "replacement state is already complete; archive it or choose a new REPLACEMENT_STATE_FILE"
   log "resuming operation $STATE_OPERATION_ID at stage $STATE_STAGE"
 }
 

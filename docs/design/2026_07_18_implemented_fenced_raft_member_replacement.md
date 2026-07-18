@@ -61,6 +61,11 @@ choice of authoritative log and accepted data-loss boundary.
 
 `--execute` is required and `REPLACEMENT_CONFIRM` must exactly equal
 `TARGET_NODE`. `--dry-run` performs no build, RPC, SSH, fence, or deployment.
+For `--execute`, `TARGET_NODE`, `REPLACEMENT_CONFIRM`,
+`REPLACEMENT_VERIFY_COMMAND`, and the external fence command must be supplied
+on the invocation. Replacement controls are never read from the deployment env;
+that file is inventory only, so a stale recovery value cannot authorize a new
+operation.
 
 The target must be present in `NODES`, be a current voter, and have exactly the
 advertised `NODES` address. A learner, absent ID, or address mismatch aborts.
@@ -96,10 +101,15 @@ RaftAdmin status now reports:
 - `configuration_index`, the current durable membership index; and
 - `pending_conf_change`, whether an unapplied change is in flight.
 
-Every `remove_server`, `add_learner`, and `promote_learner` call passes the
-current non-zero configuration index as `previous_index`. The engine rejects a
-concurrent topology change instead of applying a stale plan. The command waits
-for the requested suffrage and a clear pending-change flag before advancing.
+Preflight records both the complete member signature and its non-zero
+configuration index. Every `remove_server`, `add_learner`, and
+`promote_learner` call passes that recorded index as `previous_index`; it never
+adopts a newer index merely because another topology change committed. After
+each successful change, the command verifies the exact expected post-change
+signature before persisting the returned index for the next stage. The engine
+therefore rejects a concurrent topology change instead of applying a stale
+plan. A resume after a lost RPC response is accepted only when the complete
+member signature matches the one transition that was in flight.
 
 ### 4.5 Catch-up before promotion
 
@@ -132,7 +142,7 @@ same state file.
 
 | Stage | Durable fact |
 | --- | --- |
-| 0 | Target identity, address, original voter set, operation ID, and archive path recorded |
+| 0 | Target identity, address, complete member signature and configuration index, original voter set, operation ID, and archive path recorded |
 | 1 | Preflight and any leadership transfer completed |
 | 2 | Old ID owner fenced and endpoint observed down |
 | 3 | Target absent from committed membership |
@@ -150,9 +160,11 @@ committed learner only when its catch-up floor exists, and stage 6 accepts an
 already promoted voter. A conflicting suffrage or voter set aborts instead of
 guessing what happened.
 
-The state file is retained by default as operational evidence. Set
-`REPLACEMENT_KEEP_STATE=false` only when another durable audit system records
-the completed operation.
+The state file is retained by default as operational evidence. A retained
+stage-9 file is never treated as authorization for a later incident: a new
+replacement must archive that evidence or select a new
+`REPLACEMENT_STATE_FILE`. Set `REPLACEMENT_KEEP_STATE=false` only when another
+durable audit system records the completed operation.
 
 ## 6. Data handling
 
@@ -160,6 +172,10 @@ Archive mode is the default. The deterministic archive path includes the
 target ID and operation ID, making a retry distinguishable from a new
 replacement. If both the live data path and archive path exist, the command
 fails rather than overwriting either.
+
+Trailing slashes are removed from `DATA_DIR` before the sibling archive path is
+derived, and the filesystem root is rejected. The archive can therefore never
+be constructed as a child of the directory being moved.
 
 Delete mode must be explicitly selected. Both modes execute only after the ID
 is absent from committed membership and verify the target container is not
@@ -196,7 +212,9 @@ REPLACEMENT_FENCE_MODE=container
 The replacement command sources the deployment env for inventory and then
 invokes `rolling-update.sh` twice with only `TARGET_NODE` selected. Bootstrap
 membership is removed from both invocations. The first deploy includes
-`RAFT_JOIN_NODE`; the post-promotion deploy clears it.
+`RAFT_JOIN_NODE`; the post-promotion deploy clears it. Both invocations force
+`DRY_RUN=false`, so a stale deployment-env dry-run setting cannot advance the
+replacement state without starting the target.
 
 ## 8. Failure handling
 
@@ -204,7 +222,8 @@ membership is removed from both invocations. The first deploy includes
 | --- | --- |
 | No leader or insufficient surviving quorum | Stop. Restore an existing voter or use a separately reviewed disaster-recovery procedure. |
 | Target endpoint remains reachable after fence | Strengthen the fence. Do not remove membership. |
-| `previous_index` mismatch | Inspect the concurrent topology change and reconcile the state file with the authoritative configuration. Do not retry blindly. |
+| Recorded member signature or `previous_index` mismatch | Inspect the concurrent topology change and reconcile the state file with the authoritative configuration. Do not retry blindly. |
+| Existing state is already at stage 9 | Archive the completed evidence or choose a new state-file path before authorizing a new replacement. |
 | Data and deterministic archive both exist | Inspect the target host. Do not delete either path automatically. |
 | Learner catch-up timeout | Leave it a learner, diagnose transport/disk/snapshot transfer, and resume with the same state file. |
 | Promotion committed but normal restart fails | Keep the surviving voters running. Repair the target from its existing post-join data; do not wipe it again. |
@@ -216,8 +235,8 @@ membership is removed from both invocations. The first deploy includes
 `raft_member_replace_script_test.go` runs the complete shell workflow against a
 stateful fake RaftAdmin, SSH transport, and rolling deploy command. It verifies
 the exact voter-to-absent-to-learner-to-voter sequence, non-zero catch-up floor,
-both deploy modes, application verification, durable stage 9, and an idempotent
-completed resume.
+both deploy modes, forced execute rollout, application verification, durable
+stage 9, and rejection of a completed state as a new operation.
 
 A negative test makes one surviving voter unreachable in a three-voter group
 and proves the command aborts before the fence action. Another test loses the
@@ -228,6 +247,11 @@ server and CLI tests cover propagation and rendering of the configuration
 index and pending change fields. Existing engine membership tests cover stale
 previous indexes, learner catch-up enforcement, same-ID replacement, and
 persisted membership restart.
+
+Additional negative tests prove that deployment-env replacement controls
+cannot authorize an operation, a configuration-index change after preflight
+aborts before removal, invocation-level timing controls override stale env
+values, and a trailing-slash data path produces a sibling archive.
 
 Production acceptance still requires recording the state file, fence evidence,
 final `raftadmin status`/`configuration`, and the output of the configured
