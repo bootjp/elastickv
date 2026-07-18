@@ -274,18 +274,24 @@ func removePeerFromMap(peers map[uint64]Peer, nodeID uint64) {
 	delete(peers, nodeID)
 }
 
-func sortedPeerList(peers map[uint64]Peer) []Peer {
-	if len(peers) == 0 {
+func peerListForConfState(peers map[uint64]Peer, conf raftpb.ConfState) []Peer {
+	if len(conf.Voters) == 0 && len(conf.Learners) == 0 {
 		return nil
 	}
-	out := make([]Peer, 0, len(peers))
-	for _, peer := range peers {
-		normalizedPeer, err := normalizePersistedPeer(peer)
-		if err != nil {
-			continue
+	out := make([]Peer, 0, len(conf.Voters)+len(conf.Learners))
+	appendPeer := func(nodeID uint64, suffrage string) {
+		peer, ok := peers[nodeID]
+		if !ok {
+			peer = Peer{NodeID: nodeID, ID: strconv.FormatUint(nodeID, 10)}
 		}
-		out = append(out, normalizedPeer)
+		peer.Suffrage = suffrage
+		out = append(out, peer)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	for _, nodeID := range conf.Voters {
+		appendPeer(nodeID, SuffrageVoter)
+	}
+	for _, nodeID := range conf.Learners {
+		appendPeer(nodeID, SuffrageLearner)
+	}
 	return out
 }

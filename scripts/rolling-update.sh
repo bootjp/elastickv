@@ -37,6 +37,11 @@ Optional environment:
   RAFT_ENGINE
   RAFT_PORT
   RAFT_BOOTSTRAP_MEMBERS
+  RAFT_JOIN_NODE
+    Raft ID of one fresh node that is being attached as a learner. Requires
+    ROLLING_ORDER to contain only that node. The script derives
+    --raftJoinMembers from NODES and passes --raftJoinAsLearner only to this
+    node. Remove RAFT_JOIN_NODE and redeploy the node after promotion.
   REDIS_PORT
   DYNAMO_PORT
   RAFT_TO_REDIS_MAP
@@ -147,6 +152,7 @@ Optional environment:
 
 Notes:
   - RAFT_BOOTSTRAP_MEMBERS is only forwarded when explicitly set.
+  - RAFT_JOIN_NODE and RAFT_BOOTSTRAP_MEMBERS are mutually exclusive.
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
@@ -275,6 +281,7 @@ NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_BOOTSTRAP_MEMBERS="${RAFT_BOOTSTRAP_MEMBERS:-}"
+RAFT_JOIN_NODE="${RAFT_JOIN_NODE:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
 RAFT_TO_SQS_MAP="${RAFT_TO_SQS_MAP:-}"
@@ -531,6 +538,20 @@ derive_raft_to_redis_map() {
   )
 }
 
+derive_raft_join_members() {
+  local parts=()
+  local i
+
+  for i in "${!NODE_IDS[@]}"; do
+    parts+=("${NODE_IDS[$i]}=${NODE_HOSTS[$i]}:${RAFT_PORT}")
+  done
+
+  (
+    IFS=,
+    printf '%s\n' "${parts[*]}"
+  )
+}
+
 derive_raft_to_s3_map() {
   local parts=()
   local i
@@ -566,6 +587,10 @@ print_dry_run_plan() {
   echo "[rolling-update] target image: $IMAGE"
   echo "[rolling-update] container: $CONTAINER_NAME"
   echo "[rolling-update] raft engine: $RAFT_ENGINE"
+  if [[ -n "$RAFT_JOIN_NODE" ]]; then
+    echo "[rolling-update] learner join node: $RAFT_JOIN_NODE"
+    echo "[rolling-update] RAFT_JOIN_MEMBERS=$RAFT_JOIN_MEMBERS"
+  fi
   echo "[rolling-update] rolling order:"
   for node_id in "${ROLLING_NODE_IDS[@]}"; do
     node_host="$(node_host_by_id "$node_id")"
@@ -696,6 +721,11 @@ update_one_node() {
   local node_host="$2"
   local ssh_target="$3"
   local all_node_ids_csv all_node_hosts_csv
+  local raft_join_as_learner=false
+
+  if [[ -n "$RAFT_JOIN_NODE" && "$node_id" == "$RAFT_JOIN_NODE" ]]; then
+    raft_join_as_learner=true
+  fi
 
   all_node_ids_csv="$(IFS=,; echo "${NODE_IDS[*]}")"
   all_node_hosts_csv="$(IFS=,; echo "${NODE_HOSTS[*]}")"
@@ -738,6 +768,8 @@ update_one_node() {
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
       RAFT_BOOTSTRAP_MEMBERS="$RAFT_BOOTSTRAP_MEMBERS_Q" \
+      RAFT_JOIN_AS_LEARNER="$raft_join_as_learner" \
+      RAFT_JOIN_MEMBERS="$RAFT_JOIN_MEMBERS_Q" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       RAFT_TO_SQS_MAP="$RAFT_TO_SQS_MAP_Q" \
@@ -1200,6 +1232,11 @@ run_container() {
     raft_bootstrap_flags=(--raftBootstrapMembers "$RAFT_BOOTSTRAP_MEMBERS")
   fi
 
+  local raft_join_flags=()
+  if [[ "${RAFT_JOIN_AS_LEARNER:-false}" == "true" ]]; then
+    raft_join_flags=(--raftJoinAsLearner --raftJoinMembers "$RAFT_JOIN_MEMBERS")
+  fi
+
   # config-fingerprint label drives the skip check on the next deploy
   # (see DEPLOY_CONFIG_FP_LABEL block above). Empty value here means
   # the deploy script was run on an old layout that didn't compute one
@@ -1228,6 +1265,7 @@ run_container() {
     --raftId "$NODE_ID" \
     --raftEngine "$RAFT_ENGINE" \
     "${raft_bootstrap_flags[@]}" \
+    "${raft_join_flags[@]}" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" \
@@ -1505,6 +1543,7 @@ config_fp() {
     "$NODE_HOST" "$NODE_ID" \
     "$RAFT_ENGINE" \
     "$RAFT_BOOTSTRAP_MEMBERS" \
+    "$RAFT_JOIN_AS_LEARNER" "$RAFT_JOIN_MEMBERS" \
     "$RAFT_PORT" "$REDIS_PORT" "$DYNAMO_PORT" \
     "$RAFT_TO_REDIS_MAP" \
     "$ENABLE_S3" "$S3_PORT" "$S3_REGION" "$S3_PATH_STYLE_ONLY" \
@@ -1580,6 +1619,26 @@ REMOTE
 
 parse_nodes
 prepare_rolling_order
+
+if [[ -n "$RAFT_JOIN_NODE" ]]; then
+  if [[ -n "$RAFT_BOOTSTRAP_MEMBERS" ]]; then
+    echo "rolling-update: RAFT_JOIN_NODE and RAFT_BOOTSTRAP_MEMBERS are mutually exclusive" >&2
+    exit 1
+  fi
+  if ! contains_value "$RAFT_JOIN_NODE" "${NODE_IDS[@]}"; then
+    echo "rolling-update: RAFT_JOIN_NODE references unknown raft ID: $RAFT_JOIN_NODE" >&2
+    exit 1
+  fi
+  if [[ "${#ROLLING_NODE_IDS[@]}" -ne 1 || "${ROLLING_NODE_IDS[0]}" != "$RAFT_JOIN_NODE" ]]; then
+    echo "rolling-update: RAFT_JOIN_NODE requires ROLLING_ORDER to contain only $RAFT_JOIN_NODE" >&2
+    exit 1
+  fi
+fi
+
+RAFT_JOIN_MEMBERS=""
+if [[ -n "$RAFT_JOIN_NODE" ]]; then
+  RAFT_JOIN_MEMBERS="$(derive_raft_join_members)"
+fi
 
 if [[ -z "$RAFT_TO_REDIS_MAP" ]]; then
   RAFT_TO_REDIS_MAP="$(derive_raft_to_redis_map)"
@@ -1755,6 +1814,7 @@ SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
 RAFT_BOOTSTRAP_MEMBERS_Q="$(printf '%q' "$RAFT_BOOTSTRAP_MEMBERS")"
+RAFT_JOIN_MEMBERS_Q="$(printf '%q' "$RAFT_JOIN_MEMBERS")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"

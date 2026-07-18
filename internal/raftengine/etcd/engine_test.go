@@ -726,6 +726,7 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),
 		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
 	}
 
 	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})

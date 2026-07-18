@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -134,6 +135,193 @@ func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
 			}
 		}
 		return voters == 2
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestFreshLearnerJoinPromotesAndRestartsFromPersistedMembership(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 3)
+	activeNodes := nodes[:2]
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, activeNodes[:1])
+
+	_, ok, err := LoadPersistedPeers(nodes[1].dir)
+	require.NoError(t, err)
+	require.False(t, ok, "fresh joiner must start without copied peer metadata")
+
+	nodes[1].joinAsLearner = true
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+	joinerConfig, err := nodes[1].engine.Configuration(ctx)
+	require.NoError(t, err)
+	require.Empty(t, joinerConfig.Servers, "join transport peers must not bootstrap ConfState")
+
+	addIndex, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	warm, err := leader.engine.Propose(ctx, []byte("fresh-join"))
+	require.NoError(t, err)
+	requireTransportNodeAppliedValue(t, nodes[1], "fresh-join")
+	requireLearnerPromoted(t, ctx, leader.engine, nodes[1].peer.ID, addIndex, warm.CommitIndex)
+	requireTransportNodeSuffrage(t, ctx, nodes[1], SuffrageVoter, 2)
+	requirePersistedPeersExcludeNode(t, nodes[1].dir, nodes[2].peer.NodeID, 2)
+	restartTransportTestNodesWithoutJoin(t, ctx, activeNodes)
+
+	restartedLeader := waitForLeaderNode(t, activeNodes)
+	requireTransportNodesConfigSize(t, ctx, activeNodes, 2)
+	result, err := restartedLeader.engine.Propose(ctx, []byte("after-full-restart"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+}
+
+func TestFreshLearnerJoinReusesRemovedVoterID(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	_, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	require.NoError(t, nodes[1].engine.Close())
+	nodes[1].engine = nil
+	_, err = leader.engine.RemoveServer(ctx, nodes[1].peer.ID, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 1)
+
+	require.NoError(t, os.RemoveAll(nodes[1].dir))
+	require.NoError(t, os.MkdirAll(nodes[1].dir, 0o750))
+	nodes[1].fsm = &testStateMachine{}
+	nodes[1].joinAsLearner = true
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	joinerConfig, err := nodes[1].engine.Configuration(ctx)
+	require.NoError(t, err)
+	require.Empty(t, joinerConfig.Servers, "wiped replacement must not recover its removed voter role")
+
+	addIndex, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	warm, err := leader.engine.Propose(ctx, []byte("same-id-replacement"))
+	require.NoError(t, err)
+	requireTransportNodeAppliedValue(t, nodes[1], "same-id-replacement")
+	requireLearnerPromoted(t, ctx, leader.engine, nodes[1].peer.ID, addIndex, warm.CommitIndex)
+	requireTransportNodeSuffrage(t, ctx, nodes[1], SuffrageVoter, 2)
+
+	restartTransportTestNodesWithoutJoin(t, ctx, nodes)
+	restartedLeader := waitForLeaderNode(t, nodes)
+	requireTransportNodesConfigSize(t, ctx, nodes, 2)
+	result, err := restartedLeader.engine.Propose(ctx, []byte("after-same-id-restart"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+}
+
+func requireTransportNodeAppliedValue(t *testing.T, node *transportTestNode, value string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		applied := node.fsm.Applied()
+		return len(applied) == 1 && string(applied[0]) == value
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func requireLearnerPromoted(
+	t *testing.T,
+	ctx context.Context,
+	engine *Engine,
+	learnerID string,
+	addIndex uint64,
+	minAppliedIndex uint64,
+) {
+	t.Helper()
+	var promoteErr error
+	require.Eventually(t, func() bool {
+		_, promoteErr = engine.PromoteLearner(ctx, learnerID, addIndex, minAppliedIndex, false)
+		return promoteErr == nil || !errors.Is(promoteErr, errPromoteLearnerNotCaughtUp)
+	}, 5*time.Second, 20*time.Millisecond)
+	require.NoError(t, promoteErr)
+}
+
+func requireTransportNodeSuffrage(
+	t *testing.T,
+	ctx context.Context,
+	node *transportTestNode,
+	suffrage string,
+	configSize int,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		cfg, err := node.engine.Configuration(ctx)
+		if err != nil || len(cfg.Servers) != configSize {
+			return false
+		}
+		for _, server := range cfg.Servers {
+			if server.ID == node.peer.ID {
+				return server.Suffrage == suffrage
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func requirePersistedPeersExcludeNode(t *testing.T, dataDir string, excludedNodeID uint64, expectedSize int) {
+	t.Helper()
+	persisted, ok, err := LoadPersistedPeers(dataDir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, persisted, expectedSize, "authoritative ConfState must prune stale discovery peers")
+	for _, peer := range persisted {
+		require.NotEqual(t, excludedNodeID, peer.NodeID)
+	}
+}
+
+func restartTransportTestNodesWithoutJoin(t *testing.T, ctx context.Context, nodes []*transportTestNode) {
+	t.Helper()
+	for _, node := range nodes {
+		require.NoError(t, node.engine.Close())
+		node.engine = nil
+		node.joinAsLearner = false
+	}
+
+	for _, node := range nodes {
+		reopened, err := Open(ctx, OpenConfig{
+			NodeID:       node.peer.NodeID,
+			LocalID:      node.peer.ID,
+			LocalAddress: node.peer.Address,
+			DataDir:      node.dir,
+			Transport:    node.transport,
+			StateMachine: node.fsm,
+		})
+		require.NoError(t, err, "%s must restart from durable membership without join peers", node.peer.ID)
+		node.engine = reopened
+	}
+}
+
+func requireTransportNodesConfigSize(t *testing.T, ctx context.Context, nodes []*transportTestNode, expected int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			cfg, err := node.engine.Configuration(ctx)
+			if err != nil || len(cfg.Servers) != expected {
+				return false
+			}
+		}
+		return true
 	}, 5*time.Second, 20*time.Millisecond)
 }
 
