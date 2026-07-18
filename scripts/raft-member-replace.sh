@@ -582,8 +582,7 @@ archive_path="$4"
 data_mode="$5"
 
 sudo_cmd=()
-if [[ "$(id -u)" -ne 0 ]]; then
-  sudo -n true
+if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
   sudo_cmd=(sudo -n)
 fi
 
