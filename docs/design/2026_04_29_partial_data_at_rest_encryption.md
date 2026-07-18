@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8 and 9A shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8 and 9A–9B shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -33,7 +33,8 @@ Date: 2026-04-29
 | 7 | Writer registry + deterministic nonce (§4.1). Covers process-start registration, storage-layer registration gate, runtime re-registration for cutover and rotation, conf-change-time pre-registration, and §5.5 registry projection in `GetSidecarState` / `ResyncSidecar` (`WriterRegistryForCaller`). | shipped | `2026_05_26_implemented_7a_process_start_registration.md` + `2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md` + `2026_05_28_implemented_7b_runtime_reregistration.md` + `2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md` + `2026_05_29_implemented_7c_confchange_time_registration.md` + `2026_07_11_implemented_7d_sidecar_registry_projection.md` |
 | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | shipped | [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) + [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md) |
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
-| 9B+ | KMS-backed wrappers, rotation/retire/rewrite, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
+| 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
+| 9C+ | Rotation budget/rewrap/retire/rewrite, metrics, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
