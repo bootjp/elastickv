@@ -578,7 +578,11 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	// 6E's apply-hook to read on the next apply. Stays 0 for v1 and
 	// headerless-legacy restores.
 	f.restoredCutover = cutover
-	return errors.WithStack(f.store.Restore(io.NopCloser(br)))
+	if err := f.store.Restore(io.NopCloser(br)); err != nil {
+		return errors.WithStack(err)
+	}
+	observeStoreLastCommitTS(f.hlc, f.store)
+	return nil
 }
 
 // RestoredCutover returns the most recently restored v2

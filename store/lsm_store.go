@@ -597,7 +597,12 @@ func isPebbleMetaKey(rawKey []byte) bool {
 
 func isPebbleOperationalKey(rawKey []byte) bool {
 	return isPebbleMetaKey(rawKey) ||
-		bytes.HasPrefix(rawKey, encryption.WriterRegistryPrefix)
+		isPebbleWriterRegistryKey(rawKey)
+}
+
+func isPebbleWriterRegistryKey(rawKey []byte) bool {
+	_, _, err := encryption.DecodeRegistryKey(rawKey)
+	return err == nil
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {

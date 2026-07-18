@@ -216,6 +216,57 @@ func TestPebbleStore_RebuildLastCommitTSIgnoresWriterRegistryRows(t *testing.T) 
 	require.Equal(t, []byte("v50"), kvs[0].Value)
 }
 
+func TestPebbleStore_UserKeyWithWriterRegistryPrefixRemainsMVCCData(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-registry-prefix-user-key-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	ctx := context.Background()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok)
+
+	userKey := append([]byte(nil), encryption.WriterRegistryPrefix...)
+	userKey = append(userKey, []byte("tenant-visible-key")...)
+	require.NoError(t, ps.PutAt(ctx, userKey, []byte("visible"), 100, 0))
+
+	reg, err := WriterRegistryFor(ps)
+	require.NoError(t, err)
+	registryKey := encryption.RegistryKey(0xfeedbeef, 0xcafe)
+	_, decodedRegistryTS := decodeKeyView(registryKey)
+	require.Greater(t, decodedRegistryTS, uint64(100))
+	require.NoError(t, reg.SetRegistryRow(registryKey, encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID:          0x1234_5678_9abc_def0,
+		FirstSeenLocalEpoch: 1,
+		LastSeenLocalEpoch:  2,
+	})))
+
+	require.NoError(t, writePebbleUint64(ps.db, metaLastCommitTSBytes, 5, pebble.Sync))
+	require.NoError(t, ps.Close())
+
+	reopenedStore, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	reopened, ok := reopenedStore.(*pebbleStore)
+	require.True(t, ok)
+	defer reopened.Close()
+
+	require.Equal(t, uint64(100), reopened.LastCommitTS())
+	got, err := reopened.GetAt(ctx, userKey, reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("visible"), got)
+
+	kvs, err := reopened.ScanAt(ctx, nil, nil, 10, reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, userKey, kvs[0].Key)
+
+	reverse, err := reopened.ReverseScanAt(ctx, nil, nil, 10, reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Len(t, reverse, 1)
+	require.Equal(t, userKey, reverse[0].Key)
+}
+
 func TestPebbleStore_GetAtBatch(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-get-at-batch-test")
 	require.NoError(t, err)

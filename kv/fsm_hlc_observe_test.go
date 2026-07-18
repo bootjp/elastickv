@@ -1,6 +1,8 @@
 package kv
 
 import (
+	"bytes"
+	"io"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -108,4 +110,31 @@ func TestNewKvFSMWithHLCObservesStoreLastCommitTS(t *testing.T) {
 	require.Greater(t, hlc.Next(), priorCommit,
 		"first Next() after cold-start skip must be strictly above the prior commit")
 	require.NotNil(t, fsm)
+}
+
+// TestRestoreObservesStoreLastCommitTSIntoHLC covers the snapshot-install path
+// that bypasses Apply replay: after Restore succeeds, a node's fresh HLC must
+// still dominate the restored store's max commit timestamp before it can serve.
+func TestRestoreObservesStoreLastCommitTSIntoHLC(t *testing.T) {
+	src := store.NewMVCCStore()
+	const restoredCommit uint64 = 67890
+	require.NoError(t, src.PutAt(t.Context(), []byte("restored"), []byte("v"), restoredCommit, 0))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+
+	hlc := NewHLC()
+	fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), hlc).(*kvFSM)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), hlc.Current(), "fresh target HLC starts below the snapshot data")
+
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))))
+	require.GreaterOrEqual(t, hlc.Current(), restoredCommit,
+		"Restore must observe the restored store LastCommitTS into HLC.last")
+	require.Greater(t, hlc.Next(), restoredCommit,
+		"first Next() after Restore must be strictly above restored commit_ts")
 }
