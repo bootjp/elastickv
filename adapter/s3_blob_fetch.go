@@ -136,14 +136,14 @@ func (s *S3BlobFetchServer) PushChunkBlob(stream pb.S3BlobFetch_PushChunkBlobSer
 	if err := s.ensurePushAllowed(); err != nil {
 		return err
 	}
-	if err := s.storeChunkBlob(stream, digest, payload, commitTS); err != nil {
+	if err := s.storeChunkBlob(stream.Context(), digest, payload, commitTS); err != nil {
 		return err
 	}
 	return sendChunkBlobPushAck(stream)
 }
 
 func (s *S3BlobFetchServer) storeChunkBlob(
-	stream pb.S3BlobFetch_PushChunkBlobServer,
+	ctx context.Context,
 	digest [s3ChunkBlobSHA256Bytes]byte,
 	payload []byte,
 	commitTS uint64,
@@ -153,7 +153,7 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 		if err := s.ensurePushAllowed(); err != nil {
 			return err
 		}
-		startTS, err := s.chunkBlobWriteStartTS(stream.Context(), key, digest, payload, commitTS)
+		startTS, err := s.chunkBlobWriteStartTS(ctx, key, digest, payload, commitTS)
 		if err != nil {
 			return err
 		}
@@ -161,8 +161,8 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 			s.observeCommitTS(commitTS)
 			return nil
 		}
-		if err := s.applyChunkBlobUntilRegistered(stream.Context(), key, payload, startTS, commitTS); err != nil {
-			done, retry, retryErr := s.retryAfterChunkBlobWriteConflict(stream.Context(), err, key, digest, payload, commitTS)
+		if err := s.applyChunkBlobUntilRegistered(ctx, key, payload, startTS, commitTS); err != nil {
+			done, retry, retryErr := s.retryAfterChunkBlobWriteConflict(ctx, err, key, digest, payload, commitTS)
 			if retryErr != nil {
 				return retryErr
 			}

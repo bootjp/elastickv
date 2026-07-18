@@ -48,7 +48,7 @@ func TestS3BlobOffloadDecisionFailsClosed(t *testing.T) {
 	require.Equal(t, s3BlobOffloadReasonCapabilityMissing, decision.reason)
 }
 
-func TestS3BlobOffloadDecisionRefusesUntilDataPathIsEnabled(t *testing.T) {
+func TestS3BlobOffloadDecisionEnablesImplementedDataPath(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
@@ -63,8 +63,8 @@ func TestS3BlobOffloadDecisionRefusesUntilDataPathIsEnabled(t *testing.T) {
 	)
 
 	decision := server.s3BlobOffloadDecision(context.Background())
-	require.Equal(t, s3BlobOffloadModeLegacy, decision.mode)
-	require.Equal(t, s3BlobOffloadReasonDataPathDisabled, decision.reason)
+	require.Equal(t, s3BlobOffloadModeOffload, decision.mode)
+	require.Equal(t, s3BlobOffloadReasonEnabled, decision.reason)
 }
 
 func TestS3Server_PutObjectBlobOffloadFlagFallsBackToLegacyWithoutCapability(t *testing.T) {

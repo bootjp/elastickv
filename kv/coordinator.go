@@ -322,6 +322,23 @@ type GroupRoutableCoordinator interface {
 	EngineGroupIDForKey(key []byte) uint64
 }
 
+// RaftMember describes one member of the Raft group that owns a key. The
+// adapter layer uses this read-only view for peer-local side channels whose
+// payloads deliberately do not enter the Raft log.
+type RaftMember struct {
+	NodeID   string
+	Address  string
+	Suffrage string
+}
+
+// RaftMembershipCoordinator is the optional capability implemented by
+// coordinators that can expose the current membership of a key's owning Raft
+// group. It does not establish a read fence; callers must use it only for peer
+// discovery and keep correctness decisions behind their own quorum checks.
+type RaftMembershipCoordinator interface {
+	RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error)
+}
+
 // LeaseReadGroupKey returns a representative key per distinct owning
 // group for the supplied keys, so callers can issue one lease read per
 // group rather than one per key. The returned slice preserves the order

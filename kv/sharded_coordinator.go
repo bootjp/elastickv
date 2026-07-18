@@ -1752,6 +1752,29 @@ func (c *ShardedCoordinator) Clock() *HLC {
 	return c.clock
 }
 
+// RaftMembersForKey returns a stable value copy of the current configuration
+// for the key's owning group. It is intentionally membership-only: callers do
+// not gain access to the mutable ShardGroup or its local store.
+func (c *ShardedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error) {
+	g, ok := c.groupForKey(key)
+	if !ok || g == nil || g.Engine == nil {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	cfg, err := g.Engine.Configuration(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	members := make([]RaftMember, 0, len(cfg.Servers))
+	for _, server := range cfg.Servers {
+		members = append(members, RaftMember{
+			NodeID:   server.ID,
+			Address:  server.Address,
+			Suffrage: server.Suffrage,
+		})
+	}
+	return members, nil
+}
+
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 	gid, ok := c.router.ResolveGroup(key)
 	if !ok {

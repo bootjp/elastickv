@@ -1731,6 +1731,7 @@ var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -1788,6 +1789,14 @@ func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 		return router.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+func (c startupGatedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembersForKey(ctx, key) //nolint:wrapcheck // Preserve membership lookup errors.
 }
 
 type startupPublicKVGate struct {
@@ -2603,17 +2612,44 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	blobCluster, err := r.newS3BlobCluster()
+	if err != nil {
+		return err
+	}
 	s3Server, err := newS3Server(
 		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
 		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
 		r.metricsRegistry.S3PutAdmissionObserver(),
 		r.metricsRegistry.S3BlobOffloadObserver(),
+		blobCluster,
 	)
 	if err != nil {
+		if blobCluster != nil {
+			_ = blobCluster.Close()
+		}
 		return err
 	}
 	r.s3Server = s3Server
 	return nil
+}
+
+func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
+	if r == nil || strings.TrimSpace(r.s3Address) == "" {
+		return nil, nil
+	}
+	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.New("S3 blob offload requires raft membership discovery")
+	}
+	adminToken := ""
+	if strings.TrimSpace(*adminTokenFile) != "" {
+		loaded, err := loadAdminTokenFile(*adminTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		adminToken = loaded
+	}
+	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {
