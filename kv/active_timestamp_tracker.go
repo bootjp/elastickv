@@ -123,19 +123,42 @@ func (t *ActiveTimestampTracker) Pin(ts uint64) *ActiveTimestampToken {
 }
 
 func (t *ActiveTimestampTracker) Oldest() uint64 {
+	return t.oldestForGroup(0, false)
+}
+
+// OldestForGroup returns the oldest process-wide read pin or backup pin for
+// groupID. Backup pins for other Raft groups do not constrain this group.
+func (t *ActiveTimestampTracker) OldestForGroup(groupID uint64) uint64 {
+	return t.oldestForGroup(groupID, true)
+}
+
+func (t *ActiveTimestampTracker) oldestForGroup(groupID uint64, scoped bool) uint64 {
 	if t == nil {
 		return 0
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	readOldest := oldestReadTimestamp(t.active)
+	backupOldest := oldestBackupTimestamp(t.backupPins, groupID, scoped, time.Now())
+	return oldestNonZeroTimestamp(readOldest, backupOldest)
+}
+
+func oldestReadTimestamp(active map[uint64]uint64) uint64 {
 	var oldest uint64
-	for _, ts := range t.active {
+	for _, ts := range active {
 		if oldest == 0 || ts < oldest {
 			oldest = ts
 		}
 	}
-	now := time.Now()
-	for _, pin := range t.backupPins {
+	return oldest
+}
+
+func oldestBackupTimestamp(pins map[backupPinKey]backupDeadlinePin, groupID uint64, scoped bool, now time.Time) uint64 {
+	var oldest uint64
+	for key, pin := range pins {
+		if scoped && key.groupID != groupID {
+			continue
+		}
 		if !pin.deadline.After(now) {
 			continue
 		}
@@ -144,6 +167,13 @@ func (t *ActiveTimestampTracker) Oldest() uint64 {
 		}
 	}
 	return oldest
+}
+
+func oldestNonZeroTimestamp(a, b uint64) uint64 {
+	if a == 0 || (b != 0 && b < a) {
+		return b
+	}
+	return a
 }
 
 func (t *ActiveTimestampTracker) PinWithDeadline(pinID BackupPinID, readTS uint64, deadline time.Time) error {
@@ -162,7 +192,7 @@ func (t *ActiveTimestampTracker) pinWithDeadlineForGroup(pinID BackupPinID, grou
 	if t == nil {
 		return nil
 	}
-	if pinID.IsZero() || readTS == 0 || readTS == ^uint64(0) || deadline.IsZero() {
+	if !validBackupDeadlinePin(pinID, readTS, deadline) {
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
 	t.mu.Lock()
@@ -173,11 +203,27 @@ func (t *ActiveTimestampTracker) pinWithDeadlineForGroup(pinID BackupPinID, grou
 		t.logExpiredBackupPins(expired)
 		return errors.WithStack(ErrTooManyActiveBackups)
 	}
-	t.backupPins[key] = backupDeadlinePin{readTS: readTS, deadline: deadline}
+	t.backupPins[key] = mergeBackupDeadlinePin(
+		t.backupPins[key], backupDeadlinePin{readTS: readTS, deadline: deadline},
+	)
 	t.startBackupPinSweeperLocked()
 	t.mu.Unlock()
 	t.logExpiredBackupPins(expired)
 	return nil
+}
+
+func validBackupDeadlinePin(pinID BackupPinID, readTS uint64, deadline time.Time) bool {
+	return !pinID.IsZero() && readTS != 0 && readTS != ^uint64(0) && !deadline.IsZero()
+}
+
+func mergeBackupDeadlinePin(existing, requested backupDeadlinePin) backupDeadlinePin {
+	if existing.readTS != 0 && existing.readTS < requested.readTS {
+		requested.readTS = existing.readTS
+	}
+	if existing.deadline.After(requested.deadline) {
+		requested.deadline = existing.deadline
+	}
+	return requested
 }
 
 func (t *ActiveTimestampTracker) Extend(pinID BackupPinID, deadline time.Time) error {
@@ -209,13 +255,10 @@ func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint6
 		}
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
-	if !pin.deadline.After(time.Now()) {
+	if returnMissingExpired && !pin.deadline.After(time.Now()) {
 		delete(t.backupPins, key)
 		t.mu.Unlock()
 		t.logExpiredBackupPins([]expiredBackupPin{{key: key, ts: pin.readTS}})
-		if !returnMissingExpired {
-			return nil
-		}
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
 	if deadline.After(pin.deadline) {
