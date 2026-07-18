@@ -227,6 +227,58 @@ return {first, second}
 	require.Equal(t, map[string]any{"event": "second"}, events[0].Values)
 }
 
+func TestRedis_LuaXAddAndExpirePreservesUpdatedStreamMeta(t *testing.T) {
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	const stream = "bull:test:events-xadd-expire"
+	firstID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		ID:     "*",
+		Values: []string{"event", "first"},
+	}).Result()
+	require.NoError(t, err)
+
+	result, err := rdb.Eval(ctx, `
+local id = redis.call("XADD", KEYS[1], "*", "event", "second")
+local applied = redis.call("PEXPIRE", KEYS[1], 60000)
+return {id, applied}
+`, []string{stream}).Result()
+	require.NoError(t, err)
+	values, ok := result.([]any)
+	require.True(t, ok)
+	require.Len(t, values, 2)
+	secondID, ok := values[0].(string)
+	require.True(t, ok)
+	require.Equal(t, int64(1), values[1])
+	require.Greater(t, secondID, firstID)
+
+	xlen, err := rdb.XLen(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), xlen)
+	events, err := rdb.XRange(ctx, stream, "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	require.Equal(t, secondID, events[1].ID)
+	require.Equal(t, map[string]any{"event": "second"}, events[1].Values)
+
+	ttl, err := rdb.PTTL(ctx, stream).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+
+	thirdID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		ID:     "*",
+		Values: []string{"event", "third"},
+	}).Result()
+	require.NoError(t, err)
+	require.Greater(t, thirdID, secondID)
+}
+
 func TestRedis_LuaXAddRecreatesTTLExpiredStream(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)

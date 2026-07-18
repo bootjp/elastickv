@@ -4222,7 +4222,7 @@ func (c *luaScriptContext) streamCommitPlan(ctx context.Context, key string) (lu
 	}
 	if st.delta != nil && !st.loaded {
 		elems, err := c.streamDeltaCommitElems(ctx, key, st.delta)
-		return luaCommitPlan{preserveExisting: true, elems: elems}, err
+		return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: true, elems: elems}, err
 	}
 	elems, err := c.streamCommitElems(ctx, key)
 	return luaCommitPlan{elems: elems}, err
