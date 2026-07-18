@@ -624,6 +624,9 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 		s3Address:       heldS3.Addr().String(),
 		s3PathStyleOnly: true,
 		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
+		coordinate: startupGatedCoordinator{
+			inner: &stubStartupCoordinator{clock: kv.NewHLC()},
+		},
 	}
 	if err := runner.prepareAdminForwardServers(); err != nil {
 		t.Fatalf("prepareAdminForwardServers: %v", err)
