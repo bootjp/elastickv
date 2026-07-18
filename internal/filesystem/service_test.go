@@ -3,6 +3,7 @@ package filesystem
 import (
 	"bytes"
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -201,6 +202,27 @@ func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 	got, err = svc.Read(ctx, created.Inode, created.FH, 0, 16)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0, 0, 'a', 'b', 'c', 0, 0, 0, 0}, got)
+}
+
+func TestServiceWriteReadAtSaturatedFinalChunkBoundary(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.SetAttr(ctx, created.Inode, SetAttrMask{Size: true}, SetAttr{Size: math.MaxUint64})
+	require.NoError(t, err)
+
+	offset := math.MaxUint64 - testChunkSize + 1
+	want := []byte("xyz")
+	n, err := svc.Write(ctx, created.Inode, 0, offset, want)
+	require.NoError(t, err)
+	require.Equal(t, len(want), n)
+
+	got, err := svc.Read(ctx, created.Inode, 0, offset, uint64(len(want)))
+	require.NoError(t, err)
+	require.Equal(t, want, got)
 }
 
 func TestServiceReadTSUsesMVCCTimestampAfterLinearizableFence(t *testing.T) {

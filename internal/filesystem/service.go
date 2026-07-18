@@ -592,8 +592,9 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	last := (end - 1) / chunkSize
 	for idx := first; idx <= last; idx++ {
 		chunkStart := idx * chunkSize
+		chunkEnd := saturatingAddUint64(chunkStart, chunkSize)
 		readStart := max(offset, chunkStart)
-		readEnd := min(end, chunkStart+chunkSize)
+		readEnd := min(end, chunkEnd)
 		raw, getErr := s.store.GetAt(ctx, fskeys.ChunkKey(home, inode, idx), ts)
 		if getErr != nil {
 			if errors.Is(getErr, store.ErrKeyNotFound) {
@@ -665,8 +666,9 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 	for idx := first; idx <= last; idx++ {
 		chunkKey := fskeys.ChunkKey(meta.HomeSlot, inode, idx)
 		chunkStart := idx * chunkSize
+		chunkEnd := saturatingAddUint64(chunkStart, chunkSize)
 		writeStart := max(offset, chunkStart)
-		writeEnd := min(end, chunkStart+chunkSize)
+		writeEnd := min(end, chunkEnd)
 		srcStart, err := checkedInt(writeStart - offset)
 		if err != nil {
 			return 0, err
@@ -675,7 +677,7 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 		if err != nil {
 			return 0, err
 		}
-		fullChunkWrite := writeStart == chunkStart && writeEnd == chunkStart+chunkSize
+		fullChunkWrite := writeStart == chunkStart && writeEnd == chunkEnd
 		oldLen, value, readChunk, err := s.writeChunkValue(
 			ctx, ts, chunkKey, chunkLen, fullChunkWrite, data, srcStart, srcEnd, writeStart, chunkStart,
 		)
@@ -2562,6 +2564,14 @@ func addUint64(a uint64, b uint64) (uint64, bool) {
 		return 0, true
 	}
 	return a + b, false
+}
+
+func saturatingAddUint64(a uint64, b uint64) uint64 {
+	sum, overflow := addUint64(a, b)
+	if overflow {
+		return math.MaxUint64
+	}
+	return sum
 }
 
 func checkedInt(v uint64) (int, error) {

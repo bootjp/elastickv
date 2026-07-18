@@ -330,6 +330,89 @@ func TestBackupScannerRetainsAllCapturedRangesForUnclampedGroups(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("z")}, got)
 }
 
+func TestBackupScannerRetainsAllCapturedChunkRanges(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	home := uint64(11)
+	inodeA := uint64(22)
+	inodeB := uint64(23)
+	routeA := fskeys.ChunkRouteKey(home, inodeA)
+	routeB := fskeys.ChunkRouteKey(home, inodeB)
+	routeEnd := prefixScanEnd(routeB)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeA, 1)
+	engine.UpdateRoute(routeA, routeB, 2)
+	engine.UpdateRoute(routeB, routeEnd, 2)
+	engine.UpdateRoute(routeEnd, nil, 3)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		3: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	chunkA := fskeys.ChunkKey(home, inodeA, 0)
+	chunkB := fskeys.ChunkKey(home, inodeB, 0)
+	require.NoError(t, st.PutAt(ctx, chunkA, []byte("a"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, chunkB, []byte("b"), 2, 0))
+
+	start := fskeys.ChunkPrefix(home, inodeA)
+	end := prefixScanEnd(fskeys.ChunkPrefix(home, inodeB))
+	sc := st.NewBackupScanner(start, end, ^uint64(0), 10)
+	defer sc.Close()
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 10,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeA, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeA, End: routeB, GroupID: 2, State: distribution.RouteStateActive},
+			{RouteID: 3, Start: routeB, End: routeEnd, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 4, Start: routeEnd, GroupID: 3, State: distribution.RouteStateActive},
+		},
+	}))
+
+	var got [][]byte
+	for {
+		kvp, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, kvp.Key)
+	}
+	require.Equal(t, [][]byte{chunkA, chunkB}, got)
+}
+
+func TestBackupScannerDoesNotUseLiveCatalogForMaterialization(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("stale-old-owner"), 1, 0))
+
+	sc := st.NewBackupScanner([]byte(""), nil, ^uint64(0), 10)
+	defer sc.Close()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 10,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	kvp, ok, err := sc.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, kvp)
+}
+
 func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T) {
 	t.Parallel()
 

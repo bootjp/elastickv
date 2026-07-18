@@ -17,7 +17,6 @@ import (
 )
 
 const proxyForwardTimeout = 5 * time.Second
-const minRoutesForDedup = 2
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -347,7 +346,7 @@ func (s *ShardStore) routesForFilesystemUsageScan(start []byte, end []byte) ([]d
 
 func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]distribution.Route, bool) {
 	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
-		return dedupeRoutesByGroup(s.engine.GetIntersectingRoutes(routeStart, routeEnd)), true
+		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), true
 	}
 	chunkStart, chunkEnd, ok := filesystemChunkScanOverlap(start, end)
 	if !ok {
@@ -362,7 +361,7 @@ func (s *ShardStore) routesForFilesystemChunkScan(start []byte, end []byte) ([]d
 	// narrowing the scan to chunks only.
 	routes := s.engine.GetIntersectingRoutes(start, end)
 	routes = append(routes, s.engine.GetIntersectingRoutes(routeStart, routeEnd)...)
-	return dedupeRoutesByGroup(routes), true
+	return routes, true
 }
 
 func filesystemUsageScanOverlap(start []byte, end []byte) bool {
@@ -398,22 +397,6 @@ func filesystemChunkScanOverlap(start []byte, end []byte) ([]byte, []byte, bool)
 		return nil, nil, false
 	}
 	return overlapStart, overlapEnd, true
-}
-
-func dedupeRoutesByGroup(routes []distribution.Route) []distribution.Route {
-	if len(routes) < minRoutesForDedup {
-		return routes
-	}
-	seen := make(map[uint64]struct{}, len(routes))
-	out := make([]distribution.Route, 0, len(routes))
-	for _, route := range routes {
-		if _, ok := seen[route.GroupID]; ok {
-			continue
-		}
-		seen[route.GroupID] = struct{}{}
-		out = append(out, route)
-	}
-	return out
 }
 
 func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool) ([]*store.KVPair, error) {

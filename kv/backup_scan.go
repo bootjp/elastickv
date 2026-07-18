@@ -145,12 +145,6 @@ func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution
 			return route, true
 		}
 	}
-	if s.store != nil {
-		route, ok := s.store.engine.GetRoute(key)
-		if ok && route.GroupID == item.route.GroupID {
-			return route, true
-		}
-	}
 	return distribution.Route{}, false
 }
 
