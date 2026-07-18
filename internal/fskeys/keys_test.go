@@ -45,6 +45,57 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 	require.Nil(t, ExtractRouteKey(InodeKey(22)))
 }
 
+func TestChunkIndexFromKey(t *testing.T) {
+	key := ChunkKey(11, 22, 33)
+	index, ok := ChunkIndexFromKey(11, 22, key)
+	require.True(t, ok)
+	require.EqualValues(t, 33, index)
+
+	_, ok = ChunkIndexFromKey(11, 23, key)
+	require.False(t, ok)
+	_, ok = ChunkIndexFromKey(11, 22, append(key, 0))
+	require.False(t, ok)
+}
+
+func TestChunkPartsFromKey(t *testing.T) {
+	home, inode, index, ok := ChunkPartsFromKey(ChunkKey(11, 22, 33))
+	require.True(t, ok)
+	require.EqualValues(t, 11, home)
+	require.EqualValues(t, 22, inode)
+	require.EqualValues(t, 33, index)
+
+	_, _, _, ok = ChunkPartsFromKey(ChunkPrefix(11, 22))
+	require.False(t, ok)
+}
+
+func TestHomeInodeFromKey(t *testing.T) {
+	inode, ok := HomeInodeFromKey(HomeKey(42))
+	require.True(t, ok)
+	require.EqualValues(t, 42, inode)
+
+	_, ok = HomeInodeFromKey(append(HomeKey(42), 0))
+	require.False(t, ok)
+}
+
+func TestChunkRouteHomeFromKey(t *testing.T) {
+	home, ok := ChunkRouteHomeFromKey(ChunkRouteKey(11, 22))
+	require.True(t, ok)
+	require.EqualValues(t, 11, home)
+
+	_, ok = ChunkRouteHomeFromKey(ChunkAllPrefix())
+	require.False(t, ok)
+}
+
+func TestChunkRoutePartsFromKey(t *testing.T) {
+	home, inode, ok := ChunkRoutePartsFromKey(ChunkRouteKey(11, 22))
+	require.True(t, ok)
+	require.EqualValues(t, 11, home)
+	require.EqualValues(t, 22, inode)
+
+	_, _, ok = ChunkRoutePartsFromKey(append(ChunkRouteKey(11, 22), 0))
+	require.False(t, ok)
+}
+
 func TestUsageRouteKeyCarriesEmbeddedRoute(t *testing.T) {
 	routeKey := ChunkRouteKey(11, 22)
 	usageKey := UsageRouteKey(routeKey)

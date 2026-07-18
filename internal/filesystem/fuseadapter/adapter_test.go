@@ -28,6 +28,7 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "cross device", err: filesystem.ErrCrossDevice, want: syscall.EXDEV},
 		{name: "invalid", err: filesystem.ErrInvalid, want: syscall.EINVAL},
 		{name: "unsupported", err: filesystem.ErrUnsupported, want: syscall.EOPNOTSUPP},
+		{name: "stale home", err: filesystem.ErrStaleHome, want: syscall.EAGAIN},
 		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
 		{name: "canceled", err: context.Canceled, want: syscall.EINTR},
 		{name: "deadline", err: context.DeadlineExceeded, want: syscall.ETIMEDOUT},
@@ -290,6 +291,8 @@ type fakeCore struct {
 	readdirLimit  int
 	readdirResult filesystem.ReaddirResult
 	readdirErr    error
+	statFS        filesystem.StatFS
+	statFSErr     error
 }
 
 func (f *fakeCore) Resolve(_ context.Context, parent uint64, name []byte) (uint64, error) {
@@ -406,6 +409,6 @@ func (f *fakeCore) Readdir(
 	return f.readdirResult, f.readdirErr
 }
 
-func (*fakeCore) StatFS(context.Context, uint64) (filesystem.StatFS, error) {
-	return filesystem.StatFS{}, nil
+func (f *fakeCore) StatFS(context.Context, uint64) (filesystem.StatFS, error) {
+	return f.statFS, f.statFSErr
 }

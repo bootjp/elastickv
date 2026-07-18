@@ -3,7 +3,10 @@ package kv
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
+	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -26,7 +29,10 @@ type ShardStore struct {
 	connCache GRPCConnCache
 }
 
-var ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+var (
+	ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
+	ErrFilesystemPlacementTargetNotFound   = errors.New("filesystem placement target group has no routable home slot")
+)
 
 // NewShardStore creates a sharded MVCC store wrapper.
 func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *ShardStore {
@@ -34,6 +40,88 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 		engine: engine,
 		groups: groups,
 	}
+}
+
+// FilesystemGroupForHome resolves the group that owns one file-home route.
+func (s *ShardStore) FilesystemGroupForHome(homeSlot uint64, inode uint64) (uint64, bool) {
+	if s == nil || s.engine == nil {
+		return 0, false
+	}
+	route, ok := s.engine.GetRoute(fskeys.ChunkRouteKey(homeSlot, inode))
+	if !ok {
+		return 0, false
+	}
+	return route.GroupID, true
+}
+
+// ResolveFilesystemHomeSlot finds a home token whose file route belongs to
+// targetGroup. It derives candidates from current route boundaries and verifies
+// each candidate against the live catalog before returning it.
+func (s *ShardStore) ResolveFilesystemHomeSlot(targetGroup uint64, inode uint64) (uint64, error) {
+	if s == nil || s.engine == nil || targetGroup == 0 {
+		return 0, ErrFilesystemPlacementTargetNotFound
+	}
+	prefix := fskeys.ChunkRouteAllPrefix()
+	routes := s.engine.GetIntersectingRoutes(prefix, prefixScanEnd(prefix))
+	homes := filesystemHomeCandidates(routes, targetGroup, prefix)
+	for _, home := range homes {
+		groupID, ok := s.FilesystemGroupForHome(home, inode)
+		if ok && groupID == targetGroup {
+			return home, nil
+		}
+	}
+	return 0, errors.Wrapf(ErrFilesystemPlacementTargetNotFound, "group_id=%d inode=%d", targetGroup, inode)
+}
+
+func filesystemHomeCandidates(routes []distribution.Route, targetGroup uint64, prefix []byte) []uint64 {
+	candidates := map[uint64]struct{}{targetGroup: {}}
+	for _, route := range routes {
+		if route.GroupID != targetGroup {
+			continue
+		}
+		addFilesystemRouteHomeCandidates(candidates, route, prefix)
+	}
+	homes := make([]uint64, 0, len(candidates))
+	for home := range candidates {
+		homes = append(homes, home)
+	}
+	slices.Sort(homes)
+	return homes
+}
+
+func addFilesystemRouteHomeCandidates(candidates map[uint64]struct{}, route distribution.Route, prefix []byte) {
+	if home, ok := filesystemHomeCandidateFromBound(route.Start, false); ok {
+		candidates[home] = struct{}{}
+		if home < math.MaxUint64 {
+			candidates[home+1] = struct{}{}
+		}
+	} else if bytes.Compare(route.Start, prefix) <= 0 {
+		candidates[0] = struct{}{}
+	}
+	if home, ok := filesystemHomeCandidateFromBound(route.End, true); ok {
+		candidates[home] = struct{}{}
+		if home > 0 {
+			candidates[home-1] = struct{}{}
+		}
+	} else if route.End == nil || bytes.Compare(route.End, prefixScanEnd(prefix)) >= 0 {
+		candidates[math.MaxUint64] = struct{}{}
+	}
+}
+
+func filesystemHomeCandidateFromBound(bound []byte, upper bool) (uint64, bool) {
+	prefix := fskeys.ChunkRouteAllPrefix()
+	if !bytes.HasPrefix(bound, prefix) || len(bound) == len(prefix) {
+		return 0, false
+	}
+	rest := bound[len(prefix):]
+	var encoded [8]byte
+	if upper {
+		for i := range encoded {
+			encoded[i] = math.MaxUint8
+		}
+	}
+	copy(encoded[:], rest[:min(len(rest), len(encoded))])
+	return binary.BigEndian.Uint64(encoded[:]), true
 }
 
 func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -418,12 +506,17 @@ func (s *ShardStore) scanRoutesAt(ctx context.Context, routes []distribution.Rou
 			scanEnd = clampScanEnd(end, route.End)
 		}
 
-		kvs, err := s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, explicitGroup)
+		var kvs []*store.KVPair
+		var err error
+		if filterUsageOwners {
+			kvs, err = s.scanRouteAtWithFilesystemUsageOwnerFilter(
+				ctx, route, scanStart, scanEnd, limit, ts, false, explicitGroup,
+			)
+		} else {
+			kvs, err = s.scanRouteAtDirection(ctx, route, scanStart, scanEnd, limit, ts, false, explicitGroup)
+		}
 		if err != nil {
 			return nil, err
-		}
-		if filterUsageOwners {
-			kvs = s.filterFilesystemUsageKVsForGroup(kvs, route.GroupID)
 		}
 		if clampToRoutes {
 			out = append(out, kvs...)
@@ -469,12 +562,17 @@ func (s *ShardStore) scanKeyRoutesAt(ctx context.Context, routes []distribution.
 			seenGroups[route.GroupID] = struct{}{}
 		}
 
-		keys, err := s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+		var keys [][]byte
+		var err error
+		if filterUsageOwners {
+			keys, err = s.scanKeyRouteAtWithFilesystemUsageOwnerFilter(
+				ctx, route, scanStart, scanEnd, limit, ts,
+			)
+		} else {
+			keys, err = s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+		}
 		if err != nil {
 			return nil, err
-		}
-		if filterUsageOwners {
-			keys = s.filterFilesystemUsageKeysForGroup(keys, route.GroupID)
 		}
 		if clampToRoutes {
 			out = mergeAndTrimScanKeys(out, keys, limit)
@@ -517,6 +615,91 @@ func (s *ShardStore) filesystemUsageKeyOwnedByGroup(key []byte, groupID uint64) 
 	return ok && owner.GroupID == groupID
 }
 
+//nolint:cyclop // Owner-filtered pagination must advance both scan directions without returning stale rows.
+func (s *ShardStore) scanRouteAtWithFilesystemUsageOwnerFilter(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+	explicitGroup bool,
+) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+
+	out := make([]*store.KVPair, 0, limit)
+	cursorStart := start
+	cursorEnd := end
+	for len(out) < limit {
+		page, err := s.scanRouteAtDirection(
+			ctx, route, cursorStart, cursorEnd, limit, ts, reverse, explicitGroup,
+		)
+		if err != nil {
+			return nil, err
+		}
+		pageLen := len(page)
+		advanceKey := lastKVKey(page)
+		page = s.filterFilesystemUsageKVsForGroup(page, route.GroupID)
+		if reverse {
+			out = mergeAndTrimReverseScanResults(out, page, limit)
+		} else {
+			out = mergeAndTrimScanResults(out, page, limit)
+		}
+		if len(out) >= limit || pageLen < limit || advanceKey == nil {
+			break
+		}
+		if reverse {
+			if len(cursorStart) > 0 && bytes.Compare(advanceKey, cursorStart) <= 0 {
+				break
+			}
+			cursorEnd = advanceKey
+			continue
+		}
+		cursorStart = nextScanCursor(advanceKey)
+		if cursorEnd != nil && bytes.Compare(cursorStart, cursorEnd) >= 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *ShardStore) scanKeyRouteAtWithFilesystemUsageOwnerFilter(
+	ctx context.Context,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+
+	out := make([][]byte, 0, limit)
+	cursor := start
+	for len(out) < limit {
+		page, err := s.scanKeyRouteAt(ctx, route, cursor, end, limit, ts)
+		if err != nil {
+			return nil, err
+		}
+		pageLen := len(page)
+		advanceKey := lastScanKey(page)
+		page = s.filterFilesystemUsageKeysForGroup(page, route.GroupID)
+		out = mergeAndTrimScanKeys(out, page, limit)
+		if len(out) >= limit || pageLen < limit || advanceKey == nil {
+			break
+		}
+		cursor = nextScanCursor(advanceKey)
+		if end != nil && bytes.Compare(cursor, end) >= 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (s *ShardStore) reverseScanRoutesAt(
 	ctx context.Context,
 	routes []distribution.Route,
@@ -553,12 +736,17 @@ func (s *ShardStore) reverseScanRoutesAt(
 			continue
 		}
 		seenGroups[route.GroupID] = struct{}{}
-		kvs, err := s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true, true)
+		var kvs []*store.KVPair
+		var err error
+		if filterUsageOwners {
+			kvs, err = s.scanRouteAtWithFilesystemUsageOwnerFilter(
+				ctx, route, start, end, limit, ts, true, true,
+			)
+		} else {
+			kvs, err = s.scanRouteAtDirection(ctx, route, start, end, limit, ts, true, true)
+		}
 		if err != nil {
 			return nil, err
-		}
-		if filterUsageOwners {
-			kvs = s.filterFilesystemUsageKVsForGroup(kvs, route.GroupID)
 		}
 		out = mergeAndTrimReverseScanResults(out, kvs, limit)
 	}

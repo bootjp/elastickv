@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"math"
 	"strings"
 	"sync"
@@ -216,6 +217,13 @@ func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte
 		return
 	}
 	s.fsObserver.ObserveFilePinnedHotspot(DistributionFilePinnedHotspotSplitBoundary)
+	if homeSlot, inode, ok := fskeys.ChunkRoutePartsFromKey(splitKey); ok {
+		slog.Warn("filesystem file-pinned hotspot rejected split",
+			"reason", DistributionFilePinnedHotspotSplitBoundary,
+			"home_slot", homeSlot,
+			"inode", inode,
+		)
+	}
 }
 
 func isSplitBoundaryError(err error) bool {

@@ -306,6 +306,37 @@ func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanEnd)
 }
 
+func TestGRPCServer_RawScanAt_ReverseKeysOnlyUsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value-a"), 9, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("large-value-b"), 10, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		Reverse:  true,
+		GroupId:  42,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 2)
+	require.Equal(t, []byte("b"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.Equal(t, []byte("a"), resp.GetKv()[1].GetKey())
+	require.Empty(t, resp.GetKv()[1].GetValue())
+	require.True(t, st.reverseScan)
+	require.False(t, st.fallbackScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
 	t.Parallel()
 

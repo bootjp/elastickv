@@ -909,6 +909,33 @@ func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
+	t.Parallel()
+
+	boundary := fskeys.ChunkRouteKey(100, 0)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), boundary, 1)
+	engine.UpdateRoute(boundary, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{})
+
+	home, err := st.ResolveFilesystemHomeSlot(1, 77)
+	require.NoError(t, err)
+	groupID, ok := st.FilesystemGroupForHome(home, 77)
+	require.True(t, ok)
+	require.EqualValues(t, 1, groupID)
+	require.Less(t, home, uint64(100))
+
+	home, err = st.ResolveFilesystemHomeSlot(2, 77)
+	require.NoError(t, err)
+	groupID, ok = st.FilesystemGroupForHome(home, 77)
+	require.True(t, ok)
+	require.EqualValues(t, 2, groupID)
+	require.GreaterOrEqual(t, home, uint64(100))
+
+	_, err = st.ResolveFilesystemHomeSlot(3, 77)
+	require.ErrorIs(t, err, ErrFilesystemPlacementTargetNotFound)
+}
+
 func TestShardStoreScanAt_RoutesFilesystemUsageCountersAcrossRouteGroups(t *testing.T) {
 	t.Parallel()
 
@@ -946,6 +973,72 @@ func TestShardStoreScanAt_RoutesFilesystemUsageCountersAcrossRouteGroups(t *test
 	require.Len(t, kvs, 1)
 	require.Equal(t, key, kvs[0].Key)
 	require.Equal(t, []byte("usage"), kvs[0].Value)
+}
+
+func TestShardStoreScanAt_RefillsAfterStaleFilesystemUsageCounters(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	usagePrefix := fskeys.UsageRouteAllPrefix()
+	ownerBoundary := fskeys.InodeKey(50)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), ownerBoundary, 1)
+	engine.UpdateRoute(ownerBoundary, nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	staleOne := fskeys.UsageRouteKey(fskeys.InodeKey(1))
+	staleTwo := fskeys.UsageRouteKey(fskeys.InodeKey(2))
+	owned := fskeys.UsageRouteKey(fskeys.InodeKey(99))
+	require.NoError(t, groups[2].Store.PutAt(ctx, staleOne, []byte("stale-1"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, staleTwo, []byte("stale-2"), 2, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, owned, []byte("owned"), 3, 0))
+
+	kvs, err := st.ScanAt(ctx, usagePrefix, prefixScanEnd(usagePrefix), 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, owned, kvs[0].Key)
+	require.Equal(t, []byte("owned"), kvs[0].Value)
+
+	keys, err := st.ScanKeysAt(ctx, usagePrefix, prefixScanEnd(usagePrefix), 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{owned}, keys)
+}
+
+func TestBackupScannerPrefersFilesystemUsageOwnerCopy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	usagePrefix := fskeys.UsageRouteAllPrefix()
+	ownerBoundary := fskeys.InodeKey(50)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), ownerBoundary, 1)
+	engine.UpdateRoute(ownerBoundary, nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	key := fskeys.UsageRouteKey(fskeys.InodeKey(22))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("stale"), 2, 0))
+
+	scanner := st.NewBackupScanner(usagePrefix, prefixScanEnd(usagePrefix), ^uint64(0), 1)
+	defer scanner.Close()
+
+	pair, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, pair.Key)
+	require.Equal(t, []byte("owner"), pair.Value)
+	pair, ok, err = scanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Nil(t, pair)
 }
 
 func TestShardStoreScanAt_RoutesFilesystemChunkSubrangeByChunkRouteKey(t *testing.T) {

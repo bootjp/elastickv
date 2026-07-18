@@ -73,6 +73,7 @@ var errnoMappings = []struct {
 	{filesystem.ErrCrossDevice, syscall.EXDEV},
 	{filesystem.ErrInvalid, syscall.EINVAL},
 	{filesystem.ErrUnsupported, syscall.EOPNOTSUPP},
+	{filesystem.ErrStaleHome, syscall.EAGAIN},
 	{store.ErrWriteConflict, syscall.EAGAIN},
 }
 

@@ -52,6 +52,10 @@ var (
 	ErrCrossDevice         = errors.New("filesystem: cross-domain rename")
 	ErrInvalid             = errors.New("filesystem: invalid argument")
 	ErrUnsupported         = errors.New("filesystem: operation not supported")
+	ErrStaleHome           = errors.New("filesystem: stale or migrating file home")
+	ErrMoveJobNotFound     = errors.New("filesystem: move job not found")
+	ErrMoveFenceLost       = errors.New("filesystem: move job lost its epoch fence")
+	ErrPlacementRequired   = errors.New("filesystem: placement resolver is required")
 	ErrInodeCollisionLimit = errors.New("filesystem: inode allocation collision limit reached")
 )
 
@@ -64,6 +68,15 @@ const (
 
 type Dispatcher interface {
 	Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error)
+}
+
+type OperationalObserver interface {
+	ObserveChunkRead(time.Duration)
+	ObserveChunkWrite(time.Duration)
+	ObserveHomeEpochConflict()
+	ObserveInodeIDCollisionRetry()
+	ObserveMoveJob(jobID []byte, active bool)
+	ObservePlacementStats(PlacementStats)
 }
 
 type linearizableReader interface {
@@ -105,9 +118,10 @@ const (
 )
 
 type Home struct {
-	HomeSlot uint64    `json:"home_slot"`
-	State    HomeState `json:"state"`
-	Epoch    uint64    `json:"epoch"`
+	HomeSlot       uint64    `json:"home_slot"`
+	TargetHomeSlot uint64    `json:"target_home_slot,omitempty"`
+	State          HomeState `json:"state"`
+	Epoch          uint64    `json:"epoch"`
 }
 
 type DirEntry struct {
@@ -230,6 +244,7 @@ type Service struct {
 	now          func() time.Time
 	allocID      func() (uint64, error)
 	homeSlot     func(uint64) uint64
+	observer     OperationalObserver
 }
 
 type Option func(*Service)
@@ -283,6 +298,12 @@ func WithCapacity(capacity uint64) Option {
 func WithMaxFiles(maxFiles uint64) Option {
 	return func(s *Service) {
 		s.maxFiles = maxFiles
+	}
+}
+
+func WithOperationalObserver(observer OperationalObserver) Option {
+	return func(s *Service) {
+		s.observer = observer
 	}
 }
 
@@ -404,6 +425,11 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 	if err != nil {
 		return Stat{}, err
 	}
+	if mask.Size {
+		if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+			return Stat{}, err
+		}
+	}
 	elems := make([]*kv.Elem[kv.OP], 0)
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
 	oldSize := meta.Size
@@ -450,6 +476,9 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		return Stat{}, err
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		if mask.Size {
+			return Stat{}, s.translateHomeConflict(ctx, meta, err)
+		}
 		return Stat{}, err
 	}
 	if err := s.deleteChunkPagesAndFinalize(ctx, chunkDeletes); err != nil {
@@ -496,11 +525,11 @@ func (s *Service) setAttrSizeTxnParts(
 }
 
 func (s *Service) Create(ctx context.Context, parent uint64, name []byte, opts CreateOptions) (CreateResult, error) {
-	return s.createNode(ctx, parent, name, TypeFile, opts)
+	return s.createNodeWithIntent(ctx, parent, name, TypeFile, opts)
 }
 
 func (s *Service) Mkdir(ctx context.Context, parent uint64, name []byte, opts CreateOptions) (CreateResult, error) {
-	return s.createNode(ctx, parent, name, TypeDirectory, opts)
+	return s.createNodeWithIntent(ctx, parent, name, TypeDirectory, opts)
 }
 
 func (s *Service) Open(ctx context.Context, inode uint64, clientID []byte) (uint64, error) {
@@ -557,6 +586,12 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 
 //nolint:cyclop // Read handles EOF, sparse chunks, and chunk boundary copying in one linear path.
 func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint64, size uint64) ([]byte, error) {
+	started := time.Now()
+	defer func() {
+		if s.observer != nil {
+			s.observer.ObserveChunkRead(time.Since(started))
+		}
+	}()
 	if size > maxReadSize {
 		return nil, ErrInvalid
 	}
@@ -621,6 +656,12 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 
 //nolint:cyclop // Write performs chunk read-modify-write and metadata update atomically.
 func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint64, data []byte) (int, error) {
+	started := time.Now()
+	defer func() {
+		if s.observer != nil {
+			s.observer.ObserveChunkWrite(time.Since(started))
+		}
+	}()
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -639,6 +680,9 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 	}
 	if meta.Type == TypeDirectory {
 		return 0, ErrIsDir
+	}
+	if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		return 0, err
 	}
 	if end > meta.Size {
 		ts, meta, _, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
@@ -707,7 +751,7 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 		return 0, err
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
-		return 0, err
+		return 0, s.translateHomeConflict(ctx, meta, err)
 	}
 	return len(data), nil
 }
@@ -742,6 +786,7 @@ func (s *Service) writeChunkValue(
 	return oldLen, trimChunk(chunk), true, nil
 }
 
+//nolint:cyclop // Truncate keeps sparse growth, tail rewrite, epoch fence, usage, and paged deletion in one operation.
 func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {
@@ -753,6 +798,9 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 	}
 	if meta.Type == TypeDirectory {
 		return ErrIsDir
+	}
+	if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		return err
 	}
 	ts, meta, _, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 	if err != nil {
@@ -787,17 +835,17 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 		return err
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
-		return err
+		return s.translateHomeConflict(ctx, meta, err)
 	}
 	return s.deleteChunkPagesAndFinalize(ctx, chunkDeletes)
 }
 
 func (s *Service) Unlink(ctx context.Context, parent uint64, name []byte) error {
-	return s.unlink(ctx, parent, name, false)
+	return s.unlinkWithIntent(ctx, parent, name, false)
 }
 
 func (s *Service) Rmdir(ctx context.Context, parent uint64, name []byte) error {
-	return s.unlink(ctx, parent, name, true)
+	return s.unlinkWithIntent(ctx, parent, name, true)
 }
 
 //nolint:cyclop // Rename maps filesystem replace/error semantics into one atomic directory update.
@@ -1115,7 +1163,7 @@ func (s *Service) StatFS(ctx context.Context, _ uint64) (StatFS, error) {
 		Files:     usage.Files,
 		FreeFiles: freeAfterUsed(s.maxFiles, usage.Files, math.MaxUint64),
 		Capacity:  s.capacity,
-		Free:      freeAfterUsed(s.capacity, usage.Bytes, 0),
+		Free:      freeAfterUsed(s.capacity, usage.Bytes, math.MaxUint64),
 	}, nil
 }
 
@@ -1655,7 +1703,14 @@ func (m InodeMeta) Stat() Stat {
 }
 
 //nolint:cyclop // createNode handles common file/dir create metadata and optional open semantics.
-func (s *Service) createNode(ctx context.Context, parent uint64, name []byte, typ FileType, opts CreateOptions) (CreateResult, error) {
+func (s *Service) createNode(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	typ FileType,
+	opts CreateOptions,
+	intentKey []byte,
+) (CreateResult, error) {
 	if err := validateName(name); err != nil {
 		return CreateResult{}, err
 	}
@@ -1737,6 +1792,10 @@ func (s *Service) createNode(ctx context.Context, parent uint64, name []byte, ty
 	if err != nil {
 		return CreateResult{}, err
 	}
+	if len(intentKey) > 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: append([]byte(nil), intentKey...)})
+		readKeys = append(readKeys, append([]byte(nil), intentKey...))
+	}
 	err = s.dispatchTxn(ctx, ts, elems, readKeys)
 	if err != nil {
 		return CreateResult{}, err
@@ -1745,7 +1804,7 @@ func (s *Service) createNode(ctx context.Context, parent uint64, name []byte, ty
 }
 
 //nolint:cyclop,nestif // unlink/rmdir intentionally share errno and GC decision flow.
-func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, directory bool) error {
+func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, directory bool, intentKey []byte) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
@@ -1777,6 +1836,8 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		}
 	} else if meta.Type == TypeDirectory {
 		return ErrIsDir
+	} else if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		return err
 	}
 	now := s.now().UnixNano()
 	parentMeta.MtimeNsec = now
@@ -1818,6 +1879,10 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
 	if err != nil {
 		return err
+	}
+	if len(intentKey) > 0 {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: append([]byte(nil), intentKey...)})
+		readKeys = append(readKeys, append([]byte(nil), intentKey...))
 	}
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
@@ -2432,12 +2497,18 @@ func (s *Service) allocateInode(ctx context.Context, ts uint64) (uint64, error) 
 			return 0, err
 		}
 		if inode == 0 || inode == RootInode {
+			if s.observer != nil {
+				s.observer.ObserveInodeIDCollisionRetry()
+			}
 			continue
 		}
 		if _, err := s.inodeAt(ctx, inode, ts); errors.Is(err, ErrNotFound) {
 			return inode, nil
 		} else if err != nil {
 			return 0, err
+		}
+		if s.observer != nil {
+			s.observer.ObserveInodeIDCollisionRetry()
 		}
 	}
 	return 0, ErrInodeCollisionLimit

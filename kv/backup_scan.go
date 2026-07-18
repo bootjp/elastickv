@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -176,7 +177,7 @@ func (s *ShardStore) scanKeyRoutesWithSourceAt(
 		if err != nil {
 			return nil, err
 		}
-		out = mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), limit)
+		out = s.mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), limit)
 		if clampToRoutes && len(out) >= limit {
 			break
 		}
@@ -195,7 +196,7 @@ func routedScanKeys(route distribution.Route, keys [][]byte) []routedScanKey {
 	return items
 }
 
-func mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit int) []routedScanKey {
+func (s *ShardStore) mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit int) []routedScanKey {
 	if len(keys) == 0 {
 		return out
 	}
@@ -209,7 +210,7 @@ func mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit
 			continue
 		}
 		if write > 0 && bytes.Equal(out[write-1].key, item.key) {
-			out[write-1] = item
+			out[write-1] = s.preferredRoutedScanKey(out[write-1], item)
 			continue
 		}
 		out[write] = item
@@ -222,6 +223,20 @@ func mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit
 	}
 	clear(out[limit:])
 	return out[:limit]
+}
+
+func (s *ShardStore) preferredRoutedScanKey(current routedScanKey, candidate routedScanKey) routedScanKey {
+	if !fskeys.IsUsageRouteKey(candidate.key) {
+		return candidate
+	}
+	owner, ok := s.engine.GetRoute(routeKey(candidate.key))
+	if !ok {
+		return candidate
+	}
+	if current.route.GroupID == owner.GroupID {
+		return current
+	}
+	return candidate
 }
 
 func lastRoutedScanKey(keys []routedScanKey) []byte {

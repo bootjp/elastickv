@@ -1,0 +1,45 @@
+groups:
+  - name: elastickv-filesystem
+    rules:
+      - alert: ElastickvFilesystemFilePinnedHotspot
+        expr: sum(increase(elastickv_fs_file_pinned_hotspot_total{reason="split_boundary"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Filesystem file placement blocked a range split
+          description: A split candidate landed inside a single-file route. Inspect the node log for home_slot and inode, then move the whole file if the hotspot persists.
+
+      - alert: ElastickvFilesystemMultiShardFile
+        expr: sum(elastickv_fs_file_multi_shard_current) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Active filesystem file has chunks on multiple shard groups
+          description: Placement reconciliation found an active file outside the single-home invariant. Pause rebalancing and inspect unfinished move jobs.
+
+      - alert: ElastickvFilesystemMoveStuck
+        expr: min_over_time(sum(elastickv_fs_file_move_inflight)[30m:]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Filesystem migration has remained in flight
+          description: At least one durable whole-file move has not completed for 30 minutes. Run intent recovery and inspect the move job cursor and epoch fence.
+
+      - alert: ElastickvFilesystemOrphanGCPending
+        expr: sum(elastickv_fs_orphan_inode_gc_pending) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Filesystem orphan cleanup is pending
+          description: Orphaned inodes have remained pending. Check open-handle lease expiry and the orphan reaper.
+
+      - alert: ElastickvFilesystemHomeEpochConflicts
+        expr: sum(rate(elastickv_fs_home_epoch_conflict_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Filesystem clients repeatedly hit stale home epochs
+          description: Mutations are being retried while file homes move. Check migration duration and client retry behavior.

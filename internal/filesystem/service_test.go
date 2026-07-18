@@ -657,8 +657,8 @@ func TestServiceUnlinkFencesObservedOpenRef(t *testing.T) {
 
 	rec := attachRecorder(svc)
 	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
-	require.Len(t, rec.requests, 1)
-	require.True(t, keyInSet(rec.requests[0].ReadKeys, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
+	require.Len(t, rec.requests, 2)
+	require.True(t, keyInSet(rec.requests[1].ReadKeys, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 }
 
 func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
@@ -898,6 +898,18 @@ func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
 	require.EqualValues(t, 11, stats.Free)
 }
 
+func TestServiceStatFSReportsUnconfiguredCapacityAsUnlimited(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.Zero(t, stats.Capacity)
+	require.Equal(t, uint64(math.MaxUint64), stats.Free)
+	require.Equal(t, uint64(math.MaxUint64), stats.FreeFiles)
+}
+
 func TestServiceStatFSUsesUsageCounter(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
@@ -921,9 +933,9 @@ func TestServiceUsageUpdatesUseRoutedCounter(t *testing.T) {
 	rec := attachRecorder(svc)
 	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
 	require.NoError(t, err)
-	require.Len(t, rec.requests, 1)
-	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
-	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+	require.Len(t, rec.requests, 2)
+	requireUsageRouteCounterWithTxn(t, rec.requests[1].Elems)
+	require.False(t, elemTouchesKey(rec.requests[1].Elems, fskeys.UsageKey()))
 
 	rec.requests = nil
 	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abc"))
@@ -1016,12 +1028,12 @@ func TestServiceUnlinkLargeFileSucceedsAfterPagedDeleteFailure(t *testing.T) {
 
 	inner, ok := svc.dispatch.(*testCoordinator)
 	require.True(t, ok)
-	failSecond := &failNthDispatchCoordinator{
+	failCleanup := &failNthDispatchCoordinator{
 		inner:  inner,
-		failAt: 2,
+		failAt: 3,
 		err:    context.Canceled,
 	}
-	svc.dispatch = failSecond
+	svc.dispatch = failCleanup
 
 	err = svc.Unlink(ctx, RootInode, []byte("large"))
 	require.NoError(t, err)

@@ -1,14 +1,12 @@
 # Filesystem on Elastickv Design
 
-Status: Partial - FS Core API, filesystem chunk routing, manual split boundary
-snapping, open-handle lease/orphan GC, capacity-aware `StatFS`, the thin
-FUSE errno/session adapter, and the file-pinned hotspot skip metric are
-implemented; whole-file migration, FILE_PINNED alert rules, intent recovery,
-placement/operator metrics, and the actual FUSE mount/server binding remain
-open.
+Status: Implemented - FS Core API, chunk routing and split guardrails,
+open-handle lease/orphan GC, capacity-aware `StatFS`, go-fuse mount/server,
+whole-file migration, intent recovery, and placement observability are
+implemented. Phase 3 items remain explicit non-goals.
 Author: bootjp
 Date: 2026-02-24
-Updated: 2026-07-07
+Updated: 2026-07-19
 
 ## 1. Background
 
@@ -52,14 +50,31 @@ Implemented:
     filesystem chunk split candidate is normalized back to the same file route
     boundary and rejected, exposing auto-split planner skips caused by
     same-file pinning.
+11. `internal/filesystem/fuseadapter.RawFileSystem` binds the adapter to
+    `github.com/hanwen/go-fuse/v2`, including stable inode attributes,
+    per-directory resumable kernel offsets, explicit unsupported operations,
+    and lifecycle-owned mount/unmount. `--filesystemMount` enables the mount in
+    the server process; startup initializes the root and recovers intents before
+    serving kernel requests.
+12. `MoveFile` and `ResumeMoveFile` implement an epoch-fenced durable state
+    machine: target cleanup, paged copy, atomic home switch, source cleanup, and
+    completion. Data mutations return `ErrStaleHome` while a home is migrating;
+    the FUSE adapter maps it to retryable `EAGAIN`.
+13. Create/delete operations write a prepared intent before their atomic
+    namespace transaction and delete it inside that transaction. Startup
+    recovery clears safely aborted namespace intents and resumes unfinished move
+    jobs idempotently.
+14. Prometheus placement, operation, lease, orphan, collision, and epoch
+    metrics are implemented. The FUSE-enabled server refreshes snapshot-derived
+    gauges periodically. `monitoring/prometheus/rules/filesystem.yml` and the
+    Elastickv filesystem Grafana dashboard cover pinned files, multi-shard
+    violations, stuck moves, orphan GC, and stale-home conflicts.
 
-Remaining:
+Deferred non-goals:
 
-1. Actual FUSE mount/server binding against a chosen Go FUSE library.
-2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
-3. `FILE_PINNED_HOTSPOT` alert rules/dashboards for auto-split planner skips.
-4. Restart recovery for unfinished create/delete/move intents.
-5. Placement/operator metrics.
+1. Cross-directory atomic rename across unsupported domains.
+2. Optional large-file striping.
+3. Hard links, symbolic links, and full POSIX locking/ioctl parity.
 
 ## 2. Goals and Non-goals
 
@@ -229,7 +244,9 @@ Write path may touch multiple contiguous chunk indexes.
 
 At file creation:
 
-1. Placement manager computes `home_slot` using rendezvous hashing over active shard groups.
+1. The allocator chooses a stable 64-bit `home_slot` token (the inode ID by
+   default); the live distribution catalog maps the normalized
+   `(home_slot, inode_id)` route to an active shard group.
 2. `!fs|home|<inode_id>` is written once (`state=ACTIVE`, `epoch=1`).
 3. All chunk keys use that `home_slot`.
 
@@ -256,7 +273,7 @@ This directly reduces accidental same-file scatter caused by range splitting.
 
 `FILE_PINNED_HOTSPOT` follow-up actions:
 
-1. Increment `fs_file_pinned_hotspot_total` and emit an operator alert with inode/home metadata.
+1. Increment `elastickv_fs_file_pinned_hotspot_total` and emit an operator alert with inode/home metadata.
 2. Keep serving with single-home placement as safe default.
 3. Operator may trigger `MoveFile(inode, target_group)` for load shift.
 4. If hotspot persists on a single huge file, operator may enable manual striping policy in Phase 2+ for that inode.
@@ -265,10 +282,14 @@ This directly reduces accidental same-file scatter caused by range splitting.
 
 Rebalancing moves whole files by default:
 
-1. Copy all chunks to target home slot.
-2. Fence writes with epoch bump.
-3. Switch `!fs|home|` to new slot.
-4. Garbage-collect old chunks after grace window.
+1. Atomically set `MIGRATING`, record the target home, and bump the epoch to
+   fence data mutations.
+2. Delete stale target chunks, then copy source chunks in bounded pages while
+   checkpointing the durable job cursor.
+3. Atomically switch `!fs|home|` and inode metadata to the target slot with a
+   second epoch bump.
+4. Garbage-collect source chunks in bounded resumable pages and delete the move
+   intent on completion.
 
 Exception:
 
@@ -282,9 +303,10 @@ Exception:
 1. Resolve parent directory inode.
 2. Allocate `inode_id` via distributed random allocator.
 3. Assign `home_slot`.
-4. Write `!fs|ino|`, `!fs|home|`, and `!fs|dir|parent|name` with intent marker.
+4. Persist a prepared create intent, then atomically write `!fs|ino|`,
+   `!fs|home|`, and `!fs|dir|parent|name` while deleting that intent.
 5. If create is requested with open semantics, allocate `fh_id` and write `!fs|ref|...`.
-6. Commit and clear intent.
+6. Commit the namespace transaction and intent deletion together.
 
 Recovery replays unfinished intents idempotently.
 
@@ -300,7 +322,9 @@ Recovery replays unfinished intents idempotently.
 1. Resolve inode + home (`epoch` checked).
 2. For each touched chunk: read-modify-write.
 3. Update inode size/mtime.
-4. If epoch changed due to migration, retry with refreshed home mapping.
+4. If the home is migrating or the epoch changed before commit, return
+   `ErrStaleHome`; protocol adapters expose a retryable status (`EAGAIN` for
+   FUSE), and the caller retries after refreshing metadata.
 
 ### 8.4 Rename
 
@@ -340,7 +364,11 @@ Use intent keys for multi-step metadata/data transitions:
 2. `DELETE_INTENT`
 3. `MOVE_INTENT`
 
-Intent records live under `!fs|intent|<intent_id>` and store step cursor + payload for resume after crash.
+Intent records live under `!fs|intent|<intent_id>`. Namespace intents store the
+prepared operation identity; a surviving marker proves the atomic namespace
+transaction did not commit and can be cleared. Move cursors and phase payloads
+live in `!fs|job|move|<job_id>`, while the corresponding move intent links the
+job into startup recovery.
 
 ### 9.2 Epoch fencing
 
@@ -351,7 +379,10 @@ Writers include `(inode_id, epoch)` from home mapping.
 
 ### 9.3 Idempotency
 
-All move/create/delete steps are idempotent by key overwrite semantics and job cursor checkpoints.
+All move/create/delete recovery steps are idempotent through atomic namespace
+transactions, epoch validation, key overwrite/delete semantics, and durable job
+cursor checkpoints. Concurrent move recovery treats OCC write conflict as a
+signal to reload the current phase.
 
 ### 9.4 Open-handle lease recovery
 
@@ -417,19 +448,27 @@ Internal placement API:
 2. `MoveFile(inode, target_group)`
 3. `ListFilePlacementStats()`
 
+The server exposes the FUSE frontend when `--filesystemMount` is non-empty.
+`--filesystemClientID` identifies durable handle leases (default: `raftId`),
+while `--filesystemCapacity`, `--filesystemMaxFiles`, and
+`--filesystemPlacementScanInterval` control `statfs` reporting and placement
+metric refresh.
+
 ## 11. Metrics and SLOs
 
 Key metrics:
 
-1. `fs_file_multi_shard_detected_total`
-2. `fs_file_move_inflight`
-3. `fs_chunk_read_ops_total`, `fs_chunk_write_ops_total`
-4. `fs_chunk_read_latency_ms`, `fs_chunk_write_latency_ms`
-5. `fs_home_epoch_conflict_total`
-6. `fs_open_handle_lease_active`
-7. `fs_orphan_inode_gc_pending`
-8. `fs_file_pinned_hotspot_total`
-9. `fs_inode_id_collision_retry_total`
+1. `elastickv_fs_file_multi_shard_detected_total`
+2. `elastickv_fs_file_multi_shard_current`
+3. `elastickv_fs_file_move_inflight`
+4. `elastickv_fs_chunk_read_ops_total`, `elastickv_fs_chunk_write_ops_total`
+5. `elastickv_fs_chunk_read_latency_ms`, `elastickv_fs_chunk_write_latency_ms`
+6. `elastickv_fs_home_epoch_conflict_total`
+7. `elastickv_fs_open_handle_lease_active`
+8. `elastickv_fs_orphan_inode_gc_pending`
+9. `elastickv_fs_file_pinned_hotspot_total`
+10. `elastickv_fs_inode_id_collision_retry_total`
+11. `elastickv_fs_files_by_group{group_id}`
 
 SLO targets (initial):
 
@@ -438,20 +477,18 @@ SLO targets (initial):
 
 ## 12. Implementation Plan
 
-Phase 1:
+Implemented foundation:
 
 1. Key schema + metadata/chunk CRUD.
 2. Fixed chunk read/write/truncate.
 3. Single-home placement at file create.
 4. Split guardrail for file boundary.
 5. Protocol-neutral `FS Core API` and thin FUSE adapter with required errno mapping.
-
-Phase 2:
-
-1. Whole-file migration job.
-2. Epoch fencing + stale-home retry path.
-3. Placement metrics and operator commands.
-4. Open-handle lease reaper and orphan-GC hardening.
+6. Actual go-fuse raw filesystem mount and server lifecycle.
+7. Whole-file migration job with epoch fencing and restart recovery.
+8. Placement metrics, alert rules, dashboard, and periodic collection.
+9. Open-handle lease reaper and orphan-GC hardening.
+10. Durable create/delete/move intent recovery.
 
 Phase 3:
 
@@ -478,7 +515,9 @@ Phase 3:
    - concurrent append + read under node failure
    - migration during read/write load
 4. FUSE compatibility:
-   - libfuse integration tests for `lookup/getattr/open/read/write/readdir/rename/unlink/fsync`
+   - go-fuse raw protocol tests for stable attributes, handles, and resumable
+     `readdir` offsets
+   - kernel mount smoke test in a FUSE-capable deployment environment
    - errno conformance checks for unsupported operations
 
 ## 14. Open Questions
