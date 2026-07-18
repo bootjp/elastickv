@@ -181,7 +181,11 @@ func TestFreshLearnerJoinPromotesAndRestartsFromPersistedMembership(t *testing.T
 }
 
 func TestFreshLearnerJoinReusesRemovedVoterID(t *testing.T) {
-	nodes, peers := newTransportTestNodes(t, 2)
+	nodes, peers := newTransportTestNodes(t, 3)
+	for i := range nodes {
+		peers[i].NodeID = DeriveNodeID(peers[i].ID)
+		nodes[i].peer.NodeID = peers[i].NodeID
+	}
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
 
@@ -196,12 +200,21 @@ func TestFreshLearnerJoinReusesRemovedVoterID(t *testing.T) {
 	require.NoError(t, err)
 	waitForConfigSize(t, leader.engine, 2)
 	waitForConfigSize(t, nodes[1].engine, 2)
+	require.NoError(t, openTransportTestNode(ctx, nodes[2], peers, false))
+	_, err = leader.engine.AddVoter(ctx, nodes[2].peer.ID, nodes[2].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 3)
+	waitForConfigSize(t, nodes[1].engine, 3)
+	waitForConfigSize(t, nodes[2].engine, 3)
 
 	require.NoError(t, nodes[1].engine.Close())
 	nodes[1].engine = nil
+	leader = waitForLeaderNode(t, []*transportTestNode{nodes[0], nodes[2]})
 	_, err = leader.engine.RemoveServer(ctx, nodes[1].peer.ID, 0)
 	require.NoError(t, err)
-	waitForConfigSize(t, leader.engine, 1)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[0].engine, 2)
+	waitForConfigSize(t, nodes[2].engine, 2)
 
 	require.NoError(t, os.RemoveAll(nodes[1].dir))
 	require.NoError(t, os.MkdirAll(nodes[1].dir, 0o750))
@@ -215,18 +228,19 @@ func TestFreshLearnerJoinReusesRemovedVoterID(t *testing.T) {
 
 	addIndex, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
 	require.NoError(t, err)
-	waitForConfigSize(t, leader.engine, 2)
-	waitForConfigSize(t, nodes[1].engine, 2)
+	waitForConfigSize(t, leader.engine, 3)
+	waitForConfigSize(t, nodes[1].engine, 3)
+	waitForConfigSize(t, nodes[2].engine, 3)
 
 	warm, err := leader.engine.Propose(ctx, []byte("same-id-replacement"))
 	require.NoError(t, err)
 	requireTransportNodeAppliedValue(t, nodes[1], "same-id-replacement")
 	requireLearnerPromoted(t, ctx, leader.engine, nodes[1].peer.ID, addIndex, warm.CommitIndex)
-	requireTransportNodeSuffrage(t, ctx, nodes[1], SuffrageVoter, 2)
+	requireTransportNodeSuffrage(t, ctx, nodes[1], SuffrageVoter, 3)
 
 	restartTransportTestNodesWithoutJoin(t, ctx, nodes)
 	restartedLeader := waitForLeaderNode(t, nodes)
-	requireTransportNodesConfigSize(t, ctx, nodes, 2)
+	requireTransportNodesConfigSize(t, ctx, nodes, 3)
 	result, err := restartedLeader.engine.Propose(ctx, []byte("after-same-id-restart"))
 	require.NoError(t, err)
 	require.NotZero(t, result.CommitIndex)
