@@ -50,7 +50,7 @@ again before merge or deployment.
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
 | Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1095, #1103, and #1108 open | In flight; stacked series is not on `main` |
 | Shared Pebble block cache | PR #1082 | PR #1082 open | In flight; cache sharing only, not all resource-pool work |
-| Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; production multi-group soak evidence remains |
+| Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; production multi-group soak evidence remains outstanding |
 | S3 Raft blob offload | `2026_04_25_proposed_s3_raft_blob_offload.md` | PRs #1057 and #1063 open | In flight; payload offload is not on `main` |
 | Live logical backup | `2026_04_29_proposed_logical_backup.md` | PR #1065 merged scan primitives; PRs #1056 and #1059 open | In flight; distinct from physical SST snapshot offload |
 
@@ -115,7 +115,7 @@ the general data-plane leader proxy has the proposed circuit breaker.
 
 The next focused designs should be written and implemented in this order:
 
-1. Finish the open hotspot M2/M3, shared-cache, dedicated-TSO, and S3 offload
+1. Finish the open hotspot split M2/M3, shared-cache, dedicated-TSO, and S3 offload
    stacks without moving their mechanisms into this roadmap.
 2. Catalog delta/watch, then catalog index and batched mutation.
 3. Follower reads and cross-shard transaction completion, both gated on the
