@@ -119,6 +119,10 @@ func TestShardedCoordinatorDispatchTxn_CommitPrimaryUsesPinnedGroup(t *testing.T
 
 	g1Commit := g1Txn.requests[1]
 	g2Commit := g2Txn.requests[1]
+	require.Equal(t, [][]byte{[]byte("z-key")}, g1Txn.requests[0].WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("z-key")}, g1Commit.WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("a-key")}, g2Txn.requests[0].WriteFenceBypassKeys)
+	require.Equal(t, [][]byte{[]byte("a-key")}, g2Commit.WriteFenceBypassKeys)
 	require.Equal(t, pb.Phase_COMMIT, g1Commit.Phase)
 	require.Equal(t, pb.Phase_COMMIT, g2Commit.Phase)
 	require.Equal(t, []byte("z-key"), g1Commit.Mutations[1].Key)
@@ -129,6 +133,45 @@ func TestShardedCoordinatorDispatchTxn_CommitPrimaryUsesPinnedGroup(t *testing.T
 	primaryCommitMeta := requestTxnMeta(t, g2Commit)
 	require.Equal(t, []byte("a-key"), primaryCommitMeta.PrimaryKey)
 	require.Greater(t, primaryCommitMeta.CommitTS, startTS)
+}
+
+func TestShardedCoordinatorPinnedWritesBypassLogicalRouteFence(t *testing.T) {
+	t.Parallel()
+
+	for _, isTxn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "raw", true: "txn"}[isTxn], func(t *testing.T) {
+			t.Parallel()
+
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 1,
+				Routes: []distribution.RouteDescriptor{
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+					{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
+				},
+			}))
+
+			g1Txn := &recordingTransactional{}
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: g1Txn},
+				2: {Txn: &recordingTransactional{}},
+			}, 1, NewHLC(), nil)
+			key := []byte("z-key")
+			reqs := &OperationGroup[OP]{
+				IsTxn: isTxn,
+				Elems: []*Elem[OP]{{Op: Del, Key: key, GroupID: 1}},
+			}
+			if isTxn {
+				reqs.StartTS = 10
+			}
+
+			_, err := coord.Dispatch(context.Background(), reqs)
+			require.NoError(t, err)
+			require.Len(t, g1Txn.requests, 1)
+			require.Equal(t, [][]byte{key}, g1Txn.requests[0].WriteFenceBypassKeys)
+			require.Equal(t, key, g1Txn.requests[0].Mutations[len(g1Txn.requests[0].Mutations)-1].Key)
+		})
+	}
 }
 
 func requestTxnMeta(t *testing.T, req *pb.Request) TxnMeta {
@@ -673,7 +716,7 @@ func TestShardedCoordinatorCommitPrimaryUsesPinnedMutationGroup(t *testing.T) {
 		1: {{Op: pb.Op_DEL, Key: primaryKey}},
 		2: {{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")}},
 	}
-	primaryGid, commitIndex, err := coord.commitPrimaryTxn(context.Background(), 10, primaryKey, grouped, []uint64{1, 2}, 20, 0)
+	primaryGid, commitIndex, err := coord.commitPrimaryTxn(context.Background(), 10, primaryKey, grouped, []uint64{1, 2}, 20, 0, nil)
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), primaryGid)
 	require.Equal(t, uint64(7), commitIndex)

@@ -833,13 +833,14 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	if observedVer == 0 {
 		return nil
 	}
+	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
 
 	// (a) Observed-version check.
 	observedSnap, ok := f.routes.SnapshotAt(observedVer)
 	if !ok {
 		return errors.WithStack(ErrComposed1VersionGCd)
 	}
-	if err := f.verifyOwnerFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
+	if err := f.verifyOwnerFromSnapshot(r.GetMutations(), bypassKeys, observedSnap, observedVer, "observed"); err != nil {
 		return err
 	}
 
@@ -851,7 +852,7 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 		// short-circuit posture of an unwired FSM).
 		return nil
 	}
-	return f.verifyOwnerFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+	return f.verifyOwnerFromSnapshot(r.GetMutations(), bypassKeys, currentSnap, currentSnap.Version(), "current")
 }
 
 func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
@@ -957,12 +958,15 @@ func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
 // "current") that ends up in the wrapped error.  isTxnInternalKey
 // mutations (the TxnMeta marker prefix) are skipped — they are
 // always on every shard and have no Composed-1 ownership.
-func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, snapVer uint64, phase string) error {
+func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, bypassKeys map[string]struct{}, snap RouteSnapshot, snapVer uint64, phase string) error {
 	for _, mut := range mutations {
 		if mut == nil || len(mut.Key) == 0 {
 			continue
 		}
 		if isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
 		// routeKey-normalize before OwnerOf so the gate routes the

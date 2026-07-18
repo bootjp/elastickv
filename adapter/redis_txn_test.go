@@ -837,6 +837,8 @@ func TestRedisTxnSetReplacementDeletesNonPrefixedStringEncodings(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
+	hllValue, err := encodeRedisHLL(redisSetValue{Members: []string{"member"}}, nil)
+	require.NoError(t, err)
 	cases := []struct {
 		name        string
 		seedKey     func([]byte) []byte
@@ -846,7 +848,7 @@ func TestRedisTxnSetReplacementDeletesNonPrefixedStringEncodings(t *testing.T) {
 		{
 			name:        "hll",
 			seedKey:     redisHLLKey,
-			seedValue:   []byte("hll-payload"),
+			seedValue:   hllValue,
 			expectedDel: redisHLLKey,
 		},
 		{

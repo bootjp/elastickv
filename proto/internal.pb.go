@@ -208,10 +208,11 @@ type Request struct {
 	// is plumbing only — the FSM ignores the value, so all existing
 	// callers see no behaviour change.
 	ObservedRouteVersion uint64 `protobuf:"varint,6,opt,name=observed_route_version,json=observedRouteVersion,proto3" json:"observed_route_version,omitempty"`
-	// write_fence_bypass_keys carries point keys whose owner was resolved by a
-	// higher-level partition resolver before the request was appended to Raft.
-	// The FSM uses it only to skip the byte-route write fence for those exact
-	// point mutations; prefix deletes and unmarked keys still fail closed.
+	// write_fence_bypass_keys carries point keys whose target group was resolved
+	// outside the byte-route catalog, either by a partition resolver or an
+	// explicit maintenance pin. The FSM skips byte-route write-fence and owner
+	// checks only for those exact point mutations; prefixes and unmarked keys
+	// still fail closed.
 	WriteFenceBypassKeys [][]byte `protobuf:"bytes,7,rep,name=write_fence_bypass_keys,json=writeFenceBypassKeys,proto3" json:"write_fence_bypass_keys,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
