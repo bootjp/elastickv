@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8 shipped (5E deferred); Stage 9 open
+Status: Partial — Stages 0–8 and 9A shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -32,7 +32,8 @@ Date: 2026-04-29
 | 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal on the default encryption Raft group. The leader rotates every active DEK purpose once before listeners open; followers keep an in-memory pending request and fire only if they acquire leadership in the same process uptime. | shipped | this PR |
 | 7 | Writer registry + deterministic nonce (§4.1). Covers process-start registration, storage-layer registration gate, runtime re-registration for cutover and rotation, conf-change-time pre-registration, and §5.5 registry projection in `GetSidecarState` / `ResyncSidecar` (`WriterRegistryForCaller`). | shipped | `2026_05_26_implemented_7a_process_start_registration.md` + `2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md` + `2026_05_28_implemented_7b_runtime_reregistration.md` + `2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md` + `2026_05_29_implemented_7c_confchange_time_registration.md` + `2026_07_11_implemented_7d_sidecar_registry_projection.md` |
 | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | shipped | [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) + [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md) |
-| 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
+| 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
+| 9B+ | KMS-backed wrappers, rotation/retire/rewrite, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production

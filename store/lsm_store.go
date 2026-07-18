@@ -272,7 +272,7 @@ func WithPebbleLogger(l *slog.Logger) PebbleStoreOption {
 // fully release the memory. Callers that only need *pebble.Options should
 // still take the cache handle and defer its Unref to avoid leaking a
 // 256 MiB (default) allocation per call.
-func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
+func defaultPebbleOptionsWithCache(disableCompression bool) (*pebble.Options, *pebble.Cache) {
 	cache := pebble.NewCache(pebbleCacheBytes)
 	opts := &pebble.Options{
 		FS:                 vfs.Default,
@@ -282,6 +282,14 @@ func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
 	// Enable automatic compactions and apply all other Pebble defaults.
 	// EnsureDefaults leaves Cache alone because we already set it.
 	opts.EnsureDefaults()
+	if disableCompression {
+		// Storage-envelope payloads are compressed before encryption. The
+		// resulting ciphertext is high entropy, so Pebble block compression
+		// only burns CPU and cannot recover additional space.
+		opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
+			return pebble.DBCompressionNone
+		})
+	}
 	return opts, cache
 }
 
@@ -301,7 +309,7 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		opt(s)
 	}
 
-	pebbleOpts, cache := defaultPebbleOptionsWithCache()
+	pebbleOpts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(dir, pebbleOpts)
 	if err != nil {
 		cache.Unref()
@@ -2164,7 +2172,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 	if err := os.MkdirAll(s.dir, dirPerms); err != nil {
 		return errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(s.dir, opts)
 	if err != nil {
 		cache.Unref()
@@ -2235,7 +2243,7 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 		return err
 	}
 
-	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts); err != nil {
+	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return err
 	}
@@ -2277,8 +2285,8 @@ func makeSiblingTempDir(dir, tag string) (string, error) {
 // writeNativeSnapshotToTempDir writes batch-loop entries from r into a fresh
 // Pebble database at tmpDir, persists ts as the lastCommitTS meta-key, then
 // closes the database.
-func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
-	opts, cache := defaultPebbleOptionsWithCache()
+func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64, disableCompression bool) error {
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
@@ -2324,12 +2332,12 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64) (string, error) {
+func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64, disableCompression bool) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
@@ -2369,7 +2377,7 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS, s.cipher != nil)
 	if err != nil {
 		return err
 	}
@@ -2424,7 +2432,7 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 		_ = os.RemoveAll(tmpDir)
 		return errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	newDB, err := pebble.Open(s.dir, opts)
 	if err != nil {
 		cache.Unref()

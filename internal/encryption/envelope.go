@@ -90,6 +90,10 @@ func (e *Envelope) Encode() ([]byte, error) {
 		return nil, errors.Wrapf(ErrEnvelopeVersion,
 			"encode: got 0x%02x, want 0x%02x", e.Version, EnvelopeVersionV1)
 	}
+	if e.Flag&^FlagCompressed != 0 {
+		return nil, errors.Wrapf(ErrEnvelopeFlag,
+			"encode: got 0x%02x, allowed mask 0x%02x", e.Flag, FlagCompressed)
+	}
 	if len(e.Body) < TagSize {
 		return nil, errors.Wrapf(ErrEnvelopeShort,
 			"encode: body %d bytes, want >= %d", len(e.Body), TagSize)
@@ -115,6 +119,10 @@ func DecodeEnvelope(src []byte) (*Envelope, error) {
 	if src[versionOffset] != EnvelopeVersionV1 {
 		return nil, errors.Wrapf(ErrEnvelopeVersion,
 			"got 0x%02x, want 0x%02x", src[versionOffset], EnvelopeVersionV1)
+	}
+	if src[flagOffset]&^FlagCompressed != 0 {
+		return nil, errors.Wrapf(ErrEnvelopeFlag,
+			"got 0x%02x, allowed mask 0x%02x", src[flagOffset], FlagCompressed)
 	}
 	e := &Envelope{
 		Version: src[versionOffset],

@@ -617,7 +617,7 @@ func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(false)
 	db, err := pebble.Open(dir, opts)
 	require.NoError(t, err)
 	defer func() {

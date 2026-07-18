@@ -83,7 +83,7 @@ func TestSetPebbleCacheBytesForTestRestores(t *testing.T) {
 // is safe to call after closing the DB (the primary lifecycle path).
 func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
 	setPebbleCacheBytesForTest(t, 16<<20)
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(false)
 	require.NotNil(t, cache)
 	require.Same(t, cache, opts.Cache)
 	require.Equal(t, int64(16)<<20, cache.MaxSize())
