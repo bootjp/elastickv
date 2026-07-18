@@ -62,6 +62,7 @@ type fakeElasticKVNode struct {
 	addr       string
 	ln         net.Listener
 	leaderAddr atomic.Pointer[string]
+	commandErr atomic.Pointer[string]
 	commands   atomic.Int64
 	infoCalls  atomic.Int64
 }
@@ -89,6 +90,10 @@ func (n *fakeElasticKVNode) Leader() string {
 	return ""
 }
 
+func (n *fakeElasticKVNode) SetCommandError(err string) {
+	n.commandErr.Store(&err)
+}
+
 func (n *fakeElasticKVNode) serve() {
 	for {
 		conn, err := n.ln.Accept()
@@ -110,26 +115,41 @@ func (n *fakeElasticKVNode) handleConn(conn net.Conn) {
 		if len(args) == 0 {
 			return
 		}
-		cmd := strings.ToUpper(args[0])
-		switch cmd {
-		case "HELLO":
-			// Force go-redis to fall back to RESP2 without HELLO: return an
-			// error the client treats as "HELLO not supported".
-			_, _ = conn.Write([]byte("-ERR unknown command 'HELLO'\r\n"))
-		case "CLIENT", "AUTH", "SELECT", "PING":
-			_, _ = conn.Write([]byte("+OK\r\n"))
-		case "INFO":
-			n.infoCalls.Add(1)
-			body := fmt.Sprintf(
-				"# Replication\r\nrole:slave\r\nraft_leader_redis:%s\r\n",
-				n.Leader(),
-			)
-			_, _ = fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(body), body)
-		default:
-			n.commands.Add(1)
-			_, _ = conn.Write([]byte("+OK\r\n"))
-		}
+		n.handleCommand(conn, args)
 	}
+}
+
+func (n *fakeElasticKVNode) handleCommand(conn net.Conn, args []string) {
+	switch strings.ToUpper(args[0]) {
+	case "HELLO":
+		// Force go-redis to fall back to RESP2 without HELLO: return an
+		// error the client treats as "HELLO not supported".
+		_, _ = conn.Write([]byte("-ERR unknown command 'HELLO'\r\n"))
+	case "CLIENT", "AUTH", "SELECT", "PING":
+		_, _ = conn.Write([]byte("+OK\r\n"))
+	case "INFO":
+		n.infoCalls.Add(1)
+		body := fmt.Sprintf(
+			"# Replication\r\nrole:slave\r\nraft_leader_redis:%s\r\n",
+			n.Leader(),
+		)
+		_, _ = fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(body), body)
+	default:
+		n.writeCommandReply(conn)
+	}
+}
+
+func (n *fakeElasticKVNode) writeCommandReply(conn net.Conn) {
+	n.commands.Add(1)
+	if p := n.commandErr.Load(); p != nil {
+		_, _ = fmt.Fprintf(conn, "-%s\r\n", *p)
+		return
+	}
+	if leader := n.Leader(); leader != "" && leader != n.addr {
+		_, _ = conn.Write([]byte("-NOTLEADER etcd raft engine is not leader\r\n"))
+		return
+	}
+	_, _ = conn.Write([]byte("+OK\r\n"))
 }
 
 // readRESPArray reads a single RESP array of bulk strings from rd.
@@ -212,6 +232,97 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.NoError(t, res.Err())
 	require.Equal(t, beforeA, nodeA.commands.Load(), "command must not reach former leader A")
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
+}
+
+func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
+
+	nodeA.SetLeader(nodeA.addr)
+	nodeB.SetLeader(nodeA.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{nodeA.addr, nodeB.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == nodeA.addr
+	}, 2*time.Second, 10*time.Millisecond, "initial leader must be A")
+
+	nodeA.SetLeader(nodeB.addr)
+	nodeB.SetLeader(nodeB.addr)
+
+	res := backend.Do(context.Background(), "SET", "k", "v")
+	require.NoError(t, res.Err())
+	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "not-leader retry must synchronously adopt the advertised leader")
+	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt should hit the former leader and be rejected")
+	require.Equal(t, int64(1), nodeB.commands.Load(), "retry should land on the refreshed leader")
+}
+
+func TestLeaderAwareRedisBackend_DoesNotRetryUserNotLeaderError(t *testing.T) {
+	node := newFakeElasticKVNode(t)
+	node.SetLeader(node.addr)
+	node.SetCommandError("ERR raft engine: not leader")
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{node.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == node.addr
+	}, 2*time.Second, 10*time.Millisecond, "initial leader must be set")
+
+	res := backend.Do(context.Background(), "EVAL", "return redis.error_reply('raft engine: not leader')", 0)
+	require.Error(t, res.Err())
+	require.Contains(t, res.Err().Error(), "raft engine: not leader")
+	require.Equal(t, int64(1), node.commands.Load(), "user Redis error must not be retried")
+}
+
+func TestLeaderAwareRedisBackend_PipelineRetryRefreshesOnNotLeader(t *testing.T) {
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
+
+	nodeA.SetLeader(nodeA.addr)
+	nodeB.SetLeader(nodeA.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{nodeA.addr, nodeB.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == nodeA.addr
+	}, 2*time.Second, 10*time.Millisecond, "initial leader must be A")
+
+	nodeA.SetLeader(nodeB.addr)
+	nodeB.SetLeader(nodeB.addr)
+
+	results, err := backend.Pipeline(context.Background(), [][]any{
+		{"MULTI"},
+		{"SET", "k", "v"},
+		{"EXEC"},
+	})
+	require.NoError(t, err)
+	for _, result := range results {
+		require.NoError(t, result.Err())
+	}
+	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "pipeline retry must synchronously adopt the advertised leader")
+	require.Equal(t, int64(3), nodeA.commands.Load(), "first pipeline attempt should hit the former leader")
+	require.Equal(t, int64(3), nodeB.commands.Load(), "retry should replay the whole pipeline on the refreshed leader")
 }
 
 func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {

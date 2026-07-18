@@ -429,12 +429,14 @@ func TestZSetTTLExpiredRecreation(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 
+	expiredAt := time.UnixMilli(1)
 	// Write a wide-column ZSet with member "old-member" at ts=1.
 	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey([]byte("expired:zset"), []byte("old-member")), store.MarshalZSetScore(9.0), 1, 0))
 	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey([]byte("expired:zset"), 9.0, []byte("old-member")), []byte{}, 1, 0))
-	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey([]byte("expired:zset")), store.MarshalZSetMeta(store.ZSetMeta{Len: 1}), 1, 0))
-	// Set a TTL that is already in the past so the key appears expired.
-	require.NoError(t, st.PutAt(ctx, redisTTLKey([]byte("expired:zset")), encodeRedisTTL(time.Unix(0, 0)), 2, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey([]byte("expired:zset")),
+		store.MarshalZSetMeta(store.ZSetMeta{Len: 1, ExpireAt: redisExpireAtMillis(expiredAt)}), 1, 0))
+	// Keep a stale scan-index TTL too; the recreation cleanup must remove it.
+	require.NoError(t, st.PutAt(ctx, redisTTLKey([]byte("expired:zset")), encodeRedisTTL(expiredAt), 2, 0))
 
 	coord := newRetryOnceCoordinator(st)
 	coord.clock.Observe(2)

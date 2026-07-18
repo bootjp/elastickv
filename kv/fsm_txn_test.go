@@ -126,6 +126,42 @@ func TestPrepareRejectsSameStartTSDifferentPrimary(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
+func TestOnePhaseBatchLockCheckPreservesMutationOrder(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("p"), LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("vz")},
+			{Op: pb.Op_PUT, Key: []byte("a"), Value: []byte("va")},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, prepare))
+
+	onePhase := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    20,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 30})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("new-z")},
+			{Op: pb.Op_PUT, Key: []byte("a"), Value: []byte("new-a")},
+		},
+	}
+	err := applyFSMRequest(t, fsm, onePhase)
+	require.ErrorIs(t, err, ErrTxnLocked)
+	key, _, ok := TxnLockedDetails(err)
+	require.True(t, ok)
+	require.Equal(t, []byte("z"), key)
+}
+
 func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
 	t.Parallel()
 

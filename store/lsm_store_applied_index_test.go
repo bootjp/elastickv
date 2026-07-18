@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"os"
 	"testing"
 
@@ -209,6 +210,90 @@ func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v100"), val, "duplicate import must not rewrite the acknowledged batch")
 }
 
+func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	muts := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
+		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+	}
+	const (
+		startTS  uint64 = 100
+		commitTS uint64 = 200
+		entryIdx uint64 = 42
+	)
+
+	require.NoError(t, ps.ApplyMutations(ctx, muts, nil, commitTS, commitTS))
+	var staleAppliedIndex [8]byte
+	binary.LittleEndian.PutUint64(staleAppliedIndex[:], entryIdx-1)
+	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, staleAppliedIndex[:], pebble.Sync))
+
+	require.NoError(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, startTS, commitTS, entryIdx))
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("k1"), commitTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+}
+
+func TestApplyMutationsRaftAt_AlreadyLandedRequiresEveryMutationKey(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const (
+		startTS  uint64 = 100
+		commitTS uint64 = 200
+		entryIdx uint64 = 42
+	)
+	require.NoError(t, ps.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("a"), Value: []byte("old-a")},
+		{Op: OpTypePut, Key: []byte("b"), Value: []byte("old-b")},
+	}, nil, commitTS, commitTS))
+
+	var staleAppliedIndex [8]byte
+	binary.LittleEndian.PutUint64(staleAppliedIndex[:], entryIdx-1)
+	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, staleAppliedIndex[:], pebble.Sync))
+
+	err := ps.ApplyMutationsRaftAt(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("a"), Value: []byte("new-a")},
+		{Op: OpTypePut, Key: []byte("c"), Value: []byte("new-c")},
+	}, nil, startTS, commitTS, entryIdx)
+	require.ErrorIs(t, err, ErrWriteConflict)
+
+	got, present, idxErr := ps.LastAppliedIndex()
+	require.NoError(t, idxErr)
+	require.True(t, present)
+	require.Equal(t, entryIdx-1, got)
+
+	_, getErr := ps.GetAt(ctx, []byte("c"), commitTS)
+	require.ErrorIs(t, getErr, ErrKeyNotFound)
+}
+
+func TestApplyMutationsRaftAt_AlreadyLandedFastPathDoesNotHideConflict(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("newer"), 200, 0))
+
+	err := ps.ApplyMutationsRaftAt(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("k"), Value: []byte("raft")},
+	}, nil, 100, 300, 42)
+	require.ErrorIs(t, err, ErrWriteConflict)
+
+	got, present, idxErr := ps.LastAppliedIndex()
+	require.NoError(t, idxErr)
+	require.False(t, present)
+	require.Equal(t, uint64(0), got)
+}
+
 // TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey covers the
 // appliedIndex==0 escape hatch — callers without a raft entry index
 // (test fakes, legacy ApplyMutationsRaft) MUST NOT bump the meta key.
@@ -283,6 +368,11 @@ func TestSetDurableAppliedIndex_UsesPebbleSync(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, present, "after Close+Open metaAppliedIndex must persist (pebble.Sync forced regardless of nosync)")
 	require.Equal(t, idx, got)
+}
+
+func TestRaftApplyMetaWriteOptsSyncsAppliedIndex(t *testing.T) {
+	require.Same(t, pebble.Sync, raftApplyMetaWriteOpts(true, pebble.NoSync))
+	require.Same(t, pebble.NoSync, raftApplyMetaWriteOpts(false, pebble.NoSync))
 }
 
 // TestSetDurableAppliedIndex_Monotonic guards the round-2 fix for

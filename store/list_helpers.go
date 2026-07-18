@@ -233,19 +233,21 @@ func PrefixScanEnd(prefix []byte) []byte {
 
 // Wide-column style list storage using per-element keys.
 // Item keys: !lst|itm|<userKey><seq(8-byte sortable binary)>
-// Meta key : !lst|meta|<userKey> -> [Head(8)][Tail(8)][Len(8)]
+// Meta key : !lst|meta|<userKey> -> [Head(8)][Tail(8)][Len(8)][ExpireAtMs(8)]
 
 const (
 	ListMetaPrefix = "!lst|meta|"
 	ListItemPrefix = "!lst|itm|"
 
-	listMetaBinarySize = 24
+	listMetaLegacyBinarySize = 24
+	listMetaBinarySize       = 32
 )
 
 type ListMeta struct {
-	Head int64 `json:"h"`
-	Tail int64 `json:"t"`
-	Len  int64 `json:"l"`
+	Head     int64  `json:"h"`
+	Tail     int64  `json:"t"`
+	Len      int64  `json:"l"`
+	ExpireAt uint64 `json:"e,omitempty"`
 }
 
 // ListMetaKey builds the metadata key for a user key.
@@ -265,10 +267,10 @@ func ListItemKey(userKey []byte, seq int64) []byte {
 	return buf
 }
 
-// MarshalListMeta encodes ListMeta into a fixed 24-byte binary format.
+// MarshalListMeta encodes ListMeta into a fixed 32-byte binary format.
 func MarshalListMeta(meta ListMeta) ([]byte, error) { return marshalListMeta(meta) }
 
-// UnmarshalListMeta decodes ListMeta from the fixed 24-byte binary format.
+// UnmarshalListMeta decodes ListMeta from the legacy 24-byte or current 32-byte binary format.
 func UnmarshalListMeta(b []byte) (ListMeta, error) { return unmarshalListMeta(b) }
 
 func marshalListMeta(meta ListMeta) ([]byte, error) {
@@ -285,11 +287,12 @@ func marshalListMeta(meta ListMeta) ([]byte, error) {
 	binary.BigEndian.PutUint64(buf[0:8], uint64(meta.Head))  //nolint:gosec // Head can be negative after LPUSH; uint64 cast preserves bits
 	binary.BigEndian.PutUint64(buf[8:16], uint64(meta.Tail)) //nolint:gosec // Tail = Head + Len, may be negative
 	binary.BigEndian.PutUint64(buf[16:24], uint64(meta.Len))
+	binary.BigEndian.PutUint64(buf[24:32], meta.ExpireAt)
 	return buf, nil
 }
 
 func unmarshalListMeta(b []byte) (ListMeta, error) {
-	if len(b) != listMetaBinarySize {
+	if len(b) != listMetaLegacyBinarySize && len(b) != listMetaBinarySize {
 		return ListMeta{}, errors.Wrap(errors.Newf("invalid list meta length: %d", len(b)), "unmarshal list meta")
 	}
 
@@ -311,11 +314,15 @@ func unmarshalListMeta(b []byte) (ListMeta, error) {
 		return ListMeta{}, errors.WithStack(errors.Newf("list meta invariant violated: tail (%d) != head+len (%d)", tail, expectedTail))
 	}
 
-	return ListMeta{
+	meta := ListMeta{
 		Head: head,
 		Tail: tail,
 		Len:  iLen,
-	}, nil
+	}
+	if len(b) == listMetaBinarySize {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[24:32])
+	}
+	return meta, nil
 }
 
 // encodeSortableInt64 writes seq with sign bit flipped (seq ^ minInt64) in big-endian order.

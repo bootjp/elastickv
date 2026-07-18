@@ -219,12 +219,12 @@ func advancePebbleExportPastCurrentUserKey(
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
-	if startKey == nil {
+	if len(startKey) == 0 {
 		return false
 	}
 	for prefixLen := 1; prefixLen <= len(userKey); prefixLen++ {
 		prefix := userKey[:prefixLen]
-		if len(startKey) != 0 && bytes.Compare(prefix, startKey) < 0 {
+		if bytes.Compare(prefix, startKey) < 0 {
 			continue
 		}
 		if bytes.Compare(prefix, endKey) < 0 {
@@ -259,6 +259,14 @@ func (s *pebbleStore) exportPebbleVersion(
 		version, err := s.decodeExportedPebbleVersion(iter, userKey, commitTS, opts.KeyFamily)
 		if err != nil {
 			return false, err
+		}
+		if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
+			result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+			if finishExportIfLimited(opts, result) {
+				result.Done = false
+				return false, nil
+			}
+			return true, nil
 		}
 		result.Versions = append(result.Versions, version)
 		result.ExportedBytes += versionExportSize(userKey, len(version.Value))

@@ -198,6 +198,7 @@ func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOp
 
 func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
 	return opts.AcceptKey != nil ||
+		opts.AcceptVersion != nil ||
 		opts.MaxCommitTSInclusive != 0 ||
 		opts.MinCommitTSExclusive != 0 ||
 		opts.StartKey != nil ||
@@ -551,6 +552,9 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 		return exportCursorTagScanned
 	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
+		return exportCursorTagScanned
+	}
+	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
 		return exportCursorTagScanned
 	}
 	if opts.MaxCommitTSInclusive != 0 && version.TS > opts.MaxCommitTSInclusive {

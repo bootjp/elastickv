@@ -19,7 +19,29 @@ import (
 	goproto "google.golang.org/protobuf/proto"
 )
 
-const consistencySequenceIterations = 512
+func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
+	t.Parallel()
+
+	pairs := rawKeyPairs([][]byte{nil, {}, []byte("a")})
+	require.Len(t, pairs, 3)
+	require.Nil(t, pairs[0].Key)
+	require.NotNil(t, pairs[1].Key)
+	require.Empty(t, pairs[1].Key)
+	require.Equal(t, []byte("a"), pairs[2].Key)
+}
+
+const (
+	grpcSequenceFullIterations  = 9999
+	grpcSequenceShortIterations = 256
+)
+
+func grpcSequenceIterations(t testing.TB) int {
+	t.Helper()
+	if testing.Short() {
+		return grpcSequenceShortIterations
+	}
+	return grpcSequenceFullIterations
+}
 
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
@@ -147,6 +169,7 @@ type recordingRawGroupStore struct {
 	scanGroupID  uint64
 	scanStart    []byte
 	scanEnd      []byte
+	keyScanGroup bool
 	fallbackGet  bool
 	fallbackScan bool
 }
@@ -172,6 +195,14 @@ func (s *recordingRawGroupStore) ScanGroupAt(ctx context.Context, groupID uint64
 	s.scanStart = append([]byte(nil), start...)
 	s.scanEnd = append([]byte(nil), end...)
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingRawGroupStore) ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	s.scanGroupID = groupID
+	s.scanStart = append([]byte(nil), start...)
+	s.scanEnd = append([]byte(nil), end...)
+	s.keyScanGroup = true
+	return s.ScanKeysAt(ctx, start, end, limit, ts)
 }
 
 func TestGRPCServer_RawGet_UsesExplicitGroup(t *testing.T) {
@@ -332,13 +363,14 @@ func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), ReadRouteVersion: 98})
 	require.NoError(t, err)
 	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey:         []byte("a"),
-		EndKey:           []byte("z"),
-		Limit:            10,
-		Ts:               10,
-		ReadRouteVersion: 97,
-		RouteStart:       []byte("m"),
-		RouteEnd:         []byte("z"),
+		StartKey:           []byte("a"),
+		EndKey:             []byte("z"),
+		Limit:              10,
+		Ts:                 10,
+		ReadRouteVersion:   97,
+		RouteStart:         []byte("m"),
+		RouteEnd:           []byte("z"),
+		RouteBoundsPresent: true,
 	})
 	require.NoError(t, err)
 
@@ -349,39 +381,103 @@ func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanReadRouteEnd)
 }
 
-func TestGRPCServer_RawScanAt_PreservesFullRangeRouteBoundsPresence(t *testing.T) {
+func TestGRPCServer_RawScanAt_ReadFenceVariants(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
-	s := NewGRPCServer(st, nil)
+	tests := []struct {
+		name              string
+		req               *pb.RawScanAtRequest
+		wireRoundTrip     bool
+		wantRouteVersion  uint64
+		wantBoundsPresent bool
+		wantRouteStart    []byte
+		wantRouteEnd      []byte
+		wantKeysOnly      bool
+	}{
+		{
+			name: "preserves empty full-range bounds across proto",
+			req: &pb.RawScanAtRequest{
+				StartKey:           []byte("!redis|meta|"),
+				EndKey:             []byte("!redis|meta}"),
+				Limit:              10,
+				Ts:                 10,
+				ReadRouteVersion:   97,
+				RouteStart:         []byte{},
+				RouteEnd:           []byte{},
+				RouteBoundsPresent: true,
+			},
+			wireRoundTrip:     true,
+			wantRouteVersion:  97,
+			wantBoundsPresent: true,
+			wantRouteStart:    []byte{},
+			wantRouteEnd:      []byte{},
+		},
+		{
+			name: "ignores bytes when bounds presence is false",
+			req: &pb.RawScanAtRequest{
+				StartKey:         []byte("!redis|meta|"),
+				EndKey:           []byte("!redis|meta}"),
+				Limit:            10,
+				Ts:               10,
+				ReadRouteVersion: 97,
+				RouteStart:       []byte("m"),
+				RouteEnd:         []byte("z"),
+			},
+			wantRouteVersion: 97,
+		},
+		{
+			name: "keys-only stamps current version without caller fields",
+			req: &pb.RawScanAtRequest{
+				StartKey: []byte("a"),
+				EndKey:   []byte("z"),
+				Limit:    10,
+				Ts:       10,
+				KeysOnly: true,
+			},
+			wantRouteVersion: 55,
+			wantKeysOnly:     true,
+		},
+	}
 
-	wire, err := goproto.Marshal(&pb.RawScanAtRequest{
-		StartKey:           []byte("!redis|meta|"),
-		EndKey:             []byte("!redis|meta}"),
-		Limit:              10,
-		Ts:                 10,
-		ReadRouteVersion:   97,
-		RouteStart:         []byte{},
-		RouteEnd:           []byte{},
-		RouteBoundsPresent: true,
-	})
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+			s := NewGRPCServer(st, nil)
+			req := tc.req
+			if tc.wireRoundTrip {
+				wire, err := goproto.Marshal(req)
+				require.NoError(t, err)
+				decoded := new(pb.RawScanAtRequest)
+				require.NoError(t, goproto.Unmarshal(wire, decoded))
+				require.True(t, decoded.GetRouteBoundsPresent())
+				require.Nil(t, decoded.RouteStart)
+				require.Nil(t, decoded.RouteEnd)
+				req = decoded
+			}
 
-	var decoded pb.RawScanAtRequest
-	require.NoError(t, goproto.Unmarshal(wire, &decoded))
-	require.True(t, decoded.GetRouteBoundsPresent())
-	require.Nil(t, decoded.RouteStart)
-	require.Nil(t, decoded.RouteEnd)
-
-	_, err = s.RawScanAt(ctx, &decoded)
-	require.NoError(t, err)
-	require.Equal(t, uint64(97), st.scanReadRouteVersion)
-	require.True(t, st.scanRouteBoundsPresent)
-	require.NotNil(t, st.scanReadRouteStart)
-	require.NotNil(t, st.scanReadRouteEnd)
-	require.Empty(t, st.scanReadRouteStart)
-	require.Empty(t, st.scanReadRouteEnd)
+			resp, err := s.RawScanAt(ctx, req)
+			require.NoError(t, err)
+			require.Len(t, resp.GetKv(), 1)
+			if tc.wantKeysOnly {
+				require.Empty(t, resp.GetKv()[0].GetValue())
+			}
+			require.Equal(t, tc.wantRouteVersion, st.scanReadRouteVersion)
+			require.Equal(t, tc.wantBoundsPresent, st.scanRouteBoundsPresent)
+			if tc.wantRouteStart == nil {
+				require.Nil(t, st.scanReadRouteStart)
+			} else {
+				require.NotNil(t, st.scanReadRouteStart)
+				require.Equal(t, tc.wantRouteStart, st.scanReadRouteStart)
+			}
+			if tc.wantRouteEnd == nil {
+				require.Nil(t, st.scanReadRouteEnd)
+			} else {
+				require.NotNil(t, st.scanReadRouteEnd)
+				require.Equal(t, tc.wantRouteEnd, st.scanReadRouteEnd)
+			}
+		})
+	}
 }
 
 func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {
@@ -428,6 +524,61 @@ func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithReadFenceStore(t
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyWithRouteBoundsUsesReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:           []byte("!redis|meta|"),
+		EndKey:             []byte("!redis|meta}"),
+		Limit:              10,
+		Ts:                 10,
+		GroupId:            42,
+		KeysOnly:           true,
+		RouteStart:         []byte("m"),
+		RouteBoundsPresent: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("!redis|meta|"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("m"), st.scanReadRouteStart)
+	require.NotNil(t, st.scanReadRouteEnd)
+	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       9,
+		GroupId:  42,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.True(t, st.keyScanGroup)
+	require.False(t, st.fallbackScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
 }
 
 func TestGRPCServer_Scan_RejectsOversizedLimit(t *testing.T) {
@@ -498,7 +649,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	// not abort the test. The post-RPC assert.Equal still pins the
 	// consistency invariant: once Put eventually succeeds, the
 	// subsequent Get must return the same value, otherwise we fail.
-	for i := range consistencySequenceIterations {
+	for i := range grpcSequenceIterations(t) {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
@@ -553,7 +704,7 @@ func Test_grpc_transaction(t *testing.T) {
 	// _sequence: tolerate transient leader churn (purely availability,
 	// not consistency) while keeping the Put → Get → Delete → Get
 	// invariants strict.
-	for i := range consistencySequenceIterations {
+	for i := range grpcSequenceIterations(t) {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.Put(ctx, &pb.PutRequest{Key: key, Value: want})

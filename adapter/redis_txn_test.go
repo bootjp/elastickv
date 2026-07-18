@@ -36,9 +36,26 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 		logicalDeletes:  map[string][]byte{},
 		hashDeletes:     map[string][]byte{},
 		setDeletes:      map[string][]byte{},
+		hashCreates:     map[string]struct{}{},
 		streamDeletions: map[string][]byte{},
 		startTS:         redisTxnTestStartTS,
 	}
+}
+
+type routeGroupScanStore struct {
+	store.MVCCStore
+	groupID uint64
+}
+
+func (s *routeGroupScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if err != nil {
+		return nil, err
+	}
+	for _, kvp := range kvs {
+		kvp.RouteGroupID = s.groupID
+	}
+	return kvs, nil
 }
 
 func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
@@ -64,7 +81,48 @@ func TestRedisTxnLoadListStateFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	txn.startTS = 4
 	stState, err := txn.loadListState(key)
 	require.NoError(t, err)
-	require.Equal(t, [][]byte{deltaKey}, stState.existingDeltas)
+	require.Equal(t, []listDeltaRef{{key: deltaKey}}, stState.existingDeltas)
+}
+
+func TestRedisTxnLoadListStatePreservesDeltaRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	baseStore := store.NewMVCCStore()
+	scanStore := &routeGroupScanStore{MVCCStore: baseStore, groupID: 7}
+	server := NewRedisServer(nil, "", scanStore, newLocalAdapterCoordinator(baseStore), nil, nil)
+	ctx := context.Background()
+	key := []byte("txn-list-route-group")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, baseStore.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+	deltaKey := store.ListMetaDeltaKey(key, 2, 0)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, baseStore.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	txn := newRedisTxnTestContext(server)
+	txn.startTS = 3
+	stState, err := txn.loadListState(key)
+	require.NoError(t, err)
+	require.Equal(t, []listDeltaRef{{key: deltaKey, groupID: 7}}, stState.existingDeltas)
+}
+
+func TestRedisScanAllDeltaElemsFilteredPreservesRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	baseStore := store.NewMVCCStore()
+	scanStore := &routeGroupScanStore{MVCCStore: baseStore, groupID: 11}
+	server := NewRedisServer(nil, "", scanStore, newLocalAdapterCoordinator(baseStore), nil, nil)
+	ctx := context.Background()
+	key := []byte("scan-list-route-group")
+	deltaKey := store.ListMetaDeltaKey(key, 2, 0)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	require.NoError(t, baseStore.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	elems, err := server.scanAllDeltaElemsFiltered(ctx, store.ListMetaDeltaScanPrefix(key), 3, nil)
+	require.NoError(t, err)
+	require.Len(t, elems, 1)
+	require.Equal(t, deltaKey, elems[0].Key)
+	require.Equal(t, uint64(11), elems[0].GroupID)
 }
 
 func TestRedisTxnLoadListStateEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
@@ -93,6 +151,15 @@ func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 		}
 	}
 	return false
+}
+
+func requireNoPutElemByKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) {
+	t.Helper()
+	for _, elem := range elems {
+		if elem != nil && elem.Op == kv.Put && string(elem.Key) == string(want) {
+			t.Fatalf("unexpected put elem key %q", string(want))
+		}
+	}
 }
 
 func requireElemByKey(t *testing.T, elems []*kv.Elem[kv.OP], want []byte) *kv.Elem[kv.OP] {
@@ -766,6 +833,53 @@ func TestRedisTxnSetReplacementSkipsWideCleanupForRawStringOrMissing(t *testing.
 	}
 }
 
+func TestRedisTxnSetReplacementDeletesNonPrefixedStringEncodings(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	hllValue, err := encodeRedisHLL(redisSetValue{Members: []string{"member"}}, nil)
+	require.NoError(t, err)
+	cases := []struct {
+		name        string
+		seedKey     func([]byte) []byte
+		seedValue   []byte
+		expectedDel func([]byte) []byte
+	}{
+		{
+			name:        "hll",
+			seedKey:     redisHLLKey,
+			seedValue:   hllValue,
+			expectedDel: redisHLLKey,
+		},
+		{
+			name:        "legacy-bare-string",
+			seedKey:     func(key []byte) []byte { return key },
+			seedValue:   []byte("old"),
+			expectedDel: func(key []byte) []byte { return key },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("set-replace:non-prefixed-string:" + tc.name)
+			require.NoError(t, st.PutAt(ctx, tc.seedKey(key), tc.seedValue, redisTxnTestStartTS, 0))
+
+			txn := newRedisTxnTestContext(server)
+			res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+			require.NoError(t, err)
+			require.Equal(t, "OK", res.str)
+
+			elems, err := txn.buildReplacementElems(ctx)
+			require.NoError(t, err)
+			require.True(t, elemKeysContain(elems, tc.expectedDel(key)))
+			require.True(t, elemKeysContain(elems, redisStrKey(key)))
+		})
+	}
+}
+
 func TestRedisTxnSetReplacementDeletesExpiredRawHash(t *testing.T) {
 	t.Parallel()
 
@@ -1010,6 +1124,172 @@ func TestRedisTxnSetClearsOldTTLBeforeExpireNX(t *testing.T) {
 	requireTTLNear(t, requireElemByKey(t, elems, redisTTLKey(key)).Value, wantExpire)
 }
 
+func TestRedisTxnSetAfterCollectionExpireSkipsInlineTTLRebuild(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-after-collection-expire")
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("v"), redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdExpire), key, []byte("20")}}, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), expireRes.integer)
+	require.Contains(t, txn.collectionExpireTypes, string(key))
+
+	setRes, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("replacement")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", setRes.str)
+	require.NotContains(t, txn.collectionExpireTypes, string(key))
+
+	replacementElems, err := txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+	strElem := requireElemByKey(t, replacementElems, redisStrKey(key))
+	value, _, err := decodeRedisStr(strElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, []byte("replacement"), value)
+
+	collectionTTLElems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+	require.NoError(t, err)
+	require.Empty(t, collectionTTLElems)
+	require.Empty(t, skipTTLIndex)
+	requireNoPutElemByKey(t, append(replacementElems, collectionTTLElems...), store.HashMetaKey(key))
+}
+
+func TestRedisTxnCollectionCreateExpireKeepsTTLIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		create func(*testing.T, *txnContext, []byte) error
+	}{
+		{
+			name: "list",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyRPush(redcon.Command{Args: [][]byte{[]byte(cmdRPush), key, []byte("v")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+				return nil
+			},
+		},
+		{
+			name: "hash",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, []byte("f"), []byte("v")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+				return nil
+			},
+		},
+		{
+			name: "zset",
+			create: func(t *testing.T, txn *txnContext, key []byte) error {
+				t.Helper()
+				res, err := txn.applyZIncrBy(redcon.Command{Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), []byte("m")}})
+				require.NoError(t, err)
+				require.Equal(t, resultBulk, res.typ)
+				require.Equal(t, []byte("1"), res.bulk)
+				return nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := newRedisStorageMigrationTestServer(t)
+			txn := newRedisTxnTestContext(server)
+			key := []byte("txn:create-expire-ttl-index:" + tc.name)
+
+			require.NoError(t, tc.create(t, txn, key))
+			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), expireRes.integer)
+
+			collectionTTLElems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+			require.NoError(t, err)
+			require.Empty(t, collectionTTLElems)
+			require.Empty(t, skipTTLIndex)
+			requireElemByKey(t, txn.buildTTLElems(skipTTLIndex), redisTTLKey(key))
+		})
+	}
+}
+
+func TestRedisTxnCollectionExpireDeltaOnlyTruncatedReturnsError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cases := []struct {
+		name       string
+		deltaKey   func([]byte, uint64) []byte
+		deltaValue []byte
+	}{
+		{
+			name:       "hash",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "set",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+		},
+		{
+			name:       "zset",
+			deltaKey:   func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
+			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, st := newRedisStorageMigrationTestServer(t)
+			key := []byte("txn:ttl:delta-only-truncated:" + tc.name)
+			for ts := uint64(1); ts <= store.MaxDeltaScanLimit+1; ts++ {
+				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
+			}
+
+			txn := newRedisTxnTestContext(server)
+			txn.startTS = store.MaxDeltaScanLimit + 2
+			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), expireRes.integer)
+
+			elems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
+			require.ErrorIs(t, err, ErrDeltaScanTruncated)
+			require.Empty(t, elems)
+			require.Empty(t, skipTTLIndex)
+		})
+	}
+}
+
+func TestRedisTxnSetAfterHLLExpireSkipsDirtyHLLAnchor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("set-after-hll-expire")
+	payload, err := encodeRedisHLL(redisSetValue{Members: []string{"a"}}, nil)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), payload, redisTxnTestStartTS, 0))
+
+	txn := newRedisTxnTestContext(server)
+	expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("1000")}}, time.Millisecond)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), expireRes.integer)
+	require.True(t, elemKeysContain(txn.buildKeyElems(), redisHLLKey(key)))
+
+	setRes, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("replacement")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", setRes.str)
+	require.False(t, elemKeysContain(txn.buildKeyElems(), redisHLLKey(key)))
+}
+
 func TestRedisTxnStagedStringWinsOverDeletionOnlyCollectionStates(t *testing.T) {
 	t.Parallel()
 
@@ -1135,12 +1415,38 @@ func TestRedisTxnListDeletionElemsWriteFence(t *testing.T) {
 	require.True(t, elemKeysContain(elems, redisTxnWideListFenceKey(key)))
 }
 
+func TestRedisTxnListDeletionElemsPreserveDeltaRouteGroupID(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("delete-route-group:list")
+	deltaKey := store.ListMetaDeltaKey(key, 9, 0)
+	elems := appendListDeletionElems(nil, key, &listTxnState{
+		existingDeltas: []listDeltaRef{{key: deltaKey, groupID: 17}},
+		deleted:        true,
+	})
+	require.Equal(t, uint64(17), requireElemByKey(t, elems, deltaKey).GroupID)
+	require.True(t, elemKeysContain(elems, redisTxnWideListFenceKey(key)))
+}
+
 func TestRedisTxnHashLegacyRewriteWritesFence(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("legacy-rewrite:hash")
-	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")})
+	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")}, 0)
 	require.True(t, elemKeysContain(elems, redisTxnWideHashFenceKey(key)))
+}
+
+func TestRedisTxnHashLegacyRewritePreservesTTL(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("legacy-rewrite:hash-ttl")
+	expireAt := redisExpireAtMillis(time.Now().Add(time.Hour))
+	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")}, expireAt)
+	metaElem := requireElemByKey(t, elems, store.HashMetaKey(key))
+	meta, err := store.UnmarshalHashMeta(metaElem.Value)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, expireAt, meta.ExpireAt)
 }
 
 func TestRedisSetLegacyMigrationWritesFenceWithoutLenDelta(t *testing.T) {

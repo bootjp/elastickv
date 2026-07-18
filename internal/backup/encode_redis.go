@@ -31,9 +31,10 @@ import (
 //     The live store sets NO MVCC-level expireAt for redis writes
 //     (kv.Elem has no expiry field) and writes NO !redis|ttl| scan-index
 //     row for strings (buildTTLElems explicitly skips string keys).
-//   - HLL values are raw sketch bytes with no inline header; their TTL
-//     lives in a !redis|ttl|<userKey> scan-index row (8-byte BE ms),
-//     matching buildTTLElems for non-string types.
+//   - HLL values with TTL carry TTL INLINE in the value header
+//     (encodeRedisHLL: [0xFF 0x02][flags][expireMs BE if has_ttl][body])
+//     and keep the !redis|ttl|<userKey> scan-index row. No-TTL legacy
+//     HLL values remain raw sketch bytes for backward-compatible dumps.
 //
 // All redis entries therefore use MVCC value-header expireAt = 0
 // (the redis adapter manages expiry itself); the builder's expireAt
@@ -190,9 +191,9 @@ func (e *RedisEncoder) encodeStrings(b *snapshotBuilder) error {
 	})
 }
 
-// encodeHLL reconstructs !redis|hll| records from hll/*.bin (raw sketch
-// bytes) plus the !redis|ttl| scan-index row for any expiring HLL key,
-// matching buildTTLElems for non-string types.
+// encodeHLL reconstructs !redis|hll| records from hll/*.bin, folding
+// hll_ttl.jsonl back into the live inline HLL header and also emitting
+// the !redis|ttl| scan-index row for expiring HLL keys.
 func (e *RedisEncoder) encodeHLL(b *snapshotBuilder) error {
 	ttls, err := e.loadTTLMap(redisHLLTTLFile)
 	if err != nil {
@@ -200,11 +201,15 @@ func (e *RedisEncoder) encodeHLL(b *snapshotBuilder) error {
 	}
 	return e.walkBlobDir("hll", func(encoded string, rawKey, body []byte) error {
 		key := append([]byte(RedisHLLPrefix), rawKey...)
-		if err := b.Add(key, body, 0); err != nil {
+		expireMs := ttls[encoded]
+		value := body
+		if expireMs != 0 {
+			value = encodeRedisHLLInlineValue(body, expireMs)
+		}
+		if err := b.Add(key, value, 0); err != nil {
 			return err
 		}
-		expireMs, ok := ttls[encoded]
-		if !ok || expireMs == 0 {
+		if expireMs == 0 {
 			return nil
 		}
 		ttlKey := append([]byte(RedisTTLPrefix), rawKey...)
@@ -445,6 +450,19 @@ func encodeRedisStrInlineValue(body []byte, expireMs uint64) []byte {
 	out[2] = redisStrHasTTL
 	binary.BigEndian.PutUint64(out[redisStrBaseHeader:redisStrBaseHeader+redisUint64Bytes], expireMs)
 	copy(out[redisStrBaseHeader+redisUint64Bytes:], body)
+	return out
+}
+
+// encodeRedisHLLInlineValue reproduces adapter/redis_compat_types.go's
+// encodeRedisHLL envelope for a decoded raw sketch body with an
+// expiring TTL. No-TTL HLL restore keeps the legacy raw-sketch value.
+func encodeRedisHLLInlineValue(body []byte, expireMs uint64) []byte {
+	out := make([]byte, redisHLLBaseHeader+redisUint64Bytes+len(body))
+	out[0] = redisHLLMagic
+	out[1] = redisHLLVersion
+	out[2] = redisHLLHasTTL
+	binary.BigEndian.PutUint64(out[redisHLLBaseHeader:redisHLLBaseHeader+redisUint64Bytes], expireMs)
+	copy(out[redisHLLBaseHeader+redisUint64Bytes:], body)
 	return out
 }
 

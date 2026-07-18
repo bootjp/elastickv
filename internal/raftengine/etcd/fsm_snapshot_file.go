@@ -361,6 +361,18 @@ func restoreAndComputeCRC(f *os.File, fileSize int64, fsm StateMachine) (uint32,
 	return h.Sum32(), nil
 }
 
+func computeFSMSnapshotPayloadCRC(f *os.File, fileSize int64) (uint32, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	payloadSize := fileSize - fsmFooterSize
+	h := crc32.New(crc32cTable)
+	if _, err := io.CopyN(h, f, payloadSize); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return h.Sum32(), nil
+}
+
 // verifyFSMSnapshotFile performs a read-only CRC check without restoring the FSM.
 // Used for startup orphan detection. Pass tokenCRC=0 to skip the token comparison.
 func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {

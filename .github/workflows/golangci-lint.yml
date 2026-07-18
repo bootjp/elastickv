@@ -18,7 +18,18 @@ jobs:
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.x"
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.9.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Run golangci-lint
+        run: golangci-lint run --config=.golangci.yaml
       - name: golangci-lint
+        continue-on-error: true
         uses: reviewdog/action-golangci-lint@v2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -28,4 +39,4 @@ jobs:
           filter_mode: nofilter
           reporter: github-pr-review
           cache: false
-          fail_on_error: true
+          fail_on_error: false

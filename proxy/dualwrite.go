@@ -52,6 +52,10 @@ const (
 	asyncDropLogInterval = 5 * time.Second
 )
 
+type leaderRefreshingBackend interface {
+	RefreshLeaderNow(context.Context)
+}
+
 // readTSCompactedMarker is the substring produced by
 // store.ErrReadTSCompacted as it flows through gRPC (wrapped as
 // FailedPrecondition) and Lua PCall. Matching on substring is necessary
@@ -72,11 +76,50 @@ func isRetryableSecondaryWriteError(err error) bool {
 	if isReadTSCompactedError(err) {
 		return true
 	}
+	if isElasticKVNotLeaderError(err) {
+		return true
+	}
 	switch classifySecondaryWriteError(err) {
 	case "retry_limit", "write_conflict", "txn_locked":
 		return true
 	default:
 		return false
+	}
+}
+
+func isNotLeaderError(err error) bool {
+	return isElasticKVNotLeaderError(err)
+}
+
+func isElasticKVNotLeaderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.TrimSpace(err.Error())
+	upper := strings.ToUpper(msg)
+	if upper == "NOTLEADER" || strings.HasPrefix(upper, "NOTLEADER ") {
+		return true
+	}
+	var redisErr redis.Error
+	if errors.As(err, &redisErr) {
+		return false
+	}
+	if msg == "etcd raft engine is not leader" ||
+		msg == "raft engine: not leader" {
+		return true
+	}
+	return msg == "leader not found" ||
+		strings.HasSuffix(msg, "desc = leader not found") ||
+		strings.HasSuffix(msg, "desc = raft engine: not leader") ||
+		strings.HasSuffix(msg, "desc = etcd raft engine is not leader")
+}
+
+func refreshSecondaryLeader(ctx context.Context, backend Backend, err error) {
+	if !isNotLeaderError(err) {
+		return
+	}
+	if refresher, ok := backend.(leaderRefreshingBackend); ok {
+		refresher.RefreshLeaderNow(ctx)
 	}
 }
 
@@ -241,13 +284,10 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	// Warmup: send to secondary with short timeout (fire-and-forget, bounded)
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() {
-			sCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			d.secondary.Do(sCtx, iArgs...)
-		})
+		if replayCmd, replayArgs, ok := blockingReplayCommand(cmd, args, resp); ok {
+			d.runSecondaryWrite(func() { d.writeSecondary(replayCmd, replayArgs) })
+		}
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -337,8 +377,10 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 		if attempt >= maxSecondaryTransientRetries {
 			break
 		}
+		reason := classifySecondaryWriteError(sErr)
+		refreshSecondaryLeader(sCtx, d.secondary, sErr)
 		d.logger.Debug("retrying secondary write after transient error",
-			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "reason", classifySecondaryWriteError(sErr), "err", sErr)
+			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "reason", reason, "err", sErr)
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
@@ -385,13 +427,32 @@ func (d *DualWriter) replaySecondaryPipeline(cmds [][]any) {
 	d.runSecondaryWrite(func() {
 		sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
 		defer cancel()
-		_, pErr := d.secondary.Pipeline(sCtx, cmds)
+		results, pErr := d.secondary.Pipeline(sCtx, cmds)
 		if pErr != nil {
 			d.logger.Warn("secondary txn replay failed", "err", pErr)
 			d.metrics.SecondaryWriteErrors.Inc()
 			d.metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", classifySecondaryWriteError(pErr)).Inc()
+			return
+		}
+		if rErr := firstPipelineResultError(results); rErr != nil {
+			d.logger.Warn("secondary txn replay failed", "err", rErr)
+			d.metrics.SecondaryWriteErrors.Inc()
+			d.metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", classifySecondaryWriteError(rErr)).Inc()
 		}
 	})
+}
+
+func firstPipelineResultError(results []*redis.Cmd) error {
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		err := result.Err()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return fmt.Errorf("pipeline result: %w", err)
+		}
+	}
+	return nil
 }
 
 // waitCompactedRetryBackoff sleeps for a jittered interval or returns early

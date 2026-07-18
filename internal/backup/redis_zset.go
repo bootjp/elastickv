@@ -108,19 +108,20 @@ var ErrRedisInvalidZSetKey = cockroachdberr.New("backup: malformed !zs| key")
 // wide-column source-of-truth, surfacing deleted or outdated
 // entries in the restored zset. Codex P1 round 3 (PR #790).
 type redisZSetState struct {
-	metaSeen    bool
-	declaredLen int64
-	members     map[string]float64
-	sawWide     bool
-	expireAtMs  uint64
-	hasTTL      bool
+	metaSeen       bool
+	declaredLen    int64
+	members        map[string]float64
+	sawWide        bool
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleZSetMeta processes one !zs|meta|<len><userKey> record. The
-// value is the 8-byte BE member count. We park the declared length so
-// flushZSets can warn on a mismatch with the observed member count
-// and register the user key so a later !redis|ttl|<userKey> record
-// routes back to this zset state.
+// value is the 8-byte BE member count, optionally followed by an inline
+// expireAtMs. We park the declared length so flushZSets can warn on a
+// mismatch with the observed member count and register the user key so a
+// later !redis|ttl|<userKey> record routes back to this zset state.
 //
 // !zs|meta|d|... delta keys share the !zs|meta| string prefix, so a
 // snapshot dispatcher that routes by "starts with RedisZSetMetaPrefix"
@@ -136,23 +137,23 @@ func (r *RedisDB) HandleZSetMeta(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetKey, "meta key: %q", key)
 	}
-	if len(value) != redisUint64Bytes {
-		return cockroachdberr.Wrapf(ErrRedisInvalidZSetMeta,
-			"length %d != %d", len(value), redisUint64Bytes)
-	}
 	// Bounds-check the uint64 declared count before narrowing to
 	// int64; without this a corrupted store with the high bit set
 	// would wrap to a negative declaredLen and fire spurious
 	// redis_zset_length_mismatch warnings on every flush. Mirrors
 	// the hash/list/set encoders' symmetric guard.
-	rawLen := binary.BigEndian.Uint64(value)
-	if rawLen > math.MaxInt64 {
-		return cockroachdberr.Wrapf(ErrRedisInvalidZSetMeta,
-			"declared len %d overflows int64", rawLen)
+	declaredLen, expireAtMs, hasTTL, inlineTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidZSetMeta)
+	if err != nil {
+		return err
 	}
 	st := r.zsetState(userKey)
-	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
+	st.declaredLen = declaredLen
 	st.metaSeen = true
+	if inlineTTL {
+		st.expireAtMs = expireAtMs
+		st.hasTTL = hasTTL
+		st.inlineTTLOwned = true
+	}
 	// Codex P2 (PR #790 r9): do NOT call markZSetWide here. The
 	// live read path (adapter/redis_compat_helpers.go:610-621)
 	// switches to the wide-column layout only when the !zs|mem|
