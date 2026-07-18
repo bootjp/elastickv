@@ -27,7 +27,7 @@ require (
 	github.com/tidwall/redcon v1.6.2
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/yuin/gopher-lua v1.1.2
-	go.etcd.io/etcd/client/pkg/v3 v3.7.0-rc.0
+	go.etcd.io/etcd/client/pkg/v3 v3.7.0
 	go.etcd.io/etcd/server/v3 v3.7.0-rc.0
 	go.etcd.io/raft/v3 v3.7.0
 	go.uber.org/zap v1.28.0
