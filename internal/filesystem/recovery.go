@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	defaultIntentRecoveryLimit = 256
-	intentCleanupTimeout       = 5 * time.Second
+	defaultIntentRecoveryLimit    = 256
+	recoveryRecordClearRetryLimit = 4
+	intentCleanupTimeout          = 5 * time.Second
 )
 
 type RecoveryStats struct {
@@ -127,9 +128,14 @@ func (s *Service) recoverMoveJobs(ctx context.Context, limit int) (RecoveryStats
 		}
 		if job.Phase != MovePhaseCompleted {
 			if _, resumeErr := s.ResumeMoveFile(ctx, job.ID); resumeErr != nil {
+				if errors.Is(resumeErr, ErrMoveJobNotFound) {
+					continue
+				}
 				return stats, resumeErr
 			}
 			stats.MoveJobsResumed++
+			stats.MoveJobsCleared++
+			continue
 		}
 		if clearErr := s.clearMoveJob(ctx, job.ID); clearErr != nil {
 			return stats, clearErr
@@ -183,13 +189,17 @@ func (s *Service) recoverMoveIntent(ctx context.Context, intent IntentState) (bo
 	resumed := job.Phase != MovePhaseCompleted
 	if resumed {
 		if _, err = s.ResumeMoveFile(ctx, job.ID); err != nil {
+			if errors.Is(err, ErrMoveJobNotFound) {
+				return false, false, nil
+			}
 			return false, false, err
 		}
+		return true, true, nil
 	}
 	if err = s.clearMoveJob(ctx, job.ID); err != nil {
-		return resumed, false, err
+		return false, false, err
 	}
-	return resumed, true, nil
+	return false, true, nil
 }
 
 func (s *Service) scanRecoveryPrefix(ctx context.Context, prefix []byte, limit int) ([]*store.KVPair, error) {
@@ -229,14 +239,22 @@ func (s *Service) clearMoveJob(ctx context.Context, jobID []byte) error {
 }
 
 func (s *Service) clearRecoveryRecord(ctx context.Context, key []byte) error {
-	ts, err := s.readTS(ctx)
-	if err != nil {
-		return err
+	var lastErr error
+	for range recoveryRecordClearRetryLimit {
+		ts, err := s.readTS(ctx)
+		if err != nil {
+			return err
+		}
+		err = s.dispatchTxn(ctx, ts,
+			[]*kv.Elem[kv.OP]{{Op: kv.Del, Key: append([]byte(nil), key...)}},
+			[][]byte{append([]byte(nil), key...)},
+		)
+		if !errors.Is(err, store.ErrWriteConflict) {
+			return err
+		}
+		lastErr = err
 	}
-	return s.dispatchTxn(ctx, ts,
-		[]*kv.Elem[kv.OP]{{Op: kv.Del, Key: append([]byte(nil), key...)}},
-		[][]byte{append([]byte(nil), key...)},
-	)
+	return lastErr
 }
 
 func (s *Service) clearIntentBestEffort(ctx context.Context, key []byte) {

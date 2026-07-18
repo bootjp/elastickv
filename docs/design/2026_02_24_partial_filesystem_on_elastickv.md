@@ -392,7 +392,9 @@ bounded recovery batches until no durable job or intent remains. A move in
 source cleanup may continue from its durable source prefix when both inode and
 home records have already been removed by a concurrent unlink after the switch.
 Recovery removes completed move-job records so an earlier batch cannot hide
-later unfinished jobs.
+later unfinished jobs. Normal migration completion removes its job record before
+returning, and concurrent startup drainers treat an already-cleared job as
+success. Move-job active observations are balanced on every resume exit path.
 
 ### 9.4 Open-handle lease recovery
 
@@ -525,6 +527,9 @@ Phase 3:
    - recovery scan limits bound each startup batch
    - startup drains more than one recovery batch before serving requests
    - source cleanup completes when unlink removes inode/home after the switch
+   - normal migration completion does not retain completed job records
+   - concurrent startup recovery tolerates another drainer completing the job
+   - failed resume paths clear active migration observations
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
    - concurrent append + read under node failure

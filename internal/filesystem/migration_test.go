@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/store"
@@ -30,6 +31,8 @@ func TestServiceMoveFileCopiesSwitchesAndCleansSource(t *testing.T) {
 	require.EqualValues(t, 20, job.TargetHome)
 	require.Greater(t, job.CopiedChunks, uint64(movePageSize))
 	require.Equal(t, job.CopiedChunks, job.CleanedChunks)
+	_, err = svc.moveJob(ctx, job.ID)
+	require.ErrorIs(t, err, ErrMoveJobNotFound)
 
 	home, err := svc.GetFileHome(ctx, created.Inode)
 	require.NoError(t, err)
@@ -159,6 +162,15 @@ func TestServiceMoveFileRetriesConcurrentRecoveryConflict(t *testing.T) {
 	require.Greater(t, conflicting.calls, 2)
 }
 
+func TestServiceResumeMoveFileClearsActiveObservationOnFailure(t *testing.T) {
+	observer := &recordingMoveObserver{}
+	svc := newTestServiceWithOptions(t, nil, WithOperationalObserver(observer))
+
+	_, err := svc.ResumeMoveFile(context.Background(), []byte("missing"))
+	require.ErrorIs(t, err, ErrMoveJobNotFound)
+	require.Equal(t, []bool{true, false}, observer.active)
+}
+
 func TestServiceRejectsDataMutationWhileHomeIsMigrating(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
@@ -283,3 +295,21 @@ func assertChunkPrefixCount(t *testing.T, ctx context.Context, st store.MVCCStor
 	require.NoError(t, err)
 	require.Len(t, page, count)
 }
+
+type recordingMoveObserver struct {
+	active []bool
+}
+
+func (*recordingMoveObserver) ObserveChunkRead(time.Duration) {}
+
+func (*recordingMoveObserver) ObserveChunkWrite(time.Duration) {}
+
+func (*recordingMoveObserver) ObserveHomeEpochConflict() {}
+
+func (*recordingMoveObserver) ObserveInodeIDCollisionRetry() {}
+
+func (o *recordingMoveObserver) ObserveMoveJob(_ []byte, active bool) {
+	o.active = append(o.active, active)
+}
+
+func (*recordingMoveObserver) ObservePlacementStats(PlacementStats) {}

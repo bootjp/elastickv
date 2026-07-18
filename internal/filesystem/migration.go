@@ -206,6 +206,7 @@ func (s *Service) persistMovePreparation(
 func (s *Service) ResumeMoveFile(ctx context.Context, jobID []byte) (MoveJob, error) {
 	if s.observer != nil {
 		s.observer.ObserveMoveJob(jobID, true)
+		defer s.observer.ObserveMoveJob(jobID, false)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -217,8 +218,8 @@ func (s *Service) ResumeMoveFile(ctx context.Context, jobID []byte) (MoveJob, er
 		}
 		completed, stepErr := s.advanceMoveStep(ctx, &job)
 		if completed {
-			if s.observer != nil {
-				s.observer.ObserveMoveJob(jobID, false)
+			if err := s.clearMoveJob(ctx, job.ID); err != nil {
+				return MoveJob{}, err
 			}
 			return job, nil
 		}

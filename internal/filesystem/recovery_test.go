@@ -1,11 +1,15 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -122,6 +126,74 @@ func TestServiceRecoverIntentsPagesPastCompletedMoveJobs(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Empty(t, jobs)
+}
+
+func TestServiceRecoverIntentsToleratesConcurrentJobClear(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	base := store.NewMVCCStore()
+	barrierStore := &concurrentRecoveryScanStore{
+		MVCCStore: base,
+		release:   make(chan struct{}),
+	}
+	svc, err := NewService(barrierStore, &testCoordinator{st: barrierStore})
+	require.NoError(t, err)
+	job := MoveJob{
+		ID:         []byte("concurrent"),
+		Inode:      102,
+		SourceHome: 10,
+		TargetHome: 20,
+		Phase:      MovePhaseSourceCleanup,
+		Cursor:     fskeys.ChunkPrefix(10, 102),
+	}
+	key := fskeys.MoveJobKey(job.ID)
+	elem, err := putElem(key, job)
+	require.NoError(t, err)
+	require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{key}))
+
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, recoverErr := svc.RecoverIntents(ctx, 1)
+			errs <- recoverErr
+		}()
+	}
+	for range 2 {
+		require.NoError(t, <-errs)
+	}
+}
+
+type concurrentRecoveryScanStore struct {
+	store.MVCCStore
+	mu      sync.Mutex
+	waiting int
+	release chan struct{}
+}
+
+func (s *concurrentRecoveryScanStore) ScanAt(
+	ctx context.Context,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([]*store.KVPair, error) {
+	pairs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if err != nil || len(pairs) == 0 || !bytes.Equal(start, fskeys.MoveJobAllPrefix()) {
+		return pairs, err
+	}
+	s.mu.Lock()
+	s.waiting++
+	if s.waiting == 2 {
+		close(s.release)
+	}
+	release := s.release
+	s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-release:
+		return pairs, nil
+	}
 }
 
 func assertIntentCount(t *testing.T, ctx context.Context, svc *Service, want int) {
