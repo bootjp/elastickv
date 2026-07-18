@@ -467,19 +467,21 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 			obs.RestoreSkipped(snapIndex, have)
 		}
 		if logger != nil {
-			// Two named gap fields so an operator correlating the
-			// log against the Prometheus gauge sees consistent
-			// magnitudes (claude #934 round 5):
+			gapAheadCommitted, gapBehindCommitted := coldStartCommittedGaps(target, have)
+			// Separate gap fields let operators correlate the log with
+			// the Prometheus gauge without unsigned underflow:
 			// - gap_ahead_snapshot mirrors monitoring.ColdStartObserver
 			//   (have - snapIndex), the metric baseline.
 			// - gap_ahead_committed measures how far past the WAL
 			//   committed tail (target) the FSM is.
+			// - gap_behind_committed measures the replay tail still pending.
 			logger.Info("restoreSnapshotState skipped",
 				zap.Uint64("fsm_applied", have),
 				zap.Uint64("snapshot_index", snapIndex),
 				zap.Uint64("last_committed_index", target),
 				zap.Uint64("gap_ahead_snapshot", have-snapIndex),
-				zap.Uint64("gap_ahead_committed", have-target),
+				zap.Uint64("gap_ahead_committed", gapAheadCommitted),
+				zap.Uint64("gap_behind_committed", gapBehindCommitted),
 			)
 		}
 	case coldStartExecute:
@@ -498,6 +500,13 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 			)
 		}
 	}
+}
+
+func coldStartCommittedGaps(target, have uint64) (ahead, behind uint64) {
+	if have >= target {
+		return have - target, 0
+	}
+	return 0, target - have
 }
 
 // applyHeaderStateOnSkip validates the snapshot envelope and full payload CRC,
