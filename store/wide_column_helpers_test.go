@@ -23,7 +23,7 @@ func TestWideColumnExtractorsRejectOverflowingUserKeyLength(t *testing.T) {
 		{name: "set delta", prefix: SetMetaDeltaPrefix, suffixLen: deltaKeyTSSize + deltaKeySeqSize, extract: ExtractSetUserKeyFromDelta},
 		{name: "zset meta", prefix: ZSetMetaPrefix, extract: ExtractZSetUserKeyFromMeta},
 		{name: "zset member", prefix: ZSetMemberPrefix, extract: ExtractZSetUserKeyFromMember},
-		{name: "zset score", prefix: ZSetScorePrefix, suffixLen: zsetMetaSizeBytes, extract: ExtractZSetUserKeyFromScore},
+		{name: "zset score", prefix: ZSetScorePrefix, suffixLen: zsetScalarSizeBytes, extract: ExtractZSetUserKeyFromScore},
 		{name: "zset delta", prefix: ZSetMetaDeltaPrefix, suffixLen: deltaKeyTSSize + deltaKeySeqSize, extract: ExtractZSetUserKeyFromDelta},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

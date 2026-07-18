@@ -595,12 +595,16 @@ The fan-out aggregator's per-cell merge key gains the label:
   encoded into `bucketID` so the aggregator already separates
   same-route different-label rows correctly.
 
-Reads still sum, writes still max-with-conflict; nothing about
-the merge **rules** changes other than the wire shape of
-`bucketID`. The merge **key** logic is unchanged: composite
-`bucketID` already separates same-route different-label rows
-correctly, so the aggregator's bucketing/grouping path needs no
-edits.
+Reads still sum. Writes inherit the implemented fan-out rule from
+`2026_04_27_implemented_keyviz_cluster_fanout.md` §4: when all
+non-zero contributors carry identity, writes are deduped by
+`(bucketID, raftGroupID, leaderTerm, windowStart)`, maxed within one
+identity, and summed across distinct leader terms for the same group
+and window. Missing identity falls back to the legacy max-with-conflict
+rule. Labels do not add another merge dimension beyond `bucketID`:
+the composite `bucketID` already separates same-route different-label
+rows correctly, so the aggregator's bucketing/grouping path needs no
+extra label-specific edit.
 
 The merge **value** path, however, still needs one explicit
 field copy: `mergeRowInto` (`internal/admin/keyviz_fanout.go:509`)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -12,6 +13,62 @@ import (
 // ---------------------------------------------------------------------------
 // ApplyMutations
 // ---------------------------------------------------------------------------
+
+func TestAppendEncodedKeyReusesBuffer(t *testing.T) {
+	var buf []byte
+	buf = appendEncodedKey(buf, []byte("alpha"), 10)
+	firstPtr := &buf[0]
+	firstCap := cap(buf)
+
+	buf = appendEncodedKey(buf, []byte("bravo"), 20)
+	require.Equal(t, firstPtr, &buf[0])
+	require.Equal(t, firstCap, cap(buf))
+
+	userKey, ts := decodeKeyView(buf)
+	require.Equal(t, []byte("bravo"), userKey)
+	require.EqualValues(t, 20, ts)
+}
+
+func TestAppendKeyUpperBoundReusesBuffer(t *testing.T) {
+	var buf []byte
+	buf = appendKeyUpperBound(buf, []byte("alpha"))
+	firstPtr := &buf[0]
+	firstCap := cap(buf)
+	require.Equal(t, []byte("alphb"), buf)
+
+	buf = appendKeyUpperBound(buf, []byte("bravo"))
+	require.Equal(t, firstPtr, &buf[0])
+	require.Equal(t, firstCap, cap(buf))
+	require.Equal(t, []byte("bravp"), buf)
+
+	buf = appendKeyUpperBound(buf, []byte{'a', 0xff})
+	require.Equal(t, []byte{'b'}, buf)
+
+	buf = appendKeyUpperBound(buf, []byte{0xff})
+	require.Nil(t, buf)
+}
+
+func TestConflictCheckLinearAdvanceLimitFor(t *testing.T) {
+	require.Equal(t, conflictCheckSmallLinearAdvanceLimit, conflictCheckLinearAdvanceLimitFor(conflictCheckLargeBatchThreshold-1))
+	require.Equal(t, conflictCheckLargeLinearAdvanceLimit, conflictCheckLinearAdvanceLimitFor(conflictCheckLargeBatchThreshold))
+}
+
+func TestPebbleStore_HasCommitsAfter(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer st.Close()
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok, "expected *pebbleStore, got %T", st)
+
+	ctx := context.Background()
+	require.False(t, ps.hasCommitsAfter(0))
+
+	require.NoError(t, ps.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+	require.True(t, ps.hasCommitsAfter(9))
+	require.False(t, ps.hasCommitsAfter(10))
+	require.False(t, ps.hasCommitsAfter(11))
+}
 
 func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
 	dir := t.TempDir()
@@ -126,6 +183,53 @@ func TestPebbleStore_ApplyMutations_WriteConflict(t *testing.T) {
 	val, err := s.GetAt(ctx, []byte("k1"), 25)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v1"), val)
+}
+
+func TestPebbleStore_ApplyMutations_BatchedConflictCheckPreservesInputOrder(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("z-conflict"), []byte("old-z"), 50, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("a-conflict"), []byte("old-a"), 50, 0))
+
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("z-conflict"), Value: []byte("new-z")},
+		{Op: OpTypePut, Key: []byte("middle"), Value: []byte("middle")},
+		{Op: OpTypePut, Key: []byte("a-conflict"), Value: []byte("new-a")},
+	}
+	err = s.ApplyMutations(ctx, mutations, nil, 10, 60)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrWriteConflict))
+
+	conflictKey, ok := WriteConflictKey(err)
+	require.True(t, ok)
+	assert.Equal(t, []byte("z-conflict"), conflictKey)
+}
+
+func TestPebbleStore_ApplyMutations_LargeBatchNoConflict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	const mutationCount = 4096
+	mutations := make([]*KVPairMutation, 0, mutationCount)
+	for i := mutationCount - 1; i >= 0; i-- {
+		mutations = append(mutations, &KVPairMutation{
+			Op:    OpTypePut,
+			Key:   []byte(fmt.Sprintf("batch-key-%04d", i)),
+			Value: []byte("value"),
+		})
+	}
+
+	require.NoError(t, s.ApplyMutations(ctx, mutations, nil, 10, 20))
+	val, err := s.GetAt(ctx, []byte("batch-key-0000"), 20)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("value"), val)
 }
 
 func TestPebbleStore_ApplyMutations_NoConflictWhenStartTSGECommit(t *testing.T) {
@@ -496,6 +600,33 @@ func TestPebbleStore_ApplyMutations_ReadConflict(t *testing.T) {
 	// k2 should NOT have been written.
 	_, err = s.GetAt(ctx, []byte("k2"), 30)
 	assert.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+func TestPebbleStore_ApplyMutations_ReadConflictPreservesInputOrder(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx := context.Background()
+	require.NoError(t, s.PutAt(ctx, []byte("z-read"), []byte("old-z"), 50, 0))
+	require.NoError(t, s.PutAt(ctx, []byte("a-read"), []byte("old-a"), 50, 0))
+
+	mutations := []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("new-key"), Value: []byte("value")},
+	}
+	readKeys := [][]byte{
+		[]byte("z-read"),
+		[]byte("middle-read"),
+		[]byte("a-read"),
+	}
+	err = s.ApplyMutations(ctx, mutations, readKeys, 10, 60)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrWriteConflict))
+
+	conflictKey, ok := WriteConflictKey(err)
+	require.True(t, ok)
+	assert.Equal(t, []byte("z-read"), conflictKey)
 }
 
 func TestPebbleStore_ApplyMutations_ReadConflict_NoConflictWhenReadKeyUnchanged(t *testing.T) {

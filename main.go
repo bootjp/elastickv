@@ -53,9 +53,6 @@ const (
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
-
-	lockResolverEnabledEnv = "ELASTICKV_LOCK_RESOLVER_ENABLED"
-	fsmCompactorEnabledEnv = "ELASTICKV_FSM_COMPACTOR_ENABLED"
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -86,18 +83,6 @@ func durationToTicks(timeout time.Duration, tick time.Duration, min int) int {
 		return min
 	}
 	return ticks
-}
-
-func optionalBoolEnv(name string, def bool) bool {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.ParseBool(raw)
-	if err != nil {
-		return def
-	}
-	return v
 }
 
 var (
@@ -285,6 +270,11 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 // warning and fall through to the default.
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
+const (
+	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+)
+
 const bytesPerMiB = 1024 * 1024
 
 func main() {
@@ -350,6 +340,45 @@ func memwatchConfigFromEnv() (memwatch.Config, bool) {
 		}
 	}
 	return cfg, true
+}
+
+func enabledEnv(name string) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("invalid "+name+"; using default",
+			"value", raw,
+			"default", true,
+		)
+		return true
+	}
+	return enabled
+}
+
+func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) {
+	if enabledEnv(lockResolverEnabledEnvVar) {
+		lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
+		cleanup.Add(func() { lockResolver.Close() })
+		return
+	}
+	slog.Info("background lock resolver disabled", "env", lockResolverEnabledEnvVar)
+}
+
+func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
+	if enabledEnv(fsmCompactorEnabledEnvVar) {
+		compactor := kv.NewFSMCompactor(
+			fsmCompactionRuntimes(runtimes),
+			kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+		)
+		eg.Go(func() error {
+			return compactor.Run(ctx)
+		})
+		return
+	}
+	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
 func run() error {
@@ -2142,27 +2171,6 @@ func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.Writ
 		})
 	}
 	return out
-}
-
-func startLockResolverIfEnabled(ss *kv.ShardStore, groups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) {
-	if !optionalBoolEnv(lockResolverEnabledEnv, true) {
-		return
-	}
-	lockResolver := kv.NewLockResolver(ss, groups, nil)
-	cleanup.Add(func() { lockResolver.Close() })
-}
-
-func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
-	if !optionalBoolEnv(fsmCompactorEnabledEnv, true) {
-		return
-	}
-	compactor := kv.NewFSMCompactor(
-		fsmCompactionRuntimes(runtimes),
-		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
-	)
-	eg.Go(func() error {
-		return compactor.Run(ctx)
-	})
 }
 
 func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime {

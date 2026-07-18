@@ -2367,19 +2367,19 @@ func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
 		},
 	})
 	cfg := rawNodeTestConfig()
-	cfg.StateMachine = &volatileTagFakeFSM{}
+	fsm := &volatileTagFakeFSM{}
+	cfg.StateMachine = fsm
 
 	rawApplied, err := rawNodeAppliedForOpen(storage, 150, cfg)
 	require.NoError(t, err)
-	require.Equal(t, uint64(124), rawApplied,
-		"RawNode must still deliver volatile duplicate entries for in-memory replay")
+	require.Equal(t, uint64(150), rawApplied,
+		"volatile duplicate entries should replay without forcing RawNode to redeliver the committed tail")
+	require.Equal(t, int32(1), fsm.calls.Load())
+	require.Equal(t, []byte{0x02, 0xaa}, fsm.lastPayload)
 
 	rawNode, err := newRawNode(cfg, storage, rawApplied)
 	require.NoError(t, err)
-	require.True(t, rawNode.HasReady())
-	ready := rawNode.Ready()
-	require.NotEmpty(t, ready.CommittedEntries)
-	require.Equal(t, uint64(125), ready.CommittedEntries[0].GetIndex())
+	require.False(t, rawNode.HasReady())
 }
 
 func TestRawNodeAppliedForOpenPreservesConfChangeReplay(t *testing.T) {
@@ -2395,6 +2395,20 @@ func TestRawNodeAppliedForOpenPreservesConfChangeReplay(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(129), rawApplied,
 		"RawNode must deliver committed config changes so ApplyConfChange rebuilds membership")
+}
+
+func TestPreVoteEnabledFromEnv(t *testing.T) {
+	t.Setenv(preVoteEnvVar, "")
+	require.True(t, preVoteEnabledFromEnv())
+
+	t.Setenv(preVoteEnvVar, "false")
+	require.False(t, preVoteEnabledFromEnv())
+
+	t.Setenv(preVoteEnvVar, "true")
+	require.True(t, preVoteEnabledFromEnv())
+
+	t.Setenv(preVoteEnvVar, "not-bool")
+	require.True(t, preVoteEnabledFromEnv())
 }
 
 // TestErrNotLeaderMatchesRaftEngineSentinel pins the invariant that the
