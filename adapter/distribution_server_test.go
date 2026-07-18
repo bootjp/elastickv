@@ -875,6 +875,40 @@ func TestDistributionServerCompleteSplitJobTargetPromotion_RetryAfterCommitIsIde
 	require.Equal(t, 1, coordinator.dispatchCalls)
 }
 
+func TestDistributionServerCompleteSplitJobTargetPromotion_PersistsLegacyTerminalTime(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	routes := promotionCompleteDistributionRoutes()
+	routes[1].StagedVisibilityActive = false
+	routes[1].MigrationJobID = 0
+	saved, err := catalog.Save(ctx, 0, routes)
+	require.NoError(t, err)
+	expected := promotionCompleteDistributionJob()
+	legacy := distribution.CloneSplitJob(expected)
+	legacy.Phase = distribution.SplitJobPhaseDone
+	legacy.TargetPromotionDone = true
+	legacy.PromotionCompletedTS = saved.ReadTS + 1
+	require.NoError(t, catalog.CreateSplitJob(ctx, legacy))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+
+	snapshot, completed, err := s.completeSplitJobTargetPromotionViaCoordinator(ctx, saved.Version, expected, 3000)
+	require.NoError(t, err)
+	require.Equal(t, saved.Version+1, snapshot.Version)
+	require.Equal(t, int64(3000), completed.TerminalAtMs)
+	require.Equal(t, int64(3000), completed.UpdatedAtMs)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	loaded, found, err := catalog.SplitJob(ctx, legacy.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, completed, loaded)
+}
+
 func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T) {
 	t.Parallel()
 

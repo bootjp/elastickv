@@ -1028,7 +1028,7 @@ func (s *DistributionServer) completeSplitJobTargetPromotionViaCoordinator(
 	if alreadyDone {
 		return snapshot, current, nil
 	}
-	completion, err := distribution.CompleteTargetPromotionState(expected, snapshot.Routes, nowMs)
+	completion, err := distribution.CompleteTargetPromotionState(current, snapshot.Routes, nowMs)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobPromotionStatusError(err)
 	}
@@ -1065,12 +1065,12 @@ func (s *DistributionServer) loadPromotionCompletionCandidate(
 	if snapshot.Version == expectedVersion && distribution.SplitJobsEquivalent(current, expected) {
 		return snapshot, current, false, nil
 	}
-	job, err := completedPromotionRetryJob(snapshot.Routes, expected, current, nowMs)
+	completion, err := completedPromotionRetry(snapshot.Routes, expected, current, nowMs)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(err)
 	}
-	if job.TargetPromotionDone {
-		return snapshot, job, true, nil
+	if completion.Job.TargetPromotionDone {
+		return snapshot, current, !completion.Changed, nil
 	}
 	if snapshot.Version != expectedVersion {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(distribution.ErrCatalogVersionMismatch)
@@ -1078,24 +1078,24 @@ func (s *DistributionServer) loadPromotionCompletionCandidate(
 	return distribution.CatalogSnapshot{}, distribution.SplitJob{}, false, splitJobPromotionStatusError(distribution.ErrCatalogSplitJobConflict)
 }
 
-func completedPromotionRetryJob(
+func completedPromotionRetry(
 	routes []distribution.RouteDescriptor,
 	expected distribution.SplitJob,
 	current distribution.SplitJob,
 	nowMs int64,
-) (distribution.SplitJob, error) {
+) (distribution.TargetPromotionCompletion, error) {
 	matches, err := splitJobPromotionMatchesExpected(expected, current)
 	if err != nil {
-		return distribution.SplitJob{}, errors.WithStack(err)
+		return distribution.TargetPromotionCompletion{}, errors.WithStack(err)
 	}
 	if !matches {
-		return distribution.SplitJob{}, nil
+		return distribution.TargetPromotionCompletion{}, nil
 	}
 	completion, err := distribution.CompleteTargetPromotionState(current, routes, nowMs)
 	if err != nil {
-		return distribution.SplitJob{}, errors.WithStack(err)
+		return distribution.TargetPromotionCompletion{}, errors.WithStack(err)
 	}
-	return completion.Job, nil
+	return completion, nil
 }
 
 func (s *DistributionServer) dispatchPromotionCompletion(
