@@ -26,6 +26,7 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	proto "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -90,6 +91,13 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	}
 	if icept.s3BlobFetchEnabled {
 		t.Fatal("insecure admin mode must not expose S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("insecure admin mode must not advertise S3 blob offload capability")
 	}
 }
 
