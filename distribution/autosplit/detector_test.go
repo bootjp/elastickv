@@ -205,6 +205,39 @@ func TestNonActiveRouteAdvancesSkippedBufferedColumns(t *testing.T) {
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 }
 
+func TestApplyRouteStateAdvancesProcessedWatermark(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(250, 0)
+	state := NewDetectorState()
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+
+	first := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{hotWindow(at)},
+		Now:     at,
+	})
+	require.Empty(t, first.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+
+	state.ApplyRouteState(1, distribution.RouteStateMigratingSource, at.Add(time.Minute))
+	require.Equal(t, 0, state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, at.Add(time.Minute), state.RouteStatus(1).LastProcessedAt)
+
+	result := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(time.Minute)),
+			hotWindow(at.Add(2 * time.Minute)),
+		},
+		Now: at.Add(2 * time.Minute),
+	})
+
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+}
+
 func TestConsecutiveWindowsPromoteAndBelowThresholdResets(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(300, 0)

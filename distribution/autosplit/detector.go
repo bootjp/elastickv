@@ -159,14 +159,11 @@ func (s *DetectorState) ResetConfidence(routeID uint64) {
 
 // ApplyRouteState applies a catalog state transition to the detector state.
 //
-// Non-active route states clear confidence but preserve any cooldown deadline.
-func (s *DetectorState) ApplyRouteState(routeID uint64, state distribution.RouteState) {
-	s.applyRouteStateThrough(routeID, state, time.Time{})
-}
-
-func (s *DetectorState) applyRouteStateThrough(routeID uint64, state distribution.RouteState, through time.Time) {
+// Non-active route states clear confidence and advance the processed watermark
+// through the newest committed column the caller intentionally skipped.
+func (s *DetectorState) ApplyRouteState(routeID uint64, state distribution.RouteState, processedThrough time.Time) {
 	if state != distribution.RouteStateActive {
-		s.resetConfidenceThrough(routeID, through)
+		s.resetConfidenceThrough(routeID, processedThrough)
 	}
 }
 
@@ -236,7 +233,7 @@ func prepareRoutes(
 	for _, route := range routes {
 		live[route.RouteID] = route
 		if route.State != distribution.RouteStateActive {
-			state.applyRouteStateThrough(route.RouteID, route.State, processedThrough)
+			state.ApplyRouteState(route.RouteID, route.State, processedThrough)
 			result.Events = append(result.Events, Event{RouteID: route.RouteID, Reason: SkipReasonNonActiveState})
 			continue
 		}
