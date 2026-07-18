@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
@@ -10,6 +11,8 @@ import (
 const redisInternalRoutePrefix = "!redis|"
 
 var redisInternalRoutePrefixBytes = []byte(redisInternalRoutePrefix)
+
+const wideColumnEncodedKeyLengthSize = 4
 
 const (
 	dynamoRoutePrefix = "!ddb|route|table|"
@@ -90,6 +93,41 @@ func redisWideColumnRouteKey(key []byte) []byte {
 		return user
 	}
 	return redisZSetRouteKey(key)
+}
+
+func redisWideColumnScanRouteKey(key []byte) []byte {
+	for _, prefix := range [][]byte{
+		[]byte(store.HashMetaDeltaPrefix),
+		[]byte(store.HashMetaPrefix),
+		[]byte(store.HashFieldPrefix),
+		[]byte(store.SetMetaDeltaPrefix),
+		[]byte(store.SetMetaPrefix),
+		[]byte(store.SetMemberPrefix),
+		[]byte(store.ZSetMetaDeltaPrefix),
+		[]byte(store.ZSetMetaPrefix),
+		[]byte(store.ZSetMemberPrefix),
+		[]byte(store.ZSetScorePrefix),
+	} {
+		if user := wideColumnScanUserKey(key, prefix); user != nil {
+			return user
+		}
+	}
+	return nil
+}
+
+func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	rest := key[len(prefix):]
+	if len(rest) < wideColumnEncodedKeyLengthSize {
+		return nil
+	}
+	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
+	if uint64(keyLen) > uint64(len(rest)-wideColumnEncodedKeyLengthSize) { //nolint:gosec // non-negative slice length fits uint64.
+		return nil
+	}
+	return rest[wideColumnEncodedKeyLengthSize : uint32(wideColumnEncodedKeyLengthSize)+keyLen]
 }
 
 func redisHashRouteKey(key []byte) []byte {

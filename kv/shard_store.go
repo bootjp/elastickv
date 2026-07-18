@@ -247,7 +247,7 @@ func tryEngineLinearizableFence(ctx context.Context, engine raftengine.LeaderVie
 // multiple shards are best-effort because each shard may have a different Raft
 // apply position.
 func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	return s.scanAtWithReadFence(ctx, start, end, limit, ts, 0, 0, nil, nil)
+	return s.scanAtWithReadFence(ctx, start, end, limit, ts, 0, s.ReadRouteVersion(), nil, nil)
 }
 
 func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
@@ -345,7 +345,7 @@ func (s *ShardStore) ScanGroupKeysAt(ctx context.Context, groupID uint64, start 
 }
 
 func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, 0, nil, nil)
+	return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, s.ReadRouteVersion(), nil, nil)
 }
 
 func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
@@ -383,6 +383,13 @@ func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Rou
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
 	if userKey := store.ExtractListUserKey(start); userKey != nil {
+		route, ok := s.engine.GetRoute(userKey)
+		if !ok {
+			return []distribution.Route{}, false
+		}
+		return []distribution.Route{route}, false
+	}
+	if userKey := redisWideColumnScanRouteKey(start); userKey != nil {
 		route, ok := s.engine.GetRoute(userKey)
 		if !ok {
 			return []distribution.Route{}, false

@@ -212,6 +212,14 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
 	fake.mu.Unlock()
 
+	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 11)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(0), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	fake.mu.Unlock()
+
 	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 80, []byte{}, []byte{})
 	require.NoError(t, err)
 
@@ -229,6 +237,74 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.Equal(t, uint64(0), fake.lastScanReq.GetGroupId())
 	require.Equal(t, uint64(81), fake.lastScanReq.GetReadRouteVersion())
 	require.False(t, fake.lastScanReq.GetRouteBoundsPresent())
+}
+
+func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, nil)
+	userKey := []byte("z-user")
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+	}{
+		{name: "hash fields", prefix: store.HashFieldScanPrefix(userKey)},
+		{name: "hash deltas", prefix: store.HashMetaDeltaScanPrefix(userKey)},
+		{name: "set members", prefix: store.SetMemberScanPrefix(userKey)},
+		{name: "set deltas", prefix: store.SetMetaDeltaScanPrefix(userKey)},
+		{name: "zset members", prefix: store.ZSetMemberScanPrefix(userKey)},
+		{name: "zset scores", prefix: store.ZSetScoreScanPrefix(userKey)},
+		{name: "zset deltas", prefix: store.ZSetMetaDeltaScanPrefix(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routes, clamp := st.routesForScan(tc.prefix, prefixScanEnd(tc.prefix))
+			require.False(t, clamp)
+			require.Len(t, routes, 1)
+			require.Equal(t, uint64(2), routes[0].GroupID)
+		})
+	}
+}
+
+func TestShardStoreScanAtRoutesWideColumnPrefixesByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	userKey := []byte("z-user")
+
+	for _, tc := range []struct {
+		name   string
+		key    []byte
+		prefix []byte
+	}{
+		{name: "hash field", key: store.HashFieldKey(userKey, []byte("field")), prefix: store.HashFieldScanPrefix(userKey)},
+		{name: "hash delta", key: store.HashMetaDeltaKey(userKey, 10, 1), prefix: store.HashMetaDeltaScanPrefix(userKey)},
+		{name: "set member", key: store.SetMemberKey(userKey, []byte("member")), prefix: store.SetMemberScanPrefix(userKey)},
+		{name: "set delta", key: store.SetMetaDeltaKey(userKey, 11, 1), prefix: store.SetMetaDeltaScanPrefix(userKey)},
+		{name: "zset member", key: store.ZSetMemberKey(userKey, []byte("member")), prefix: store.ZSetMemberScanPrefix(userKey)},
+		{name: "zset score", key: store.ZSetScoreKey(userKey, 1.5, []byte("member")), prefix: store.ZSetScoreScanPrefix(userKey)},
+		{name: "zset delta", key: store.ZSetMetaDeltaKey(userKey, 12, 1), prefix: store.ZSetMetaDeltaScanPrefix(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, st.PutAt(ctx, tc.key, []byte("value"), 20, 0))
+			kvs, err := st.ScanAt(ctx, tc.prefix, prefixScanEnd(tc.prefix), 10, 20)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: tc.key, Value: []byte("value")}}, kvs)
+			_, err = groups[1].Store.GetAt(ctx, tc.key, 20)
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
 }
 
 func TestShardStoreReadFenceFailsClosedWhileCatalogVersionIsBehind(t *testing.T) {
