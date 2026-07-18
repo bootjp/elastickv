@@ -86,6 +86,8 @@ func (s *LeaderRoutedStore) proxyRawGetWithReadFence(ctx context.Context, key []
 	}
 
 	cli := pb.NewRawKVClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, ReadRouteVersion: readRouteVersion})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -129,6 +131,8 @@ func (s *LeaderRoutedStore) proxyRawLatestCommitTSWithReadFence(ctx context.Cont
 	}
 
 	cli := pb.NewRawKVClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	resp, err := cli.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: key, ReadRouteVersion: readRouteVersion})
 	if err != nil {
 		return 0, false, errors.WithStack(err)
@@ -180,6 +184,8 @@ func (s *LeaderRoutedStore) proxyRawScanAtWithReadFence(
 	}
 
 	cli := pb.NewRawKVClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
 		StartKey:           start,
 		EndKey:             end,
@@ -224,6 +230,8 @@ func (s *LeaderRoutedStore) proxyRawScanKeysAtWithReadFence(
 	}
 
 	cli := pb.NewRawKVClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
 		StartKey:         start,
 		EndKey:           end,
