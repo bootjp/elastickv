@@ -14,6 +14,7 @@ const (
 	defaultReadWeight        = 1
 	defaultThresholdOpsMin   = 50_000
 	defaultCandidateWindows  = 3
+	defaultMaxRoutes         = 1024
 	defaultMaxSplitsPerCycle = 1
 	opsPerMinute             = 60
 )
@@ -57,6 +58,7 @@ func DefaultConfig() Config {
 		ReadWeight:        defaultReadWeight,
 		ThresholdOpsMin:   defaultThresholdOpsMin,
 		CandidateWindows:  defaultCandidateWindows,
+		MaxRoutes:         defaultMaxRoutes,
 		MaxSplitsPerCycle: defaultMaxSplitsPerCycle,
 	}
 }
@@ -159,8 +161,12 @@ func (s *DetectorState) ResetConfidence(routeID uint64) {
 //
 // Non-active route states clear confidence but preserve any cooldown deadline.
 func (s *DetectorState) ApplyRouteState(routeID uint64, state distribution.RouteState) {
+	s.applyRouteStateThrough(routeID, state, time.Time{})
+}
+
+func (s *DetectorState) applyRouteStateThrough(routeID uint64, state distribution.RouteState, through time.Time) {
 	if state != distribution.RouteStateActive {
-		s.ResetConfidence(routeID)
+		s.resetConfidenceThrough(routeID, through)
 	}
 }
 
@@ -203,14 +209,14 @@ func Evaluate(cfg Config, state *DetectorState, in Input) Result {
 		state.ensure()
 	}
 
-	live, active, result := prepareRoutes(state, in.Routes)
-	state.gc(live)
-
 	latestHot := map[uint64]candidate{}
 	windows := append([]ColumnWindow(nil), in.Windows...)
 	sort.SliceStable(windows, func(i, j int) bool {
 		return windows[i].Column.At.Before(windows[j].Column.At)
 	})
+	live, active, result := prepareRoutes(state, in.Routes, newestWindowAt(windows))
+	state.gc(live)
+
 	for _, window := range windows {
 		processWindow(cfg, state, active, window, in.Now, latestHot, &result)
 	}
@@ -222,6 +228,7 @@ func Evaluate(cfg Config, state *DetectorState, in Input) Result {
 func prepareRoutes(
 	state *DetectorState,
 	routes []distribution.RouteDescriptor,
+	processedThrough time.Time,
 ) (map[uint64]distribution.RouteDescriptor, []distribution.RouteDescriptor, Result) {
 	live := make(map[uint64]distribution.RouteDescriptor, len(routes))
 	active := make([]distribution.RouteDescriptor, 0, len(routes))
@@ -229,13 +236,20 @@ func prepareRoutes(
 	for _, route := range routes {
 		live[route.RouteID] = route
 		if route.State != distribution.RouteStateActive {
-			state.ApplyRouteState(route.RouteID, route.State)
+			state.applyRouteStateThrough(route.RouteID, route.State, processedThrough)
 			result.Events = append(result.Events, Event{RouteID: route.RouteID, Reason: SkipReasonNonActiveState})
 			continue
 		}
 		active = append(active, route)
 	}
 	return live, active, result
+}
+
+func newestWindowAt(windows []ColumnWindow) time.Time {
+	if len(windows) == 0 {
+		return time.Time{}
+	}
+	return windows[len(windows)-1].Column.At
 }
 
 func processWindow(
@@ -250,8 +264,9 @@ func processWindow(
 	if window.Duration <= 0 {
 		result.Events = append(result.Events, Event{Reason: SkipReasonInvalidWindow, At: window.Column.At})
 		for _, route := range active {
-			state.resetConfidenceAt(route.RouteID, window.Column.At)
-			delete(latestHot, route.RouteID)
+			if state.resetConfidenceAt(route.RouteID, window.Column.At) {
+				delete(latestHot, route.RouteID)
+			}
 		}
 		return
 	}
@@ -376,17 +391,32 @@ func (s *DetectorState) ensure() {
 	}
 }
 
-func (s *DetectorState) resetConfidenceAt(routeID uint64, at time.Time) {
+func (s *DetectorState) resetConfidenceThrough(routeID uint64, through time.Time) {
 	if s == nil {
 		return
 	}
 	s.ensure()
 	status := s.routes[routeID]
 	status.ConsecutiveOver = 0
-	if at.After(status.LastProcessedAt) {
-		status.LastProcessedAt = at
+	if through.After(status.LastProcessedAt) {
+		status.LastProcessedAt = through
 	}
 	s.routes[routeID] = status
+}
+
+func (s *DetectorState) resetConfidenceAt(routeID uint64, at time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.ensure()
+	status := s.routes[routeID]
+	if !at.After(status.LastProcessedAt) {
+		return false
+	}
+	status.ConsecutiveOver = 0
+	status.LastProcessedAt = at
+	s.routes[routeID] = status
+	return true
 }
 
 func (s *DetectorState) gc(live map[uint64]distribution.RouteDescriptor) {
@@ -408,6 +438,9 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.CandidateWindows <= 0 {
 		cfg.CandidateWindows = defaults.CandidateWindows
+	}
+	if cfg.MaxRoutes <= 0 {
+		cfg.MaxRoutes = defaults.MaxRoutes
 	}
 	if cfg.MaxSplitsPerCycle <= 0 {
 		cfg.MaxSplitsPerCycle = defaults.MaxSplitsPerCycle

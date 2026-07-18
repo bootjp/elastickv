@@ -165,6 +165,46 @@ func TestNonActiveRouteResetsConfidence(t *testing.T) {
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 }
 
+func TestNonActiveRouteAdvancesSkippedBufferedColumns(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(225, 0)
+	state := NewDetectorState()
+	active := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 2
+
+	first := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{active},
+		Windows: []ColumnWindow{hotWindow(at)},
+		Now:     at,
+	})
+	require.Empty(t, first.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+
+	migrating := active
+	migrating.State = distribution.RouteStateMigratingSource
+	skipped := Evaluate(cfg, state, Input{
+		Routes:  []distribution.RouteDescriptor{migrating},
+		Windows: []ColumnWindow{hotWindow(at.Add(time.Minute))},
+		Now:     at.Add(time.Minute),
+	})
+	require.Empty(t, skipped.Decisions)
+	require.Equal(t, 0, state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, at.Add(time.Minute), state.RouteStatus(1).LastProcessedAt)
+	requireEvent(t, skipped.Events, 1, SkipReasonNonActiveState)
+
+	replayed := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{active},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(time.Minute)),
+			hotWindow(at.Add(2 * time.Minute)),
+		},
+		Now: at.Add(2 * time.Minute),
+	})
+	require.Empty(t, replayed.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+}
+
 func TestConsecutiveWindowsPromoteAndBelowThresholdResets(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(300, 0)
@@ -227,6 +267,42 @@ func TestDuplicateColumnsAreSkippedAcrossEvaluations(t *testing.T) {
 	})
 	require.Len(t, next.Decisions, 1)
 	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+}
+
+func TestStaleInvalidWindowDoesNotResetConfidence(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(330, 0)
+	state := NewDetectorState()
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.CandidateWindows = 3
+
+	warmup := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at),
+			hotWindow(at.Add(time.Minute)),
+		},
+		Now: at.Add(time.Minute),
+	})
+	require.Empty(t, warmup.Decisions)
+	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+
+	result := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			testWindow(at, 0,
+				testRow(1, 1, 0, 2, "a", "m", 100, 0),
+				testRow(1, 1, 1, 2, "m", "z", 100, 0),
+			),
+			hotWindow(at.Add(2 * time.Minute)),
+		},
+		Now: at.Add(2 * time.Minute),
+	})
+
+	require.Len(t, result.Decisions, 1)
+	require.Equal(t, 3, state.RouteStatus(1).ConsecutiveOver)
+	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
 }
 
 func TestBufferedColdColumnAfterHotRunSuppressesDecision(t *testing.T) {
@@ -356,6 +432,32 @@ func TestRouteCapUsesCycleLocalReservation(t *testing.T) {
 	require.Len(t, result.Decisions, 1)
 	require.Equal(t, uint64(1), result.Decisions[0].RouteID)
 	requireEvent(t, result.Events, 2, SkipReasonRouteCap)
+}
+
+func TestDefaultConfigSetsRouteCap(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, defaultMaxRoutes, DefaultConfig().MaxRoutes)
+}
+
+func TestZeroMaxRoutesUsesDefaultRouteCap(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(550, 0)
+	routes := make([]distribution.RouteDescriptor, 0, defaultMaxRoutes)
+	for routeID := uint64(1); routeID <= defaultMaxRoutes; routeID++ {
+		routes = append(routes, testRoute(routeID, 1, "a", "z"))
+	}
+	cfg := testConfig()
+	cfg.MaxRoutes = 0
+
+	result := Evaluate(cfg, NewDetectorState(), Input{
+		Routes:  routes,
+		Windows: []ColumnWindow{hotWindow(at)},
+		Now:     at,
+	})
+
+	require.Empty(t, result.Decisions)
+	requireEvent(t, result.Events, 1, SkipReasonRouteCap)
 }
 
 func TestMaxSplitsPerCycleBudget(t *testing.T) {
