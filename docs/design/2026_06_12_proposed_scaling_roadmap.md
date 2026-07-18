@@ -1,8 +1,14 @@
 # Scaling roadmap — multi-region, route scale-out, storage tier, coordinator
 
-**Status:** Proposed (no implementation yet).
+**Status:** Proposed. Superseded by `2026_06_23_proposed_scaling_roadmap.md`.
 **Author:** bootjp
 **Date:** 2026-06-12
+
+> This document is retained as the original sequencing and SLO record. It is
+> not an implementation specification and must not be used as the scope for a
+> combined implementation PR. The 2026-06-23 roadmap audits the current
+> implementation, closes completed prerequisites, and tracks the remaining
+> work as separate design documents and milestone PRs.
 
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
