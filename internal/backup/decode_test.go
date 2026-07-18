@@ -2,10 +2,13 @@ package backup
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/bootjp/elastickv/internal/s3keys"
 )
 
 // TestDecodeSnapshot_RejectsEmptyOutRoot pins that DecodeOptions
@@ -98,6 +101,51 @@ func TestDecodeSnapshot_RoutesRedisString(t *testing.T) {
 	wantPath := filepath.Join(root, "redis", "db_0", "strings", "greeting.bin")
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("stat %s: %v", wantPath, err)
+	}
+}
+
+func TestDecodeSnapshot_RoutesS3OffloadRecords(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	b := newSnapBuilder(1)
+	body := []byte("offloaded")
+	digest := sha256.Sum256(body)
+	ref, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: digest,
+		Size:          uint64(len(body)),
+		SourcePeer:    "n1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
+			{"part_no": 1, "chunk_count": 1, "offloaded": true},
+		},
+	})
+	b.WriteEntry(s3keys.BucketMetaKey("b"), 1, encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": "b", "generation": 1,
+	}), false, 0, snapshotEncStateCleartx)
+	b.WriteEntry(s3keys.ChunkBlobKey(digest), 1, body, false, 0, snapshotEncStateCleartx)
+	b.WriteEntry(s3keys.ChunkRefKey("b", 1, "o", "u", 1, 0), 1, ref, false, 0, snapshotEncStateCleartx)
+	b.WriteEntry(s3keys.ObjectManifestKey("b", 1, "o"), 1, manifest, false, 0, snapshotEncStateCleartx)
+
+	result, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:  root,
+		Adapters: AdapterSet{S3: true},
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if result.Counters.S3 != 4 {
+		t.Fatalf("Counters.S3 = %d, want 4", result.Counters.S3)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "s3", "b", "o")) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
 	}
 }
 

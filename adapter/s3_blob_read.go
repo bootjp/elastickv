@@ -215,34 +215,42 @@ func writeTimeS3BlobReplicas(peers []s3keys.ChunkRefPeer) []S3BlobReplica {
 
 func orderedS3BlobPeers(writeReplicas []S3BlobReplica, currentReplicas []S3BlobReplica, selfNodeID, sourcePeer string) []S3BlobReplica {
 	peers := make([]S3BlobReplica, 0, len(writeReplicas)+len(currentReplicas))
+	sources := make([]S3BlobReplica, 0)
 	seen := make(map[string]struct{}, len(writeReplicas)+len(currentReplicas))
-	var source *S3BlobReplica
-	replicas := make([]S3BlobReplica, 0, len(writeReplicas)+len(currentReplicas))
-	replicas = append(replicas, writeReplicas...)
-	replicas = append(replicas, currentReplicas...)
-	for _, replica := range replicas {
-		if replica.NodeID == selfNodeID {
-			continue
-		}
-		identity := replica.NodeID + "\x00" + replica.Address
-		if _, duplicate := seen[identity]; duplicate {
-			continue
-		}
-		seen[identity] = struct{}{}
+	for _, replica := range currentReplicas {
 		if replica.NodeID == sourcePeer {
-			if source == nil {
-				copyReplica := replica
-				source = &copyReplica
-			}
-			continue
+			sources = appendUniqueS3BlobPeer(sources, seen, replica, selfNodeID)
 		}
-		peers = append(peers, replica)
+	}
+	for _, replica := range writeReplicas {
+		if replica.NodeID == sourcePeer {
+			sources = appendUniqueS3BlobPeer(sources, seen, replica, selfNodeID)
+		}
+	}
+	for _, replica := range writeReplicas {
+		if replica.NodeID != sourcePeer {
+			peers = appendUniqueS3BlobPeer(peers, seen, replica, selfNodeID)
+		}
+	}
+	for _, replica := range currentReplicas {
+		if replica.NodeID != sourcePeer {
+			peers = appendUniqueS3BlobPeer(peers, seen, replica, selfNodeID)
+		}
 	}
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-	if source != nil {
-		peers = append([]S3BlobReplica{*source}, peers...)
+	return append(sources, peers...)
+}
+
+func appendUniqueS3BlobPeer(dst []S3BlobReplica, seen map[string]struct{}, replica S3BlobReplica, selfNodeID string) []S3BlobReplica {
+	if replica.NodeID == selfNodeID || replica.NodeID == "" || replica.Address == "" {
+		return dst
 	}
-	return peers
+	identity := replica.NodeID + "\x00" + replica.Address
+	if _, duplicate := seen[identity]; duplicate {
+		return dst
+	}
+	seen[identity] = struct{}{}
+	return append(dst, replica)
 }
 
 func (s *S3Server) fetchS3ChunkBlobFromPeers(

@@ -230,6 +230,28 @@ func TestS3BlobFetchUsesWriteTimeReplicaAfterMembershipChange(t *testing.T) {
 	require.Equal(t, payload, got)
 }
 
+func TestOrderedS3BlobPeersTriesCurrentSourceAddressBeforeWriteTimeAddress(t *testing.T) {
+	t.Parallel()
+
+	writeReplicas := []S3BlobReplica{
+		{NodeID: "n1", Address: "old-n1:50051"},
+		{NodeID: "n2", Address: "n2:50051"},
+	}
+	currentReplicas := []S3BlobReplica{
+		{NodeID: "n1", Address: "new-n1:50051"},
+		{NodeID: "n3", Address: "n3:50051"},
+	}
+
+	got := orderedS3BlobPeers(writeReplicas, currentReplicas, "n4", "n1")
+	require.Len(t, got, 4)
+	require.Equal(t, S3BlobReplica{NodeID: "n1", Address: "new-n1:50051"}, got[0])
+	require.Equal(t, S3BlobReplica{NodeID: "n1", Address: "old-n1:50051"}, got[1])
+	require.ElementsMatch(t, []S3BlobReplica{
+		{NodeID: "n2", Address: "n2:50051"},
+		{NodeID: "n3", Address: "n3:50051"},
+	}, got[2:])
+}
+
 func TestS3BlobReadUsesManifestChunkRefVersion(t *testing.T) {
 	t.Parallel()
 

@@ -1,9 +1,12 @@
 package backup
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +27,8 @@ const (
 	S3UploadMetaPrefix     = s3keys.UploadMetaPrefix
 	S3UploadPartPrefix     = s3keys.UploadPartPrefix
 	S3BlobPrefix           = s3keys.BlobPrefix
+	S3ChunkRefPrefix       = s3keys.ChunkRefPrefix
+	S3ChunkBlobPrefix      = s3keys.ChunkBlobPrefix
 	S3GCUploadPrefix       = s3keys.GCUploadPrefix
 	S3RoutePrefix          = s3keys.RoutePrefix
 )
@@ -55,6 +60,12 @@ var (
 	// Without this guard a partial / racy snapshot would silently
 	// emit a truncated body. Codex P1 #729.
 	ErrS3IncompleteBlobChunks = errors.New("backup: incomplete blob chunks for manifest-declared part")
+	// ErrS3InvalidChunkRef is returned when a !s3|chunkref| value cannot
+	// be decoded or disagrees with its content-addressed chunkblob.
+	ErrS3InvalidChunkRef = errors.New("backup: invalid S3 chunk reference")
+	// ErrS3ChunkBlobHashMismatch is returned when a !s3|chunkblob| value
+	// does not hash to the digest encoded in its key.
+	ErrS3ChunkBlobHashMismatch = errors.New("backup: S3 chunkblob hash mismatch")
 )
 
 // verifyChunkCompleteness checks every (partNo, partVersion) entry in
@@ -79,7 +90,7 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 	}
 	got := make(map[s3PartKey]map[uint64]struct{}, len(declaredParts))
 	for _, k := range chunks {
-		pk := s3PartKey{partNo: k.partNo, partVersion: k.partVersion}
+		pk := s3PartKey{partNo: k.partNo, partVersion: k.partVersion, offloaded: k.offloaded}
 		if got[pk] == nil {
 			got[pk] = make(map[uint64]struct{})
 		}
@@ -92,14 +103,14 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 		seen := got[pk]
 		if uint64(len(seen)) != want.chunkCount { //nolint:gosec // bounded
 			return errors.Wrapf(ErrS3IncompleteBlobChunks,
-				"partNo=%d partVersion=%d declared chunks=%d, observed unique=%d",
-				pk.partNo, pk.partVersion, want.chunkCount, len(seen))
+				"partNo=%d partVersion=%d offloaded=%t declared chunks=%d, observed unique=%d",
+				pk.partNo, pk.partVersion, pk.offloaded, want.chunkCount, len(seen))
 		}
 		for i := uint64(0); i < want.chunkCount; i++ {
 			if _, ok := seen[i]; !ok {
 				return errors.Wrapf(ErrS3IncompleteBlobChunks,
-					"partNo=%d partVersion=%d declared chunks=%d, missing chunkNo=%d",
-					pk.partNo, pk.partVersion, want.chunkCount, i)
+					"partNo=%d partVersion=%d offloaded=%t declared chunks=%d, missing chunkNo=%d",
+					pk.partNo, pk.partVersion, pk.offloaded, want.chunkCount, i)
 			}
 		}
 	}
@@ -117,6 +128,8 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 //	                            scratch chunk pool
 //	!s3|bucket|gen|*     (bg) -- ignored (operational counter)
 //	!s3|bucket|meta|*    (bm) -- buffered until Finalize
+//	!s3|chunkblob|*      (cb) -- validated and spilled once per digest
+//	!s3|chunkref|*       (cr) -- linked to manifest parts at Finalize
 //	!s3|gc|upload|*      (g)  -- ignored (in-flight cleanup state)
 //	!s3|obj|head|*       (o)  -- buffered until Finalize
 //	!s3|upload|meta|*    (um) -- excluded by default; opt in via
@@ -131,8 +144,9 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 // assembled body to <outRoot>/s3/<bucket>/<object> with the metadata
 // sidecar at <object>.elastickv-meta.json.
 //
-// Memory: O(num_objects + num_buckets) buffered metadata. Per-blob
-// payloads are streamed to disk as they arrive — never held in memory.
+// Memory: O(num_objects + num_buckets + num_chunkrefs + num_chunkblobs)
+// buffered metadata and scratch paths. Payloads are streamed to disk as they
+// arrive and are not retained in memory by the encoder.
 type S3Encoder struct {
 	outRoot                  string
 	scratchRoot              string
@@ -141,7 +155,11 @@ type S3Encoder struct {
 	renameCollisions         bool
 
 	buckets map[string]*s3BucketState
-	warn    func(event string, fields ...any)
+	// chunkBlobPaths indexes content-addressed offload payloads spilled
+	// under scratchRoot. Multiple object chunks can safely share one path.
+	chunkBlobPaths      map[[sha256.Size]byte]string
+	chunkBlobDirCreated bool
+	warn                func(event string, fields ...any)
 }
 
 type s3BucketState struct {
@@ -197,6 +215,10 @@ type s3ObjectState struct {
 	// chunkPaths maps (uploadID, partNo, chunkNo, partVersion) ->
 	// scratch path.
 	chunkPaths map[s3ChunkKey]string
+	// chunkRefs maps an offloaded object-chunk location to its
+	// content-addressed payload descriptor. Paths are resolved at finalize
+	// after all chunkblob records have been scanned.
+	chunkRefs map[s3ChunkKey]s3keys.ChunkRefValue
 }
 
 type s3ChunkKey struct {
@@ -204,6 +226,7 @@ type s3ChunkKey struct {
 	partNo      uint64
 	chunkNo     uint64
 	partVersion uint64
+	offloaded   bool
 }
 
 // s3PartKey is the manifest-declared part identifier: a (partNo,
@@ -213,6 +236,7 @@ type s3ChunkKey struct {
 type s3PartKey struct {
 	partNo      uint64
 	partVersion uint64
+	offloaded   bool
 }
 
 // s3DeclaredPart captures what the manifest claims for a part: its
@@ -293,12 +317,14 @@ type s3LiveManifest struct {
 }
 
 type s3LivePart struct {
-	PartNo      uint64   `json:"part_no"`
-	ETag        string   `json:"etag"`
-	SizeBytes   int64    `json:"size_bytes"`
-	ChunkCount  uint64   `json:"chunk_count"`
-	ChunkSizes  []uint64 `json:"chunk_sizes"`
-	PartVersion uint64   `json:"part_version"`
+	PartNo          uint64   `json:"part_no"`
+	ETag            string   `json:"etag"`
+	SizeBytes       int64    `json:"size_bytes"`
+	ChunkCount      uint64   `json:"chunk_count"`
+	ChunkSizes      []uint64 `json:"chunk_sizes"`
+	PartVersion     uint64   `json:"part_version"`
+	ChunkRefVersion uint64   `json:"chunk_ref_version"`
+	Offloaded       bool     `json:"offloaded"`
 }
 
 // NewS3Encoder constructs an encoder rooted at <outRoot>/s3/. Blob
@@ -309,9 +335,10 @@ type s3LivePart struct {
 // Close().
 func NewS3Encoder(outRoot, scratchRoot string) *S3Encoder {
 	return &S3Encoder{
-		outRoot:     outRoot,
-		scratchRoot: filepath.Join(scratchRoot, "s3"),
-		buckets:     make(map[string]*s3BucketState),
+		outRoot:        outRoot,
+		scratchRoot:    filepath.Join(scratchRoot, "s3"),
+		buckets:        make(map[string]*s3BucketState),
+		chunkBlobPaths: make(map[[sha256.Size]byte]string),
 	}
 }
 
@@ -407,7 +434,11 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 	st.uploadID = live.UploadID
 	st.declaredParts = make(map[s3PartKey]s3DeclaredPart, len(live.Parts))
 	for _, p := range live.Parts {
-		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: p.PartVersion}] = s3DeclaredPart{
+		partVersion := p.PartVersion
+		if p.Offloaded {
+			partVersion = p.ChunkRefVersion
+		}
+		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: partVersion, offloaded: p.Offloaded}] = s3DeclaredPart{
 			chunkCount: p.ChunkCount,
 		}
 	}
@@ -448,6 +479,55 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	}
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
 	st.chunkPaths[s3ChunkKey{uploadID: uploadID, partNo: partNo, chunkNo: chunkNo, partVersion: partVersion}] = path
+	return nil
+}
+
+// HandleChunkBlob validates and spills a content-addressed offload payload.
+// The payload is stored once per digest and linked to object chunks later by
+// HandleChunkRef metadata.
+func (s *S3Encoder) HandleChunkBlob(key, value []byte) error {
+	digest, ok := s3keys.ParseChunkBlobKey(key)
+	if !ok {
+		return errors.Wrapf(ErrS3MalformedKey, "chunkblob key: %q", key)
+	}
+	if actual := sha256.Sum256(value); actual != digest {
+		return errors.Wrapf(ErrS3ChunkBlobHashMismatch, "key digest=%x actual=%x", digest, actual)
+	}
+	dir := filepath.Join(s.scratchRoot, "chunkblobs")
+	if !s.chunkBlobDirCreated {
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
+			return errors.WithStack(err)
+		}
+		s.chunkBlobDirCreated = true
+	}
+	path := filepath.Join(dir, hex.EncodeToString(digest[:]))
+	if err := writeFileAtomic(path, value); err != nil {
+		return err
+	}
+	s.chunkBlobPaths[digest] = path
+	return nil
+}
+
+// HandleChunkRef parks an offloaded object-chunk descriptor. The referenced
+// chunkblob can appear before or after this record; resolution is deferred to
+// Finalize so snapshot scan order does not affect the logical backup.
+func (s *S3Encoder) HandleChunkRef(key, value []byte) error {
+	bucket, gen, object, uploadID, partNo, chunkNo, partVersion, ok := s3keys.ParseVersionedChunkRefKey(key)
+	if !ok {
+		return errors.Wrapf(ErrS3MalformedKey, "chunkref key: %q", key)
+	}
+	ref, ok := s3keys.DecodeChunkRefValue(value)
+	if !ok {
+		return errors.Wrapf(ErrS3InvalidChunkRef, "chunkref key: %q", key)
+	}
+	st := s.objectState(bucket, gen, object)
+	if st.chunkRefs == nil {
+		st.chunkRefs = make(map[s3ChunkKey]s3keys.ChunkRefValue)
+	}
+	st.chunkRefs[s3ChunkKey{
+		uploadID: uploadID, partNo: partNo, chunkNo: chunkNo,
+		partVersion: partVersion, offloaded: true,
+	}] = ref
 	return nil
 }
 
@@ -706,6 +786,9 @@ func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string,
 	if obj.manifest == nil {
 		return s.flushOrphanObject(b, bucketDir, obj)
 	}
+	if err := s.resolveOffloadedChunkPaths(obj); err != nil {
+		return err
+	}
 	objectName, kind, err := s.resolveObjectFilename(b, obj, needsLeafDataRename, objectKeys)
 	if err != nil {
 		return err
@@ -728,6 +811,38 @@ func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string,
 		if err := s.recordKeymap(b, bucketDir, objectName, []byte(obj.object), kind); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// resolveOffloadedChunkPaths links manifest-selected chunkrefs to their
+// content-addressed scratch payloads. Stale refs from overwritten uploads are
+// ignored before validation so asynchronous cleanup cannot break a backup of
+// the currently committed manifest.
+func (s *S3Encoder) resolveOffloadedChunkPaths(obj *s3ObjectState) error {
+	obj.chunkPaths = ensureChunkPaths(obj.chunkPaths)
+	for key, ref := range obj.chunkRefs {
+		if key.uploadID != obj.uploadID {
+			continue
+		}
+		partKey := s3PartKey{partNo: key.partNo, partVersion: key.partVersion, offloaded: true}
+		if _, declared := obj.declaredParts[partKey]; !declared {
+			continue
+		}
+		path, ok := s.chunkBlobPaths[ref.ContentSHA256]
+		if !ok {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if ref.Size > math.MaxInt64 || info.Size() != int64(ref.Size) { //nolint:gosec // ref.Size is bounded above.
+			return errors.Wrapf(ErrS3InvalidChunkRef,
+				"partNo=%d chunkNo=%d version=%d declared size=%d actual size=%d",
+				key.partNo, key.chunkNo, key.partVersion, ref.Size, info.Size())
+		}
+		obj.chunkPaths[key] = path
 	}
 	return nil
 }
@@ -1012,7 +1127,7 @@ func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, d
 			continue
 		}
 		if declaredParts != nil {
-			declared, ok := declaredParts[s3PartKey{partNo: k.partNo, partVersion: k.partVersion}]
+			declared, ok := declaredParts[s3PartKey{partNo: k.partNo, partVersion: k.partVersion, offloaded: k.offloaded}]
 			if !ok {
 				continue
 			}
@@ -1033,18 +1148,21 @@ func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, d
 		}
 		keys = append(keys, k)
 	}
-	sort.SliceStable(keys, func(i, j int) bool {
-		a, b := keys[i], keys[j]
-		switch {
-		case a.partNo != b.partNo:
-			return a.partNo < b.partNo
-		case a.partVersion != b.partVersion:
-			return a.partVersion < b.partVersion
-		default:
-			return a.chunkNo < b.chunkNo
-		}
-	})
+	sort.SliceStable(keys, func(i, j int) bool { return lessS3ChunkKey(keys[i], keys[j]) })
 	return keys
+}
+
+func lessS3ChunkKey(a, b s3ChunkKey) bool {
+	switch {
+	case a.partNo != b.partNo:
+		return a.partNo < b.partNo
+	case a.partVersion != b.partVersion:
+		return a.partVersion < b.partVersion
+	case a.offloaded != b.offloaded:
+		return !a.offloaded
+	default:
+		return a.chunkNo < b.chunkNo
+	}
 }
 
 func appendFile(dst io.Writer, srcPath string) error {
