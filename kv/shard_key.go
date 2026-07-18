@@ -124,10 +124,11 @@ func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 		return nil
 	}
 	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
-	if uint64(keyLen) > uint64(len(rest)-wideColumnEncodedKeyLengthSize) { //nolint:gosec // non-negative slice length fits uint64.
+	rest = rest[wideColumnEncodedKeyLengthSize:]
+	if uint64(keyLen) > uint64(len(rest)) {
 		return nil
 	}
-	return rest[wideColumnEncodedKeyLengthSize : uint32(wideColumnEncodedKeyLengthSize)+keyLen]
+	return rest[:keyLen]
 }
 
 func redisHashRouteKey(key []byte) []byte {

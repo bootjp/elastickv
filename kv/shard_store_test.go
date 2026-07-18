@@ -195,16 +195,16 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	ctx := context.Background()
-	_, err := st.GetAtWithReadFence(ctx, []byte("k"), 10, 0, 77)
+	_, err := st.GetAt(ctx, []byte("k"), 10)
 	require.NoError(t, err)
-	_, _, err = st.LatestCommitTSWithReadFence(ctx, []byte("k"), 78)
+	_, _, err = st.LatestCommitTS(ctx, []byte("k"))
 	require.NoError(t, err)
 	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 79, []byte("a"), []byte("m"))
 	require.NoError(t, err)
 
 	fake.mu.Lock()
-	require.Equal(t, uint64(77), fake.lastGetReq.GetReadRouteVersion())
-	require.Equal(t, uint64(78), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(100), fake.lastGetReq.GetReadRouteVersion())
+	require.Equal(t, uint64(100), fake.lastLatestReq.GetReadRouteVersion())
 	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
 	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
 	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
@@ -242,10 +242,18 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.NoError(t, err)
 
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	require.Equal(t, uint64(0), fake.lastScanReq.GetGroupId())
 	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
 	require.False(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAt(ctx, []byte(""), nil, 10, 11)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
 }
 
 func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {

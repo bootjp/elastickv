@@ -341,8 +341,12 @@ func TestLeaderRoutedStore_ForwardsKeyScanReadFenceWithoutValues(t *testing.T) {
 	t.Cleanup(stop)
 
 	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
-	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
-	t.Cleanup(func() { _ = s.Close() })
+	mvcc := store.NewMVCCStore()
+	s := NewLeaderRoutedStore(mvcc, coord)
+	t.Cleanup(func() {
+		require.NoError(t, s.Close())
+		require.NoError(t, mvcc.Close())
+	})
 
 	keys, err := s.ScanKeysAtWithReadFence(context.Background(), []byte("a"), []byte("z"), 10, 11, 0, 83)
 	require.NoError(t, err)

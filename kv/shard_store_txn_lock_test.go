@@ -358,6 +358,7 @@ func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	rawPrefix := []byte("!redis|meta|")
 	rawEnd := prefixScanEnd(rawPrefix)
 	for i := uint64(0); i <= lockPageLimit; i++ {
@@ -370,7 +371,7 @@ func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {
 		require.NoError(t, st.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
 	}
 
-	_, err := scanTxnLockPagesAtWithRouteFilter(ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0), lockPageLimit, []byte("m"), nil)
+	_, err := scanTxnLockPagesAtWithRouteFilter(ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0), lockPageLimit, []byte(""), nil)
 	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
