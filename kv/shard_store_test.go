@@ -1220,6 +1220,59 @@ func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) 
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_RoutesRedisWideColumnPrefixAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("am"), 1)
+	engine.UpdateRoute([]byte("am"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	left := store.HashFieldKey([]byte("alice"), []byte("field"))
+	right := store.HashFieldKey([]byte("amy"), []byte("field"))
+	require.NoError(t, st.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	start := store.HashFieldScanPrefix([]byte("a"))
+	end := prefixScanEnd([]byte(store.HashFieldPrefix))
+	kvs, err := st.ScanAt(ctx, start, end, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.ElementsMatch(t, [][]byte{left, right}, [][]byte{kvs[0].Key, kvs[1].Key})
+}
+
+func TestShardStoreScanAt_RoutesExactRedisWideColumnScanToOneShard(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("am"), 1)
+	engine.UpdateRoute([]byte("am"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	start := store.HashFieldScanPrefix([]byte("alice"))
+	routes, clamp, _ := st.routesForScanWithVersion(start, prefixScanEnd(start))
+	require.False(t, clamp)
+	require.Len(t, routes, 1)
+	require.Equal(t, uint64(1), routes[0].GroupID)
+}
+
 // TestShardStoreReverseScanAt_DescendingOrderAcrossShards verifies that
 // ReverseScanAt with a nil start (clampToRoutes=false) merges results from all
 // shards and returns them in descending key order.

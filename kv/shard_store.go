@@ -413,8 +413,12 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 		}
 		return []distribution.Route{route}, false, version
 	}
-	if userKey := redisWideColumnScanRouteKey(start); userKey != nil {
-		route, version, ok := s.engine.GetRouteWithVersion(userKey)
+	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
+		if !exact {
+			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+			return routes, false, version
+		}
+		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
 		if !ok {
 			return []distribution.Route{}, false, version
 		}

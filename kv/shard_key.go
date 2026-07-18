@@ -115,6 +115,17 @@ func redisWideColumnScanRouteKey(key []byte) []byte {
 	return nil
 }
 
+func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
+	userKey := redisWideColumnScanRouteKey(start)
+	if userKey == nil {
+		return nil, nil, false, false
+	}
+	if exactEnd := prefixScanEnd(start); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+		return userKey, nil, true, true
+	}
+	return userKey, prefixScanEnd(userKey), false, true
+}
+
 func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 	if !bytes.HasPrefix(key, prefix) {
 		return nil

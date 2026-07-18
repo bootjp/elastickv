@@ -466,6 +466,47 @@ func TestGRPCServer_RawScanAt_ReadFenceVariants(t *testing.T) {
 	}
 }
 
+func TestGRPCServer_RawScanAt_ValueReadFenceRequiresAwareStore(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		req  *pb.RawScanAtRequest
+	}{
+		{
+			name: "route version",
+			req: &pb.RawScanAtRequest{
+				StartKey:         []byte("a"),
+				EndKey:           []byte("z"),
+				Limit:            10,
+				Ts:               10,
+				ReadRouteVersion: 7,
+			},
+		},
+		{
+			name: "route bounds",
+			req: &pb.RawScanAtRequest{
+				StartKey:           []byte("a"),
+				EndKey:             []byte("z"),
+				Limit:              10,
+				Ts:                 10,
+				RouteStart:         []byte("m"),
+				RouteEnd:           []byte("z"),
+				RouteBoundsPresent: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.NewMVCCStore()
+			t.Cleanup(func() { _ = st.Close() })
+			s := NewGRPCServer(st, nil)
+			_, err := s.RawScanAt(context.Background(), tc.req)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+		})
+	}
+}
+
 func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {
 	t.Parallel()
 
