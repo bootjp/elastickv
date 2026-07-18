@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,16 @@ type fakeGroup struct {
 	servers      []raftengine.Server
 	cfgErr       error
 	snapshotEach uint64
+}
+
+type countingStatusGroup struct {
+	fakeGroup
+	calls *atomic.Int64
+}
+
+func (g countingStatusGroup) Status() raftengine.Status {
+	g.calls.Add(1)
+	return g.fakeGroup.Status()
 }
 
 func (f fakeGroup) Status() raftengine.Status {
@@ -374,6 +385,30 @@ func TestGetRaftGroupsLeaderVersionTriesAlternateAddressForSameLeaderID(t *testi
 	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
 		t.Fatalf("probe calls by address = %v, want both stale and alternate addresses", callsByAddr)
 	}
+	require.Equal(t, 2, callsByAddr["10.0.0.12:50051"]+callsByAddr["10.0.0.22:50051"],
+		"one per-node probe should try each candidate once")
+}
+
+func TestGetRaftGroupsSnapshotsEachGroupOnce(t *testing.T) {
+	t.Parallel()
+	const groupCount = 64
+	var calls atomic.Int64
+	srv := NewAdminServer(
+		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
+		nil,
+		WithAdminLeaderVersionProbe(func(context.Context, string) (string, error) { return "v2", nil }),
+	)
+	for id := uint64(1); id <= groupCount; id++ {
+		srv.RegisterGroup(id, countingStatusGroup{
+			fakeGroup: fakeGroup{leaderID: "n2", leaderAddr: "10.0.0.12:50051"},
+			calls:     &calls,
+		})
+	}
+
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	require.Len(t, resp.GetGroups(), groupCount)
+	require.Equal(t, int64(groupCount), calls.Load())
 }
 
 func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
@@ -415,6 +450,13 @@ func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
 	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
 		t.Fatalf("probe calls by address = %v, want timeout candidate and alternate address", callsByAddr)
 	}
+}
+
+func TestLeaderVersionProbeAttemptTimeoutHasSaneMinimum(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, 100*time.Millisecond, leaderVersionProbeAttemptTimeout(500*time.Millisecond, 100))
+	require.Equal(t, 50*time.Millisecond, leaderVersionProbeAttemptTimeout(50*time.Millisecond, 100))
+	require.Equal(t, 250*time.Millisecond, leaderVersionProbeAttemptTimeout(500*time.Millisecond, 2))
 }
 
 func requireLeaderVersion(t *testing.T, resp *pb.GetRaftGroupsResponse, want, label string) {

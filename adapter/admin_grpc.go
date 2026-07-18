@@ -103,6 +103,7 @@ type versionCacheEntry struct {
 const (
 	defaultAdminLeaderVersionProbeTimeout = 500 * time.Millisecond
 	defaultAdminLeaderVersionCacheTTL     = 10 * time.Second
+	minLeaderVersionProbeAttemptTimeout   = 100 * time.Millisecond
 )
 
 // AdminServer implements the node-side Admin gRPC service described in
@@ -451,10 +452,15 @@ func (s *AdminServer) GetRaftGroups(
 	s.groupsMu.RLock()
 	defer s.groupsMu.RUnlock()
 	ids := sortedGroupIDs(s.groups)
+	statuses := make([]raftengine.Status, len(ids))
+	for i, id := range ids {
+		statuses[i] = s.groups[id].Status()
+	}
+	probeAddresses := leaderProbeAddressesByNode(statuses)
 	out := make([]*pb.RaftGroupState, 0, len(ids))
 	now := s.now()
-	for _, id := range ids {
-		st := s.groups[id].Status()
+	for i, id := range ids {
+		st := statuses[i]
 		// Translate LastContact (duration since the last contact with the
 		// leader, per raftengine.Status) into an absolute unix-ms so UI
 		// clients can diff against their own clock instead of having to
@@ -475,7 +481,7 @@ func (s *AdminServer) GetRaftGroups(
 			CommitIndex:       st.CommitIndex,
 			AppliedIndex:      st.AppliedIndex,
 			LastContactUnixMs: lastContactUnixMs,
-			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader, now, s.leaderProbeAddressesLocked(st.Leader)),
+			LeaderNodeVersion: s.leaderNodeVersion(ctx, st.Leader, now, probeAddresses[leaderVersionCacheKey(st.Leader)]),
 		})
 	}
 	return &pb.GetRaftGroupsResponse{Groups: out}, nil
@@ -507,33 +513,23 @@ func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.L
 	return ""
 }
 
-func (s *AdminServer) leaderProbeAddressesLocked(leader raftengine.LeaderInfo) []string {
-	seen := map[string]struct{}{}
-	addresses := make([]string, 0, 1)
-	add := func(address string) {
-		address = strings.TrimSpace(address)
-		if address == "" {
-			return
-		}
-		if _, ok := seen[address]; ok {
-			return
-		}
-		seen[address] = struct{}{}
-		addresses = append(addresses, address)
-	}
-	add(leader.Address)
-	if leader.ID == "" {
-		return addresses
-	}
-	for _, id := range sortedGroupIDs(s.groups) {
-		group := s.groups[id]
-		if group == nil {
+func leaderProbeAddressesByNode(statuses []raftengine.Status) map[string][]string {
+	addresses := make(map[string][]string)
+	seen := make(map[string]map[string]struct{})
+	for _, st := range statuses {
+		key := leaderVersionCacheKey(st.Leader)
+		address := strings.TrimSpace(st.Leader.Address)
+		if key == "" || address == "" {
 			continue
 		}
-		st := group.Status()
-		if st.Leader.ID == leader.ID {
-			add(st.Leader.Address)
+		if seen[key] == nil {
+			seen[key] = make(map[string]struct{})
 		}
+		if _, ok := seen[key][address]; ok {
+			continue
+		}
+		seen[key][address] = struct{}{}
+		addresses[key] = append(addresses[key], address)
 	}
 	return addresses
 }
@@ -549,9 +545,6 @@ func (s *AdminServer) localLeaderVersion(leader raftengine.LeaderInfo) (string, 
 }
 
 func leaderVersionCacheKey(leader raftengine.LeaderInfo) string {
-	if leader.ID != "" && leader.Address != "" {
-		return leader.ID + "\x00" + leader.Address
-	}
 	if leader.ID != "" {
 		return leader.ID
 	}
@@ -641,8 +634,8 @@ func leaderVersionProbeAttemptTimeout(total time.Duration, candidates int) time.
 		return total
 	}
 	perCandidate := total / time.Duration(candidates)
-	if perCandidate <= 0 {
-		return total
+	if perCandidate < minLeaderVersionProbeAttemptTimeout {
+		return min(total, minLeaderVersionProbeAttemptTimeout)
 	}
 	return perCandidate
 }
