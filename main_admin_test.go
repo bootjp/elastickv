@@ -71,6 +71,9 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if len(icept.unary) != 1 || len(icept.stream) != 1 {
 		t.Fatalf("expected 1 unary + 1 stream interceptor, got %d + %d", len(icept.unary), len(icept.stream))
 	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
+	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
@@ -84,6 +87,9 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	}
 	if !icept.empty() {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
+	}
+	if icept.s3BlobFetchEnabled {
+		t.Fatal("insecure admin mode must not expose S3BlobFetch")
 	}
 }
 

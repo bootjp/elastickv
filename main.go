@@ -1714,8 +1714,9 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 // ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
 // silent overwrites (gRPC-Go: last option of the same type wins).
 type adminGRPCInterceptors struct {
-	unary  []grpc.UnaryServerInterceptor
-	stream []grpc.StreamServerInterceptor
+	unary              []grpc.UnaryServerInterceptor
+	stream             []grpc.StreamServerInterceptor
+	s3BlobFetchEnabled bool
 }
 
 func (a adminGRPCInterceptors) empty() bool {
@@ -1898,6 +1899,7 @@ func configureAdminService(
 	if stream != nil {
 		icept.stream = append(icept.stream, stream)
 	}
+	icept.s3BlobFetchEnabled = token != ""
 	return srv, icept, nil
 }
 
@@ -2060,6 +2062,26 @@ func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime 
 	return out
 }
 
+func registerS3BlobFetchServer(
+	registrar grpc.ServiceRegistrar,
+	enabled bool,
+	st store.MVCCStore,
+	observer adapter.S3BlobOffloadObserver,
+	clock *kv.HLC,
+	pushBlocked func() bool,
+) []string {
+	if !enabled {
+		return nil
+	}
+	pb.RegisterS3BlobFetchServer(registrar, adapter.NewS3BlobFetchServer(
+		st,
+		observer,
+		adapter.WithS3BlobFetchClock(clock),
+		adapter.WithS3BlobFetchPushBlocked(pushBlocked),
+	))
+	return []string{"S3BlobFetch"}
+}
+
 func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -2106,12 +2128,14 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterS3BlobFetchServer(gs, adapter.NewS3BlobFetchServer(
+		staticServingServices := registerS3BlobFetchServer(
+			gs,
+			adminGRPCOpts.s3BlobFetchEnabled,
 			rt.store,
 			s3BlobObserver,
-			adapter.WithS3BlobFetchClock(coordinate.Clock()),
-			adapter.WithS3BlobFetchPushBlocked(s3BlobPushBlocked),
-		))
+			coordinate.Clock(),
+			s3BlobPushBlocked,
+		)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2160,7 +2184,7 @@ func startRaftServers(
 			gs,
 			rt.engine,
 			[]string{"RawKV"},
-			[]string{"S3BlobFetch"},
+			staticServingServices,
 			confChangeInterceptor,
 		)
 		reflection.Register(gs)
