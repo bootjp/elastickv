@@ -257,6 +257,9 @@ type recordingRawReadFenceStore struct {
 	scanReverse              bool
 	scanGroupID              uint64
 	scanRouteBoundsPresent   bool
+	keyScanCalled            bool
+	keyScanReadRouteVersion  uint64
+	keyScanGroupID           uint64
 	callerSuppliedGetSeen    uint64
 	callerSuppliedScanSeen   uint64
 	callerSuppliedLatestSeen uint64
@@ -293,6 +296,13 @@ func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, star
 		s.callerSuppliedScanSeen = readRouteVersion
 	}
 	return []*store.KVPair{{Key: append([]byte(nil), start...), Value: []byte("v")}}, nil
+}
+
+func (s *recordingRawReadFenceStore) ScanKeysAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, groupID uint64, readRouteVersion uint64) ([][]byte, error) {
+	s.keyScanCalled = true
+	s.keyScanReadRouteVersion = readRouteVersion
+	s.keyScanGroupID = groupID
+	return [][]byte{append([]byte(nil), start...)}, nil
 }
 
 func cloneTestBytes(b []byte) []byte {
@@ -432,7 +442,13 @@ func TestGRPCServer_RawScanAt_ReadFenceVariants(t *testing.T) {
 			if tc.wantKeysOnly {
 				require.Empty(t, resp.GetKv()[0].GetValue())
 			}
-			require.Equal(t, tc.wantRouteVersion, st.scanReadRouteVersion)
+			if tc.wantKeysOnly && !tc.wantBoundsPresent {
+				require.True(t, st.keyScanCalled)
+				require.Equal(t, tc.wantRouteVersion, st.keyScanReadRouteVersion)
+				require.Zero(t, st.scanReadRouteVersion)
+			} else {
+				require.Equal(t, tc.wantRouteVersion, st.scanReadRouteVersion)
+			}
 			require.Equal(t, tc.wantBoundsPresent, st.scanRouteBoundsPresent)
 			if tc.wantRouteStart == nil {
 				require.Nil(t, st.scanReadRouteStart)
@@ -522,6 +538,31 @@ func TestGRPCServer_RawScanAt_KeysOnlyWithRouteBoundsUsesReadFence(t *testing.T)
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyUsesReadFenceKeyScanner(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		GroupId:  42,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.True(t, st.keyScanCalled)
+	require.Equal(t, uint64(55), st.keyScanReadRouteVersion)
+	require.Equal(t, uint64(42), st.keyScanGroupID)
+	require.Zero(t, st.scanReadRouteVersion)
 }
 
 func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {

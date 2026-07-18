@@ -46,6 +46,10 @@ type rawReadFenceScanner interface {
 	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
 }
 
+type rawReadFenceKeyScanner interface {
+	ScanKeysAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64) ([][]byte, error)
+}
+
 type rawReadFenceVersioner interface {
 	ReadRouteVersion() uint64
 }
@@ -220,15 +224,22 @@ func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest
 }
 
 func (r *GRPCServer) rawScanKeysAtWithReadFence(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
+	if req.GetGroupId() != 0 && req.GetReverse() && !req.GetRouteBoundsPresent() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
+	}
+	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
+	if !req.GetReverse() && !req.GetRouteBoundsPresent() {
+		if keyScanner, ok := r.store.(rawReadFenceKeyScanner); ok {
+			keys, err := keyScanner.ScanKeysAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetGroupId(), readRouteVersion)
+			return keys, errors.WithStack(err)
+		}
+	}
 	fenceScanner, ok := r.store.(rawReadFenceScanner)
 	if !ok {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with read fence requires a read-fence-aware store"))
 	}
-	if req.GetGroupId() != 0 && req.GetReverse() && !req.GetRouteBoundsPresent() {
-		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
-	}
 	routeStart, routeEnd := rawScanRouteBounds(req)
-	kvs, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), routeStart, routeEnd)
+	kvs, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

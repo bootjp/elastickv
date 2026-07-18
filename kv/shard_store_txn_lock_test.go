@@ -316,7 +316,7 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
-func TestShardStoreScanAtWithReadFence_SkipsManyOutOfRouteLocks(t *testing.T) {
+func TestShardStoreScanAtWithReadFence_BoundsForeignLockScan(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -349,10 +349,8 @@ func TestShardStoreScanAtWithReadFence_SkipsManyOutOfRouteLocks(t *testing.T) {
 		require.NoError(t, st1.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
 	}
 
-	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
-	require.NoError(t, err)
-	require.Len(t, kvs, 1)
-	require.Equal(t, right, kvs[0].Key)
+	_, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
+	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
 func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {

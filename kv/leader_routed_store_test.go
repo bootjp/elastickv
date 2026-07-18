@@ -331,6 +331,29 @@ func TestLeaderRoutedStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
 }
 
+func TestLeaderRoutedStore_ForwardsKeyScanReadFenceWithoutValues(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{Kv: []*pb.RawKVPair{{Key: []byte("k")}}},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
+	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	keys, err := s.ScanKeysAtWithReadFence(context.Background(), []byte("a"), []byte("z"), 10, 11, 0, 83)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("k")}, keys)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.True(t, fake.lastScanKeysOnly)
+	require.Equal(t, uint64(83), fake.lastScanReq.GetReadRouteVersion())
+}
+
 func TestLeaderRoutedStore_ReturnsLeaderNotFoundWhenNoLeaderAddr(t *testing.T) {
 	t.Parallel()
 
