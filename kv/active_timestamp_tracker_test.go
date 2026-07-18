@@ -68,6 +68,23 @@ func TestActiveTimestampTrackerBackupPinExtendMovesDeadline(t *testing.T) {
 	require.Equal(t, 1, tracker.ActiveBackupPinCount())
 }
 
+func TestActiveTimestampTrackerBackupPinExtendKeepsLaterDeadline(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	defer tracker.Close()
+	pinID := backupTrackerTestPinID(1)
+	laterDeadline := time.Now().Add(time.Hour)
+	retriedDeadline := laterDeadline.Add(-time.Minute)
+	require.NoError(t, tracker.PinWithDeadline(pinID, 42, laterDeadline))
+
+	require.NoError(t, tracker.Extend(pinID, retriedDeadline))
+
+	got, ok := tracker.BackupPinDeadline(pinID)
+	require.True(t, ok)
+	require.Equal(t, laterDeadline, got)
+}
+
 func TestActiveTimestampTrackerBackupPinExtendMissingIsInvalid(t *testing.T) {
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 
