@@ -52,6 +52,30 @@ func TestSchedulerTickSchedulesSplitRange(t *testing.T) {
 	require.Equal(t, uint64(0), splitter.requests[0].TargetGroupID)
 }
 
+func TestSchedulerUsesCommittedCatalogVersionBetweenSplits(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			testRoute(1, 1, "a", "m"),
+			testRoute(2, 1, "m", "z"),
+		},
+	}}
+	splitter := &fakeSplitter{}
+	scheduler := newTestScheduler(source, splitter, dualRouteHotColumns(now, 2), nil)
+	scheduler.wasLeader = true
+	scheduler.cfg.Detector.MaxSplitsPerCycle = 2
+
+	result, err := scheduler.Tick(context.Background(), now.Add(2*time.Minute))
+
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Scheduled)
+	require.Len(t, splitter.requests, 2)
+	require.Equal(t, uint64(7), splitter.requests[0].ExpectedCatalogVersion)
+	require.Equal(t, uint64(8), splitter.requests[1].ExpectedCatalogVersion)
+}
+
 func TestSchedulerKillSwitchSkipsSplitRange(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
@@ -220,6 +244,15 @@ func hotColumns(start time.Time, hotCount int) []keyviz.MatrixColumn {
 	return cols
 }
 
+func dualRouteHotColumns(start time.Time, hotCount int) []keyviz.MatrixColumn {
+	cols := make([]keyviz.MatrixColumn, 0, hotCount+1)
+	cols = append(cols, keyviz.MatrixColumn{At: start})
+	for i := 1; i <= hotCount; i++ {
+		cols = append(cols, dualRouteHotColumn(start.Add(time.Duration(i)*time.Minute)))
+	}
+	return cols
+}
+
 func hotColumn(at time.Time) keyviz.MatrixColumn {
 	return keyviz.MatrixColumn{
 		At: at,
@@ -228,6 +261,18 @@ func hotColumn(at time.Time) keyviz.MatrixColumn {
 			testRow(1, 1, 1, 2, "m", "z", 60, 0),
 			testRow(2, 1, 0, 2, "a", "m", 60, 0),
 			testRow(2, 1, 1, 2, "m", "z", 60, 0),
+		},
+	}
+}
+
+func dualRouteHotColumn(at time.Time) keyviz.MatrixColumn {
+	return keyviz.MatrixColumn{
+		At: at,
+		Rows: []keyviz.MatrixRow{
+			testRow(1, 1, 0, 2, "a", "g", 60, 0),
+			testRow(1, 1, 1, 2, "g", "m", 60, 0),
+			testRow(2, 1, 0, 2, "m", "t", 60, 0),
+			testRow(2, 1, 1, 2, "t", "z", 60, 0),
 		},
 	}
 }

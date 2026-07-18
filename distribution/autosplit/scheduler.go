@@ -200,7 +200,7 @@ func (s *Scheduler) tickAndLog(ctx context.Context, now time.Time) {
 	}
 }
 
-func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) error {
+func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) (uint64, error) {
 	execCtx, cancel := context.WithTimeout(ctx, s.cfg.SplitTimeout)
 	defer cancel()
 
@@ -220,21 +220,21 @@ func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, 
 		TargetGroupID:          decision.TargetGroupID,
 	})
 	if err != nil {
-		return errors.Wrap(err, "autosplit: split range")
+		return catalogVersion, errors.Wrap(err, "autosplit: split range")
 	}
 	s.cfg.Logger.InfoContext(ctx, "autosplit: split committed",
 		slog.Uint64("route_id", decision.RouteID),
 		slog.Uint64("catalog_version", result.CatalogVersion),
 		slog.String("split_key", loggedSplitKey(decision.SplitKey)),
 		slog.String("split_origin", string(decision.SplitOrigin)))
-	return nil
+	return result.CatalogVersion, nil
 }
 
 func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64, decisions []Decision) (int, int) {
 	scheduled := 0
 	failed := 0
 	for _, decision := range decisions {
-		err := s.executeDecision(ctx, catalogVersion, decision)
+		nextCatalogVersion, err := s.executeDecision(ctx, catalogVersion, decision)
 		if err != nil {
 			failed++
 			s.cfg.Logger.WarnContext(ctx, "autosplit: split failed",
@@ -246,6 +246,7 @@ func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64,
 				slog.Any("err", err))
 			continue
 		}
+		catalogVersion = nextCatalogVersion
 		scheduled++
 	}
 	return scheduled, failed
