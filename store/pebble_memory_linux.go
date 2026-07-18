@@ -23,7 +23,7 @@ func systemMemoryBytes() int64 {
 	if err := unix.Sysinfo(&info); err != nil {
 		return 0
 	}
-	total := uint64(info.Totalram) * uint64(info.Unit)
+	total := info.Totalram * uint64(info.Unit)
 	if total > math.MaxInt64 {
 		return math.MaxInt64
 	}
