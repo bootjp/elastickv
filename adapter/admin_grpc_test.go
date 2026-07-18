@@ -597,6 +597,38 @@ func TestAdminTokenAuthSkipsOtherServices(t *testing.T) {
 	}
 }
 
+func TestAdminTokenAuthProtectsS3BlobFetch(t *testing.T) {
+	t.Parallel()
+	unary, stream := AdminTokenAuth("s3cret")
+	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
+	info := &grpc.UnaryServerInfo{FullMethod: pb.S3BlobFetch_FetchChunkBlob_FullMethodName}
+	if _, err := unary(context.Background(), nil, info, handler); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("unauthenticated unary code = %v, want %v", status.Code(err), codes.Unauthenticated)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer s3cret"))
+	streamInfo := &grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName}
+	called := false
+	err := stream(nil, &adminAuthTestServerStream{ctx: ctx}, streamInfo, func(any, grpc.ServerStream) error {
+		called = true
+		return nil
+	})
+	if err != nil || !called {
+		t.Fatalf("authenticated stream err = %v, called = %v", err, called)
+	}
+}
+
+type adminAuthTestServerStream struct {
+	ctx context.Context
+}
+
+func (s *adminAuthTestServerStream) Context() context.Context   { return s.ctx }
+func (*adminAuthTestServerStream) SetHeader(metadata.MD) error  { return nil }
+func (*adminAuthTestServerStream) SendHeader(metadata.MD) error { return nil }
+func (*adminAuthTestServerStream) SetTrailer(metadata.MD)       {}
+func (*adminAuthTestServerStream) SendMsg(any) error            { return nil }
+func (*adminAuthTestServerStream) RecvMsg(any) error            { return nil }
+
 func TestAdminTokenAuthEmptyTokenDisabled(t *testing.T) {
 	t.Parallel()
 	unary, stream := AdminTokenAuth("")

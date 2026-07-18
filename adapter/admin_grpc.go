@@ -476,12 +476,21 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // adminMethodPrefix is "/Admin/" today but is derived from the generated
 // service descriptor so a future proto package declaration (which would
 // package-qualify the service name) does not silently bypass the auth gate.
-var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
+var (
+	adminMethodPrefix       = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
+	s3BlobFetchMethodPrefix = "/" + pb.S3BlobFetch_ServiceDesc.ServiceName + "/"
+)
+
+func bearerTokenProtectedMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
+		strings.HasPrefix(fullMethod, s3BlobFetchMethodPrefix)
+}
 
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
 // "authorization: Bearer <token>" metadata against the supplied token. An
 // empty token disables enforcement; callers should pair that mode with a
-// --adminInsecureNoAuth flag so operators knowingly opt in.
+// --adminInsecureNoAuth flag so operators knowingly opt in. The token also
+// protects the peer-only S3BlobFetch service when that service is registered.
 func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	if token == "" {
 		return nil, nil
@@ -511,7 +520,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !bearerTokenProtectedMethod(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		if err := check(ctx); err != nil {
@@ -525,7 +534,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !bearerTokenProtectedMethod(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		if err := check(ss.Context()); err != nil {

@@ -99,6 +99,9 @@ const (
 	// raft hot path is high blast radius and a regression here can cause
 	// cluster-wide elections.
 	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
+	// preVoteEnvVar permits an operator to temporarily disable raft
+	// pre-vote during manual quorum recovery. It defaults to enabled.
+	preVoteEnvVar = "ELASTICKV_RAFT_PRE_VOTE"
 	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
 	// snapshot once the applied index has advanced this many entries past
 	// the last snapshot's index. etcd/raft itself uses 10_000 as a default,
@@ -817,7 +820,13 @@ func rawNodeAppliedForOpen(storage *etcdraft.MemoryStorage, applied uint64, cfg 
 	if applied <= baseApplied {
 		return applied, nil
 	}
-	return trimRawNodeAppliedForReplay(storage, baseApplied, applied, cfg), nil
+	rawApplied := trimRawNodeAppliedForReplay(storage, baseApplied, applied, cfg)
+	if rawApplied > baseApplied {
+		if err := replayColdStartVolatileEntries(storage, baseApplied+1, rawApplied+1, cfg); err != nil {
+			return 0, err
+		}
+	}
+	return rawApplied, nil
 }
 
 func rawNodeAppliedBounds(storage *etcdraft.MemoryStorage, applied uint64) (uint64, uint64, error) {
@@ -867,23 +876,58 @@ func coldStartEntryRequiresReplay(entry *raftpb.Entry, cfg OpenConfig) bool {
 	default:
 		return false
 	}
+	_, _, err := coldStartNormalPayload(entry, cfg)
+	return err != nil
+}
+
+func replayColdStartVolatileEntries(storage *etcdraft.MemoryStorage, lo, hi uint64, cfg OpenConfig) error {
+	entries, err := storage.Entries(lo, hi, math.MaxUint64)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for _, entry := range entries {
+		if entry == nil || !entryTypeIsNormal(entry) {
+			continue
+		}
+		payload, ok, err := coldStartNormalPayload(entry, cfg)
+		if err != nil {
+			return err
+		}
+		if !ok || !coldStartPayloadIsVolatile(payload, cfg) {
+			continue
+		}
+		cfg.StateMachine.Apply(payload)
+	}
+	return nil
+}
+
+func entryTypeIsNormal(entry *raftpb.Entry) bool {
+	return entry.GetType() == raftpb.EntryNormal
+}
+
+func coldStartNormalPayload(entry *raftpb.Entry, cfg OpenConfig) ([]byte, bool, error) {
 	if len(entry.GetData()) == 0 {
-		return false
+		return nil, false, nil
 	}
 	_, payload, ok := decodeProposalEnvelope(entry.GetData())
 	if !ok {
-		return false
+		return nil, false, nil
 	}
-	if entry.GetIndex() > orInertCutover(cfg.RaftCutoverIndex)() {
-		if cfg.RaftCipher == nil {
-			return true
-		}
-		plain, err := unwrapRaftPayload(cfg.RaftCipher, payload)
-		if err != nil {
-			return true
-		}
-		payload = plain
+	if entry.GetIndex() <= orInertCutover(cfg.RaftCutoverIndex)() {
+		return payload, true, nil
 	}
+	if cfg.RaftCipher == nil {
+		return nil, false, errors.Wrap(ErrRaftUnwrapFailed,
+			"raftengine/etcd: cold-start entry past raft envelope cutover but no raft cipher wired")
+	}
+	plain, err := unwrapRaftPayload(cfg.RaftCipher, payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return plain, true, nil
+}
+
+func coldStartPayloadIsVolatile(payload []byte, cfg OpenConfig) bool {
 	classifier, ok := cfg.StateMachine.(raftengine.VolatileEntryClassifier)
 	if !ok {
 		return false
@@ -902,7 +946,7 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 		MaxCommittedSizePerReady:  cfg.MaxSizePerMsg,
 		MaxInflightMsgs:           cfg.MaxInflightMsg,
 		CheckQuorum:               true,
-		PreVote:                   true,
+		PreVote:                   preVoteEnabledFromEnv(),
 		ReadOnlyOption:            etcdraft.ReadOnlySafe,
 		DisableProposalForwarding: true,
 	})
@@ -4359,6 +4403,20 @@ func dispatcherLanesEnabledFromEnv() bool {
 	enabled, err := strconv.ParseBool(v)
 	if err != nil {
 		return false
+	}
+	return enabled
+}
+
+func preVoteEnabledFromEnv() bool {
+	v := strings.TrimSpace(os.Getenv(preVoteEnvVar))
+	if v == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		slog.Warn("invalid ELASTICKV_RAFT_PRE_VOTE; using default",
+			"value", v, "default", true)
+		return true
 	}
 	return enabled
 }

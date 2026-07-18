@@ -40,6 +40,21 @@ func encodeNewStringValue(t *testing.T, value []byte, expireAtMs uint64) []byte 
 	return append(header, body...)
 }
 
+func encodeNewHLLValue(t *testing.T, value []byte, expireAtMs uint64) []byte {
+	t.Helper()
+	flags := byte(0)
+	header := []byte{redisHLLMagic, redisHLLVersion, flags}
+	body := value
+	if expireAtMs > 0 {
+		flags = redisHLLHasTTL
+		header[2] = flags
+		var ttl [redisUint64Bytes]byte
+		binary.BigEndian.PutUint64(ttl[:], expireAtMs)
+		header = append(header, ttl[:]...)
+	}
+	return append(header, body...)
+}
+
 func encodeTTLValue(expireAtMs uint64) []byte {
 	var b [redisUint64Bytes]byte
 	binary.BigEndian.PutUint64(b[:], expireAtMs)
@@ -157,6 +172,54 @@ func TestRedisDB_HandleHLL_WritesRawSketch(t *testing.T) {
 	body := readBlob(t, filepath.Join(root, "redis", "db_0", "hll", "uniques.bin"))
 	if string(body) != string(sketch) {
 		t.Fatalf("hll blob = %x want %x", body, sketch)
+	}
+}
+
+func TestRedisDB_HandleHLL_NewFormatStripsEnvelopeAndDeduplicatesTTL(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	sketch := []byte{0xde, 0xad, 0xbe, 0xef}
+	if err := db.HandleHLL([]byte("uniques"), encodeNewHLLValue(t, sketch, fixedExpireMs)); err != nil {
+		t.Fatalf("HandleHLL: %v", err)
+	}
+	if err := db.HandleTTL([]byte("uniques"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatalf("HandleTTL: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	body := readBlob(t, filepath.Join(root, "redis", "db_0", "hll", "uniques.bin"))
+	if !bytes.Equal(body, sketch) {
+		t.Fatalf("hll blob = %x want %x", body, sketch)
+	}
+	recs := readTTLJSONL(t, filepath.Join(root, "redis", "db_0", "hll_ttl.jsonl"))
+	if len(recs) != 1 {
+		t.Fatalf("hll_ttl records = %d, want 1", len(recs))
+	}
+	if recs[0].Key != "uniques" || recs[0].ExpireAtMs != fixedExpireMs {
+		t.Fatalf("hll_ttl[0] = %#v, want key uniques ms %d", recs[0], fixedExpireMs)
+	}
+}
+
+func TestRedisDB_HandleHLL_NewFormatNoTTLIgnoresScanIndex(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	sketch := []byte{0xca, 0xfe}
+	if err := db.HandleHLL([]byte("fresh"), encodeNewHLLValue(t, sketch, 0)); err != nil {
+		t.Fatalf("HandleHLL: %v", err)
+	}
+	if err := db.HandleTTL([]byte("fresh"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatalf("HandleTTL: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	body := readBlob(t, filepath.Join(root, "redis", "db_0", "hll", "fresh.bin"))
+	if !bytes.Equal(body, sketch) {
+		t.Fatalf("hll blob = %x want %x", body, sketch)
+	}
+	if _, err := os.Stat(filepath.Join(root, "redis", "db_0", "hll_ttl.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("expected no hll_ttl.jsonl for no-TTL HLL envelope, stat err=%v", err)
 	}
 }
 

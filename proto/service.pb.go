@@ -499,7 +499,8 @@ type RawScanAtRequest struct {
 	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
 	Ts            uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
 	Reverse       bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
-	GroupId       uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
+	GroupId       uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`    // optional explicit Raft group for non-range-owned keyspaces
+	KeysOnly      bool                   `protobuf:"varint,7,opt,name=keys_only,json=keysOnly,proto3" json:"keys_only,omitempty"` // when true, response kv entries omit values
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -574,6 +575,13 @@ func (x *RawScanAtRequest) GetGroupId() uint64 {
 		return x.GroupId
 	}
 	return 0
+}
+
+func (x *RawScanAtRequest) GetKeysOnly() bool {
+	if x != nil {
+		return x.KeysOnly
+	}
+	return false
 }
 
 type RawKVPair struct {
@@ -2487,14 +2495,15 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xa3\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xc0\x01\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x03R\x05limit\x12\x0e\n" +
 	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
 	"\areverse\x18\x05 \x01(\bR\areverse\x12\x19\n" +
-	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\"3\n" +
+	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\x12\x1b\n" +
+	"\tkeys_only\x18\a \x01(\bR\bkeysOnly\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +

@@ -9,13 +9,14 @@ import (
 
 // Stream wide-column key layout:
 //
-//	Meta:  !stream|meta|<userKeyLen(4)><userKey>        → [Len(8)][LastMs(8)][LastSeq(8)]
+//	Meta:  !stream|meta|<userKeyLen(4)><userKey>        → [Len(8)][LastMs(8)][LastSeq(8)][ExpireAtMs(8)]
 //	Entry: !stream|entry|<userKeyLen(4)><userKey><StreamID(16)>
 const (
 	StreamMetaPrefix  = "!stream|meta|"
 	StreamEntryPrefix = "!stream|entry|"
 
-	streamMetaBinarySize = 24
+	streamMetaLegacyBinarySize = 24
+	streamMetaBinarySize       = 32
 	// StreamIDBytes is the fixed size of the binary StreamID suffix on an entry key:
 	// 8 bytes big-endian ms || 8 bytes big-endian seq. Big-endian so lex order
 	// over the raw key bytes matches the (ms, seq) numeric order used by XADD / XRANGE.
@@ -37,12 +38,13 @@ var (
 // LastMs/LastSeq track the highest ID ever appended so XADD '*' stays
 // strictly monotonic even after XTRIM removes the current tail.
 type StreamMeta struct {
-	Length  int64
-	LastMs  uint64
-	LastSeq uint64
+	Length   int64
+	LastMs   uint64
+	LastSeq  uint64
+	ExpireAt uint64
 }
 
-// MarshalStreamMeta encodes StreamMeta into a fixed 24-byte binary format.
+// MarshalStreamMeta encodes StreamMeta into a fixed 32-byte binary format.
 func MarshalStreamMeta(m StreamMeta) ([]byte, error) {
 	if m.Length < 0 {
 		return nil, errors.WithStack(errors.Newf("stream meta negative length: %d", m.Length))
@@ -51,23 +53,28 @@ func MarshalStreamMeta(m StreamMeta) ([]byte, error) {
 	binary.BigEndian.PutUint64(buf[0:8], uint64(m.Length)) //nolint:gosec
 	binary.BigEndian.PutUint64(buf[8:16], m.LastMs)
 	binary.BigEndian.PutUint64(buf[16:24], m.LastSeq)
+	binary.BigEndian.PutUint64(buf[24:32], m.ExpireAt)
 	return buf, nil
 }
 
-// UnmarshalStreamMeta decodes StreamMeta from the fixed 24-byte binary format.
+// UnmarshalStreamMeta decodes StreamMeta from the legacy 24-byte or current 32-byte binary format.
 func UnmarshalStreamMeta(b []byte) (StreamMeta, error) {
-	if len(b) != streamMetaBinarySize {
+	if len(b) != streamMetaLegacyBinarySize && len(b) != streamMetaBinarySize {
 		return StreamMeta{}, errors.WithStack(errors.Newf("invalid stream meta length: %d", len(b)))
 	}
 	length := binary.BigEndian.Uint64(b[0:8])
 	if length > (1<<streamMetaLengthSignBit)-1 {
 		return StreamMeta{}, errors.New("stream meta length overflows int64")
 	}
-	return StreamMeta{
+	meta := StreamMeta{
 		Length:  int64(length), //nolint:gosec
 		LastMs:  binary.BigEndian.Uint64(b[8:16]),
 		LastSeq: binary.BigEndian.Uint64(b[16:24]),
-	}, nil
+	}
+	if len(b) == streamMetaBinarySize {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[24:32])
+	}
+	return meta, nil
 }
 
 // StreamMetaKey builds the per-stream metadata key.

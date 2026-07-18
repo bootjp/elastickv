@@ -26,6 +26,7 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	proto "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -71,6 +72,9 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if len(icept.unary) != 1 || len(icept.stream) != 1 {
 		t.Fatalf("expected 1 unary + 1 stream interceptor, got %d + %d", len(icept.unary), len(icept.stream))
 	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
+	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
@@ -84,6 +88,16 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	}
 	if !icept.empty() {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
+	}
+	if icept.s3BlobFetchEnabled {
+		t.Fatal("insecure admin mode must not expose S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("insecure admin mode must not advertise S3 blob offload capability")
 	}
 }
 

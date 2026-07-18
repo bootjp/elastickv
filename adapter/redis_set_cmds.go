@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -44,7 +45,23 @@ func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint6
 }
 
 func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(context.Background(), redisHLLKey(key), readTS)
+	ctx := context.Background()
+	exists, err := r.hllAnchorExistsAt(ctx, key, readTS)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	expired, err := r.hasExpired(ctx, key, readTS, false)
+	if err != nil {
+		return false, err
+	}
+	return !expired, nil
+}
+
+func (r *RedisServer) hllAnchorExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	exists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
 	if err != nil {
 		return false, fmt.Errorf("exists hll: %w", err)
 	}
@@ -74,13 +91,20 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 			Value: []byte{},
 		})
 	}
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return legacyExpiredCollectionCleanupElems(key, redisSetKey(key)), nil
+	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
 	// Write a base meta so that resolveSetMeta starts from an accurate count.
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.SetMetaKey(key),
-		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members)), ExpireAt: ttlMs}),
 	})
 	elems = append(elems, redisTxnWideSetFenceElem(key))
 	return elems, nil
@@ -177,21 +201,7 @@ func sortedExactSetMembers(existing map[string]struct{}) []string {
 
 func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string, key []byte, readTS uint64, members map[string]struct{}) error {
 	if kind != setKind {
-		// HLL and other non-set kinds keep using the legacy blob format.
-		if len(members) == 0 {
-			elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-			if err != nil {
-				return err
-			}
-			return r.dispatchElems(ctx, true, readTS, elems)
-		}
-		payload, err := marshalSetValue(redisSetValue{Members: sortedExactSetMembers(members)})
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisExactSetStorageKey(kind, key), Value: payload},
-		})
+		return r.persistHLLMembersTxn(ctx, key, readTS, members)
 	}
 	// Wide-column set: full rewrite (used when the whole state is available).
 	if len(members) == 0 {
@@ -219,6 +229,38 @@ func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string
 	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
+func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, readTS uint64, members map[string]struct{}) error {
+	// HLL keeps a single anchor payload, now wrapped in an inline-TTL envelope
+	// while preserving legacy payload reads during migration.
+	if len(members) == 0 {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+	ttl, err := r.ttlAt(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if ttl != nil && !ttl.After(time.Now()) {
+		ttl = nil
+	}
+	payload, err := encodeRedisHLL(redisSetValue{Members: sortedExactSetMembers(members)}, ttl)
+	if err != nil {
+		return err
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisHLLKey(key), Value: payload}}
+	return r.dispatchElems(ctx, true, readTS, appendHLLScanIndexElem(elems, key, ttl))
+}
+
+func appendHLLScanIndexElem(elems []*kv.Elem[kv.OP], key []byte, ttl *time.Time) []*kv.Elem[kv.OP] {
+	if ttl != nil {
+		return append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	}
+	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
+}
+
 // applySetMemberMutation emits a Put or Del for one set member and returns the
 // change count (1) and the signed length delta (+1 or -1), or (0, 0) if no change.
 func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, add bool) ([]*kv.Elem[kv.OP], int, int64) {
@@ -231,7 +273,8 @@ func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, a
 	return elems, 0, 0
 }
 
-// mutateExactSetLegacy handles SADD/SREM for non-set kinds (e.g. HLL) via the legacy blob path.
+// mutateExactSetLegacy handles SADD/SREM for non-set kinds (e.g. HLL) via a
+// single anchor payload.
 func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context, kind string, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -265,7 +308,8 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		if err := r.rejectHLLPayloadForSetCreate(key, readTS, typ); err != nil {
+		cleanupElems, migrationElems, legacyMemberBase, expiredRecreate, err := r.setWideMutationBase(ctx, key, readTS, typ)
+		if err != nil {
 			return err
 		}
 
@@ -275,25 +319,18 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return cockerrors.WithStack(err)
 		}
 
-		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
-		if migErr != nil {
-			return migErr
-		}
-		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(members)+setWideColOverhead)
+		elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+len(members)+setWideColOverhead)
+		elems = append(elems, cleanupElems...)
 		elems = append(elems, migrationElems...)
-
-		// Extract legacy member names from migration ops so that applySetMemberMutations
-		// can treat them as already-existing (they are not yet visible at readTS).
-		legacyMemberBase := buildLegacySetMemberBase(migrationElems, key)
 
 		var lenDelta int64
 		var mutErr error
-		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase)
+		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase, expiredRecreate)
 		if mutErr != nil {
 			return mutErr
 		}
 
-		if changed == 0 && len(migrationElems) == 0 {
+		if changed == 0 && len(migrationElems) == 0 && len(cleanupElems) == 0 {
 			return nil
 		}
 
@@ -318,11 +355,41 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 	conn.WriteInt(changed)
 }
 
-func (r *RedisServer) rejectHLLPayloadForSetCreate(key []byte, readTS uint64, typ redisValueType) error {
+func (r *RedisServer) setWideMutationBase(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	typ redisValueType,
+) ([]*kv.Elem[kv.OP], []*kv.Elem[kv.OP], map[string]struct{}, bool, error) {
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeSet)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	if expiredRecreate {
+		return cleanupElems, nil, nil, true, nil
+	}
+	if !opElemsDeleteKey(cleanupElems, redisHLLKey(key)) {
+		if err := r.rejectHLLPayloadForSetCreate(ctx, key, readTS, typ); err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+	var migrationElems []*kv.Elem[kv.OP]
+	if !cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeSet) {
+		migrationElems, err = r.buildSetLegacyMigrationElems(ctx, key, readTS)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+	// Extract legacy member names from migration ops so that applySetMemberMutations
+	// can treat them as already-existing (they are not yet visible at readTS).
+	return cleanupElems, migrationElems, buildLegacySetMemberBase(migrationElems, key), false, nil
+}
+
+func (r *RedisServer) rejectHLLPayloadForSetCreate(ctx context.Context, key []byte, readTS uint64, typ redisValueType) error {
 	if typ != redisTypeNone {
 		return nil
 	}
-	hllExists, err := r.hllExistsAt(key, readTS)
+	hllExists, err := r.hllAnchorExistsAt(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
@@ -453,8 +520,11 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 // scan; otherwise it returns an empty (non-nil) map for per-member ExistsAt
 // fallback. Legacy members from migration elems are merged in so that members
 // already in-flight in the same transaction are treated as existing.
-func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}) (map[string]struct{}, error) {
+func (r *RedisServer) initSetExistsMap(ctx context.Context, key []byte, members [][]byte, readTS uint64, legacyBase map[string]struct{}, ignoreExisting bool) (map[string]struct{}, error) {
 	existsMap := make(map[string]struct{})
+	if ignoreExisting {
+		return existsMap, nil
+	}
 	if len(members) >= wideColumnBulkScanThreshold || len(legacyBase) > 0 {
 		var err error
 		existsMap, err = r.scanSetMemberExistsMap(ctx, key, readTS)
@@ -495,12 +565,12 @@ func (r *RedisServer) lookupSetMemberExists(ctx context.Context, memberStr strin
 // The bulk scan threshold is wideColumnBulkScanThreshold.
 // legacyBase contains members from a legacy blob being migrated in the same
 // transaction; they are not visible at readTS and must be treated as existing.
-func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}) ([]*kv.Elem[kv.OP], int, int64, error) {
-	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase)
+func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, members [][]byte, add bool, readTS uint64, elems []*kv.Elem[kv.OP], legacyBase map[string]struct{}, ignoreExisting bool) ([]*kv.Elem[kv.OP], int, int64, error) {
+	existsMap, err := r.initSetExistsMap(ctx, key, members, readTS, legacyBase, ignoreExisting)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	isSmallClean := len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
+	isSmallClean := !ignoreExisting && len(members) < wideColumnBulkScanThreshold && len(legacyBase) == 0
 	changed := 0
 	lenDelta := int64(0)
 	for _, member := range members {
@@ -653,7 +723,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 			return err
 		}
 
-		value, err := r.loadSetAt(context.Background(), hllKind, cmd.Args[1], readTS)
+		value, err := r.loadSetAt(ctx, hllKind, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
@@ -689,16 +759,17 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 			writeRedisError(conn, err)
 			return
 		}
-		if typ != redisTypeNone {
-			hllExists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
-			if err != nil {
-				writeRedisError(conn, err)
-				return
-			}
-			if !hllExists {
-				conn.WriteError(wrongTypeMessage)
-				return
-			}
+		hllExists, err := r.hllExistsAt(key, readTS)
+		if err != nil {
+			writeRedisError(conn, err)
+			return
+		}
+		if typ != redisTypeNone && !hllExists {
+			conn.WriteError(wrongTypeMessage)
+			return
+		}
+		if !hllExists {
+			continue
 		}
 		value, err := r.loadSetAt(ctx, hllKind, key, readTS)
 		if err != nil {

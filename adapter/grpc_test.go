@@ -16,6 +16,30 @@ import (
 	_ "google.golang.org/grpc/health"
 )
 
+func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
+	t.Parallel()
+
+	pairs := rawKeyPairs([][]byte{nil, {}, []byte("a")})
+	require.Len(t, pairs, 3)
+	require.Nil(t, pairs[0].Key)
+	require.NotNil(t, pairs[1].Key)
+	require.Empty(t, pairs[1].Key)
+	require.Equal(t, []byte("a"), pairs[2].Key)
+}
+
+const (
+	grpcSequenceFullIterations  = 9999
+	grpcSequenceShortIterations = 256
+)
+
+func grpcSequenceIterations(t testing.TB) int {
+	t.Helper()
+	if testing.Short() {
+		return grpcSequenceShortIterations
+	}
+	return grpcSequenceFullIterations
+}
+
 func Test_value_can_be_deleted(t *testing.T) {
 	t.Parallel()
 	nodes, adders, _ := createNode(t, 3)
@@ -142,6 +166,7 @@ type recordingRawGroupStore struct {
 	scanGroupID  uint64
 	scanStart    []byte
 	scanEnd      []byte
+	keyScanGroup bool
 	fallbackGet  bool
 	fallbackScan bool
 }
@@ -167,6 +192,14 @@ func (s *recordingRawGroupStore) ScanGroupAt(ctx context.Context, groupID uint64
 	s.scanStart = append([]byte(nil), start...)
 	s.scanEnd = append([]byte(nil), end...)
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingRawGroupStore) ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	s.scanGroupID = groupID
+	s.scanStart = append([]byte(nil), start...)
+	s.scanEnd = append([]byte(nil), end...)
+	s.keyScanGroup = true
+	return s.ScanKeysAt(ctx, start, end, limit, ts)
 }
 
 func TestGRPCServer_RawGet_UsesExplicitGroup(t *testing.T) {
@@ -203,6 +236,33 @@ func TestGRPCServer_RawScanAt_UsesExplicitGroup(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, resp.GetKv(), 1)
+	require.False(t, st.fallbackScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       9,
+		GroupId:  42,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.True(t, st.keyScanGroup)
 	require.False(t, st.fallbackScan)
 	require.Equal(t, uint64(42), st.scanGroupID)
 	require.Equal(t, []byte("a"), st.scanStart)
@@ -277,7 +337,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	// not abort the test. The post-RPC assert.Equal still pins the
 	// consistency invariant: once Put eventually succeeds, the
 	// subsequent Get must return the same value, otherwise we fail.
-	for i := range 9999 {
+	for i := range grpcSequenceIterations(t) {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
@@ -332,7 +392,7 @@ func Test_grpc_transaction(t *testing.T) {
 	// _sequence: tolerate transient leader churn (purely availability,
 	// not consistency) while keeping the Put → Get → Delete → Get
 	// invariants strict.
-	for i := range 9999 {
+	for i := range grpcSequenceIterations(t) {
 		want := []byte("sequence" + strconv.Itoa(i))
 		err := retryNotLeader(ctx, func() error {
 			_, perr := c.Put(ctx, &pb.PutRequest{Key: key, Value: want})
