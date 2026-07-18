@@ -60,6 +60,10 @@ type rawGroupScanner interface {
 	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
 
+type rawGroupKeyScanner interface {
+	ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error)
+}
+
 func WithCloseStore() GRPCServerOption {
 	return func(s *GRPCServer) {
 		s.closeStore = true
@@ -184,15 +188,80 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
 
+	if req.GetKeysOnly() {
+		keys, err := r.rawScanKeysAt(ctx, req, limit, readTS)
+		if err != nil {
+			return rawScanErrorResponse(err)
+		}
+		return &pb.RawScanAtResponse{Kv: rawKeyPairs(keys)}, nil
+	}
+
 	res, err := r.rawScanAt(ctx, req, limit, readTS)
 	if err != nil {
-		if errors.Is(err, store.ErrReadTSCompacted) {
-			return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
-		}
-		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
+		return rawScanErrorResponse(err)
 	}
 
 	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
+}
+
+func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
+	if req.GetRouteBoundsPresent() || req.GetReadRouteVersion() != 0 {
+		return r.rawScanKeysAtWithReadFence(ctx, req, limit, readTS)
+	}
+	if groupID := req.GetGroupId(); groupID != 0 {
+		return r.rawScanGroupKeysAt(ctx, req, groupID, limit, readTS)
+	}
+	if req.GetReverse() {
+		return r.rawReverseScanKeysAt(ctx, req, limit, readTS)
+	}
+	keys, err := r.store.ScanKeysAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	return keys, errors.WithStack(err)
+}
+
+func (r *GRPCServer) rawScanKeysAtWithReadFence(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
+	fenceScanner, ok := r.store.(rawReadFenceScanner)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with read fence requires a read-fence-aware store"))
+	}
+	if req.GetGroupId() != 0 && req.GetReverse() && !req.GetRouteBoundsPresent() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
+	}
+	routeStart, routeEnd := rawScanRouteBounds(req)
+	kvs, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), routeStart, routeEnd)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return storeKeysFromKVPairs(kvs), nil
+}
+
+func (r *GRPCServer) rawScanGroupKeysAt(ctx context.Context, req *pb.RawScanAtRequest, groupID uint64, limit int, readTS uint64) ([][]byte, error) {
+	if req.GetReverse() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
+	}
+	groupScanner, ok := r.store.(rawGroupKeyScanner)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with explicit group requires a group-aware store"))
+	}
+	keys, err := groupScanner.ScanGroupKeysAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return keys, nil
+}
+
+func (r *GRPCServer) rawReverseScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
+	kvs, err := r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return storeKeysFromKVPairs(kvs), nil
+}
+
+func rawScanErrorResponse(err error) (*pb.RawScanAtResponse, error) {
+	if errors.Is(err, store.ErrReadTSCompacted) {
+		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
+	}
+	return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
 }
 
 func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([]*store.KVPair, error) {
@@ -290,6 +359,25 @@ func rawKvPairs(res []*store.KVPair) []*pb.RawKVPair {
 		})
 	}
 	return out
+}
+
+func rawKeyPairs(keys [][]byte) []*pb.RawKVPair {
+	out := make([]*pb.RawKVPair, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, &pb.RawKVPair{Key: key})
+	}
+	return out
+}
+
+func storeKeysFromKVPairs(kvs []*store.KVPair) [][]byte {
+	keys := make([][]byte, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		keys = append(keys, kvp.Key)
+	}
+	return keys
 }
 
 func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {

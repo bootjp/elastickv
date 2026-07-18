@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -39,6 +40,17 @@ func encodeRedisTree(t *testing.T, inRoot string) []byte {
 		t.Fatalf("WriteTo: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func snapshotUserValueForKey(t *testing.T, b *snapshotBuilder, userKey []byte) []byte {
+	t.Helper()
+	for _, entry := range b.entries {
+		if len(entry.key) == len(userKey)+snapshotTSSize && bytes.HasPrefix(entry.key, userKey) {
+			return entry.val[snapshotValueHeaderSize:]
+		}
+	}
+	t.Fatalf("missing encoded entry for user key %q", userKey)
+	return nil
 }
 
 // decodeRedisTree decodes fsm bytes through the real decode path into a
@@ -105,9 +117,8 @@ func TestRedisEncodeStringTTLRoundTripViaDecode(t *testing.T) {
 	}
 }
 
-// TestRedisEncodeHLLTTLRoundTripViaDecode pins that an HLL sketch is
-// emitted raw under !redis|hll| and its TTL via an !redis|ttl| row,
-// both recovered on decode (hll/<k>.bin + hll_ttl.jsonl).
+// TestRedisEncodeHLLTTLRoundTripViaDecode pins that an HLL sketch and
+// TTL are both recovered on decode (hll/<k>.bin + hll_ttl.jsonl).
 func TestRedisEncodeHLLTTLRoundTripViaDecode(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
@@ -128,6 +139,35 @@ func TestRedisEncodeHLLTTLRoundTripViaDecode(t *testing.T) {
 	}
 	if gotMs := readTTLSidecar(t, out, "hll_ttl.jsonl")[enc]; gotMs != expireMs {
 		t.Fatalf("decoded hll_ttl[%s] = %d, want %d", enc, gotMs, expireMs)
+	}
+}
+
+func TestRedisEncodeHLLTTLIsInlineInValue(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("counter"))
+	const expireMs uint64 = 1_700_000_000_000
+	sketch := []byte{0x01, 0x02, 0x03, 0xFF, 0x00}
+	writeRedisFile(t, in, filepath.Join("hll", enc+".bin"), sketch)
+	writeTTLSidecar(t, in, "hll_ttl.jsonl", enc, expireMs)
+
+	b := newSnapshotBuilder(redisEncTS)
+	if err := NewRedisEncoder(in, 0).Encode(b); err != nil {
+		t.Fatalf("RedisEncoder.Encode: %v", err)
+	}
+	key := append([]byte(RedisHLLPrefix), []byte("counter")...)
+	got := snapshotUserValueForKey(t, b, key)
+	if len(got) != redisHLLBaseHeader+redisUint64Bytes+len(sketch) {
+		t.Fatalf("encoded hll length = %d, want %d", len(got), redisHLLBaseHeader+redisUint64Bytes+len(sketch))
+	}
+	if !bytes.Equal(got[:redisHLLBaseHeader], []byte{redisHLLMagic, redisHLLVersion, redisHLLHasTTL}) {
+		t.Fatalf("encoded hll header = %x", got[:redisHLLBaseHeader])
+	}
+	if gotMs := binary.BigEndian.Uint64(got[redisHLLBaseHeader : redisHLLBaseHeader+redisUint64Bytes]); gotMs != expireMs {
+		t.Fatalf("encoded hll ttl = %d, want %d", gotMs, expireMs)
+	}
+	if !bytes.Equal(got[redisHLLBaseHeader+redisUint64Bytes:], sketch) {
+		t.Fatalf("encoded hll sketch = %x, want %x", got[redisHLLBaseHeader+redisUint64Bytes:], sketch)
 	}
 }
 

@@ -260,7 +260,10 @@ func EncodeSplitJob(job SplitJob) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Wrapf(ErrCatalogInvalidSplitJobRecord, "marshal split job: %v", err)
 	}
-	out := make([]byte, 1+len(body))
+	if len(body) > math.MaxInt-1 {
+		return nil, errors.Wrap(ErrCatalogInvalidSplitJobRecord, "encoded split job exceeds maximum slice length")
+	}
+	out := make([]byte, len(body)+1)
 	out[0] = catalogJobCodecVersion
 	copy(out[1:], body)
 	return out, nil
@@ -542,7 +545,64 @@ func validateSplitJobPhases(job SplitJob) error {
 	if !job.RetryPhase.valid() || !job.AbandonFromPhase.valid() {
 		return errors.WithStack(ErrCatalogInvalidSplitJobPhase)
 	}
+	if !job.retryPhaseValidForPhase() || !job.abandonFromPhaseValidForPhase() {
+		return errors.WithStack(ErrCatalogInvalidSplitJobPhase)
+	}
 	return nil
+}
+
+func (job SplitJob) retryPhaseValidForPhase() bool {
+	if job.Phase == SplitJobPhaseFailed {
+		return job.RetryPhase.retryable()
+	}
+	return job.RetryPhase == SplitJobPhaseNone
+}
+
+func (job SplitJob) abandonFromPhaseValidForPhase() bool {
+	if job.Phase == SplitJobPhaseAbandoning {
+		return job.AbandonFromPhase.abandonable()
+	}
+	return job.AbandonFromPhase == SplitJobPhaseNone
+}
+
+func (p SplitJobPhase) retryable() bool {
+	switch p {
+	case SplitJobPhaseBackfill,
+		SplitJobPhaseFence,
+		SplitJobPhaseDeltaCopy,
+		SplitJobPhaseCutover,
+		SplitJobPhaseCleanup:
+		return true
+	case SplitJobPhaseNone,
+		SplitJobPhasePlanned,
+		SplitJobPhaseDone,
+		SplitJobPhaseFailed,
+		SplitJobPhaseAbandoning,
+		SplitJobPhaseAbandoned:
+		return false
+	default:
+		return false
+	}
+}
+
+func (p SplitJobPhase) abandonable() bool {
+	switch p {
+	case SplitJobPhaseBackfill,
+		SplitJobPhaseFence,
+		SplitJobPhaseDeltaCopy:
+		return true
+	case SplitJobPhaseNone,
+		SplitJobPhasePlanned,
+		SplitJobPhaseCutover,
+		SplitJobPhaseCleanup,
+		SplitJobPhaseDone,
+		SplitJobPhaseFailed,
+		SplitJobPhaseAbandoning,
+		SplitJobPhaseAbandoned:
+		return false
+	default:
+		return false
+	}
 }
 
 func validateSplitJobBarriers(job SplitJob) error {
@@ -553,10 +613,15 @@ func validateSplitJobBarriers(job SplitJob) error {
 }
 
 func validateSplitJobBracketProgress(progress []SplitJobBracketProgress) error {
+	seen := make(map[uint64]struct{}, len(progress))
 	for _, p := range progress {
 		if !p.ExportPhase.valid() {
 			return errors.WithStack(ErrCatalogInvalidSplitJobExportPhase)
 		}
+		if _, ok := seen[p.BracketID]; ok {
+			return errors.WithStack(ErrCatalogInvalidSplitJobRecord)
+		}
+		seen[p.BracketID] = struct{}{}
 	}
 	return nil
 }
@@ -726,7 +791,7 @@ func (s *CatalogStore) buildSplitJobPutMutations(ctx context.Context, readTS uin
 	if jobID == math.MaxUint64 {
 		return nil, errors.WithStack(ErrCatalogSplitJobIDOverflow)
 	}
-	nextJobID, err := s.splitJobNextIDFloorAt(ctx, readTS, jobID)
+	nextJobID, err := s.splitJobNextIDAdvanceAt(ctx, readTS, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -746,7 +811,7 @@ func (s *CatalogStore) buildSplitJobPutMutations(ctx context.Context, readTS uin
 	return mutations, nil
 }
 
-func (s *CatalogStore) splitJobNextIDFloorAt(ctx context.Context, ts uint64, jobID uint64) (uint64, error) {
+func (s *CatalogStore) splitJobNextIDAdvanceAt(ctx context.Context, ts uint64, jobID uint64) (uint64, error) {
 	nextJobID, err := s.nextSplitJobIDAt(ctx, ts)
 	if err != nil {
 		return 0, err
@@ -759,14 +824,13 @@ func (s *CatalogStore) splitJobNextIDFloorAt(ctx context.Context, ts uint64, job
 	if err != nil {
 		return 0, err
 	}
-	if nextJobID < floor {
-		nextJobID = floor
+	if jobID+1 > floor {
+		floor = jobID + 1
 	}
-	floor = jobID + 1
-	if nextJobID < floor {
-		nextJobID = floor
+	if nextJobID == 0 || nextJobID < floor {
+		return floor, nil
 	}
-	return nextJobID, nil
+	return 0, nil
 }
 
 func (s *CatalogStore) applySplitJobMutations(ctx context.Context, readTS uint64, readKeys [][]byte, mutations []*store.KVPairMutation) error {

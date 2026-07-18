@@ -1,6 +1,6 @@
 # Deploy via Tailscale + GitHub Actions — Runbook
 
-Companion doc to `docs/design/2026_04_24_proposed_deploy_via_tailscale.md`. This
+Companion doc to `docs/design/2026_04_24_implemented_deploy_via_tailscale.md`. This
 runbook is for operators: what to configure on GitHub and Tailscale so the
 `rolling-update` workflow can execute a production deploy.
 

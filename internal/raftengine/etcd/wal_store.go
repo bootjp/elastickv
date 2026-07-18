@@ -142,16 +142,11 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		return nil, err
 	}
 
-	// Codex P1 #934: open the WAL BEFORE the skip-gate decision so we
-	// know the post-snapshot entry tail. The skip path is only safe
-	// when the FSM is at least as advanced as the last WAL entry; if
-	// the FSM is past `tok.Index` but the WAL still carries entries
-	// `tok.Index+1 .. have` (the normal interval between snapshots,
-	// since metaAppliedIndex advances on each Apply), those entries
-	// would re-apply onto a Pebble store that already contains them,
-	// hitting OCC conflicts and leaving the HLC below timestamps
-	// already on disk. Compute the WAL tail's last index and gate
-	// the skip on `have >= lastWalIndex`.
+	// Open the WAL before the restore decision so we know the committed
+	// replay target. The FSM restore can be skipped as soon as the
+	// durable FSM is at least at the snapshot pointer: Open seeds the
+	// engine's applied counter from EffectiveApplied, and WAL replay
+	// then delivers only committed entries above that durable point.
 	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot))
 	if err != nil {
 		return nil, err
@@ -202,30 +197,36 @@ func reportColdStartExecute(obs raftengine.ColdStartObserver, logger *zap.Logger
 	if logger == nil {
 		return
 	}
-	// gap_to_snapshot uses absolute value because the gate now
-	// permits have > snapIndex (FSM ahead of snapshot but behind
-	// committed tail). gap_behind_committed is target-have; can be
-	// 0 when have==target.
+	// gap_to_snapshot uses absolute value because stale metadata can
+	// still report an FSM ahead of the snapshot while the execute path
+	// runs due to an earlier fallback. gap_behind_committed is clamped
+	// to avoid underflow when tests call this helper with a lower
+	// synthetic target.
 	var gapToSnapshot uint64
 	if have >= snapIndex {
 		gapToSnapshot = have - snapIndex
 	} else {
 		gapToSnapshot = snapIndex - have
 	}
+	var gapBehindCommitted uint64
+	if target > have {
+		gapBehindCommitted = target - have
+	}
 	logger.Info("restoreSnapshotState executed (FSM behind WAL committed tail)",
 		zap.Uint64("fsm_applied", have),
 		zap.Uint64("snapshot_index", snapIndex),
 		zap.Uint64("last_committed_index", target),
 		zap.Uint64("gap_to_snapshot", gapToSnapshot),
-		zap.Uint64("gap_behind_committed", target-have),
+		zap.Uint64("gap_behind_committed", gapBehindCommitted),
 	)
 }
 
 // coldStartSkipThreshold returns the maximum log index the cold-
 // start replay can deliver via Ready.CommittedEntries on this
-// node: max(snapshot.Metadata.Index, hardState.Commit). The skip
-// gate compares the FSM's durable applied index against this
-// value; skip is only safe when the FSM is at least this fresh.
+// node: max(snapshot.Metadata.Index, hardState.Commit). This is the
+// committed replay target used for observability; the snapshot body
+// restore decision itself only requires the durable FSM to be at
+// least at snapshot.Metadata.Index.
 //
 // Followers can carry an UNCOMMITTED WAL suffix
 // (entries[n-1].Index > hardState.Commit). Raft does NOT surface
@@ -252,8 +253,7 @@ func coldStartSkipThreshold(snapshot raftpb.Snapshot, hardState raftpb.HardState
 // skip gate fires with the FSM at `have > snapshot.Metadata.Index`,
 // EffectiveApplied carries `have`; without this seed the engine
 // would deliver entries snapshot.Index+1..have to applyCommitted
-// and re-apply them onto a Pebble store already containing them
-// (codex P1 #934 root cause).
+// and re-apply them onto a Pebble store already containing them.
 func coldStartApplied(disk *diskState) uint64 {
 	base := maxAppliedIndex(disk.LocalSnap)
 	if disk.EffectiveApplied > base {
@@ -356,12 +356,12 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 // <= have or the Pebble store would observe them twice (OCC
 // conflicts; HLC ceiling inversion). The execute path returns
 // snapshot.Metadata.Index to leave engine behaviour unchanged.
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, committedTailIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
 	if etcdraft.IsEmptySnap(&snapshot) || len(snapshot.Data) == 0 || fsm == nil {
 		return 0, nil
 	}
 	if isSnapshotToken(snapshot.Data) {
-		return restoreSnapshotStateFromToken(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger)
+		return restoreSnapshotStateFromToken(fsm, snapshot, committedTailIndex, fsmSnapDir, obs, logger)
 	}
 	// Legacy format: full FSM payload embedded in snapshot.Data.
 	if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
@@ -376,32 +376,33 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalInd
 //   - skip path: `have` (FSM is already past snapshot.Metadata.Index)
 //   - execute path: snapshot.Metadata.Index (restored from snapshot)
 //
-// The skip threshold is lastWalIndex (NOT tok.Index): the FSM must be
-// at least as fresh as the last WAL entry the cold-start replay would
-// deliver, otherwise entries between tok.Index and have would re-apply
-// onto a Pebble store that already contains them. Codex P1 #934.
+// The skip threshold is snapshot.Metadata.Index: once the FSM is at
+// the snapshot pointer, the engine can seed its applied counter from
+// the durable FSM index and replay only the committed WAL suffix above
+// that point.
 //
 // Metrics + log fire AFTER the restore-side work succeeds (coderabbit
 // Major #934): a header/CRC failure must not register a "successful"
 // outcome in the soak metrics.
-func restoreSnapshotStateFromToken(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
+func restoreSnapshotStateFromToken(fsm StateMachine, snapshot raftpb.Snapshot, committedTailIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
 	tok, err := decodeSnapshotToken(snapshot.Data)
 	if err != nil {
 		return 0, err
 	}
-	decision, have := decideSkipOutcome(fsm, lastWalIndex)
+	snapIndex := snapshot.GetMetadata().GetIndex()
+	decision, have := decideSkipOutcome(fsm, snapIndex)
 	snapPath := fsmSnapPath(fsmSnapDir, tok.Index)
 	if decision == coldStartSkip {
 		if err := applyHeaderStateOnSkip(fsm, snapPath, tok.CRC32C); err != nil {
 			return 0, err
 		}
-		reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+		reportColdStart(obs, logger, decision, snapIndex, committedTailIndex, have)
 		return have, nil
 	}
 	if err := openAndRestoreFSMSnapshot(fsm, snapPath, tok.CRC32C); err != nil {
 		return 0, err
 	}
-	reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+	reportColdStart(obs, logger, decision, snapIndex, committedTailIndex, have)
 	return snapshot.GetMetadata().GetIndex(), nil
 }
 
@@ -468,6 +469,13 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 			obs.RestoreSkipped(snapIndex, have)
 		}
 		if logger != nil {
+			var gapAheadCommitted uint64
+			var gapBehindCommitted uint64
+			if have >= target {
+				gapAheadCommitted = have - target
+			} else {
+				gapBehindCommitted = target - have
+			}
 			// Two named gap fields so an operator correlating the
 			// log against the Prometheus gauge sees consistent
 			// magnitudes (claude #934 round 5):
@@ -480,7 +488,8 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 				zap.Uint64("snapshot_index", snapIndex),
 				zap.Uint64("last_committed_index", target),
 				zap.Uint64("gap_ahead_snapshot", have-snapIndex),
-				zap.Uint64("gap_ahead_committed", have-target),
+				zap.Uint64("gap_ahead_committed", gapAheadCommitted),
+				zap.Uint64("gap_behind_committed", gapBehindCommitted),
 			)
 		}
 	case coldStartExecute:
