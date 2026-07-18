@@ -11,9 +11,10 @@ import (
 //
 // The leading `!` and the pipe-separated layout match the existing
 // `!admin|` reservation in adapter/distribution_server.go and the
-// `txnInternalKeyPrefix` reservation in store/. The pebbleStore's
-// applyMutationsBatch refuses user mutations whose key starts with
-// this prefix so a malformed user Put cannot clobber registry rows.
+// `txnInternalKeyPrefix` reservation in store/. Pebble raw-key scans
+// distinguish registry rows by this exact unversioned key shape, not
+// by prefix alone, so MVCC-encoded user keys that happen to share the
+// textual prefix remain normal user data.
 //
 // Registry rows are written through pebbleStore.EncryptionRegistryBatch
 // (Stage 4 admin path), NOT through the MVCC encoded-key flow —

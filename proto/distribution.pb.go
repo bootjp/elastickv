@@ -76,6 +76,180 @@ func (RouteState) EnumDescriptor() ([]byte, []int) {
 	return file_distribution_proto_rawDescGZIP(), []int{0}
 }
 
+type SplitJobPhase int32
+
+const (
+	SplitJobPhase_SPLIT_JOB_PHASE_NONE       SplitJobPhase = 0
+	SplitJobPhase_SPLIT_JOB_PHASE_PLANNED    SplitJobPhase = 1
+	SplitJobPhase_SPLIT_JOB_PHASE_BACKFILL   SplitJobPhase = 2
+	SplitJobPhase_SPLIT_JOB_PHASE_FENCE      SplitJobPhase = 3
+	SplitJobPhase_SPLIT_JOB_PHASE_DELTA_COPY SplitJobPhase = 4
+	SplitJobPhase_SPLIT_JOB_PHASE_CUTOVER    SplitJobPhase = 5
+	SplitJobPhase_SPLIT_JOB_PHASE_CLEANUP    SplitJobPhase = 6
+	SplitJobPhase_SPLIT_JOB_PHASE_DONE       SplitJobPhase = 7
+	SplitJobPhase_SPLIT_JOB_PHASE_FAILED     SplitJobPhase = 8
+	SplitJobPhase_SPLIT_JOB_PHASE_ABANDONING SplitJobPhase = 9
+	SplitJobPhase_SPLIT_JOB_PHASE_ABANDONED  SplitJobPhase = 10
+)
+
+// Enum value maps for SplitJobPhase.
+var (
+	SplitJobPhase_name = map[int32]string{
+		0:  "SPLIT_JOB_PHASE_NONE",
+		1:  "SPLIT_JOB_PHASE_PLANNED",
+		2:  "SPLIT_JOB_PHASE_BACKFILL",
+		3:  "SPLIT_JOB_PHASE_FENCE",
+		4:  "SPLIT_JOB_PHASE_DELTA_COPY",
+		5:  "SPLIT_JOB_PHASE_CUTOVER",
+		6:  "SPLIT_JOB_PHASE_CLEANUP",
+		7:  "SPLIT_JOB_PHASE_DONE",
+		8:  "SPLIT_JOB_PHASE_FAILED",
+		9:  "SPLIT_JOB_PHASE_ABANDONING",
+		10: "SPLIT_JOB_PHASE_ABANDONED",
+	}
+	SplitJobPhase_value = map[string]int32{
+		"SPLIT_JOB_PHASE_NONE":       0,
+		"SPLIT_JOB_PHASE_PLANNED":    1,
+		"SPLIT_JOB_PHASE_BACKFILL":   2,
+		"SPLIT_JOB_PHASE_FENCE":      3,
+		"SPLIT_JOB_PHASE_DELTA_COPY": 4,
+		"SPLIT_JOB_PHASE_CUTOVER":    5,
+		"SPLIT_JOB_PHASE_CLEANUP":    6,
+		"SPLIT_JOB_PHASE_DONE":       7,
+		"SPLIT_JOB_PHASE_FAILED":     8,
+		"SPLIT_JOB_PHASE_ABANDONING": 9,
+		"SPLIT_JOB_PHASE_ABANDONED":  10,
+	}
+)
+
+func (x SplitJobPhase) Enum() *SplitJobPhase {
+	p := new(SplitJobPhase)
+	*p = x
+	return p
+}
+
+func (x SplitJobPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SplitJobPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_distribution_proto_enumTypes[1].Descriptor()
+}
+
+func (SplitJobPhase) Type() protoreflect.EnumType {
+	return &file_distribution_proto_enumTypes[1]
+}
+
+func (x SplitJobPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SplitJobPhase.Descriptor instead.
+func (SplitJobPhase) EnumDescriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{1}
+}
+
+type SplitJobBarrierState int32
+
+const (
+	SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_NONE     SplitJobBarrierState = 0
+	SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_ARMING   SplitJobBarrierState = 1
+	SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_ARMED    SplitJobBarrierState = 2
+	SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_CLEARING SplitJobBarrierState = 3
+)
+
+// Enum value maps for SplitJobBarrierState.
+var (
+	SplitJobBarrierState_name = map[int32]string{
+		0: "SPLIT_JOB_BARRIER_STATE_NONE",
+		1: "SPLIT_JOB_BARRIER_STATE_ARMING",
+		2: "SPLIT_JOB_BARRIER_STATE_ARMED",
+		3: "SPLIT_JOB_BARRIER_STATE_CLEARING",
+	}
+	SplitJobBarrierState_value = map[string]int32{
+		"SPLIT_JOB_BARRIER_STATE_NONE":     0,
+		"SPLIT_JOB_BARRIER_STATE_ARMING":   1,
+		"SPLIT_JOB_BARRIER_STATE_ARMED":    2,
+		"SPLIT_JOB_BARRIER_STATE_CLEARING": 3,
+	}
+)
+
+func (x SplitJobBarrierState) Enum() *SplitJobBarrierState {
+	p := new(SplitJobBarrierState)
+	*p = x
+	return p
+}
+
+func (x SplitJobBarrierState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SplitJobBarrierState) Descriptor() protoreflect.EnumDescriptor {
+	return file_distribution_proto_enumTypes[2].Descriptor()
+}
+
+func (SplitJobBarrierState) Type() protoreflect.EnumType {
+	return &file_distribution_proto_enumTypes[2]
+}
+
+func (x SplitJobBarrierState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SplitJobBarrierState.Descriptor instead.
+func (SplitJobBarrierState) EnumDescriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{2}
+}
+
+type SplitJobExportPhase int32
+
+const (
+	SplitJobExportPhase_SPLIT_JOB_EXPORT_PHASE_NONE       SplitJobExportPhase = 0
+	SplitJobExportPhase_SPLIT_JOB_EXPORT_PHASE_BACKFILL   SplitJobExportPhase = 1
+	SplitJobExportPhase_SPLIT_JOB_EXPORT_PHASE_DELTA_COPY SplitJobExportPhase = 2
+)
+
+// Enum value maps for SplitJobExportPhase.
+var (
+	SplitJobExportPhase_name = map[int32]string{
+		0: "SPLIT_JOB_EXPORT_PHASE_NONE",
+		1: "SPLIT_JOB_EXPORT_PHASE_BACKFILL",
+		2: "SPLIT_JOB_EXPORT_PHASE_DELTA_COPY",
+	}
+	SplitJobExportPhase_value = map[string]int32{
+		"SPLIT_JOB_EXPORT_PHASE_NONE":       0,
+		"SPLIT_JOB_EXPORT_PHASE_BACKFILL":   1,
+		"SPLIT_JOB_EXPORT_PHASE_DELTA_COPY": 2,
+	}
+)
+
+func (x SplitJobExportPhase) Enum() *SplitJobExportPhase {
+	p := new(SplitJobExportPhase)
+	*p = x
+	return p
+}
+
+func (x SplitJobExportPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SplitJobExportPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_distribution_proto_enumTypes[3].Descriptor()
+}
+
+func (SplitJobExportPhase) Type() protoreflect.EnumType {
+	return &file_distribution_proto_enumTypes[3]
+}
+
+func (x SplitJobExportPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SplitJobExportPhase.Descriptor instead.
+func (SplitJobExportPhase) EnumDescriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{3}
+}
+
 type GetRouteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
@@ -346,6 +520,406 @@ func (x *RouteDescriptor) GetParentRouteId() uint64 {
 	return 0
 }
 
+type SplitJobBracketProgress struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	BracketId         uint64                 `protobuf:"varint,1,opt,name=bracket_id,json=bracketId,proto3" json:"bracket_id,omitempty"`
+	Family            uint32                 `protobuf:"varint,2,opt,name=family,proto3" json:"family,omitempty"`
+	ExportPhase       SplitJobExportPhase    `protobuf:"varint,3,opt,name=export_phase,json=exportPhase,proto3,enum=SplitJobExportPhase" json:"export_phase,omitempty"`
+	Cursor            []byte                 `protobuf:"bytes,4,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Done              bool                   `protobuf:"varint,5,opt,name=done,proto3" json:"done,omitempty"`
+	ScannedBytes      uint64                 `protobuf:"varint,6,opt,name=scanned_bytes,json=scannedBytes,proto3" json:"scanned_bytes,omitempty"`
+	AcceptedRows      uint64                 `protobuf:"varint,7,opt,name=accepted_rows,json=acceptedRows,proto3" json:"accepted_rows,omitempty"`
+	LastAckedBatchSeq uint64                 `protobuf:"varint,8,opt,name=last_acked_batch_seq,json=lastAckedBatchSeq,proto3" json:"last_acked_batch_seq,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *SplitJobBracketProgress) Reset() {
+	*x = SplitJobBracketProgress{}
+	mi := &file_distribution_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SplitJobBracketProgress) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SplitJobBracketProgress) ProtoMessage() {}
+
+func (x *SplitJobBracketProgress) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SplitJobBracketProgress.ProtoReflect.Descriptor instead.
+func (*SplitJobBracketProgress) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SplitJobBracketProgress) GetBracketId() uint64 {
+	if x != nil {
+		return x.BracketId
+	}
+	return 0
+}
+
+func (x *SplitJobBracketProgress) GetFamily() uint32 {
+	if x != nil {
+		return x.Family
+	}
+	return 0
+}
+
+func (x *SplitJobBracketProgress) GetExportPhase() SplitJobExportPhase {
+	if x != nil {
+		return x.ExportPhase
+	}
+	return SplitJobExportPhase_SPLIT_JOB_EXPORT_PHASE_NONE
+}
+
+func (x *SplitJobBracketProgress) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *SplitJobBracketProgress) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *SplitJobBracketProgress) GetScannedBytes() uint64 {
+	if x != nil {
+		return x.ScannedBytes
+	}
+	return 0
+}
+
+func (x *SplitJobBracketProgress) GetAcceptedRows() uint64 {
+	if x != nil {
+		return x.AcceptedRows
+	}
+	return 0
+}
+
+func (x *SplitJobBracketProgress) GetLastAckedBatchSeq() uint64 {
+	if x != nil {
+		return x.LastAckedBatchSeq
+	}
+	return 0
+}
+
+type SplitJob struct {
+	state                            protoimpl.MessageState     `protogen:"open.v1"`
+	JobId                            uint64                     `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	SourceRouteId                    uint64                     `protobuf:"varint,2,opt,name=source_route_id,json=sourceRouteId,proto3" json:"source_route_id,omitempty"`
+	SplitKey                         []byte                     `protobuf:"bytes,3,opt,name=split_key,json=splitKey,proto3" json:"split_key,omitempty"`
+	TargetGroupId                    uint64                     `protobuf:"varint,4,opt,name=target_group_id,json=targetGroupId,proto3" json:"target_group_id,omitempty"`
+	Phase                            SplitJobPhase              `protobuf:"varint,5,opt,name=phase,proto3,enum=SplitJobPhase" json:"phase,omitempty"`
+	RetryPhase                       SplitJobPhase              `protobuf:"varint,6,opt,name=retry_phase,json=retryPhase,proto3,enum=SplitJobPhase" json:"retry_phase,omitempty"`
+	AbandonFromPhase                 SplitJobPhase              `protobuf:"varint,7,opt,name=abandon_from_phase,json=abandonFromPhase,proto3,enum=SplitJobPhase" json:"abandon_from_phase,omitempty"`
+	SnapshotTs                       uint64                     `protobuf:"varint,8,opt,name=snapshot_ts,json=snapshotTs,proto3" json:"snapshot_ts,omitempty"`
+	SnapshotMinAdmittedTs            uint64                     `protobuf:"varint,9,opt,name=snapshot_min_admitted_ts,json=snapshotMinAdmittedTs,proto3" json:"snapshot_min_admitted_ts,omitempty"`
+	WriteTrackerArmed                bool                       `protobuf:"varint,10,opt,name=write_tracker_armed,json=writeTrackerArmed,proto3" json:"write_tracker_armed,omitempty"`
+	DeltaFloor                       uint64                     `protobuf:"varint,11,opt,name=delta_floor,json=deltaFloor,proto3" json:"delta_floor,omitempty"`
+	PostFenceDrainCompleted          bool                       `protobuf:"varint,12,opt,name=post_fence_drain_completed,json=postFenceDrainCompleted,proto3" json:"post_fence_drain_completed,omitempty"`
+	FenceTs                          uint64                     `protobuf:"varint,13,opt,name=fence_ts,json=fenceTs,proto3" json:"fence_ts,omitempty"`
+	CutoverVersion                   uint64                     `protobuf:"varint,14,opt,name=cutover_version,json=cutoverVersion,proto3" json:"cutover_version,omitempty"`
+	CutoverReadFenceState            SplitJobBarrierState       `protobuf:"varint,15,opt,name=cutover_read_fence_state,json=cutoverReadFenceState,proto3,enum=SplitJobBarrierState" json:"cutover_read_fence_state,omitempty"`
+	TargetStagedReadinessState       SplitJobBarrierState       `protobuf:"varint,16,opt,name=target_staged_readiness_state,json=targetStagedReadinessState,proto3,enum=SplitJobBarrierState" json:"target_staged_readiness_state,omitempty"`
+	SourceCutoverReadFenceAckCursor  []byte                     `protobuf:"bytes,17,opt,name=source_cutover_read_fence_ack_cursor,json=sourceCutoverReadFenceAckCursor,proto3" json:"source_cutover_read_fence_ack_cursor,omitempty"`
+	TargetStagedReadinessAckCursor   []byte                     `protobuf:"bytes,18,opt,name=target_staged_readiness_ack_cursor,json=targetStagedReadinessAckCursor,proto3" json:"target_staged_readiness_ack_cursor,omitempty"`
+	Cursor                           []byte                     `protobuf:"bytes,19,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	MaxImportedTs                    uint64                     `protobuf:"varint,20,opt,name=max_imported_ts,json=maxImportedTs,proto3" json:"max_imported_ts,omitempty"`
+	TargetPromotionDone              bool                       `protobuf:"varint,21,opt,name=target_promotion_done,json=targetPromotionDone,proto3" json:"target_promotion_done,omitempty"`
+	PromotionCompletedTs             uint64                     `protobuf:"varint,22,opt,name=promotion_completed_ts,json=promotionCompletedTs,proto3" json:"promotion_completed_ts,omitempty"`
+	FenceCatalogVersion              uint64                     `protobuf:"varint,23,opt,name=fence_catalog_version,json=fenceCatalogVersion,proto3" json:"fence_catalog_version,omitempty"`
+	FenceAckCursor                   []byte                     `protobuf:"bytes,24,opt,name=fence_ack_cursor,json=fenceAckCursor,proto3" json:"fence_ack_cursor,omitempty"`
+	SourceCutoverAckCursor           []byte                     `protobuf:"bytes,25,opt,name=source_cutover_ack_cursor,json=sourceCutoverAckCursor,proto3" json:"source_cutover_ack_cursor,omitempty"`
+	SourceReadDrainCursor            []byte                     `protobuf:"bytes,26,opt,name=source_read_drain_cursor,json=sourceReadDrainCursor,proto3" json:"source_read_drain_cursor,omitempty"`
+	TargetClearedDescriptorAckCursor []byte                     `protobuf:"bytes,27,opt,name=target_cleared_descriptor_ack_cursor,json=targetClearedDescriptorAckCursor,proto3" json:"target_cleared_descriptor_ack_cursor,omitempty"`
+	BracketProgress                  []*SplitJobBracketProgress `protobuf:"bytes,28,rep,name=bracket_progress,json=bracketProgress,proto3" json:"bracket_progress,omitempty"`
+	SourceRetentionPinTs             uint64                     `protobuf:"varint,29,opt,name=source_retention_pin_ts,json=sourceRetentionPinTs,proto3" json:"source_retention_pin_ts,omitempty"`
+	LastError                        string                     `protobuf:"bytes,30,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
+	StartedAtMs                      int64                      `protobuf:"varint,31,opt,name=started_at_ms,json=startedAtMs,proto3" json:"started_at_ms,omitempty"`
+	UpdatedAtMs                      int64                      `protobuf:"varint,32,opt,name=updated_at_ms,json=updatedAtMs,proto3" json:"updated_at_ms,omitempty"`
+	TerminalAtMs                     int64                      `protobuf:"varint,33,opt,name=terminal_at_ms,json=terminalAtMs,proto3" json:"terminal_at_ms,omitempty"`
+	unknownFields                    protoimpl.UnknownFields
+	sizeCache                        protoimpl.SizeCache
+}
+
+func (x *SplitJob) Reset() {
+	*x = SplitJob{}
+	mi := &file_distribution_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SplitJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SplitJob) ProtoMessage() {}
+
+func (x *SplitJob) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SplitJob.ProtoReflect.Descriptor instead.
+func (*SplitJob) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SplitJob) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *SplitJob) GetSourceRouteId() uint64 {
+	if x != nil {
+		return x.SourceRouteId
+	}
+	return 0
+}
+
+func (x *SplitJob) GetSplitKey() []byte {
+	if x != nil {
+		return x.SplitKey
+	}
+	return nil
+}
+
+func (x *SplitJob) GetTargetGroupId() uint64 {
+	if x != nil {
+		return x.TargetGroupId
+	}
+	return 0
+}
+
+func (x *SplitJob) GetPhase() SplitJobPhase {
+	if x != nil {
+		return x.Phase
+	}
+	return SplitJobPhase_SPLIT_JOB_PHASE_NONE
+}
+
+func (x *SplitJob) GetRetryPhase() SplitJobPhase {
+	if x != nil {
+		return x.RetryPhase
+	}
+	return SplitJobPhase_SPLIT_JOB_PHASE_NONE
+}
+
+func (x *SplitJob) GetAbandonFromPhase() SplitJobPhase {
+	if x != nil {
+		return x.AbandonFromPhase
+	}
+	return SplitJobPhase_SPLIT_JOB_PHASE_NONE
+}
+
+func (x *SplitJob) GetSnapshotTs() uint64 {
+	if x != nil {
+		return x.SnapshotTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetSnapshotMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.SnapshotMinAdmittedTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetWriteTrackerArmed() bool {
+	if x != nil {
+		return x.WriteTrackerArmed
+	}
+	return false
+}
+
+func (x *SplitJob) GetDeltaFloor() uint64 {
+	if x != nil {
+		return x.DeltaFloor
+	}
+	return 0
+}
+
+func (x *SplitJob) GetPostFenceDrainCompleted() bool {
+	if x != nil {
+		return x.PostFenceDrainCompleted
+	}
+	return false
+}
+
+func (x *SplitJob) GetFenceTs() uint64 {
+	if x != nil {
+		return x.FenceTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetCutoverVersion() uint64 {
+	if x != nil {
+		return x.CutoverVersion
+	}
+	return 0
+}
+
+func (x *SplitJob) GetCutoverReadFenceState() SplitJobBarrierState {
+	if x != nil {
+		return x.CutoverReadFenceState
+	}
+	return SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_NONE
+}
+
+func (x *SplitJob) GetTargetStagedReadinessState() SplitJobBarrierState {
+	if x != nil {
+		return x.TargetStagedReadinessState
+	}
+	return SplitJobBarrierState_SPLIT_JOB_BARRIER_STATE_NONE
+}
+
+func (x *SplitJob) GetSourceCutoverReadFenceAckCursor() []byte {
+	if x != nil {
+		return x.SourceCutoverReadFenceAckCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetTargetStagedReadinessAckCursor() []byte {
+	if x != nil {
+		return x.TargetStagedReadinessAckCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetMaxImportedTs() uint64 {
+	if x != nil {
+		return x.MaxImportedTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetTargetPromotionDone() bool {
+	if x != nil {
+		return x.TargetPromotionDone
+	}
+	return false
+}
+
+func (x *SplitJob) GetPromotionCompletedTs() uint64 {
+	if x != nil {
+		return x.PromotionCompletedTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetFenceCatalogVersion() uint64 {
+	if x != nil {
+		return x.FenceCatalogVersion
+	}
+	return 0
+}
+
+func (x *SplitJob) GetFenceAckCursor() []byte {
+	if x != nil {
+		return x.FenceAckCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetSourceCutoverAckCursor() []byte {
+	if x != nil {
+		return x.SourceCutoverAckCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetSourceReadDrainCursor() []byte {
+	if x != nil {
+		return x.SourceReadDrainCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetTargetClearedDescriptorAckCursor() []byte {
+	if x != nil {
+		return x.TargetClearedDescriptorAckCursor
+	}
+	return nil
+}
+
+func (x *SplitJob) GetBracketProgress() []*SplitJobBracketProgress {
+	if x != nil {
+		return x.BracketProgress
+	}
+	return nil
+}
+
+func (x *SplitJob) GetSourceRetentionPinTs() uint64 {
+	if x != nil {
+		return x.SourceRetentionPinTs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetLastError() string {
+	if x != nil {
+		return x.LastError
+	}
+	return ""
+}
+
+func (x *SplitJob) GetStartedAtMs() int64 {
+	if x != nil {
+		return x.StartedAtMs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetUpdatedAtMs() int64 {
+	if x != nil {
+		return x.UpdatedAtMs
+	}
+	return 0
+}
+
+func (x *SplitJob) GetTerminalAtMs() int64 {
+	if x != nil {
+		return x.TerminalAtMs
+	}
+	return 0
+}
+
 type ListRoutesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -354,7 +928,7 @@ type ListRoutesRequest struct {
 
 func (x *ListRoutesRequest) Reset() {
 	*x = ListRoutesRequest{}
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -366,7 +940,7 @@ func (x *ListRoutesRequest) String() string {
 func (*ListRoutesRequest) ProtoMessage() {}
 
 func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -379,7 +953,7 @@ func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesRequest.ProtoReflect.Descriptor instead.
 func (*ListRoutesRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{5}
+	return file_distribution_proto_rawDescGZIP(), []int{7}
 }
 
 type ListRoutesResponse struct {
@@ -392,7 +966,7 @@ type ListRoutesResponse struct {
 
 func (x *ListRoutesResponse) Reset() {
 	*x = ListRoutesResponse{}
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -404,7 +978,7 @@ func (x *ListRoutesResponse) String() string {
 func (*ListRoutesResponse) ProtoMessage() {}
 
 func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -417,7 +991,7 @@ func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesResponse.ProtoReflect.Descriptor instead.
 func (*ListRoutesResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{6}
+	return file_distribution_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListRoutesResponse) GetCatalogVersion() uint64 {
@@ -445,7 +1019,7 @@ type SplitRangeRequest struct {
 
 func (x *SplitRangeRequest) Reset() {
 	*x = SplitRangeRequest{}
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -457,7 +1031,7 @@ func (x *SplitRangeRequest) String() string {
 func (*SplitRangeRequest) ProtoMessage() {}
 
 func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -470,7 +1044,7 @@ func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeRequest.ProtoReflect.Descriptor instead.
 func (*SplitRangeRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{7}
+	return file_distribution_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SplitRangeRequest) GetExpectedCatalogVersion() uint64 {
@@ -505,7 +1079,7 @@ type SplitRangeResponse struct {
 
 func (x *SplitRangeResponse) Reset() {
 	*x = SplitRangeResponse{}
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -517,7 +1091,7 @@ func (x *SplitRangeResponse) String() string {
 func (*SplitRangeResponse) ProtoMessage() {}
 
 func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -530,7 +1104,7 @@ func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeResponse.ProtoReflect.Descriptor instead.
 func (*SplitRangeResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{8}
+	return file_distribution_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SplitRangeResponse) GetCatalogVersion() uint64 {
@@ -574,7 +1148,56 @@ const file_distribution_proto_rawDesc = "" +
 	"\x03end\x18\x03 \x01(\fR\x03end\x12\"\n" +
 	"\rraft_group_id\x18\x04 \x01(\x04R\vraftGroupId\x12!\n" +
 	"\x05state\x18\x05 \x01(\x0e2\v.RouteStateR\x05state\x12&\n" +
-	"\x0fparent_route_id\x18\x06 \x01(\x04R\rparentRouteId\"\x13\n" +
+	"\x0fparent_route_id\x18\x06 \x01(\x04R\rparentRouteId\"\xb0\x02\n" +
+	"\x17SplitJobBracketProgress\x12\x1d\n" +
+	"\n" +
+	"bracket_id\x18\x01 \x01(\x04R\tbracketId\x12\x16\n" +
+	"\x06family\x18\x02 \x01(\rR\x06family\x127\n" +
+	"\fexport_phase\x18\x03 \x01(\x0e2\x14.SplitJobExportPhaseR\vexportPhase\x12\x16\n" +
+	"\x06cursor\x18\x04 \x01(\fR\x06cursor\x12\x12\n" +
+	"\x04done\x18\x05 \x01(\bR\x04done\x12#\n" +
+	"\rscanned_bytes\x18\x06 \x01(\x04R\fscannedBytes\x12#\n" +
+	"\raccepted_rows\x18\a \x01(\x04R\facceptedRows\x12/\n" +
+	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xe9\f\n" +
+	"\bSplitJob\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12&\n" +
+	"\x0fsource_route_id\x18\x02 \x01(\x04R\rsourceRouteId\x12\x1b\n" +
+	"\tsplit_key\x18\x03 \x01(\fR\bsplitKey\x12&\n" +
+	"\x0ftarget_group_id\x18\x04 \x01(\x04R\rtargetGroupId\x12$\n" +
+	"\x05phase\x18\x05 \x01(\x0e2\x0e.SplitJobPhaseR\x05phase\x12/\n" +
+	"\vretry_phase\x18\x06 \x01(\x0e2\x0e.SplitJobPhaseR\n" +
+	"retryPhase\x12<\n" +
+	"\x12abandon_from_phase\x18\a \x01(\x0e2\x0e.SplitJobPhaseR\x10abandonFromPhase\x12\x1f\n" +
+	"\vsnapshot_ts\x18\b \x01(\x04R\n" +
+	"snapshotTs\x127\n" +
+	"\x18snapshot_min_admitted_ts\x18\t \x01(\x04R\x15snapshotMinAdmittedTs\x12.\n" +
+	"\x13write_tracker_armed\x18\n" +
+	" \x01(\bR\x11writeTrackerArmed\x12\x1f\n" +
+	"\vdelta_floor\x18\v \x01(\x04R\n" +
+	"deltaFloor\x12;\n" +
+	"\x1apost_fence_drain_completed\x18\f \x01(\bR\x17postFenceDrainCompleted\x12\x19\n" +
+	"\bfence_ts\x18\r \x01(\x04R\afenceTs\x12'\n" +
+	"\x0fcutover_version\x18\x0e \x01(\x04R\x0ecutoverVersion\x12N\n" +
+	"\x18cutover_read_fence_state\x18\x0f \x01(\x0e2\x15.SplitJobBarrierStateR\x15cutoverReadFenceState\x12X\n" +
+	"\x1dtarget_staged_readiness_state\x18\x10 \x01(\x0e2\x15.SplitJobBarrierStateR\x1atargetStagedReadinessState\x12M\n" +
+	"$source_cutover_read_fence_ack_cursor\x18\x11 \x01(\fR\x1fsourceCutoverReadFenceAckCursor\x12J\n" +
+	"\"target_staged_readiness_ack_cursor\x18\x12 \x01(\fR\x1etargetStagedReadinessAckCursor\x12\x16\n" +
+	"\x06cursor\x18\x13 \x01(\fR\x06cursor\x12&\n" +
+	"\x0fmax_imported_ts\x18\x14 \x01(\x04R\rmaxImportedTs\x122\n" +
+	"\x15target_promotion_done\x18\x15 \x01(\bR\x13targetPromotionDone\x124\n" +
+	"\x16promotion_completed_ts\x18\x16 \x01(\x04R\x14promotionCompletedTs\x122\n" +
+	"\x15fence_catalog_version\x18\x17 \x01(\x04R\x13fenceCatalogVersion\x12(\n" +
+	"\x10fence_ack_cursor\x18\x18 \x01(\fR\x0efenceAckCursor\x129\n" +
+	"\x19source_cutover_ack_cursor\x18\x19 \x01(\fR\x16sourceCutoverAckCursor\x127\n" +
+	"\x18source_read_drain_cursor\x18\x1a \x01(\fR\x15sourceReadDrainCursor\x12N\n" +
+	"$target_cleared_descriptor_ack_cursor\x18\x1b \x01(\fR targetClearedDescriptorAckCursor\x12C\n" +
+	"\x10bracket_progress\x18\x1c \x03(\v2\x18.SplitJobBracketProgressR\x0fbracketProgress\x125\n" +
+	"\x17source_retention_pin_ts\x18\x1d \x01(\x04R\x14sourceRetentionPinTs\x12\x1d\n" +
+	"\n" +
+	"last_error\x18\x1e \x01(\tR\tlastError\x12\"\n" +
+	"\rstarted_at_ms\x18\x1f \x01(\x03R\vstartedAtMs\x12\"\n" +
+	"\rupdated_at_ms\x18  \x01(\x03R\vupdatedAtMs\x12$\n" +
+	"\x0eterminal_at_ms\x18! \x01(\x03R\fterminalAtMs\"\x13\n" +
 	"\x11ListRoutesRequest\"g\n" +
 	"\x12ListRoutesResponse\x12'\n" +
 	"\x0fcatalog_version\x18\x01 \x01(\x04R\x0ecatalogVersion\x12(\n" +
@@ -593,7 +1216,29 @@ const file_distribution_proto_rawDesc = "" +
 	"\x12ROUTE_STATE_ACTIVE\x10\x01\x12\x1c\n" +
 	"\x18ROUTE_STATE_WRITE_FENCED\x10\x02\x12 \n" +
 	"\x1cROUTE_STATE_MIGRATING_SOURCE\x10\x03\x12 \n" +
-	"\x1cROUTE_STATE_MIGRATING_TARGET\x10\x042\xf2\x01\n" +
+	"\x1cROUTE_STATE_MIGRATING_TARGET\x10\x04*\xce\x02\n" +
+	"\rSplitJobPhase\x12\x18\n" +
+	"\x14SPLIT_JOB_PHASE_NONE\x10\x00\x12\x1b\n" +
+	"\x17SPLIT_JOB_PHASE_PLANNED\x10\x01\x12\x1c\n" +
+	"\x18SPLIT_JOB_PHASE_BACKFILL\x10\x02\x12\x19\n" +
+	"\x15SPLIT_JOB_PHASE_FENCE\x10\x03\x12\x1e\n" +
+	"\x1aSPLIT_JOB_PHASE_DELTA_COPY\x10\x04\x12\x1b\n" +
+	"\x17SPLIT_JOB_PHASE_CUTOVER\x10\x05\x12\x1b\n" +
+	"\x17SPLIT_JOB_PHASE_CLEANUP\x10\x06\x12\x18\n" +
+	"\x14SPLIT_JOB_PHASE_DONE\x10\a\x12\x1a\n" +
+	"\x16SPLIT_JOB_PHASE_FAILED\x10\b\x12\x1e\n" +
+	"\x1aSPLIT_JOB_PHASE_ABANDONING\x10\t\x12\x1d\n" +
+	"\x19SPLIT_JOB_PHASE_ABANDONED\x10\n" +
+	"*\xa5\x01\n" +
+	"\x14SplitJobBarrierState\x12 \n" +
+	"\x1cSPLIT_JOB_BARRIER_STATE_NONE\x10\x00\x12\"\n" +
+	"\x1eSPLIT_JOB_BARRIER_STATE_ARMING\x10\x01\x12!\n" +
+	"\x1dSPLIT_JOB_BARRIER_STATE_ARMED\x10\x02\x12$\n" +
+	" SPLIT_JOB_BARRIER_STATE_CLEARING\x10\x03*\x82\x01\n" +
+	"\x13SplitJobExportPhase\x12\x1f\n" +
+	"\x1bSPLIT_JOB_EXPORT_PHASE_NONE\x10\x00\x12#\n" +
+	"\x1fSPLIT_JOB_EXPORT_PHASE_BACKFILL\x10\x01\x12%\n" +
+	"!SPLIT_JOB_EXPORT_PHASE_DELTA_COPY\x10\x022\xf2\x01\n" +
 	"\fDistribution\x121\n" +
 	"\bGetRoute\x12\x10.GetRouteRequest\x1a\x11.GetRouteResponse\"\x00\x12=\n" +
 	"\fGetTimestamp\x12\x14.GetTimestampRequest\x1a\x15.GetTimestampResponse\"\x00\x127\n" +
@@ -614,38 +1259,50 @@ func file_distribution_proto_rawDescGZIP() []byte {
 	return file_distribution_proto_rawDescData
 }
 
-var file_distribution_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_distribution_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_distribution_proto_goTypes = []any{
-	(RouteState)(0),              // 0: RouteState
-	(*GetRouteRequest)(nil),      // 1: GetRouteRequest
-	(*GetRouteResponse)(nil),     // 2: GetRouteResponse
-	(*GetTimestampRequest)(nil),  // 3: GetTimestampRequest
-	(*GetTimestampResponse)(nil), // 4: GetTimestampResponse
-	(*RouteDescriptor)(nil),      // 5: RouteDescriptor
-	(*ListRoutesRequest)(nil),    // 6: ListRoutesRequest
-	(*ListRoutesResponse)(nil),   // 7: ListRoutesResponse
-	(*SplitRangeRequest)(nil),    // 8: SplitRangeRequest
-	(*SplitRangeResponse)(nil),   // 9: SplitRangeResponse
+	(RouteState)(0),                 // 0: RouteState
+	(SplitJobPhase)(0),              // 1: SplitJobPhase
+	(SplitJobBarrierState)(0),       // 2: SplitJobBarrierState
+	(SplitJobExportPhase)(0),        // 3: SplitJobExportPhase
+	(*GetRouteRequest)(nil),         // 4: GetRouteRequest
+	(*GetRouteResponse)(nil),        // 5: GetRouteResponse
+	(*GetTimestampRequest)(nil),     // 6: GetTimestampRequest
+	(*GetTimestampResponse)(nil),    // 7: GetTimestampResponse
+	(*RouteDescriptor)(nil),         // 8: RouteDescriptor
+	(*SplitJobBracketProgress)(nil), // 9: SplitJobBracketProgress
+	(*SplitJob)(nil),                // 10: SplitJob
+	(*ListRoutesRequest)(nil),       // 11: ListRoutesRequest
+	(*ListRoutesResponse)(nil),      // 12: ListRoutesResponse
+	(*SplitRangeRequest)(nil),       // 13: SplitRangeRequest
+	(*SplitRangeResponse)(nil),      // 14: SplitRangeResponse
 }
 var file_distribution_proto_depIdxs = []int32{
-	0, // 0: RouteDescriptor.state:type_name -> RouteState
-	5, // 1: ListRoutesResponse.routes:type_name -> RouteDescriptor
-	5, // 2: SplitRangeResponse.left:type_name -> RouteDescriptor
-	5, // 3: SplitRangeResponse.right:type_name -> RouteDescriptor
-	1, // 4: Distribution.GetRoute:input_type -> GetRouteRequest
-	3, // 5: Distribution.GetTimestamp:input_type -> GetTimestampRequest
-	6, // 6: Distribution.ListRoutes:input_type -> ListRoutesRequest
-	8, // 7: Distribution.SplitRange:input_type -> SplitRangeRequest
-	2, // 8: Distribution.GetRoute:output_type -> GetRouteResponse
-	4, // 9: Distribution.GetTimestamp:output_type -> GetTimestampResponse
-	7, // 10: Distribution.ListRoutes:output_type -> ListRoutesResponse
-	9, // 11: Distribution.SplitRange:output_type -> SplitRangeResponse
-	8, // [8:12] is the sub-list for method output_type
-	4, // [4:8] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	0,  // 0: RouteDescriptor.state:type_name -> RouteState
+	3,  // 1: SplitJobBracketProgress.export_phase:type_name -> SplitJobExportPhase
+	1,  // 2: SplitJob.phase:type_name -> SplitJobPhase
+	1,  // 3: SplitJob.retry_phase:type_name -> SplitJobPhase
+	1,  // 4: SplitJob.abandon_from_phase:type_name -> SplitJobPhase
+	2,  // 5: SplitJob.cutover_read_fence_state:type_name -> SplitJobBarrierState
+	2,  // 6: SplitJob.target_staged_readiness_state:type_name -> SplitJobBarrierState
+	9,  // 7: SplitJob.bracket_progress:type_name -> SplitJobBracketProgress
+	8,  // 8: ListRoutesResponse.routes:type_name -> RouteDescriptor
+	8,  // 9: SplitRangeResponse.left:type_name -> RouteDescriptor
+	8,  // 10: SplitRangeResponse.right:type_name -> RouteDescriptor
+	4,  // 11: Distribution.GetRoute:input_type -> GetRouteRequest
+	6,  // 12: Distribution.GetTimestamp:input_type -> GetTimestampRequest
+	11, // 13: Distribution.ListRoutes:input_type -> ListRoutesRequest
+	13, // 14: Distribution.SplitRange:input_type -> SplitRangeRequest
+	5,  // 15: Distribution.GetRoute:output_type -> GetRouteResponse
+	7,  // 16: Distribution.GetTimestamp:output_type -> GetTimestampResponse
+	12, // 17: Distribution.ListRoutes:output_type -> ListRoutesResponse
+	14, // 18: Distribution.SplitRange:output_type -> SplitRangeResponse
+	15, // [15:19] is the sub-list for method output_type
+	11, // [11:15] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_distribution_proto_init() }
@@ -658,8 +1315,8 @@ func file_distribution_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_distribution_proto_rawDesc), len(file_distribution_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   9,
+			NumEnums:      4,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
