@@ -218,7 +218,9 @@ func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint6
 		}
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
-	pin.deadline = deadline
+	if deadline.After(pin.deadline) {
+		pin.deadline = deadline
+	}
 	t.backupPins[key] = pin
 	t.mu.Unlock()
 	return nil
