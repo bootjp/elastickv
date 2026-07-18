@@ -677,7 +677,8 @@ func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
-	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
+	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
 
 	_, err = svc.GetAttr(ctx, file.Inode)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -738,7 +739,8 @@ func TestServiceReapExpiredOpenHandleGcsInSingleTxn(t *testing.T) {
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
-	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
+	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
 }
 
 func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
@@ -875,14 +877,56 @@ func TestServiceStatFSUsesUsageCounter(t *testing.T) {
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
 
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
-	elem, err := putElem(fskeys.UsageKey(), FSUsage{Files: 42, Bytes: 17})
+	elem, err := putElem(fskeys.UsageRouteKey(kv.RouteKey(fskeys.InodeKey(2))), routedFSUsageCounter{FilesAdd: 41, BytesAdd: 17})
 	require.NoError(t, err)
-	require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{fskeys.UsageKey()}))
+	require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{elem.Key}))
 
 	stats, err := svc.StatFS(ctx, RootInode)
 	require.NoError(t, err)
 	require.EqualValues(t, 42, stats.Files)
 	require.EqualValues(t, 83, stats.Free)
+}
+
+func TestServiceUsageUpdatesUseRoutedCounter(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithCapacity(100))
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	rec := attachRecorder(svc)
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.Len(t, rec.requests, 1)
+	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
+	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+
+	rec.requests = nil
+	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abc"))
+	require.NoError(t, err)
+	require.Len(t, rec.requests, 1)
+	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
+	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.UsageKey()))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.Files)
+	require.EqualValues(t, 97, stats.Free)
+}
+
+func TestServiceStatFSCombinesLegacyUsageWithRoutedDeltas(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
+
+	legacy, err := putElem(fskeys.UsageKey(), FSUsage{Files: 42, Bytes: 20})
+	require.NoError(t, err)
+	routeKey := fskeys.UsageRouteKey(kv.RouteKey(fskeys.InodeKey(2)))
+	routed, err := putElem(routeKey, routedFSUsageCounter{FilesAdd: 2, FilesSub: 1, BytesAdd: 7, BytesSub: 3})
+	require.NoError(t, err)
+	require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{legacy, routed}, [][]byte{fskeys.UsageKey(), routeKey}))
+
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 43, stats.Files)
+	require.EqualValues(t, 76, stats.Free)
 }
 
 func TestServiceTruncateSparseTailPreservesUsage(t *testing.T) {
@@ -1216,6 +1260,28 @@ func elemTouchesKey(elems []*kv.Elem[kv.OP], want []byte) bool {
 		}
 	}
 	return false
+}
+
+func requireUsageRouteCounterWithTxn(t *testing.T, elems []*kv.Elem[kv.OP]) {
+	t.Helper()
+	var txnRoute []byte
+	for _, elem := range elems {
+		if elem == nil || fskeys.IsUsageRouteKey(elem.Key) || bytes.Equal(elem.Key, fskeys.UsageKey()) {
+			continue
+		}
+		txnRoute = kv.RouteKey(elem.Key)
+		break
+	}
+	require.NotNil(t, txnRoute)
+
+	for _, elem := range elems {
+		if elem == nil || !fskeys.IsUsageRouteKey(elem.Key) {
+			continue
+		}
+		require.Equal(t, txnRoute, kv.RouteKey(elem.Key))
+		return
+	}
+	require.Fail(t, "missing routed usage counter")
 }
 
 func sequenceIDAllocator(ids ...uint64) func() (uint64, error) {

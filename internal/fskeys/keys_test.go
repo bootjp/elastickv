@@ -45,6 +45,16 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 	require.Nil(t, ExtractRouteKey(InodeKey(22)))
 }
 
+func TestUsageRouteKeyCarriesEmbeddedRoute(t *testing.T) {
+	routeKey := ChunkRouteKey(11, 22)
+	usageKey := UsageRouteKey(routeKey)
+
+	require.True(t, IsUsageRouteKey(usageKey))
+	require.Equal(t, routeKey, ExtractRouteKey(usageKey))
+	require.False(t, IsUsageRouteKey(UsageKey()))
+	require.Nil(t, ExtractRouteKey(UsageKey()))
+}
+
 func TestChunkScanRouteBounds(t *testing.T) {
 	t.Parallel()
 

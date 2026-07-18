@@ -22,6 +22,7 @@ const (
 	usageKey       = "!fs|usage"
 
 	chunkRoutePrefix = "!fs|route|chk|"
+	usageRoutePrefix = "!fs|usage|route|"
 
 	chunkRouteKeyBytes = len(chunkRoutePrefix) + 2*u64Bytes
 )
@@ -29,6 +30,7 @@ const (
 var (
 	chunkPrefixBytes      = []byte(chunkPrefix)
 	chunkRoutePrefixBytes = []byte(chunkRoutePrefix)
+	usageRoutePrefixBytes = []byte(usageRoutePrefix)
 )
 
 // InodeKey returns the metadata key for an inode.
@@ -118,9 +120,12 @@ func ChunkRouteKey(homeSlot, inode uint64) []byte {
 	return out
 }
 
-// ExtractRouteKey normalizes filesystem chunk keys to the file-home route
-// domain. Non-chunk keys return nil and keep the caller's default routing.
+// ExtractRouteKey normalizes filesystem keys with virtual route domains.
+// Non-virtual keys return nil and keep the caller's default routing.
 func ExtractRouteKey(key []byte) []byte {
+	if route := extractUsageRouteKey(key); route != nil {
+		return route
+	}
 	if !bytes.HasPrefix(key, chunkPrefixBytes) {
 		return nil
 	}
@@ -132,6 +137,17 @@ func ExtractRouteKey(key []byte) []byte {
 	out = append(out, chunkRoutePrefixBytes...)
 	out = append(out, rest[:2*u64Bytes]...)
 	return out
+}
+
+func extractUsageRouteKey(key []byte) []byte {
+	if !bytes.HasPrefix(key, usageRoutePrefixBytes) {
+		return nil
+	}
+	route, rest, ok := decodeOrderedBytes(key[len(usageRoutePrefixBytes):])
+	if !ok || len(rest) != 0 || len(route) == 0 {
+		return nil
+	}
+	return route
 }
 
 // ChunkScanRouteBounds maps raw chunk scan bounds to the virtual chunk route
@@ -261,6 +277,23 @@ func RefFenceKey(inode uint64) []byte {
 // UsageKey returns the filesystem-wide StatFS counter key.
 func UsageKey() []byte {
 	return []byte(usageKey)
+}
+
+// UsageRouteAllPrefix returns the scan prefix for routed StatFS usage counters.
+func UsageRouteAllPrefix() []byte {
+	return []byte(usageRoutePrefix)
+}
+
+// IsUsageRouteKey reports whether key is a routed StatFS usage counter.
+func IsUsageRouteKey(key []byte) bool {
+	return bytes.HasPrefix(key, usageRoutePrefixBytes)
+}
+
+// UsageRouteKey returns a StatFS usage counter key routed with routeKey.
+func UsageRouteKey(routeKey []byte) []byte {
+	out := make([]byte, 0, len(usageRoutePrefix)+len(routeKey)+orderedTerminatorBytes)
+	out = append(out, usageRoutePrefixBytes...)
+	return appendOrderedBytes(out, routeKey)
 }
 
 // IntentKey returns a crash-recovery intent key.

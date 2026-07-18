@@ -184,6 +184,13 @@ type FSUsage struct {
 	Bytes uint64 `json:"bytes"`
 }
 
+type routedFSUsageCounter struct {
+	FilesAdd uint64 `json:"files_add"`
+	FilesSub uint64 `json:"files_sub"`
+	BytesAdd uint64 `json:"bytes_add"`
+	BytesSub uint64 `json:"bytes_sub"`
+}
+
 type usageDelta struct {
 	filesAdd uint64
 	filesSub uint64
@@ -335,8 +342,12 @@ func (s *Service) InitializeRoot(ctx context.Context, mode uint32, uid uint32, g
 		fskeys.InodeKey(RootInode), meta,
 		fskeys.HomeKey(RootInode), home,
 		fskeys.DirVersionKey(RootInode), unixNsecVersion(now),
-		fskeys.UsageKey(), FSUsage{Files: 1},
 	)
+	if err != nil {
+		return err
+	}
+	readKeys := [][]byte{fskeys.InodeKey(RootInode)}
+	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, usageDelta{filesAdd: 1})
 	if err != nil {
 		return err
 	}
@@ -344,7 +355,7 @@ func (s *Service) InitializeRoot(ctx context.Context, mode uint32, uid uint32, g
 		Elems:    elems,
 		IsTxn:    true,
 		StartTS:  ts,
-		ReadKeys: [][]byte{fskeys.InodeKey(RootInode), fskeys.UsageKey()},
+		ReadKeys: readKeys,
 	})
 	return errors.Wrap(err, "filesystem initialize root dispatch")
 }
@@ -1126,18 +1137,54 @@ func (s *Service) statFSUsage(ctx context.Context, ts uint64) (statFSUsage, erro
 }
 
 func (s *Service) usageAt(ctx context.Context, ts uint64) (FSUsage, error) {
+	usage := FSUsage{}
+	found := false
 	raw, err := s.store.GetAt(ctx, fskeys.UsageKey(), ts)
 	if err == nil {
-		return decodeJSON[FSUsage](raw)
+		usage, err = decodeJSON[FSUsage](raw)
+		if err != nil {
+			return FSUsage{}, err
+		}
+		found = true
 	}
-	if !errors.Is(err, store.ErrKeyNotFound) {
+	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return FSUsage{}, errors.Wrap(err, "filesystem read usage")
 	}
-	usage, err := s.statFSUsage(ctx, ts)
+	counter, routedFound, err := s.routedUsageCounterAt(ctx, ts)
 	if err != nil {
 		return FSUsage{}, err
 	}
-	return FSUsage{Files: usage.files, Bytes: usage.bytes}, nil
+	if routedFound {
+		if err := usage.applyRoutedCounter(counter); err != nil {
+			return FSUsage{}, err
+		}
+		found = true
+	}
+	if found {
+		return usage, nil
+	}
+	scanned, err := s.statFSUsage(ctx, ts)
+	if err != nil {
+		return FSUsage{}, err
+	}
+	return FSUsage{Files: scanned.files, Bytes: scanned.bytes}, nil
+}
+
+func (s *Service) routedUsageCounterAt(ctx context.Context, ts uint64) (routedFSUsageCounter, bool, error) {
+	var total routedFSUsageCounter
+	found := false
+	err := s.scanVisiblePrefix(ctx, fskeys.UsageRouteAllPrefix(), ts, func(pair *store.KVPair) error {
+		counter, err := decodeJSON[routedFSUsageCounter](pair.Value)
+		if err != nil {
+			return err
+		}
+		found = true
+		return total.merge(counter)
+	})
+	if err != nil {
+		return routedFSUsageCounter{}, false, errors.Wrap(err, "filesystem read routed usage")
+	}
+	return total, found, nil
 }
 
 func (s *Service) appendUsageUpdate(
@@ -1150,18 +1197,64 @@ func (s *Service) appendUsageUpdate(
 	if delta.empty() {
 		return elems, readKeys, nil
 	}
-	usage, err := s.usageAt(ctx, ts)
+	usageKey, ok := usageRouteKeyForTxn(elems, readKeys)
+	if !ok {
+		return nil, nil, ErrInvalid
+	}
+	counter, err := s.usageCounterAt(ctx, usageKey, ts)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := usage.apply(delta); err != nil {
+	if err := counter.apply(delta); err != nil {
 		return nil, nil, err
 	}
-	elem, err := putElem(fskeys.UsageKey(), usage)
+	elem, err := putElem(usageKey, counter)
 	if err != nil {
 		return nil, nil, err
 	}
-	return append(elems, elem), append(readKeys, fskeys.UsageKey()), nil
+	return append(elems, elem), append(readKeys, usageKey), nil
+}
+
+func (s *Service) usageCounterAt(ctx context.Context, key []byte, ts uint64) (routedFSUsageCounter, error) {
+	raw, err := s.store.GetAt(ctx, key, ts)
+	if err == nil {
+		return decodeJSON[routedFSUsageCounter](raw)
+	}
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return routedFSUsageCounter{}, nil
+	}
+	return routedFSUsageCounter{}, errors.Wrap(err, "filesystem read routed usage counter")
+}
+
+func usageRouteKeyForTxn(elems []*kv.Elem[kv.OP], readKeys [][]byte) ([]byte, bool) {
+	if routeKey := usageRouteKeyFromElems(elems); routeKey != nil {
+		return routeKey, true
+	}
+	for _, key := range readKeys {
+		if routeKey := usageRouteKeyFromKey(key); routeKey != nil {
+			return routeKey, true
+		}
+	}
+	return nil, false
+}
+
+func usageRouteKeyFromElems(elems []*kv.Elem[kv.OP]) []byte {
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		if routeKey := usageRouteKeyFromKey(elem.Key); routeKey != nil {
+			return routeKey
+		}
+	}
+	return nil
+}
+
+func usageRouteKeyFromKey(key []byte) []byte {
+	if len(key) == 0 || bytes.Equal(key, fskeys.UsageKey()) || fskeys.IsUsageRouteKey(key) {
+		return nil
+	}
+	return fskeys.UsageRouteKey(kv.RouteKey(key))
 }
 
 func (s *Service) dispatchUsageTxnAndDeleteChunks(
@@ -1194,21 +1287,51 @@ func (d usageDelta) merge(other usageDelta) usageDelta {
 	return d
 }
 
-func (u *FSUsage) apply(delta usageDelta) error {
+func (c *routedFSUsageCounter) merge(other routedFSUsageCounter) error {
 	var overflow bool
-	if u.Files < delta.filesSub || u.Bytes < delta.bytesSub {
-		return ErrInvalid
-	}
-	u.Files -= delta.filesSub
-	u.Bytes -= delta.bytesSub
-	u.Files, overflow = addUint64(u.Files, delta.filesAdd)
+	c.FilesAdd, overflow = addUint64(c.FilesAdd, other.FilesAdd)
 	if overflow {
 		return ErrInvalid
 	}
-	u.Bytes, overflow = addUint64(u.Bytes, delta.bytesAdd)
+	c.FilesSub, overflow = addUint64(c.FilesSub, other.FilesSub)
 	if overflow {
 		return ErrInvalid
 	}
+	c.BytesAdd, overflow = addUint64(c.BytesAdd, other.BytesAdd)
+	if overflow {
+		return ErrInvalid
+	}
+	c.BytesSub, overflow = addUint64(c.BytesSub, other.BytesSub)
+	if overflow {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (c *routedFSUsageCounter) apply(delta usageDelta) error {
+	return c.merge(routedFSUsageCounter{
+		FilesAdd: delta.filesAdd,
+		FilesSub: delta.filesSub,
+		BytesAdd: delta.bytesAdd,
+		BytesSub: delta.bytesSub,
+	})
+}
+
+func (u *FSUsage) applyRoutedCounter(counter routedFSUsageCounter) error {
+	var overflow bool
+	files, overflow := addUint64(u.Files, counter.FilesAdd)
+	if overflow {
+		return ErrInvalid
+	}
+	bytes, overflow := addUint64(u.Bytes, counter.BytesAdd)
+	if overflow {
+		return ErrInvalid
+	}
+	if files < counter.FilesSub || bytes < counter.BytesSub {
+		return ErrInvalid
+	}
+	u.Files = files - counter.FilesSub
+	u.Bytes = bytes - counter.BytesSub
 	return nil
 }
 
