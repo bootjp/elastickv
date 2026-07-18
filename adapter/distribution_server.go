@@ -1119,6 +1119,7 @@ func splitJobPromotionMatchesExpected(expected, current distribution.SplitJob) (
 	normalized.Phase = expected.Phase
 	normalized.TargetPromotionDone = expected.TargetPromotionDone
 	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
+	normalized.TerminalAtMs = expected.TerminalAtMs
 	normalized.UpdatedAtMs = expected.UpdatedAtMs
 	expectedRaw, err := distribution.EncodeSplitJob(expected)
 	if err != nil {

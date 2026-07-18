@@ -38,15 +38,7 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 		Routes: normalized,
 	}
 	if out.Job.TargetPromotionDone {
-		if targetClearedDescriptorPresent(out.Job, out.Routes) {
-			if out.Job.Phase != SplitJobPhaseDone {
-				out.Changed = true
-				out.Job.Phase = SplitJobPhaseDone
-				out.Job.UpdatedAtMs = nowMs
-			}
-			return out, nil
-		}
-		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
+		return completeAlreadyPromotedTarget(out, nowMs)
 	}
 
 	cleared, err := clearTargetPromotionRoutes(job, out.Routes)
@@ -61,7 +53,26 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 	out.ClearedRouteIDs = cleared
 	out.Job.TargetPromotionDone = true
 	out.Job.Phase = SplitJobPhaseDone
+	out.Job.TerminalAtMs = nowMs
 	out.Job.UpdatedAtMs = nowMs
+	return out, nil
+}
+
+func completeAlreadyPromotedTarget(out TargetPromotionCompletion, nowMs int64) (TargetPromotionCompletion, error) {
+	if !targetClearedDescriptorPresent(out.Job, out.Routes) {
+		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
+	}
+	if out.Job.Phase != SplitJobPhaseDone {
+		out.Changed = true
+		out.Job.Phase = SplitJobPhaseDone
+	}
+	if out.Job.TerminalAtMs <= 0 {
+		out.Changed = true
+		out.Job.TerminalAtMs = nowMs
+	}
+	if out.Changed {
+		out.Job.UpdatedAtMs = nowMs
+	}
 	return out, nil
 }
 
@@ -246,6 +257,7 @@ func promotionCompleteJobMatchesExpected(expected SplitJob, expectedRaw []byte, 
 	normalized.Phase = expected.Phase
 	normalized.TargetPromotionDone = expected.TargetPromotionDone
 	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
+	normalized.TerminalAtMs = expected.TerminalAtMs
 	normalized.UpdatedAtMs = expected.UpdatedAtMs
 	raw, err := EncodeSplitJob(normalized)
 	if err != nil {

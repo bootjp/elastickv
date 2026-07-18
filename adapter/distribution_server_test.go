@@ -830,6 +830,7 @@ func TestDistributionServerCompleteSplitJobTargetPromotion_UsesCoordinatorCAS(t 
 	require.Equal(t, distribution.SplitJobPhaseDone, completed.Phase)
 	require.Equal(t, before.ReadTS+10, completed.PromotionCompletedTS)
 	require.Equal(t, int64(2000), completed.UpdatedAtMs)
+	require.Equal(t, int64(2000), completed.TerminalAtMs)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, 1, coordinator.timestampCalls)
 	require.Equal(t, before.ReadTS, coordinator.lastStartTS)
@@ -916,6 +917,7 @@ func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T
 	require.True(t, loadedJob.TargetPromotionDone)
 	require.Equal(t, distribution.SplitJobPhaseDone, loadedJob.Phase)
 	require.NotZero(t, loadedJob.PromotionCompletedTS)
+	require.Positive(t, loadedJob.TerminalAtMs)
 
 	loaded, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
