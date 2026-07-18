@@ -194,6 +194,9 @@ func (s *Service) scanRecoveryPrefix(ctx context.Context, prefix []byte, limit i
 		for _, pair := range page {
 			if pair != nil && bytes.HasPrefix(pair.Key, prefix) {
 				out = append(out, pair)
+				if len(out) == limit {
+					return out, nil
+				}
 			}
 		}
 		if len(page) < limit {

@@ -54,6 +54,20 @@ func (s *ShardStore) FilesystemGroupForHome(homeSlot uint64, inode uint64) (uint
 	return route.GroupID, true
 }
 
+// FilesystemGroupIDs returns every physical group that may retain filesystem
+// chunks, including stale copies no longer owned by the current route catalog.
+func (s *ShardStore) FilesystemGroupIDs() []uint64 {
+	if s == nil {
+		return nil
+	}
+	groupIDs := make([]uint64, 0, len(s.groups))
+	for groupID := range s.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	slices.Sort(groupIDs)
+	return groupIDs
+}
+
 // ResolveFilesystemHomeSlot finds a home token whose file route belongs to
 // targetGroup. It derives candidates from current route boundaries and verifies
 // each candidate against the live catalog before returning it.

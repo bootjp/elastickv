@@ -29,6 +29,7 @@ const (
 type dirPosition struct {
 	cookie string
 	skip   int
+	eof    bool
 }
 
 type directoryHandle struct {
@@ -120,18 +121,13 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 	}
 	ctx, done := requestContext(cancel)
 	defer done()
-	result, errno := r.adapter.Create(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
+	result, errno := r.adapter.Mknod(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
 		UID:  input.Uid,
 		GID:  input.Gid,
 	})
 	if errno != 0 {
 		return fuse.Status(errno)
-	}
-	if result.FH != 0 {
-		if releaseErrno := r.adapter.Release(ctx, result.Inode, result.FH); releaseErrno != 0 {
-			return fuse.Status(releaseErrno)
-		}
 	}
 	r.fillEntry(out, result.Stat)
 	return fuse.OK
@@ -289,14 +285,27 @@ func (r *RawFileSystem) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	if !ok {
 		return fuse.Status(syscall.EINVAL)
 	}
+	if position.eof {
+		return fuse.OK
+	}
 	result, errno := r.adapter.Readdir(ctx, input.NodeId, position.cookie)
 	if errno != 0 {
 		return fuse.Status(errno)
 	}
+	return addDirEntries(handle, input.Offset, position, result, out)
+}
+
+func addDirEntries(
+	handle *directoryHandle,
+	inputOffset uint64,
+	position dirPosition,
+	result filesystem.ReaddirResult,
+	out *fuse.DirEntryList,
+) fuse.Status {
 	if position.skip > len(result.Entries) {
 		return fuse.Status(syscall.EIO)
 	}
-	offset := input.Offset
+	offset := inputOffset
 	for index := position.skip; index < len(result.Entries); index++ {
 		entry := result.Entries[index]
 		offset++
@@ -311,8 +320,11 @@ func (r *RawFileSystem) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out 
 		if index+1 < len(result.Entries) {
 			handle.positions[offset] = dirPosition{cookie: position.cookie, skip: index + 1}
 		} else {
-			handle.positions[offset] = dirPosition{cookie: result.NextCookie}
+			handle.positions[offset] = dirPosition{cookie: result.NextCookie, eof: result.NextCookie == ""}
 		}
+	}
+	if len(result.Entries) == 0 && result.NextCookie == "" {
+		handle.positions[inputOffset] = dirPosition{eof: true}
 	}
 	return fuse.OK
 }

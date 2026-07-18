@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,4 +59,55 @@ func TestServiceListFilePlacementStatsAllowsMigrationDualPlacement(t *testing.T)
 	require.NoError(t, err)
 	require.Zero(t, stats.MultiShardFiles)
 	require.Empty(t, stats.MultiShardInodes)
+}
+
+func TestServiceListFilePlacementStatsUsesPhysicalSourceGroup(t *testing.T) {
+	ctx := context.Background()
+	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+
+	physical := &physicalPlacementStore{
+		migrationPlacementStore: placement,
+		groups: map[uint64]store.MVCCStore{
+			1: store.NewMVCCStore(),
+			2: store.NewMVCCStore(),
+		},
+	}
+	svc.store = physical
+	chunkKey := fskeys.ChunkKey(10, created.Inode, 0)
+	for _, group := range physical.groups {
+		require.NoError(t, group.PutAt(ctx, chunkKey, []byte("data"), 1, 0))
+	}
+
+	stats, err := svc.ListFilePlacementStats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[uint64]uint64{1: 1}, stats.FilesByGroup)
+	require.EqualValues(t, 1, stats.MultiShardFiles)
+	require.Equal(t, []uint64{created.Inode}, stats.MultiShardInodes)
+}
+
+type physicalPlacementStore struct {
+	*migrationPlacementStore
+	groups map[uint64]store.MVCCStore
+}
+
+func (s *physicalPlacementStore) FilesystemGroupIDs() []uint64 {
+	return []uint64{1, 2}
+}
+
+func (s *physicalPlacementStore) ScanGroupAt(
+	ctx context.Context,
+	groupID uint64,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([]*store.KVPair, error) {
+	group, ok := s.groups[groupID]
+	if !ok {
+		return nil, nil
+	}
+	return group.ScanAt(ctx, start, end, limit, ts)
 }

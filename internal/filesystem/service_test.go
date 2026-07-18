@@ -158,6 +158,28 @@ type failNthDispatchCoordinator struct {
 	err    error
 }
 
+type afterSuccessfulDispatchCoordinator struct {
+	inner  *testCoordinator
+	after  func(context.Context)
+	called bool
+}
+
+func (c *afterSuccessfulDispatchCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *afterSuccessfulDispatchCoordinator) Dispatch(
+	ctx context.Context,
+	req *kv.OperationGroup[kv.OP],
+) (*kv.CoordinateResponse, error) {
+	resp, err := c.inner.Dispatch(ctx, req)
+	if err == nil && !c.called {
+		c.called = true
+		c.after(ctx)
+	}
+	return resp, err
+}
+
 func (c *failNthDispatchCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
 	return c.inner.LinearizableRead(ctx)
 }
@@ -1189,6 +1211,31 @@ func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {
 	require.NoError(t, err)
 	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(meta.HomeSlot, file.Inode, 0), svc.store.LastCommitTS())
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestServiceTruncateRejectsHomeThatStartsMigratingDuringStaleCleanup(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, 0, 0, bytes.Repeat([]byte{'x'}, int(3*testChunkSize)))
+	require.NoError(t, err)
+	forceInodeSizeZeroForTest(t, ctx, svc, file.Inode)
+
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	hook := &afterSuccessfulDispatchCoordinator{inner: inner}
+	hook.after = func(ctx context.Context) {
+		svc.dispatch = inner
+		setMigratingHomeForTest(t, ctx, svc, file.Inode, file.Inode+1)
+		svc.dispatch = hook
+	}
+	svc.dispatch = hook
+
+	err = svc.Truncate(ctx, file.Inode, 0)
+	require.ErrorIs(t, err, ErrStaleHome)
+	require.True(t, hook.called)
 }
 
 func TestServiceTruncateShrinkReclaimsStaleChunksPastCurrentEOF(t *testing.T) {

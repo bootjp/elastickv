@@ -936,6 +936,17 @@ func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
 	require.ErrorIs(t, err, ErrFilesystemPlacementTargetNotFound)
 }
 
+func TestShardStoreFilesystemGroupIDsReturnsPhysicalGroupsSorted(t *testing.T) {
+	t.Parallel()
+
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		9: {},
+		2: {},
+		5: {},
+	})
+	require.Equal(t, []uint64{2, 5, 9}, st.FilesystemGroupIDs())
+}
+
 func TestShardStoreScanAt_RoutesFilesystemUsageCountersAcrossRouteGroups(t *testing.T) {
 	t.Parallel()
 

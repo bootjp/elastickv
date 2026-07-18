@@ -52,10 +52,11 @@ Implemented:
     same-file pinning.
 11. `internal/filesystem/fuseadapter.RawFileSystem` binds the adapter to
     `github.com/hanwen/go-fuse/v2`, including stable inode attributes,
-    per-directory resumable kernel offsets, explicit unsupported operations,
-    and lifecycle-owned mount/unmount. `--filesystemMount` enables the mount in
-    the server process; startup initializes the root and recovers intents before
-    serving kernel requests.
+    per-directory resumable kernel offsets with terminal EOF state, lease-free
+    regular-file `MKNOD`, explicit unsupported operations, and lifecycle-owned
+    mount/unmount. `--filesystemMount` enables the mount in the server process;
+    startup initializes the root and recovers intents before serving kernel
+    requests.
 12. `MoveFile` and `ResumeMoveFile` implement an epoch-fenced durable state
     machine: target cleanup, paged copy, atomic home switch, source cleanup, and
     completion. Data mutations return `ErrStaleHome` while a home is migrating;
@@ -63,12 +64,14 @@ Implemented:
 13. Create/delete operations write a prepared intent before their atomic
     namespace transaction and delete it inside that transaction. Startup
     recovery clears safely aborted namespace intents and resumes unfinished move
-    jobs idempotently.
+    jobs idempotently, bounded by the configured recovery-record limit per scan.
 14. Prometheus placement, operation, lease, orphan, collision, and epoch
     metrics are implemented. The FUSE-enabled server refreshes snapshot-derived
-    gauges periodically. `monitoring/prometheus/rules/filesystem.yml` and the
-    Elastickv filesystem Grafana dashboard cover pinned files, multi-shard
-    violations, stuck moves, orphan GC, and stale-home conflicts.
+    gauges periodically. Multi-shard detection scans each physical Raft group
+    and attributes chunks to the scanned source group so stale copies remain
+    visible after routing changes. `monitoring/prometheus/rules/filesystem.yml`
+    and the Elastickv filesystem Grafana dashboard cover pinned files,
+    multi-shard violations, stuck moves, orphan GC, and stale-home conflicts.
 
 Deferred non-goals:
 
@@ -376,6 +379,8 @@ Writers include `(inode_id, epoch)` from home mapping.
 
 1. If shard owner sees stale epoch, return retryable stale-home error.
 2. Client refreshes `!fs|home|` and retries.
+3. Size-changing writes and replacement rename revalidate the active home after
+   maintenance reads before publishing metadata changes.
 
 ### 9.3 Idempotency
 
@@ -429,7 +434,7 @@ Error model:
 | `flush` | `Flush` | Push session buffer |
 | `fsync` | `Fsync` | Raft durability barrier |
 | `release` | `Release` | Remove lease/ref |
-| `create` | `Create` | Atomic name reservation + inode allocation |
+| `create` / `mknod` | `Create` | Atomic name reservation + inode allocation; `mknod` does not allocate an open-handle lease |
 | `mkdir` | `Mkdir` | Parent type and permission checks |
 | `unlink` | `Unlink` | Delayed physical delete when open refs exist |
 | `rmdir` | `Rmdir` | Must fail with `ENOTEMPTY` if children exist |
@@ -486,7 +491,7 @@ Implemented foundation:
 5. Protocol-neutral `FS Core API` and thin FUSE adapter with required errno mapping.
 6. Actual go-fuse raw filesystem mount and server lifecycle.
 7. Whole-file migration job with epoch fencing and restart recovery.
-8. Placement metrics, alert rules, dashboard, and periodic collection.
+8. Physical-group placement metrics, alert rules, dashboard, and periodic collection.
 9. Open-handle lease reaper and orphan-GC hardening.
 10. Durable create/delete/move intent recovery.
 
@@ -508,8 +513,10 @@ Phase 3:
    - open-unlink-read-release lifecycle
    - rename in-domain succeeds, cross-domain returns `EXDEV`
    - readdir cookie resume under concurrent directory mutation (no duplicates/skips within one snapshot sequence)
+   - terminal readdir offsets do not restart after backend EOF
    - same-file operations stay on one shard
    - restart recovery with unfinished intents
+   - recovery scan limits bound each startup batch
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
    - concurrent append + read under node failure

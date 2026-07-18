@@ -150,6 +150,42 @@ func TestServiceRejectsDataMutationWhileHomeIsMigrating(t *testing.T) {
 	require.ErrorIs(t, svc.Unlink(ctx, RootInode, []byte("file")), ErrStaleHome)
 }
 
+func TestServiceRenameRejectsMigratingReplacement(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 3, 100, 101)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	source, err := svc.Create(ctx, RootInode, []byte("source"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	target, err := svc.Create(ctx, RootInode, []byte("target"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	setMigratingHomeForTest(t, ctx, svc, target.Inode, 20)
+
+	err = svc.Rename(ctx, RootInode, []byte("source"), RootInode, []byte("target"))
+	require.ErrorIs(t, err, ErrStaleHome)
+	resolved, err := svc.Resolve(ctx, RootInode, []byte("source"))
+	require.NoError(t, err)
+	require.Equal(t, source.Inode, resolved)
+	resolved, err = svc.Resolve(ctx, RootInode, []byte("target"))
+	require.NoError(t, err)
+	require.Equal(t, target.Inode, resolved)
+}
+
+func setMigratingHomeForTest(t *testing.T, ctx context.Context, svc *Service, inode uint64, targetHome uint64) {
+	t.Helper()
+	ts := svc.store.LastCommitTS()
+	home, err := svc.homeAt(ctx, inode, ts)
+	require.NoError(t, err)
+	meta, err := svc.inodeAt(ctx, inode, ts)
+	require.NoError(t, err)
+	home.State = HomeStateMigrating
+	home.TargetHomeSlot = targetHome
+	home.Epoch++
+	meta.Epoch = home.Epoch
+	elems, err := putElems(fskeys.HomeKey(inode), home, fskeys.InodeKey(inode), meta)
+	require.NoError(t, err)
+	require.NoError(t, svc.dispatchTxn(ctx, ts, elems, [][]byte{fskeys.HomeKey(inode), fskeys.InodeKey(inode)}))
+}
+
 type testCoordinatorFactory struct{}
 
 func (*testCoordinatorFactory) coordinator(st store.MVCCStore) Dispatcher {

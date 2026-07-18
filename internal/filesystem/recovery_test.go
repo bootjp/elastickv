@@ -49,6 +49,38 @@ func TestServiceRecoverIntentsAbortsPreparedNamespaceMutation(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestServiceRecoverIntentsHonorsScanLimit(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+
+	for _, id := range []string{"create-a", "create-b", "create-c"} {
+		intent := IntentState{
+			ID:        []byte(id),
+			Kind:      IntentKindCreate,
+			Phase:     "prepared",
+			Parent:    RootInode,
+			Name:      []byte(id),
+			CreatedAt: svc.now().UnixNano(),
+			UpdatedAt: svc.now().UnixNano(),
+		}
+		key := fskeys.IntentKey(intent.ID)
+		elem, err := putElem(key, intent)
+		require.NoError(t, err)
+		require.NoError(t, svc.dispatchTxn(ctx, svc.store.LastCommitTS(), []*kv.Elem[kv.OP]{elem}, [][]byte{key}))
+	}
+
+	stats, err := svc.RecoverIntents(ctx, 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.IntentsCleared)
+	assertIntentCount(t, ctx, svc, 1)
+
+	stats, err = svc.RecoverIntents(ctx, 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.IntentsCleared)
+	assertIntentCount(t, ctx, svc, 0)
+}
+
 func assertIntentCount(t *testing.T, ctx context.Context, svc *Service, want int) {
 	t.Helper()
 	prefix := fskeys.IntentAllPrefix()

@@ -943,6 +943,9 @@ func (s *Service) renameTargetTxnParts(
 		elems, reads, delta, err := s.rmdirTargetTxnParts(ctx, ts, parentMeta, replacedMeta)
 		return elems, reads, delta, nil, err
 	}
+	if err := s.ensureActiveHomeAt(ctx, replacedMeta, ts); err != nil {
+		return nil, nil, usageDelta{}, nil, err
+	}
 	return s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
 }
 
@@ -1904,12 +1907,13 @@ func (s *Service) unlinkFileTxnParts(
 	meta *InodeMeta,
 	now int64,
 ) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
+	homeKey := fskeys.HomeKey(meta.Inode)
 	if meta.Nlink > 0 {
 		meta.Nlink--
 	}
 	if meta.Nlink != 0 {
 		elems, err := s.putUnlinkedFileMeta(meta, now)
-		return elems, nil, usageDelta{}, nil, err
+		return elems, [][]byte{homeKey}, usageDelta{}, nil, err
 	}
 	hasRefs, refReads, err := s.openRefReadKeys(ctx, meta.Inode, ts)
 	if err != nil {
@@ -1924,7 +1928,7 @@ func (s *Service) unlinkFileTxnParts(
 	}
 	meta.Orphaned = true
 	elems, err := s.putUnlinkedFileMeta(meta, now)
-	return elems, refReads, usageDelta{}, nil, err
+	return elems, append(refReads, homeKey), usageDelta{}, nil, err
 }
 
 func (s *Service) putUnlinkedFileMeta(
@@ -2280,6 +2284,9 @@ func (s *Service) cleanupStaleChunksBeforeSizeChange(
 	}
 	if refreshedMeta.Type == TypeDirectory {
 		return 0, nil, false, ErrIsDir
+	}
+	if err := s.ensureActiveHomeAt(ctx, refreshedMeta, refreshedTS); err != nil {
+		return 0, nil, false, err
 	}
 	return refreshedTS, refreshedMeta, true, nil
 }

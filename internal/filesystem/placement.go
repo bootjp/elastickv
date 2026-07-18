@@ -18,6 +18,11 @@ type PlacementStats struct {
 	OrphanedInodes   uint64
 }
 
+type filePlacementGroupScanner interface {
+	FilesystemGroupIDs() []uint64
+	ScanGroupAt(context.Context, uint64, []byte, []byte, int, uint64) ([]*store.KVPair, error)
+}
+
 // ListFilePlacementStats computes operator-facing placement state at one
 // fenced snapshot and publishes it to the configured observer.
 func (s *Service) ListFilePlacementStats(ctx context.Context) (PlacementStats, error) {
@@ -110,6 +115,9 @@ func (s *Service) scanPlacementChunkGroups(
 	ts uint64,
 	resolver filePlacementResolver,
 ) (map[uint64]map[uint64]struct{}, error) {
+	if scanner, ok := s.store.(filePlacementGroupScanner); ok {
+		return scanPhysicalPlacementChunkGroups(ctx, scanner, ts)
+	}
 	chunkGroups := make(map[uint64]map[uint64]struct{})
 	if err := s.scanVisiblePrefix(ctx, fskeys.ChunkAllPrefix(), ts, func(pair *store.KVPair) error {
 		home, inode, _, ok := fskeys.ChunkPartsFromKey(pair.Key)
@@ -129,6 +137,45 @@ func (s *Service) scanPlacementChunkGroups(
 		return nil
 	}); err != nil {
 		return nil, errors.Wrap(err, "filesystem scan placement chunks")
+	}
+	return chunkGroups, nil
+}
+
+func scanPhysicalPlacementChunkGroups(
+	ctx context.Context,
+	scanner filePlacementGroupScanner,
+	ts uint64,
+) (map[uint64]map[uint64]struct{}, error) {
+	chunkGroups := make(map[uint64]map[uint64]struct{})
+	prefix := fskeys.ChunkAllPrefix()
+	end := prefixEnd(prefix)
+	for _, groupID := range scanner.FilesystemGroupIDs() {
+		start := append([]byte(nil), prefix...)
+		for {
+			page, err := scanner.ScanGroupAt(ctx, groupID, start, end, statFSScanPageSize, ts)
+			if err != nil {
+				return nil, errors.Wrapf(err, "filesystem scan placement chunks for group %d", groupID)
+			}
+			for _, pair := range page {
+				if pair == nil {
+					continue
+				}
+				_, inode, _, ok := fskeys.ChunkPartsFromKey(pair.Key)
+				if !ok {
+					continue
+				}
+				groups := chunkGroups[inode]
+				if groups == nil {
+					groups = make(map[uint64]struct{})
+					chunkGroups[inode] = groups
+				}
+				groups[groupID] = struct{}{}
+			}
+			if len(page) < statFSScanPageSize {
+				break
+			}
+			start = scanCursorAfter(page[len(page)-1].Key)
+		}
 	}
 	return chunkGroups, nil
 }

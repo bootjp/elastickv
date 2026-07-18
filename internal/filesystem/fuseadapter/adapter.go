@@ -220,6 +220,17 @@ func (a *Adapter) Create(
 	return result, Errno(err)
 }
 
+func (a *Adapter) Mknod(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	opts filesystem.CreateOptions,
+) (filesystem.CreateResult, syscall.Errno) {
+	opts.ClientID = nil
+	result, err := a.core.Create(ctx, parent, name, opts)
+	return result, Errno(err)
+}
+
 func (a *Adapter) Mkdir(
 	ctx context.Context,
 	parent uint64,

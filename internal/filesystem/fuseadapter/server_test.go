@@ -90,6 +90,34 @@ func TestRawFileSystemCreateAndReadUseFuseHandles(t *testing.T) {
 	require.Equal(t, []byte("payload"), data)
 }
 
+func TestRawFileSystemMknodDoesNotAllocateOpenHandle(t *testing.T) {
+	core := &fakeCore{createResult: filesystem.CreateResult{
+		Inode: 7,
+		FH:    9,
+		Stat: filesystem.Stat{
+			Inode:      7,
+			Generation: 1,
+			Type:       filesystem.TypeFile,
+			Mode:       0o600,
+			Nlink:      1,
+		},
+	}}
+	adapter := New(core, []byte("mount-a"), WithHandleKeepaliveInterval(0))
+	t.Cleanup(adapter.Close)
+	raw := NewRawFileSystem(adapter)
+
+	var out fuse.EntryOut
+	status := raw.Mknod(nil, &fuse.MknodIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 1000, Gid: 1001}}},
+		Mode:     syscall.S_IFREG | 0o600,
+	}, "file", &out)
+	require.Equal(t, fuse.OK, status)
+	require.EqualValues(t, 7, out.NodeId)
+	require.Empty(t, core.createOpts.ClientID)
+	require.Zero(t, core.releaseInode)
+	require.Zero(t, core.releaseFH)
+}
+
 func TestRawFileSystemReadDirResumesWithinBackendPage(t *testing.T) {
 	core := &pagedReaddirCore{fakeCore: &fakeCore{
 		stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
@@ -136,6 +164,47 @@ func TestRawFileSystemReadDirResumesWithinBackendPage(t *testing.T) {
 	raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: filesystem.RootInode}, Fh: openOut.Fh})
 	status = raw.ReadDir(nil, &fuse.ReadIn{Fh: openOut.Fh}, fuse.NewDirEntryList(make([]byte, 40), 0))
 	require.Equal(t, fuse.Status(syscall.EBADF), status)
+}
+
+func TestRawFileSystemReadDirKeepsEOFOffsetTerminal(t *testing.T) {
+	core := &pagedReaddirCore{fakeCore: &fakeCore{
+		stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
+	}}
+	adapter := New(core, []byte("mount-a"), WithHandleKeepaliveInterval(0))
+	t.Cleanup(adapter.Close)
+	raw := NewRawFileSystem(adapter)
+
+	var openOut fuse.OpenOut
+	status := raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: filesystem.RootInode}}, &openOut)
+	require.Equal(t, fuse.OK, status)
+
+	first := fuse.NewDirEntryList(make([]byte, 256), 0)
+	status = raw.ReadDir(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Fh:       openOut.Fh,
+	}, first)
+	require.Equal(t, fuse.OK, status)
+	require.EqualValues(t, 2, first.Offset)
+
+	last := fuse.NewDirEntryList(make([]byte, 256), first.Offset)
+	status = raw.ReadDir(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Fh:       openOut.Fh,
+		Offset:   first.Offset,
+	}, last)
+	require.Equal(t, fuse.OK, status)
+	require.EqualValues(t, 3, last.Offset)
+	require.Equal(t, []string{"", "next"}, core.cookies)
+
+	eof := fuse.NewDirEntryList(make([]byte, 256), last.Offset)
+	status = raw.ReadDir(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Fh:       openOut.Fh,
+		Offset:   last.Offset,
+	}, eof)
+	require.Equal(t, fuse.OK, status)
+	require.EqualValues(t, last.Offset, eof.Offset)
+	require.Equal(t, []string{"", "next"}, core.cookies)
 }
 
 func TestDefaultMountOptionsEnableKernelPermissionChecks(t *testing.T) {
