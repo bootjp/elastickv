@@ -3,7 +3,9 @@ package kv
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -180,6 +182,51 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 	require.Equal(t, 1, tx.commits)
 }
 
+func TestCoordinateSamplerObservesRawTxnAndRead(t *testing.T) {
+	t.Parallel()
+
+	const routeID = uint64(7)
+	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 8,
+	})
+	sampler.RegisterRoute(routeID, []byte(""), nil, 1)
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	c := (&Coordinate{
+		transactionManager: &stubTransactional{},
+		engine:             stubLeaderEngine{},
+		clock:              clock,
+	}).WithSampler(sampler, routeID)
+
+	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("raw"), Value: []byte("value")},
+		},
+	})
+	require.NoError(t, err)
+	startTS, err := c.nextStartTS(context.Background())
+	require.NoError(t, err)
+	_, err = c.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("txn"), Value: []byte("value")},
+		},
+	})
+	require.NoError(t, err)
+	_, err = c.LeaseReadForKey(context.Background(), []byte("read"))
+	require.NoError(t, err)
+
+	sampler.Flush()
+	row := requireKeyVizRouteRow(t, sampler, routeID)
+	const expectedWriteBytes uint64 = 16 // raw+value and txn+value.
+	require.Equal(t, uint64(2), row.Writes)
+	require.Equal(t, uint64(1), row.Reads)
+	require.Equal(t, expectedWriteBytes, row.WriteBytes)
+}
+
 // TestToRawRequestLeavesTsForLeaderStamping is the regression for the
 // codex P2 review on PR #867.
 //
@@ -219,6 +266,20 @@ func TestToRawRequestLeavesTsForLeaderStamping(t *testing.T) {
 				"forwarded raw requests must arrive with Ts==0 so the leader's stampRawTimestamps assigns the canonical ts (HLC leader-only invariant + HLC-4 (iii) fence)")
 		})
 	}
+}
+
+func requireKeyVizRouteRow(t *testing.T, sampler *keyviz.MemSampler, routeID uint64) keyviz.MatrixRow {
+	t.Helper()
+	cols := sampler.Snapshot(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	for _, col := range cols {
+		for _, row := range col.Rows {
+			if row.RouteID == routeID {
+				return row
+			}
+		}
+	}
+	require.Failf(t, "missing keyviz row", "route_id=%d", routeID)
+	return keyviz.MatrixRow{}
 }
 
 // TestBuildRedirectRequestsSurvivesStaleFollowerCeiling exercises the

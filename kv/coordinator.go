@@ -12,6 +12,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 )
@@ -110,6 +111,23 @@ func (c *Coordinate) SetHLCLeaseRenewalBlocker(blocked func() bool) {
 		return
 	}
 	c.hlcRenewalBlocked = blocked
+}
+
+// WithSampler wires a keyviz sampler onto the single-group coordinator.
+// routeID must be the catalog route ID covering the single group; a zero routeID
+// disables sampling so callers cannot accidentally emit unroutable rows.
+func (c *Coordinate) WithSampler(s keyviz.Sampler, routeID uint64) *Coordinate {
+	if c == nil {
+		return c
+	}
+	if routeID == 0 {
+		c.sampler = nil
+		c.samplerRouteID = 0
+		return c
+	}
+	c.sampler = s
+	c.samplerRouteID = routeID
+	return c
 }
 
 // normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
@@ -228,7 +246,9 @@ type Coordinate struct {
 	// (nil when no observer is attached; LeaseRead short-circuits the
 	// nil check so production does not pay an interface call when
 	// monitoring is disabled).
-	leaseObserver LeaseReadObserver
+	leaseObserver  LeaseReadObserver
+	sampler        keyviz.Sampler
+	samplerRouteID uint64
 }
 
 var _ Coordinator = (*Coordinate)(nil)
@@ -907,7 +927,8 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 	return linearizableReadEngineCtx(ctx, c.engine)
 }
 
-func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+func (c *Coordinate) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.observeRead(key)
 	return c.LinearizableRead(ctx)
 }
 
@@ -1012,7 +1033,8 @@ func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, lea
 	return now.Sub(ack) < leaseDur
 }
 
-func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+func (c *Coordinate) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.observeRead(key)
 	return c.LeaseRead(ctx)
 }
 
@@ -1119,6 +1141,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	if err := ValidateElemCommitTSPatches(reqs, commitTS); err != nil {
 		return nil, err
 	}
+	c.observeElems(reqs)
 
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu, eliminating the TOCTOU
@@ -1144,7 +1167,9 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*CoordinateResponse, error) {
 	muts := make([]*pb.Mutation, 0, len(req))
 	for _, elem := range req {
-		muts = append(muts, elemToMutation(elem))
+		mut := elemToMutation(elem)
+		c.observeMutation(mut)
+		muts = append(muts, mut)
 	}
 
 	ts, err := c.allocateTimestamp(ctx, "allocate raw dispatch ts")
@@ -1166,6 +1191,29 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 		CommitIndex: r.CommitIndex,
 		CommitTS:    ts,
 	}, nil
+}
+
+func (c *Coordinate) observeElems(elems []*Elem[OP]) {
+	if c == nil || c.sampler == nil || c.samplerRouteID == 0 {
+		return
+	}
+	for _, elem := range elems {
+		c.observeMutation(elemToMutation(elem))
+	}
+}
+
+func (c *Coordinate) observeMutation(mut *pb.Mutation) {
+	if c == nil || c.sampler == nil || c.samplerRouteID == 0 || mut == nil {
+		return
+	}
+	c.sampler.Observe(c.samplerRouteID, mut.Key, keyviz.OpWrite, len(mut.Value), keyviz.LabelLegacy)
+}
+
+func (c *Coordinate) observeRead(key []byte) {
+	if c == nil || c.sampler == nil || c.samplerRouteID == 0 {
+		return
+	}
+	c.sampler.Observe(c.samplerRouteID, key, keyviz.OpRead, 0, keyviz.LabelLegacy)
 }
 
 // toRawRequest builds a forwarded raw Request for the redirect path

@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	autoSplit                  = flag.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the default-group leader")
+	autoSplit                  = flag.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the catalog leader")
 	autoSplitEvalInterval      = flag.Duration("autoSplitEvalInterval", autosplit.DefaultEvalInterval, "Interval between automatic hotspot split evaluations")
 	autoSplitSplitCooldown     = flag.Duration("autoSplitSplitCooldown", autosplit.DefaultSplitCooldown, "Minimum wall-clock cooldown before a route created by SplitRange can be auto-split again")
 	autoSplitSplitTimeout      = flag.Duration("autoSplitSplitTimeout", autosplit.DefaultSplitTimeout, "Timeout for each automatic SplitRange RPC")
@@ -35,6 +35,10 @@ var (
 
 type autoSplitLeader interface {
 	IsLeader() bool
+}
+
+type autoSplitKeyLeader interface {
+	IsLeaderForKey(key []byte) bool
 }
 
 func recordExplicitRuntimeFlags(fs *flag.FlagSet) {
@@ -73,7 +77,7 @@ func autoSplitConfigFromFlags(leader autoSplitLeader) (autosplit.SchedulerConfig
 		},
 	}
 	if leader != nil {
-		cfg.IsLeader = leader.IsLeader
+		cfg.IsLeader = autoSplitLeaderGate(leader)
 	}
 	if err := validateAutoSplitConfig(cfg); err != nil {
 		return autosplit.SchedulerConfig{}, err
@@ -131,7 +135,7 @@ func startAutoSplitScheduler(
 		return
 	}
 	if leader != nil {
-		cfg.IsLeader = leader.IsLeader
+		cfg.IsLeader = autoSplitLeaderGate(leader)
 	}
 	scheduler := autosplit.NewScheduler(
 		cfg,
@@ -168,3 +172,15 @@ func (s autoSplitDistributionSplitter) SplitRange(ctx context.Context, req autos
 }
 
 var _ autoSplitLeader = (*kv.ShardedCoordinator)(nil)
+
+func autoSplitLeaderGate(leader autoSplitLeader) func() bool {
+	if leader == nil {
+		return nil
+	}
+	if keyLeader, ok := leader.(autoSplitKeyLeader); ok {
+		return func() bool {
+			return keyLeader.IsLeaderForKey(distribution.CatalogVersionKey())
+		}
+	}
+	return leader.IsLeader
+}

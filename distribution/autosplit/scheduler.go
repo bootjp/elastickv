@@ -1,6 +1,7 @@
 package autosplit
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"log/slog"
@@ -104,10 +105,16 @@ type Scheduler struct {
 	sampler          MatrixSampler
 	registrar        RouteRegistrar
 	state            *DetectorState
-	registeredRoutes map[uint64]struct{}
+	registeredRoutes map[uint64]registeredRoute
 	wasLeader        bool
 	leaderStartedAt  time.Time
 	leaderWatermark  time.Time
+}
+
+type registeredRoute struct {
+	start   []byte
+	end     []byte
+	groupID uint64
 }
 
 // NewScheduler builds a leader-local scheduler. It is inert when cfg.Enabled is
@@ -121,7 +128,7 @@ func NewScheduler(cfg SchedulerConfig, source SnapshotSource, splitter Splitter,
 		sampler:          sampler,
 		registrar:        registrar,
 		state:            NewDetectorState(),
-		registeredRoutes: make(map[uint64]struct{}),
+		registeredRoutes: make(map[uint64]registeredRoute),
 	}
 }
 
@@ -311,11 +318,16 @@ func (s *Scheduler) reconcileSamplerRoutes(routes []distribution.RouteDescriptor
 	live := make(map[uint64]struct{}, len(routes))
 	for _, route := range routes {
 		live[route.RouteID] = struct{}{}
-		if _, ok := s.registeredRoutes[route.RouteID]; ok {
+		registered, ok := s.registeredRoutes[route.RouteID]
+		next := registeredRouteFromDescriptor(route)
+		if ok && registered.equal(next) {
 			continue
 		}
+		if ok {
+			s.registrar.RemoveRoute(route.RouteID)
+		}
 		s.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID)
-		s.registeredRoutes[route.RouteID] = struct{}{}
+		s.registeredRoutes[route.RouteID] = next
 	}
 	for routeID := range s.registeredRoutes {
 		if _, ok := live[routeID]; ok {
@@ -324,6 +336,20 @@ func (s *Scheduler) reconcileSamplerRoutes(routes []distribution.RouteDescriptor
 		s.registrar.RemoveRoute(routeID)
 		delete(s.registeredRoutes, routeID)
 	}
+}
+
+func registeredRouteFromDescriptor(route distribution.RouteDescriptor) registeredRoute {
+	return registeredRoute{
+		start:   distribution.CloneBytes(route.Start),
+		end:     distribution.CloneBytes(route.End),
+		groupID: route.GroupID,
+	}
+}
+
+func (r registeredRoute) equal(other registeredRoute) bool {
+	return r.groupID == other.groupID &&
+		bytes.Equal(r.start, other.start) &&
+		bytes.Equal(r.end, other.end)
 }
 
 func (s *Scheduler) resetForLeadership(now time.Time) {

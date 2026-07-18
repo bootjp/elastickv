@@ -217,6 +217,36 @@ func TestSchedulerReconcilesSamplerRoutes(t *testing.T) {
 	require.Equal(t, []uint64{1}, registrar.removed)
 }
 
+func TestSchedulerReregistersChangedSamplerRoute(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "m")},
+	}}
+	registrar := &fakeRegistrar{}
+	scheduler := newTestScheduler(source, &fakeSplitter{}, nil, nil)
+	scheduler.registrar = registrar
+	scheduler.wasLeader = true
+
+	_, err := scheduler.Tick(context.Background(), now)
+	require.NoError(t, err)
+
+	source.snapshot = distribution.CatalogSnapshot{
+		Version: 2,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 2, "m", "z")},
+	}
+	_, err = scheduler.Tick(context.Background(), now.Add(time.Minute))
+
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 1}, registrar.registered)
+	require.Equal(t, []uint64{1}, registrar.removed)
+	require.Len(t, registrar.registrations, 2)
+	require.Equal(t, uint64(2), registrar.registrations[1].groupID)
+	require.Equal(t, []byte("m"), registrar.registrations[1].start)
+	require.Equal(t, []byte("z"), registrar.registrations[1].end)
+}
+
 func newTestScheduler(source *fakeSnapshotSource, splitter *fakeSplitter, cols []keyviz.MatrixColumn, killSwitch KillSwitch) *Scheduler {
 	cfg := SchedulerConfig{
 		Enabled: true,
@@ -343,12 +373,26 @@ func (f *fakeSampler) HistoryColumns() int {
 }
 
 type fakeRegistrar struct {
-	registered []uint64
-	removed    []uint64
+	registered    []uint64
+	registrations []fakeRegistration
+	removed       []uint64
 }
 
-func (f *fakeRegistrar) RegisterRoute(routeID uint64, _, _ []byte, _ uint64) bool {
+type fakeRegistration struct {
+	routeID uint64
+	start   []byte
+	end     []byte
+	groupID uint64
+}
+
+func (f *fakeRegistrar) RegisterRoute(routeID uint64, start, end []byte, groupID uint64) bool {
 	f.registered = append(f.registered, routeID)
+	f.registrations = append(f.registrations, fakeRegistration{
+		routeID: routeID,
+		start:   distribution.CloneBytes(start),
+		end:     distribution.CloneBytes(end),
+		groupID: groupID,
+	})
 	return true
 }
 

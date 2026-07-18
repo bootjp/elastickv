@@ -56,7 +56,7 @@ var (
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route")
 
-	autoSplit                  = flag.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the default-group leader")
+	autoSplit                  = flag.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the catalog leader")
 	autoSplitEvalInterval      = flag.Duration("autoSplitEvalInterval", autosplit.DefaultEvalInterval, "Interval between automatic hotspot split evaluations")
 	autoSplitSplitCooldown     = flag.Duration("autoSplitSplitCooldown", autosplit.DefaultSplitCooldown, "Minimum wall-clock cooldown before a route created by SplitRange can be auto-split again")
 	autoSplitSplitTimeout      = flag.Duration("autoSplitSplitTimeout", autosplit.DefaultSplitTimeout, "Timeout for each automatic SplitRange RPC")
@@ -295,6 +295,18 @@ func seedDemoKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 	}
 }
 
+func demoKeyVizRouteID(engine *distribution.Engine) uint64 {
+	if engine == nil {
+		return 0
+	}
+	for _, route := range engine.Stats() {
+		if route.State == distribution.RouteStateActive {
+			return route.RouteID
+		}
+	}
+	return 0
+}
+
 func startDemoKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
 	if eg == nil || s == nil {
 		return
@@ -324,7 +336,7 @@ func demoAutoSplitConfigFromFlags(coordinator *kv.Coordinate) (autosplit.Schedul
 		},
 	}
 	if coordinator != nil {
-		cfg.IsLeader = coordinator.IsLeader
+		cfg.IsLeader = demoAutoSplitLeaderGate(coordinator)
 	}
 	if err := validateDemoAutoSplitConfig(cfg); err != nil {
 		return autosplit.SchedulerConfig{}, err
@@ -374,7 +386,7 @@ func startDemoAutoSplitScheduler(
 		return
 	}
 	if coordinator != nil {
-		cfg.IsLeader = coordinator.IsLeader
+		cfg.IsLeader = demoAutoSplitLeaderGate(coordinator)
 	}
 	scheduler := autosplit.NewScheduler(
 		cfg,
@@ -390,6 +402,15 @@ func startDemoAutoSplitScheduler(
 
 type demoAutoSplitDistributionSplitter struct {
 	server *adapter.DistributionServer
+}
+
+func demoAutoSplitLeaderGate(coordinator *kv.Coordinate) func() bool {
+	if coordinator == nil {
+		return nil
+	}
+	return func() bool {
+		return coordinator.IsLeaderForKey(distribution.CatalogVersionKey())
+	}
 }
 
 func (s demoAutoSplitDistributionSplitter) SplitRange(ctx context.Context, req autosplit.SplitRequest) (autosplit.SplitResult, error) {
@@ -666,6 +687,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 	sampler := buildDemoKeyVizSampler()
 	seedDemoKeyVizRoutes(sampler, distEngine)
+	coordinator.WithSampler(sampler, demoKeyVizRouteID(distEngine))
 	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{
 		GroupID:      1,
 		StatusReader: engine,
