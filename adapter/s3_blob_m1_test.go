@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,9 +15,12 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -275,6 +279,56 @@ func TestGRPCS3BlobClusterRequiresAndForwardsBearerToken(t *testing.T) {
 	md, ok := metadata.FromOutgoingContext(ctx)
 	require.True(t, ok)
 	require.Equal(t, []string{"Bearer peer-secret"}, md.Get("authorization"))
+}
+
+func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	peerStore := store.NewMVCCStore()
+	admin := NewAdminServer(NodeIdentity{NodeID: "n2", GRPCAddress: listener.Addr().String()}, nil)
+	admin.SetCapability(S3BlobOffloadCapabilityName, true)
+	unary, stream := AdminTokenAuth("peer-secret")
+	server := grpc.NewServer(grpc.ChainUnaryInterceptor(unary), grpc.ChainStreamInterceptor(stream))
+	pb.RegisterAdminServer(server, admin)
+	pb.RegisterS3BlobFetchServer(server, NewS3BlobFetchServer(peerStore, nil))
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		serveErr := <-serveDone
+		require.True(t, serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped))
+	})
+
+	members := staticS3BlobMembership{members: []kv.RaftMember{
+		{NodeID: "n1", Address: "127.0.0.1:1", Suffrage: "voter"},
+		{NodeID: "n2", Address: listener.Addr().String(), Suffrage: "voter"},
+	}}
+	cluster := NewGRPCS3BlobCluster("n1", members, "peer-secret")
+	t.Cleanup(func() { require.NoError(t, cluster.Close()) })
+	require.True(t, cluster.AllPeersSupportS3BlobOffload(context.Background()))
+
+	payload := []byte("authenticated-peer-transfer")
+	digest := sha256.Sum256(payload)
+	replica := S3BlobReplica{NodeID: "n2", Address: listener.Addr().String(), Suffrage: "voter"}
+	require.NoError(t, cluster.PushChunkBlob(context.Background(), replica, digest, payload, 10))
+	fetched, err := cluster.FetchChunkBlob(context.Background(), replica, digest)
+	require.NoError(t, err)
+	require.Equal(t, payload, fetched)
+
+	unauthenticated := NewGRPCS3BlobCluster("n1", members, "")
+	t.Cleanup(func() { require.NoError(t, unauthenticated.Close()) })
+	err = unauthenticated.PushChunkBlob(context.Background(), replica, digest, payload, 11)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+type staticS3BlobMembership struct {
+	members []kv.RaftMember
+}
+
+func (m staticS3BlobMembership) RaftMembersForKey(context.Context, []byte) ([]kv.RaftMember, error) {
+	return append([]kv.RaftMember(nil), m.members...), nil
 }
 
 func requireGRPCS3BlobCluster(t *testing.T, token string) *grpcS3BlobCluster {
