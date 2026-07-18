@@ -2,9 +2,7 @@ package backup
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
-	"math"
 	"path/filepath"
 	"sort"
 
@@ -31,7 +29,7 @@ const (
 )
 
 // ErrRedisInvalidSetMeta is returned when an !st|meta| value is not
-// the expected 8-byte big-endian member count.
+// the expected big-endian member count, optionally followed by inline TTL.
 var ErrRedisInvalidSetMeta = cockroachdberr.New("backup: invalid !st|meta| value")
 
 // ErrRedisInvalidSetKey is returned when an !st| key cannot be parsed
@@ -44,18 +42,19 @@ var ErrRedisInvalidSetKey = cockroachdberr.New("backup: malformed !st| key")
 // that re-emits a member is harmless — Redis sets are mathematical
 // sets, not multisets).
 type redisSetState struct {
-	metaSeen    bool
-	declaredLen int64
-	members     map[string]struct{}
-	expireAtMs  uint64
-	hasTTL      bool
+	metaSeen       bool
+	declaredLen    int64
+	members        map[string]struct{}
+	expireAtMs     uint64
+	hasTTL         bool
+	inlineTTLOwned bool
 }
 
 // HandleSetMeta processes one !st|meta|<len><userKey> record. The
-// value is the 8-byte BE member count. We park the declared length
-// so flushSets can warn on a mismatch with the observed member
-// count and register the user key so a later !redis|ttl|<userKey>
-// record routes back to this set state.
+// value is the 8-byte BE member count, optionally followed by an inline
+// expireAtMs. We park the declared length so flushSets can warn on a
+// mismatch with the observed member count and register the user key so a
+// later !redis|ttl|<userKey> record routes back to this set state.
 //
 // !st|meta|d|... delta keys share the !st|meta| string prefix, so a
 // snapshot dispatcher that routes by "starts with RedisSetMetaPrefix"
@@ -71,23 +70,23 @@ func (r *RedisDB) HandleSetMeta(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidSetKey, "meta key: %q", key)
 	}
-	if len(value) != redisUint64Bytes {
-		return cockroachdberr.Wrapf(ErrRedisInvalidSetMeta,
-			"length %d != %d", len(value), redisUint64Bytes)
-	}
 	// Bounds-check the uint64 declared count before narrowing to
 	// int64; without this a corrupted store with the high bit set
 	// would wrap to a negative declaredLen and fire spurious
 	// redis_set_length_mismatch warnings on every flush. Mirrors
 	// the hash + list encoders' symmetric guard.
-	rawLen := binary.BigEndian.Uint64(value)
-	if rawLen > math.MaxInt64 {
-		return cockroachdberr.Wrapf(ErrRedisInvalidSetMeta,
-			"declared len %d overflows int64", rawLen)
+	declaredLen, expireAtMs, hasTTL, inlineTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidSetMeta)
+	if err != nil {
+		return err
 	}
 	st := r.setState(userKey)
-	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
+	st.declaredLen = declaredLen
 	st.metaSeen = true
+	if inlineTTL {
+		st.expireAtMs = expireAtMs
+		st.hasTTL = hasTTL
+		st.inlineTTLOwned = true
+	}
 	return nil
 }
 

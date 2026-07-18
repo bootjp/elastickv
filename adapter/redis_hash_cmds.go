@@ -67,13 +67,20 @@ func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []b
 			Value: []byte(val),
 		})
 	}
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return legacyExpiredCollectionCleanupElems(key, redisHashKey(key)), nil
+	}
 	// Delete the legacy blob.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
 	// Write a base meta so that resolveHashMeta starts from an accurate count.
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey(key),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	return elems, nil
 }
@@ -89,6 +96,38 @@ func addLegacyHashFieldsToMap(migrationElems []*kv.Elem[kv.OP], key []byte, exis
 			}
 		}
 	}
+}
+
+func (r *RedisServer) hashMigrationSnapshot(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	ignoreExisting bool,
+	skipLegacy bool,
+) ([]*kv.Elem[kv.OP], map[string]struct{}, error) {
+	existsMap := map[string]struct{}{}
+	if ignoreExisting {
+		return nil, existsMap, nil
+	}
+	var migrationElems []*kv.Elem[kv.OP]
+	if !skipLegacy {
+		var err error
+		migrationElems, err = r.buildHashLegacyMigrationElems(ctx, key, readTS)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Fields from the legacy blob are being migrated in this same transaction,
+	// so they are not yet visible at readTS. Add them to existsMap so that
+	// buildHashFieldElems does not count already-existing fields as new.
+	if !skipLegacy {
+		addLegacyHashFieldsToMap(migrationElems, key, existsMap)
+	}
+	return migrationElems, existsMap, nil
 }
 
 // buildHashFieldElems iterates over field-value pairs in args, checks each
@@ -124,7 +163,12 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeHash); err != nil {
+		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
+		if err != nil {
+			return err
+		}
+		cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeHash)
+		if err != nil {
 			return err
 		}
 
@@ -135,26 +179,14 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		}
 
 		// Atomically migrate any legacy blob on first wide-column write.
-		// Fetch migration elems before allocating the main elems slice so that
-		// the initial capacity accounts for both migration and field Put ops,
-		// avoiding a reallocation when a legacy blob is present.
-		migrationElems, err := r.buildHashLegacyMigrationElems(ctx, key, readTS)
+		skipLegacy := cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeHash)
+		migrationElems, existsMap, err := r.hashMigrationSnapshot(ctx, key, readTS, expiredRecreate, skipLegacy)
 		if err != nil {
 			return err
 		}
-		elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+len(args)/redisPairWidth+setWideColOverhead)
+		elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+len(args)/redisPairWidth+setWideColOverhead)
+		elems = append(elems, cleanupElems...)
 		elems = append(elems, migrationElems...)
-
-		// Bulk-scan existing fields once so buildHashFieldElems can check
-		// existence via a map lookup instead of per-field ExistsAt.
-		existsMap, err := r.scanHashFieldExistsMap(ctx, key, readTS)
-		if err != nil {
-			return err
-		}
-		// Fields from the legacy blob are being migrated in this same transaction,
-		// so they are not yet visible at readTS. Add them to existsMap so that
-		// buildHashFieldElems does not count already-existing fields as new.
-		addLegacyHashFieldsToMap(migrationElems, key, existsMap)
 
 		var newFields int
 		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
@@ -494,6 +526,13 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return err
+	}
+	if expired {
+		return r.dispatchElems(ctx, true, readTS, legacyExpiredCollectionCleanupElems(key, redisHashKey(key)))
+	}
 	// Wide-column rewrite: write per-field keys and a new base meta.
 	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.
 	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
@@ -507,7 +546,7 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey(key),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value))}),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	// Also remove the legacy blob if it was present.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
@@ -654,7 +693,10 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 // readHashFieldInt reads the current integer value of a hash field from wide-column or legacy storage.
 // Returns (current, isNewField, legacyHashValue, error). legacyHashValue is non-nil only when
 // the value came from a legacy JSON blob that needs to be migrated on the next write.
-func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, readTS uint64) (int64, bool, redisHashValue, error) {
+func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, readTS uint64, ignoreExisting bool, skipLegacy bool) (int64, bool, redisHashValue, error) {
+	if ignoreExisting {
+		return 0, true, nil, nil
+	}
 	fieldKey := store.HashFieldKey(key, field)
 	raw, readErr := r.store.GetAt(ctx, fieldKey, readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
@@ -668,6 +710,9 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 		return current, false, nil, nil
 	}
 	// Not in wide-column – check legacy blob.
+	if skipLegacy {
+		return 0, true, nil, nil
+	}
 	legacyValue, legacyErr := r.loadHashAt(ctx, key, readTS)
 	if legacyErr != nil {
 		return 0, true, nil, legacyErr
@@ -684,14 +729,15 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
-func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64) (int64, error) {
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64, cleanupElems []*kv.Elem[kv.OP]) (int64, error) {
 	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
 	}
 	current += increment
 	newVal := strconv.FormatInt(current, 10)
-	elems := make([]*kv.Elem[kv.OP], 0, len(migrationElems)+setWideColOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+setWideColOverhead)
+	elems = append(elems, cleanupElems...)
 	elems = append(elems, migrationElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
@@ -721,6 +767,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	if err != nil {
 		return 0, err
 	}
+	cleanupElems, expiredRecreate, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeHash)
+	if err != nil {
+		return 0, err
+	}
 
 	startTS := normalizeStartTS(readTS)
 	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "hincrbyTxn: allocate commitTS")
@@ -729,19 +779,21 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	}
 	fieldKey := store.HashFieldKey(key, field)
 
-	current, isNewField, legacyValue, err := r.readHashFieldInt(ctx, key, field, readTS)
+	skipLegacy := cleanupDeletesLegacyCollection(cleanupElems, key, redisTypeHash)
+	current, isNewField, legacyValue, err := r.readHashFieldInt(ctx, key, field, readTS, expiredRecreate, skipLegacy)
 	if err != nil {
 		return 0, err
 	}
 
 	// If a legacy blob exists, migrate it atomically with the increment.
 	if len(legacyValue) > 0 {
-		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, typ, increment)
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, typ, increment, cleanupElems)
 	}
 
 	current += increment
 	newVal := strconv.FormatInt(current, 10)
-	elems := make([]*kv.Elem[kv.OP], 0, setWideColOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+setWideColOverhead)
+	elems = append(elems, cleanupElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})

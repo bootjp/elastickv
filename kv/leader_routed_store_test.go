@@ -85,6 +85,9 @@ type fakeRawKVServer struct {
 	scanCalls   int
 	latestCalls int
 
+	lastScanGroupID  uint64
+	lastScanKeysOnly bool
+
 	getResp    *pb.RawGetResponse
 	scanResp   *pb.RawScanAtResponse
 	latestResp *pb.RawLatestCommitTSResponse
@@ -100,10 +103,12 @@ func (f *fakeRawKVServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGet
 	return &pb.RawGetResponse{}, nil
 }
 
-func (f *fakeRawKVServer) RawScanAt(context.Context, *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+func (f *fakeRawKVServer) RawScanAt(_ context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.scanCalls++
+	f.lastScanGroupID = req.GetGroupId()
+	f.lastScanKeysOnly = req.GetKeysOnly()
 	if f.scanResp != nil {
 		return f.scanResp, nil
 	}

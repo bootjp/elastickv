@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"sync"
 	"time"
@@ -14,9 +15,11 @@ import (
 )
 
 const (
-	defaultDeltaCompactorMaxDeltaCount = 64
-	defaultDeltaCompactorScanInterval  = 30 * time.Second
-	defaultDeltaCompactorTimeout       = 5 * time.Second
+	defaultDeltaCompactorMaxDeltaCount  = 64
+	defaultDeltaCompactorScanInterval   = 30 * time.Second
+	defaultDeltaCompactorTimeout        = 5 * time.Second
+	defaultDeltaCompactorTimeoutBackoff = time.Minute
+	metaDeltaCommitTSBytes              = 8
 
 	// deltaCompactorTickScanLimit is the maximum number of delta keys scanned
 	// per collection type per compaction tick. It bounds per-tick I/O while
@@ -45,12 +48,13 @@ type urgentCompactionRequest struct {
 // tick silently. Compaction is performed as an OCC transaction so concurrent
 // writers never conflict with the compactor.
 type DeltaCompactor struct {
-	st       store.MVCCStore
-	coord    kv.Coordinator
-	logger   *slog.Logger
-	maxCount int
-	interval time.Duration
-	timeout  time.Duration
+	st             store.MVCCStore
+	coord          kv.Coordinator
+	logger         *slog.Logger
+	maxCount       int
+	interval       time.Duration
+	timeout        time.Duration
+	timeoutBackoff time.Duration
 	// cursors tracks the exclusive lower bound for the next scan of each
 	// collection type (keyed by collectionDeltaHandler.typeName). This allows
 	// each tick to resume where the previous one stopped, ensuring that keys
@@ -67,6 +71,10 @@ type DeltaCompactor struct {
 	// loop drains this channel between regular ticks so hot keys are unblocked
 	// quickly without waiting for the next scheduled pass.
 	urgentCh chan urgentCompactionRequest
+
+	stateMu       sync.Mutex
+	backoffUntil  time.Time
+	handlerCursor int
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -101,6 +109,16 @@ func WithDeltaCompactorTimeout(d time.Duration) DeltaCompactorOption {
 	}
 }
 
+// WithDeltaCompactorTimeoutBackoff sets how long background passes are skipped
+// after a tick exhausts its timeout. Default: 1m.
+func WithDeltaCompactorTimeoutBackoff(d time.Duration) DeltaCompactorOption {
+	return func(c *DeltaCompactor) {
+		if d >= 0 {
+			c.timeoutBackoff = d
+		}
+	}
+}
+
 // WithDeltaCompactorLogger sets the logger.
 func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 	return func(c *DeltaCompactor) {
@@ -113,14 +131,15 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 // NewDeltaCompactor creates a DeltaCompactor that operates on st using coord.
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
-		st:       st,
-		coord:    kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
-		logger:   slog.Default(),
-		maxCount: defaultDeltaCompactorMaxDeltaCount,
-		interval: defaultDeltaCompactorScanInterval,
-		timeout:  defaultDeltaCompactorTimeout,
-		cursors:  make(map[string][]byte),
-		urgentCh: make(chan urgentCompactionRequest, urgentCompactionChanSize),
+		st:             st,
+		coord:          kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
+		logger:         slog.Default(),
+		maxCount:       defaultDeltaCompactorMaxDeltaCount,
+		interval:       defaultDeltaCompactorScanInterval,
+		timeout:        defaultDeltaCompactorTimeout,
+		timeoutBackoff: defaultDeltaCompactorTimeoutBackoff,
+		cursors:        make(map[string][]byte),
+		urgentCh:       make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -261,49 +280,135 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 // SyncOnce runs one compaction pass. The IsLeader() guard avoids the
 // full-prefix delta scan on followers, which would proxy cross-node on
 // ShardStore backends. For sharded deployments where this node is the
-// leader for a non-default shard group, the regular tick is skipped; those
-// keys are still handled by the urgent compaction path (compactUrgentKey)
-// which uses IsLeaderForKey for per-key routing. buildBatchElems adds an
-// additional per-key IsLeaderForKey filter so a default-group leader never
-// dispatches mutations for shards it does not own.
-// Each collection-type handler runs in its own goroutine so that a slow
-// handler (e.g. one with many list deltas) does not delay Hash/Set/ZSet
-// compaction. All goroutines share the same per-tick timeout context.
+// leader for a non-default shard group, the regular delta-compaction tick is
+// skipped; those keys are still handled by the urgent compaction path
+// (compactUrgentKey) which uses IsLeaderForKey for per-key routing.
+//
+// The TTL-inline migrator is intentionally outside the default-group leader
+// guard. It is a migration path, not just a hot-key repair path, and each
+// candidate is still filtered by IsLeaderForKey before dispatch. Without this
+// pass, keys whose shard is led by this node but whose default group is led
+// elsewhere would never get their inline TTL anchor before legacy fallback is
+// disabled.
+//
+// Collection-type handlers run sequentially under one per-tick timeout. A
+// production leader can otherwise receive four full-prefix scans at the same
+// time; under Redis migration load that can starve Raft heartbeats and cause
+// callers to see connection resets. Urgent single-key compaction and TTL
+// migration remain independently key-routed.
 func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
-	if c.coord == nil || !c.coord.IsLeader() {
+	if c.coord == nil {
+		return nil
+	}
+	if active, until := c.backgroundBackoffActive(time.Now()); active {
+		c.logger.DebugContext(ctx, "delta compactor: skipping pass during timeout backoff",
+			"backoff_until", until)
 		return nil
 	}
 	readTS := snapshotTS(c.coord.Clock(), c.st)
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	handlers := c.allHandlers()
-	errs := make([]error, len(handlers))
-	var wg sync.WaitGroup
-	for i, h := range handlers {
-		wg.Add(1)
-		go func(idx int, handler collectionDeltaHandler) {
-			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					c.logger.Error("DeltaCompactor: panic in handler",
-						slog.String("type", handler.typeName),
-						slog.Any("panic", rec))
-					errs[idx] = errors.Errorf("panic in %s compactor: %v", handler.typeName, rec)
-				}
-			}()
-			errs[idx] = c.compactHandler(tickCtx, handler, readTS)
-		}(i, h)
+	combined := c.compactBackgroundHandlers(tickCtx, readTS)
+	if tickCtx.Err() == nil {
+		if err := c.migrateTTLInlineOnce(tickCtx, readTS); err != nil && !errors.Is(err, context.Canceled) {
+			combined = errors.CombineErrors(combined, err)
+		}
 	}
-	wg.Wait()
+	if deltaCompactorBudgetExhausted(combined, tickCtx, ctx) {
+		c.backoffBackgroundCompaction(c.timeoutBackoff)
+		c.logger.WarnContext(ctx, "delta compactor: backing off after timeout",
+			"backoff", c.timeoutBackoff,
+			"error", combined)
+	}
+	return errors.WithStack(combined)
+}
 
+func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS uint64) error {
+	if !c.coord.IsLeader() {
+		return nil
+	}
+	handlers := c.allHandlers()
+	start := c.backgroundHandlerStart(len(handlers))
 	var combined error
-	for _, err := range errs {
+	for offset := range handlers {
+		if ctx.Err() != nil {
+			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
+		}
+		idx := (start + offset) % len(handlers)
+		h := handlers[idx]
+		err := c.compactHandlerSafely(ctx, h, readTS)
+		c.advanceBackgroundHandlerCursor(idx, len(handlers))
 		if err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
 	return errors.WithStack(combined)
+}
+
+func (c *DeltaCompactor) backgroundHandlerStart(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.handlerCursor < 0 || c.handlerCursor >= total {
+		c.handlerCursor = 0
+	}
+	return c.handlerCursor
+}
+
+func (c *DeltaCompactor) advanceBackgroundHandlerCursor(current, total int) {
+	if total <= 0 {
+		return
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.handlerCursor = (current + 1) % total
+}
+
+func (c *DeltaCompactor) compactHandlerSafely(ctx context.Context, h collectionDeltaHandler, readTS uint64) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.logger.Error("DeltaCompactor: panic in handler",
+				slog.String("type", h.typeName),
+				slog.Any("panic", rec))
+			err = errors.Errorf("panic in %s compactor: %v", h.typeName, rec)
+		}
+	}()
+	return c.compactHandler(ctx, h, readTS)
+}
+
+func (c *DeltaCompactor) backgroundBackoffActive(now time.Time) (bool, time.Time) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.backoffUntil.IsZero() {
+		return false, time.Time{}
+	}
+	if now.Before(c.backoffUntil) {
+		return true, c.backoffUntil
+	}
+	c.backoffUntil = time.Time{}
+	return false, time.Time{}
+}
+
+func (c *DeltaCompactor) backoffBackgroundCompaction(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.backoffUntil = time.Now().Add(d)
+}
+
+func deltaCompactorBudgetExhausted(err error, workCtx, parentCtx context.Context) bool {
+	if err == nil || workCtx == nil {
+		return false
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return false
+	}
+	return workCtx.Err() != nil
 }
 
 // collectionDeltaHandler holds the type-specific functions for one collection type.
@@ -510,16 +615,85 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 
 // loadListBaseMeta reads the base list metadata key. Returns a zero ListMeta
 // if the key does not exist (all state may be in uncompacted delta keys).
-func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, error) {
+func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, []byte, error) {
 	raw, err := c.st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return store.ListMeta{}, nil
+			return store.ListMeta{}, nil, nil
 		}
-		return store.ListMeta{}, errors.WithStack(err)
+		return store.ListMeta{}, nil, errors.WithStack(err)
 	}
 	meta, err := store.UnmarshalListMeta(raw)
-	return meta, errors.WithStack(err)
+	return meta, raw, errors.WithStack(err)
+}
+
+func compactedMetaExpireAt(
+	ctx context.Context,
+	st store.MVCCStore,
+	userKey []byte,
+	readTS uint64,
+	raw []byte,
+	inlineSize int,
+	expireAt uint64,
+	deltaKVs []*store.KVPair,
+	deltaScanPrefix []byte,
+) (uint64, error) {
+	if len(raw) == inlineSize {
+		return expireAt, nil
+	}
+	ttlMs, ttlCommitTS, found, err := legacyTTLMillisWithCommitTSAt(ctx, st, userKey, readTS)
+	if err != nil || !found {
+		return 0, err
+	}
+	if len(raw) == 0 && legacyTTLPrecedesAllMetaDeltas(ttlCommitTS, deltaKVs, deltaScanPrefix) {
+		return 0, nil
+	}
+	return ttlMs, nil
+}
+
+func legacyTTLMillisWithCommitTSAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, uint64, bool, error) {
+	ttlKey := redisTTLKey(userKey)
+	raw, err := st.GetAt(ctx, ttlKey, readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, errors.WithStack(err)
+	}
+	ttl, err := decodeRedisTTL(raw)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	commitTS, ok, err := st.LatestCommitTS(ctx, ttlKey)
+	if err != nil {
+		return 0, 0, false, errors.WithStack(err)
+	}
+	return redisExpireAtMillis(ttl), commitTS, ok, nil
+}
+
+func legacyTTLPrecedesAllMetaDeltas(ttlCommitTS uint64, deltaKVs []*store.KVPair, deltaScanPrefix []byte) bool {
+	minDeltaTS, ok := minMetaDeltaCommitTS(deltaKVs, deltaScanPrefix)
+	return ok && ttlCommitTS < minDeltaTS
+}
+
+func minMetaDeltaCommitTS(deltaKVs []*store.KVPair, deltaScanPrefix []byte) (uint64, bool) {
+	var minTS uint64
+	found := false
+	for _, pair := range deltaKVs {
+		if pair == nil || !bytes.HasPrefix(pair.Key, deltaScanPrefix) {
+			continue
+		}
+		rest := pair.Key[len(deltaScanPrefix):]
+		if len(rest) < metaDeltaCommitTSBytes {
+			continue
+		}
+		ts := binary.BigEndian.Uint64(rest[:metaDeltaCommitTSBytes])
+		if !found || ts < minTS {
+			minTS = ts
+			found = true
+		}
+	}
+	return minTS, found
 }
 
 // sumListMetaDeltas aggregates HeadDelta and LenDelta across all delta KVPairs.
@@ -549,7 +723,14 @@ func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	// Read base metadata (may not exist if all state is in deltas).
-	baseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
+	baseMeta, rawBaseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
+	if err != nil {
+		return nil, err
+	}
+	expireAt, err := compactedMetaExpireAt(
+		ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt,
+		deltaKVs, store.ListMetaDeltaScanPrefix(userKey),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -560,8 +741,9 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	}
 
 	newMeta := store.ListMeta{
-		Head: baseMeta.Head + headDelta,
-		Len:  baseMeta.Len + lenDelta,
+		Head:     baseMeta.Head + headDelta,
+		Len:      baseMeta.Len + lenDelta,
+		ExpireAt: expireAt,
 	}
 	if newMeta.Len < 0 {
 		c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
@@ -650,9 +832,9 @@ type simpleLenHandlerParams struct {
 	extractUserKey   func(key []byte) []byte
 	deltaKeyPrefixFn func(userKey []byte) []byte
 	metaKeyFn        func(userKey []byte) []byte
-	unmarshalBase    func([]byte) (int64, error)
+	unmarshalBase    func([]byte) (int64, uint64, error)
 	unmarshalDelta   func([]byte) (int64, error)
-	marshalBase      func(int64) []byte
+	marshalBase      func(int64, uint64) []byte
 }
 
 func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collectionDeltaHandler {
@@ -664,6 +846,7 @@ func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collecti
 		buildElems: func(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 			return c.buildSimpleCompactElems(ctx, userKey, deltaKVs, readTS,
 				p.metaKeyFn(userKey),
+				p.deltaKeyPrefixFn(userKey),
 				p.unmarshalBase,
 				p.unmarshalDelta,
 				p.marshalBase,
@@ -679,15 +862,17 @@ func (c *DeltaCompactor) hashHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractHashUserKeyFromDelta,
 		deltaKeyPrefixFn: store.HashMetaDeltaScanPrefix,
 		metaKeyFn:        store.HashMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalHashMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalHashMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalHashMeta(store.HashMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalHashMeta(store.HashMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -698,15 +883,17 @@ func (c *DeltaCompactor) setHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractSetUserKeyFromDelta,
 		deltaKeyPrefixFn: store.SetMetaDeltaScanPrefix,
 		metaKeyFn:        store.SetMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalSetMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalSetMeta(store.SetMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalSetMeta(store.SetMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -717,15 +904,17 @@ func (c *DeltaCompactor) zsetHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractZSetUserKeyFromDelta,
 		deltaKeyPrefixFn: store.ZSetMetaDeltaScanPrefix,
 		metaKeyFn:        store.ZSetMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalZSetMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalZSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalZSetMeta(store.ZSetMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -736,9 +925,10 @@ func foldSimpleLenDeltas(
 	deltaKVs []*store.KVPair,
 	additionalDelta int64,
 	baseLen int64,
+	expireAt uint64,
 	metaKey []byte,
 	unmarshalDelta func([]byte) (int64, error),
-	marshalBase func(int64) []byte,
+	marshalBase func(int64, uint64) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
 	var deltaSum int64
 	for _, d := range deltaKVs {
@@ -752,7 +942,7 @@ func foldSimpleLenDeltas(
 	if newLen < 0 {
 		newLen = 0
 	}
-	metaElem := simpleMetaElemForLen(metaKey, newLen, marshalBase)
+	metaElem := simpleMetaElemForLen(metaKey, newLen, expireAt, marshalBase)
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
@@ -765,26 +955,35 @@ func foldSimpleLenDeltas(
 // It is used by Hash, Set, and ZSet compaction, which all carry only a LenDelta.
 func (c *DeltaCompactor) buildSimpleCompactElems(
 	ctx context.Context,
-	_ []byte,
+	userKey []byte,
 	deltaKVs []*store.KVPair,
 	readTS uint64,
 	metaKey []byte,
-	unmarshalBase func([]byte) (int64, error),
+	deltaScanPrefix []byte,
+	unmarshalBase func([]byte) (int64, uint64, error),
 	unmarshalDelta func([]byte) (int64, error),
-	marshalBase func(int64) []byte,
+	marshalBase func(int64, uint64) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
 	raw, err := c.st.GetAt(ctx, metaKey, readTS)
 	var baseLen int64
+	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, errors.WithStack(err)
 	}
 	if err == nil {
-		baseLen, err = unmarshalBase(raw)
+		baseLen, expireAt, err = unmarshalBase(raw)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
-	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, metaKey, unmarshalDelta, marshalBase)
+	expireAt, err = compactedMetaExpireAt(
+		ctx, c.st, userKey, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt,
+		deltaKVs, deltaScanPrefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, expireAt, metaKey, unmarshalDelta, marshalBase)
 }
 
 // zsetInlineMetaCompactionThreshold is the number of existing ZSetMetaDeltaKey
@@ -812,6 +1011,7 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 	}
 	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
 	var baseLen int64
+	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, errors.WithStack(err)
 	}
@@ -821,24 +1021,29 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 			return nil, false, errors.WithStack(unmarshalErr)
 		}
 		baseLen = m.Len
+		expireAt = m.ExpireAt
+	}
+	expireAt, err = compactedMetaExpireAt(ctx, r.store, key, readTS, raw, redisSimpleMetaInlineSizeBytes, expireAt, deltaKVs, prefix)
+	if err != nil {
+		return nil, false, err
 	}
 	elems, err := foldSimpleLenDeltas(
-		deltaKVs, additionalDelta, baseLen,
+		deltaKVs, additionalDelta, baseLen, expireAt,
 		store.ZSetMetaKey(key),
 		func(b []byte) (int64, error) {
 			d, unmarshalErr := store.UnmarshalZSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(unmarshalErr)
 		},
-		func(n int64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n}) },
+		func(n int64, ttl uint64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n, ExpireAt: ttl}) },
 	)
 	return elems, true, err
 }
 
 // simpleMetaElemForLen returns a Put or Del elem for a Hash/Set/ZSet metadata key.
 // When newLen==0 a Del is returned to match Redis semantics (empty collection = non-existent).
-func simpleMetaElemForLen(metaKey []byte, newLen int64, marshalBase func(int64) []byte) *kv.Elem[kv.OP] {
+func simpleMetaElemForLen(metaKey []byte, newLen int64, expireAt uint64, marshalBase func(int64, uint64) []byte) *kv.Elem[kv.OP] {
 	if newLen == 0 {
 		return &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey}
 	}
-	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen)}
+	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen, expireAt)}
 }
