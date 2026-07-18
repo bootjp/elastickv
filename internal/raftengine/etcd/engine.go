@@ -3564,18 +3564,19 @@ func (e *Engine) refreshStatus() {
 	leader := e.leaderInfo(basic.Lead)
 
 	status := raftengine.Status{
-		State:             state,
-		Leader:            leader,
-		Term:              basic.GetTerm(),
-		CommitIndex:       basic.GetCommit(),
-		AppliedIndex:      e.applied,
-		LastLogIndex:      lastLogIndex,
-		LastSnapshotIndex: snapshot.GetMetadata().GetIndex(),
-		FSMPending:        pendingEntries(basic.GetCommit(), e.applied),
-		NumPeers:          numRemoteServers(config.Servers, e.localID),
-		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
-		LeadTransferee:    basic.LeadTransferee,
-		PendingConfChange: e.hasPendingConfChange(),
+		State:              state,
+		Leader:             leader,
+		Term:               basic.GetTerm(),
+		CommitIndex:        basic.GetCommit(),
+		AppliedIndex:       e.applied,
+		LastLogIndex:       lastLogIndex,
+		LastSnapshotIndex:  snapshot.GetMetadata().GetIndex(),
+		FSMPending:         pendingEntries(basic.GetCommit(), e.applied),
+		NumPeers:           numRemoteServers(config.Servers, e.localID),
+		LastContact:        lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
+		ConfigurationIndex: e.currentConfigIndex(),
+		LeadTransferee:     basic.LeadTransferee,
+		PendingConfChange:  e.hasPendingConfChange(),
 	}
 
 	e.mu.Lock()

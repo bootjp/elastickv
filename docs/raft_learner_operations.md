@@ -233,6 +233,27 @@ The script derives `--raftJoinMembers` from `NODES` and rejects a join rollout
 that contains another node. After promotion, clear `RAFT_JOIN_NODE` and run the
 same single-node rollout once more to remove the temporary join flags.
 
+For recurring production replacements, use the fenced, resumable wrapper
+instead of issuing those steps independently:
+
+```sh
+TARGET_NODE=n4 \
+REPLACEMENT_CONFIRM=n4 \
+ROLLING_UPDATE_ENV_FILE=/path/to/deploy.env \
+REPLACEMENT_FENCE_COMMAND='fence-n4-and-block-raft' \
+REPLACEMENT_VERIFY_COMMAND='verify-a-real-write-and-read' \
+./scripts/raft-member-replace.sh --execute
+```
+
+Run the same command with `--dry-run` first. The wrapper verifies surviving
+quorum before fencing, passes `configuration_index` to every membership RPC,
+records a non-zero learner catch-up floor, restarts without join flags, and
+requires the application verification command to succeed. It supports one
+Raft group with a surviving quorum; it is not a forced no-quorum recovery tool.
+See
+`docs/design/2026_07_18_implemented_fenced_raft_member_replacement.md` for the
+state machine, fencing contract, and failure handling.
+
 ## Removing a learner
 
 If a learner needs to be detached (e.g., the operator decided not to

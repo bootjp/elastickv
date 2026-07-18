@@ -47,17 +47,19 @@ func (s *Server) Status(context.Context, *pb.RaftAdminStatusRequest) (*pb.RaftAd
 	}
 	current := s.engine.Status()
 	return &pb.RaftAdminStatusResponse{
-		State:             stateToProto(current.State),
-		LeaderId:          current.Leader.ID,
-		LeaderAddress:     current.Leader.Address,
-		Term:              current.Term,
-		CommitIndex:       current.CommitIndex,
-		AppliedIndex:      current.AppliedIndex,
-		LastLogIndex:      current.LastLogIndex,
-		LastSnapshotIndex: current.LastSnapshotIndex,
-		FsmPending:        current.FSMPending,
-		NumPeers:          current.NumPeers,
-		LastContactNanos:  current.LastContact.Nanoseconds(),
+		State:              stateToProto(current.State),
+		LeaderId:           current.Leader.ID,
+		LeaderAddress:      current.Leader.Address,
+		Term:               current.Term,
+		CommitIndex:        current.CommitIndex,
+		AppliedIndex:       current.AppliedIndex,
+		LastLogIndex:       current.LastLogIndex,
+		LastSnapshotIndex:  current.LastSnapshotIndex,
+		FsmPending:         current.FSMPending,
+		NumPeers:           current.NumPeers,
+		LastContactNanos:   current.LastContact.Nanoseconds(),
+		ConfigurationIndex: current.ConfigurationIndex,
+		PendingConfChange:  current.PendingConfChange,
 	}, nil
 }
 

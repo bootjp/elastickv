@@ -202,14 +202,16 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 				ID:      "node-1",
 				Address: "127.0.0.1:50051",
 			},
-			Term:              7,
-			CommitIndex:       10,
-			AppliedIndex:      9,
-			LastLogIndex:      12,
-			LastSnapshotIndex: 8,
-			FSMPending:        1,
-			NumPeers:          2,
-			LastContact:       0,
+			Term:               7,
+			CommitIndex:        10,
+			AppliedIndex:       9,
+			LastLogIndex:       12,
+			LastSnapshotIndex:  8,
+			FSMPending:         1,
+			NumPeers:           2,
+			LastContact:        0,
+			ConfigurationIndex: 6,
+			PendingConfChange:  true,
 		},
 		config: raftengine.Configuration{
 			Servers: []raftengine.Server{
@@ -225,6 +227,8 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.Equal(t, pb.RaftAdminState_RAFT_ADMIN_STATE_LEADER, statusResp.State)
 	require.Equal(t, "node-1", statusResp.LeaderId)
 	require.Equal(t, uint64(10), statusResp.CommitIndex)
+	require.Equal(t, uint64(6), statusResp.ConfigurationIndex)
+	require.True(t, statusResp.PendingConfChange)
 
 	cfgResp, err := server.Configuration(context.Background(), &pb.RaftAdminConfigurationRequest{})
 	require.NoError(t, err)

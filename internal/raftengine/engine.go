@@ -92,6 +92,10 @@ type Status struct {
 	FSMPending        uint64
 	NumPeers          uint64
 	LastContact       time.Duration
+	// ConfigurationIndex is the highest committed membership index durably
+	// published by this node. Operators pass it back as previous_index on the
+	// next membership RPC to reject concurrent topology changes.
+	ConfigurationIndex uint64
 	// LeadTransferee is non-zero on the current leader while a leadership
 	// transfer is in progress, and zero otherwise (including on followers).
 	// Writers should hold new proposals while this is non-zero, since etcd/raft

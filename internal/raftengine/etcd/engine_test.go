@@ -420,6 +420,10 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	})
 
 	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
+	require.Eventually(t, func() bool {
+		return engine.Status().ConfigurationIndex == engine.currentConfigIndex() &&
+			engine.Status().ConfigurationIndex > 0
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
