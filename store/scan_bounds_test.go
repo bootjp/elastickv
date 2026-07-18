@@ -57,6 +57,15 @@ func TestMVCCStore_ScanAt_NilEnd(t *testing.T) {
 	require.Len(t, kvs, 2)
 }
 
+func TestMVCCStore_ScanAtContextCanceled(t *testing.T) {
+	st := NewMVCCStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := st.ScanAt(ctx, []byte("a"), nil, 10, 10)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 // TestPebbleStore_ScanAt_ExclusiveEndBound verifies [start, end) for pebble.
 func TestPebbleStore_ScanAt_ExclusiveEndBound(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-scan-bound-*")
@@ -100,4 +109,20 @@ func TestPebbleStore_ScanAt_EndEqualsLastKey(t *testing.T) {
 	require.Len(t, kvs, 2)
 	assert.Equal(t, []byte("x"), kvs[0].Key)
 	assert.Equal(t, []byte("y"), kvs[1].Key)
+}
+
+func TestPebbleStore_ScanAtContextCanceled(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-scan-canceled-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = s.ScanAt(ctx, []byte("a"), nil, 10, 10)
+	require.ErrorIs(t, err, context.Canceled)
 }

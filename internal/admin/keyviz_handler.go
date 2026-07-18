@@ -56,7 +56,7 @@ const keyVizRowBudgetCap = 1024
 //
 // Fanout is non-nil when the handler is configured for cluster-wide
 // fan-out (Phase 2-C): it carries per-node status so the SPA can
-// surface degraded responses inline (see design 2026_04_27_proposed_keyviz_cluster_fanout.md).
+// surface degraded responses inline (see design 2026_04_27_implemented_keyviz_cluster_fanout.md).
 // The field is omitted from the wire form when fan-out is disabled
 // so old clients keep working unchanged.
 type KeyVizMatrix struct {

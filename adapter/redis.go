@@ -189,6 +189,11 @@ type RedisServer struct {
 	// reads on hot keys faster than the regular compaction interval.
 	compactor *DeltaCompactor
 
+	// disableLegacyTTLReadFallback removes !redis|ttl| from the authoritative
+	// read path after the inline TTL migrator has rewritten all anchors. The
+	// default keeps the fallback enabled for rolling upgrades.
+	disableLegacyTTLReadFallback bool
+
 	// connIDSeq hands out monotonically increasing per-connection
 	// identifiers. The zero value is never returned (atomic.AddUint64
 	// returns 1 on first call) so clients can treat 0 as "unset".
@@ -222,13 +227,6 @@ type RedisServer struct {
 	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
 
-	// standaloneSetDedup is kept for compatibility with older tests and
-	// deployments that toggled the former standalone SET sub-gate. SET now
-	// has the same collection-overwrite semantics on the dedup path as the
-	// legacy path, so onePhaseTxnDedup alone controls standalone SET/INCR/HSET
-	// routing.
-	standaloneSetDedup bool
-
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -246,15 +244,6 @@ func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
 	}
 }
 
-// WithStandaloneSetDedup is a compatibility no-op. Standalone SET follows
-// onePhaseTxnDedup now that SET-over-collection parity is implemented in
-// txnContext.applySet.
-func WithStandaloneSetDedup(enabled bool) RedisServerOption {
-	return func(r *RedisServer) {
-		r.standaloneSetDedup = enabled
-	}
-}
-
 func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisServerOption {
 	return func(r *RedisServer) {
 		r.readTracker = tracker
@@ -266,6 +255,17 @@ func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisSe
 func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 	return func(r *RedisServer) {
 		r.compactor = c
+	}
+}
+
+// WithRedisLegacyTTLReadFallback controls whether pre-inline !redis|ttl|
+// entries are still consulted after the anchor-specific TTL probes miss.
+// Leave this enabled during rolling upgrades; disable it only after the
+// background inline TTL migrator has completed for the cluster and legacy bare
+// string keys have been separately ruled out or rewritten.
+func WithRedisLegacyTTLReadFallback(enabled bool) RedisServerOption {
+	return func(r *RedisServer) {
+		r.disableLegacyTTLReadFallback = !enabled
 	}
 }
 
@@ -522,12 +522,10 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
 		// constructor option still trumps the env var.
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
-		// Compatibility field for the removed standalone SET sub-gate.
-		standaloneSetDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP_SET") == "1",
-		baseCtx:            baseCtx,
-		baseCancel:         baseCancel,
-		streamWaiters:      newKeyWaiterRegistry(),
-		zsetWaiters:        newKeyWaiterRegistry(),
+		baseCtx:          baseCtx,
+		baseCancel:       baseCancel,
+		streamWaiters:    newKeyWaiterRegistry(),
+		zsetWaiters:      newKeyWaiterRegistry(),
 	}
 	r.relay.Bind(r.publishLocal)
 

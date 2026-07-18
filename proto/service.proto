@@ -78,6 +78,7 @@ message RawScanAtRequest {
   uint64 ts = 4; // optional read timestamp; if zero, server uses current HLC
   bool reverse = 5;
   uint64 group_id = 6; // optional explicit Raft group for non-range-owned keyspaces
+  bool keys_only = 7; // when true, response kv entries omit values
 }
 
 message RawKVPair {

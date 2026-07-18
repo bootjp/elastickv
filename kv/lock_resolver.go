@@ -1,13 +1,18 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 const (
@@ -15,17 +20,34 @@ const (
 	lockResolverInterval = 10 * time.Second
 	// lockResolverBatchSize limits the number of locks scanned per group per cycle.
 	lockResolverBatchSize = 100
+	// lockResolverCycleBudget caps best-effort cleanup work so it cannot occupy
+	// the Raft leader long enough to starve HLC lease renewal.
+	lockResolverCycleBudget = 500 * time.Millisecond
+	// lockResolverOperationBudget bounds a single background resolution attempt.
+	// Foreground read/write paths still use their own caller deadlines.
+	lockResolverOperationBudget = 250 * time.Millisecond
+	// lockResolverBudgetBackoff keeps best-effort cleanup from immediately
+	// hammering the same saturated Raft/LSM path after a budget timeout.
+	lockResolverBudgetBackoff   = time.Minute
+	lockResolverMaxL0Files      = defaultFSMCompactorMaxL0Files
+	lockResolverMaxL0Sublevels  = defaultFSMCompactorMaxL0Sublevels
+	lockResolverMaxLSMDebtBytes = defaultFSMCompactorMaxLSMDebtBytes
 )
+
+var errLockResolverBudgetExhausted = errors.New("lock resolver budget exhausted")
 
 // LockResolver periodically scans for expired transaction locks and resolves
 // them. This handles the case where secondary commit fails and leaves orphaned
 // locks that no read path would discover (e.g., cold keys).
 type LockResolver struct {
-	store  *ShardStore
-	groups map[uint64]*ShardGroup
-	log    *slog.Logger
-	cancel context.CancelFunc
-	done   chan struct{}
+	store             *ShardStore
+	groups            map[uint64]*ShardGroup
+	log               *slog.Logger
+	mu                sync.Mutex
+	nextLockScanStart map[uint64][]byte
+	resolveBackoff    map[uint64]time.Time
+	cancel            context.CancelFunc
+	done              chan struct{}
 }
 
 // NewLockResolver creates and starts a background lock resolver.
@@ -35,11 +57,13 @@ func NewLockResolver(ss *ShardStore, groups map[uint64]*ShardGroup, log *slog.Lo
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	lr := &LockResolver{
-		store:  ss,
-		groups: groups,
-		log:    log,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		store:             ss,
+		groups:            groups,
+		log:               log,
+		nextLockScanStart: make(map[uint64][]byte),
+		resolveBackoff:    make(map[uint64]time.Time),
+		cancel:            cancel,
+		done:              make(chan struct{}),
 	}
 	go lr.run(ctx)
 	return lr
@@ -68,16 +92,27 @@ func (lr *LockResolver) run(ctx context.Context) {
 }
 
 func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
+	passCtx, cancel := context.WithTimeout(ctx, lockResolverCycleBudget)
+	defer cancel()
+
 	for gid, g := range lr.groups {
 		if ctx.Err() != nil {
 			return
 		}
-		// Only resolve on the leader and skip during leadership transfer to
-		// avoid a flood of dropped proposals.
-		if !isLeaderAcceptingWrites(engineForGroup(g)) {
+		if lr.resolveBackoffActive(gid, time.Now()) {
 			continue
 		}
-		if err := lr.resolveGroupLocks(ctx, gid, g); err != nil {
+		if passCtx.Err() != nil {
+			lr.logLockResolverYield(gid, passCtx.Err())
+			return
+		}
+		err := lr.resolveGroupLocks(passCtx, gid, g)
+		if err != nil {
+			if errors.Is(err, errLockResolverBudgetExhausted) || lockResolverBudgetExhausted(err, passCtx, ctx) {
+				lr.backoffGroupResolve(gid, lockResolverBudgetBackoff)
+				lr.logLockResolverYield(gid, err)
+				return
+			}
 			lr.log.Warn("lock resolver: group scan failed",
 				slog.Uint64("gid", gid),
 				slog.Any("err", err),
@@ -87,17 +122,22 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 }
 
 func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *ShardGroup) error {
-	if g.Store == nil {
+	if !lr.groupReadyForBackgroundResolve(ctx, gid, g) {
 		return nil
 	}
 
 	// Scan lock key range: [!txn|lock| ... prefixEnd(!txn|lock|))
-	lockStart := txnLockKey(nil)
-	lockEnd := prefixScanEnd(lockStart)
+	lockRangeStart := txnLockKey(nil)
+	lockEnd := prefixScanEnd(lockRangeStart)
+	lockStart := lr.lockScanStart(gid, lockRangeStart, lockEnd)
 
 	lockKVs, err := g.Store.ScanAt(ctx, lockStart, lockEnd, lockResolverBatchSize, math.MaxUint64)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if len(lockKVs) == 0 {
+		lr.resetLockScanStart(gid)
+		return nil
 	}
 
 	var resolved, skipped int
@@ -105,36 +145,20 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 		if ctx.Err() != nil {
 			return errors.WithStack(ctx.Err())
 		}
-		userKey, ok := txnUserKeyFromLockKey(kvp.Key)
-		if !ok {
-			continue
+		if !lockResolverRaftReady(engineForGroup(g)) {
+			return nil
 		}
-
-		lock, err := decodeTxnLock(kvp.Value)
+		outcome, err := lr.resolveScannedLock(ctx, gid, g, kvp)
 		if err != nil {
-			lr.log.Warn("lock resolver: decode lock failed",
-				slog.String("key", string(userKey)),
-				slog.Any("err", err),
-			)
-			continue
+			return err
 		}
-
-		// Only resolve expired locks — active transaction locks are not touched.
-		if !txnLockExpired(lock) {
-			skipped++
-			continue
-		}
-
-		if err := lr.resolveExpiredLock(ctx, g, userKey, lock); err != nil {
-			lr.log.Warn("lock resolver: resolve failed",
-				slog.Uint64("gid", gid),
-				slog.String("key", string(userKey)),
-				slog.Uint64("start_ts", lock.StartTS),
-				slog.Any("err", err),
-			)
-			continue
-		}
-		resolved++
+		lr.advanceLockScanStart(gid, kvp.Key, lockEnd)
+		resolvedDelta, skippedDelta := lockResolveOutcomeCounts(outcome)
+		resolved += resolvedDelta
+		skipped += skippedDelta
+	}
+	if len(lockKVs) < lockResolverBatchSize {
+		lr.resetLockScanStart(gid)
 	}
 
 	if resolved > 0 {
@@ -147,8 +171,235 @@ func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *Sh
 	return nil
 }
 
+func lockResolverGroupCanResolve(g *ShardGroup) bool {
+	ready, _, _ := lockResolverGroupResolveState(g)
+	return ready
+}
+
+func lockResolverGroupResolveState(g *ShardGroup) (ready bool, overloaded bool, snap *pebble.Metrics) {
+	if g == nil || g.Store == nil {
+		return false, false, nil
+	}
+	if !lockResolverRaftReady(engineForGroup(g)) {
+		return false, false, nil
+	}
+	overloaded, snap = lockResolverLSMBackpressured(g.Store)
+	return !overloaded, overloaded, snap
+}
+
+func lockResolveOutcomeCounts(outcome lockResolveOutcome) (resolved int, skippedActive int) {
+	switch outcome {
+	case lockResolveResolved:
+		return 1, 0
+	case lockResolveSkippedActive:
+		return 0, 1
+	case lockResolveIgnored:
+		return 0, 0
+	}
+	return 0, 0
+}
+
+type lockResolveOutcome int
+
+const (
+	lockResolveIgnored lockResolveOutcome = iota
+	lockResolveSkippedActive
+	lockResolveResolved
+)
+
+func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *ShardGroup, kvp *store.KVPair) (lockResolveOutcome, error) {
+	userKey, ok := txnUserKeyFromLockKey(kvp.Key)
+	if !ok {
+		return lockResolveIgnored, nil
+	}
+
+	lock, err := decodeTxnLock(kvp.Value)
+	if err != nil {
+		lr.log.Warn("lock resolver: decode lock failed",
+			slog.String("key", string(userKey)),
+			slog.Any("err", err),
+		)
+		return lockResolveIgnored, nil
+	}
+
+	// Only resolve expired locks; active transaction locks are not touched.
+	if !txnLockExpired(lock) {
+		return lockResolveSkippedActive, nil
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, lockResolverOperationBudget)
+	defer cancel()
+	err = lr.resolveExpiredLock(opCtx, g, userKey, lock)
+	if err == nil {
+		return lockResolveResolved, nil
+	}
+	if lockResolverBudgetExhausted(err, opCtx, ctx) {
+		marked := errors.Mark(err, errLockResolverBudgetExhausted)
+		return lockResolveIgnored, errors.Wrap(marked, "lock resolver budget exhausted")
+	}
+	lr.log.Warn("lock resolver: resolve failed",
+		slog.Uint64("gid", gid),
+		slog.String("key", string(userKey)),
+		slog.Uint64("start_ts", lock.StartTS),
+		slog.Any("err", err),
+	)
+	return lockResolveIgnored, nil
+}
+
+func (lr *LockResolver) groupReadyForBackgroundResolve(ctx context.Context, gid uint64, g *ShardGroup) bool {
+	ready, overloaded, snap := lockResolverGroupResolveState(g)
+	if overloaded {
+		lr.log.WarnContext(ctx, "lock resolver: skipping under pebble backpressure",
+			slog.Uint64("gid", gid),
+			slog.Any("l0_files", snap.Levels[0].TablesCount),
+			slog.Any("l0_sublevels", snap.Levels[0].Sublevels),
+			slog.Any("compaction_debt_bytes", snap.Compact.EstimatedDebt),
+			slog.Any("compactions_in_progress", snap.Compact.NumInProgress),
+			slog.Any("compaction_in_progress_bytes", snap.Compact.InProgressBytes),
+		)
+	}
+	return ready
+}
+
+func (lr *LockResolver) primaryGroupReadyForBackgroundAbort(primaryKey []byte) bool {
+	pg, ok := lr.store.groupForKey(primaryKey)
+	return ok && lockResolverGroupCanResolve(pg)
+}
+
+func (lr *LockResolver) logLockResolverYield(gid uint64, err error) {
+	lr.log.Warn("lock resolver: yielding after resolver budget",
+		slog.Uint64("gid", gid),
+		slog.Duration("backoff", lockResolverBudgetBackoff),
+		slog.Any("err", err),
+	)
+}
+
+func (lr *LockResolver) lockScanStart(gid uint64, lockRangeStart, lockRangeEnd []byte) []byte {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	start := lr.nextLockScanStart[gid]
+	if len(start) == 0 || !lockScanStartInRange(start, lockRangeStart, lockRangeEnd) {
+		return append([]byte(nil), lockRangeStart...)
+	}
+	return append([]byte(nil), start...)
+}
+
+func (lr *LockResolver) advanceLockScanStart(gid uint64, key, lockRangeEnd []byte) {
+	next := lockResolverNextScanStartAfter(key, lockRangeEnd)
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.ensureStateLocked()
+	if len(next) == 0 {
+		delete(lr.nextLockScanStart, gid)
+		return
+	}
+	lr.nextLockScanStart[gid] = next
+}
+
+func (lr *LockResolver) resetLockScanStart(gid uint64) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	delete(lr.nextLockScanStart, gid)
+}
+
+func (lr *LockResolver) resolveBackoffActive(gid uint64, now time.Time) bool {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	until, ok := lr.resolveBackoff[gid]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(lr.resolveBackoff, gid)
+	return false
+}
+
+func (lr *LockResolver) backoffGroupResolve(gid uint64, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.ensureStateLocked()
+	lr.resolveBackoff[gid] = time.Now().Add(d)
+}
+
+func (lr *LockResolver) ensureStateLocked() {
+	if lr.nextLockScanStart == nil {
+		lr.nextLockScanStart = make(map[uint64][]byte)
+	}
+	if lr.resolveBackoff == nil {
+		lr.resolveBackoff = make(map[uint64]time.Time)
+	}
+}
+
+func lockScanStartInRange(start, lockRangeStart, lockRangeEnd []byte) bool {
+	return bytes.Compare(start, lockRangeStart) >= 0 && (len(lockRangeEnd) == 0 || bytes.Compare(start, lockRangeEnd) < 0)
+}
+
+func lockResolverNextScanStartAfter(key, lockRangeEnd []byte) []byte {
+	next := append(append([]byte(nil), key...), 0)
+	if len(lockRangeEnd) > 0 && bytes.Compare(next, lockRangeEnd) >= 0 {
+		return nil
+	}
+	return next
+}
+
+func lockResolverRaftReady(engine interface {
+	raftengine.LeaderView
+	raftengine.StatusReader
+}) bool {
+	if !isLeaderEngine(engine) {
+		return false
+	}
+	status := engine.Status()
+	if status.State != raftengine.StateLeader {
+		return false
+	}
+	if status.LeadTransferee != 0 || status.PendingConfChange {
+		return false
+	}
+	if status.FSMPending > 0 {
+		return false
+	}
+	return status.AppliedIndex >= status.CommitIndex
+}
+
+func lockResolverLSMBackpressured(st store.MVCCStore) (bool, *pebble.Metrics) {
+	source, ok := st.(pebbleMetricsSource)
+	if !ok {
+		return false, nil
+	}
+	snap := source.Metrics()
+	if snap == nil {
+		return false, nil
+	}
+	return lsmWriteBackpressured(snap, lsmBackpressureLimits{
+		maxL0Files:      lockResolverMaxL0Files,
+		maxL0Sublevels:  lockResolverMaxL0Sublevels,
+		maxLSMDebtBytes: lockResolverMaxLSMDebtBytes,
+	}), snap
+}
+
+func lockResolverBudgetExhausted(err error, workCtx, parentCtx context.Context) bool {
+	if err == nil || workCtx == nil {
+		return false
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return false
+	}
+	if workCtx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
 func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, userKey []byte, lock txnLock) error {
-	status, commitTS, err := lr.store.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	status, commitTS, err := lr.backgroundPrimaryTxnStatus(ctx, lock)
 	if err != nil {
 		return err
 	}
@@ -163,12 +414,33 @@ func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, u
 		}
 		return applyTxnResolution(ctx, g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{userKey})
 	case txnStatusPending:
-		// Lock is expired but primary is still pending — the primary's
-		// tryAbortExpiredPrimary inside primaryTxnStatus should have
-		// attempted to abort it. If it couldn't (e.g., primary shard
-		// unreachable), we skip and retry next cycle.
+		// Lock is expired but primary is still pending. The background path
+		// skips abort when the primary shard is not locally ready, so retry
+		// cleanup on a later cycle.
 		return nil
 	default:
 		return errors.Wrapf(ErrTxnInvalidMeta, "unknown txn status for key %s", string(userKey))
 	}
+}
+
+func (lr *LockResolver) backgroundPrimaryTxnStatus(ctx context.Context, lock txnLock) (txnStatus, uint64, error) {
+	status, commitTS, done, err := lr.store.primaryTxnRecordedStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil || done {
+		return status, commitTS, err
+	}
+
+	primaryLock, locked, err := lr.store.primaryTxnLock(ctx, lock.PrimaryKey, lock.StartTS)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if !locked {
+		return txnStatusRolledBack, 0, nil
+	}
+	if !txnLockExpired(primaryLock) {
+		return txnStatusPending, 0, nil
+	}
+	if !lr.primaryGroupReadyForBackgroundAbort(lock.PrimaryKey) {
+		return txnStatusPending, 0, nil
+	}
+	return lr.store.expiredPrimaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
 }

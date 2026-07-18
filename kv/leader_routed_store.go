@@ -153,6 +153,45 @@ func (s *LeaderRoutedStore) proxyRawScanAt(
 	return out, nil
 }
 
+func (s *LeaderRoutedStore) proxyRawScanKeysAt(
+	ctx context.Context,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([][]byte, error) {
+	addr := s.leaderAddrForKey(start)
+	if addr == "" {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	cli := pb.NewRawKVClient(conn)
+	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: start,
+		EndKey:   end,
+		Limit:    int64(limit),
+		Ts:       ts,
+		KeysOnly: true,
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	out := make([][]byte, 0, len(resp.Kv))
+	for _, kvp := range resp.Kv {
+		if kvp == nil {
+			continue
+		}
+		out = append(out, bytes.Clone(kvp.Key))
+	}
+	return out, nil
+}
+
 func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	if s == nil || s.local == nil {
 		return nil, store.ErrKeyNotFound
@@ -260,6 +299,25 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, false)
 }
 
+func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if s == nil || s.local == nil {
+		return [][]byte{}, nil
+	}
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
+		return keys, errors.WithStack(err)
+	}
+	return s.proxyRawScanKeysAt(ctx, start, end, limit, ts)
+}
+
+func (s *LeaderRoutedStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, false)
+}
+
 func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil
@@ -273,6 +331,35 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 		return kvs, errors.WithStack(err)
 	}
 	return s.proxyRawScanAt(ctx, start, end, limit, ts, true)
+}
+
+func (s *LeaderRoutedStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, true)
+}
+
+func (s *LeaderRoutedStore) scanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {
+	if s == nil || s.local == nil {
+		return []*store.KVPair{}, false, nil
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return []*store.KVPair{}, false, nil
+	}
+	ok, fenceTS := s.leaderFenceTS(ctx, start)
+	if ok {
+		scanner, hasPhysicalLimit := s.local.(physicalLimitedStore)
+		if hasPhysicalLimit {
+			return scanPhysicalLimitLocal(ctx, scanner, start, end, visibleLimit, physicalLimit, max(ts, fenceTS), reverse)
+		}
+		if !reverse {
+			kvs, err := s.local.ScanAt(ctx, start, end, visibleLimit, max(ts, fenceTS))
+			return kvs, false, errors.WithStack(err)
+		}
+		kvs, err := s.local.ReverseScanAt(ctx, start, end, visibleLimit, max(ts, fenceTS))
+		return kvs, false, errors.WithStack(err)
+	}
+	// RawScanAt cannot enforce physicalLimit, so report truncation and let
+	// callers fail closed instead of proxying an unbounded physical scan.
+	return nil, true, nil
 }
 
 func (s *LeaderRoutedStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
