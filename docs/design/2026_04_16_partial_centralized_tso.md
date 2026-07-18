@@ -55,7 +55,12 @@ Implemented:
     for Raft-envelope cutovers, while route validation keeps all user data out
     of the control group. Restore accepts snapshots written by the earlier
     compatibility `kvFSM`, imports their HLC ceiling, derives a safe allocation
-    floor, and drains the legacy MVCC payload for full CRC verification.
+    floor, and drains the legacy MVCC payload for full CRC verification. The
+    group-0 `EncryptionAdmin` surface is capability-only: mutators are left
+    unwired and return `FailedPrecondition`. During upgrade replay, valid
+    encryption control entries committed by the earlier compatibility FSM are
+    decoded and deterministically rejected without halting the TSO apply loop;
+    malformed control entries still halt fail-closed.
 
 Remaining:
 
@@ -715,4 +720,7 @@ least as large as the maximum shard ceiling.
    logs already carry compatible HLC lease entries. `TSOStateMachine.Restore`
    recognizes legacy `kvFSM` snapshot headers, imports the ceiling, derives the
    allocation floor, and drains the old store payload before Raft resumes log
-   replay, so runtime wiring does not require deleting group-0 state.
+   replay. Valid historical encryption control entries are decoded and rejected
+   as obsolete ordinary apply responses, so replay advances without mutating
+   TSO state; new group-0 encryption mutators are disabled at the RPC boundary.
+   Runtime wiring therefore does not require deleting group-0 state.

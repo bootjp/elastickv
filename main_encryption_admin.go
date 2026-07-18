@@ -76,6 +76,18 @@ type encryptionAdminEngine interface {
 	raftengine.LeaderView
 }
 
+// encryptionAdminWiringForGroup keeps the read-only capability service on the
+// dedicated TSO listener while withholding every mutating proposal path. The
+// TSO FSM has no encryption applier or writer registry, so allowing a mutator
+// to propose there would commit an entry that cannot update dedicated TSO
+// state. Data groups retain the normal flag-driven mutator wiring.
+func encryptionAdminWiringForGroup(groupID uint64, enableMutators bool, engine encryptionAdminEngine) (bool, encryptionAdminEngine) {
+	if groupID == dedicatedTSORaftGroupID {
+		return false, nil
+	}
+	return enableMutators, engine
+}
+
 // registerEncryptionAdminServer constructs and registers an
 // EncryptionAdminServer on the supplied gRPC server. The function
 // is intentionally per-shard: the §7.1 Phase-0 GetCapability

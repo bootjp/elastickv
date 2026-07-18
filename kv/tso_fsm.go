@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -13,7 +14,10 @@ import (
 var _ raftengine.StateMachine = (*TSOStateMachine)(nil)
 var _ raftengine.VolatileEntryClassifier = (*TSOStateMachine)(nil)
 
-var ErrTSOStateMachineInvalidEntry = errors.New("tso fsm: invalid entry")
+var (
+	ErrTSOStateMachineInvalidEntry      = errors.New("tso fsm: invalid entry")
+	ErrTSOLegacyEncryptionEntryRejected = errors.New("tso fsm: legacy encryption entry rejected")
+)
 
 const (
 	// raftEncodeTSOAllocationFloor is TSO-FSM-local. It intentionally uses a
@@ -48,9 +52,35 @@ func (f *TSOStateMachine) Apply(data []byte) any {
 		return f.applyLeaseEntry(data)
 	case raftEncodeTSOAllocationFloor:
 		return f.applyAllocationFloorEntry(data)
+	case fsmwire.OpRegistration, fsmwire.OpBootstrap, fsmwire.OpRotation:
+		return rejectLegacyTSOEncryptionEntry(data)
 	default:
 		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry, "unexpected tag 0x%02x", data[0]))
 	}
+}
+
+// rejectLegacyTSOEncryptionEntry lets an upgraded group 0 advance past a
+// control entry committed while it still ran kvFSM. New group-0 listeners do
+// not expose encryption mutators, so these entries can only be historical.
+// Validate the old wire shape before returning an ordinary apply response:
+// malformed control bytes still halt, while a valid obsolete entry is
+// deterministically rejected without mutating TSO state or halting replay.
+func rejectLegacyTSOEncryptionEntry(data []byte) any {
+	var err error
+	switch data[0] {
+	case fsmwire.OpRegistration:
+		_, err = fsmwire.DecodeRegistration(data[1:])
+	case fsmwire.OpBootstrap:
+		_, err = fsmwire.DecodeBootstrap(data[1:])
+	case fsmwire.OpRotation:
+		_, err = fsmwire.DecodeRotation(data[1:])
+	}
+	if err != nil {
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"malformed legacy encryption entry tag 0x%02x: %v", data[0], err))
+	}
+	return errors.Wrapf(ErrTSOLegacyEncryptionEntryRejected,
+		"tag 0x%02x is not part of dedicated TSO state", data[0])
 }
 
 func (f *TSOStateMachine) applyLeaseEntry(data []byte) any {
@@ -172,7 +202,10 @@ func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, err
 
 func hasLegacyKVFSMSnapshotHeader(br *bufio.Reader) (bool, error) {
 	peeked, err := br.Peek(len(hlcSnapshotMagic))
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
 		return false, errors.Wrap(err, "tso fsm snapshot: peek legacy header")
 	}
 	switch {

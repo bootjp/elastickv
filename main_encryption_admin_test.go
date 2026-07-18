@@ -134,6 +134,29 @@ func TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_DedicatedTSOGroupAlwaysRefusesMutators(t *testing.T) {
+	enabled, engine := encryptionAdminWiringForGroup(
+		dedicatedTSORaftGroupID,
+		true,
+		stubEncryptionAdminEngine{},
+	)
+	if enabled || engine != nil {
+		t.Fatalf("dedicated TSO mutator wiring = (%v, %T), want (false, nil)", enabled, engine)
+	}
+	err := callBootstrapAgainstNewServer(t, enabled, engine)
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("BootstrapEncryption status=%v, want FailedPrecondition; err=%v", got, err)
+	}
+}
+
+func TestEncryptionAdmin_DataGroupPreservesMutatorGate(t *testing.T) {
+	want := stubEncryptionAdminEngine{}
+	enabled, engine := encryptionAdminWiringForGroup(1, true, want)
+	if !enabled || engine == nil {
+		t.Fatalf("data-group mutator wiring = (%v, %T), want (true, non-nil)", enabled, engine)
+	}
+}
+
 func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine encryptionAdminEngine) error {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)

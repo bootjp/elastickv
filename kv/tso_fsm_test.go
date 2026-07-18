@@ -1,11 +1,13 @@
 package kv
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -49,6 +51,64 @@ func TestTSOStateMachineRejectsNonLeaseEntry(t *testing.T) {
 	payload[0] = raftEncodeSingle
 
 	err := requireTSOHaltError(t, NewTSOStateMachine(NewHLC()).Apply(payload))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+}
+
+func TestTSOStateMachineRejectsLegacyEncryptionEntriesWithoutHalting(t *testing.T) {
+	t.Parallel()
+
+	registration := fsmwire.RegistrationPayload{DEKID: 1, FullNodeID: 2, LocalEpoch: 3}
+	tests := []struct {
+		name    string
+		opcode  byte
+		payload []byte
+	}{
+		{
+			name:    "registration",
+			opcode:  fsmwire.OpRegistration,
+			payload: fsmwire.EncodeRegistration(registration),
+		},
+		{
+			name:   "bootstrap",
+			opcode: fsmwire.OpBootstrap,
+			payload: fsmwire.EncodeBootstrap(fsmwire.BootstrapPayload{
+				StorageDEKID:   1,
+				WrappedStorage: []byte("storage"),
+				RaftDEKID:      2,
+				WrappedRaft:    []byte("raft"),
+				BatchRegistry:  []fsmwire.RegistrationPayload{registration},
+			}),
+		},
+		{
+			name:   "rotation",
+			opcode: fsmwire.OpRotation,
+			payload: fsmwire.EncodeRotation(fsmwire.RotationPayload{
+				SubTag:               fsmwire.RotateSubRotateDEK,
+				DEKID:                4,
+				Purpose:              fsmwire.PurposeStorage,
+				Wrapped:              []byte("rotated"),
+				ProposerRegistration: registration,
+			}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := append([]byte{tc.opcode}, tc.payload...)
+			result := NewTSOStateMachine(NewHLC()).Apply(entry)
+			err, ok := result.(error)
+			require.Truef(t, ok, "legacy control response type = %T, want ordinary error", result)
+			require.ErrorIs(t, err, ErrTSOLegacyEncryptionEntryRejected)
+			_, halts := result.(interface{ HaltApply() error })
+			require.False(t, halts, "valid legacy control entry must not halt replay")
+		})
+	}
+}
+
+func TestTSOStateMachineHaltsMalformedLegacyEncryptionEntry(t *testing.T) {
+	t.Parallel()
+
+	err := requireTSOHaltError(t, NewTSOStateMachine(NewHLC()).Apply([]byte{fsmwire.OpRegistration}))
 	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
 }
 
@@ -152,6 +212,17 @@ func TestTSOStateMachineRestoreRejectsTruncatedSnapshot(t *testing.T) {
 
 	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader([]byte{0x01, 0x02}))
 	require.Error(t, err)
+}
+
+func TestTSOStateMachineLegacySnapshotProbeRejectsEveryShortMagicPrefix(t *testing.T) {
+	t.Parallel()
+
+	for size := range len(hlcSnapshotMagic) {
+		payload := append([]byte(nil), hlcSnapshotMagic[:size]...)
+		legacy, err := hasLegacyKVFSMSnapshotHeader(bufio.NewReader(bytes.NewReader(payload)))
+		require.NoError(t, err)
+		require.False(t, legacy)
+	}
 }
 
 func TestTSOStateMachineRestoreLegacySnapshotDerivesAllocationFloor(t *testing.T) {

@@ -2179,12 +2179,17 @@ func startRaftServers(
 		// Proposer + LeaderView for the cutover marker, while
 		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
 		// path for normal admin entries.
+		runtimeMutators, runtimeEncryptionEngine := encryptionAdminWiringForGroup(
+			rt.spec.id,
+			enableMutators,
+			rt.engine,
+		)
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
 			*encryptionSidecarPath,
-			enableMutators,
-			rt.engine,
+			runtimeMutators,
+			runtimeEncryptionEngine,
 			encryptionCapabilityFanout,
 			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
