@@ -1736,8 +1736,15 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
+	return f.recordAndApplyCommit(ctx, storeMuts, uniq, applyStartTS, commitTS)
+}
+
+func (f *kvFSM) recordAndApplyCommit(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
 	if len(storeMuts) == 0 {
 		return nil
+	}
+	if err := f.recordMigrationWrite(ctx, uniq, commitTS); err != nil {
+		return err
 	}
 	if err := f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS); err != nil {
 		return err

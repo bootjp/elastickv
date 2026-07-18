@@ -184,6 +184,56 @@ func TestFSMMigrationWriteTrackerCoversAllAdmissionPaths(t *testing.T) {
 	require.Equal(t, uint64(55), migrationTrackerMinimum(t, fsm))
 }
 
+func TestFSMMigrationWriteTrackerRecordsCommitPreparedBeforeArm(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	startTS, commitTS := uint64(40), uint64(60)
+	meta := &pb.Mutation{
+		Op:  pb.Op_PUT,
+		Key: []byte(txnMetaPrefix),
+		Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: []byte("n"),
+			CommitTS:   commitTS,
+			LockTTLms:  defaultTxnLockTTLms,
+		}),
+	}
+	mutation := &pb.Mutation{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("value")}
+	require.NoError(t, fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn:     true,
+		Phase:     pb.Phase_PREPARE,
+		Ts:        startTS,
+		Mutations: []*pb.Mutation{meta, mutation},
+	}, startTS))
+
+	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
+		JobID:               12,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      12,
+		MinWriteTSExclusive: 1,
+		Armed:               true,
+		RetentionPinTS:      1,
+		TrackWrites:         true,
+	})
+	require.NoError(t, fsm.handleTxnRequest(ctx, &pb.Request{
+		IsTxn:     true,
+		Phase:     pb.Phase_COMMIT,
+		Ts:        startTS,
+		Mutations: []*pb.Mutation{meta, mutation},
+	}, commitTS))
+	require.Equal(t, commitTS, migrationTrackerMinimum(t, fsm))
+}
+
 func newReadinessReadKeyFSM(t *testing.T) *kvFSM {
 	t.Helper()
 
