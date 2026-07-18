@@ -12,7 +12,10 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-var gcpKMSAAD = []byte("elastickv-dek-wrap-v1")
+var (
+	gcpKMSAAD        = []byte("elastickv-dek-wrap-v1")
+	crc32cCastagnoli = crc32.MakeTable(crc32.Castagnoli)
+)
 
 type gcpKMSClient interface {
 	Encrypt(context.Context, *kmspb.EncryptRequest) (*kmspb.EncryptResponse, error)
@@ -65,7 +68,7 @@ func validGCPKeyName(name string) bool {
 }
 
 func crc32c(data []byte) *wrapperspb.Int64Value {
-	return wrapperspb.Int64(int64(crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))))
+	return wrapperspb.Int64(int64(crc32.Checksum(data, crc32cCastagnoli)))
 }
 
 func checksumMatches(data []byte, checksum *wrapperspb.Int64Value) bool {
