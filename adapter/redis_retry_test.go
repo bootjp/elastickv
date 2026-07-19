@@ -388,6 +388,71 @@ func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 	}
 }
 
+func TestRetryRedisWriteDoesNotLeakWireInternalKeyAtRetryLimit(t *testing.T) {
+	internalKey := store.StreamEntryKey([]byte("retry:stream"), 1, 2)
+	wireErr := errors.WithStack(status.Error(codes.Unknown,
+		store.NewWriteConflictError(internalKey).Error()))
+	attempts := 0
+	srv := &RedisServer{}
+
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		return wireErr
+	})
+
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.ErrorContains(t, err, "redis txn retry limit exceeded")
+	require.ErrorContains(t, err, "key: retry:stream")
+	require.NotContains(t, err.Error(), store.StreamEntryPrefix)
+	require.Equal(t, redisTxnRetryMaxAttempts+1, attempts)
+}
+
+func TestNormalizeRetryableRedisTxnErrWireErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		wireErr          error
+		wantSentinel     error
+		wantKey          string
+		wantDetail       string
+		internalKeyToken string
+	}{
+		{
+			name: "write conflict",
+			wireErr: errors.WithStack(status.Error(codes.Unknown,
+				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error())),
+			wantSentinel:     store.ErrWriteConflict,
+			wantKey:          "retry:stream",
+			internalKeyToken: store.StreamEntryPrefix,
+		},
+		{
+			name: "transaction locked with detail",
+			wireErr: errors.WithStack(status.Error(codes.Aborted,
+				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow").Error())),
+			wantSentinel:     kv.ErrTxnLocked,
+			wantKey:          "retry:list",
+			wantDetail:       "timestamp overflow",
+			internalKeyToken: store.ListItemPrefix,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			normalized := normalizeRetryableRedisTxnErr(tt.wireErr)
+
+			require.ErrorIs(t, normalized, tt.wantSentinel)
+			require.ErrorContains(t, normalized, "key: "+tt.wantKey)
+			if tt.wantDetail != "" {
+				require.ErrorContains(t, normalized, tt.wantDetail)
+			}
+			require.NotContains(t, normalized.Error(), tt.internalKeyToken)
+		})
+	}
+}
+
 func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {
 	t.Parallel()
 

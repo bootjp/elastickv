@@ -64,31 +64,67 @@ const (
 	redisTxnWireErrLocked
 )
 
-// wireRedisTxnErrKind restores retry classification after an internal leader
-// redirect crosses gRPC. Forward currently returns transaction failures as a
-// codes.Unknown status, which strips the typed ErrWriteConflict / ErrTxnLocked
-// chain. Match only the exact server-generated key error envelope so unrelated
-// Unknown statuses that happen to mention a conflict remain terminal.
-func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
+// parseWireRedisTxnErr restores transaction error typing after an internal
+// leader redirect crosses gRPC. Forward currently returns transaction failures
+// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked chain.
+// Match only the exact server-generated key error envelope and normalize the
+// storage key before rebuilding the typed error so terminal retry paths cannot
+// expose the internal key layout to Redis clients.
+func wireRedisTxnStatus(err error) (*status.Status, bool) {
 	type grpcStatusCarrier interface {
 		GRPCStatus() *status.Status
 	}
 	var carrier grpcStatusCarrier
 	if !errors.As(err, &carrier) {
-		return redisTxnWireErrNone
+		return nil, false
 	}
 	st := carrier.GRPCStatus()
 	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
-		return redisTxnWireErrNone
+		return nil, false
+	}
+	return st, true
+}
+
+func parseWireRedisTxnErr(err error) error {
+	st, ok := wireRedisTxnStatus(err)
+	if !ok {
+		return nil
 	}
 	msg := st.Message()
 	if !strings.HasPrefix(msg, "key: ") {
-		return redisTxnWireErrNone
+		return nil
 	}
+
+	if content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+store.ErrWriteConflict.Error()); ok {
+		logicalKey := normalizeRetryableRedisTxnKey([]byte(content))
+		return errors.WithStack(store.NewWriteConflictError(logicalKey))
+	}
+
+	content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+kv.ErrTxnLocked.Error())
+	if !ok {
+		return nil
+	}
+	keyText := content
+	detail := ""
+	if strings.HasSuffix(content, ")") {
+		if detailStart := strings.LastIndex(content, " ("); detailStart >= 0 {
+			keyText = content[:detailStart]
+			detail = content[detailStart+2 : len(content)-1]
+		}
+	}
+	logicalKey := normalizeRetryableRedisTxnKey([]byte(keyText))
+	if detail != "" {
+		return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
+	}
+	return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+}
+
+func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
+	parsed := parseWireRedisTxnErr(err)
 	switch {
-	case strings.HasSuffix(msg, ": "+store.ErrWriteConflict.Error()):
+	case errors.Is(parsed, store.ErrWriteConflict):
 		return redisTxnWireErrWriteConflict
-	case strings.HasSuffix(msg, ": "+kv.ErrTxnLocked.Error()):
+	case errors.Is(parsed, kv.ErrTxnLocked):
 		return redisTxnWireErrLocked
 	default:
 		return redisTxnWireErrNone
@@ -151,6 +187,9 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 }
 
 func normalizeRetryableRedisTxnErr(err error) error {
+	if parsed := parseWireRedisTxnErr(err); parsed != nil {
+		return parsed
+	}
 	if key, detail, ok := kv.TxnLockedDetails(err); ok {
 		logicalKey := normalizeRetryableRedisTxnKey(key)
 		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
