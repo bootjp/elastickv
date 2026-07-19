@@ -149,6 +149,38 @@ func TestCatalogWatcherNotifiesAfterApplyingSnapshot(t *testing.T) {
 	require.Equal(t, uint64(1), observed.Routes[0].RouteID)
 }
 
+func TestCatalogWatcherNotifiesOnceWhenEngineAlreadyAppliedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := NewCatalogStore(store.NewMVCCStore())
+	snapshot, err := catalog.Save(ctx, 0, []RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte(""),
+		End:     nil,
+		GroupID: 1,
+		State:   RouteStateActive,
+	}})
+	require.NoError(t, err)
+
+	engine := NewEngine()
+	require.NoError(t, engine.ApplySnapshot(snapshot))
+	observed := 0
+	watcher := NewCatalogWatcher(
+		catalog,
+		engine,
+		WithCatalogWatcherSnapshotObserver(func(got CatalogSnapshot) {
+			observed++
+			require.Equal(t, snapshot.Version, got.Version)
+			require.Equal(t, snapshot.Routes, got.Routes)
+		}),
+	)
+
+	require.NoError(t, watcher.SyncOnce(ctx))
+	require.NoError(t, watcher.SyncOnce(ctx))
+	require.Equal(t, 1, observed)
+}
+
 func TestCatalogWatcherRetriesOnTransientReadError(t *testing.T) {
 	t.Parallel()
 

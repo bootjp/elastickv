@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"flag"
+	"math"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/stretchr/testify/require"
 )
@@ -49,6 +51,30 @@ func TestAutoSplitLeaderGateFallsBackToDefaultLeader(t *testing.T) {
 
 	require.True(t, gate())
 	require.True(t, leader.called)
+}
+
+func TestValidateAutoSplitDetectorConfigRejectsNonFiniteFloats(t *testing.T) {
+	t.Parallel()
+
+	valid := autosplit.DefaultConfig()
+	tests := []struct {
+		name   string
+		mutate func(*autosplit.Config)
+	}{
+		{name: "write weight NaN", mutate: func(cfg *autosplit.Config) { cfg.WriteWeight = math.NaN() }},
+		{name: "read weight positive infinity", mutate: func(cfg *autosplit.Config) { cfg.ReadWeight = math.Inf(1) }},
+		{name: "threshold negative infinity", mutate: func(cfg *autosplit.Config) { cfg.ThresholdOpsMin = math.Inf(-1) }},
+		{name: "top key share NaN", mutate: func(cfg *autosplit.Config) { cfg.TopKeyShare = math.NaN() }},
+		{name: "absolute floor positive infinity", mutate: func(cfg *autosplit.Config) { cfg.TopKeyAbsoluteFloor = math.Inf(1) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := valid
+			tc.mutate(&cfg)
+			require.Error(t, validateAutoSplitDetectorConfig(cfg))
+		})
+	}
 }
 
 type fakeAutoSplitLeader struct {

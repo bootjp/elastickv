@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"math"
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
@@ -174,7 +175,14 @@ func validateAutoSplitDetectorConfig(cfg autosplit.Config) error {
 	if err := validateAutoSplitWeights(cfg.WriteWeight, cfg.ReadWeight); err != nil {
 		return err
 	}
-	if cfg.ThresholdOpsMin <= 0 {
+	if err := validateAutoSplitDetectorLimits(cfg); err != nil {
+		return err
+	}
+	return validateAutoSplitHotKeyThresholds(cfg)
+}
+
+func validateAutoSplitDetectorLimits(cfg autosplit.Config) error {
+	if !isFiniteAutoSplitFloat(cfg.ThresholdOpsMin) || cfg.ThresholdOpsMin <= 0 {
 		return errors.New("--autoSplitThreshold must be positive")
 	}
 	if cfg.CandidateWindows <= 0 {
@@ -186,20 +194,29 @@ func validateAutoSplitDetectorConfig(cfg autosplit.Config) error {
 	if cfg.MaxSplitsPerCycle <= 0 {
 		return errors.New("--autoSplitMaxPerCycle must be positive")
 	}
-	if cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
+	return nil
+}
+
+func validateAutoSplitHotKeyThresholds(cfg autosplit.Config) error {
+	if !isFiniteAutoSplitFloat(cfg.TopKeyShare) || cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
 		return errors.New("--autoSplitTopKeyShare must be in (0, 1]")
 	}
-	if cfg.TopKeyAbsoluteFloor < 0 {
+	if !isFiniteAutoSplitFloat(cfg.TopKeyAbsoluteFloor) || cfg.TopKeyAbsoluteFloor < 0 {
 		return errors.New("--autoSplitTopKeyAbsoluteFloor must be non-negative")
 	}
 	return nil
 }
 
 func validateAutoSplitWeights(writeWeight, readWeight float64) error {
-	if writeWeight < 0 || readWeight < 0 || (writeWeight == 0 && readWeight == 0) {
+	if !isFiniteAutoSplitFloat(writeWeight) || !isFiniteAutoSplitFloat(readWeight) ||
+		writeWeight < 0 || readWeight < 0 || (writeWeight == 0 && readWeight == 0) {
 		return errors.New("--autoSplitWriteWeight and --autoSplitReadWeight must be non-negative and at least one must be positive")
 	}
 	return nil
+}
+
+func isFiniteAutoSplitFloat(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 func validateAutoSplitSchedulerConfig(cfg autosplit.SchedulerConfig) error {

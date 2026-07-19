@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -259,6 +260,37 @@ func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
 	sampler.Flush()
 	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 7).Writes)
 	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 8).Writes)
+}
+
+func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {
+	t.Parallel()
+
+	const routeID = uint64(7)
+	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 8,
+	})
+	require.True(t, sampler.RegisterRoute(routeID, []byte(""), nil, 1))
+	c := (&Coordinate{
+		engine: redirectSamplerFollowerEngine{},
+	}).WithSampler(sampler, routeID)
+
+	_, err := c.dispatchOnce(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
+		{Op: Put, Key: []byte("forwarded"), Value: []byte("value")},
+	}})
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+	sampler.Flush()
+	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, routeID).Writes)
+}
+
+type redirectSamplerFollowerEngine struct {
+	stubLeaderEngine
+}
+
+func (redirectSamplerFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
+func (redirectSamplerFollowerEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{}
 }
 
 // TestToRawRequestLeavesTsForLeaderStamping is the regression for the

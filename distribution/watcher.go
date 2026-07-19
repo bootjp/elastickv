@@ -67,6 +67,7 @@ type CatalogWatcher struct {
 	batchSize        int
 	logger           *slog.Logger
 	snapshotObserver CatalogSnapshotObserver
+	observedVersion  uint64
 }
 
 // NewCatalogWatcher creates a watcher that polls the durable route catalog and
@@ -126,8 +127,8 @@ func (w *CatalogWatcher) Run(ctx context.Context) error {
 	}
 }
 
-// SyncOnce applies the latest durable snapshot when its version is newer than
-// the current engine version.
+// SyncOnce applies durable catalog deltas and notifies observers when the
+// engine reaches a catalog snapshot that has not been observed yet.
 func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 	if err := w.validate(); err != nil {
 		return err
@@ -149,6 +150,9 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		}
 		w.notifySnapshotObserver(*changes.Reset)
 		return nil
+	}
+	if len(changes.Deltas) == 0 {
+		return w.notifyLatestSnapshotObserver(ctx)
 	}
 	applied := false
 	for _, delta := range changes.Deltas {
@@ -172,6 +176,7 @@ func (w *CatalogWatcher) notifySnapshotObserver(snapshot CatalogSnapshot) {
 	if w.snapshotObserver != nil {
 		w.snapshotObserver(snapshot)
 	}
+	w.observedVersion = snapshot.Version
 }
 
 func (w *CatalogWatcher) notifyLatestSnapshotObserver(ctx context.Context) error {
@@ -182,11 +187,20 @@ func (w *CatalogWatcher) notifyLatestSnapshotObserver(ctx context.Context) error
 	if err != nil {
 		return err
 	}
-	if snapshot.Version != w.engine.Version() {
+	engineVersion := w.engine.Version()
+	if !shouldObserveCatalogSnapshot(snapshot.Version, engineVersion, w.observedVersion) {
 		return nil
 	}
-	w.snapshotObserver(snapshot)
+	if snapshot.Version != engineVersion {
+		return nil
+	}
+	w.notifySnapshotObserver(snapshot)
 	return nil
+}
+
+func shouldObserveCatalogSnapshot(catalogVersion, engineVersion, observedVersion uint64) bool {
+	return catalogVersion >= engineVersion &&
+		(catalogVersion > engineVersion || catalogVersion > observedVersion)
 }
 
 func (w *CatalogWatcher) validate() error {

@@ -612,6 +612,7 @@ func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderA
 // monotonicity across the leader transition.
 func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
+		c.observeElems(reqs.Elems)
 		return c.redirect(ctx, reqs)
 	}
 
