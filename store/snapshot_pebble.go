@@ -112,5 +112,8 @@ type countingWriter struct {
 func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	w.n += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	return n, errors.WithStack(err)
 }

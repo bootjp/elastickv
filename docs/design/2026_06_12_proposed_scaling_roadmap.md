@@ -364,7 +364,8 @@ control-plane (`*_proposed_*` doc TBD).**
 
 ### 5.2 Design — milestones
 
-**M1 — SST ingest snapshot transfer (`*_proposed_*` doc TBD).**
+**M1 — SST ingest snapshot transfer
+([focused design](2026_07_19_implemented_pebble_sst_ingest_snapshot_transfer.md)).**
 - Replace `pebbleSnapshot.WriteTo`'s full-iter stream with
   **Pebble SST-level snapshot transfer**: leader takes a
   Pebble snapshot, copies the live SSTs (+ memtable flush) as

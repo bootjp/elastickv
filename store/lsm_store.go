@@ -208,6 +208,12 @@ type pebbleStore struct {
 	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu        sync.Mutex
 	dir                  string
+	// sstIngestSnapshots enables the cluster-wide opt-in snapshot format
+	// implemented in snapshot_pebble_sst.go. Receivers always understand the
+	// format; senders keep the legacy stream by default for rolling-upgrade
+	// compatibility with older binaries.
+	sstIngestSnapshots       bool
+	sstIngestTargetFileBytes uint64
 	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
@@ -270,6 +276,15 @@ func WithPebbleLogger(l *slog.Logger) PebbleStoreOption {
 	}
 }
 
+// WithSSTIngestSnapshots controls whether Snapshot emits the SST-ingest
+// format. It is primarily useful for tests and embedded callers; production
+// resolves ELASTICKV_PEBBLE_SST_INGEST_SNAPSHOT at store construction time.
+func WithSSTIngestSnapshots(enabled bool) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		s.sstIngestSnapshots = enabled
+	}
+}
+
 // defaultPebbleOptionsWithCache returns the standard Pebble options used
 // throughout the store (including restores) to ensure consistent behaviour
 // between a freshly opened and a restored/swapped-in database, along with
@@ -306,12 +321,17 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		writeConflicts:        newWriteConflictCounter(),
-		fsmApplyWriteOpts:     fsmOpts,
-		fsmApplySyncModeLabel: fsmLabel,
+		writeConflicts:           newWriteConflictCounter(),
+		fsmApplyWriteOpts:        fsmOpts,
+		fsmApplySyncModeLabel:    fsmLabel,
+		sstIngestSnapshots:       resolveSSTIngestSnapshots(os.Getenv(sstIngestSnapshotEnv)),
+		sstIngestTargetFileBytes: defaultSSTIngestTargetFileSize,
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if err := cleanupPebbleSnapshotArtifacts(dir); err != nil {
+		return nil, err
 	}
 
 	pebbleOpts, cache := defaultPebbleOptionsWithCache()
@@ -357,6 +377,13 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	// A backup is only stale after the live directory has opened and its
+	// metadata has been read successfully. Before this point it is the recovery
+	// source for a process crash between the two restore renames.
+	if err := cleanupPebbleRestoreBackups(dir); err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -2761,6 +2788,9 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 }
 
 func (s *pebbleStore) Snapshot() (Snapshot, error) {
+	if s.sstIngestSnapshots {
+		return s.newSSTIngestSnapshot()
+	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	snap := s.db.NewSnapshot()
@@ -2944,6 +2974,8 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 		// Native Pebble format: restorePebbleNativeAtomic performs a temp-dir
 		// swap so the existing DB is preserved if the restore fails midway.
 		return s.restorePebbleNativeAtomic(br)
+	case bytes.Equal(header, pebbleSSTIngestSnapshotMagic[:]):
+		return s.restorePebbleSSTIngestAtomic(br)
 	case bytes.Equal(header, mvccSnapshotMagic[:]):
 		// Streaming MVCC format: restoreFromStreamingMVCC performs an atomic
 		// temp-dir swap, so the existing DB is preserved until checksum
@@ -3236,62 +3268,101 @@ func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
 	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
-// swapInTempDB closes the current DB, removes its directory, and renames tmpDir
-// to s.dir, then reopens the DB. The caller is responsible for closing tmpDB
-// before calling this.
+// swapInTempDB closes the current DB and atomically exchanges its directory
+// with tmpDir. The old directory remains as a same-filesystem rollback point
+// until the replacement has opened and its metadata has been verified.
 func (s *pebbleStore) swapInTempDB(tmpDir string) error {
+	return s.swapInTempDBWithMetadata(tmpDir, nil)
+}
+
+func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSnapshotMetadata) error {
+	backupDir, err := makeSiblingTempDir(s.dir, "restore-backup")
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return err
+	}
 	if err := s.db.Close(); err != nil {
 		_ = os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(backupDir)
 		return errors.WithStack(err)
 	}
 	if s.cache != nil {
 		s.cache.Unref()
 		s.cache = nil
 	}
-	if err := os.RemoveAll(s.dir); err != nil {
+	s.db = nil
+	if err := os.Rename(s.dir, backupDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		_ = os.RemoveAll(backupDir)
+		return errors.Join(errors.WithStack(err), s.reopenStoreDB(s.dir))
 	}
 	if err := os.Rename(tmpDir, s.dir); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		return errors.Join(errors.WithStack(err), s.restoreSwapBackup(backupDir))
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
-	newDB, err := pebble.Open(s.dir, opts)
+	if err := s.reopenStoreDB(s.dir); err != nil {
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
+	}
+	lastCommitTS, minRetainedTS, pendingMinRetainedTS, err := s.metadataAfterSwap(expected)
 	if err != nil {
-		cache.Unref()
-		return errors.WithStack(err)
-	}
-	s.db = newDB
-	s.cache = cache
-	// cleanupOnSwapFail mirrors the cleanup in NewPebbleStore: release the
-	// creator ref on the freshly-opened cache so a failed metadata read
-	// does not pin a ~256 MiB cache on the store across restore retries.
-	cleanupOnSwapFail := func() {
-		_ = newDB.Close()
-		cache.Unref()
-		s.db = nil
-		s.cache = nil
-	}
-	lastCommitTS, err := s.findMaxCommitTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
-	}
-	minRetainedTS, err := s.findMinRetainedTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
-	}
-	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	if err := os.RemoveAll(backupDir); err != nil {
+		s.log.Warn("failed to remove restore backup", "path", backupDir, "error", err)
+	}
 	return nil
+}
+
+func (s *pebbleStore) reopenStoreDB(dir string) error {
+	opts, cache := defaultPebbleOptionsWithCache()
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		cache.Unref()
+		return errors.WithStack(err)
+	}
+	s.db = db
+	s.cache = cache
+	return nil
+}
+
+func (s *pebbleStore) restoreSwapBackup(backupDir string) error {
+	var cleanupErr error
+	if s.db != nil {
+		cleanupErr = s.db.Close()
+		s.db = nil
+	}
+	if s.cache != nil {
+		s.cache.Unref()
+		s.cache = nil
+	}
+	removeErr := os.RemoveAll(s.dir)
+	renameErr := os.Rename(backupDir, s.dir)
+	if renameErr != nil {
+		return errors.Join(errors.WithStack(cleanupErr), errors.WithStack(removeErr), errors.WithStack(renameErr))
+	}
+	return errors.Join(errors.WithStack(cleanupErr), errors.WithStack(removeErr), s.reopenStoreDB(s.dir))
+}
+
+func (s *pebbleStore) metadataAfterSwap(expected *pebbleSnapshotMetadata) (uint64, uint64, uint64, error) {
+	if expected == nil {
+		lastCommitTS, err := s.findMaxCommitTS()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		minRetainedTS, err := s.findMinRetainedTS()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
+		return lastCommitTS, minRetainedTS, pendingMinRetainedTS, err
+	}
+	if err := verifyPebbleSnapshotMetadata(s.db, *expected); err != nil {
+		return 0, 0, 0, err
+	}
+	return expected.LastCommitTS, expected.MinRetainedTS, expected.PendingMinRetainedTS, nil
 }
 
 func (s *pebbleStore) Close() error {
