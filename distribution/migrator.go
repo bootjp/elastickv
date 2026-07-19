@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"bytes"
+	"encoding/binary"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
@@ -69,6 +70,7 @@ const (
 	migrationDynamoGenPrefix   = "!ddb|meta|gen|"
 	migrationDynamoItemPrefix  = "!ddb|item|"
 	migrationDynamoGSIPrefix   = "!ddb|gsi|"
+	migrationStagedDataPrefix  = "!dist|migstage|"
 )
 
 const (
@@ -82,6 +84,8 @@ const (
 	migrationSQSMsgGroupPrefix       = "!sqs|msg|group|"
 	migrationSQSMsgByAgePrefix       = "!sqs|msg|byage|"
 	migrationSQSPartitionedSuffix    = "p|"
+	migrationStagedDataJobIDBytes    = 8
+	migrationStagedDataSeparator     = byte('|')
 )
 
 var (
@@ -281,6 +285,38 @@ func (b MigrationBracket) containsFamilyShape(rawKey []byte) bool {
 	default:
 		return true
 	}
+}
+
+// MigrationStagedDataKey returns the target-local shadow key used while a
+// cross-group split imports data before CUTOVER/promotion.
+func MigrationStagedDataKey(jobID uint64, rawKey []byte) []byte {
+	key := make([]byte, len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes+1+len(rawKey))
+	copy(key, migrationStagedDataPrefix)
+	binary.BigEndian.PutUint64(key[len(migrationStagedDataPrefix):], jobID)
+	key[len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes] = migrationStagedDataSeparator
+	copy(key[len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes+1:], rawKey)
+	return key
+}
+
+// MigrationStagedDataKeyPrefix returns the prefix covering all staged data for
+// one migration job.
+func MigrationStagedDataKeyPrefix(jobID uint64) []byte {
+	return MigrationStagedDataKey(jobID, nil)
+}
+
+func IsMigrationStagedDataKey(key []byte) bool {
+	return len(key) >= len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes+1 &&
+		bytes.HasPrefix(key, []byte(migrationStagedDataPrefix)) &&
+		key[len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes] == migrationStagedDataSeparator
+}
+
+func MigrationStagedDataKeyParts(key []byte) (uint64, []byte, bool) {
+	if !IsMigrationStagedDataKey(key) {
+		return 0, nil, false
+	}
+	jobID := binary.BigEndian.Uint64(key[len(migrationStagedDataPrefix):])
+	rawKey := bytes.Clone(key[len(migrationStagedDataPrefix)+migrationStagedDataJobIDBytes+1:])
+	return jobID, rawKey, true
 }
 
 func (b MigrationBracket) containsDecodedS3Route(rawKey, routeStart, routeEnd []byte) bool {

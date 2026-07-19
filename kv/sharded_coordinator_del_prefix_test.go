@@ -122,6 +122,72 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		"same DEL_PREFIX element must use the same timestamp across shards")
 }
 
+func newMigrationFloorEngine(t *testing.T, floor uint64) *distribution.Engine {
+	t.Helper()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 nil,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: floor,
+			},
+		},
+	}))
+	return engine
+}
+
+func TestShardedCoordinatorRejectsPointWriteAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("z"), Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before proposing a floor-violating point write")
+}
+
+func TestShardedCoordinatorRejectsDelPrefixAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("z")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before broadcasting a floor-violating prefix delete")
+}
+
+func TestShardedCoordinatorRejectsRawDelPrefixMutationAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, ^uint64(0)), map[uint64]*ShardGroup{
+		1: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+
+	for _, mut := range []*pb.Mutation{
+		{Op: pb.Op_DEL_PREFIX, Key: []byte("z")},
+		{Op: pb.Op_DEL_PREFIX, Key: nil},
+	} {
+		err := coord.rejectWriteTimestampFloorMutations([]*pb.Mutation{mut}, 100)
+		require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	}
+}
+
 func TestShardedCoordinator_DelPrefixDoesNotAutoPinObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
@@ -376,6 +442,118 @@ func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteOnWriteFencedRoute(
 		require.ErrorIs(t, err, ErrRouteWriteFenced)
 		require.Empty(t, g1Txn.requests, "coordinator must reject before proposing to the raw-key shard")
 		require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the fenced shard")
+	}
+}
+
+func s3BucketAuxiliaryStagedRoutes(bucket string, rawGroupID, stagedGroupID uint64) []distribution.RouteDescriptor {
+	routes := s3BucketAuxiliaryFenceRoutes(bucket, rawGroupID, stagedGroupID)
+	routes[1].State = distribution.RouteStateActive
+	routes[1].StagedVisibilityActive = true
+	routes[1].MigrationJobID = 9
+	return routes
+}
+
+func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToStagedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	route, ok := coord.stagedVisibilityRouteForS3BucketAuxiliaryKey(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), route.GroupID)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+	require.Equal(t, key, g2Txn.requests[0].Mutations[0].Key)
+}
+
+func TestShardedCoordinatorIgnoresRawRouteFloorForS3BucketAuxiliaryWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliaryStagedRoutes(bucket, 1, 2)
+	routes[2].MinWriteTSExclusive = ^uint64(0)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  routes,
+	}))
+
+	rawRoute, ok := engine.GetRoute(routeKey(key))
+	require.True(t, ok)
+	require.Equal(t, ^uint64(0), rawRoute.MinWriteTSExclusive)
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.NotEmpty(t, auxRoutes)
+	require.Zero(t, auxRoutes[0].MinWriteTSExclusive)
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+}
+
+func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteAtMigrationTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	end := prefixScanEnd(start)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: start, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: start, End: end, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+			{RouteID: 3, Start: end, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+			Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("v")}},
+		})
+		require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+		require.Empty(t, g1Txn.requests, "coordinator must reject before proposing to the raw-key shard")
+		require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the floor-fenced shard")
 	}
 }
 

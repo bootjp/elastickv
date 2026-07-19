@@ -504,18 +504,24 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	if err != nil {
 		return redisTypeNone, err
 	}
-	if typ == redisTypeNone && len(c.negativeType) < maxNegativeTypeCacheEntries {
-		// Pin the absence result for the rest of this Eval so repeated
-		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
-		// does not re-run the ~8-seek rawKeyTypeAt probe on every
-		// redis.call.
-		//
-		// Bounded to keep adversarial scripts from growing the map
-		// unboundedly; once full, subsequent misses correctly fall
-		// through to the server probe without caching.
-		c.negativeType[string(key)] = true
+	if typ == redisTypeNone {
+		c.rememberNegativeType(key)
 	}
 	return typ, nil
+}
+
+func (c *luaScriptContext) rememberNegativeType(key []byte) {
+	if len(c.negativeType) >= maxNegativeTypeCacheEntries {
+		return
+	}
+	// Pin the absence result for the rest of this Eval so repeated
+	// BullMQ-style polling of a missing key (e.g. a "delayed" zset) does
+	// not re-run the ~8-seek rawKeyTypeAt probe on every redis.call.
+	//
+	// Bounded to keep adversarial scripts from growing the map
+	// unboundedly; once full, subsequent misses correctly fall through to
+	// the server probe without caching.
+	c.negativeType[string(key)] = true
 }
 
 func (c *luaScriptContext) ensureKeyNotExpired(key []byte) error {

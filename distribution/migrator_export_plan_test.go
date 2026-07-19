@@ -396,6 +396,28 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	require.False(t, bytes.Equal(prefixes[0], MigrationKnownInternalPrefixes()[0]), "prefix list must be cloned")
 }
 
+func TestMigrationStagedDataKeyRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte("user|raw")
+	key := MigrationStagedDataKey(42, raw)
+	require.True(t, IsMigrationStagedDataKey(key))
+	require.True(t, bytes.HasPrefix(key, MigrationStagedDataKeyPrefix(42)))
+	require.False(t, IsMigrationStagedDataKey([]byte("!dist|migstage|short")))
+
+	jobID, original, ok := MigrationStagedDataKeyParts(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(42), jobID)
+	require.Equal(t, []byte("user|raw"), original)
+
+	raw[0] = 'X'
+	original[0] = 'Y'
+	jobID, original, ok = MigrationStagedDataKeyParts(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(42), jobID)
+	require.Equal(t, []byte("user|raw"), original)
+}
+
 func TestValidateMigrationRouteRangeRejectsReservedControlPrefixes(t *testing.T) {
 	t.Parallel()
 

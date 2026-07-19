@@ -25,11 +25,12 @@ type Route struct {
 	GroupID uint64
 	// State tracks control-plane state for this route.
 	State RouteState
-	// StagedVisibilityActive allows serving reads to merge staged migration rows.
+	// StagedVisibilityActive makes migrated versions visible through the
+	// staged/live merge path after cross-group CUTOVER.
 	StagedVisibilityActive bool
-	// MigrationJobID identifies the active staged migration job.
+	// MigrationJobID identifies the migration job that owns staged visibility.
 	MigrationJobID uint64
-	// MinWriteTSExclusive rejects writes at or below the migration cutover floor.
+	// MinWriteTSExclusive is the post-migration write timestamp floor.
 	MinWriteTSExclusive uint64
 	// Load tracks the number of accesses served by this range.
 	Load uint64
@@ -386,17 +387,7 @@ func (e *Engine) Stats() []Route {
 	defer e.mu.RUnlock()
 	stats := make([]Route, len(e.routes))
 	for i, r := range e.routes {
-		stats[i] = Route{
-			RouteID:                r.RouteID,
-			Start:                  CloneBytes(r.Start),
-			End:                    CloneBytes(r.End),
-			GroupID:                r.GroupID,
-			State:                  r.State,
-			StagedVisibilityActive: r.StagedVisibilityActive,
-			MigrationJobID:         r.MigrationJobID,
-			MinWriteTSExclusive:    r.MinWriteTSExclusive,
-			Load:                   r.Load,
-		}
+		stats[i] = cloneRoute(r)
 	}
 	return stats
 }
@@ -429,17 +420,7 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 			break
 		}
 		// Route intersects with scan range
-		result = append(result, Route{
-			RouteID:                r.RouteID,
-			Start:                  CloneBytes(r.Start),
-			End:                    CloneBytes(r.End),
-			GroupID:                r.GroupID,
-			State:                  r.State,
-			StagedVisibilityActive: r.StagedVisibilityActive,
-			MigrationJobID:         r.MigrationJobID,
-			MinWriteTSExclusive:    r.MinWriteTSExclusive,
-			Load:                   r.Load,
-		})
+		result = append(result, cloneRoute(*r))
 	}
 	return result, e.catalogVersion
 }

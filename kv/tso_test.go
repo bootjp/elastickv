@@ -336,6 +336,21 @@ func TestShardedCoordinatorRawFollowerDefersTSOAllocationToLeaderPath(t *testing
 	require.EqualValues(t, 0, txn.requests[0].Ts)
 }
 
+func TestShardedCoordinatorRejectsTSORawPointWriteAfterStamping(t *testing.T) {
+	t.Parallel()
+
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, testTSOInitialBase), map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil).WithTSOAllocator(&fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true})
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("z"), Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, txn.requests, "coordinator must reject after TSO stamping before proposing")
+}
+
 func TestShardedCoordinatorUsesTSOAllocatorForRawTxnAndDelPrefix(t *testing.T) {
 	t.Parallel()
 

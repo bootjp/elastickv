@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"os"
@@ -95,6 +96,118 @@ func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	val, err := ps.GetAt(ctx, []byte("k1"), ts)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val)
+}
+
+func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+	prefix := []byte("stage|")
+
+	require.NoError(t, ps.PutAt(ctx, stage("k"), []byte("v10"), 10, 0))
+
+	const entryIdx uint64 = 77
+	result, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:        9,
+		AppliedIndex: entryIdx,
+		StartKey:     prefix,
+		EndKey:       PrefixScanEnd(prefix),
+		MaxVersions:  10,
+		TargetKey:    targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+	require.Equal(t, uint64(1), result.PromotedRows)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "PromoteVersions must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("k"), 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v10"), val)
+	_, err = ps.GetAt(ctx, stage("k"), 10)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	const retryEntryIdx uint64 = 78
+	retry, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:        9,
+		AppliedIndex: retryEntryIdx,
+		StartKey:     prefix,
+		EndKey:       PrefixScanEnd(prefix),
+		MaxVersions:  10,
+		TargetKey:    targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, retry.Done)
+	require.Equal(t, uint64(1), retry.TotalPromotedRows)
+
+	got, present, err = ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "completed PromoteVersions retry must persist metaAppliedIndex")
+	require.Equal(t, retryEntryIdx, got)
+}
+
+func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const entryIdx uint64 = 123
+	result, err := ps.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:        9,
+		AppliedIndex: entryIdx,
+		BracketID:    1,
+		BatchSeq:     1,
+		Cursor:       []byte("c1"),
+		Versions: []MVCCVersion{
+			{Key: []byte("stage|k"), CommitTS: 100, Value: []byte("v100")},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []byte("c1"), result.AckedCursor)
+	require.Equal(t, uint64(100), result.MaxImportedTS)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "ImportVersionsRaft must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+
+	val, err := ps.GetAt(ctx, []byte("stage|k"), 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
+
+	const retryEntryIdx uint64 = 124
+	duplicate, err := ps.ImportVersionsRaft(ctx, ImportVersionsOptions{
+		JobID:        9,
+		AppliedIndex: retryEntryIdx,
+		BracketID:    1,
+		BatchSeq:     1,
+		Cursor:       []byte("ignored"),
+		Versions: []MVCCVersion{
+			{Key: []byte("stage|k"), CommitTS: 100, Value: []byte("changed")},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, duplicate.Duplicate)
+	require.Equal(t, []byte("c1"), duplicate.AckedCursor)
+
+	got, present, err = ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "duplicate ImportVersionsRaft retry must still advance metaAppliedIndex")
+	require.Equal(t, retryEntryIdx, got)
+
+	val, err = ps.GetAt(ctx, []byte("stage|k"), 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val, "duplicate import must not rewrite the acknowledged batch")
 }
 
 func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.T) {
