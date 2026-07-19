@@ -105,7 +105,7 @@ the general data-plane leader proxy has the proposed circuit breaker.
 
 ## 5. Additional gaps introduced by the 2026-06-23 roadmap
 
-| Gap | Disposition | Required focused owner |
+| Gap | Disposition | Required owner |
 |---|---|---|
 | Region/range balance scheduler | Unimplemented and unowned | `*_proposed_region_balance_scheduler.md`; depend on replica placement, multi-node bootstrap, and hotspot migration |
 | Range merge | Unimplemented and unowned | `*_proposed_range_merge.md`; split same-group and cross-group merge into reviewable milestones and define transaction drain/fencing |
