@@ -11,7 +11,8 @@ import (
 )
 
 type internalAdminLeaderView struct {
-	state raftengine.State
+	state     raftengine.State
+	readIndex uint64
 }
 
 func (v internalAdminLeaderView) State() raftengine.State { return v.state }
@@ -19,8 +20,25 @@ func (internalAdminLeaderView) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "leader", Address: "leader:50051"}
 }
 func (internalAdminLeaderView) VerifyLeader(context.Context) error { return nil }
-func (internalAdminLeaderView) LinearizableRead(context.Context) (uint64, error) {
-	return 0, nil
+func (v internalAdminLeaderView) LinearizableRead(context.Context) (uint64, error) {
+	return v.readIndex, nil
+}
+
+func TestInternalForwardLeaseReadUsesLeaderBarrier(t *testing.T) {
+	t.Parallel()
+	internal := NewInternalWithEngine(
+		nil,
+		internalAdminLeaderView{state: raftengine.StateLeader, readIndex: 23},
+		nil,
+		nil,
+	)
+	resp, err := internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})
+	require.NoError(t, err)
+	require.Equal(t, uint64(23), resp.GetAppliedIndex())
+
+	internal.leader = internalAdminLeaderView{state: raftengine.StateFollower}
+	_, err = internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})
+	require.ErrorIs(t, err, ErrNotLeader)
 }
 
 type internalAdminProposer struct {

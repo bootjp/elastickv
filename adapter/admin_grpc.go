@@ -722,6 +722,11 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
+func adminAuthenticatedMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
+		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName
+}
+
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
 // "authorization: Bearer <token>" metadata against the supplied token. An
 // empty token disables enforcement; callers should pair that mode with a
@@ -755,7 +760,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !adminAuthenticatedMethod(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		if err := check(ctx); err != nil {
@@ -769,7 +774,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !adminAuthenticatedMethod(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		if err := check(ss.Context()); err != nil {

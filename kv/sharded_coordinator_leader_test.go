@@ -2,12 +2,29 @@ package kv
 
 import (
 	"context"
+	"net"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
+
+type leaseReadForwardServer struct {
+	pb.UnimplementedInternalServer
+	calls atomic.Int32
+}
+
+func (s *leaseReadForwardServer) ForwardLeaseRead(
+	context.Context,
+	*pb.ForwardLeaseReadRequest,
+) (*pb.ForwardLeaseReadResponse, error) {
+	s.calls.Add(1)
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44}, nil
+}
 
 func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	t.Parallel()
@@ -64,6 +81,33 @@ func TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader(t *testing.T) {
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
 
 	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
+}
+
+func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *testing.T) {
+	t.Parallel()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	service := &leaseReadForwardServer{}
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, service)
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	group := &ShardGroup{Engine: follower, Store: store.NewMVCCStore()}
+	proxy := NewLeaderProxyForShardGroup(group)
+	t.Cleanup(func() { require.NoError(t, proxy.Close()) })
+	group.Txn = proxy
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: group}, 1, NewHLC(), nil)
+
+	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
+	require.Equal(t, int32(1), service.calls.Load())
 }
 
 func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *testing.T) {

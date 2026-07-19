@@ -108,6 +108,20 @@ func (i *Internal) ForwardAdminProposal(
 	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
 }
 
+func (i *Internal) ForwardLeaseRead(
+	ctx context.Context,
+	_ *pb.ForwardLeaseReadRequest,
+) (*pb.ForwardLeaseReadResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	index, err := i.leader.LinearizableRead(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index}, nil
+}
+
 func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {
 	if result == nil {
 		return errors.New("admin proposal returned nil result")

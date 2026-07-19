@@ -60,6 +60,9 @@ type ShardGroup struct {
 	// NewLeaderProxyForShardGroup), so the no-wrap default keeps
 	// working.
 	proposer raftengine.Proposer
+	// leaderRead forwards a read barrier to this group's current leader when
+	// the local replica is a follower. It is installed with the LeaderProxy.
+	leaderRead func(context.Context) (uint64, error)
 }
 
 // Proposer returns the wrap-aware proposer chain installed by
@@ -207,10 +210,12 @@ func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *Lead
 	// (codex P2 round-1); routing both paths through the same
 	// proposer closes that hole.
 	g.proposer = newDynamicWrappedProposer(g.Engine, &g.raftPayloadWrap)
-	return &LeaderProxy{
+	p := &LeaderProxy{
 		engine: g.Engine,
 		tm:     NewTransactionWithProposer(g.proposer, opts...),
 	}
+	g.leaderRead = p.forwardLeaseRead
+	return p
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
@@ -1820,8 +1825,26 @@ func observeLeaseRead(observer LeaseReadObserver, hit bool) {
 	}
 }
 
+func shouldForwardGroupLeaseRead(g *ShardGroup, engine raftengine.Engine) bool {
+	return g != nil && g.leaderRead != nil && engine != nil && engine.State() != raftengine.StateLeader
+}
+
+func handleGroupLeaseReadError(ctx context.Context, g *ShardGroup, err error) (uint64, error) {
+	if g != nil && isLeadershipLossError(err) {
+		g.lease.invalidate()
+	}
+	if g != nil && g.leaderRead != nil && isTransientLeaderError(err) {
+		return g.leaderRead(ctx)
+	}
+	return 0, err
+}
+
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
+	if shouldForwardGroupLeaseRead(g, engine) {
+		observeLeaseRead(observer, false)
+		return g.leaderRead(ctx)
+	}
 	// g.lp caches the LeaseProvider assertion done once at construction
 	// (NewShardedCoordinator); a nil group or an engine without the
 	// capability falls through to the linearizable slow path. The nil-g
@@ -1852,10 +1875,7 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		if isLeadershipLossError(err) {
-			g.lease.invalidate()
-		}
-		return 0, err
+		return handleGroupLeaseReadError(ctx, g, err)
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
 	return idx, nil

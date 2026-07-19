@@ -223,6 +223,46 @@ func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request) (*T
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
 }
 
+func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (uint64, error) {
+	deadline := time.Now().Add(leaderProxyRetryBudget)
+	ctx, cancel := context.WithDeadline(callerCtx, deadline)
+	defer cancel()
+	var lastErr error
+	for time.Now().Before(deadline) {
+		index, err := p.forwardLeaseReadOnce(ctx)
+		if err == nil {
+			return index, nil
+		}
+		lastErr = err
+		if !isTransientLeaderError(err) {
+			return 0, err
+		}
+		waitLeaderProxyBackoff(ctx, leaderProxyRetryInterval, deadline)
+	}
+	if lastErr == nil {
+		lastErr = ErrLeaderNotFound
+	}
+	return 0, errors.WithStack(lastErr)
+}
+
+func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (uint64, error) {
+	addr := leaderAddrFromEngine(p.engine)
+	if addr == "" {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	conn, err := p.connCache.ConnFor(addr)
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
+	defer cancel()
+	resp, err := pb.NewInternalClient(conn).ForwardLeaseRead(ctx, &pb.ForwardLeaseReadRequest{})
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return resp.GetAppliedIndex(), nil
+}
+
 var _ Transactional = (*LeaderProxy)(nil)
 var _ io.Closer = (*LeaderProxy)(nil)
 

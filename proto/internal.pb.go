@@ -542,6 +542,86 @@ func (x *ForwardAdminProposalResponse) GetCommitIndex() uint64 {
 	return 0
 }
 
+type ForwardLeaseReadRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardLeaseReadRequest) Reset() {
+	*x = ForwardLeaseReadRequest{}
+	mi := &file_internal_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardLeaseReadRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardLeaseReadRequest) ProtoMessage() {}
+
+func (x *ForwardLeaseReadRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardLeaseReadRequest.ProtoReflect.Descriptor instead.
+func (*ForwardLeaseReadRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{7}
+}
+
+type ForwardLeaseReadResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AppliedIndex  uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardLeaseReadResponse) Reset() {
+	*x = ForwardLeaseReadResponse{}
+	mi := &file_internal_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardLeaseReadResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardLeaseReadResponse) ProtoMessage() {}
+
+func (x *ForwardLeaseReadResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardLeaseReadResponse.ProtoReflect.Descriptor instead.
+func (*ForwardLeaseReadResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ForwardLeaseReadResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
 type RelayPublishRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Channel       []byte                 `protobuf:"bytes,1,opt,name=channel,proto3" json:"channel,omitempty"`
@@ -552,7 +632,7 @@ type RelayPublishRequest struct {
 
 func (x *RelayPublishRequest) Reset() {
 	*x = RelayPublishRequest{}
-	mi := &file_internal_proto_msgTypes[7]
+	mi := &file_internal_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -564,7 +644,7 @@ func (x *RelayPublishRequest) String() string {
 func (*RelayPublishRequest) ProtoMessage() {}
 
 func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[7]
+	mi := &file_internal_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -577,7 +657,7 @@ func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishRequest.ProtoReflect.Descriptor instead.
 func (*RelayPublishRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{7}
+	return file_internal_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RelayPublishRequest) GetChannel() []byte {
@@ -603,7 +683,7 @@ type RelayPublishResponse struct {
 
 func (x *RelayPublishResponse) Reset() {
 	*x = RelayPublishResponse{}
-	mi := &file_internal_proto_msgTypes[8]
+	mi := &file_internal_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +695,7 @@ func (x *RelayPublishResponse) String() string {
 func (*RelayPublishResponse) ProtoMessage() {}
 
 func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[8]
+	mi := &file_internal_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +708,7 @@ func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishResponse.ProtoReflect.Descriptor instead.
 func (*RelayPublishResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{8}
+	return file_internal_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RelayPublishResponse) GetSubscribers() int64 {
@@ -667,7 +747,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x1bForwardAdminProposalRequest\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\"A\n" +
 	"\x1cForwardAdminProposalResponse\x12!\n" +
-	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\"I\n" +
+	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\"\x19\n" +
+	"\x17ForwardLeaseReadRequest\"?\n" +
+	"\x18ForwardLeaseReadResponse\x12#\n" +
+	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
@@ -683,10 +766,11 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xd0\x01\n" +
+	"\x05ABORT\x10\x032\x9b\x02\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
-	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12=\n" +
+	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
+	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
@@ -702,7 +786,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                              // 0: Op
 	(Phase)(0),                           // 1: Phase
@@ -713,8 +797,10 @@ var file_internal_proto_goTypes = []any{
 	(*ForwardResponse)(nil),              // 6: ForwardResponse
 	(*ForwardAdminProposalRequest)(nil),  // 7: ForwardAdminProposalRequest
 	(*ForwardAdminProposalResponse)(nil), // 8: ForwardAdminProposalResponse
-	(*RelayPublishRequest)(nil),          // 9: RelayPublishRequest
-	(*RelayPublishResponse)(nil),         // 10: RelayPublishResponse
+	(*ForwardLeaseReadRequest)(nil),      // 9: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),     // 10: ForwardLeaseReadResponse
+	(*RelayPublishRequest)(nil),          // 11: RelayPublishRequest
+	(*RelayPublishResponse)(nil),         // 12: RelayPublishResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -724,12 +810,14 @@ var file_internal_proto_depIdxs = []int32{
 	3,  // 4: ForwardRequest.requests:type_name -> Request
 	5,  // 5: Internal.Forward:input_type -> ForwardRequest
 	7,  // 6: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	9,  // 7: Internal.RelayPublish:input_type -> RelayPublishRequest
-	6,  // 8: Internal.Forward:output_type -> ForwardResponse
-	8,  // 9: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	10, // 10: Internal.RelayPublish:output_type -> RelayPublishResponse
-	8,  // [8:11] is the sub-list for method output_type
-	5,  // [5:8] is the sub-list for method input_type
+	9,  // 7: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	11, // 8: Internal.RelayPublish:input_type -> RelayPublishRequest
+	6,  // 9: Internal.Forward:output_type -> ForwardResponse
+	8,  // 10: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	10, // 11: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	12, // 12: Internal.RelayPublish:output_type -> RelayPublishResponse
+	9,  // [9:13] is the sub-list for method output_type
+	5,  // [5:9] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
 	5,  // [5:5] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
@@ -746,7 +834,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,6 +77,30 @@ type backupFenceOrderCoordinator struct {
 	onBarrier              func(uint64)
 }
 
+type backupFenceTSOCoordinator struct {
+	stubStartupCoordinator
+	min        uint64
+	nextAfter  uint64
+	barriers   atomic.Int32
+	barrierErr error
+	nextErr    error
+	afterErr   error
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroups(context.Context) error {
+	c.barriers.Add(1)
+	return c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) Next(context.Context) (uint64, error) {
+	return c.nextAfter, c.nextErr
+}
+
+func (c *backupFenceTSOCoordinator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	c.min = min
+	return c.nextAfter, c.afterErr
+}
+
 func (c *backupFenceOrderCoordinator) LeaseReadAllGroups(context.Context) error {
 	ts, err := c.Clock().NextFenced()
 	if err != nil {
@@ -105,6 +130,23 @@ func TestAdminBackupReadFenceAllocatesTimestampAfterBarrier(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, coordinate.timestampDuringBarrier, shardStore.LastCommitTS())
 	require.Greater(t, readTS, coordinate.timestampDuringBarrier)
+}
+
+func TestAdminBackupReadFenceUsesCoordinatorTimestampAllocator(t *testing.T) {
+	t.Parallel()
+	coordinate := &backupFenceTSOCoordinator{nextAfter: 9_000}
+	groupStore := store.NewMVCCStore()
+	require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), 7_000, 0))
+	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
+		1: {Store: groupStore},
+	})
+	fence := adminBackupReadFence(coordinate, shardStore)
+
+	readTS, err := fence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(9_000), readTS)
+	require.Equal(t, uint64(7_000), coordinate.min)
+	require.Equal(t, int32(1), coordinate.barriers.Load())
 }
 
 func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {

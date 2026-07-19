@@ -7,6 +7,7 @@ service Internal {
   // for internal leader redirect only
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
   rpc ForwardAdminProposal(ForwardAdminProposalRequest) returns (ForwardAdminProposalResponse) {}
+  rpc ForwardLeaseRead(ForwardLeaseReadRequest) returns (ForwardLeaseReadResponse) {}
   rpc RelayPublish(RelayPublishRequest) returns (RelayPublishResponse) {}
 }
 
@@ -84,6 +85,12 @@ message ForwardAdminProposalRequest {
 
 message ForwardAdminProposalResponse {
   uint64 commit_index = 1;
+}
+
+message ForwardLeaseReadRequest {}
+
+message ForwardLeaseReadResponse {
+  uint64 applied_index = 1;
 }
 
 message RelayPublishRequest {

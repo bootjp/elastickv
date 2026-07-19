@@ -89,6 +89,25 @@ func (s *ShardStore) CaptureBackupRouteSnapshot(start []byte, end []byte) Backup
 	}
 }
 
+// CaptureBackupRouteSnapshotAt reads the durable distribution catalog at ts.
+// This keeps backup ownership aligned with the same MVCC timestamp used to
+// materialize values even if the live route watcher advances immediately
+// after the backup read fence.
+func (s *ShardStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts uint64) (BackupRouteSnapshot, error) {
+	if s == nil {
+		return BackupRouteSnapshot{}, errors.New("backup route store is unavailable")
+	}
+	snapshot, err := distribution.NewCatalogStore(s).SnapshotAt(ctx, ts)
+	if err != nil {
+		return BackupRouteSnapshot{}, errors.Wrap(err, "read distribution catalog at backup timestamp")
+	}
+	routes, err := distribution.RoutesFromCatalogSnapshot(snapshot)
+	if err != nil {
+		return BackupRouteSnapshot{}, errors.Wrap(err, "materialize backup route snapshot")
+	}
+	return BackupRouteSnapshot{routes: cloneBackupRoutes(routes)}, nil
+}
+
 // NewBackupScannerAtSnapshot creates a value scanner from a captured route view.
 func NewBackupScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupScanner {
 	if pageSize <= 0 {

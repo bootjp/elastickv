@@ -10,6 +10,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 type adminProposalLeaderView struct {
@@ -47,16 +48,20 @@ func (p *recordingAdminProposer) ProposeAdmin(_ context.Context, data []byte) (*
 type forwardingAdminServer struct {
 	pb.UnimplementedInternalServer
 
-	mu      sync.Mutex
-	payload []byte
+	mu            sync.Mutex
+	payload       []byte
+	authorization []string
 }
 
 func (s *forwardingAdminServer) ForwardAdminProposal(
-	_ context.Context,
+	ctx context.Context,
 	req *pb.ForwardAdminProposalRequest,
 ) (*pb.ForwardAdminProposalResponse, error) {
 	s.mu.Lock()
 	s.payload = append([]byte(nil), req.GetPayload()...)
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		s.authorization = append([]string(nil), md.Get("authorization")...)
+	}
 	s.mu.Unlock()
 	return &pb.ForwardAdminProposalResponse{CommitIndex: 123}, nil
 }
@@ -105,5 +110,34 @@ func TestLeaderAdminProposerForwardsFollowerProposal(t *testing.T) {
 	require.Zero(t, local.adminCalls)
 	service.mu.Lock()
 	require.Equal(t, []byte("pin"), service.payload)
+	service.mu.Unlock()
+}
+
+func TestLeaderAdminProposerForwardsBearerToken(t *testing.T) {
+	t.Parallel()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	service := &forwardingAdminServer{}
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, service)
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+
+	cache := &GRPCConnCache{}
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+	proposer := NewLeaderAdminProposer(
+		&adminProposalLeaderView{state: raftengine.StateFollower, addr: lis.Addr().String()},
+		&recordingAdminProposer{},
+		cache,
+		WithLeaderAdminToken("s3cret"),
+	)
+	_, err = proposer.ProposeAdmin(context.Background(), []byte("pin"))
+	require.NoError(t, err)
+	service.mu.Lock()
+	require.Equal(t, []string{"Bearer s3cret"}, service.authorization)
 	service.mu.Unlock()
 }

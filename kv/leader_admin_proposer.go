@@ -7,23 +7,40 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 )
+
+type LeaderAdminProposerOption func(*leaderAdminProposer)
+
+func WithLeaderAdminToken(token string) LeaderAdminProposerOption {
+	return func(p *leaderAdminProposer) {
+		p.adminToken = token
+	}
+}
 
 // leaderAdminProposer forwards ProposeAdmin calls to the current group leader.
 // Propose remains local because only barrier-exempt, idempotent admin entries
 // are safe to retry across a leadership change.
 type leaderAdminProposer struct {
-	leader    raftengine.LeaderView
-	local     raftengine.Proposer
-	connCache *GRPCConnCache
+	leader     raftengine.LeaderView
+	local      raftengine.Proposer
+	connCache  *GRPCConnCache
+	adminToken string
 }
 
 func NewLeaderAdminProposer(
 	leader raftengine.LeaderView,
 	local raftengine.Proposer,
 	connCache *GRPCConnCache,
+	opts ...LeaderAdminProposerOption,
 ) raftengine.Proposer {
-	return &leaderAdminProposer{leader: leader, local: local, connCache: connCache}
+	p := &leaderAdminProposer{leader: leader, local: local, connCache: connCache}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(p)
+		}
+	}
+	return p
 }
 
 func (p *leaderAdminProposer) Propose(
@@ -125,6 +142,9 @@ func (p *leaderAdminProposer) forwardAdmin(
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
+	if p.adminToken != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+p.adminToken)
+	}
 	resp, err := pb.NewInternalClient(conn).ForwardAdminProposal(ctx, &pb.ForwardAdminProposalRequest{Payload: data})
 	if err != nil {
 		return nil, errors.WithStack(err)

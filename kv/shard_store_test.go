@@ -669,6 +669,36 @@ func TestBackupScannerReusesCapturedRouteSnapshot(t *testing.T) {
 	require.Equal(t, []byte("pinned-owner"), pair.Value)
 }
 
+func TestCaptureBackupRouteSnapshotAtUsesDurableCatalogTimestamp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	shards := NewShardStore(engine, groups)
+	catalog := distribution.NewCatalogStore(groups[1].Store)
+	old, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(old))
+	oldReadTS := groups[1].Store.LastCommitTS()
+	current, err := catalog.Save(ctx, old.Version, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(current))
+
+	snapshot, err := shards.CaptureBackupRouteSnapshotAt(ctx, oldReadTS)
+	require.NoError(t, err)
+	require.Len(t, snapshot.routes, 2)
+	require.Equal(t, uint64(1), snapshot.routes[0].GroupID)
+	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
+}
+
 func TestBackupScannerMaterializesFromCapturedRoute(t *testing.T) {
 	t.Parallel()
 

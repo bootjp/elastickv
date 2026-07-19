@@ -2146,7 +2146,12 @@ func setupAdminService(
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
 		if group := shardGroups[rt.spec.id]; group != nil {
-			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(rt.engine, group.Proposer(), connCache))
+			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(
+				rt.engine,
+				group.Proposer(),
+				connCache,
+				kv.WithLeaderAdminToken(icept.token),
+			))
 		}
 	}
 	// Only register a real sampler. Passing a typed-nil *MemSampler
@@ -2218,6 +2223,7 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 type adminGRPCInterceptors struct {
 	unary  []grpc.UnaryServerInterceptor
 	stream []grpc.StreamServerInterceptor
+	token  string
 }
 
 func (a adminGRPCInterceptors) empty() bool {
@@ -2233,6 +2239,8 @@ var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2271,6 +2279,22 @@ func (c startupGatedCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c startupGatedCoordinator) Clock() *kv.HLC {
 	return c.inner.Clock()
+}
+
+func (c startupGatedCoordinator) Next(ctx context.Context) (uint64, error) {
+	alloc, ok := c.inner.(kv.TimestampAllocator)
+	if !ok {
+		return 0, errors.New("startup coordinator timestamp allocator is unavailable")
+	}
+	return alloc.Next(ctx) //nolint:wrapcheck // Preserve allocator errors for callers.
+}
+
+func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	alloc, ok := c.inner.(kv.TimestampAfterAllocator)
+	if !ok {
+		return 0, errors.New("startup coordinator timestamp-after allocator is unavailable")
+	}
+	return alloc.NextAfter(ctx, min) //nolint:wrapcheck // Preserve allocator errors for callers.
 }
 
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
@@ -2380,7 +2404,7 @@ func configureAdminService(
 	srv := adapter.NewAdminServer(self, members, opts...)
 	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability())
 	unary, stream := adapter.AdminTokenAuth(token)
-	var icept adminGRPCInterceptors
+	icept := adminGRPCInterceptors{token: token}
 	if unary != nil {
 		icept.unary = append(icept.unary, unary)
 	}
@@ -2450,13 +2474,36 @@ func adminBackupReadFence(coordinate kv.Coordinator, shardStore *kv.ShardStore) 
 		if err := kv.LeaseReadAllGroupsThrough(coordinate, ctx); err != nil {
 			return 0, errors.Wrap(err, "backup: fence raft groups")
 		}
-		clock.Observe(shardStore.LastCommitTS())
-		readTS, err := clock.NextFenced()
+		lastCommitTS := shardStore.LastCommitTS()
+		clock.Observe(lastCommitTS)
+		readTS, err := allocateBackupReadTimestamp(ctx, coordinate, lastCommitTS)
 		if err != nil {
 			return 0, errors.Wrap(err, "backup: issue read timestamp")
 		}
 		return readTS, nil
 	}
+}
+
+func allocateBackupReadTimestamp(ctx context.Context, coordinate kv.Coordinator, min uint64) (uint64, error) {
+	if alloc, ok := coordinate.(kv.TimestampAfterAllocator); ok {
+		return alloc.NextAfter(ctx, min) //nolint:wrapcheck // Canonical coordinator/TSO error.
+	}
+	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		if err != nil {
+			return 0, err //nolint:wrapcheck // Wrapped at the backup call site.
+		}
+		if ts <= min {
+			return 0, errors.Errorf("timestamp allocator returned %d, not after %d", ts, min)
+		}
+		return ts, nil
+	}
+	clock := coordinate.Clock()
+	if clock == nil {
+		return 0, errors.New("backup timestamp allocator is unavailable")
+	}
+	clock.Observe(min)
+	return clock.NextFenced() //nolint:wrapcheck // Wrapped at the backup call site.
 }
 
 func adminBackupPeerProbe(connCache *kv.GRPCConnCache) adapter.BackupPeerProbe {
@@ -2698,12 +2745,13 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
+		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups))
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			append(internalTimestampOptions(coordinate), adapter.WithInternalAdminProposer(proposerForGroup(rt, shardGroups)))...,
+			internalOpts...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		if adminServer != nil {
@@ -2776,6 +2824,18 @@ func startRaftServers(
 		})
 	}
 	return nil
+}
+
+func internalServerOptions(
+	coordinate kv.Coordinator,
+	adminServer *adapter.AdminServer,
+	proposer raftengine.Proposer,
+) []adapter.InternalOption {
+	opts := internalTimestampOptions(coordinate)
+	if adminServer != nil {
+		return append(opts, adapter.WithInternalAdminProposer(proposer))
+	}
+	return opts
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {

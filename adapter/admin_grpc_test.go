@@ -1021,6 +1021,20 @@ func TestAdminTokenAuthSkipsOtherServices(t *testing.T) {
 	}
 }
 
+func TestAdminTokenAuthProtectsForwardAdminProposal(t *testing.T) {
+	t.Parallel()
+	unary, _ := AdminTokenAuth("s3cret")
+	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_ForwardAdminProposal_FullMethodName}
+	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
+
+	_, err := unary(context.Background(), nil, info, handler)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer s3cret"))
+	resp, err := unary(ctx, nil, info, handler)
+	require.NoError(t, err)
+	require.Equal(t, "ok", resp)
+}
+
 func TestAdminTokenAuthEmptyTokenDisabled(t *testing.T) {
 	t.Parallel()
 	unary, stream := AdminTokenAuth("")

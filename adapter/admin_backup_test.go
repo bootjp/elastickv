@@ -114,6 +114,7 @@ type backupTestStore struct {
 	mu           sync.Mutex
 	keys         [][]byte
 	readTS       []uint64
+	capturedTS   []uint64
 	onCapture    func()
 	onExhaust    func()
 	scanDelay    time.Duration
@@ -121,14 +122,15 @@ type backupTestStore struct {
 	pairCloseErr error
 }
 
-func (s *backupTestStore) CaptureBackupRouteSnapshot(_, _ []byte) kv.BackupRouteSnapshot {
+func (s *backupTestStore) CaptureBackupRouteSnapshotAt(_ context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
 	s.mu.Lock()
+	s.capturedTS = append(s.capturedTS, ts)
 	onCapture := s.onCapture
 	s.mu.Unlock()
 	if onCapture != nil {
 		onCapture()
 	}
-	return kv.BackupRouteSnapshot{}
+	return kv.BackupRouteSnapshot{}, nil
 }
 
 func (s *backupTestStore) NewBackupKeyScannerAtSnapshot(_ kv.BackupRouteSnapshot, ts uint64, _ int) kv.BackupKeyScanner {
@@ -337,6 +339,7 @@ func TestBeginBackupCapturesRouteSnapshotAfterReadFence(t *testing.T) {
 	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
 	require.NoError(t, err)
 	require.Equal(t, int32(2), stage.Load())
+	require.Equal(t, []uint64{42}, store.capturedTS)
 }
 
 func TestBeginBackupRenewsWhileBaselineRuns(t *testing.T) {

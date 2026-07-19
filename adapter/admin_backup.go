@@ -54,7 +54,7 @@ type BackupPeerVersion struct {
 type BackupPeerProbe func(context.Context, string) (BackupPeerVersion, error)
 
 type BackupStore interface {
-	CaptureBackupRouteSnapshot(start, end []byte) kv.BackupRouteSnapshot
+	CaptureBackupRouteSnapshotAt(context.Context, uint64) (kv.BackupRouteSnapshot, error)
 	NewBackupKeyScannerAtSnapshot(snapshot kv.BackupRouteSnapshot, ts uint64, pageSize int) kv.BackupKeyScanner
 	NewBackupScannerAtSnapshot(snapshot kv.BackupRouteSnapshot, ts uint64, pageSize int) kv.BackupScanner
 }
@@ -259,7 +259,10 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	if readTS == 0 || readTS == ^uint64(0) {
 		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "%s", "backup read fence returned an invalid timestamp")
 	}
-	routes := s.backupStore.CaptureBackupRouteSnapshot(nil, nil)
+	routes, err := s.backupStore.CaptureBackupRouteSnapshotAt(ctx, readTS)
+	if err != nil {
+		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
+	}
 	pinID, err := newBackupPinID()
 	if err != nil {
 		return preparedBackup{}, status.Errorf(codes.Internal, "generate backup pin id: %v", err)
