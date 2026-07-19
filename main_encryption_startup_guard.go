@@ -245,6 +245,7 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 	if !encryptionEnabled || sidecarPath == "" {
 		return nil
 	}
+	multi = effectiveMultiDataDirs(groups, multi)
 	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
 	if err != nil {
 		return err
@@ -368,6 +369,7 @@ func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipS
 	if !in.encryptionEnabled || in.sidecarPath == "" {
 		return nil
 	}
+	in.multi = effectiveMultiDataDirs(in.groups, in.multi)
 	sc, err := readExistingSidecarForStartupGuard(in.sidecarPath)
 	if err != nil || sc == nil {
 		return err

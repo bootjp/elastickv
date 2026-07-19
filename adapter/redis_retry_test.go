@@ -12,25 +12,29 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type retryOnceCoordinator struct {
 	store      store.MVCCStore
 	clock      *kv.HLC
 	dispatches int
+	firstErr   error
 }
 
 func newRetryOnceCoordinator(st store.MVCCStore) *retryOnceCoordinator {
 	return &retryOnceCoordinator{
-		store: st,
-		clock: kv.NewHLC(),
+		store:    st,
+		clock:    kv.NewHLC(),
+		firstErr: store.ErrWriteConflict,
 	}
 }
 
 func (c *retryOnceCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.dispatches++
 	if c.dispatches == 1 {
-		return nil, store.ErrWriteConflict
+		return nil, c.firstErr
 	}
 
 	ts := c.clock.Next()
@@ -291,6 +295,199 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	value, _, err := decodeRedisStr(rawValue)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), value)
+}
+
+func TestRedisXAddRetriesWireWriteConflict(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, false)
+	coord.wireWriteConflicts = true
+	srv := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+	conn := &recordingConn{}
+
+	srv.xadd(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
+	}})
+
+	require.Empty(t, conn.err)
+	require.NotEmpty(t, conn.bulk)
+	require.Equal(t, 2, coord.dispatches)
+	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), meta.Length)
+}
+
+func TestRedisXAddDedupsLandedWireWriteConflict(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.wireWriteConflicts = true
+	srv := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+	conn := &recordingConn{}
+
+	srv.xadd(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
+	}})
+
+	require.Empty(t, conn.err)
+	require.NotEmpty(t, conn.bulk)
+	require.Equal(t, 2, coord.dispatches, "ambiguous apply plus exact-ts reuse probe")
+	require.Equal(t, 1, coord.probeNoOps, "reuse must observe the landed first attempt")
+	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.Clock(), st))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), meta.Length, "the generated XADD entry must not be appended twice")
+}
+
+func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.wireWriteConflicts = true
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+	conn := &recordingConn{}
+
+	srv.xadd(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
+	}})
+
+	require.NotEmpty(t, conn.err)
+	require.Contains(t, conn.err, "key: retry:stream")
+	require.NotContains(t, conn.err, store.StreamEntryPrefix)
+	require.Equal(t, 1, coord.dispatches, "unsafe legacy path must fail closed instead of replaying XADD")
+	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.Clock(), st))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), meta.Length)
+}
+
+func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
+	t.Parallel()
+
+	wireErr := errors.WithStack(status.Error(codes.Aborted,
+		kv.NewTxnLockedError(store.ListItemKey([]byte("list"), 1)).Error()))
+	attempts := 0
+	srv := &RedisServer{}
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		if attempts == 1 {
+			return wireErr
+		}
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
+	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(wireErr))
+}
+
+func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		wireErr error
+	}{
+		{name: "plain unknown", wireErr: status.Error(codes.Unknown, "write conflict")},
+		{name: "unknown non-matching envelope", wireErr: status.Error(codes.Unknown, "key: user-visible failure")},
+		{name: "internal code with matching message", wireErr: status.Error(codes.Internal, "key: k: write conflict")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			srv := &RedisServer{}
+			err := srv.retryRedisWrite(context.Background(), func() error {
+				attempts++
+				return tt.wireErr
+			})
+
+			require.ErrorIs(t, err, tt.wireErr)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
+func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
+	internalKey := store.StreamEntryKey([]byte("retry:stream"), 1, 2)
+	wireErr := errors.WithStack(status.Error(codes.Unknown,
+		store.NewWriteConflictError(internalKey).Error()))
+	attempts := 0
+	srv := &RedisServer{}
+
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		return wireErr
+	})
+
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.ErrorContains(t, err, "key: retry:stream")
+	require.NotContains(t, err.Error(), "redis txn retry limit exceeded")
+	require.NotContains(t, err.Error(), store.StreamEntryPrefix)
+	require.Equal(t, 1, attempts)
+}
+
+func TestNormalizeRetryableRedisTxnErrWireErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		wireErr          error
+		wantSentinel     error
+		wantKey          string
+		wantDetail       string
+		internalKeyToken string
+	}{
+		{
+			name: "write conflict",
+			wireErr: errors.WithStack(status.Error(codes.Unknown,
+				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error())),
+			wantSentinel:     store.ErrWriteConflict,
+			wantKey:          "retry:stream",
+			internalKeyToken: store.StreamEntryPrefix,
+		},
+		{
+			name: "transaction locked with detail",
+			wireErr: errors.WithStack(status.Error(codes.Aborted,
+				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow").Error())),
+			wantSentinel:     kv.ErrTxnLocked,
+			wantKey:          "retry:list",
+			wantDetail:       "timestamp overflow",
+			internalKeyToken: store.ListItemPrefix,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			normalized := normalizeRetryableRedisTxnErr(tt.wireErr)
+
+			require.ErrorIs(t, normalized, tt.wantSentinel)
+			require.ErrorContains(t, normalized, "key: "+tt.wantKey)
+			if tt.wantDetail != "" {
+				require.ErrorContains(t, normalized, tt.wantDetail)
+			}
+			require.NotContains(t, normalized.Error(), tt.internalKeyToken)
+		})
+	}
 }
 
 func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {

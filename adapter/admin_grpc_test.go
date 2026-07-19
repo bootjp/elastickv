@@ -71,6 +71,24 @@ func TestGetClusterOverviewReturnsSelfAndLeaders(t *testing.T) {
 	}
 }
 
+func TestGetClusterOverviewReturnsCapabilities(t *testing.T) {
+	t.Parallel()
+	srv := NewAdminServer(NodeIdentity{NodeID: "node-a"}, nil)
+	srv.SetCapability(S3BlobOffloadCapabilityName, false)
+	srv.SetCapability("feature-test", true)
+
+	resp, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if got, ok := resp.Capabilities[S3BlobOffloadCapabilityName]; !ok || got {
+		t.Fatalf("s3 blob offload capability = (%v, %v), want (false, true)", got, ok)
+	}
+	if got, ok := resp.Capabilities["feature-test"]; !ok || !got {
+		t.Fatalf("feature-test capability = (%v, %v), want (true, true)", got, ok)
+	}
+}
+
 func TestGetRaftGroupsExposesCommitApplied(t *testing.T) {
 	t.Parallel()
 	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil)

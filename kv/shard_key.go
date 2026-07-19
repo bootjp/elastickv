@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 )
@@ -48,8 +49,12 @@ var (
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 )
 
-// routeKey normalizes internal keys (e.g., list metadata/items) to the logical
+// RouteKey normalizes internal keys (e.g., list metadata/items) to the logical
 // user key used for shard routing.
+func RouteKey(key []byte) []byte {
+	return routeKey(key)
+}
+
 func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil
@@ -71,6 +76,9 @@ func normalizeRouteKey(key []byte) []byte {
 		return route
 	}
 	if user := s3keys.ExtractRouteKey(key); user != nil {
+		return user
+	}
+	if user := fskeys.ExtractRouteKey(key); user != nil {
 		return user
 	}
 	if user := store.ExtractListUserKey(key); user != nil {

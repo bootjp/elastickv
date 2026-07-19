@@ -223,6 +223,11 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	if dispErr == nil {
 		return r.resolveReuseLength(ctx, key, pending), false, nil
 	}
+	// This path owns an exact reusable write set plus PrevCommitTS, so it can
+	// safely opt in to retrying an otherwise-ambiguous forwarded conflict.
+	// Normalize before the typed conflict branch; generic Redis writes keep
+	// raw wire write conflicts fail-closed.
+	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (codex P1): the apply might have
 		// landed at this fresh commitTS but bubbled up as WriteConflict due
@@ -422,6 +427,10 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			newLen = updatedMeta.Len
 			return nil
 		}
+		// Preserve the exact attempt for a forwarded conflict only after
+		// restoring its typed form. The next iteration can then reuse these
+		// operations instead of recomputing a second list append.
+		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt for reuse if retryRedisWrite will actually
 		// loop — i.e. the error is one of WriteConflict / TxnLocked. For
 		// errors that escape the loop (transient-leader, context deadline,
