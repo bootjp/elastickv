@@ -357,9 +357,19 @@ func (x *GetRouteResponse) GetRaftGroupId() uint64 {
 }
 
 type GetTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Count requests a consecutive timestamp window and defaults to one.
+	Count uint32 `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"`
+	// MinTimestamp requires the returned window base to be strictly greater
+	// than this value. It lets commit timestamp callers preserve startTS <
+	// commitTS across a follower-to-TSO-leader RPC.
+	MinTimestamp uint64 `protobuf:"varint,2,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	// ActivateCutover durably switches the dedicated TSO group into production
+	// issuance. Once committed, shadow clients return TSO timestamps instead of
+	// legacy HLC candidates, so a rolling cutover cannot reintroduce them.
+	ActivateCutover bool `protobuf:"varint,3,opt,name=activate_cutover,json=activateCutover,proto3" json:"activate_cutover,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GetTimestampRequest) Reset() {
@@ -392,9 +402,42 @@ func (*GetTimestampRequest) Descriptor() ([]byte, []int) {
 	return file_distribution_proto_rawDescGZIP(), []int{2}
 }
 
+func (x *GetTimestampRequest) GetCount() uint32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+func (x *GetTimestampRequest) GetMinTimestamp() uint64 {
+	if x != nil {
+		return x.MinTimestamp
+	}
+	return 0
+}
+
+func (x *GetTimestampRequest) GetActivateCutover() bool {
+	if x != nil {
+		return x.ActivateCutover
+	}
+	return false
+}
+
 type GetTimestampResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// CommittedByDedicatedTSO distinguishes a durable TSO window from the
+	// legacy catalog timestamp response during rolling upgrades.
+	CommittedByDedicatedTso bool `protobuf:"varint,2,opt,name=committed_by_dedicated_tso,json=committedByDedicatedTso,proto3" json:"committed_by_dedicated_tso,omitempty"`
+	// Count echoes the number of consecutive timestamps reserved at timestamp.
+	Count uint32 `protobuf:"varint,3,opt,name=count,proto3" json:"count,omitempty"`
+	// PreviousAllocationFloor is the highest timestamp already reserved before
+	// this request. Shadow validation uses it to reject legacy candidates that
+	// overlap any earlier dedicated or shadow reservation.
+	PreviousAllocationFloor uint64 `protobuf:"varint,4,opt,name=previous_allocation_floor,json=previousAllocationFloor,proto3" json:"previous_allocation_floor,omitempty"`
+	// CutoverActive reports the durable group-0 cutover marker after applying
+	// this request. Shadow nodes switch to the returned TSO timestamp when true.
+	CutoverActive bool `protobuf:"varint,5,opt,name=cutover_active,json=cutoverActive,proto3" json:"cutover_active,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -434,6 +477,34 @@ func (x *GetTimestampResponse) GetTimestamp() uint64 {
 		return x.Timestamp
 	}
 	return 0
+}
+
+func (x *GetTimestampResponse) GetCommittedByDedicatedTso() bool {
+	if x != nil {
+		return x.CommittedByDedicatedTso
+	}
+	return false
+}
+
+func (x *GetTimestampResponse) GetCount() uint32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetPreviousAllocationFloor() uint64 {
+	if x != nil {
+		return x.PreviousAllocationFloor
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetCutoverActive() bool {
+	if x != nil {
+		return x.CutoverActive
+	}
+	return false
 }
 
 type RouteDescriptor struct {
@@ -1146,10 +1217,17 @@ const file_distribution_proto_rawDesc = "" +
 	"\x10GetRouteResponse\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x02 \x01(\fR\x03end\x12\"\n" +
-	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\x15\n" +
-	"\x13GetTimestampRequest\"4\n" +
+	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"{\n" +
+	"\x13GetTimestampRequest\x12\x14\n" +
+	"\x05count\x18\x01 \x01(\rR\x05count\x12#\n" +
+	"\rmin_timestamp\x18\x02 \x01(\x04R\fminTimestamp\x12)\n" +
+	"\x10activate_cutover\x18\x03 \x01(\bR\x0factivateCutover\"\xea\x01\n" +
 	"\x14GetTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xe5\x01\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12;\n" +
+	"\x1acommitted_by_dedicated_tso\x18\x02 \x01(\bR\x17committedByDedicatedTso\x12\x14\n" +
+	"\x05count\x18\x03 \x01(\rR\x05count\x12:\n" +
+	"\x19previous_allocation_floor\x18\x04 \x01(\x04R\x17previousAllocationFloor\x12%\n" +
+	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\"\xe5\x01\n" +
 	"\x0fRouteDescriptor\x12\x19\n" +
 	"\broute_id\x18\x01 \x01(\x04R\arouteId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +

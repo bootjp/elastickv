@@ -25,8 +25,12 @@ const (
 	// range so old data-group FSMs halt on a misrouted entry. The remaining
 	// magic and version bytes keep it distinct from every encryption opcode.
 	tsoAllocationFloorEnvelope = "\x07TSOF\x01"
-	tsoSnapshotV1Len           = hlcLeasePayloadLen
-	tsoSnapshotV2Len           = hlcLeasePayloadLen * 2
+	// tsoCutoverEnvelope uses the same legacy fail-closed prefix but a distinct
+	// magic, so an encryption entry cannot become a one-way TSO state change.
+	tsoCutoverEnvelope = "\x07TSOC\x01"
+	tsoSnapshotV1Len   = hlcLeasePayloadLen
+	tsoSnapshotV2Len   = hlcLeasePayloadLen * 2
+	tsoSnapshotV3Len   = tsoSnapshotV2Len + 1
 )
 
 // TSOStateMachine is the minimal state machine for the dedicated timestamp
@@ -38,6 +42,7 @@ type TSOStateMachine struct {
 	hlc             *HLC
 	ceilingMs       atomic.Int64
 	allocationFloor atomic.Uint64
+	cutoverActive   atomic.Bool
 }
 
 func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
@@ -53,6 +58,8 @@ func (f *TSOStateMachine) Apply(data []byte) any {
 		return f.applyLeaseEntry(data)
 	case bytes.HasPrefix(data, []byte(tsoAllocationFloorEnvelope)):
 		return f.applyAllocationFloorEntry(data)
+	case bytes.Equal(data, []byte(tsoCutoverEnvelope)):
+		return f.applyCutoverEntry(data)
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return rejectLegacyTSOEncryptionEntry(data)
 	default:
@@ -116,14 +123,47 @@ func (f *TSOStateMachine) applyAllocationFloorEntry(data []byte) any {
 	return nil
 }
 
+func (f *TSOStateMachine) applyCutoverEntry(data []byte) any {
+	if !bytes.Equal(data, []byte(tsoCutoverEnvelope)) {
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"invalid TSO cutover envelope length %d", len(data)))
+	}
+	if f != nil {
+		f.cutoverActive.Store(true)
+	}
+	return nil
+}
+
+// AllocationFloor returns the highest timestamp window end applied by the
+// dedicated TSO group. It is consensus-owned state, unlike HLC.Current().
+func (f *TSOStateMachine) AllocationFloor() uint64 {
+	if f == nil {
+		return 0
+	}
+	return f.allocationFloor.Load()
+}
+
+// CutoverActive reports whether production issuance has durably crossed the
+// one-way migration marker. The marker cannot be cleared without a separate
+// cluster-wide rollback protocol.
+func (f *TSOStateMachine) CutoverActive() bool {
+	return f != nil && f.cutoverActive.Load()
+}
+
 func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 	var ceilingMs int64
 	var allocationFloor uint64
+	var cutoverActive bool
 	if f != nil {
 		ceilingMs = f.ceilingMs.Load()
 		allocationFloor = f.allocationFloor.Load()
+		cutoverActive = f.cutoverActive.Load()
 	}
-	return &tsoFSMSnapshot{ceilingMs: ceilingMs, allocationFloor: allocationFloor}, nil
+	return &tsoFSMSnapshot{
+		ceilingMs:       ceilingMs,
+		allocationFloor: allocationFloor,
+		cutoverActive:   cutoverActive,
+	}, nil
 }
 
 func (f *TSOStateMachine) Restore(r io.Reader) error {
@@ -134,12 +174,12 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	if legacy, err := restoreLegacyKVFSMSnapshot(f, br); legacy || err != nil {
 		return err
 	}
-	ceilingMs, allocationFloor, err := readTSOSnapshotState(br)
+	ceilingMs, allocationFloor, cutoverActive, err := readTSOSnapshotState(br)
 	if err != nil {
 		return err
 	}
 	if f != nil {
-		f.restoreSnapshotState(ceilingMs, allocationFloor)
+		f.restoreSnapshotState(ceilingMs, allocationFloor, cutoverActive)
 	}
 	return nil
 }
@@ -151,13 +191,28 @@ func tsoSnapshotReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
 }
 
-func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, error) {
-	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV2Len+1))
+func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, bool, error) {
+	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV3Len+1))
 	if err != nil {
-		return 0, 0, errors.Wrap(err, "restore tso fsm snapshot")
+		return 0, 0, false, errors.Wrap(err, "restore tso fsm snapshot")
 	}
+	ceilingMs, allocationFloor, cutoverActive, legacySnapshot, err := decodeTSOSnapshotPayload(payload)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if ceilingMs < 0 {
+		return 0, 0, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+	}
+	if legacySnapshot && ceilingMs > 0 {
+		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
+	}
+	return ceilingMs, allocationFloor, cutoverActive, nil
+}
+
+func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, error) {
 	var ceilingMs int64
 	var allocationFloor uint64
+	var cutoverActive bool
 	var legacySnapshot bool
 	switch len(payload) {
 	case tsoSnapshotV1Len:
@@ -166,16 +221,32 @@ func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, error) {
 	case tsoSnapshotV2Len:
 		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
 		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:])
+	case tsoSnapshotV3Len:
+		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
+		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len])
+		var err error
+		cutoverActive, err = decodeTSOCutoverByte(payload[tsoSnapshotV2Len])
+		if err != nil {
+			return 0, 0, false, false, err
+		}
 	default:
-		return 0, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: expected %d or %d bytes, got %d", tsoSnapshotV1Len, tsoSnapshotV2Len, len(payload))
+		return 0, 0, false, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: expected %d, %d, or %d bytes, got %d",
+			tsoSnapshotV1Len, tsoSnapshotV2Len, tsoSnapshotV3Len, len(payload))
 	}
-	if ceilingMs < 0 {
-		return 0, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+	return ceilingMs, allocationFloor, cutoverActive, legacySnapshot, nil
+}
+
+func decodeTSOCutoverByte(value byte) (bool, error) {
+	switch value {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: invalid cutover byte %d", value)
 	}
-	if legacySnapshot && ceilingMs > 0 {
-		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
-	}
-	return ceilingMs, allocationFloor, nil
 }
 
 // restoreLegacyKVFSMSnapshot migrates snapshots produced while reserved group
@@ -201,7 +272,7 @@ func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, err
 	if f == nil || ceilingMs == 0 {
 		return true, nil
 	}
-	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs))
+	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs), false)
 	return true, nil
 }
 
@@ -226,6 +297,9 @@ func hasLegacyKVFSMSnapshotHeader(br *bufio.Reader) (bool, error) {
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
+	if bytes.Equal(payload, []byte(tsoCutoverEnvelope)) {
+		return true
+	}
 	return len(payload) == hlcLeaseEntryLen && payload[0] == raftEncodeHLCLease ||
 		len(payload) == len(tsoAllocationFloorEnvelope)+hlcLeasePayloadLen &&
 			bytes.HasPrefix(payload, []byte(tsoAllocationFloorEnvelope))
@@ -251,7 +325,7 @@ func (f *TSOStateMachine) applyAllocationFloor(floor uint64) {
 	}
 }
 
-func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor uint64) {
+func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor uint64, cutoverActive bool) {
 	if f == nil {
 		return
 	}
@@ -260,6 +334,9 @@ func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor 
 	}
 	if allocationFloor > 0 {
 		storeMaxUint64(&f.allocationFloor, allocationFloor)
+	}
+	if cutoverActive {
+		f.cutoverActive.Store(true)
 	}
 	if f.hlc != nil {
 		if currentCeiling := f.ceilingMs.Load(); currentCeiling > 0 {
@@ -306,9 +383,14 @@ func marshalTSOAllocationFloor(floor uint64) []byte {
 	return out
 }
 
+func marshalTSOCutover() []byte {
+	return []byte(tsoCutoverEnvelope)
+}
+
 type tsoFSMSnapshot struct {
 	ceilingMs       int64
 	allocationFloor uint64
+	cutoverActive   bool
 }
 
 func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
@@ -317,13 +399,18 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 	}
 	var ceilingMs int64
 	var allocationFloor uint64
+	var cutoverActive bool
 	if s != nil {
 		ceilingMs = s.ceilingMs
 		allocationFloor = s.allocationFloor
+		cutoverActive = s.cutoverActive
 	}
-	var buf [tsoSnapshotV2Len]byte
+	var buf [tsoSnapshotV3Len]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp.
-	binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:], allocationFloor)
+	binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
+	if cutoverActive {
+		buf[tsoSnapshotV2Len] = 1
+	}
 	n, err := w.Write(buf[:])
 	if err != nil {
 		return int64(n), errors.Wrap(err, "write tso fsm snapshot")

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	stderrors "errors"
 	"io"
 	"math"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -17,9 +19,12 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 const proxyForwardTimeout = 5 * time.Second
+
+const maxTSOCommitFloorConcurrency = 16
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
@@ -33,6 +38,14 @@ var (
 	ErrCrossShardMutationBatchNotSupported = errors.New("cross-shard mutation batches are not supported")
 	ErrFilesystemPlacementTargetNotFound   = errors.New("filesystem placement target group has no routable home slot")
 )
+
+var ErrTSOCommitFloorUnavailable = errors.New("tso: authoritative data-group commit floor is unavailable")
+
+// TSOCutoverFloorProvider supplies the highest commit timestamp that the
+// dedicated TSO must exceed before a leader term can issue a window.
+type TSOCutoverFloorProvider interface {
+	GlobalCommittedTimestampFloor(context.Context) (uint64, error)
+}
 
 // NewShardStore creates a sharded MVCC store wrapper.
 func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *ShardStore {
@@ -2253,6 +2266,140 @@ func (s *ShardStore) LastCommitTS() uint64 {
 		}
 	}
 	return max
+}
+
+// GlobalCommittedTimestampFloor returns a strict, leader-fenced maximum over
+// every data group. Unlike GlobalLastCommitTS helpers used by best-effort read
+// snapshots, this method never falls back to a stale local follower watermark:
+// inability to reach any group's authoritative leader fails the TSO term
+// initialization closed.
+func (s *ShardStore) GlobalCommittedTimestampFloor(ctx context.Context) (uint64, error) {
+	if s == nil {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	ids, err := s.tsoCommitFloorGroupIDs()
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if len(ids) == 1 {
+		return s.singleGroupCommittedTimestampFloor(ctx, ids[0])
+	}
+	return s.parallelCommittedTimestampFloor(ctx, ids)
+}
+
+func (s *ShardStore) tsoCommitFloorGroupIDs() ([]uint64, error) {
+	ids := make([]uint64, 0, len(s.groups))
+	for groupID, group := range s.groups {
+		if groupID == 0 {
+			continue
+		}
+		if group == nil || group.Store == nil {
+			return nil, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+				"data group %d has no local store", groupID)
+		}
+		ids = append(ids, groupID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+func (s *ShardStore) singleGroupCommittedTimestampFloor(ctx context.Context, groupID uint64) (uint64, error) {
+	ts, err := s.authoritativeGroupLastCommitTS(ctx, groupID, s.groups[groupID])
+	if err != nil {
+		return 0, errors.Wrapf(err, "tso commit floor: group %d", groupID)
+	}
+	return ts, nil
+}
+
+// GroupCommittedTimestampFloor returns the local group's watermark only after
+// a ReadIndex fence proves this node is still that group's leader. It is the
+// server-side contract for remote TSO term initialization; callers must not
+// substitute a node-global or follower-local watermark.
+func (s *ShardStore) GroupCommittedTimestampFloor(ctx context.Context, groupID uint64) (uint64, error) {
+	if s == nil || groupID == 0 {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	group, ok := s.groups[groupID]
+	if !ok || group == nil || group.Store == nil {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"data group %d is not available on this node", groupID)
+	}
+	engine := engineForGroup(group)
+	if !isLeaderEngine(engine) {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"data group %d is not led by this node", groupID)
+	}
+	if _, err := linearizableReadEngineCtx(nonNilTSOContext(ctx), engine); err != nil {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"fence data group %d leader: %v", groupID, err)
+	}
+	return group.Store.LastCommitTS(), nil
+}
+
+func (s *ShardStore) parallelCommittedTimestampFloor(ctx context.Context, ids []uint64) (uint64, error) {
+	eg, egctx := errgroup.WithContext(nonNilTSOContext(ctx))
+	eg.SetLimit(min(len(ids), maxTSOCommitFloorConcurrency))
+	var mu sync.Mutex
+	var maxTS uint64
+	for _, groupID := range ids {
+		eg.Go(func() error {
+			ts, err := s.authoritativeGroupLastCommitTS(egctx, groupID, s.groups[groupID])
+			if err != nil {
+				return errors.Wrapf(err, "tso commit floor: group %d", groupID)
+			}
+			mu.Lock()
+			maxTS = max(maxTS, ts)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return maxTS, nil
+}
+
+func (s *ShardStore) authoritativeGroupLastCommitTS(ctx context.Context, groupID uint64, group *ShardGroup) (uint64, error) {
+	engine := engineForGroup(group)
+	if engine == nil {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"data group %d has no raft engine", groupID)
+	}
+	if isLeaderEngine(engine) {
+		if ts, err := s.GroupCommittedTimestampFloor(ctx, groupID); err == nil {
+			return ts, nil
+		}
+		// Leadership may have changed between State and ReadIndex. Resolve the
+		// newly published leader below instead of trusting the local watermark.
+	}
+	addr := leaderAddrFromEngine(engine)
+	if addr == "" {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"data group %d has no known leader", groupID)
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"dial data group %d leader %s: %v", groupID, addr, err)
+	}
+	requestCtx, cancel := context.WithTimeout(nonNilTSOContext(ctx), proxyForwardTimeout)
+	defer cancel()
+	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(requestCtx, &pb.RawLatestCommitTSRequest{GroupId: groupID})
+	if err != nil {
+		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
+			"read data group %d leader %s watermark: %v", groupID, addr, err)
+	}
+	if !resp.GetLeaderFenced() || resp.GetGroupId() != groupID {
+		return 0, errors.Wrapf(
+			stderrors.Join(ErrTSOCommitFloorUnavailable, ErrTSOProtocolUnsupported),
+			"data group %d leader %s returned unfenced watermark for group %d",
+			groupID, addr, resp.GetGroupId(),
+		)
+	}
+	return resp.GetTs(), nil
 }
 
 // LastAppliedIndex aggregates the durable applied-index across every

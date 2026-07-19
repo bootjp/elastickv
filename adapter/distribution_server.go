@@ -20,13 +20,14 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
-	mu          sync.Mutex
-	engine      *distribution.Engine
-	catalog     *distribution.CatalogStore
-	coordinator kv.Coordinator
-	readTracker *kv.ActiveTimestampTracker
-	fsObserver  DistributionFilesystemObserver
-	reloadRetry struct {
+	mu                 sync.Mutex
+	engine             *distribution.Engine
+	catalog            *distribution.CatalogStore
+	coordinator        kv.Coordinator
+	timestampAllocator kv.TSOAllocator
+	readTracker        *kv.ActiveTimestampTracker
+	fsObserver         DistributionFilesystemObserver
+	reloadRetry        struct {
 		attempts int
 		interval time.Duration
 	}
@@ -47,6 +48,15 @@ const DistributionFilePinnedHotspotSplitBoundary = "split_boundary"
 func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.coordinator = coordinator
+	}
+}
+
+// WithDistributionTimestampAllocator exposes the local dedicated TSO
+// allocator through GetTimestamp. The allocator itself rejects followers, so
+// clients can re-resolve the group-0 leader without a forwarding loop.
+func WithDistributionTimestampAllocator(allocator kv.TSOAllocator) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.timestampAllocator = allocator
 	}
 }
 
@@ -129,10 +139,121 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 	}, nil
 }
 
-// GetTimestamp returns monotonically increasing timestamp.
+// GetTimestamp returns the base of a consecutive timestamp window. When a
+// dedicated allocator is configured, only the local group-0 leader can serve
+// the request and the returned window is already durable in that Raft group.
 func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimestampRequest) (*pb.GetTimestampResponse, error) {
-	ts := s.engine.NextTimestamp()
-	return &pb.GetTimestampResponse{Timestamp: ts}, nil
+	count, minTimestamp, err := timestampRequestValues(req)
+	if err != nil {
+		return nil, err
+	}
+	activateCutover := req != nil && req.GetActivateCutover()
+	if s.timestampAllocator == nil {
+		if count != 1 || minTimestamp != 0 || activateCutover {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "dedicated TSO allocator is not configured"))
+		}
+		if s.engine == nil {
+			return nil, errors.WithStack(status.Error(codes.Unavailable, "distribution engine is not configured"))
+		}
+		return &pb.GetTimestampResponse{Timestamp: s.engine.NextTimestamp()}, nil
+	}
+
+	reservation, err := s.allocateTimestampReservation(ctx, count, minTimestamp, activateCutover)
+	if err != nil {
+		return nil, timestampRPCError(err)
+	}
+	if err := validateTimestampReservation(reservation, count, minTimestamp); err != nil {
+		return nil, errors.WithStack(status.Error(codes.Internal, err.Error()))
+	}
+	return &pb.GetTimestampResponse{
+		Timestamp:               reservation.Base,
+		CommittedByDedicatedTso: true,
+		Count:                   uint32(count), //nolint:gosec // count is bounded by MaxTSOBatchSize.
+		PreviousAllocationFloor: reservation.PreviousAllocationFloor,
+		CutoverActive:           reservation.CutoverActive,
+	}, nil
+}
+
+func (s *DistributionServer) allocateTimestampReservation(
+	ctx context.Context,
+	count int,
+	minTimestamp uint64,
+	activateCutover bool,
+) (kv.TSOReservation, error) {
+	if allocator, ok := s.timestampAllocator.(kv.TSOReservationAllocator); ok {
+		reservation, err := allocator.ReserveBatchAfter(ctx, count, minTimestamp, activateCutover)
+		return reservation, errors.Wrap(err, "reserve dedicated TSO window")
+	}
+	reservation := kv.TSOReservation{Count: count}
+	switch {
+	case activateCutover:
+		return reservation, errors.WithStack(status.Error(codes.FailedPrecondition,
+			"TSO allocator does not support durable cutover"))
+	case minTimestamp > 0:
+		return reservation, errors.WithStack(status.Error(codes.FailedPrecondition,
+			"TSO allocator does not support durable reservation metadata"))
+	default:
+		base, err := s.timestampAllocator.NextBatch(ctx, count)
+		reservation.Base = base
+		return reservation, errors.Wrap(err, "reserve TSO window")
+	}
+}
+
+func validateTimestampWindow(base uint64, count int, minTimestamp uint64) error {
+	if base == 0 || base <= minTimestamp {
+		return errors.Errorf("dedicated TSO returned base %d at or below minimum %d", base, minTimestamp)
+	}
+	size := uint64(count) //nolint:gosec // count is positive and bounded by timestampRequestValues.
+	if base > math.MaxUint64-(size-1) {
+		return errors.Errorf("dedicated TSO returned overflowing window base=%d count=%d", base, count)
+	}
+	return nil
+}
+
+func validateTimestampReservation(reservation kv.TSOReservation, count int, minTimestamp uint64) error {
+	if err := validateTimestampWindow(reservation.Base, count, minTimestamp); err != nil {
+		return err
+	}
+	if reservation.Count != count {
+		return errors.Errorf("dedicated TSO returned count %d, want %d", reservation.Count, count)
+	}
+	if reservation.PreviousAllocationFloor >= reservation.Base {
+		return errors.Errorf("dedicated TSO returned base %d at or below previous floor %d",
+			reservation.Base, reservation.PreviousAllocationFloor)
+	}
+	return nil
+}
+
+func timestampRequestValues(req *pb.GetTimestampRequest) (int, uint64, error) {
+	if req == nil {
+		return 1, 0, nil
+	}
+	count := req.GetCount()
+	if count == 0 {
+		count = 1
+	}
+	if count > uint32(kv.MaxTSOBatchSize) {
+		return 0, 0, status.Errorf(codes.InvalidArgument, "timestamp count %d exceeds maximum %d", count, kv.MaxTSOBatchSize)
+	}
+	return int(count), req.GetMinTimestamp(), nil
+}
+
+func timestampRPCError(err error) error {
+	if code := status.Code(err); code != codes.Unknown {
+		return err
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return errors.WithStack(status.Error(codes.Canceled, err.Error()))
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.WithStack(status.Error(codes.DeadlineExceeded, err.Error()))
+	case errors.Is(err, kv.ErrInvalidTSOBatchSize), errors.Is(err, kv.ErrTxnCommitTSRequired):
+		return errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
+	case errors.Is(err, kv.ErrTSONotLeader), errors.Is(err, kv.ErrLeaderNotFound):
+		return errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+	default:
+		return errors.WithStack(status.Error(codes.Unavailable, err.Error()))
+	}
 }
 
 // ListRoutes returns all durable routes from catalog storage.

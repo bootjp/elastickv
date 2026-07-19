@@ -64,11 +64,14 @@ message RawDeleteResponse {
 
 message RawLatestCommitTSRequest {
   bytes key = 1;
+  uint64 group_id = 2; // optional explicit group for leader-fenced watermark reads
 }
 
 message RawLatestCommitTSResponse {
   uint64 ts = 1;
   bool exists = 2;
+  uint64 group_id = 3; // echoes an explicit group watermark request
+  bool leader_fenced = 4; // true only after that group's leader ReadIndex fence
 }
 
 message RawScanAtRequest {
