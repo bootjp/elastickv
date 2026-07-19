@@ -86,12 +86,13 @@ type RouteSnapshot struct {
 // per the §8 failure-modes table, but the verdict separates them so
 // the operator-facing error message can name the precise reason.
 type CapabilityVerdict struct {
-	FullNodeID        uint64
-	EncryptionCapable bool
-	BuildSHA          string
-	SidecarPresent    bool
-	Reachable         bool
-	Err               error
+	FullNodeID               uint64
+	EncryptionCapable        bool
+	StorageEnvelopeV2Capable bool
+	BuildSHA                 string
+	SidecarPresent           bool
+	Reachable                bool
+	Err                      error
 }
 
 // CapabilityFanoutResult is the aggregated outcome. OK is true iff
@@ -105,6 +106,21 @@ type CapabilityVerdict struct {
 type CapabilityFanoutResult struct {
 	Verdicts []CapabilityVerdict
 	OK       bool
+}
+
+// StorageEnvelopeV2Ready reports whether every probed member can read V2
+// storage envelopes. Missing fields from an older binary decode as false, so
+// the transition stays fail-closed throughout a rolling upgrade.
+func (r CapabilityFanoutResult) StorageEnvelopeV2Ready() bool {
+	if len(r.Verdicts) == 0 {
+		return false
+	}
+	for _, verdict := range r.Verdicts {
+		if !verdict.Reachable || !verdict.EncryptionCapable || !verdict.StorageEnvelopeV2Capable {
+			return false
+		}
+	}
+	return true
 }
 
 // DialFunc opens a connection to one node's admin endpoint and
@@ -343,6 +359,7 @@ func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) Cap
 	}
 	verdict.Reachable = true
 	verdict.EncryptionCapable = report.GetEncryptionCapable()
+	verdict.StorageEnvelopeV2Capable = report.GetStorageEnvelopeV2Capable()
 	verdict.BuildSHA = report.GetBuildSha()
 	verdict.SidecarPresent = report.GetSidecarPresent()
 	if report.GetFullNodeId() != 0 {

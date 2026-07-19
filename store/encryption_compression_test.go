@@ -68,6 +68,47 @@ func TestEncryption_CompressesOnlyWhenSmaller(t *testing.T) {
 	}
 }
 
+func TestEncryption_StorageEnvelopeV2CapabilityGate(t *testing.T) {
+	t.Parallel()
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	if _, err := rand.Read(dek); err != nil {
+		t.Fatalf("rand.Read DEK: %v", err)
+	}
+	const keyID uint32 = 107
+	if err := ks.Set(keyID, dek); err != nil {
+		t.Fatalf("Keystore.Set: %v", err)
+	}
+	cipher, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	v2Active := false
+	s := &pebbleStore{
+		cipher:                  cipher,
+		nonceFactory:            NewCounterNonceFactory(0x0102, 0x0304),
+		activeStorageKeyID:      func() (uint32, bool) { return keyID, true },
+		storageEnvelopeV2Active: func() bool { return v2Active },
+	}
+	plaintext := bytes.Repeat([]byte("compressible"), 512)
+	pebbleKey := encodeKey([]byte("capability-gate"), 100)
+
+	body, _, err := s.encryptForKey(pebbleKey, plaintext, 0, false)
+	require.NoError(t, err)
+	env, err := encryption.DecodeEnvelope(body)
+	require.NoError(t, err)
+	require.Equal(t, encryption.EnvelopeVersionV1, env.Version)
+	require.Zero(t, env.Flag)
+
+	v2Active = true
+	body, _, err = s.encryptForKey(pebbleKey, plaintext, 0, false)
+	require.NoError(t, err)
+	env, err = encryption.DecodeEnvelope(body)
+	require.NoError(t, err)
+	require.Equal(t, encryption.EnvelopeVersionV2, env.Version)
+	require.Equal(t, encryption.FlagCompressed, env.Flag)
+}
+
 func TestEncryption_CompressionFlagTamperRejected(t *testing.T) {
 	t.Parallel()
 	f := newEncryptedStoreFixture(t, 102)

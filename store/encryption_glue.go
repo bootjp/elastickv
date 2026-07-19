@@ -160,6 +160,11 @@ type ActiveStorageKeyID func() (uint32, bool)
 // the design supports) would still decrypt old envelopes correctly.
 type StorageEnvelopeActive func() bool
 
+// StorageEnvelopeV2Active reports whether every current voter and learner can
+// read V2 storage envelopes. When wired and false, encrypted writes remain V1
+// and uncompressed so a rolling-upgrade peer can still read snapshots.
+type StorageEnvelopeV2Active func() bool
+
 // StorageRegistered reports whether this process load's §4.1 writer
 // registration has committed for the currently-active storage DEK
 // (Stage 7a-2). It gates only the DIRECT write path: when it returns
@@ -232,6 +237,19 @@ func WithStorageEnvelopeGate(active StorageEnvelopeActive) PebbleStoreOption {
 			return
 		}
 		s.storageEnvelopeActive = active
+	}
+}
+
+// WithStorageEnvelopeV2Gate prevents V2 writes until the cluster-wide
+// capability fan-out has observed support from every voter and learner.
+// Reads always accept both V1 and V2. A nil gate preserves the standalone
+// and test-fixture behavior from before capability negotiation was wired.
+func WithStorageEnvelopeV2Gate(active StorageEnvelopeV2Active) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		if active == nil {
+			return
+		}
+		s.storageEnvelopeV2Active = active
 	}
 }
 
@@ -355,7 +373,10 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 		return nil, 0, errors.Wrap(err, "store: nonce factory")
 	}
 	nonce := nonceArr[:]
-	payload, envelopeFlag := compressForEncryption(plaintext)
+	payload, envelopeFlag := plaintext, byte(0)
+	if s.storageEnvelopeV2Active == nil || s.storageEnvelopeV2Active() {
+		payload, envelopeFlag = compressForEncryption(plaintext)
+	}
 	envelopeVersion := encryption.EnvelopeVersionV1
 	if envelopeFlag&encryption.FlagCompressed != 0 {
 		envelopeVersion = encryption.EnvelopeVersionV2

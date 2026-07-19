@@ -371,12 +371,16 @@ func (s *EncryptionAdminServer) Validate() error {
 // case so the empty epoch never reaches the writer registry.
 func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*pb.CapabilityReport, error) {
 	if s.sidecarPath == "" {
-		return &pb.CapabilityReport{BuildSha: s.buildSHA}, nil
+		return &pb.CapabilityReport{
+			BuildSha:                 s.buildSHA,
+			StorageEnvelopeV2Capable: true,
+		}, nil
 	}
 	report := &pb.CapabilityReport{
-		EncryptionCapable: true,
-		BuildSha:          s.buildSHA,
-		FullNodeId:        s.fullNodeID,
+		EncryptionCapable:        true,
+		StorageEnvelopeV2Capable: true,
+		BuildSha:                 s.buildSHA,
+		FullNodeId:               s.fullNodeID,
 		// LocalEpoch stays at 0 until Stage 7 wires the §4.1
 		// writer-registry counter. The §5.6 step 1a pre-check
 		// happens before any DEK exists, so 0 is the correct

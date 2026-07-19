@@ -289,6 +289,11 @@ type pebbleStore struct {
 	// fixtures depend on that posture and the 6D-6 production wiring
 	// in main.go is what flips the gate on.
 	storageEnvelopeActive StorageEnvelopeActive
+	// storageEnvelopeV2Active is the rolling-upgrade reader-capability
+	// gate for compressed V2 envelopes. Production keeps it false until
+	// every voter and learner advertises V2 support. A nil closure keeps
+	// the pre-gate embedded/test behavior.
+	storageEnvelopeV2Active StorageEnvelopeV2Active
 	// storageRegistered is the Stage 7a-2 §4.1 registration gate. When
 	// wired, the DIRECT write path (PutAt / ExpireAt / ApplyMutations)
 	// refuses to emit an encrypted envelope — returning

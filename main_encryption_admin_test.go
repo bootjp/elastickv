@@ -112,6 +112,18 @@ func TestWriterRegistryForEncryptionAdminMissingDefaultGroup(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdminMutatorAuthorityOnlyDefaultGroup(t *testing.T) {
+	if encryptionAdminMutatorAuthority(true, 2, 1) {
+		t.Fatal("non-default group received encryption mutator authority")
+	}
+	if !encryptionAdminMutatorAuthority(true, 1, 1) {
+		t.Fatal("default group did not receive encryption mutator authority")
+	}
+	if encryptionAdminMutatorAuthority(false, 1, 1) {
+		t.Fatal("disabled encryption mutators received authority")
+	}
+}
+
 func TestRecoveryStateForEncryptionAdminUsesDefaultGroup(t *testing.T) {
 	defaultEngine := &stubEncryptionRecoveryEngine{applied: 41}
 	otherEngine := &stubEncryptionRecoveryEngine{applied: 99}

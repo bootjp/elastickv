@@ -119,8 +119,11 @@ type CapabilityReport struct {
 	SidecarPresent    bool                   `protobuf:"varint,3,opt,name=sidecar_present,json=sidecarPresent,proto3" json:"sidecar_present,omitempty"`
 	FullNodeId        uint64                 `protobuf:"varint,4,opt,name=full_node_id,json=fullNodeId,proto3" json:"full_node_id,omitempty"`
 	LocalEpoch        uint32                 `protobuf:"varint,5,opt,name=local_epoch,json=localEpoch,proto3" json:"local_epoch,omitempty"` // MUST be <= 0xFFFF on the wire.
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Old binaries omit this field and therefore decode as false. Writers must
+	// keep emitting V1 envelopes until every voter and learner reports true.
+	StorageEnvelopeV2Capable bool `protobuf:"varint,6,opt,name=storage_envelope_v2_capable,json=storageEnvelopeV2Capable,proto3" json:"storage_envelope_v2_capable,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *CapabilityReport) Reset() {
@@ -186,6 +189,13 @@ func (x *CapabilityReport) GetLocalEpoch() uint32 {
 		return x.LocalEpoch
 	}
 	return 0
+}
+
+func (x *CapabilityReport) GetStorageEnvelopeV2Capable() bool {
+	if x != nil {
+		return x.StorageEnvelopeV2Capable
+	}
+	return false
 }
 
 // SidecarStateReport is the §5.5 compaction-fallback RPC. Served on
@@ -1209,7 +1219,7 @@ var File_encryption_admin_proto protoreflect.FileDescriptor
 const file_encryption_admin_proto_rawDesc = "" +
 	"\n" +
 	"\x16encryption_admin.proto\"\a\n" +
-	"\x05Empty\"\xca\x01\n" +
+	"\x05Empty\"\x89\x02\n" +
 	"\x10CapabilityReport\x12-\n" +
 	"\x12encryption_capable\x18\x01 \x01(\bR\x11encryptionCapable\x12\x1b\n" +
 	"\tbuild_sha\x18\x02 \x01(\tR\bbuildSha\x12'\n" +
@@ -1217,7 +1227,8 @@ const file_encryption_admin_proto_rawDesc = "" +
 	"\ffull_node_id\x18\x04 \x01(\x04R\n" +
 	"fullNodeId\x12\x1f\n" +
 	"\vlocal_epoch\x18\x05 \x01(\rR\n" +
-	"localEpoch\"\xe5\x04\n" +
+	"localEpoch\x12=\n" +
+	"\x1bstorage_envelope_v2_capable\x18\x06 \x01(\bR\x18storageEnvelopeV2Capable\"\xe5\x04\n" +
 	"\x12SidecarStateReport\x12U\n" +
 	"\x12wrapped_deks_by_id\x18\x01 \x03(\v2(.SidecarStateReport.WrappedDeksByIdEntryR\x0fwrappedDeksById\x12*\n" +
 	"\x11active_storage_id\x18\x02 \x01(\rR\x0factiveStorageId\x12$\n" +

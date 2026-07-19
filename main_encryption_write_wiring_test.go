@@ -73,8 +73,8 @@ func TestEncryptionWriteWiring_PebbleOptions_WiredWhenCipherSet(t *testing.T) {
 		cipher:       cipher,
 		nonceFactory: encryption.NewDeterministicNonceFactory(0xABCD, 0),
 	}
-	if opts := w.pebbleOptions(); len(opts) != 3 {
-		t.Errorf("wired pebbleOptions = %d opts, want 3 (WithEncryption + WithStorageEnvelopeGate + WithStorageRegistrationGate)", len(opts))
+	if opts := w.pebbleOptions(); len(opts) != 4 {
+		t.Errorf("wired pebbleOptions = %d opts, want 4 (encryption + storage cutover + V2 capability + registration gates)", len(opts))
 	}
 }
 
@@ -240,14 +240,25 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	if w.raftEpoch != 1 {
 		t.Errorf("raft epoch = %d, want 1 (bumped from 0)", w.raftEpoch)
 	}
-	// WithEncryption + WithStorageEnvelopeGate + WithStorageRegistrationGate
-	// (Stage 7a-2 added the third).
-	if opts := w.pebbleOptions(); len(opts) != 3 {
-		t.Errorf("pebbleOptions = %d, want 3", len(opts))
+	// WithEncryption plus storage cutover, V2 capability, and registration gates.
+	if opts := w.pebbleOptions(); len(opts) != 4 {
+		t.Errorf("pebbleOptions = %d, want 4", len(opts))
 	}
+	assertStorageEnvelopeV2Activation(t, w)
 	// Cache must reflect the on-disk active DEK + cutover gate.
 	if id, ok := w.cache.ActiveStorageKeyID(); !ok || id != 3 {
 		t.Errorf("cache ActiveStorageKeyID = (%d, %v), want (3, true)", id, ok)
+	}
+}
+
+func assertStorageEnvelopeV2Activation(t *testing.T, w encryptionWriteWiring) {
+	t.Helper()
+	if w.storageEnvelopeV2WritesActive() {
+		t.Error("V2 writes started active before cluster capability confirmation")
+	}
+	w.activateStorageEnvelopeV2Writes()
+	if !w.storageEnvelopeV2WritesActive() {
+		t.Error("V2 writes remained inactive after capability confirmation")
 	}
 }
 

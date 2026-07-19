@@ -20,6 +20,8 @@ const stubDerivedNodeID uint64 = 0xCAFEF00DDEADBEEF
 
 func stubDeriveNodeID(string) uint64 { return stubDerivedNodeID }
 
+func allowStorageEnvelopeV2Capability(context.Context, string) error { return nil }
+
 // TestEncryptionPreRegister_PreBootstrapSkips pins design §5.2: when
 // the StateCache reports (0, false) — no active storage DEK, either
 // pre-bootstrap or encryption-disabled — PreAddMember returns nil
@@ -33,7 +35,7 @@ func TestEncryptionPreRegister_PreBootstrapSkips(t *testing.T) {
 	if pre == nil {
 		t.Fatal("newEncryptionPreRegister returned nil despite non-nil cache+group")
 	}
-	if err := pre.PreAddMember(context.Background(), "n1"); err != nil {
+	if err := pre.PreAddMember(context.Background(), "n1", "n1:50051"); err != nil {
 		t.Errorf("PreAddMember should skip pre-bootstrap: got %v", err)
 	}
 }
@@ -85,9 +87,45 @@ func TestEncryptionPreRegister_IdempotentWhenRowExists(t *testing.T) {
 	sc.Active.Storage = testRegDEKID
 	cache.RefreshFromSidecar(sc)
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID)
-	if err := pre.PreAddMember(context.Background(), "raftN"); err != nil {
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID, allowStorageEnvelopeV2Capability)
+	if err := pre.PreAddMember(context.Background(), "raftN", "raftN:50051"); err != nil {
 		t.Errorf("PreAddMember should skip when matching row exists: got %v", err)
+	}
+}
+
+func TestEncryptionPreRegister_RejectsMemberWithoutV2Capability(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	cache := encryption.NewStateCache()
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = testRegDEKID
+	cache.RefreshFromSidecar(sc)
+	sentinel := errors.New("old binary")
+	var probedAddress string
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st},
+		cache,
+		"",
+		stubDeriveNodeID,
+		func(_ context.Context, address string) error {
+			probedAddress = address
+			return sentinel
+		},
+	)
+	err := pre.PreAddMember(context.Background(), "old", "old:50051")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("PreAddMember error = %v, want capability error", err)
+	}
+	if probedAddress != "old:50051" {
+		t.Fatalf("capability probe address = %q, want old:50051", probedAddress)
+	}
+	reg, regErr := store.WriterRegistryFor(st)
+	if regErr != nil {
+		t.Fatalf("WriterRegistryFor: %v", regErr)
+	}
+	if _, ok, regErr := reg.GetRegistryRow(encryption.RegistryKey(testRegDEKID, encryption.NodeID16(stubDerivedNodeID))); regErr != nil || ok {
+		t.Fatalf("registry changed before capability acceptance: present=%t err=%v", ok, regErr)
 	}
 }
 
@@ -127,8 +165,8 @@ func TestEncryptionPreRegister_Uint16CollisionReturnsTypedError(t *testing.T) {
 	}
 	collidingDerive := func(string) uint64 { return collidingFullNodeID }
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", collidingDerive)
-	err = pre.PreAddMember(context.Background(), "raftN")
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", collidingDerive, allowStorageEnvelopeV2Capability)
+	err = pre.PreAddMember(context.Background(), "raftN", "raftN:50051")
 	if !errors.Is(err, encryption.ErrWriterUint16Collision) {
 		t.Errorf("PreAddMember on §6.1 collision: want ErrWriterUint16Collision, got %v", err)
 	}

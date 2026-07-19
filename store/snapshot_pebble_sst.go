@@ -94,6 +94,7 @@ type pebbleSSTExporter struct {
 	largest         []byte
 	fileIndex       int
 	targetFileBytes uint64
+	compression     *sstable.CompressionProfile
 }
 
 func resolveSSTIngestSnapshots(raw string) bool {
@@ -351,7 +352,7 @@ func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMet
 		return nil, err
 	}
 
-	manifest, err := exportPebbleSnapshotSSTs(db, exportDir, metadata, targetFileBytes)
+	manifest, err := exportPebbleSnapshotSSTs(db, exportDir, metadata, targetFileBytes, disableCompression)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -376,7 +377,7 @@ func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMet
 	return bundle, nil
 }
 
-func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64) (pebbleSSTIngestManifest, error) {
+func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64, disableCompression bool) (pebbleSSTIngestManifest, error) {
 	if targetFileBytes == 0 {
 		targetFileBytes = defaultSSTIngestTargetFileSize
 	}
@@ -384,6 +385,7 @@ func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSn
 		db:              db,
 		dir:             exportDir,
 		targetFileBytes: targetFileBytes,
+		compression:     sstExportCompression(disableCompression),
 		manifest: pebbleSSTIngestManifest{
 			Version:              sstIngestSnapshotVersion,
 			LastCommitTS:         metadata.LastCommitTS,
@@ -417,6 +419,13 @@ func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSn
 		return exporter.manifest, err
 	}
 	return exporter.manifest, nil
+}
+
+func sstExportCompression(disable bool) *sstable.CompressionProfile {
+	if disable {
+		return sstable.NoCompression
+	}
+	return nil
 }
 
 func (e *pebbleSSTExporter) Add(key, value []byte) error {
@@ -461,6 +470,7 @@ func (e *pebbleSSTExporter) startFile(firstKey []byte) error {
 	e.writer = sstable.NewWriter(objstorageprovider.NewFileWritable(file), sstable.WriterOptions{
 		Comparer:    pebble.DefaultComparer,
 		TableFormat: e.db.TableFormat(),
+		Compression: e.compression,
 	})
 	e.currentBytes = 0
 	e.smallest = bytes.Clone(firstKey)

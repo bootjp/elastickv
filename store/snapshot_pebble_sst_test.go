@@ -13,6 +13,7 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,6 +40,12 @@ func openSSTSnapshotTestStore(t *testing.T, dir string, opts ...PebbleStoreOptio
 		}
 	})
 	return store
+}
+
+func TestSSTExportCompressionPolicy(t *testing.T) {
+	t.Parallel()
+	require.Nil(t, sstExportCompression(false))
+	require.Same(t, sstable.NoCompression, sstExportCompression(true))
 }
 
 func withSSTIngestTargetFileBytesForTest(target uint64) PebbleStoreOption {

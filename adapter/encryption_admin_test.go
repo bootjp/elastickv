@@ -39,6 +39,9 @@ func TestEncryptionAdmin_GetCapability_NoSidecarPath(t *testing.T) {
 	if got.BuildSha != "test-sha" {
 		t.Errorf("BuildSha=%q, want %q", got.BuildSha, "test-sha")
 	}
+	if !got.StorageEnvelopeV2Capable {
+		t.Error("StorageEnvelopeV2Capable=false on a V2 reader binary")
+	}
 }
 
 func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
@@ -63,6 +66,9 @@ func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
 	}
 	if got.SidecarPresent {
 		t.Errorf("SidecarPresent=true, want false when sidecar file is missing")
+	}
+	if !got.StorageEnvelopeV2Capable {
+		t.Error("StorageEnvelopeV2Capable=false on a V2 reader binary")
 	}
 }
 

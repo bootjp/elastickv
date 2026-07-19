@@ -94,7 +94,7 @@ func (s *Server) AddVoter(ctx context.Context, req *pb.RaftAdminAddVoterRequest)
 	// row exists at apply time and any §6.1 uint16 collision halts here
 	// rather than after the conf-change is durable.
 	if s.interceptor != nil {
-		if err := s.interceptor.PreAddMember(ctx, req.Id); err != nil {
+		if err := s.interceptor.PreAddMember(ctx, req.Id, req.Address); err != nil {
 			return nil, adminError(err)
 		}
 	}
@@ -113,7 +113,7 @@ func (s *Server) AddLearner(ctx context.Context, req *pb.RaftAdminAddLearnerRequ
 		return nil, grpcStatus(codes.InvalidArgument, "id and address are required")
 	}
 	if s.interceptor != nil {
-		if err := s.interceptor.PreAddMember(ctx, req.Id); err != nil {
+		if err := s.interceptor.PreAddMember(ctx, req.Id, req.Address); err != nil {
 			return nil, adminError(err)
 		}
 	}

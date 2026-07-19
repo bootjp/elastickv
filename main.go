@@ -2640,9 +2640,11 @@ func startRaftServers(
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, encryptionCapabilityFanout, encWiring)
 	adminWriterRegistry := writerRegistryForEncryptionAdmin(runtimes, defaultGroup)
 	recoveryLeaderView, recoveryAppliedIndex := recoveryStateForEncryptionAdmin(runtimes, defaultGroup)
 	for _, rt := range runtimes {
+		mutatorAuthority := encryptionAdminMutatorAuthority(enableMutators, rt.spec.id, defaultGroup)
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
 		opts = append(opts, baseOpts...)
@@ -2698,18 +2700,23 @@ func startRaftServers(
 		// come from the default group that owns the shared sidecar and
 		// writer registry. ShardGroup.Proposer() supplies the wrap-aware
 		// post-cutover path for normal admin entries.
+		adminOpts := encryptionAdminOptionsForRuntime(
+			mutatorAuthority,
+			rt,
+			shardGroups,
+			adminWriterRegistry,
+			recoveryLeaderView,
+			recoveryAppliedIndex,
+			encWiring,
+		)
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
 			*encryptionSidecarPath,
-			enableMutators,
+			mutatorAuthority,
 			rt.engine,
 			encryptionCapabilityFanout,
-			adapter.WithEncryptionAdminWriterRegistry(adminWriterRegistry),
-			adapter.WithEncryptionAdminRecoveryLeaderView(recoveryLeaderView),
-			adapter.WithEncryptionAdminLatestAppliedIndex(recoveryAppliedIndex),
-			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
-			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+			adminOpts...,
 		)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
