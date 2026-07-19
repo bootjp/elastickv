@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"golang.org/x/sync/errgroup"
@@ -17,7 +18,11 @@ func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, groupCtx := errgroup.WithContext(ctx)
-	wiring := encryptionWriteWiring{storageEnvelopeV2Active: &atomic.Bool{}}
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = 1
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
 	var calls atomic.Int32
 	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
 		calls.Add(1)
@@ -38,6 +43,34 @@ func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("capability monitor calls = %d, want one sticky activation", got)
+	}
+}
+
+func TestStorageEnvelopeV2CapabilityMonitorWaitsForBootstrap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, groupCtx := errgroup.WithContext(ctx)
+	wiring := encryptionWriteWiring{
+		cache:                   encryption.NewStateCache(),
+		storageEnvelopeV2Active: &atomic.Bool{},
+	}
+	var calls atomic.Int32
+	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+		calls.Add(1)
+		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+		}}}, nil
+	}, wiring)
+	time.Sleep(20 * time.Millisecond)
+	if wiring.storageEnvelopeV2WritesActive() {
+		t.Fatal("capability monitor activated V2 writes before encryption bootstrap")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("capability fanout calls before bootstrap = %d, want zero", got)
+	}
+	cancel()
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("capability monitor: %v", err)
 	}
 }
 

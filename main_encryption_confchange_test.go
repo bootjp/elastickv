@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -20,23 +21,37 @@ const stubDerivedNodeID uint64 = 0xCAFEF00DDEADBEEF
 
 func stubDeriveNodeID(string) uint64 { return stubDerivedNodeID }
 
-func allowStorageEnvelopeV2Capability(context.Context, string) error { return nil }
+func allowStorageEnvelopeV2Capability(context.Context, string, uint64) error { return nil }
 
-// TestEncryptionPreRegister_PreBootstrapSkips pins design §5.2: when
-// the StateCache reports (0, false) — no active storage DEK, either
-// pre-bootstrap or encryption-disabled — PreAddMember returns nil
-// without proposing or reading the registry.
-func TestEncryptionPreRegister_PreBootstrapSkips(t *testing.T) {
+// TestEncryptionPreRegister_PreBootstrapProbesThenSkipsRegistry pins that
+// pre-bootstrap joins still prove V2 reader support before returning without
+// a registry proposal. This prevents a later sticky V2 latch from racing an
+// incompatible membership addition.
+func TestEncryptionPreRegister_PreBootstrapProbesThenSkipsRegistry(t *testing.T) {
 	t.Parallel()
 	cache := encryption.NewStateCache() // zero-value: ActiveStorageKeyID()=(0,false)
 	st := newRegistrationTestStore(t)
 	defaultGroup := &kv.ShardGroup{Store: st}
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, defaultGroup, cache, "", stubDeriveNodeID)
+	var probedFullNodeID uint64
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		defaultGroup,
+		cache,
+		"",
+		stubDeriveNodeID,
+		func(_ context.Context, _ string, fullNodeID uint64) error {
+			probedFullNodeID = fullNodeID
+			return nil
+		},
+	)
 	if pre == nil {
 		t.Fatal("newEncryptionPreRegister returned nil despite non-nil cache+group")
 	}
 	if err := pre.PreAddMember(context.Background(), "n1", "n1:50051"); err != nil {
-		t.Errorf("PreAddMember should skip pre-bootstrap: got %v", err)
+		t.Errorf("PreAddMember should skip registry work pre-bootstrap: got %v", err)
+	}
+	if probedFullNodeID != stubDerivedNodeID {
+		t.Fatalf("capability probe full node id = %d, want %d", probedFullNodeID, stubDerivedNodeID)
 	}
 }
 
@@ -108,8 +123,11 @@ func TestEncryptionPreRegister_RejectsMemberWithoutV2Capability(t *testing.T) {
 		cache,
 		"",
 		stubDeriveNodeID,
-		func(_ context.Context, address string) error {
+		func(_ context.Context, address string, fullNodeID uint64) error {
 			probedAddress = address
+			if fullNodeID != stubDerivedNodeID {
+				t.Fatalf("capability probe full node id = %d, want %d", fullNodeID, stubDerivedNodeID)
+			}
 			return sentinel
 		},
 	)
@@ -126,6 +144,48 @@ func TestEncryptionPreRegister_RejectsMemberWithoutV2Capability(t *testing.T) {
 	}
 	if _, ok, regErr := reg.GetRegistryRow(encryption.RegistryKey(testRegDEKID, encryption.NodeID16(stubDerivedNodeID))); regErr != nil || ok {
 		t.Fatalf("registry changed before capability acceptance: present=%t err=%v", ok, regErr)
+	}
+}
+
+func TestProbeStorageEnvelopeV2CapabilityTimesOut(t *testing.T) {
+	t.Parallel()
+	const timeout = 20 * time.Millisecond
+	started := time.Now()
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"unreachable:50051",
+		stubDerivedNodeID,
+		timeout,
+		func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capability probe error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("capability probe elapsed = %v, want bounded return", elapsed)
+	}
+}
+
+func TestProbeStorageEnvelopeV2CapabilityRejectsNodeIDMismatch(t *testing.T) {
+	t.Parallel()
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"other:50051",
+		stubDerivedNodeID,
+		time.Second,
+		func(context.Context, string) (*pb.CapabilityReport, error) {
+			return &pb.CapabilityReport{
+				FullNodeId:               stubDerivedNodeID + 1,
+				EncryptionCapable:        true,
+				StorageEnvelopeV2Capable: true,
+			}, nil
+		},
+	)
+	if !errors.Is(err, errMemberCapabilityIDMismatch) {
+		t.Fatalf("capability probe error = %v, want node id mismatch", err)
 	}
 }
 

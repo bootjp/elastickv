@@ -14,11 +14,13 @@ This milestone implements the compress-then-encrypt storage path from
 - `FlagCompressed` is authenticated as part of the envelope AAD.
 - Reads decompress only after GCM authentication succeeds.
 - V1 envelopes require `flag=0`; compressed values use envelope V2.
-- V2 writes remain disabled until every live voter and learner advertises the
-  V2 reader capability; absent fields from older binaries fail closed.
-- Once encryption is bootstrapped, AddVoter/AddLearner probes the target
-  endpoint and refuses members that do not advertise encryption and V2 reader
-  capability before proposing the membership change.
+- V2 writes remain disabled until encryption is bootstrapped and every live
+  voter and learner advertises the V2 reader capability; absent fields from
+  older binaries fail closed.
+- AddVoter/AddLearner probes the target endpoint before and after bootstrap,
+  bounds the probe to five seconds, and requires the reported full node ID to
+  match the requested Raft ID. A timeout, mismatch, or missing encryption/V2
+  reader capability is refused before proposing the membership change.
 - Unknown version/flag combinations fail closed.
 - The cleartext-rebadge guard verifies both valid compression-flag variants.
 - Pebble block compression is disabled for encryption-wired stores, including

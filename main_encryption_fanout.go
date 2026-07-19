@@ -59,7 +59,7 @@ func startStorageEnvelopeV2CapabilityMonitor(
 	capabilityFanout adapter.CapabilityFanoutFn,
 	wiring encryptionWriteWiring,
 ) {
-	if eg == nil || capabilityFanout == nil || wiring.storageEnvelopeV2Active == nil {
+	if eg == nil || capabilityFanout == nil || wiring.cache == nil || wiring.storageEnvelopeV2Active == nil {
 		return
 	}
 	eg.Go(func() error {
@@ -71,15 +71,29 @@ func startStorageEnvelopeV2CapabilityMonitor(
 				return nil
 			case <-timer.C:
 			}
-			result, err := capabilityFanout(ctx)
-			if err == nil && result.StorageEnvelopeV2Ready() {
-				wiring.activateStorageEnvelopeV2Writes()
-				slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation")
+			if tryActivateStorageEnvelopeV2Writes(ctx, capabilityFanout, wiring) {
 				return nil
 			}
 			timer.Reset(storageEnvelopeV2CapabilityRetryInterval)
 		}
 	})
+}
+
+func tryActivateStorageEnvelopeV2Writes(
+	ctx context.Context,
+	capabilityFanout adapter.CapabilityFanoutFn,
+	wiring encryptionWriteWiring,
+) bool {
+	if _, bootstrapped := wiring.cache.ActiveStorageKeyID(); !bootstrapped {
+		return false
+	}
+	result, err := capabilityFanout(ctx)
+	if err != nil || !result.StorageEnvelopeV2Ready() {
+		return false
+	}
+	wiring.activateStorageEnvelopeV2Writes()
+	slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation")
+	return true
 }
 
 // buildCapabilityFanoutFn assembles the adapter.CapabilityFanoutFn the

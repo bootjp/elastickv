@@ -4,6 +4,7 @@ import (
 	"context"
 	stderrors "errors"
 	"log/slog"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftadmin"
@@ -16,7 +17,10 @@ import (
 var (
 	errMemberNotEncryptionCapable = stderrors.New("member is not encryption capable")
 	errMemberNotStorageV2Capable  = stderrors.New("member does not support V2 storage envelopes")
+	errMemberCapabilityIDMismatch = stderrors.New("member capability node id does not match requested raft id")
 )
+
+const membershipCapabilityProbeTimeout = 5 * time.Second
 
 // encryptionPreRegister is the Stage 7c §3.1 encryption-aware
 // implementation of raftadmin.MembershipChangeInterceptor. It runs
@@ -46,7 +50,9 @@ type encryptionPreRegister struct {
 	capabilityProbe storageEnvelopeV2CapabilityProbe
 }
 
-type storageEnvelopeV2CapabilityProbe func(context.Context, string) error
+type storageEnvelopeV2CapabilityProbe func(context.Context, string, uint64) error
+
+type storageEnvelopeV2CapabilityRPC func(context.Context, string) (*pb.CapabilityReport, error)
 
 // newEncryptionPreRegister constructs the interceptor or returns nil
 // when encryption is not wired (no shared cache or no default
@@ -85,20 +91,20 @@ func newEncryptionPreRegister(
 // proposes RegisterEncryptionWriter(activeDEK, NodeID(raftID), 0)
 // and surfaces the propose result.
 func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID, address string) error {
-	activeDEK, ok := e.cache.ActiveStorageKeyID()
-	if !ok {
-		// Pre-bootstrap cluster: there is no registry to gate on.
-		// (Encryption-enabled but not yet bootstrapped, or
-		// encryption-disabled with an empty cache.)
-		return nil
-	}
 	if e.capabilityProbe == nil {
 		return errors.New("encryption: membership V2 capability probe is not configured")
 	}
-	if err := e.capabilityProbe(ctx, address); err != nil {
+	newNodeFullID := e.deriveNodeID(raftID)
+	if err := e.capabilityProbe(ctx, address, newNodeFullID); err != nil {
 		return errors.Wrap(err, "encryption: refuse member before V2 capability confirmation")
 	}
-	newNodeFullID := e.deriveNodeID(raftID)
+	activeDEK, ok := e.cache.ActiveStorageKeyID()
+	if !ok {
+		// Pre-bootstrap clusters have no registry row to create, but the
+		// capability probe above still prevents a future V2 latch from
+		// racing an incompatible membership addition.
+		return nil
+	}
 	if err := e.preRegisterDEK(ctx, activeDEK, newNodeFullID, "storage"); err != nil {
 		return err
 	}
@@ -112,23 +118,49 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID, addres
 	return e.preRegisterDEK(ctx, raftDEK, newNodeFullID, "raft")
 }
 
-func probeStorageEnvelopeV2Capability(ctx context.Context, address string) error {
+func probeStorageEnvelopeV2Capability(ctx context.Context, address string, expectedFullNodeID uint64) error {
+	return probeStorageEnvelopeV2CapabilityWithRPC(
+		ctx,
+		address,
+		expectedFullNodeID,
+		membershipCapabilityProbeTimeout,
+		getStorageEnvelopeV2Capability,
+	)
+}
+
+func probeStorageEnvelopeV2CapabilityWithRPC(
+	ctx context.Context,
+	address string,
+	expectedFullNodeID uint64,
+	timeout time.Duration,
+	rpc storageEnvelopeV2CapabilityRPC,
+) error {
 	if address == "" {
 		return errors.New("encryption: member address is empty")
 	}
-	connCache := &kv.GRPCConnCache{}
-	defer func() {
-		if err := connCache.Close(); err != nil {
-			slog.Warn("encryption: failed to close membership capability connection", slog.String("error", err.Error()))
-		}
-	}()
-	conn, err := connCache.ConnFor(address)
-	if err != nil {
-		return errors.Wrapf(err, "dial member %s", address)
+	if timeout <= 0 {
+		return errors.New("encryption: membership capability probe timeout must be positive")
 	}
-	report, err := pb.NewEncryptionAdminClient(conn).GetCapability(ctx, &pb.Empty{})
+	if rpc == nil {
+		return errors.New("encryption: membership capability RPC is not configured")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	report, err := rpc(probeCtx, address)
 	if err != nil {
 		return errors.Wrapf(err, "GetCapability member %s", address)
+	}
+	if report == nil {
+		return errors.Errorf("GetCapability member %s returned a nil report", address)
+	}
+	if report.GetFullNodeId() != expectedFullNodeID {
+		return errors.Wrapf(
+			errMemberCapabilityIDMismatch,
+			"member %s reported full_node_id=%d, want %d",
+			address,
+			report.GetFullNodeId(),
+			expectedFullNodeID,
+		)
 	}
 	if !report.GetEncryptionCapable() {
 		return errors.Wrapf(errMemberNotEncryptionCapable, "member %s", address)
@@ -137,6 +169,24 @@ func probeStorageEnvelopeV2Capability(ctx context.Context, address string) error
 		return errors.Wrapf(errMemberNotStorageV2Capable, "member %s", address)
 	}
 	return nil
+}
+
+func getStorageEnvelopeV2Capability(ctx context.Context, address string) (*pb.CapabilityReport, error) {
+	connCache := &kv.GRPCConnCache{}
+	defer func() {
+		if err := connCache.Close(); err != nil {
+			slog.Warn("encryption: failed to close membership capability connection", slog.String("error", err.Error()))
+		}
+	}()
+	conn, err := connCache.ConnFor(address)
+	if err != nil {
+		return nil, errors.Wrapf(err, "dial member %s", address)
+	}
+	report, err := pb.NewEncryptionAdminClient(conn).GetCapability(ctx, &pb.Empty{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetCapability member %s", address)
+	}
+	return report, nil
 }
 
 func (e *encryptionPreRegister) activeRaftDEKForPreRegister() (uint32, bool, error) {
