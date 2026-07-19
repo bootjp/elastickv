@@ -11,6 +11,10 @@ import (
 
 const defaultTSOLeaderPollInterval = 25 * time.Millisecond
 
+// MaxTSOBatchSize is the largest consecutive timestamp window accepted by a
+// TSO allocator or the Distribution.GetTimestamp RPC.
+const MaxTSOBatchSize = maxHLCBatchSize
+
 var (
 	ErrTSOAllocatorRequired = errors.New("tso: allocator is required")
 	ErrTSOCoordinatorNil    = errors.New("tso: coordinator is required")
@@ -32,6 +36,12 @@ type TSOAllocator interface {
 // narrow lets production use a batched TSO while tests can inject a tiny fake.
 type TimestampAllocator interface {
 	Next(ctx context.Context) (uint64, error)
+}
+
+// TimestampAllocatorProvider lets coordinator decorators preserve access to
+// the configured allocator without making the decorator itself an allocator.
+type TimestampAllocatorProvider interface {
+	TimestampAllocator() TimestampAllocator
 }
 
 type TimestampAfterAllocator interface {
@@ -91,7 +101,13 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 	return nextTimestampAfterObserved(ctx, coord, clock, startTS, label)
 }
 
-func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {
+// TimestampAllocatorThrough returns the allocator configured behind a
+// coordinator or coordinator decorator.
+func TimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(TimestampAllocatorProvider); ok {
+		alloc := provider.TimestampAllocator()
+		return alloc, alloc != nil
+	}
 	switch c := coord.(type) {
 	case *Coordinate:
 		if c != nil && c.tsAllocator != nil {
@@ -107,6 +123,10 @@ func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool)
 		alloc, ok := coord.(TimestampAllocator)
 		return alloc, ok
 	}
+}
+
+func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {
+	return TimestampAllocatorThrough(coord)
 }
 
 func nextTimestampFromAllocator(ctx context.Context, alloc TimestampAllocator, label string) (uint64, error) {

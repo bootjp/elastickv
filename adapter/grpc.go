@@ -52,6 +52,10 @@ type rawGroupKeyScanner interface {
 	ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error)
 }
 
+type rawGroupCommitFloorReader interface {
+	GroupCommittedTimestampFloor(ctx context.Context, groupID uint64) (uint64, error)
+}
+
 func WithCloseStore() GRPCServerOption {
 	return func(s *GRPCServer) {
 		s.closeStore = true
@@ -133,6 +137,23 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 }
 
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	if groupID := req.GetGroupId(); groupID != 0 {
+		reader, ok := r.store.(rawGroupCommitFloorReader)
+		if !ok {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition,
+				"group watermark requires a group-aware store"))
+		}
+		ts, err := reader.GroupCommittedTimestampFloor(ctx, groupID)
+		if err != nil {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+		}
+		return &pb.RawLatestCommitTSResponse{
+			Ts:           ts,
+			Exists:       ts > 0,
+			GroupId:      groupID,
+			LeaderFenced: true,
+		}, nil
+	}
 	key := req.GetKey()
 	if len(key) == 0 {
 		// No key: return the store's global last-committed watermark.
@@ -166,7 +187,6 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if readTS == 0 {
 		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
-
 	if req.GetKeysOnly() {
 		keys, err := r.rawScanKeysAt(ctx, req, limit, readTS)
 		if err != nil {
@@ -179,7 +199,6 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if err != nil {
 		return rawScanErrorResponse(err)
 	}
-
 	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
 }
 

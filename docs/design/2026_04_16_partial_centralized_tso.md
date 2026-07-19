@@ -1,9 +1,10 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
-  bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
-  the minimal TSO-only FSM and runtime group-0 wiring are implemented, while
-  follower redirect/admin exposure and shadow validation remain open
+- Status: Partial — M1-M6 are implemented, including the dedicated group-0
+  FSM, leader-routed durable windows, strict term bootstrap, serialized shadow
+  migration, and the one-way rolling cutover marker. M7 legacy cleanup and
+  cross-shard SSI timestamp validation remain open; runtime config reload and
+  production latency/alerting work also remain open.
 - Author: bootjp
 - Date: 2026-04-16
 - Updated: 2026-07-18
@@ -41,10 +42,9 @@ Implemented:
    bridge, and the all-led-group HLC renewal loop keeps its ceiling warm
    alongside data groups. Adding only group 0 to an existing single-data-group
    deployment keeps the data group on its legacy `base/raftID` directory while
-   isolating group 0 under `base/raftID/group-0`. The current `--tsoEnabled`
-   bridge still issues timestamps from the locally led data shard through
-   `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
-   until the TSO-leader redirect path exists.
+   isolating group 0 under `base/raftID/group-0`. When group 0 is present,
+   `--tsoEnabled` now routes issuance to its current leader; without group 0,
+   the flag preserves the earlier local/default-group compatibility bridge.
 9. `TSOStateMachine` implements the dedicated-group FSM contract: it accepts
    HLC lease entries and explicit allocation-floor entries, halt-fails invalid
    entries, snapshots/restores TSO-owned ceiling/floor state, and classifies
@@ -60,13 +60,52 @@ Implemented:
     unwired and return `FailedPrecondition`. During upgrade replay, valid
     encryption control entries committed by the earlier compatibility FSM are
     decoded and deterministically rejected without halting the TSO apply loop;
-    malformed control entries still halt fail-closed.
+   malformed control entries still halt fail-closed.
+11. `RaftTSOAllocator` verifies group-0 leadership and commits every returned
+    window's inclusive end before exposing it. On the first request of every
+    leader term it obtains a strict, leader-fenced maximum `LastCommitTS` from
+    every data group; failure to reach any authoritative group leader blocks
+    issuance rather than falling back to a stale replica watermark. Remote
+    watermark requests carry the explicit data-group ID, and the receiving
+    node revalidates local leadership with a linearizable ReadIndex before
+    returning that group's store watermark, so dialing a recently-demoted
+    leader cannot satisfy the fence with stale local state. The response echoes
+    the group ID and carries an explicit leader-fenced marker; a legacy server
+    that ignores the request field is rejected fail-closed. The allocator also
+    revalidates the same group-0 term after the remote floor/cutover work and
+    after committing the allocation floor. A term change may leak a committed
+    window, but that window is never returned and its floor prevents reuse.
+12. `LeaderRoutedTSOAllocator` serves the local group-0 leader directly and
+    redirects followers through `Distribution.GetTimestamp`. The response
+    carries an explicit durable-TSO marker and echoed count, so a new client
+    rejects a rolling-upgrade response from a legacy server that ignored the
+    batch/minimum request fields.
+13. `--tsoShadowEnabled` serializes each legacy candidate through group 0
+    before returning it. The response includes the allocation floor that
+    preceded the reservation. A candidate at or below that floor is discarded,
+    the local HLC observes the newer reservation, and allocation retries. TSO
+    unavailability fails the write closed because an unmirrored legacy value
+    cannot establish cutover readiness.
+14. The group-0 FSM persists a one-way production cutover marker. The first
+    `--tsoEnabled` refill commits that marker before its window. Nodes still in
+    shadow mode observe the marker in their next reservation response and
+    return the TSO value instead of a legacy candidate, preserving safety
+    during a rolling flag transition. Routed responses are also observed into
+    the local legacy HLC so the fallback clock never moves backward. On
+    restart, the restored marker takes precedence over startup flags: a node
+    started with neither mode flag, or with only `--tsoShadowEnabled`, installs
+    production group-0 routing instead of re-entering legacy or shadow
+    issuance. The marker uses a versioned TSO envelope with the same legacy
+    fail-closed prefix as allocation-floor entries and a distinct magic, so an
+    old or misrouted data FSM halts while encryption bytes cannot activate it.
 
 Remaining:
 
-1. Add follower redirect/admin exposure for the dedicated TSO leader.
-2. Add Phase B shadow-read validation before making dedicated TSO the only
-   production timestamp path.
+1. M7 Phase-D removal of per-shard renewal/legacy issuance after the migration
+   compatibility window closes.
+2. Cross-shard SSI read-timestamp validation through the dedicated TSO.
+3. Runtime config reload for the mode switch; current flags are startup-only.
+4. Production benchmark, divergence metrics, and alert thresholds.
 
 ### 1.1 Original Limitation
 
@@ -531,7 +570,10 @@ New TSO leader elected via Raft
   ├─ FSM.Restore() or Raft log replay
   │    → physicalCeiling restored to the last committed value
   │
-  └─ HLC.Next() uses max(now, physicalCeiling)
+  ├─ strict read of every data-group leader LastCommitTS
+  │    → failure blocks issuance
+  │
+  └─ HLC.Next() uses max(now, physicalCeiling, global commit floor)
        → new leader issues timestamps strictly above the old leader's window ✅
 ```
 
@@ -632,7 +674,7 @@ Migrating from the current per-shard ceiling model to a centralized TSO must
 not interrupt writes or violate timestamp monotonicity. The following phased
 approach enables a live cutover.
 
-### 7.1 Phase A — Dual-Write Bridge (no cutover risk)
+### 7.1 Phase A — Group-0 Warm-up (no read cutover)
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -641,32 +683,47 @@ approach enables a live cutover.
 │  startTS = legacyHLC.Next()  (existing path, unchanged)   │
 │                                                            │
 │  RunHLCLeaseRenewal():                                     │
-│    ├─ propose to all shard groups (M1 fix, Section 6)      │
-│    └─ also propose to TSO group (new, write-only)          │
-│       ↳ TSO FSM advances its ceiling in parallel           │
+│    └─ each local Raft leader proposes to the groups it leads│
+│       ↳ the group-0 leader warms the TSO FSM ceiling       │
 └──────────────────────────────────────────────────────────┘
 ```
 
 - The TSO group receives ceiling proposals but **no reads are served from it**.
 - This allows TSO FSM state to warm up and be validated in production before
   the cutover.
-- Rollback: stop proposing to the TSO group; no state change on data path.
+- These independent proposals do **not** prove that the TSO ceiling is greater
+  than every data-group ceiling. Phase A is warm-up only; Phase B provides the
+  issuance-level serialization required for a safe transition.
+- Rollback: remove group 0 before entering Phase B; no timestamp path changed.
 
-### 7.2 Phase B — Shadow Read Validation
+### 7.2 Phase B — Serialized Shadow Migration
 
-- Both `legacyHLC.Next()` and `tso.Next()` are called per transaction.
-- Results are compared in a shadow log; divergences are alerted but the legacy
-  value is used.
-- This phase validates that the TSO ceiling is always ≥ the legacy ceiling.
+- Every node must run `--tsoShadowEnabled` before any node enables cutover.
+- A legacy candidate is sent to the TSO leader as `min_timestamp`. Under the
+  group-0 allocator mutex, the leader samples the preceding durable allocation
+  floor, reserves and commits a timestamp above the candidate, and returns both.
+- If the candidate is at or below the preceding floor, it may overlap an older
+  TSO/shadow reservation and is discarded. The caller observes the newer TSO
+  value into its HLC and retries; only a candidate proven above the preceding
+  floor is returned to the legacy write path.
+- Shadow RPC/proposal failure fails timestamp issuance closed. A fail-open
+  shadow cannot prove the migration invariant and is therefore not eligible
+  for production cutover.
 
-### 7.3 Phase C — TSO Cutover (feature flag)
+### 7.3 Phase C — Durable TSO Cutover
 
-- A runtime feature flag (`tso.enabled`) switches `startTS` to `tso.Next()`.
-- The flag can be toggled per-node via config reload (no process restart).
-- Because the TSO ceiling was kept ≥ the legacy ceiling throughout Phase A/B,
-  there is no timestamp regression at the moment of cutover.
-- Rollback: flip the flag back; the legacy HLC has been monotonically advancing
-  in parallel so it remains safe to resume.
+- The startup flag `--tsoEnabled` switches coordinator issuance to the
+  leader-routed allocator. Runtime config reload remains future work.
+- The first production refill commits the group-0 cutover marker before
+  committing and returning its timestamp window.
+- The marker is encoded in a versioned TSO-specific envelope whose leading
+  reserved byte remains fail-closed on pre-TSO and data-group FSMs.
+- A node still running Phase B receives `cutover_active=true` on its next
+  shadow reservation and returns the reserved TSO timestamp. Therefore a
+  rolling restart does not keep issuing legacy values after the marker.
+- The marker is intentionally one-way. Before it commits, rollback means
+  returning every node to Phase B. After it commits, rollback must preserve the
+  TSO path; clearing it requires a separate cluster-wide quiescence protocol.
 
 ### 7.4 Phase D — Legacy Cleanup
 
@@ -676,15 +733,17 @@ approach enables a live cutover.
 
 ### 7.5 Monotonicity Invariant Across Phases
 
-At every phase boundary, the following invariant must hold:
+At every Phase-B/C issuance boundary, the following invariant must hold:
 
 ```
-tso_ceiling ≥ max(ceiling committed by any shard group leader)
+returned_legacy_ts > previous_tso_allocation_floor
+new_tso_allocation_floor >= returned_legacy_ts
 ```
 
-This is enforced by Phase A's dual-write: every ceiling update that reaches
-a shard group also reaches the TSO group, so the TSO ceiling is always at
-least as large as the maximum shard ceiling.
+Both comparisons occur in one group-0-serialized reservation before the legacy
+candidate is returned. Once the cutover marker applies, shadow callers stop
+returning legacy candidates. Independently, every new TSO leader term fences
+its first window above the strict maximum committed data timestamp.
 
 ---
 
@@ -693,12 +752,12 @@ least as large as the maximum shard ceiling.
 | Phase | Scope | Priority |
 |-------|-------|----------|
 | M1 — shipped | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
-| M2 — shipped for reserved group 0 | Phase A dual-write bridge: when group 0 is configured, all-led HLC renewal also proposes ceiling updates to it while shard range validation prevents user data routes to group 0 (Section 7.1) | High |
+| M2 — shipped | Reserve group 0, keep its ceiling warm as a pre-migration compatibility step, and prevent user-data routes from entering the control group (Section 7.1). This warm-up alone is not a cutover proof. | High |
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
-| M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable, warmed by the HLC renewal bridge, and runs the minimal `TSOStateMachine` without an MVCC store; TSO-leader redirect/admin exposure and TSO-leader-only timestamp issuance remain open | Low |
-| M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
+| M5 — shipped | Preserve the default-group `LocalTSOAllocator` compatibility bridge when group 0 is absent; route coordinator-owned timestamp call sites through the allocator abstraction. | Medium |
+| M6 — shipped | Run the dedicated group-0 FSM, fence each new TSO leader term above all authoritative data-group commit floors, redirect follower requests to the TSO leader over gRPC, synchronously serialize fail-closed shadow issuance, and commit the one-way rolling cutover marker before production windows. | Low |
+| M7 — open | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---
 
@@ -714,9 +773,9 @@ least as large as the maximum shard ceiling.
    stricter form (`ceiling + 1`) guarantees no overlap even if wall clocks
    drift, at the cost of one extra millisecond per renewal window.
 
-4. **Non-leader TSO requests:** Should follower nodes redirect to the TSO
-   leader via gRPC, or support follower reads with a known-safe timestamp
-   bound?
+4. **Non-leader TSO requests (resolved):** Followers redirect to the current
+   group-0 leader through `Distribution.GetTimestamp`. Timestamp allocation is
+   a consensus write, so follower reads cannot replace the leader proposal.
 
 5. **Backward compatibility (resolved for group 0):** Existing group-0 Raft
    logs already carry compatible HLC lease entries. `TSOStateMachine.Restore`

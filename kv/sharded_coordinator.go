@@ -24,7 +24,11 @@ type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
-	lease  leaseState
+	// TSOState is set only for reserved group 0. Keeping the applied floor and
+	// cutover marker next to the group's engine lets the leader allocator read
+	// consensus-owned state without treating the shared HLC mirror as durable.
+	TSOState *TSOStateMachine
+	lease    leaseState
 	// lp caches the Engine's optional LeaseProvider capability so the
 	// groupLeaseRead / maybeRefresh hot paths test a single field for
 	// nil instead of performing an interface type assertion per call.

@@ -399,6 +399,7 @@ func (x *RawDeleteResponse) GetSuccess() bool {
 type RawLatestCommitTSRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	GroupId       uint64                 `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit group for leader-fenced watermark reads
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -440,10 +441,19 @@ func (x *RawLatestCommitTSRequest) GetKey() []byte {
 	return nil
 }
 
+func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
 type RawLatestCommitTSResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ts            uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
 	Exists        bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
+	GroupId       uint64                 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
+	LeaderFenced  bool                   `protobuf:"varint,4,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -488,6 +498,20 @@ func (x *RawLatestCommitTSResponse) GetTs() uint64 {
 func (x *RawLatestCommitTSResponse) GetExists() bool {
 	if x != nil {
 		return x.Exists
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSResponse) GetLeaderFenced() bool {
+	if x != nil {
+		return x.LeaderFenced
 	}
 	return false
 }
@@ -2282,12 +2306,15 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\",\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"G\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\"C\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\x04R\agroupId\"\x83\x01\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xc0\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\x12\x19\n" +
+	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x12#\n" +
+	"\rleader_fenced\x18\x04 \x01(\bR\fleaderFenced\"\xc0\x01\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +

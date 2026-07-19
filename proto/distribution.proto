@@ -21,10 +21,33 @@ message GetRouteResponse {
   uint64 raft_group_id = 3;
 }
 
-message GetTimestampRequest {}
+message GetTimestampRequest {
+  // Count requests a consecutive timestamp window and defaults to one.
+  uint32 count = 1;
+  // MinTimestamp requires the returned window base to be strictly greater
+  // than this value. It lets commit timestamp callers preserve startTS <
+  // commitTS across a follower-to-TSO-leader RPC.
+  uint64 min_timestamp = 2;
+  // ActivateCutover durably switches the dedicated TSO group into production
+  // issuance. Once committed, shadow clients return TSO timestamps instead of
+  // legacy HLC candidates, so a rolling cutover cannot reintroduce them.
+  bool activate_cutover = 3;
+}
 
 message GetTimestampResponse {
   uint64 timestamp = 1;
+  // CommittedByDedicatedTSO distinguishes a durable TSO window from the
+  // legacy catalog timestamp response during rolling upgrades.
+  bool committed_by_dedicated_tso = 2;
+  // Count echoes the number of consecutive timestamps reserved at timestamp.
+  uint32 count = 3;
+  // PreviousAllocationFloor is the highest timestamp already reserved before
+  // this request. Shadow validation uses it to reject legacy candidates that
+  // overlap any earlier dedicated or shadow reservation.
+  uint64 previous_allocation_floor = 4;
+  // CutoverActive reports the durable group-0 cutover marker after applying
+  // this request. Shadow nodes switch to the returned TSO timestamp when true.
+  bool cutover_active = 5;
 }
 
 enum RouteState {

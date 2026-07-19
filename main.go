@@ -124,8 +124,9 @@ var (
 	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
 	raftJoinMembers                 = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
 	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
-	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Issue coordinator-owned persistence timestamps through the local TSO batch allocator instead of direct HLC calls")
-	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used when --tsoEnabled is true")
+	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Commit the one-way cutover marker and issue coordinator-owned persistence timestamps through the dedicated TSO leader when group 0 is configured")
+	tsoShadowEnabled                = flag.Bool("tsoShadowEnabled", false, "Serialize legacy HLC issuance through the dedicated TSO; fail closed on TSO errors and switch to TSO values after cutover")
+	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
 	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", defaultLeaderBalanceGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
@@ -513,9 +514,11 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate); err != nil {
+	tsoWiring, err := configureCoordinatorTSO(coordinate, shardGroups, shardStore)
+	if err != nil {
 		return err
 	}
+	cleanup.Add(tsoWiring.CloseWithLog)
 
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
@@ -562,6 +565,7 @@ func run() error {
 		cfg.engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
+		adapter.WithDistributionTimestampAllocator(tsoWiring.serverAllocator),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
@@ -1503,10 +1507,10 @@ func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {
 
 // buildDedicatedTSOGroup constructs group 0 with the minimal TSO state machine.
 // It intentionally does not open an MVCC store: shard routing validation keeps
-// user data out of group 0, while the state machine persists only its ceiling
-// and allocation floor in Raft snapshots. The ShardGroup still receives the
-// normal proposer wrapper so lease renewals participate in raft-envelope
-// cutovers exactly like data-group proposals.
+// user data out of group 0, while the state machine persists its ceiling,
+// allocation floor, and one-way cutover marker in Raft snapshots. The
+// ShardGroup still receives the normal proposer wrapper so lease renewals
+// participate in raft-envelope cutovers exactly like data-group proposals.
 func buildDedicatedTSOGroup(
 	raftID string,
 	group groupSpec,
@@ -1528,7 +1532,7 @@ func buildDedicatedTSOGroup(
 	if err != nil {
 		return nil, nil, err
 	}
-	sg := &kv.ShardGroup{Engine: runtime.engine}
+	sg := &kv.ShardGroup{Engine: runtime.engine, TSOState: sm}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
 }
@@ -2054,22 +2058,134 @@ func configurationContainsMember(configuration raftengine.Configuration, localID
 	return false
 }
 
-func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
-	if !*tsoEnabled {
+type coordinatorTSOWiring struct {
+	serverAllocator kv.TSOAllocator
+	routedAllocator *kv.LeaderRoutedTSOAllocator
+	shadowAllocator *kv.ShadowTimestampAllocator
+}
+
+func (w coordinatorTSOWiring) Close() error {
+	if w.shadowAllocator != nil {
+		if err := w.shadowAllocator.Close(); err != nil {
+			return errors.Wrap(err, "close TSO shadow validator")
+		}
+	}
+	if w.routedAllocator == nil {
 		return nil
 	}
-	// Group 0 is reserved for TSO state, but data-shard leaders must keep
-	// issuing timestamps locally until a TSO-leader redirect path exists.
-	tso, err := kv.NewLocalTSOAllocator(coordinate)
-	if err != nil {
-		return errors.Wrap(err, "configure tso allocator")
+	return errors.Wrap(w.routedAllocator.Close(), "close TSO leader routing")
+}
+
+func (w coordinatorTSOWiring) CloseWithLog() {
+	if err := w.Close(); err != nil {
+		slog.Warn("failed to close TSO routing connections", slog.Any("err", err))
 	}
-	batch, err := kv.NewBatchAllocator(tso, *tsoBatchSize)
+}
+
+func configureCoordinatorTSO(
+	coordinate *kv.ShardedCoordinator,
+	shardGroups map[uint64]*kv.ShardGroup,
+	floorProviders ...kv.TSOCutoverFloorProvider,
+) (coordinatorTSOWiring, error) {
+	var wiring coordinatorTSOWiring
+	if coordinate == nil {
+		return wiring, errors.Wrap(kv.ErrTSOCoordinatorNil, "configure tso allocator")
+	}
+	if *tsoEnabled && *tsoShadowEnabled {
+		return wiring, errors.New("--tsoEnabled and --tsoShadowEnabled are mutually exclusive")
+	}
+
+	tsoGroup, dedicated := shardGroups[dedicatedTSORaftGroupID]
+	if !dedicated {
+		return configureLegacyCoordinatorTSO(coordinate)
+	}
+	var floorProvider kv.TSOCutoverFloorProvider
+	if len(floorProviders) > 0 {
+		floorProvider = floorProviders[0]
+	}
+	return configureDedicatedCoordinatorTSO(coordinate, tsoGroup, floorProvider)
+}
+
+func configureLegacyCoordinatorTSO(coordinate *kv.ShardedCoordinator) (coordinatorTSOWiring, error) {
+	var wiring coordinatorTSOWiring
+	if *tsoShadowEnabled {
+		return wiring, errors.Wrap(kv.ErrTSOGroupRequired, "configure tso shadow allocator")
+	}
+	if !*tsoEnabled {
+		return wiring, nil
+	}
+	// Preserve the pre-group-0 bridge for deployments that enable TSO
+	// batching before adding the dedicated group.
+	local, err := kv.NewLocalTSOAllocator(coordinate)
 	if err != nil {
-		return errors.Wrap(err, "configure tso batch allocator")
+		return wiring, errors.Wrap(err, "configure local tso bridge")
+	}
+	batch, err := kv.NewBatchAllocator(local, *tsoBatchSize)
+	if err != nil {
+		return wiring, errors.Wrap(err, "configure local tso bridge batch")
 	}
 	coordinate.WithTSOAllocator(batch)
-	return nil
+	return wiring, nil
+}
+
+func configureDedicatedCoordinatorTSO(
+	coordinate *kv.ShardedCoordinator,
+	tsoGroup *kv.ShardGroup,
+	floorProvider kv.TSOCutoverFloorProvider,
+) (coordinatorTSOWiring, error) {
+	var wiring coordinatorTSOWiring
+	local, err := kv.NewRaftTSOAllocator(
+		tsoGroup,
+		coordinate.Clock(),
+		kv.WithTSOCutoverFloorProvider(floorProvider),
+	)
+	if err != nil {
+		return wiring, errors.Wrap(err, "configure dedicated tso allocator")
+	}
+	wiring.serverAllocator = local
+	cutoverActive := tsoGroup.TSOState.CutoverActive()
+	if !*tsoEnabled && !*tsoShadowEnabled && !cutoverActive {
+		return wiring, nil
+	}
+
+	routedOpts := []kv.LeaderRoutedTSOAllocatorOption{
+		kv.WithTSORoutedClock(coordinate.Clock()),
+	}
+	if *tsoEnabled {
+		routedOpts = append(routedOpts, kv.WithTSOCutoverActivation())
+	}
+	routed, err := kv.NewLeaderRoutedTSOAllocator(local, tsoGroup.Engine, routedOpts...)
+	if err != nil {
+		return wiring, errors.Wrap(err, "configure tso leader routing")
+	}
+	wiring.routedAllocator = routed
+	coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
+	return installDedicatedCoordinatorTSO(coordinate, wiring, routed, cutoverActive)
+}
+
+func installDedicatedCoordinatorTSO(
+	coordinate *kv.ShardedCoordinator,
+	wiring coordinatorTSOWiring,
+	routed *kv.LeaderRoutedTSOAllocator,
+	cutoverActive bool,
+) (coordinatorTSOWiring, error) {
+	if *tsoShadowEnabled && !cutoverActive {
+		shadow, err := kv.NewShadowTimestampAllocator(coordinate.Clock(), routed, slog.Default())
+		if err != nil {
+			_ = wiring.Close()
+			return coordinatorTSOWiring{}, errors.Wrap(err, "configure tso shadow allocator")
+		}
+		wiring.shadowAllocator = shadow
+		coordinate.WithTSOAllocator(shadow)
+		return wiring, nil
+	}
+	batch, err := kv.NewBatchAllocator(routed, *tsoBatchSize)
+	if err != nil {
+		_ = wiring.Close()
+		return coordinatorTSOWiring{}, errors.Wrap(err, "configure tso batch allocator")
+	}
+	coordinate.WithTSOAllocator(batch)
+	return wiring, nil
 }
 
 type hlcLeaseRenewalBlocker interface {
@@ -2215,6 +2331,7 @@ var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2253,6 +2370,11 @@ func (c startupGatedCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c startupGatedCoordinator) Clock() *kv.HLC {
 	return c.inner.Clock()
+}
+
+func (c startupGatedCoordinator) TimestampAllocator() kv.TimestampAllocator {
+	alloc, _ := kv.TimestampAllocatorThrough(c.inner)
+	return alloc
 }
 
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
@@ -2659,7 +2781,7 @@ func startRaftServers(
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
-	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+	if alloc, ok := kv.TimestampAllocatorThrough(coordinate); ok {
 		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
 	}
 	return nil

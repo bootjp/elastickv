@@ -157,6 +157,29 @@ func TestTSOStateMachineRejectsBareEncryptionReservedAllocationFloor(t *testing.
 	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
 }
 
+func TestTSOStateMachineAppliesOneWayCutoverMarker(t *testing.T) {
+	t.Parallel()
+
+	fsm := NewTSOStateMachine(NewHLC())
+	require.False(t, fsm.CutoverActive())
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	require.True(t, fsm.CutoverActive())
+	require.Nil(t, fsm.Apply(marshalTSOCutover()), "cutover replay must be idempotent")
+
+	err := requireTSOHaltError(t, fsm.Apply(append([]byte(tsoCutoverEnvelope), 1)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+}
+
+func TestTSOStateMachineRejectsInvalidCutoverSnapshotByte(t *testing.T) {
+	t.Parallel()
+
+	payload := make([]byte, tsoSnapshotV3Len)
+	payload[tsoSnapshotV2Len] = 2
+	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader(payload))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "invalid cutover byte")
+}
+
 func TestTSOStateMachineNilHLCDoesNotPanic(t *testing.T) {
 	t.Parallel()
 
@@ -173,6 +196,7 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	require.Nil(t, source.Apply(marshalHLCLeaseRenew(ceilingMs)))
 	floor := tsoLeaseAllocationFloor(ceilingMs)
 	require.Nil(t, source.Apply(marshalTSOAllocationFloor(floor)))
+	require.Nil(t, source.Apply(marshalTSOCutover()))
 
 	snap, err := source.Snapshot()
 	require.NoError(t, err)
@@ -181,14 +205,15 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	n, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
-	require.EqualValues(t, tsoSnapshotV2Len, n)
-	require.Len(t, buf.Bytes(), tsoSnapshotV2Len)
+	require.EqualValues(t, tsoSnapshotV3Len, n)
+	require.Len(t, buf.Bytes(), tsoSnapshotV3Len)
 
 	targetHLC := NewHLC()
 	target := NewTSOStateMachine(targetHLC)
 	require.NoError(t, target.Restore(bytes.NewReader(buf.Bytes())))
 	require.Equal(t, ceilingMs, targetHLC.PhysicalCeiling())
 	require.Equal(t, floor, targetHLC.Current())
+	require.True(t, target.CutoverActive())
 }
 
 func TestTSOStateMachineSnapshotUsesTSOOwnedCeiling(t *testing.T) {
@@ -274,9 +299,9 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 	var snapBuf bytes.Buffer
 	n, err := snap.WriteTo(&snapBuf)
 	require.NoError(t, err)
-	require.EqualValues(t, tsoSnapshotV2Len, n)
+	require.EqualValues(t, tsoSnapshotV3Len, n)
 	require.Equal(t, uint64(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[:hlcLeasePayloadLen]))
-	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[hlcLeasePayloadLen:]))
+	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[hlcLeasePayloadLen:tsoSnapshotV2Len]))
 }
 
 func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
@@ -313,9 +338,10 @@ func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
 			var payload bytes.Buffer
 			_, err = got.WriteTo(&payload)
 			require.NoError(t, err)
-			require.Len(t, payload.Bytes(), tsoSnapshotV2Len)
+			require.Len(t, payload.Bytes(), tsoSnapshotV3Len)
 			require.Equal(t, uint64(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[:hlcLeasePayloadLen]))
-			require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[hlcLeasePayloadLen:]))
+			require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[hlcLeasePayloadLen:tsoSnapshotV2Len]))
+			require.Zero(t, payload.Bytes()[tsoSnapshotV2Len])
 		})
 	}
 }
@@ -326,8 +352,10 @@ func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {
 	fsm := NewTSOStateMachine(NewHLC())
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalHLCLeaseRenew(1_700_000_123_456)))
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOAllocationFloor(1)))
+	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOCutover()))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeHLCLease}))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte(tsoAllocationFloorEnvelope)))
+	require.False(t, fsm.IsVolatileOnlyPayload(append([]byte(tsoCutoverEnvelope), 1)))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeSingle}))
 }
 
