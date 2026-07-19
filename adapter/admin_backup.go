@@ -39,6 +39,7 @@ const (
 	defaultLiveBackupRenewAttempts        = 3
 	defaultLiveBackupRenewBackoff         = 500 * time.Millisecond
 	backupAppliedPollInterval             = 10 * time.Millisecond
+	defaultLiveBackupMaxActivePins        = 4
 )
 
 var (
@@ -83,6 +84,7 @@ type AdminBackupConfig struct {
 	BeginDeadline           time.Duration
 	SnapshotHeadroomEntries uint64
 	ScanPageSize            int
+	MaxActivePins           int
 	RenewAttempts           int
 	RenewBackoff            time.Duration
 }
@@ -94,6 +96,7 @@ type backupConfig struct {
 	beginDeadline           time.Duration
 	snapshotHeadroomEntries uint64
 	scanPageSize            int
+	maxActivePins           int
 	renewAttempts           int
 	renewBackoff            time.Duration
 }
@@ -106,6 +109,7 @@ func defaultBackupConfig() backupConfig {
 		beginDeadline:           defaultLiveBackupBeginDeadline,
 		snapshotHeadroomEntries: defaultLiveBackupHeadroom,
 		scanPageSize:            defaultLiveBackupScanPageSize,
+		maxActivePins:           defaultLiveBackupMaxActivePins,
 		renewAttempts:           defaultLiveBackupRenewAttempts,
 		renewBackoff:            defaultLiveBackupRenewBackoff,
 	}
@@ -150,6 +154,9 @@ func WithAdminBackupConfig(cfg AdminBackupConfig) AdminOption {
 		}
 		if cfg.ScanPageSize > 0 {
 			s.backupConfig.scanPageSize = cfg.ScanPageSize
+		}
+		if cfg.MaxActivePins > 0 {
+			s.backupConfig.maxActivePins = cfg.MaxActivePins
 		}
 		if cfg.RenewAttempts > 0 {
 			s.backupConfig.renewAttempts = cfg.RenewAttempts
@@ -245,11 +252,12 @@ func (s *AdminServer) BeginBackup(ctx context.Context, req *pb.BeginBackupReques
 	s.rememberBackupSession(tok, prepared.routes)
 
 	return &pb.BeginBackupResponse{
-		ReadTs:         prepared.readTS,
-		PinToken:       encodedToken,
-		TtlMsEffective: uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
-		Shards:         backupShardResponses(prepared.groups, prepared.commits),
-		ExpectedKeys:   backupExpectedResponses(counts, appliedAtCount),
+		ReadTs:              prepared.readTS,
+		PinToken:            encodedToken,
+		TtlMsEffective:      uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
+		Shards:              backupShardResponses(prepared.groups, prepared.commits),
+		ExpectedKeys:        backupExpectedResponses(counts, appliedAtCount),
+		MaxActiveBackupPins: uint32(s.backupConfig.maxActivePins), //nolint:gosec // startup validation requires a positive int.
 	}, nil
 }
 

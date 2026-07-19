@@ -463,7 +463,7 @@ P2:
 - `2026_04_29_implemented_snapshot_logical_decoder.md` — Phase 0 format
   owner; Phase 0a (decoder), Phase 0b (encoder), and Phase 0c
   operator integration are shipped.
-- `2026_04_29_proposed_logical_backup.md` — Phase 1 (live PIT
+- `2026_04_29_implemented_logical_backup.md` — Phase 1 (live PIT
   extraction); produces the same directory format this encoder reads.
 - `2026_04_14_implemented_etcd_snapshot_disk_offload.md` — the `.fsm`
   / `.snap` EKVT token format the restore runbook seeds.

@@ -186,6 +186,7 @@ message BeginBackupResponse {
   uint64 ttl_ms_effective = 3;
   repeated BackupShardApplied shards = 4;
   repeated BackupExpectedKeys expected_keys = 5;
+  uint32 max_active_backup_pins = 6;
 }
 
 message RenewBackupRequest {

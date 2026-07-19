@@ -25,6 +25,10 @@ const (
 	DDBTableGenPrefix  = "!ddb|meta|gen|"
 	DDBItemPrefix      = "!ddb|item|"
 	DDBGSIPrefix       = "!ddb|gsi|"
+
+	defaultDDBBundleSizeBytes = 64 << 20
+	ddbUnbundledWarnItems     = 1_000_000
+	ddbGenerationSlots        = 2
 )
 
 // Stored value magic prefixes. Mirror adapter/dynamodb_storage_codec.go:15-16.
@@ -38,9 +42,10 @@ var (
 // ErrDDBInvalidSchema, ErrDDBInvalidItem, ErrDDBMalformedKey are the
 // typed error classes for this encoder. Surface via errors.Is.
 var (
-	ErrDDBInvalidSchema = errors.New("backup: invalid !ddb|meta|table value")
-	ErrDDBInvalidItem   = errors.New("backup: invalid !ddb|item value")
-	ErrDDBMalformedKey  = errors.New("backup: malformed DynamoDB key")
+	ErrDDBInvalidSchema      = errors.New("backup: invalid !ddb|meta|table value")
+	ErrDDBInvalidItem        = errors.New("backup: invalid !ddb|item value")
+	ErrDDBMalformedKey       = errors.New("backup: malformed DynamoDB key")
+	ErrDDBBundleItemTooLarge = errors.New("backup: DynamoDB JSONL item exceeds bundle size")
 )
 
 // DDBEncoder encodes the DynamoDB prefix family into the per-table layout
@@ -59,6 +64,7 @@ var (
 type DDBEncoder struct {
 	outRoot     string
 	bundleJSONL bool
+	bundleSize  int64
 
 	tables map[string]*ddbTableState
 
@@ -82,8 +88,9 @@ func ensureItemsByGen(m map[uint64][]*pb.DynamoItem) map[uint64][]*pb.DynamoItem
 // NewDDBEncoder constructs an encoder rooted at <outRoot>/dynamodb/.
 func NewDDBEncoder(outRoot string) *DDBEncoder {
 	return &DDBEncoder{
-		outRoot: outRoot,
-		tables:  make(map[string]*ddbTableState),
+		outRoot:    outRoot,
+		bundleSize: defaultDDBBundleSizeBytes,
+		tables:     make(map[string]*ddbTableState),
 	}
 }
 
@@ -91,12 +98,17 @@ func NewDDBEncoder(outRoot string) *DDBEncoder {
 // (one item per line). Default is per-item files. The choice is recorded
 // in MANIFEST.json (`dynamodb_layout`) by the master pipeline; the
 // encoder itself only needs the flag to pick the on-disk shape.
-//
-// Bundle mode is a follow-up: this PR ships per-item only. Calling
-// WithBundleJSONL(true) returns an error from Finalize until the bundle
-// path lands.
 func (d *DDBEncoder) WithBundleJSONL(on bool) *DDBEncoder {
 	d.bundleJSONL = on
+	return d
+}
+
+// WithBundleSizeBytes sets the maximum size of one data-<part>.jsonl file.
+// Zero keeps the 64 MiB default.
+func (d *DDBEncoder) WithBundleSizeBytes(size int64) *DDBEncoder {
+	if size > 0 {
+		d.bundleSize = size
+	}
 	return d
 }
 
@@ -184,9 +196,6 @@ func (d *DDBEncoder) HandleTableGen(_, _ []byte) error { return nil }
 // immediately rather than being attributed to a later table (Gemini
 // MEDIUM #182).
 func (d *DDBEncoder) Finalize() error {
-	if d.bundleJSONL {
-		return errors.New("backup: dynamodb_layout=jsonl not implemented in this PR")
-	}
 	for _, st := range d.tables {
 		if st.schema == nil {
 			d.emitWarn("ddb_orphan_items",
@@ -232,27 +241,142 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	// authoritative one (the live code prefers it on read). We emit
 	// migration-source first, then active gen LAST, so writeFileAtomic's
 	// tmp+rename leaves the active-gen content on disk per (pk,sk).
-	emitOrder := []uint64{}
+	emitOrder := ddbGenerationEmitOrder(activeGen, migrationSourceGen)
+	d.warnStaleGenerationItems(st, emitOrder)
+	items, err := effectiveDDBItems(st.itemsByGen, emitOrder, hashKey, rangeKey)
+	if err != nil {
+		return err
+	}
+	return d.writeEffectiveDDBItems(itemsDir, st.name, hashKey, rangeKey, items)
+}
+
+func ddbGenerationEmitOrder(activeGen, migrationSourceGen uint64) []uint64 {
+	emitOrder := make([]uint64, 0, ddbGenerationSlots)
 	if migrationSourceGen != 0 && migrationSourceGen != activeGen {
 		emitOrder = append(emitOrder, migrationSourceGen)
 	}
-	emitOrder = append(emitOrder, activeGen)
+	return append(emitOrder, activeGen)
+}
+
+func (d *DDBEncoder) warnStaleGenerationItems(st *ddbTableState, emitOrder []uint64) {
 	if stale := totalStaleItemsExcluding(st.itemsByGen, emitOrder); stale > 0 {
 		d.emitWarn("ddb_stale_generation_items",
 			"table", st.name,
-			"active_generation", activeGen,
-			"migration_source_generation", migrationSourceGen,
+			"active_generation", st.schema.GetGeneration(),
+			"migration_source_generation", st.schema.GetMigratingFromGeneration(),
 			"stale_count", stale,
 			"hint", "stale-gen rows excluded; restore would otherwise emit them under the new schema")
 	}
-	for _, gen := range emitOrder {
-		for _, item := range st.itemsByGen[gen] {
-			if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
-				return err
-			}
+}
+
+func (d *DDBEncoder) writeEffectiveDDBItems(
+	itemsDir string,
+	tableName string,
+	hashKey string,
+	rangeKey string,
+	items []*pb.DynamoItem,
+) error {
+	if d.bundleJSONL {
+		return writeDDBJSONLBundles(itemsDir, items, d.bundleSize)
+	}
+	if len(items) > ddbUnbundledWarnItems {
+		d.emitWarn("ddb_unbundled_large_scope", "table", tableName, "items", len(items))
+	}
+	for _, item := range items {
+		if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func effectiveDDBItems(
+	itemsByGen map[uint64][]*pb.DynamoItem,
+	emitOrder []uint64,
+	hashKey string,
+	rangeKey string,
+) ([]*pb.DynamoItem, error) {
+	byKey := make(map[string]*pb.DynamoItem)
+	for _, gen := range emitOrder {
+		for _, item := range itemsByGen[gen] {
+			key, err := ddbItemIdentity(hashKey, rangeKey, item)
+			if err != nil {
+				return nil, err
+			}
+			byKey[key] = item
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for key := range byKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]*pb.DynamoItem, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, byKey[key])
+	}
+	return out, nil
+}
+
+func ddbItemIdentity(hashKey, rangeKey string, item *pb.DynamoItem) (string, error) {
+	attrs := item.GetAttributes()
+	hashVal, ok := attrs[hashKey]
+	if !ok {
+		return "", errors.Wrapf(ErrDDBInvalidItem, "item missing hash-key attribute %q", hashKey)
+	}
+	hashSegment, err := ddbKeyAttrToSegment(hashVal)
+	if err != nil {
+		return "", err
+	}
+	if rangeKey == "" {
+		return hashSegment, nil
+	}
+	rangeVal, ok := attrs[rangeKey]
+	if !ok {
+		return "", errors.Wrapf(ErrDDBInvalidItem, "item missing range-key attribute %q", rangeKey)
+	}
+	rangeSegment, err := ddbKeyAttrToSegment(rangeVal)
+	if err != nil {
+		return "", err
+	}
+	return hashSegment + "\x00" + rangeSegment, nil
+}
+
+func writeDDBJSONLBundles(itemsDir string, items []*pb.DynamoItem, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return errors.New("backup: DynamoDB JSONL bundle size must be positive")
+	}
+	part := 1
+	var body []byte
+	flush := func() error {
+		if len(body) == 0 {
+			return nil
+		}
+		path := filepath.Join(itemsDir, fmt.Sprintf("data-%05d.jsonl", part))
+		if err := writeFileAtomic(path, body); err != nil {
+			return err
+		}
+		part++
+		body = body[:0]
+		return nil
+	}
+	for _, item := range items {
+		line, err := json.Marshal(itemToPublic(item))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		line = append(line, '\n')
+		if int64(len(line)) > maxBytes {
+			return errors.Wrapf(ErrDDBBundleItemTooLarge, "item line is %d bytes, bundle limit is %d", len(line), maxBytes)
+		}
+		if int64(len(body)+len(line)) > maxBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		body = append(body, line...)
+	}
+	return flush()
 }
 
 func totalStaleItemsExcluding(m map[uint64][]*pb.DynamoItem, included []uint64) int {

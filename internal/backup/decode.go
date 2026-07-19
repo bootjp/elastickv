@@ -87,6 +87,8 @@ type DecodeOptions struct {
 	// DynamoDBBundleJSONL switches the DynamoDB encoder to the JSONL
 	// bundle layout (`items/data-<part>.jsonl`).
 	DynamoDBBundleJSONL bool
+	// DynamoDBBundleSizeBytes caps each JSONL part. Zero uses 64 MiB.
+	DynamoDBBundleSizeBytes int64
 
 	// WarnSink, when non-nil, receives structured warnings from the
 	// per-adapter encoders ("redis_orphan_ttl", "ddb_orphan_items",
@@ -188,10 +190,14 @@ func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
 	if opts.OutRoot == "" {
 		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "OutRoot required")
 	}
+	if opts.DynamoDBBundleSizeBytes < 0 {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "DynamoDBBundleSizeBytes must not be negative")
+	}
 	d := &dispatcher{opts: opts}
 	if opts.Adapters.DynamoDB {
 		d.ddb = NewDDBEncoder(opts.OutRoot).
 			WithBundleJSONL(opts.DynamoDBBundleJSONL).
+			WithBundleSizeBytes(opts.DynamoDBBundleSizeBytes).
 			WithWarnSink(opts.WarnSink)
 	}
 	if opts.Adapters.S3 {

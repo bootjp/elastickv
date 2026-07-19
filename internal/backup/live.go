@@ -17,9 +17,16 @@ type Scope struct {
 	Name    string
 }
 
+const (
+	adapterDynamoDB = "dynamodb"
+	adapterS3       = "s3"
+	adapterRedis    = "redis"
+	adapterSQS      = "sqs"
+)
+
 func (s Scope) ID() string {
-	if s.Adapter == "redis" {
-		return "redis/" + s.Name
+	if s.Adapter == adapterRedis {
+		return adapterRedis + "/" + s.Name
 	}
 	return s.Adapter + "/" + s.Name
 }
@@ -46,7 +53,7 @@ func ScopeForKey(key []byte) (Scope, bool, error) {
 	):
 		return scopeForSQSKey(key)
 	case isRedisBackupKey(key):
-		return Scope{Adapter: "redis", Name: "db_0"}, true, nil
+		return Scope{Adapter: adapterRedis, Name: "db_0"}, true, nil
 	default:
 		return Scope{}, false, nil
 	}

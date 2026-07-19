@@ -1290,14 +1290,15 @@ func (x *BeginBackupRequest) GetTtlMs() uint64 {
 }
 
 type BeginBackupResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	ReadTs         uint64                 `protobuf:"varint,1,opt,name=read_ts,json=readTs,proto3" json:"read_ts,omitempty"`
-	PinToken       []byte                 `protobuf:"bytes,2,opt,name=pin_token,json=pinToken,proto3" json:"pin_token,omitempty"`
-	TtlMsEffective uint64                 `protobuf:"varint,3,opt,name=ttl_ms_effective,json=ttlMsEffective,proto3" json:"ttl_ms_effective,omitempty"`
-	Shards         []*BackupShardApplied  `protobuf:"bytes,4,rep,name=shards,proto3" json:"shards,omitempty"`
-	ExpectedKeys   []*BackupExpectedKeys  `protobuf:"bytes,5,rep,name=expected_keys,json=expectedKeys,proto3" json:"expected_keys,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	ReadTs              uint64                 `protobuf:"varint,1,opt,name=read_ts,json=readTs,proto3" json:"read_ts,omitempty"`
+	PinToken            []byte                 `protobuf:"bytes,2,opt,name=pin_token,json=pinToken,proto3" json:"pin_token,omitempty"`
+	TtlMsEffective      uint64                 `protobuf:"varint,3,opt,name=ttl_ms_effective,json=ttlMsEffective,proto3" json:"ttl_ms_effective,omitempty"`
+	Shards              []*BackupShardApplied  `protobuf:"bytes,4,rep,name=shards,proto3" json:"shards,omitempty"`
+	ExpectedKeys        []*BackupExpectedKeys  `protobuf:"bytes,5,rep,name=expected_keys,json=expectedKeys,proto3" json:"expected_keys,omitempty"`
+	MaxActiveBackupPins uint32                 `protobuf:"varint,6,opt,name=max_active_backup_pins,json=maxActiveBackupPins,proto3" json:"max_active_backup_pins,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *BeginBackupResponse) Reset() {
@@ -1363,6 +1364,13 @@ func (x *BeginBackupResponse) GetExpectedKeys() []*BackupExpectedKeys {
 		return x.ExpectedKeys
 	}
 	return nil
+}
+
+func (x *BeginBackupResponse) GetMaxActiveBackupPins() uint32 {
+	if x != nil {
+		return x.MaxActiveBackupPins
+	}
+	return 0
 }
 
 type RenewBackupRequest struct {
@@ -2230,13 +2238,14 @@ const file_admin_proto_rawDesc = "" +
 	"\tkey_count\x18\x03 \x01(\x04R\bkeyCount\x123\n" +
 	"\x16applied_index_at_count\x18\x04 \x01(\x04R\x13appliedIndexAtCount\"+\n" +
 	"\x12BeginBackupRequest\x12\x15\n" +
-	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\"\xdc\x01\n" +
+	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\"\x91\x02\n" +
 	"\x13BeginBackupResponse\x12\x17\n" +
 	"\aread_ts\x18\x01 \x01(\x04R\x06readTs\x12\x1b\n" +
 	"\tpin_token\x18\x02 \x01(\fR\bpinToken\x12(\n" +
 	"\x10ttl_ms_effective\x18\x03 \x01(\x04R\x0ettlMsEffective\x12+\n" +
 	"\x06shards\x18\x04 \x03(\v2\x13.BackupShardAppliedR\x06shards\x128\n" +
-	"\rexpected_keys\x18\x05 \x03(\v2\x13.BackupExpectedKeysR\fexpectedKeys\"H\n" +
+	"\rexpected_keys\x18\x05 \x03(\v2\x13.BackupExpectedKeysR\fexpectedKeys\x123\n" +
+	"\x16max_active_backup_pins\x18\x06 \x01(\rR\x13maxActiveBackupPins\"H\n" +
 	"\x12RenewBackupRequest\x12\x1b\n" +
 	"\tpin_token\x18\x01 \x01(\fR\bpinToken\x12\x15\n" +
 	"\x06ttl_ms\x18\x02 \x01(\x04R\x05ttlMs\"\\\n" +
