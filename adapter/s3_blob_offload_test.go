@@ -28,6 +28,7 @@ func TestS3BlobOffloadEnvCanEnableGate(t *testing.T) {
 	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
 
 	require.True(t, server.blobOffloadEnabled)
+	require.False(t, server.blobOffloadGCReady)
 }
 
 func TestS3BlobOffloadDecisionFailsClosed(t *testing.T) {
@@ -48,7 +49,27 @@ func TestS3BlobOffloadDecisionFailsClosed(t *testing.T) {
 	require.Equal(t, s3BlobOffloadReasonCapabilityMissing, decision.reason)
 }
 
-func TestS3BlobOffloadDecisionRefusesUntilDataPathIsEnabled(t *testing.T) {
+func TestS3BlobOffloadDecisionEnablesImplementedDataPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(
+		nil,
+		"",
+		st,
+		newLocalAdapterCoordinator(st),
+		nil,
+		WithS3BlobOffloadEnabled(true),
+		WithS3BlobOffloadCapabilityChecker(alwaysS3BlobOffloadCapable{}),
+		withS3BlobOffloadGCReadyForTest(),
+	)
+
+	decision := server.s3BlobOffloadDecision(context.Background())
+	require.Equal(t, s3BlobOffloadModeOffload, decision.mode)
+	require.Equal(t, s3BlobOffloadReasonEnabled, decision.reason)
+}
+
+func TestS3BlobOffloadDecisionFailsClosedWithoutGC(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
@@ -64,7 +85,7 @@ func TestS3BlobOffloadDecisionRefusesUntilDataPathIsEnabled(t *testing.T) {
 
 	decision := server.s3BlobOffloadDecision(context.Background())
 	require.Equal(t, s3BlobOffloadModeLegacy, decision.mode)
-	require.Equal(t, s3BlobOffloadReasonDataPathDisabled, decision.reason)
+	require.Equal(t, s3BlobOffloadReasonGCNotReady, decision.reason)
 }
 
 func TestS3Server_PutObjectBlobOffloadFlagFallsBackToLegacyWithoutCapability(t *testing.T) {
@@ -111,16 +132,33 @@ func (alwaysS3BlobOffloadCapable) AllPeersSupportS3BlobOffload(context.Context) 
 	return true
 }
 
+func withS3BlobOffloadGCReadyForTest() S3ServerOption {
+	return func(server *S3Server) {
+		if server != nil {
+			server.blobOffloadGCReady = true
+		}
+	}
+}
+
 type recordingS3BlobOffloadObserver struct {
-	decisions []s3BlobOffloadDecision
+	decisions           []s3BlobOffloadDecision
+	replicationDegraded int
+	shaMismatch         int
+	unrecoverable       int
 }
 
 func (o *recordingS3BlobOffloadObserver) ObserveS3BlobOffloadDecision(mode, reason string) {
 	o.decisions = append(o.decisions, s3BlobOffloadDecision{mode: mode, reason: reason})
 }
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobReplicationDegraded() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobReplicationDegraded() {
+	o.replicationDegraded++
+}
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobSHAMismatch() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobSHAMismatch() {
+	o.shaMismatch++
+}
 
-func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobUnrecoverable() {}
+func (o *recordingS3BlobOffloadObserver) ObserveS3ChunkBlobUnrecoverable() {
+	o.unrecoverable++
+}

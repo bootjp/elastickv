@@ -597,6 +597,59 @@ func TestAdminTokenAuthSkipsOtherServices(t *testing.T) {
 	}
 }
 
+func TestAdminTokenAuthDoesNotAuthorizeS3BlobFetch(t *testing.T) {
+	t.Parallel()
+	unary, stream := AdminTokenAuth("read-only-admin")
+	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
+	info := &grpc.UnaryServerInfo{FullMethod: pb.S3BlobFetch_FetchChunkBlob_FullMethodName}
+	if _, err := unary(context.Background(), nil, info, handler); err != nil {
+		t.Fatalf("admin gate must skip peer method: %v", err)
+	}
+
+	streamInfo := &grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName}
+	called := false
+	err := stream(nil, &adminAuthTestServerStream{ctx: context.Background()}, streamInfo, func(any, grpc.ServerStream) error {
+		called = true
+		return nil
+	})
+	if err != nil || !called {
+		t.Fatalf("admin gate must skip peer stream: err = %v, called = %v", err, called)
+	}
+}
+
+func TestS3BlobPeerTokenAuthRejectsAdminToken(t *testing.T) {
+	t.Parallel()
+	unary, stream := S3BlobPeerTokenAuth("peer-secret")
+	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
+	info := &grpc.UnaryServerInfo{FullMethod: pb.S3BlobFetch_FetchChunkBlob_FullMethodName}
+	adminCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer read-only-admin"))
+	if _, err := unary(adminCtx, nil, info, handler); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("admin token code = %v, want %v", status.Code(err), codes.Unauthenticated)
+	}
+
+	peerCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer peer-secret"))
+	streamInfo := &grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName}
+	called := false
+	err := stream(nil, &adminAuthTestServerStream{ctx: peerCtx}, streamInfo, func(any, grpc.ServerStream) error {
+		called = true
+		return nil
+	})
+	if err != nil || !called {
+		t.Fatalf("peer-authenticated stream err = %v, called = %v", err, called)
+	}
+}
+
+type adminAuthTestServerStream struct {
+	ctx context.Context
+}
+
+func (s *adminAuthTestServerStream) Context() context.Context   { return s.ctx }
+func (*adminAuthTestServerStream) SetHeader(metadata.MD) error  { return nil }
+func (*adminAuthTestServerStream) SendHeader(metadata.MD) error { return nil }
+func (*adminAuthTestServerStream) SetTrailer(metadata.MD)       {}
+func (*adminAuthTestServerStream) SendMsg(any) error            { return nil }
+func (*adminAuthTestServerStream) RecvMsg(any) error            { return nil }
+
 func TestAdminTokenAuthEmptyTokenDisabled(t *testing.T) {
 	t.Parallel()
 	unary, stream := AdminTokenAuth("")

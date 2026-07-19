@@ -1865,6 +1865,67 @@ func (c *ShardedCoordinator) Clock() *HLC {
 	return c.clock
 }
 
+// RaftMembers returns every configured Raft endpoint across all local groups.
+// Endpoints, rather than node IDs, are deduplicated because one process can
+// expose a distinct listener per group. The stable sort keeps capability-cache
+// fingerprints deterministic despite map iteration order.
+func (c *ShardedCoordinator) RaftMembers(ctx context.Context) ([]RaftMember, error) {
+	if c == nil || len(c.groups) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	membersByEndpoint := make(map[string]RaftMember)
+	for _, group := range c.groups {
+		members, err := raftMembersForGroup(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		for _, member := range members {
+			endpoint := member.NodeID + "\x00" + member.Address
+			membersByEndpoint[endpoint] = member
+		}
+	}
+	endpoints := make([]string, 0, len(membersByEndpoint))
+	for endpoint := range membersByEndpoint {
+		endpoints = append(endpoints, endpoint)
+	}
+	slices.Sort(endpoints)
+	members := make([]RaftMember, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		members = append(members, membersByEndpoint[endpoint])
+	}
+	return members, nil
+}
+
+// RaftMembersForKey returns a stable value copy of the current configuration
+// for the key's owning group. It is intentionally membership-only: callers do
+// not gain access to the mutable ShardGroup or its local store.
+func (c *ShardedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	return raftMembersForGroup(ctx, g)
+}
+
+func raftMembersForGroup(ctx context.Context, group *ShardGroup) ([]RaftMember, error) {
+	if group == nil || group.Engine == nil {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	cfg, err := group.Engine.Configuration(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	members := make([]RaftMember, 0, len(cfg.Servers))
+	for _, server := range cfg.Servers {
+		members = append(members, RaftMember{
+			NodeID:   server.ID,
+			Address:  server.Address,
+			Suffrage: server.Suffrage,
+		})
+	}
+	return members, nil
+}
+
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 	gid, ok := c.router.ResolveGroup(key)
 	if !ok {

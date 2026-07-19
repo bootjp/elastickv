@@ -212,6 +212,10 @@ func resolvePebbleCachePercent(envVal string) int {
 }
 
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
+
+var localAuxiliaryMVCCPrefixes = [][]byte{
+	[]byte("!s3|chunkblob|"),
+}
 var metaMinRetainedTSBytes = []byte(metaMinRetainedTS)
 var metaPendingMinRetainedTSBytes = []byte(metaPendingMinRetainedTS)
 var metaAppliedIndexBytes = []byte(metaAppliedIndex)
@@ -734,6 +738,9 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		if userKey == nil {
 			continue
 		}
+		if isLocalAuxiliaryMVCCKey(userKey) {
+			continue
+		}
 		if ts > maxTS {
 			maxTS = ts
 		}
@@ -742,6 +749,15 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		return 0, errors.WithStack(err)
 	}
 	return maxTS, nil
+}
+
+func isLocalAuxiliaryMVCCKey(userKey []byte) bool {
+	for _, prefix := range localAuxiliaryMVCCPrefixes {
+		if bytes.HasPrefix(userKey, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *pebbleStore) findMinRetainedTS() (uint64, error) {
@@ -2201,7 +2217,14 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	// registration commits.
 	// appliedIndex=0: direct path has no raft index; the leaf treats 0 as
 	// "do not write metaAppliedIndex" so the meta key stays unchanged.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, true)
+}
+
+// ApplyMutationsPreservingLastCommitTS is a direct, durable write path for
+// local auxiliary MVCC keys that must not advance the store-wide safe snapshot
+// watermark. It still uses pebble.Sync and the direct writer-registration gate.
+func (s *pebbleStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, false)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -2230,7 +2253,7 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 	// land here; their LastAppliedIndex() will stay behind the snapshot
 	// pointer and the skip optimisation will fall back to full restore
 	// for them. Preferred path is ApplyMutationsRaftAt.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0, true)
 }
 
 // ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
@@ -2242,7 +2265,7 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 // Production callers (kvFSM.applyXxx with f.pendingApplyIdx) SHOULD
 // pass the entry.Index value the engine delivered via SetApplyIndex.
 func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex, true)
 }
 
 func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, commitTS uint64) (bool, error) {
@@ -2335,8 +2358,8 @@ func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
 	return s.lastCommitTS > startTS
 }
 
-func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
-	if !s.hasCommitsAfter(startTS) {
+func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64, force bool) error {
+	if !force && !s.hasCommitsAfter(startTS) {
 		return nil
 	}
 	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
@@ -2345,7 +2368,7 @@ func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPa
 	return s.checkReadConflicts(ctx, readKeys, startTS)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64, advanceLastCommitTS bool) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -2368,12 +2391,41 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	// Keep OCC at the store boundary: callers pass the read snapshot via
 	// startTS/readKeys, and leader-issued commit timestamps alone do not prove
 	// the read set is still current.
-	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS); err != nil {
+	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS, !advanceLastCommitTS); err != nil {
 		return err
 	}
 
 	if err := s.applyMutationsBatch(b, mutations, commitTS, gateRegistration); err != nil {
 		return err
+	}
+
+	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
+	if err != nil {
+		return err
+	}
+	defer unlockLastCommitTS()
+	// Bundle metaAppliedIndex in the same batch as the data + commitTS
+	// meta key so a crash either commits all three atomically or none.
+	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
+	// or ApplyMutationsRaft); they leave the key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+	if err := b.Commit(writeOpts); err != nil {
+		return errors.WithStack(err)
+	}
+	if advanceLastCommitTS {
+		s.updateLastCommitTS(newLastTS)
+	}
+
+	return nil
+}
+
+func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
+	if !advance {
+		return 0, func() {}, nil
 	}
 
 	// Hold mtx across read → batch-set → commit → in-memory update so that a
@@ -2387,26 +2439,9 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	}
 	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
 		s.mtx.Unlock()
-		return err
+		return 0, nil, err
 	}
-	// Bundle metaAppliedIndex in the same batch as the data + commitTS
-	// meta key so a crash either commits all three atomically or none.
-	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
-	// or ApplyMutationsRaft); they leave the key unchanged.
-	if appliedIndex > 0 {
-		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
-			s.mtx.Unlock()
-			return err
-		}
-	}
-	if err := b.Commit(writeOpts); err != nil {
-		s.mtx.Unlock()
-		return errors.WithStack(err)
-	}
-	s.updateLastCommitTS(newLastTS)
-	s.mtx.Unlock()
-
-	return nil
+	return newLastTS, s.mtx.Unlock, nil
 }
 
 // DeletePrefixAt atomically deletes all visible keys matching prefix by writing
