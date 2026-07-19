@@ -489,8 +489,13 @@ adopt_committed_target_change() {
   actual_signature="$(configuration_signature "$VIEW_CONFIGURATION")"
   [[ "$actual_signature" == "$expected_signature" ]] || \
     fail "$context observed an unexpected membership after a lost response"
-  (( VIEW_CONFIG_INDEX >= STATE_EXPECTED_CONFIG_INDEX )) || \
-    fail "$context regressed the configuration index"
+  if [[ "$STATE_EXPECTED_MEMBERS" == "$actual_signature" ]]; then
+    [[ "$VIEW_CONFIG_INDEX" == "$STATE_EXPECTED_CONFIG_INDEX" ]] || \
+      fail "$context saved post-change configuration index changed: expected=$STATE_EXPECTED_CONFIG_INDEX actual=$VIEW_CONFIG_INDEX"
+  else
+    (( VIEW_CONFIG_INDEX > STATE_EXPECTED_CONFIG_INDEX )) || \
+      fail "$context did not advance the configuration index after the lost response"
+  fi
   STATE_EXPECTED_MEMBERS="$actual_signature"
   STATE_EXPECTED_CONFIG_INDEX="$VIEW_CONFIG_INDEX"
   write_state
@@ -514,7 +519,8 @@ record_committed_target_change() {
 }
 
 discover_leader() {
-  local address status state leader_address leader_id
+  local address status state leader_address leader_id leader_status
+  local verified_state verified_id verified_address
   local i
   for i in "${!NODE_HOSTS[@]}"; do
     address="${NODE_HOSTS[$i]}:${RAFT_PORT}"
@@ -528,8 +534,15 @@ discover_leader() {
     leader_id="$(printf '%s\n' "$status" | field_value leader_id)"
     leader_address="$(printf '%s\n' "$status" | field_value leader_address)"
     if [[ -n "$leader_id" && -n "$leader_address" ]]; then
-      printf '%s|%s\n' "$leader_id" "$leader_address"
-      return 0
+      leader_status="$(status_for "$leader_address" || true)"
+      [[ -n "$leader_status" ]] || continue
+      verified_state="$(printf '%s\n' "$leader_status" | field_value state)"
+      verified_id="$(printf '%s\n' "$leader_status" | field_value leader_id)"
+      verified_address="$(printf '%s\n' "$leader_status" | field_value leader_address)"
+      if [[ "$verified_state" == "LEADER" && "$verified_id" == "$leader_id" && "$verified_address" == "$leader_address" ]]; then
+        printf '%s|%s\n' "$leader_id" "$leader_address"
+        return 0
+      fi
     fi
   done
   return 1
@@ -671,9 +684,10 @@ preflight() {
     raftadmin "$leader_address" leadership_transfer_to_server "$candidate_id" "$candidate_address" >/dev/null
     wait_for_leader "$candidate_id" >/dev/null || fail "leadership did not transfer to $candidate_id"
     load_leader_view || fail "cannot read stable leader view after leadership transfer"
-    [[ "$VIEW_CONFIG_INDEX" == "$config_index" ]] || fail "membership changed during leadership transfer"
     [[ "$(configuration_signature "$VIEW_CONFIGURATION")" == "$initial_signature" ]] || \
       fail "membership changed during leadership transfer"
+    config_index="$VIEW_CONFIG_INDEX"
+    config="$VIEW_CONFIGURATION"
   fi
 
   STATE_EXPECTED_VOTERS="$(voter_csv "$config")"
@@ -1049,19 +1063,26 @@ verify_cluster_once() {
 }
 
 verify_stability() {
-  local elapsed=0 stable=0 expected_leader="" leader
+  local elapsed=0 stable_since=-1 expected_leader="" leader stable
   while (( elapsed < REPLACEMENT_TIMEOUT_SECONDS )); do
     leader="$(verify_cluster_once || true)"
     if [[ -n "$leader" && ( -z "$expected_leader" || "$leader" == "$expected_leader" ) ]]; then
+      if [[ -z "$expected_leader" ]]; then
+        stable_since=$elapsed
+      fi
       expected_leader="$leader"
-      stable=$((stable + REPLACEMENT_POLL_SECONDS))
+      stable=$((elapsed - stable_since))
       if (( stable >= REPLACEMENT_STABILITY_SECONDS )); then
         log "cluster stable for ${stable}s with leader=$leader"
         return 0
       fi
     else
       expected_leader="$leader"
-      stable=0
+      if [[ -n "$leader" ]]; then
+        stable_since=$elapsed
+      else
+        stable_since=-1
+      fi
     fi
     sleep "$REPLACEMENT_POLL_SECONDS"
     elapsed=$((elapsed + REPLACEMENT_POLL_SECONDS))

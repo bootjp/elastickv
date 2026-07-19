@@ -1650,6 +1650,31 @@ func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
 	require.Empty(t, engine.pendingConfigs)
 }
 
+func TestReconcilePendingConfChangeFenceClearsOverwrittenProposal(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 10, 12, map[uint64]raftpb.Entry{
+		12: {
+			Type: entryTypePtr(raftpb.EntryNormal),
+			Data: []byte("replacement leader entry"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(10)
+	engine.markPendingConfChange(12)
+
+	require.NoError(t, engine.reconcilePendingConfChangeFence())
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestReconcilePendingConfChangeFenceKeepsUnstableProposal(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 10, 11, nil)
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(10)
+	engine.markPendingConfChange(12)
+
+	require.NoError(t, engine.reconcilePendingConfChangeFence())
+	require.True(t, engine.hasPendingConfChange())
+}
+
 func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {

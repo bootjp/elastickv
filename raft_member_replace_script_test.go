@@ -58,6 +58,8 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 		"FAKE_STATE_DIR=" + stateDir,
 	})
 	require.Contains(t, output, "replacement completed: target=n2")
+	require.GreaterOrEqual(t, strings.Count(mustReadTestFile(t, filepath.Join(stateDir, "stability-status-calls")), "\n"), 10,
+		"a one-second stability window with one-second polling requires two complete healthy observations")
 	require.FileExists(t, filepath.Join(stateDir, "verified"))
 	require.FileExists(t, filepath.Join(stateDir, "data-reset"))
 	require.Equal(t, "voter\n", mustReadTestFile(t, filepath.Join(stateDir, "member")))
@@ -134,6 +136,80 @@ func TestRaftMemberReplaceScriptStopsProcessAfterExternalFence(t *testing.T) {
 	require.Contains(t, output, "external fence verified; stopping the target process")
 	require.FileExists(t, filepath.Join(stateDir, "external-fenced"))
 	require.Equal(t, "stop\nreset-data\n", mustReadTestFile(t, filepath.Join(stateDir, "remote-actions")))
+}
+
+func TestRaftMemberReplaceScriptValidatesReportedLeader(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	fakeBin := filepath.Join(stateDir, "bin")
+	require.NoError(t, os.Mkdir(fakeBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "member"), []byte("voter\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "config-index"), []byte("10\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "stale-leader-once"), nil, 0o600))
+
+	raftadmin := writeExecutableTestFile(t, fakeBin, "raftadmin", fakeRaftadminScript)
+	ssh := writeExecutableTestFile(t, fakeBin, "ssh", fakeReplacementSSHScript)
+	rolling := writeExecutableTestFile(t, fakeBin, "rolling-update", fakeReplacementRollingScript)
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("NODES=n3=127.0.0.3,n1=127.0.0.1,n2=127.0.0.2\n"), 0o600))
+
+	output := runReplacementScript(t, repoRoot, []string{
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=container",
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=1",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+		"REPLACEMENT_STABILITY_SECONDS=1",
+		"REPLACEMENT_TIMEOUT_SECONDS=5",
+		"REPLACEMENT_POLL_SECONDS=1",
+		"REPLACEMENT_STATE_FILE=" + filepath.Join(stateDir, "replace.state"),
+		"ROLLING_UPDATE_ENV_FILE=" + envFile,
+		"ROLLING_UPDATE_SCRIPT=" + rolling,
+		"RAFTADMIN_BIN=" + raftadmin,
+		"SSH_BIN=" + ssh,
+		"FAKE_STATE_DIR=" + stateDir,
+	})
+	require.Contains(t, output, "replacement completed: target=n2")
+}
+
+func TestRaftMemberReplaceScriptAdoptsConfigIndexAfterLeadershipTransfer(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	fakeBin := filepath.Join(stateDir, "bin")
+	require.NoError(t, os.Mkdir(fakeBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "member"), []byte("voter\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "config-index"), []byte("10\n"), 0o600))
+
+	raftadmin := writeExecutableTestFile(t, fakeBin, "raftadmin", fakeRaftadminScript)
+	ssh := writeExecutableTestFile(t, fakeBin, "ssh", fakeReplacementSSHScript)
+	rolling := writeExecutableTestFile(t, fakeBin, "rolling-update", fakeReplacementRollingScript)
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("NODES=n1=127.0.0.1,n2=127.0.0.2,n3=127.0.0.3\n"), 0o600))
+	stateFile := filepath.Join(stateDir, "replace.state")
+
+	output := runReplacementScript(t, repoRoot, []string{
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=container",
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=1",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+		"REPLACEMENT_STABILITY_SECONDS=1",
+		"REPLACEMENT_TIMEOUT_SECONDS=5",
+		"REPLACEMENT_POLL_SECONDS=1",
+		"REPLACEMENT_STATE_FILE=" + stateFile,
+		"ROLLING_UPDATE_ENV_FILE=" + envFile,
+		"ROLLING_UPDATE_SCRIPT=" + rolling,
+		"RAFTADMIN_BIN=" + raftadmin,
+		"SSH_BIN=" + ssh,
+		"FAKE_STATE_DIR=" + stateDir,
+		"FAKE_TARGET_STARTS_LEADER=true",
+		"FAKE_BUMP_CONFIG_ON_TRANSFER=true",
+	})
+	require.Contains(t, output, "transferring leadership from n2 to n1")
+	require.Contains(t, output, "replacement completed: target=n2")
+	require.Contains(t, mustReadTestFile(t, stateFile), "expected_config_index=14\n")
 }
 
 func TestRaftMemberReplaceScriptRequiresInvocationControls(t *testing.T) {
@@ -292,6 +368,16 @@ func TestRaftMemberReplaceScriptResumesAfterLearnerCommitResponseLoss(t *testing
 	)
 	require.NoError(t, os.WriteFile(stateFile, []byte(interruptedState), 0o600))
 
+	staleMetadataState := strings.Replace(interruptedState, "expected_config_index=12\n", "expected_config_index=11\n", 1)
+	require.NoError(t, os.WriteFile(stateFile, []byte(staleMetadataState), 0o600))
+	staleMetadataCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	staleMetadataCmd.Dir = repoRoot
+	staleMetadataCmd.Env = append(os.Environ(), commandEnv...)
+	staleMetadataOutput, staleMetadataErr := staleMetadataCmd.CombinedOutput()
+	require.Error(t, staleMetadataErr)
+	require.Contains(t, string(staleMetadataOutput), "saved post-change configuration index changed: expected=11 actual=12")
+	require.NoError(t, os.WriteFile(stateFile, []byte(interruptedState), 0o600))
+
 	changedDataDirCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
 	changedDataDirCmd.Dir = repoRoot
 	changedDataDirEnv := append(append([]string{}, commandEnv...), "DATA_DIR=/srv/elastickv")
@@ -413,20 +499,35 @@ command="$2"
 state_dir="$FAKE_STATE_DIR"
 
 if [[ "$command" == "status" ]]; then
+  if [[ -f "$state_dir/stability-phase" ]]; then
+    printf '%s\n' "$addr" >> "$state_dir/stability-status-calls"
+  fi
   if [[ "$addr" == "127.0.0.2:50051" && -f "$state_dir/down-n2" ]]; then
     exit 1
   fi
-  if [[ "$addr" == "127.0.0.1:50051" ]]; then
+  leader_id=n1
+  leader_address=127.0.0.1:50051
+  if [[ "${FAKE_TARGET_STARTS_LEADER:-false}" == "true" && ! -f "$state_dir/transferred" ]]; then
+    leader_id=n2
+    leader_address=127.0.0.2:50051
+  fi
+  if [[ "$addr" == "$leader_address" ]]; then
     raft_state=LEADER
   elif [[ "$addr" == "127.0.0.3:50051" && -f "$state_dir/candidate-n3" ]]; then
     raft_state=CANDIDATE
   else
     raft_state=FOLLOWER
   fi
+  if [[ "$addr" == "127.0.0.3:50051" && -f "$state_dir/stale-leader-once" ]]; then
+    rm -f "$state_dir/stale-leader-once"
+    raft_state=FOLLOWER
+    leader_id=n2
+    leader_address=127.0.0.2:50051
+  fi
   cat <<EOF
 state: $raft_state
-leader_id: "n1"
-leader_address: "127.0.0.1:50051"
+leader_id: "$leader_id"
+leader_address: "$leader_address"
 term: 5
 commit_index: 100
 applied_index: 100
@@ -489,6 +590,10 @@ case "$command" in
     increment_index
     ;;
   leadership_transfer_to_server)
+    touch "$state_dir/transferred"
+    if [[ "${FAKE_BUMP_CONFIG_ON_TRANSFER:-false}" == "true" ]]; then
+      increment_index
+    fi
     ;;
   *)
     echo "unexpected raftadmin command: $*" >&2
@@ -528,5 +633,7 @@ if [[ "${RAFT_JOIN_NODE:-}" == "n2" ]]; then
     rm -f "$FAKE_STATE_DIR/fail-join-rollout-once"
     exit 74
   fi
+else
+  touch "$FAKE_STATE_DIR/stability-phase"
 fi
 `

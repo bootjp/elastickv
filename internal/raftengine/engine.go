@@ -35,6 +35,9 @@ var (
 	// unapplied configuration change, so transfer is rejected until the
 	// membership transition settles.
 	ErrLeadershipTransferConfChangePending = errors.New("raft engine: leadership transfer blocked by pending config change")
+	// ErrMembershipChangePending indicates that a membership proposal is
+	// already present in the local Raft log and has not settled yet.
+	ErrMembershipChangePending = errors.New("raft engine: membership change blocked by pending config change")
 	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
 	// cutover barrier is open on this leader and rejecting fresh
 	// USER proposals on the Propose path. The error is the step-1
