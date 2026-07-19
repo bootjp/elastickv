@@ -19,6 +19,7 @@ func TestScopeForKey(t *testing.T) {
 		scoped bool
 	}{
 		{name: "dynamodb meta", key: []byte(DDBTableMetaPrefix + enc("orders")), want: Scope{Adapter: "dynamodb", Name: "orders"}, scoped: true},
+		{name: "dynamodb generation", key: []byte(DDBTableGenPrefix + enc("orders")), scoped: false},
 		{name: "s3 bucket", key: s3keys.BucketMetaKey("photos"), want: Scope{Adapter: "s3", Name: "photos"}, scoped: true},
 		{name: "sqs metadata", key: []byte(SQSQueueMetaPrefix + enc("jobs")), want: Scope{Adapter: "sqs", Name: "jobs"}, scoped: true},
 		{name: "sqs sequence", key: []byte(SQSQueueSeqPrefix + enc("jobs")), scoped: false},

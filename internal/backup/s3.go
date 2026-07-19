@@ -546,6 +546,28 @@ func (s *S3Encoder) Finalize() error {
 	return firstErr
 }
 
+// RetainedRecordCounts reports the source records represented by the native
+// dump after Finalize filtering. It excludes orphan buckets/chunks, stale
+// generations, stale uploads, and undeclared chunks.
+func (s *S3Encoder) RetainedRecordCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(s.buckets))
+	for _, bucket := range s.buckets {
+		if bucket.meta == nil {
+			continue
+		}
+		count := uint64(1) // !s3|bucket|meta
+		for _, object := range bucket.objects {
+			if object.manifest == nil || (bucket.activeGen != 0 && object.generation != bucket.activeGen) {
+				continue
+			}
+			count++ // !s3|obj|head
+			count += uint64(len(filterChunksForManifest(object.chunkPaths, object.uploadID, object.declaredParts)))
+		}
+		out[bucket.name] = count
+	}
+	return out
+}
+
 func (s *S3Encoder) flushBucket(b *s3BucketState) error {
 	// Reject bucket-name dot segments before the filesystem join.
 	// `EncodeSegment(".") == "."` and `EncodeSegment("..") == ".."`

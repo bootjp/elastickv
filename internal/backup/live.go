@@ -63,6 +63,8 @@ func scopeForDDBKey(key []byte) (Scope, bool, error) {
 	switch {
 	case bytes.HasPrefix(key, []byte(DDBTableMetaPrefix)):
 		return ddbScopeFromDirectSegment(key, DDBTableMetaPrefix)
+	case bytes.HasPrefix(key, []byte(DDBTableGenPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(DDBItemPrefix)):
 		encoded, _, err := parseDDBItemKey(key)
 		if err != nil {
@@ -220,6 +222,28 @@ func (d *LiveDecoder) Finalize() (DecodeCounters, error) {
 		return DecodeCounters{}, err
 	}
 	return d.d.counters, nil
+}
+
+// FinalizedScopeCounts replaces streamed counts for adapters whose encoders
+// make relational keep/drop decisions during Finalize. S3 is authoritative
+// here because orphan chunks and stale-generation objects are only known after
+// the complete bucket state has been assembled.
+func (d *LiveDecoder) FinalizedScopeCounts(streamed map[Scope]uint64) (map[Scope]uint64, error) {
+	if d == nil || d.d == nil || !d.finalized {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live decoder is not finalized")
+	}
+	out := make(map[Scope]uint64, len(streamed))
+	for scope, count := range streamed {
+		if scope.Adapter != adapterS3 || d.d.s3 == nil {
+			out[scope] = count
+		}
+	}
+	if d.d.s3 != nil {
+		for name, count := range d.d.s3.RetainedRecordCounts() {
+			out[Scope{Adapter: adapterS3, Name: name}] = count
+		}
+	}
+	return out, nil
 }
 
 func (s Scope) String() string {

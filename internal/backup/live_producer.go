@@ -285,7 +285,7 @@ func dumpPinnedBackup(
 	if err != nil {
 		return LiveBackupResult{}, errors.Wrap(err, "list live backup scopes")
 	}
-	selected, err := selectLiveBackupScopes(opts.Adapters, opts.Scopes, listed.GetScopes())
+	selected, err := selectLiveBackupScopes(opts.Adapters, opts.Scopes, listed.GetScopes(), begin.GetExpectedKeys())
 	if err != nil {
 		return LiveBackupResult{}, err
 	}
@@ -312,6 +312,10 @@ func dumpPinnedBackup(
 	}
 	if finalizeErr != nil {
 		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected)}, finalizeErr
+	}
+	actual, err = decoder.FinalizedScopeCounts(actual)
+	if err != nil {
+		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected), Counters: counters}, err
 	}
 	if err := validateExpectedLiveCounts(selected, actual, begin.GetExpectedKeys()); err != nil {
 		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected), Counters: counters}, err
@@ -360,15 +364,46 @@ func streamSelectedBackup(
 	return nil
 }
 
-func selectLiveBackupScopes(adapters AdapterSet, requested []Scope, listed []*pb.BackupScope) (map[Scope]struct{}, error) {
+func selectLiveBackupScopes(
+	adapters AdapterSet,
+	requested []Scope,
+	listed []*pb.BackupScope,
+	baseline []*pb.BackupExpectedKeys,
+) (map[Scope]struct{}, error) {
 	available, err := availableLiveBackupScopes(adapters, listed)
 	if err != nil {
 		return nil, err
 	}
 	if len(requested) == 0 {
+		if err := addBaselineLiveBackupScopes(available, adapters, baseline); err != nil {
+			return nil, err
+		}
 		return available, nil
 	}
 	return requestedLiveBackupScopes(adapters, requested, available)
+}
+
+func addBaselineLiveBackupScopes(
+	selected map[Scope]struct{},
+	adapters AdapterSet,
+	baseline []*pb.BackupExpectedKeys,
+) error {
+	for _, item := range baseline {
+		if item == nil || item.GetKeyCount() == 0 {
+			continue
+		}
+		scope := Scope{Adapter: item.GetAdapter(), Name: item.GetScope()}
+		if scope.Adapter == "" || scope.Name == "" {
+			return errors.Wrap(ErrLiveBackupScope, "server returned an empty baseline scope")
+		}
+		if err := validateLiveScope(scope); err != nil {
+			return err
+		}
+		if adapterEnabled(adapters, scope.Adapter) {
+			selected[scope] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func availableLiveBackupScopes(adapters AdapterSet, listed []*pb.BackupScope) (map[Scope]struct{}, error) {
@@ -618,12 +653,13 @@ type liveBackupLease struct {
 	ttl    time.Duration
 	cancel context.CancelCauseFunc
 
-	mu       sync.RWMutex
-	token    []byte
-	renewals uint64
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	doneCh   chan error
+	mu        sync.RWMutex
+	token     []byte
+	expiresAt time.Time
+	renewals  uint64
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	doneCh    chan error
 }
 
 func newLiveBackupLease(
@@ -634,7 +670,7 @@ func newLiveBackupLease(
 ) *liveBackupLease {
 	return &liveBackupLease{
 		rpc: rpc, ttl: ttl,
-		token: append([]byte(nil), begin.GetPinToken()...), cancel: cancel,
+		token: append([]byte(nil), begin.GetPinToken()...), expiresAt: time.Now().Add(ttl), cancel: cancel,
 		stopCh: make(chan struct{}), doneCh: make(chan error, 1),
 	}
 }
@@ -678,8 +714,15 @@ func (l *liveBackupLease) renewLoop(ctx context.Context) error {
 func (l *liveBackupLease) renewOnce(ctx context.Context) (time.Duration, error) {
 	l.mu.RLock()
 	ttl := l.ttl
+	expiresAt := l.expiresAt
 	l.mu.RUnlock()
-	resp, err := l.rpc.RenewBackup(ctx, &pb.RenewBackupRequest{
+	attemptTimeout, err := liveBackupRenewalAttemptTimeout(ttl, time.Until(expiresAt))
+	if err != nil {
+		return 0, err
+	}
+	renewCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+	defer cancel()
+	resp, err := l.rpc.RenewBackup(renewCtx, &pb.RenewBackupRequest{
 		PinToken: l.tokenSnapshot(), TtlMs: durationMillis(ttl),
 	})
 	if err != nil {
@@ -699,9 +742,21 @@ func (l *liveBackupLease) renewOnce(ctx context.Context) (time.Duration, error) 
 	l.mu.Lock()
 	l.token = append(l.token[:0], resp.GetPinToken()...)
 	l.ttl = renewedTTL
+	l.expiresAt = time.Now().Add(renewedTTL)
 	l.renewals++
 	l.mu.Unlock()
 	return interval, nil
+}
+
+func liveBackupRenewalAttemptTimeout(ttl, remaining time.Duration) (time.Duration, error) {
+	timeout := ttl / liveBackupRenewalDivisor
+	if remaining < timeout {
+		timeout = remaining
+	}
+	if timeout <= 0 {
+		return 0, errors.New("renewal deadline has expired")
+	}
+	return timeout, nil
 }
 
 func liveBackupRenewalInterval(ttl time.Duration) (time.Duration, error) {

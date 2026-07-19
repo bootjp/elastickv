@@ -187,6 +187,21 @@ func TestRunLiveBackupCountShortfallLeavesNoManifest(t *testing.T) {
 	}
 }
 
+func TestRunLiveBackupValidatesBaselineScopeMissingFromList(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	rpc.listed = nil
+	rpc.records = nil
+	root := filepath.Join(t.TempDir(), "dump")
+	_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root, Adapters: AdapterSet{Redis: true}, TTL: time.Minute,
+	})
+	if !errors.Is(err, ErrCompactionDuringDump) {
+		t.Fatalf("err=%v, want ErrCompactionDuringDump", err)
+	}
+	assertLiveBackupHasNoManifest(t, root)
+}
+
 func TestRunLiveBackupRenewalFailureCancelsStreamAndReleasesPin(t *testing.T) {
 	t.Parallel()
 	rpc := successfulLiveBackupRPC()
@@ -217,10 +232,28 @@ func TestRunLiveBackupRenewalFailureCancelsStreamAndReleasesPin(t *testing.T) {
 	}
 }
 
+func TestRunLiveBackupRenewalDeadlineCancelsStream(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	rpc.begin.TtlMsEffective = 30
+	rpc.renewWait = true
+	rpc.renewStarted = make(chan struct{})
+	rpc.blockStream = true
+	root := filepath.Join(t.TempDir(), "dump")
+	_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root, Adapters: AdapterSet{Redis: true}, TTL: time.Minute,
+	})
+	if !errors.Is(err, ErrLiveBackupRenewal) {
+		t.Fatalf("err=%v, want ErrLiveBackupRenewal", err)
+	}
+	assertLiveBackupHasNoManifest(t, root)
+	assertLiveBackupEnded(t, rpc, "pin-token")
+}
+
 func TestRunLiveBackupStopsRenewalBeforeManifestPublication(t *testing.T) {
 	t.Parallel()
 	rpc := successfulLiveBackupRPC()
-	rpc.begin.TtlMsEffective = 9
+	rpc.begin.TtlMsEffective = 300
 	rpc.renewStarted = make(chan struct{})
 	rpc.renewWait = true
 	rpc.streamRelease = rpc.renewStarted
@@ -240,7 +273,7 @@ func TestRunLiveBackupStopsRenewalBeforeManifestPublication(t *testing.T) {
 		t.Fatal("MANIFEST.json was published while a pin renewal was still active")
 	}
 	manifest := readLiveBackupManifest(t, root)
-	if manifest.Live == nil || manifest.Live.ReadTS != 42 || manifest.BackupTSTTLMS != 9 {
+	if manifest.Live == nil || manifest.Live.ReadTS != 42 || manifest.BackupTSTTLMS != 300 {
 		t.Fatalf("manifest live metadata = %+v", manifest)
 	}
 }
@@ -342,6 +375,34 @@ func TestCrossAdapterConsistency(t *testing.T) {
 		t.Fatalf("RunLiveBackup: %v", err)
 	}
 	assertCrossAdapterLiveBackup(t, root, body, result)
+}
+
+func TestRunLiveBackupRejectsS3ScopeWithOnlyOrphanRecords(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	const (
+		bucket   = "deleted"
+		object   = "orphan"
+		uploadID = "stale-upload"
+	)
+	rpc.listed = []*pb.BackupScope{{Adapter: adapterS3, Scope: bucket}}
+	rpc.begin.ExpectedKeys = []*pb.BackupExpectedKeys{{Adapter: adapterS3, Scope: bucket, KeyCount: 2}}
+	rpc.records = []*pb.BackupKV{
+		{Key: s3keys.ObjectManifestKey(bucket, 1, object), Value: encodeS3ManifestValue(t, map[string]any{
+			"upload_id": uploadID, "size_bytes": 1, "parts": []map[string]any{
+				{"part_no": 1, "size_bytes": 1, "chunk_count": 1},
+			},
+		})},
+		{Key: s3keys.BlobKey(bucket, 1, object, uploadID, 1, 0), Value: []byte("x")},
+	}
+	root := filepath.Join(t.TempDir(), "dump")
+	_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root, Adapters: AdapterSet{S3: true}, TTL: time.Minute,
+	})
+	if !errors.Is(err, ErrCompactionDuringDump) {
+		t.Fatalf("err=%v, want ErrCompactionDuringDump", err)
+	}
+	assertLiveBackupHasNoManifest(t, root)
 }
 
 func crossAdapterLiveBackupRPC(t *testing.T) (*fakeLiveBackupRPC, []byte) {
