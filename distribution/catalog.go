@@ -251,13 +251,6 @@ func EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(route RouteDescrip
 	return encodeRouteDescriptorWithSplitAtHLCOffset(route)
 }
 
-func EncodeRouteDescriptorForCatalogWrite(route RouteDescriptor, allowV2 bool) ([]byte, error) {
-	if routeDescriptorRequiresV2(route) && !allowV2 {
-		return nil, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
-	}
-	return EncodeRouteDescriptor(route)
-}
-
 // DecodeRouteDescriptor deserializes a route descriptor record.
 func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if len(raw) < 1 {
