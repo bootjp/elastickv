@@ -27,10 +27,11 @@ const (
 )
 
 var (
-	ErrCompactionDuringDump   = errors.New("backup: key shortfall while live pin was active")
-	ErrLiveBackupOutputExists = errors.New("backup: live output already exists")
-	ErrLiveBackupRenewal      = errors.New("backup: live pin renewal failed")
-	ErrLiveBackupScope        = errors.New("backup: requested live scope is unavailable")
+	ErrCompactionDuringDump         = errors.New("backup: key shortfall while live pin was active")
+	ErrLiveBackupOutputExists       = errors.New("backup: live output already exists")
+	ErrLiveBackupRenewal            = errors.New("backup: live pin renewal failed")
+	ErrLiveBackupRestoreUnsupported = errors.New("backup: live producer mode is unsupported by native restore")
+	ErrLiveBackupScope              = errors.New("backup: requested live scope is unavailable")
 )
 
 // LiveBackupRPC is the transport-neutral control plane used by RunLiveBackup.
@@ -221,8 +222,31 @@ func validateLiveBackupOptions(rpc LiveBackupRPC, opts LiveBackupOptions) error 
 	case opts.DynamoDBBundleSizeBytes < 0:
 		return errors.New("backup: DynamoDB bundle size must not be negative")
 	default:
-		return nil
+		return ValidateLiveBackupRestoreCompatibility(opts)
 	}
+}
+
+// ValidateLiveBackupRestoreCompatibility rejects producer modes that the
+// documented native snapshot restore path cannot faithfully reverse yet.
+// Keeping this check public lets the CLI fail before dialing the cluster while
+// RunLiveBackup repeats it for in-process callers.
+func ValidateLiveBackupRestoreCompatibility(opts LiveBackupOptions) error {
+	checks := []struct {
+		unsupported bool
+		flag        string
+	}{
+		{opts.DynamoDBBundleJSONL && opts.Adapters.DynamoDB, "--dynamodb-bundle-mode=jsonl"},
+		{opts.IncludeIncompleteUploads && opts.Adapters.S3, "--include-incomplete-uploads"},
+		{opts.IncludeOrphans && opts.Adapters.S3, "--include-orphans"},
+		{opts.PreserveSQSVisibility && opts.Adapters.SQS, "--preserve-sqs-visibility"},
+		{opts.IncludeSQSSideRecords && opts.Adapters.SQS, "--include-sqs-side-records"},
+	}
+	for _, check := range checks {
+		if check.unsupported {
+			return errors.Wrap(ErrLiveBackupRestoreUnsupported, check.flag)
+		}
+	}
+	return nil
 }
 
 func createLiveBackupOutputRoot(root string) error {
@@ -321,8 +345,11 @@ func streamSelectedBackup(
 		if _, ok := selected[scope]; !ok {
 			return errors.Wrapf(ErrLiveBackupScope, "stream returned unselected %s", scope)
 		}
+		if err := decoder.Add(pair.GetKey(), pair.GetValue()); err != nil {
+			return err
+		}
 		actual[scope]++
-		return decoder.Add(pair.GetKey(), pair.GetValue())
+		return nil
 	})
 	if err != nil {
 		if cause := context.Cause(ctx); errors.Is(cause, ErrLiveBackupRenewal) {
@@ -469,6 +496,9 @@ func minimumAcceptedLiveCount(expected uint64) uint64 {
 	}
 	tolerance := onePercent + integerSqrt(expected)
 	if tolerance >= expected {
+		if expected > 0 {
+			return 1
+		}
 		return 0
 	}
 	return expected - tolerance

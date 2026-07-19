@@ -81,15 +81,13 @@ func scopeForS3Key(key []byte) (Scope, bool, error) {
 	case bytes.HasPrefix(key, []byte(S3BucketMetaPrefix)):
 		bucket, ok := s3keys.ParseBucketMetaKey(key)
 		return parsedS3Scope(bucket, ok, key)
+	case bytes.HasPrefix(key, []byte(S3BucketGenPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(S3ObjectManifestPrefix)):
 		bucket, _, _, ok := s3keys.ParseObjectManifestKey(key)
 		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3UploadMetaPrefix)):
-		bucket, ok := parseUploadFamily(S3UploadMetaPrefix, key)
-		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3UploadPartPrefix)):
-		bucket, _, _, _, _, ok := s3keys.ParseUploadPartKey(key)
-		return parsedS3Scope(bucket, ok, key)
+	case bytes.HasPrefix(key, []byte(S3UploadMetaPrefix)), bytes.HasPrefix(key, []byte(S3UploadPartPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(S3BlobPrefix)):
 		bucket, _, _, _, _, _, _, ok := s3keys.ParseBlobKey(key)
 		return parsedS3Scope(bucket, ok, key)
@@ -112,26 +110,9 @@ func scopeForSQSKey(key []byte) (Scope, bool, error) {
 			return Scope{}, false, err
 		}
 		return decodedScope("sqs", encoded)
-	case bytes.HasPrefix(key, []byte(SQSQueueSeqPrefix)):
-		return sqsScopeFromDirectSegment(key, SQSQueueSeqPrefix)
 	default:
-		prefix, ok := sqsDerivedBackupPrefix(key)
-		if !ok {
-			return Scope{}, false, nil
-		}
-		return sqsScopeFromGenericKey(key, prefix)
+		return Scope{}, false, nil
 	}
-}
-
-func sqsDerivedBackupPrefix(key []byte) (string, bool) {
-	for _, prefix := range [...]string{
-		SQSQueueTombstonePrefix, SQSMsgVisPrefix, SQSMsgByAgePrefix, SQSMsgDedupPrefix, SQSMsgGroupPrefix,
-	} {
-		if bytes.HasPrefix(key, []byte(prefix)) {
-			return prefix, true
-		}
-	}
-	return "", false
 }
 
 func hasAnyBackupPrefix(key []byte, prefixes ...string) bool {
@@ -155,14 +136,6 @@ func sqsScopeFromDirectSegment(key []byte, prefix string) (Scope, bool, error) {
 	encoded := string(key[len(prefix):])
 	if encoded == "" {
 		return Scope{}, false, errors.Wrapf(ErrScopeKeyMalformed, "sqs key %q", key)
-	}
-	return decodedScope("sqs", encoded)
-}
-
-func sqsScopeFromGenericKey(key []byte, prefix string) (Scope, bool, error) {
-	encoded, err := parseSQSGenericKey(key, prefix)
-	if err != nil {
-		return Scope{}, false, err
 	}
 	return decodedScope("sqs", encoded)
 }

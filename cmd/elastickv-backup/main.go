@@ -96,24 +96,9 @@ func run(argv []string, stdout, stderr io.Writer) (retErr error) {
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	result, err := backup.RunLiveBackup(ctx, &grpcLiveBackupRPC{client: pb.NewAdminClient(conn), token: token}, backup.LiveBackupOptions{
-		OutputRoot:               cfg.outputRoot,
-		Adapters:                 cfg.adapters,
-		Scopes:                   cfg.scopes,
-		TTL:                      cfg.ttl,
-		IncludeIncompleteUploads: cfg.includeIncompleteUploads,
-		IncludeOrphans:           cfg.includeOrphans,
-		PreserveSQSVisibility:    cfg.preserveSQSVisibility,
-		IncludeSQSSideRecords:    cfg.includeSQSSideRecords,
-		RenameS3Collisions:       cfg.renameCollisions,
-		DynamoDBBundleJSONL:      cfg.bundleJSONL,
-		DynamoDBBundleSizeBytes:  cfg.bundleSizeBytes,
-		ElastickvVersion:         version,
-		ClusterID:                cfg.clusterID,
-		BeginTimeout:             cfg.beginTimeout,
-		EndTimeout:               cfg.endTimeout,
-		WarnSink:                 warningSink(logger),
-	})
+	opts := liveBackupOptions(cfg)
+	opts.WarnSink = warningSink(logger)
+	result, err := backup.RunLiveBackup(ctx, &grpcLiveBackupRPC{client: pb.NewAdminClient(conn), token: token}, opts)
 	if err != nil {
 		return errors.Wrap(err, "create live backup")
 	}
@@ -215,7 +200,30 @@ func buildDumpConfig(values *dumpFlagValues) (*config, error) {
 	if err := populateDynamoDBBundleConfig(&cfg, values); err != nil {
 		return nil, err
 	}
+	if err := backup.ValidateLiveBackupRestoreCompatibility(liveBackupOptions(&cfg)); err != nil {
+		return nil, errors.Wrap(err, "validate native restore compatibility")
+	}
 	return &cfg, nil
+}
+
+func liveBackupOptions(cfg *config) backup.LiveBackupOptions {
+	return backup.LiveBackupOptions{
+		OutputRoot:               cfg.outputRoot,
+		Adapters:                 cfg.adapters,
+		Scopes:                   cfg.scopes,
+		TTL:                      cfg.ttl,
+		IncludeIncompleteUploads: cfg.includeIncompleteUploads,
+		IncludeOrphans:           cfg.includeOrphans,
+		PreserveSQSVisibility:    cfg.preserveSQSVisibility,
+		IncludeSQSSideRecords:    cfg.includeSQSSideRecords,
+		RenameS3Collisions:       cfg.renameCollisions,
+		DynamoDBBundleJSONL:      cfg.bundleJSONL,
+		DynamoDBBundleSizeBytes:  cfg.bundleSizeBytes,
+		ElastickvVersion:         version,
+		ClusterID:                cfg.clusterID,
+		BeginTimeout:             cfg.beginTimeout,
+		EndTimeout:               cfg.endTimeout,
+	}
 }
 
 func validateDumpFlagValues(values *dumpFlagValues) error {
@@ -415,25 +423,49 @@ func loadAdminToken(path string) (string, error) {
 }
 
 func loadTransportCredentials(caFile, serverName string, skipVerify bool) (credentials.TransportCredentials, error) {
-	if caFile == "" && !skipVerify {
+	tlsRequested := caFile != "" || skipVerify
+	if err := validateTLSFlagCombination(tlsRequested, caFile, serverName, skipVerify); err != nil {
+		return nil, err
+	}
+	if !tlsRequested {
 		return insecure.NewCredentials(), nil
 	}
 	conf := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName, InsecureSkipVerify: skipVerify} //nolint:gosec // explicit development flag.
-	if caFile != "" {
-		pem, err := os.ReadFile(caFile) //nolint:gosec // operator-selected CA file
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		pool, err := x509.SystemCertPool()
-		if err != nil || pool == nil {
-			pool = x509.NewCertPool()
-		}
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, errors.New("TLS CA file contains no certificates")
-		}
-		conf.RootCAs = pool
+	if caFile == "" {
+		return credentials.NewTLS(conf), nil
 	}
+	pool, err := loadTLSCAPool(caFile)
+	if err != nil {
+		return nil, err
+	}
+	conf.RootCAs = pool
 	return credentials.NewTLS(conf), nil
+}
+
+func validateTLSFlagCombination(tlsRequested bool, caFile, serverName string, skipVerify bool) error {
+	switch {
+	case !tlsRequested && serverName != "":
+		return errors.New("--tls-server-name requires --tls-ca-cert-file or --tls-insecure-skip-verify")
+	case caFile != "" && skipVerify:
+		return errors.New("--tls-ca-cert-file and --tls-insecure-skip-verify are mutually exclusive")
+	default:
+		return nil
+	}
+}
+
+func loadTLSCAPool(caFile string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(caFile) //nolint:gosec // operator-selected CA file
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, errors.New("TLS CA file contains no certificates")
+	}
+	return pool, nil
 }
 
 func warningSink(logger *slog.Logger) func(string, ...any) {

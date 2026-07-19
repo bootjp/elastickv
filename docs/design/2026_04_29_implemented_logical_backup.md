@@ -361,11 +361,9 @@ item table emits 50 million inodes. On most modern filesystems
 (ext4/xfs/zfs/apfs) this is fine for write-once-and-tar dumps but
 slow for live filesystem operations.
 
-For tables where the inode count is the binding constraint, the
-producer accepts an opt-in `--dynamodb-bundle-mode jsonl` (paired
-with `--dynamodb-bundle-size 64MiB`, defaulting to that value) that
-emits items as `items/data-<part-id>.jsonl` instead, packed up to the
-configurable per-file size budget:
+The logical decoder implements an opt-in JSONL layout (paired with a
+configurable part-size budget) that emits items as
+`items/data-<part-id>.jsonl`:
 
 ```text
 dynamodb/orders/
@@ -377,17 +375,15 @@ dynamodb/orders/
 ```
 
 `MANIFEST.json` records the choice (`dynamodb_layout: "per-item" |
-"jsonl"`) so a restore tool dispatches the right reader. The bundle
-mode is an explicit operational decision; the default stays per-file
-because that is the layout the user asked for and the layout that
-makes one-line recovery scripts trivial. Operators are also free to
-post-process a per-item dump into bundles (`find … | xargs cat`)
-without losing any information, so the choice is not load-bearing on
-the format itself.
+"jsonl"`) so a restore tool can dispatch the right reader. The live
+producer currently rejects `--dynamodb-bundle-mode jsonl` when DynamoDB is
+selected because the documented native snapshot encoder cannot reverse that
+layout yet. Shipping the producer mode and reverse encoder together is an
+intentional future extension; completed live backups therefore remain
+restorable by the current native path.
 
-The producer emits a structured warning when an unbundled scope
-exceeds 1 million items so operators can decide whether to switch
-modes for that table.
+The producer emits a structured warning when an unbundled scope exceeds one
+million items so operators can provision inode capacity explicitly.
 
 GSIs are **not materialized** under the dump because they are derivable
 from `_schema.json` plus the base item set. Re-creating the table from
@@ -445,9 +441,10 @@ Multipart parts are **flattened on dump**: the user gets the assembled
 object, not the per-part fragments. Tools like `aws s3 cp --recursive`
 work on the dump directory tree directly. In-flight multipart uploads
 (`!s3|upload|meta|`, `!s3|upload|part|`, blob chunks not yet committed by
-`CompleteMultipartUpload`) are excluded by default; an
-`--include-incomplete-uploads` dump flag emits them under
-`s3/<bucket>/_incomplete_uploads/<uploadID>/`.
+`CompleteMultipartUpload`) are excluded. The decoder has an
+`--include-incomplete-uploads` representation under
+`s3/<bucket>/_incomplete_uploads/<uploadID>/`, but the live producer rejects
+that mode until the native snapshot encoder can reverse it.
 
 `_bucket.json`:
 
@@ -466,8 +463,9 @@ Generation handling: only the live (latest) generation per bucket is
 included. Pre-generation orphans (objects under
 `!s3|blob|<bucket>|<oldGen>|...`) are deliberately omitted — they exist on
 disk only because GC has not run yet, and replaying them into a fresh
-elastickv would resurrect deleted state. They land under
-`_orphans/<oldGen>/` only when `--include-orphans` is passed.
+elastickv would resurrect deleted state. The decoder can place them under
+`_orphans/<oldGen>/`, but the live producer rejects `--include-orphans` until
+the native snapshot encoder supports that subtree.
 
 ### Redis
 
@@ -599,10 +597,10 @@ The schema is the dump-time projection of `sqsMessageRecord`
 (`adapter/sqs_messages.go:80`) with **all visibility-state fields present
 but zeroed**. A restored queue starts with every message visible — which
 matches what AWS SQS does when a queue is rehydrated from a backup. If the
-operator explicitly requests `--preserve-visibility`, the live
-`visible_at_millis` / `current_receipt_token` are kept, but this is opt-in
-because resuming with a stale receipt token mid-flight is almost never
-the right behavior.
+decoder can preserve live `visible_at_millis` / `current_receipt_token`, but
+the live producer rejects that opt-in until the native snapshot encoder can
+round-trip those fields. Resuming with a stale receipt token mid-flight is
+also rarely the desired restore behavior.
 
 JSONL was chosen over per-message files for two reasons: (1) production
 queues commonly hold tens of thousands of messages, and one file per
@@ -614,8 +612,9 @@ In-flight side records (`!sqs|msg|dedup|`, `!sqs|msg|group|`,
 `!sqs|msg|byage|`, `!sqs|msg|vis|`, `!sqs|queue|tombstone|`) are derivable
 from the queue config + message records and are not dumped. The dedup
 window will reset on restore; this is documented as expected behavior.
-Operators who need exactness pass `--include-sqs-side-records`, which
-emits an `_internals/` subdirectory of newline-delimited records.
+The decoder can emit an `_internals/` subdirectory of newline-delimited side
+records, but the live producer rejects `--include-sqs-side-records` until the
+native snapshot encoder can reverse them.
 
 ## MANIFEST.json
 
@@ -1133,15 +1132,11 @@ elastickv-backup dump \
   [--adapter dynamodb,s3,redis,sqs] \
   [--scope    dynamodb=orders,users] \
   [--scope    s3=photos] \
-  [--include-incomplete-uploads] \
-  [--include-orphans] \
-  [--preserve-sqs-visibility] \
-  [--include-sqs-side-records] \
   [--checksums sha256] \
   [--ttl-ms 1800000] \
   [--begin-backup-deadline 30s] \
   [--end-backup-deadline 30s] \
-  [--dynamodb-bundle-mode per-item|jsonl] \
+  [--dynamodb-bundle-mode per-item] \
   [--dynamodb-bundle-size 64MiB] \
   [--rename-collisions]
 ```
@@ -1257,10 +1252,9 @@ parser, the format has failed its goal.
   restore (the body hash drives dedup; replaying the dump produces the
   same hashes). For ID-based dedup, callers replaying messages from
   the dump *and* from a still-live source concurrently can produce
-  duplicates. Operators who depend on exact dedup state across a
-  restore use `--include-sqs-side-records` to opt in to the
-  `_internals/dedup.jsonl` artifact, then replay it through a
-  follow-up tool that re-seeds the dedup keys.
+  duplicates. Exact side-record backup and replay remains a future extension;
+  the live producer rejects `--include-sqs-side-records` until the native
+  reverse encoder and a supported replay path can preserve it.
 - **Redis TTL keys may already be expired by the time of restore.**
   TTLs are dumped as absolute Unix-millis (`expire_at_ms`). The
   default restore behavior is **skip-expired**: keys whose

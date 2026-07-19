@@ -423,6 +423,40 @@ func TestExpectedKeysBaselineToleratesTTLExpiry(t *testing.T) {
 	}
 }
 
+func TestExpectedKeysBaselineRequiresRecordForSmallNonEmptyScope(t *testing.T) {
+	t.Parallel()
+	scope := Scope{Adapter: adapterRedis, Name: "db_0"}
+	selected := map[Scope]struct{}{scope: {}}
+	for _, expected := range []uint64{1, 2} {
+		baseline := []*pb.BackupExpectedKeys{{Adapter: scope.Adapter, Scope: scope.Name, KeyCount: expected}}
+		err := validateExpectedLiveCounts(selected, map[Scope]uint64{scope: 0}, baseline)
+		if !errors.Is(err, ErrCompactionDuringDump) {
+			t.Fatalf("baseline=%d error=%v, want ErrCompactionDuringDump", expected, err)
+		}
+	}
+}
+
+func TestValidateLiveBackupRestoreCompatibility(t *testing.T) {
+	t.Parallel()
+	cases := []LiveBackupOptions{
+		{Adapters: AdapterSet{DynamoDB: true}, DynamoDBBundleJSONL: true},
+		{Adapters: AdapterSet{S3: true}, IncludeIncompleteUploads: true},
+		{Adapters: AdapterSet{S3: true}, IncludeOrphans: true},
+		{Adapters: AdapterSet{SQS: true}, PreserveSQSVisibility: true},
+		{Adapters: AdapterSet{SQS: true}, IncludeSQSSideRecords: true},
+	}
+	for _, opts := range cases {
+		if err := ValidateLiveBackupRestoreCompatibility(opts); !errors.Is(err, ErrLiveBackupRestoreUnsupported) {
+			t.Fatalf("opts=%+v error=%v, want ErrLiveBackupRestoreUnsupported", opts, err)
+		}
+	}
+	if err := ValidateLiveBackupRestoreCompatibility(LiveBackupOptions{
+		Adapters: AdapterSet{Redis: true}, DynamoDBBundleJSONL: true, IncludeOrphans: true,
+	}); err != nil {
+		t.Fatalf("adapter-scoped options rejected: %v", err)
+	}
+}
+
 func waitForLiveBackupRenewal(t *testing.T, rpc *fakeLiveBackupRPC) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

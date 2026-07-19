@@ -68,8 +68,10 @@ elastickv-backup dump \
   --scope s3=photos
 ```
 
-For large DynamoDB tables, `--dynamodb-bundle-mode jsonl` avoids one inode per
-item. `--dynamodb-bundle-size` defaults to `64MiB` in that mode.
+The producer currently requires DynamoDB per-item output. JSONL output remains
+disabled until the native snapshot encoder can reverse that layout. The S3
+incomplete-upload/orphan and SQS visibility/side-record opt-ins are likewise
+rejected while the documented native restore path cannot preserve them.
 
 ## Stream An Archive
 
@@ -133,9 +135,9 @@ df -i /backups
 du -sh /backups/elastickv-2026-07-18
 ```
 
-Per-item DynamoDB output can consume one inode per item. Switch future runs to
-`--dynamodb-bundle-mode jsonl` when inode pressure, rather than bytes, is the
-limiting resource.
+Per-item DynamoDB output can consume one inode per item. Capacity planning must
+include that inode cost until JSONL output and its native reverse encoder ship
+together.
 
 ## Failure Handling
 
