@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	defaultMaxActiveBackupPins = 64
+	defaultMaxActiveBackupPins = 4
 	defaultBackupPinSweepEvery = time.Second
 )
 
@@ -231,19 +231,14 @@ func (t *ActiveTimestampTracker) Extend(pinID BackupPinID, deadline time.Time) e
 }
 
 func (t *ActiveTimestampTracker) ExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
-	return t.extendForGroup(pinID, groupID, deadline)
+	return t.extendForGroup(pinID, groupID, deadline, true)
 }
 
-func (t *ActiveTimestampTracker) ApplyExtendForGroup(
-	pinID BackupPinID,
-	groupID uint64,
-	readTS uint64,
-	deadline time.Time,
-) error {
-	return t.pinWithDeadlineForGroup(pinID, groupID, readTS, deadline, false)
+func (t *ActiveTimestampTracker) ApplyExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+	return t.extendForGroup(pinID, groupID, deadline, false)
 }
 
-func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time, returnMissingExpired bool) error {
 	if t == nil {
 		return nil
 	}
@@ -255,9 +250,12 @@ func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint6
 	pin, exists := t.backupPins[key]
 	if !exists {
 		t.mu.Unlock()
+		if !returnMissingExpired {
+			return nil
+		}
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
-	if !pin.deadline.After(time.Now()) {
+	if returnMissingExpired && !pin.deadline.After(time.Now()) {
 		delete(t.backupPins, key)
 		t.mu.Unlock()
 		t.logExpiredBackupPins([]expiredBackupPin{{key: key, ts: pin.readTS}})

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 option go_package = "github.com/bootjp/elastickv/proto";
 
-// Admin is the node-side read-only admin gRPC service consumed by
+// Admin is the node-side admin gRPC service consumed by
 // cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
 // metadata unless the node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
@@ -16,6 +16,7 @@ service Admin {
   rpc RenewBackup (RenewBackupRequest) returns (RenewBackupResponse) {}
   rpc EndBackup (EndBackupRequest) returns (EndBackupResponse) {}
   rpc ListAdaptersAndScopes (ListAdaptersAndScopesRequest) returns (ListAdaptersAndScopesResponse) {}
+  rpc StreamBackup (StreamBackupRequest) returns (stream BackupKV) {}
   rpc GetNodeVersion (GetNodeVersionRequest) returns (GetNodeVersionResponse) {}
   rpc StreamEvents (StreamEventsRequest) returns (stream StreamEventsEvent) {}
 }
@@ -172,6 +173,7 @@ message BackupExpectedKeys {
   string adapter = 1;
   string scope = 2;
   uint64 key_count = 3;
+  uint64 applied_index_at_count = 4;
 }
 
 message BeginBackupRequest {
@@ -193,6 +195,8 @@ message RenewBackupRequest {
 
 message RenewBackupResponse {
   uint64 ttl_ms_effective = 1;
+  // Replaces the request token and carries the newly committed hard deadline.
+  bytes pin_token = 2;
 }
 
 message EndBackupRequest {
@@ -214,10 +218,26 @@ message ListAdaptersAndScopesResponse {
   repeated BackupScope scopes = 1;
 }
 
+message StreamBackupRequest {
+  bytes pin_token = 1;
+  // Empty means every scope present at read_ts. Otherwise only the exact
+  // adapter/scope pairs are emitted.
+  repeated BackupScope scopes = 2;
+}
+
+message BackupKV {
+  bytes key = 1;
+  bytes value = 2;
+}
+
 message GetNodeVersionRequest {}
 
 message GetNodeVersionResponse {
   string node_version = 1;
+  // backup_protocol_version is a capability gate, not a release-version
+  // comparison. Zero means the node cannot safely apply live-backup FSM
+  // entries; version 1 supports reservation, pin, renew, release and stream.
+  uint32 backup_protocol_version = 2;
 }
 
 message StreamEventsRequest {}

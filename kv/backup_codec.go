@@ -11,24 +11,28 @@ import (
 const (
 	raftEncodeBackup byte = 0x0e
 
-	backupSubtypePin     byte = 0x01
-	backupSubtypeExtend  byte = 0x02
-	backupSubtypeRelease byte = 0x03
+	backupSubtypePin       byte = 0x01
+	backupSubtypeExtend    byte = 0x02
+	backupSubtypeRelease   byte = 0x03
+	backupSubtypeReserve   byte = 0x04
+	backupSubtypeUnreserve byte = 0x05
 
 	backupPinIDBytes = 16
 	backupUint64Size = 8
 
 	backupEnvelopeHeaderLen = 2
 	backupPinEntryLen       = backupEnvelopeHeaderLen + backupPinIDBytes + backupUint64Size + backupUint64Size
-	backupExtendEntryLen    = backupPinEntryLen
+	backupExtendEntryLen    = backupEnvelopeHeaderLen + backupPinIDBytes + backupUint64Size
 	backupReleaseEntryLen   = backupEnvelopeHeaderLen + backupPinIDBytes
 
-	backupPinIDStart    = backupEnvelopeHeaderLen
-	backupPinIDEnd      = backupPinIDStart + backupPinIDBytes
-	backupReadTSStart   = backupPinIDEnd
-	backupReadTSEnd     = backupReadTSStart + backupUint64Size
-	backupDeadlineStart = backupReadTSEnd
-	backupDeadlineEnd   = backupDeadlineStart + backupUint64Size
+	backupPinIDStart        = backupEnvelopeHeaderLen
+	backupPinIDEnd          = backupPinIDStart + backupPinIDBytes
+	backupReadTSStart       = backupPinIDEnd
+	backupReadTSEnd         = backupReadTSStart + backupUint64Size
+	backupDeadlineStart     = backupReadTSEnd
+	backupDeadlineEnd       = backupDeadlineStart + backupUint64Size
+	backupExtendMillisStart = backupPinIDEnd
+	backupExtendMillisEnd   = backupExtendMillisStart + backupUint64Size
 )
 
 var (
@@ -44,13 +48,19 @@ type BackupPinEntry struct {
 
 type BackupExtendEntry struct {
 	PinID    BackupPinID
-	ReadTS   uint64
 	Deadline time.Time
 }
 
 type BackupReleaseEntry struct {
 	PinID BackupPinID
 }
+
+// BackupReserveEntry is committed through one deterministic Raft group before
+// fan-out. Its group-zero tracker record serializes the cluster-wide pin cap.
+type BackupReserveEntry = BackupPinEntry
+
+// BackupUnreserveEntry releases the group-zero capacity reservation.
+type BackupUnreserveEntry = BackupReleaseEntry
 
 type backupEntry struct {
 	subtype byte
@@ -74,8 +84,7 @@ func EncodeBackupExtendEntry(entry BackupExtendEntry) []byte {
 	out[0] = raftEncodeBackup
 	out[1] = backupSubtypeExtend
 	copy(out[backupPinIDStart:backupPinIDEnd], entry.PinID[:])
-	binary.BigEndian.PutUint64(out[backupReadTSStart:backupReadTSEnd], entry.ReadTS)
-	binary.BigEndian.PutUint64(out[backupDeadlineStart:backupDeadlineEnd], backupDeadlineMillis(entry.Deadline))
+	binary.BigEndian.PutUint64(out[backupExtendMillisStart:backupExtendMillisEnd], backupDeadlineMillis(entry.Deadline))
 	return out
 }
 
@@ -84,6 +93,18 @@ func EncodeBackupReleaseEntry(entry BackupReleaseEntry) []byte {
 	out[0] = raftEncodeBackup
 	out[1] = backupSubtypeRelease
 	copy(out[backupPinIDStart:backupPinIDEnd], entry.PinID[:])
+	return out
+}
+
+func EncodeBackupReserveEntry(entry BackupReserveEntry) []byte {
+	out := EncodeBackupPinEntry(entry)
+	out[1] = backupSubtypeReserve
+	return out
+}
+
+func EncodeBackupUnreserveEntry(entry BackupUnreserveEntry) []byte {
+	out := EncodeBackupReleaseEntry(entry)
+	out[1] = backupSubtypeUnreserve
 	return out
 }
 
@@ -99,14 +120,14 @@ func decodeBackupPayload(data []byte) (backupEntry, error) {
 		return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 	}
 	switch data[0] {
-	case backupSubtypePin:
+	case backupSubtypePin, backupSubtypeReserve:
 		if len(data) != backupPinEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 		}
 		var id BackupPinID
 		copy(id[:], data[backupPinIDStart-1:backupPinIDEnd-1])
 		return backupEntry{
-			subtype: backupSubtypePin,
+			subtype: data[0],
 			pin: BackupPinEntry{
 				PinID:    id,
 				ReadTS:   binary.BigEndian.Uint64(data[backupReadTSStart-1 : backupReadTSEnd-1]),
@@ -123,18 +144,17 @@ func decodeBackupPayload(data []byte) (backupEntry, error) {
 			subtype: backupSubtypeExtend,
 			extend: BackupExtendEntry{
 				PinID:    id,
-				ReadTS:   binary.BigEndian.Uint64(data[backupReadTSStart-1 : backupReadTSEnd-1]),
-				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupDeadlineStart-1 : backupDeadlineEnd-1])),
+				Deadline: backupDeadlineFromMillis(binary.BigEndian.Uint64(data[backupExtendMillisStart-1 : backupExtendMillisEnd-1])),
 			},
 		}, nil
-	case backupSubtypeRelease:
+	case backupSubtypeRelease, backupSubtypeUnreserve:
 		if len(data) != backupReleaseEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 		}
 		var id BackupPinID
 		copy(id[:], data[backupPinIDStart-1:backupPinIDEnd-1])
 		return backupEntry{
-			subtype: backupSubtypeRelease,
+			subtype: data[0],
 			release: BackupReleaseEntry{
 				PinID: id,
 			},

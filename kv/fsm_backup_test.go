@@ -27,7 +27,6 @@ func TestApplyBackupUsesSharedTracker(t *testing.T) {
 
 	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
 		PinID:    pinID,
-		ReadTS:   42,
 		Deadline: secondDeadline,
 	}))))
 	gotDeadline, ok := tracker.BackupPinDeadline(pinID)
@@ -97,13 +96,28 @@ func TestApplyBackupLimitDoesNotDropCommittedPins(t *testing.T) {
 	require.Equal(t, uint64(42), tracker.Oldest())
 }
 
-func TestApplyBackupMissingExtendRestoresCommittedFence(t *testing.T) {
+func TestApplyBackupMissingExtendIsNoop(t *testing.T) {
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 
 	resp := fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
 		PinID:    backupTrackerTestPinID(1),
-		ReadTS:   42,
+		Deadline: time.Now().Add(time.Hour),
+	}))
+
+	require.NoError(t, haltApplyOf(resp))
+	require.Nil(t, resp)
+	require.Equal(t, 0, tracker.ActiveBackupPinCount())
+}
+
+func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, tracker.PinWithDeadline(pinID, 42, time.Now().Add(-time.Millisecond)))
+
+	resp := fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
+		PinID:    pinID,
 		Deadline: time.Now().Add(time.Hour),
 	}))
 
@@ -113,24 +127,46 @@ func TestApplyBackupMissingExtendRestoresCommittedFence(t *testing.T) {
 	require.Equal(t, uint64(42), tracker.Oldest())
 }
 
-func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
+func TestApplyBackupObservesPinnedReadTimestamp(t *testing.T) {
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	hlc := NewHLC()
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		store.NewMVCCStore(), hlc, tracker, WithRouteHistory(nil, 1),
+	).(*kvFSM)
+	require.True(t, ok)
+	readTS := hlc.Next() + 10_000
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+	require.GreaterOrEqual(t, hlc.Current(), readTS)
+}
+
+func TestApplyBackupReserveEnforcesCapacityAndUnreserveReleases(t *testing.T) {
+	tracker := NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0),
+		WithActiveTimestampTrackerMaxBackupPins(1),
+	)
 	fsm := newBackupTestFSM(t, tracker)
-	pinID := backupTrackerTestPinID(1)
-	require.NoError(t, tracker.PinWithDeadline(pinID, 42, time.Now().Add(-time.Millisecond)))
-	tracker.reapExpiredBackupPins(time.Now())
-	require.Equal(t, 0, tracker.ActiveBackupPinCount())
+	deadline := time.Now().Add(time.Hour)
+	first := backupTrackerTestPinID(1)
+	second := backupTrackerTestPinID(2)
 
-	resp := fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
-		PinID:    pinID,
-		ReadTS:   42,
-		Deadline: time.Now().Add(time.Hour),
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: first, ReadTS: 42, Deadline: deadline,
+	}))))
+	resp := fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: second, ReadTS: 43, Deadline: deadline,
 	}))
-
 	require.NoError(t, haltApplyOf(resp))
-	require.Nil(t, resp)
-	require.Equal(t, 1, tracker.ActiveBackupPinCount())
-	require.Equal(t, uint64(42), tracker.Oldest())
+	respErr, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, respErr, ErrTooManyActiveBackups)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupUnreserveEntry(BackupUnreserveEntry{PinID: first}))))
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: second, ReadTS: 43, Deadline: deadline,
+	}))))
 }
 
 func TestApplyBackupZeroDeadlineReturnsNonFatalError(t *testing.T) {

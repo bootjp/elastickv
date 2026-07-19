@@ -19,8 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName      = "/Internal/Forward"
-	Internal_RelayPublish_FullMethodName = "/Internal/RelayPublish"
+	Internal_Forward_FullMethodName              = "/Internal/Forward"
+	Internal_ForwardAdminProposal_FullMethodName = "/Internal/ForwardAdminProposal"
+	Internal_RelayPublish_FullMethodName         = "/Internal/RelayPublish"
 )
 
 // InternalClient is the client API for Internal service.
@@ -29,6 +30,7 @@ const (
 type InternalClient interface {
 	// for internal leader redirect only
 	Forward(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
+	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
 	RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error)
 }
 
@@ -44,6 +46,16 @@ func (c *internalClient) Forward(ctx context.Context, in *ForwardRequest, opts .
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ForwardResponse)
 	err := c.cc.Invoke(ctx, Internal_Forward_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardAdminProposalResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardAdminProposal_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +78,7 @@ func (c *internalClient) RelayPublish(ctx context.Context, in *RelayPublishReque
 type InternalServer interface {
 	// for internal leader redirect only
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
+	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
 	RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
@@ -79,6 +92,9 @@ type UnimplementedInternalServer struct{}
 
 func (UnimplementedInternalServer) Forward(context.Context, *ForwardRequest) (*ForwardResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
+}
+func (UnimplementedInternalServer) ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardAdminProposal not implemented")
 }
 func (UnimplementedInternalServer) RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RelayPublish not implemented")
@@ -122,6 +138,24 @@ func _Internal_Forward_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ForwardAdminProposal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardAdminProposalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardAdminProposal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, req.(*ForwardAdminProposalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Internal_RelayPublish_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RelayPublishRequest)
 	if err := dec(in); err != nil {
@@ -150,6 +184,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Forward",
 			Handler:    _Internal_Forward_Handler,
+		},
+		{
+			MethodName: "ForwardAdminProposal",
+			Handler:    _Internal_ForwardAdminProposal_Handler,
 		},
 		{
 			MethodName: "RelayPublish",

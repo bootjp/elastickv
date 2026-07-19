@@ -485,7 +485,7 @@ func (s *S3Encoder) HandleIncompleteUpload(prefix string, key, value []byte) err
 	if !s.includeIncompleteUploads {
 		return nil
 	}
-	bucket, _, _, _, _, ok := parseUploadFamily(prefix, key)
+	bucket, ok := parseUploadFamily(prefix, key)
 	if !ok {
 		return errors.Wrapf(ErrS3MalformedKey, "upload-family key: %q", key)
 	}
@@ -1066,10 +1066,11 @@ func ensureChunkPaths(m map[s3ChunkKey]string) map[s3ChunkKey]string {
 	return m
 }
 
-func parseUploadFamily(prefix string, key []byte) (bucket string, generation uint64, object string, uploadID string, partNo uint64, ok bool) {
+func parseUploadFamily(prefix string, key []byte) (string, bool) {
 	switch prefix {
 	case S3UploadPartPrefix:
-		return s3keys.ParseUploadPartKey(key)
+		bucket, _, _, _, _, ok := s3keys.ParseUploadPartKey(key)
+		return bucket, ok
 	case S3UploadMetaPrefix:
 		// Parse via prefix arithmetic: same shape as upload-part minus
 		// the partNo trailer. ParseUploadPartKey would reject the
@@ -1077,22 +1078,22 @@ func parseUploadFamily(prefix string, key []byte) (bucket string, generation uin
 		// only needs the bucket for routing.
 		out := key[len(S3UploadMetaPrefix):]
 		if len(out) == 0 {
-			return "", 0, "", "", 0, false
+			return "", false
 		}
 		return decodeBucketSegmentForRouting(out)
 	}
-	return "", 0, "", "", 0, false
+	return "", false
 }
 
-func decodeBucketSegmentForRouting(rest []byte) (string, uint64, string, string, uint64, bool) {
+func decodeBucketSegmentForRouting(rest []byte) (string, bool) {
 	// We only need the bucket for routing; the rest is passed through
 	// as opaque bytes.
 	for i := 0; i < len(rest); i++ {
 		if rest[i] == 0x00 && i+1 < len(rest) && rest[i+1] == 0x01 {
-			return string(rest[:i]), 0, "", "", 0, true
+			return string(rest[:i]), true
 		}
 	}
-	return "", 0, "", "", 0, false
+	return "", false
 }
 
 func uint64Hex(v uint64) string {

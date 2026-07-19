@@ -6,7 +6,6 @@ import (
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
-	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -18,6 +17,24 @@ const defaultBackupScanPageSize = 1024
 type BackupScanner interface {
 	Next(ctx context.Context) (*store.KVPair, bool, error)
 	Close() error
+}
+
+// BackupKeyScanner is the count-only counterpart to BackupScanner. It pages
+// through the same captured route set without materializing values.
+type BackupKeyScanner interface {
+	Next(ctx context.Context) ([]byte, bool, error)
+	Close() error
+}
+
+// BackupRouteSnapshot is an immutable route view shared by every scan in one
+// logical backup. Keeping it separate from a scanner lets BeginBackup count
+// keys and StreamBackup materialize values from the same ownership view even
+// when the live route catalog changes between those RPCs.
+type BackupRouteSnapshot struct {
+	routes        []distribution.Route
+	clampToRoutes bool
+	start         []byte
+	end           []byte
 }
 
 type backupScanner struct {
@@ -39,22 +56,51 @@ type routedScanKey struct {
 	route distribution.Route
 }
 
+type backupKeyScanner struct {
+	store         *ShardStore
+	routes        []distribution.Route
+	clampToRoutes bool
+	end           []byte
+	ts            uint64
+	pageSize      int
+	cursor        []byte
+	page          []routedScanKey
+	index         int
+	closed        bool
+	exhausted     bool
+}
+
 func NewBackupScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupScanner {
+	snapshot := st.CaptureBackupRouteSnapshot(start, end)
+	return NewBackupScannerAtSnapshot(st, snapshot, ts, pageSize)
+}
+
+// CaptureBackupRouteSnapshot captures route ownership and scan bounds once.
+func (s *ShardStore) CaptureBackupRouteSnapshot(start []byte, end []byte) BackupRouteSnapshot {
+	if s == nil {
+		return BackupRouteSnapshot{start: bytes.Clone(start), end: bytes.Clone(end)}
+	}
+	routes, clampToRoutes := s.routesForForwardScan(start, end)
+	return BackupRouteSnapshot{
+		routes:        cloneBackupRoutes(routes),
+		clampToRoutes: clampToRoutes,
+		start:         bytes.Clone(start),
+		end:           bytes.Clone(end),
+	}
+}
+
+// NewBackupScannerAtSnapshot creates a value scanner from a captured route view.
+func NewBackupScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupScanner {
 	if pageSize <= 0 {
 		pageSize = defaultBackupScanPageSize
 	}
-	var routes []distribution.Route
-	var clampToRoutes bool
-	if st != nil {
-		routes, clampToRoutes = st.routesForForwardScan(start, end)
-		routes = append([]distribution.Route(nil), routes...)
-	}
+	snapshot = cloneBackupRouteSnapshot(snapshot)
 	return &backupScanner{
 		store:         st,
-		routes:        routes,
-		clampToRoutes: clampToRoutes,
-		cursor:        bytes.Clone(start),
-		end:           bytes.Clone(end),
+		routes:        snapshot.routes,
+		clampToRoutes: snapshot.clampToRoutes,
+		cursor:        snapshot.start,
+		end:           snapshot.end,
 		ts:            ts,
 		pageSize:      pageSize,
 	}
@@ -62,6 +108,40 @@ func NewBackupScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageS
 
 func (s *ShardStore) NewBackupScanner(start []byte, end []byte, ts uint64, pageSize int) BackupScanner {
 	return NewBackupScanner(s, start, end, ts, pageSize)
+}
+
+func (s *ShardStore) NewBackupScannerAtSnapshot(snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupScanner {
+	return NewBackupScannerAtSnapshot(s, snapshot, ts, pageSize)
+}
+
+func NewBackupKeyScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupKeyScanner {
+	snapshot := st.CaptureBackupRouteSnapshot(start, end)
+	return NewBackupKeyScannerAtSnapshot(st, snapshot, ts, pageSize)
+}
+
+// NewBackupKeyScannerAtSnapshot creates a key-only scanner from a captured route view.
+func NewBackupKeyScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupKeyScanner {
+	if pageSize <= 0 {
+		pageSize = defaultBackupScanPageSize
+	}
+	snapshot = cloneBackupRouteSnapshot(snapshot)
+	return &backupKeyScanner{
+		store:         st,
+		routes:        snapshot.routes,
+		clampToRoutes: snapshot.clampToRoutes,
+		cursor:        snapshot.start,
+		end:           snapshot.end,
+		ts:            ts,
+		pageSize:      pageSize,
+	}
+}
+
+func (s *ShardStore) NewBackupKeyScanner(start []byte, end []byte, ts uint64, pageSize int) BackupKeyScanner {
+	return NewBackupKeyScanner(s, start, end, ts, pageSize)
+}
+
+func (s *ShardStore) NewBackupKeyScannerAtSnapshot(snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupKeyScanner {
+	return NewBackupKeyScannerAtSnapshot(s, snapshot, ts, pageSize)
 }
 
 func (s *backupScanner) Next(ctx context.Context) (*store.KVPair, bool, error) {
@@ -91,6 +171,63 @@ func (s *backupScanner) Close() error {
 	s.closed = true
 	s.exhausted = true
 	s.page = nil
+	return nil
+}
+
+func (s *backupKeyScanner) Next(ctx context.Context) ([]byte, bool, error) {
+	if s.closed || s.store == nil {
+		return nil, false, nil
+	}
+	for s.index >= len(s.page) {
+		if err := s.loadNextPage(ctx); err != nil {
+			return nil, false, err
+		}
+		if len(s.page) == 0 {
+			if s.exhausted {
+				return nil, false, nil
+			}
+			continue
+		}
+	}
+	key := bytes.Clone(s.page[s.index].key)
+	s.index++
+	return key, true, nil
+}
+
+func (s *backupKeyScanner) Close() error {
+	s.closed = true
+	s.exhausted = true
+	s.page = nil
+	return nil
+}
+
+func (s *backupKeyScanner) loadNextPage(ctx context.Context) error {
+	if s.exhausted {
+		s.page = nil
+		s.index = 0
+		return nil
+	}
+	keys, err := s.store.scanKeyRoutesWithSourceAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
+	if err != nil {
+		return err
+	}
+	s.page = s.page[:0]
+	for _, item := range keys {
+		if _, ok := routeForRoutedKey(item, s.routes); ok {
+			s.page = append(s.page, item)
+		}
+	}
+	s.index = 0
+	if len(keys) == 0 {
+		s.exhausted = true
+		return nil
+	}
+	last := lastRoutedScanKey(keys)
+	if last == nil {
+		s.exhausted = true
+		return nil
+	}
+	s.cursor = nextScanCursor(last)
 	return nil
 }
 
@@ -134,11 +271,15 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 }
 
 func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution.Route, bool) {
+	return routeForRoutedKey(item, s.routes)
+}
+
+func routeForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool) {
 	key := routeKey(item.key)
 	if routeContainsKey(item.route, key) {
 		return item.route, true
 	}
-	for _, route := range s.routes {
+	for _, route := range routes {
 		if route.GroupID != item.route.GroupID {
 			continue
 		}
@@ -147,6 +288,25 @@ func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution
 		}
 	}
 	return distribution.Route{}, false
+}
+
+func cloneBackupRouteSnapshot(snapshot BackupRouteSnapshot) BackupRouteSnapshot {
+	return BackupRouteSnapshot{
+		routes:        cloneBackupRoutes(snapshot.routes),
+		clampToRoutes: snapshot.clampToRoutes,
+		start:         bytes.Clone(snapshot.start),
+		end:           bytes.Clone(snapshot.end),
+	}
+}
+
+func cloneBackupRoutes(routes []distribution.Route) []distribution.Route {
+	out := make([]distribution.Route, len(routes))
+	for i, route := range routes {
+		out[i] = route
+		out[i].Start = bytes.Clone(route.Start)
+		out[i].End = bytes.Clone(route.End)
+	}
+	return out
 }
 
 func (s *ShardStore) scanKeyRoutesWithSourceAt(
@@ -177,7 +337,7 @@ func (s *ShardStore) scanKeyRoutesWithSourceAt(
 		if err != nil {
 			return nil, err
 		}
-		out = s.mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), limit)
+		out = mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), routes, limit)
 		if clampToRoutes && len(out) >= limit {
 			break
 		}
@@ -196,7 +356,12 @@ func routedScanKeys(route distribution.Route, keys [][]byte) []routedScanKey {
 	return items
 }
 
-func (s *ShardStore) mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []routedScanKey, limit int) []routedScanKey {
+func mergeAndTrimRoutedScanKeys(
+	out []routedScanKey,
+	keys []routedScanKey,
+	routes []distribution.Route,
+	limit int,
+) []routedScanKey {
 	if len(keys) == 0 {
 		return out
 	}
@@ -210,7 +375,7 @@ func (s *ShardStore) mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []rout
 			continue
 		}
 		if write > 0 && bytes.Equal(out[write-1].key, item.key) {
-			out[write-1] = s.preferredRoutedScanKey(out[write-1], item)
+			out[write-1] = preferredRoutedScanKey(out[write-1], item, routes)
 			continue
 		}
 		out[write] = item
@@ -225,18 +390,13 @@ func (s *ShardStore) mergeAndTrimRoutedScanKeys(out []routedScanKey, keys []rout
 	return out[:limit]
 }
 
-func (s *ShardStore) preferredRoutedScanKey(current routedScanKey, candidate routedScanKey) routedScanKey {
-	if !fskeys.IsUsageRouteKey(candidate.key) {
+func preferredRoutedScanKey(current, candidate routedScanKey, routes []distribution.Route) routedScanKey {
+	_, currentOwned := routeForRoutedKey(current, routes)
+	_, candidateOwned := routeForRoutedKey(candidate, routes)
+	if candidateOwned && !currentOwned {
 		return candidate
 	}
-	owner, ok := s.engine.GetRoute(routeKey(candidate.key))
-	if !ok {
-		return candidate
-	}
-	if current.route.GroupID == owner.GroupID {
-		return current
-	}
-	return candidate
+	return current
 }
 
 func lastRoutedScanKey(keys []routedScanKey) []byte {

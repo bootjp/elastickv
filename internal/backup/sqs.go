@@ -379,7 +379,13 @@ func (s *SQSEncoder) HandleSideRecord(prefix string, key, value []byte) error {
 	if !s.includeSideRecords {
 		return nil
 	}
-	encQueue, err := parseSQSGenericKey(key, prefix)
+	var encQueue string
+	var err error
+	if prefix == SQSQueueSeqPrefix {
+		encQueue, err = parseSQSQueueSequenceKey(key)
+	} else {
+		encQueue, err = parseSQSGenericKey(key, prefix)
+	}
 	if err != nil {
 		// Tombstones include a fixed-width gen but no msg ID; the
 		// generic parser tolerates the empty trailer.
@@ -392,6 +398,18 @@ func (s *SQSEncoder) HandleSideRecord(prefix string, key, value []byte) error {
 		ValueB64: base64.RawURLEncoding.EncodeToString(value),
 	})
 	return nil
+}
+
+func parseSQSQueueSequenceKey(key []byte) (string, error) {
+	encoded, err := stripPrefixSegment(key, []byte(SQSQueueSeqPrefix))
+	if err != nil {
+		return "", err
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) == 0 {
+		return "", errors.Wrapf(ErrSQSMalformedKey, "invalid queue sequence key %q", key)
+	}
+	return encoded, nil
 }
 
 // Finalize flushes every queue's _queue.json and messages.jsonl. Queues

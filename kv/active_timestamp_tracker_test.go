@@ -109,9 +109,7 @@ func TestActiveTimestampTrackerApplyExtendReplaysAfterLocalExpiry(t *testing.T) 
 	now := time.Now()
 
 	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 20, now.Add(-time.Millisecond)))
-	tracker.reapExpiredBackupPins(now)
-	require.Equal(t, 0, tracker.ActiveBackupPinCount())
-	require.NoError(t, tracker.ApplyExtendForGroup(pinID, 7, 20, now.Add(time.Hour)))
+	require.NoError(t, tracker.ApplyExtendForGroup(pinID, 7, now.Add(time.Hour)))
 
 	deadline, ok := tracker.BackupPinDeadlineForGroup(pinID, 7)
 	require.True(t, ok)

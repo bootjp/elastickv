@@ -13,6 +13,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -137,6 +138,18 @@ type AdminServer struct {
 	leaderVersionProbeSeq     atomic.Uint64
 	versionCache              sync.Map
 
+	backupMu              sync.Mutex
+	backupStateMu         sync.Mutex
+	backupStore           BackupStore
+	backupReadFence       BackupReadFence
+	backupPeerProbe       BackupPeerProbe
+	backupLimiter         BackupPinLimiter
+	backupTokenKey        [32]byte
+	backupProtocolVersion uint32
+	backupConfig          backupConfig
+	backupProposers       map[uint64]raftengine.Proposer
+	backupSessions        map[kv.BackupPinID]backupSession
+
 	pb.UnimplementedAdminServer
 }
 
@@ -155,6 +168,9 @@ func NewAdminServer(self NodeIdentity, members []NodeIdentity, opts ...AdminOpti
 		now:                       time.Now,
 		leaderVersionProbeTimeout: defaultAdminLeaderVersionProbeTimeout,
 		leaderVersionCacheTTL:     defaultAdminLeaderVersionCacheTTL,
+		backupConfig:              defaultBackupConfig(),
+		backupProposers:           make(map[uint64]raftengine.Proposer),
+		backupSessions:            make(map[kv.BackupPinID]backupSession),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -521,7 +537,10 @@ func (s *AdminServer) GetNodeVersion(
 	context.Context,
 	*pb.GetNodeVersionRequest,
 ) (*pb.GetNodeVersionResponse, error) {
-	return &pb.GetNodeVersionResponse{NodeVersion: s.nodeVersion}, nil
+	return &pb.GetNodeVersionResponse{
+		NodeVersion:           s.nodeVersion,
+		BackupProtocolVersion: s.backupProtocolVersion,
+	}, nil
 }
 
 func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo, now time.Time, addresses []string) string {

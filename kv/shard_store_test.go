@@ -585,6 +585,90 @@ func TestBackupScannerPaging(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("x"), []byte("z")}, got)
 }
 
+func TestBackupKeyScannerPaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	commitTS := uint64(1)
+	for _, key := range [][]byte{[]byte("a"), []byte("b"), []byte("x"), []byte("z")} {
+		require.NoError(t, st.PutAt(ctx, key, []byte("value-not-materialized"), commitTS, 0))
+		commitTS++
+	}
+
+	sc := st.NewBackupKeyScanner([]byte(""), nil, ^uint64(0), 2)
+	defer sc.Close()
+	var got [][]byte
+	for {
+		key, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("x"), []byte("z")}, got)
+}
+
+func TestBackupKeyScannerFiltersStaleOffRouteKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	groups := map[uint64]*ShardGroup{1: {Store: store.NewMVCCStore()}}
+	st := NewShardStore(distribution.NewEngine(), groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("owned"), 2, 0))
+	scanner := &backupKeyScanner{
+		store: st, routes: []distribution.Route{{Start: []byte("m"), GroupID: 1}},
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer scanner.Close()
+
+	key, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("x"), key)
+	_, ok, err = scanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestBackupScannerReusesCapturedRouteSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("pinned-owner"), 1, 0))
+	snapshot := st.CaptureBackupRouteSnapshot(nil, nil)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("live-owner"), 2, 0))
+
+	scanner := st.NewBackupScannerAtSnapshot(snapshot, ^uint64(0), 1)
+	defer scanner.Close()
+	pair, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("pinned-owner"), pair.Value)
+}
+
 func TestBackupScannerMaterializesFromCapturedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -631,7 +715,7 @@ func TestBackupScannerMaterializesFromEnumeratedRoute(t *testing.T) {
 		2: {Store: store.NewMVCCStore()},
 	}
 	st := NewShardStore(engine, groups)
-	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale-first-route"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("first-enumerated-route"), 1, 0))
 	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("enumerated-route"), 2, 0))
 
 	sc := &backupScanner{
@@ -648,7 +732,48 @@ func TestBackupScannerMaterializesFromEnumeratedRoute(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, []byte("a"), kvp.Key)
-	require.Equal(t, []byte("enumerated-route"), kvp.Value)
+	require.Equal(t, []byte("first-enumerated-route"), kvp.Value)
+}
+
+func TestBackupScannersPreferCapturedOwnerForDuplicateKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups)
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("captured-owner"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale-owner"), 1, 0))
+	routes := []distribution.Route{
+		{RouteID: 2, Start: []byte(""), End: []byte("m"), GroupID: 2},
+		{RouteID: 1, Start: []byte("m"), GroupID: 1},
+	}
+
+	keyScanner := &backupKeyScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer keyScanner.Close()
+	key, ok, err := keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), key)
+	_, ok, err = keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	valueScanner := &backupScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer valueScanner.Close()
+	pair, ok, err := valueScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), pair.Key)
+	require.Equal(t, []byte("captured-owner"), pair.Value)
 }
 
 func TestBackupScannerPreservesFullRoutingAfterListKeyCursor(t *testing.T) {

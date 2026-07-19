@@ -1,0 +1,97 @@
+package adapter
+
+import (
+	"context"
+	stderrors "errors"
+	"testing"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
+)
+
+type internalAdminLeaderView struct {
+	state raftengine.State
+}
+
+func (v internalAdminLeaderView) State() raftengine.State { return v.state }
+func (internalAdminLeaderView) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "leader", Address: "leader:50051"}
+}
+func (internalAdminLeaderView) VerifyLeader(context.Context) error { return nil }
+func (internalAdminLeaderView) LinearizableRead(context.Context) (uint64, error) {
+	return 0, nil
+}
+
+type internalAdminProposer struct {
+	payload  []byte
+	response any
+}
+
+func (p *internalAdminProposer) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, stderrors.New("unexpected user proposal")
+}
+
+func (p *internalAdminProposer) ProposeAdmin(
+	_ context.Context,
+	payload []byte,
+) (*raftengine.ProposalResult, error) {
+	p.payload = append([]byte(nil), payload...)
+	return &raftengine.ProposalResult{CommitIndex: 17, Response: p.response}, nil
+}
+
+func TestInternalForwardAdminProposalUsesLeaderProposer(t *testing.T) {
+	t.Parallel()
+	proposer := &internalAdminProposer{}
+	internal := NewInternalWithEngine(
+		nil,
+		internalAdminLeaderView{state: raftengine.StateLeader},
+		nil,
+		nil,
+		WithInternalAdminProposer(proposer),
+	)
+
+	resp, err := internal.ForwardAdminProposal(
+		context.Background(),
+		&pb.ForwardAdminProposalRequest{Payload: []byte("pin")},
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint64(17), resp.GetCommitIndex())
+	require.Equal(t, []byte("pin"), proposer.payload)
+}
+
+func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		state     raftengine.State
+		proposer  raftengine.Proposer
+		errTarget error
+		errText   string
+	}{
+		{name: "follower", state: raftengine.StateFollower, errTarget: ErrNotLeader},
+		{
+			name: "apply response", state: raftengine.StateLeader,
+			proposer: &internalAdminProposer{response: stderrors.New("apply failed")},
+			errText:  "apply failed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			internal := NewInternalWithEngine(
+				nil,
+				internalAdminLeaderView{state: tc.state},
+				nil,
+				nil,
+				WithInternalAdminProposer(tc.proposer),
+			)
+			_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{})
+			if tc.errTarget != nil {
+				require.ErrorIs(t, err, tc.errTarget)
+			}
+			if tc.errText != "" {
+				require.ErrorContains(t, err, tc.errText)
+			}
+		})
+	}
+}

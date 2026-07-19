@@ -18,6 +18,12 @@ func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption 
 	}
 }
 
+func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.adminProposer = proposer
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -36,6 +42,7 @@ type Internal struct {
 	transactionManager kv.Transactional
 	clock              *kv.HLC
 	tsAllocator        kv.TimestampAllocator
+	adminProposer      raftengine.Proposer
 	relay              *RedisPubSubRelay
 
 	pb.UnimplementedInternalServer
@@ -76,6 +83,42 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func (i *Internal) ForwardAdminProposal(
+	ctx context.Context,
+	req *pb.ForwardAdminProposalRequest,
+) (*pb.ForwardAdminProposalResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if i.adminProposer == nil {
+		return nil, errors.New("admin proposer is unavailable")
+	}
+	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := forwardedAdminProposalResponseError(result); err != nil {
+		return nil, err
+	}
+	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
+}
+
+func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {
+	if result == nil {
+		return errors.New("admin proposal returned nil result")
+	}
+	if result.Response == nil {
+		return nil
+	}
+	if err, ok := result.Response.(error); ok {
+		return errors.WithStack(err)
+	}
+	return errors.Errorf("unexpected admin proposal response %T", result.Response)
 }
 
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
