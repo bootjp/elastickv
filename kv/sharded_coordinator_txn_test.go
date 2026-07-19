@@ -82,6 +82,32 @@ func TestShardedCoordinatorDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 }
 
+func TestShardedCoordinatorDelPrefixBroadcast_UsesConfiguredAllShardGroups(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	tsoTxn := &recordingTransactional{}
+	dataTxn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		0: {Txn: tsoTxn},
+		1: {Txn: dataTxn},
+	}, 1, NewHLC(), nil).WithAllShardGroups(1)
+
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: DelPrefix, Key: []byte("tenant/")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Empty(t, tsoTxn.requests)
+	require.Len(t, dataTxn.requests, 1)
+	require.Equal(t, pb.Op_DEL_PREFIX, dataTxn.requests[0].Mutations[0].Op)
+	require.Equal(t, []byte("tenant/"), dataTxn.requests[0].Mutations[0].Key)
+}
+
 func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing.T) {
 	t.Parallel()
 

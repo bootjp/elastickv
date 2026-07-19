@@ -511,6 +511,7 @@ func run() error {
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
+		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
 	if err := configureCoordinatorTSO(coordinate); err != nil {
 		return err
@@ -986,7 +987,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGrou
 		leaderDynamo:        leaderDynamo,
 		leaderSQS:           leaderSQS,
 		sqsFifoPartitionMap: sqsFifoPartitionMap,
-		multi:               len(groups) > 1,
+		multi:               dataGroupsNeedMultiDirs(groups),
 	}, nil
 }
 
@@ -1094,6 +1095,9 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 	if len(parsed) == 0 {
 		return parsed, nil
 	}
+	if err := validateSQSFifoPartitionMapNoDedicatedTSOGroup(parsed); err != nil {
+		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
+	}
 	groupIDs := make(map[string]struct{}, len(groups))
 	for _, g := range groups {
 		groupIDs[strconv.FormatUint(g.id, 10)] = struct{}{}
@@ -1102,6 +1106,20 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
 	}
 	return parsed, nil
+}
+
+func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsFifoQueueRouting) error {
+	for _, queue := range slices.Sorted(maps.Keys(partitionMap)) {
+		routing := partitionMap[queue]
+		for partition, group := range routing.groups {
+			if group == strconv.FormatUint(dedicatedTSORaftGroupID, 10) {
+				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+					"queue %q partition %d: group %q is reserved for TSO",
+					queue, partition, group)
+			}
+		}
+	}
+	return nil
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
@@ -1371,6 +1389,7 @@ func buildShardGroups(
 	// NewApplier install a private per-applier cache, silently
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
+	multi = effectiveMultiDataDirs(groups, multi)
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
@@ -1996,6 +2015,8 @@ func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
 	if !*tsoEnabled {
 		return nil
 	}
+	// Group 0 is reserved for TSO state, but data-shard leaders must keep
+	// issuing timestamps locally until a TSO-leader redirect path exists.
 	tso, err := kv.NewLocalTSOAllocator(coordinate)
 	if err != nil {
 		return errors.Wrap(err, "configure tso allocator")

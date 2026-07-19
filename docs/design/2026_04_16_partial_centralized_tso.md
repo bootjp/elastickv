@@ -1,11 +1,11 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1 all-led-group HLC renewal and the M3-M5 default-group
-  TSO allocator/batch cutover are implemented; dedicated TSO Raft group wiring
-  remains open
+- Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
+  bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
+  the minimal TSO-only FSM and follower redirect/admin exposure remain open
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-07
+- Updated: 2026-07-11
 
 ---
 
@@ -33,12 +33,25 @@ Implemented:
    wiring a `LocalTSOAllocator` through `BatchAllocator` so production
    coordinators can cut over to the default-group-backed TSO path without
    changing the legacy HLC default.
+8. `groupID = 0` is reserved for the dedicated TSO group in runtime config:
+   shard ranges cannot route user data to it, the default data group skips it,
+   and SQS FIFO partition maps cannot route queue partitions to it. Existing
+   `--raftGroups` / `--raftGroupPeers` bootstrap the group as a compatibility
+   bridge, and the all-led-group HLC renewal loop keeps its ceiling warm
+   alongside data groups. Adding only group 0 to an existing single-data-group
+   deployment keeps the data group on its legacy `base/raftID` directory while
+   isolating group 0 under `base/raftID/group-0`. The current `--tsoEnabled`
+   bridge still issues timestamps from the locally led data shard through
+   `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
+   until the TSO-leader redirect path exists.
 
 Remaining:
 
-1. Reserve and bootstrap a dedicated TSO Raft group.
+1. Replace the compatibility bridge FSM with the minimal TSO-only FSM that
+   persists only the HLC ceiling.
 2. Add follower redirect/admin exposure for the dedicated TSO leader.
-3. Wire deployment/bootstrap config and mixed-version safety around the extra group.
+3. Add Phase B shadow-read validation before making dedicated TSO the only
+   production timestamp path.
 
 ### 1.1 Original Limitation
 
@@ -616,11 +629,11 @@ least as large as the maximum shard ceiling.
 | Phase | Scope | Priority |
 |-------|-------|----------|
 | M1 — shipped | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
-| M2 | Phase A dual-write bridge: also propose ceiling to TSO group (Section 7.1) | Deferred until dedicated group |
+| M2 — shipped for reserved group 0 | Phase A dual-write bridge: when group 0 is configured, all-led HLC renewal also proposes ceiling updates to it while shard range validation prevents user data routes to group 0 (Section 7.1) | High |
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 | Dedicated TSO Raft group (`groupID = 0`) with `TSOStateMachine` | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; TSO-leader-only timestamp issuance and the minimal `TSOStateMachine` remain open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---
