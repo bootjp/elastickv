@@ -111,6 +111,40 @@ func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
 			wantErr: ErrExternalSnapshotRestoreInvalid,
 		},
 		{
+			name: "duplicate explicit peer id",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers = []Peer{
+					{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"},
+					{NodeID: 2, ID: "n1", Address: "127.0.0.1:12002"},
+				}
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "duplicate normalized peer id",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers = []Peer{
+					{NodeID: 1, Address: "127.0.0.1:12001"},
+					{NodeID: 2, Address: "127.0.0.1:12001"},
+				}
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "invalid peer suffrage",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers[0].Suffrage = "observer"
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "learner only membership",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers[0].Suffrage = SuffrageLearner
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
 			name: "copied payload sha mismatch",
 			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
 				opts.ExpectedPayloadSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"

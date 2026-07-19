@@ -142,12 +142,25 @@ client ─► HTTP PUT body
                 fsync-acks have returned (= chunkBlobMinReplicas
                 durable copies including the leader)
              5. queue ChunkRef into pendingBatch
-        ─► flushBatch:
-             coordinator.Dispatch(OperationGroup{
-                 Elems: [ chunkref Puts ... + manifest Put ],
+             6. dispatch each full s3MetaBatchOps chunkref batch
+                through Raft under immutable attempt-versioned keys
+        ─► final flushBatch:
+             coordinator.Dispatch(Transaction{
+                 Elems: [ final partial chunkref batch + manifest Put ],
              })
         ─► HTTP 200 OK once Dispatch acks
 ```
+
+The full chunkref batches in step 6 are staged metadata: readers
+cannot discover them until the final manifest transaction commits,
+so the manifest remains the linearisation point. Attempt-versioned
+multipart keys prevent a retry from overwriting references selected
+by an older committed part descriptor. A failed request schedules
+best-effort deletion of staged chunkrefs by their unique attempt
+prefix; chunkblobs that were already fsynced remain content-addressed
+orphans for the M3 orphan scan in §3.5. Batching at `s3MetaBatchOps`
+keeps every Raft proposal below `MaxSizePerMsg` even for
+multi-terabyte objects.
 
 Step 3 — synchronous chunkblob replication before the chunkref
 commit — is the difference between "Raft-equivalent durability"
@@ -189,7 +202,17 @@ follower that crashes after acking the push but before the chunkref
 commits is fine — the chunkref will be retried by the leader on the
 next attempt because it has not yet entered the Raft log.
 
-**Behaviour during cluster shrink / partial outage.** A controlled
+**M1 safety override.** M1 does not yet include M2's follower-apply
+and backfill worker. It therefore waits for durable acknowledgements
+from **every current Raft member**, including learners, before
+committing a chunkref. This makes each current node's offline logical
+backup self-contained: a backup taken from any member can resolve
+every committed chunkref from its local `chunkblob` keyspace. An
+unreachable current member fails the PUT closed. Once M2 guarantees
+eventual local fetch on apply/backfill, the implementation may adopt
+the quorum policy below without making member-local backups partial.
+
+**Post-M2 behaviour during cluster shrink / partial outage.** A controlled
 decommission (5 → 3 nodes) or a transient partition can leave the
 leader with fewer reachable peers than `(N/2)+1` configured at the
 last membership commit. Blocking PUTs until the configured minimum
@@ -605,6 +628,13 @@ capability-advertising peers exists.
 | M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0–M3 burn in for 30 days in production. | High (long-running batch over live traffic). |
 
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
+
+Until M3 wires reference counting, the grace queue, and the orphan
+scanner into the server lifecycle, the runtime GC-readiness gate
+remains false. Setting `ELASTICKV_S3_BLOB_OFFLOAD=true` before that
+point still selects the legacy path. This fail-closed gate prevents
+M1 chunkblobs from becoming an unbounded production keyspace while
+preserving explicit test coverage of the M1 data path.
 
 - WAL growth per GiB of S3 PUT < 1 MiB on a one-week soak test.
 - Snapshot transfer for a 100 GiB-cluster follower restart completes
