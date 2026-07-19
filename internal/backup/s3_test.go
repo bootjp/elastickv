@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -62,6 +63,26 @@ func emitObject(t *testing.T, enc *S3Encoder, bucket string, gen uint64, object 
 	}
 	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), body); err != nil {
 		t.Fatalf("HandleBlob: %v", err)
+	}
+}
+
+func emitOffloadedChunk(t *testing.T, enc *S3Encoder, bucket string, gen uint64, object, uploadID string, partNo, chunkNo, version uint64, body []byte) {
+	t.Helper()
+	digest := sha256.Sum256(body)
+	if err := enc.HandleChunkBlob(s3keys.ChunkBlobKey(digest), body); err != nil {
+		t.Fatalf("HandleChunkBlob(%d): %v", chunkNo, err)
+	}
+	ref, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: digest,
+		Size:          uint64(len(body)),
+		SourcePeer:    "n1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := s3keys.VersionedChunkRefKey(bucket, gen, object, uploadID, partNo, chunkNo, version)
+	if err := enc.HandleChunkRef(key, ref); err != nil {
+		t.Fatalf("HandleChunkRef(%d): %v", chunkNo, err)
 	}
 }
 
@@ -145,6 +166,128 @@ func TestS3_MultipartObjectAssemblesInPartChunkOrder(t *testing.T) {
 	}
 	if string(got) != "helloWORLD!" {
 		t.Fatalf("body = %q want %q", got, "helloWORLD!")
+	}
+}
+
+func TestS3_OffloadedObjectAssemblesFromChunkRefs(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket, object, uploadID := "logs", "offloaded.bin", "u-offload"
+	const gen, chunkRefVersion = uint64(3), uint64(91)
+	chunks := []struct {
+		no   uint64
+		body []byte
+	}{
+		{no: 0, body: []byte("hello ")},
+		{no: 1, body: []byte("world")},
+	}
+
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for _, chunk := range chunks {
+		emitOffloadedChunk(t, enc, bucket, gen, object, uploadID, 1, chunk.no, chunkRefVersion, chunk.body)
+	}
+	// A legacy blob with the same numeric part version must not satisfy an
+	// offloaded manifest part.
+	if err := enc.HandleBlob(s3keys.VersionedBlobKey(bucket, gen, object, uploadID, 1, 0, chunkRefVersion), []byte("wrong")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": 11, "parts": []map[string]any{
+			{
+				"part_no": 1, "size_bytes": 11, "chunk_count": 2,
+				"chunk_sizes": []uint64{6, 5}, "offloaded": true, "chunk_ref_version": chunkRefVersion,
+			},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "s3", bucket, object)) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "hello world" {
+		t.Fatalf("body = %q, want %q", body, "hello world")
+	}
+}
+
+func TestS3_OffloadedObjectFailsClosedWhenChunkBlobIsMissing(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	body := []byte("missing")
+	digest := sha256.Sum256(body)
+	ref, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: digest,
+		Size:          uint64(len(body)),
+		SourcePeer:    "n1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleChunkRef(s3keys.ChunkRefKey("b", 1, "o", "u", 1, 0), ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
+			{"part_no": 1, "chunk_count": 1, "chunk_sizes": []uint64{uint64(len(body))}, "offloaded": true},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); !errors.Is(err, ErrS3IncompleteBlobChunks) {
+		t.Fatalf("Finalize error = %v, want ErrS3IncompleteBlobChunks", err)
+	}
+}
+
+func TestS3_OffloadedObjectRejectsManifestChunkSizeMismatch(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	body := []byte("content")
+	const chunkRefVersion = uint64(7)
+	const mismatchedChunkSize = uint64(8)
+	emitOffloadedChunk(t, enc, "b", 1, "o", "u", 1, 0, chunkRefVersion, body)
+	manifest := encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": len(body), "parts": []map[string]any{
+			{
+				"part_no": 1, "chunk_count": 1, "chunk_sizes": []uint64{mismatchedChunkSize},
+				"offloaded": true, "chunk_ref_version": chunkRefVersion,
+			},
+		},
+	})
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); !errors.Is(err, ErrS3InvalidChunkRef) {
+		t.Fatalf("Finalize error = %v, want ErrS3InvalidChunkRef", err)
+	}
+}
+
+func TestS3_OffloadedObjectRejectsMissingManifestChunkSizes(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	manifest := encodeS3ManifestValue(t, map[string]any{
+		"upload_id": "u", "size_bytes": 1, "parts": []map[string]any{
+			{"part_no": 1, "chunk_count": 1, "offloaded": true},
+		},
+	})
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey("b", 1, "o"), manifest); !errors.Is(err, ErrS3InvalidManifest) {
+		t.Fatalf("HandleObjectManifest error = %v, want ErrS3InvalidManifest", err)
+	}
+}
+
+func TestS3_ChunkBlobRejectsContentHashMismatch(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	digest := sha256.Sum256([]byte("expected"))
+	err := enc.HandleChunkBlob(s3keys.ChunkBlobKey(digest), []byte("different"))
+	if !errors.Is(err, ErrS3ChunkBlobHashMismatch) {
+		t.Fatalf("HandleChunkBlob error = %v, want ErrS3ChunkBlobHashMismatch", err)
 	}
 }
 

@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"context"
+	"crypto/sha256"
 	"strings"
 	"testing"
 
@@ -18,6 +20,16 @@ import (
 // because the entire point of this test is to detect when an S3 batch
 // silently grows past it.
 const raftMaxSizePerMsgPostPR593 = 4 << 20
+
+type recordingS3MetaCoordinator struct {
+	stubAdapterCoordinator
+	dispatchSizes []int
+}
+
+func (c *recordingS3MetaCoordinator) Dispatch(_ context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.dispatchSizes = append(c.dispatchSizes, len(req.Elems))
+	return &kv.CoordinateResponse{}, nil
+}
 
 // TestS3ChunkBatchFitsInRaftMaxSize is the byte-budget invariant the
 // s3ChunkBatchOps comment advertises: a worst-case S3 PutObject /
@@ -139,6 +151,62 @@ func TestS3MetaBatchFitsInRaftMaxSize(t *testing.T) {
 	)
 }
 
+func TestS3OffloadedChunkRefBatchFitsInRaftMaxSize(t *testing.T) {
+	t.Parallel()
+
+	bucket := "test-bucket"
+	objectKey := strings.Repeat("a", 1024)
+	uploadID := "upload-12345678901234567890"
+	digest := sha256.Sum256([]byte("chunk"))
+	refValue, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{
+		ContentSHA256: digest,
+		Size:          s3ChunkSize,
+		SourcePeer:    "node-1",
+		ReplicaPeers: []s3keys.ChunkRefPeer{
+			{NodeID: "node-1", Address: "192.168.0.210:50051"},
+			{NodeID: "node-2", Address: "192.168.0.211:50051"},
+			{NodeID: "node-3", Address: "192.168.0.212:50051"},
+			{NodeID: "node-4", Address: "192.168.0.213:50051"},
+			{NodeID: "node-5", Address: "192.168.0.214:50051"},
+		},
+	})
+	require.NoError(t, err)
+
+	muts := make([]*pb.Mutation, 0, s3MetaBatchOps)
+	for i := uint64(0); i < uint64(s3MetaBatchOps); i++ {
+		muts = append(muts, &pb.Mutation{
+			Op:    pb.Op_PUT,
+			Key:   s3keys.VersionedChunkRefKey(bucket, 1, objectKey, uploadID, 1, i, 99),
+			Value: refValue,
+		})
+	}
+	encoded, err := proto.Marshal(&pb.Request{Ts: 1234567890, Mutations: muts})
+	require.NoError(t, err)
+	require.Less(t, len(encoded)+1, raftMaxSizePerMsgPostPR593)
+}
+
+func TestS3OffloadedChunkRefsFlushAtMetaBatchLimit(t *testing.T) {
+	t.Parallel()
+
+	coordinator := &recordingS3MetaCoordinator{}
+	uploader := &s3ChunkUploader{
+		server: &S3Server{coordinator: coordinator},
+		ctx:    context.Background(),
+		cfg:    s3ChunkUploadConfig{offloaded: true},
+	}
+	for i := 0; i < s3MetaBatchOps-1; i++ {
+		uploader.pendingBatch = append(uploader.pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put})
+	}
+	require.NoError(t, uploader.flushFullBatch())
+	require.Empty(t, coordinator.dispatchSizes)
+	require.Len(t, uploader.pendingBatch, s3MetaBatchOps-1)
+
+	uploader.pendingBatch = append(uploader.pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put})
+	require.NoError(t, uploader.flushFullBatch())
+	require.Equal(t, []int{s3MetaBatchOps}, coordinator.dispatchSizes)
+	require.Empty(t, uploader.pendingBatch)
+}
+
 // TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps is the
 // regression guard for the slice-by-value bug Gemini caught: a
 // previous version of appendPartBlobKeys took `pending` by value, so
@@ -191,4 +259,28 @@ func TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps(t *testing.T) {
 		"each flush must drain exactly s3MetaBatchOps entries; pending must not silently overflow the cap")
 	require.Len(t, pending, 7,
 		"trailing 7 entries should remain for the caller's final flush()")
+}
+
+func TestAppendPartBlobKeys_UsesVersionedChunkRefsForOffloadedPart(t *testing.T) {
+	t.Parallel()
+
+	pending := make([]*kv.Elem[kv.OP], 0, 1)
+	part := s3ObjectPart{
+		PartNo:          7,
+		ChunkSizes:      []uint64{123},
+		ChunkRefVersion: 99,
+		Offloaded:       true,
+	}
+
+	ok := (*S3Server)(nil).appendPartBlobKeys(
+		&pending, "bucket", 3, "object", "upload", part, func() {},
+	)
+	require.True(t, ok)
+	require.Len(t, pending, 1)
+	require.Equal(t, kv.Del, pending[0].Op)
+	require.Equal(
+		t,
+		s3keys.VersionedChunkRefKey("bucket", 3, "object", "upload", 7, 0, 99),
+		pending[0].Key,
+	)
 }
