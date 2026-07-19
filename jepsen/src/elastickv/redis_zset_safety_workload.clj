@@ -581,25 +581,36 @@
   (and (some? (:complete-idx earlier))
        (> (:invoke-idx later) (:complete-idx earlier))))
 
-(defn- superseded-by-preceding-state-change?
-  "True iff a committed mutation before the read strictly follows m and
-  changes this member's state. Such a later committed write/remove
-  determines the read's base state and makes m's pre-read uncertainty
-  irrelevant for this read.
-
-  Relative increments are not absolute overwrites. Earlier uncertainty
-  may still be required to make a later :ok ZINCRBY reply consistent, so
-  later ZINCRBYs do not supersede pre-read :info operations."
-  [preceding m]
-  (some #(and (or (= :zadd (:f %))
-                  (effective-zrem? %))
-              (strictly-follows? % m))
-        preceding))
-
 (defn- real-time-before?
   [a b]
   (and (some? (:complete-idx a))
        (< (:complete-idx a) (:invoke-idx b))))
+
+(defn- could-linearize-between?
+  "True when candidate can be ordered after earlier and before later without
+  violating either operation's real-time window."
+  [candidate earlier later]
+  (and (not (real-time-before? candidate earlier))
+       (not (real-time-before? later candidate))))
+
+(defn- superseded-by-preceding-state-change?
+  "True iff an unconditional committed ZADD before the read makes m's
+  pre-read uncertainty irrelevant.
+
+  ZINCRBY and ZREM are state-dependent: their replies can require m to have
+  taken effect. When either could linearize between m and a later ZADD, keep
+  m so the checker can validate that dependent reply before the ZADD resets
+  the member state. A successful ZREM is also state-dependent (it can return
+  true only for a present member), so it cannot supersede uncertainty by
+  itself."
+  [preceding m]
+  (some (fn [reset]
+          (and (= :zadd (:f reset))
+               (strictly-follows? reset m)
+               (not-any? #(and (#{:zincrby :zrem} (:f %))
+                                (could-linearize-between? % m reset))
+                         preceding)))
+        preceding))
 
 (defn- unique-mutations
   [muts]
