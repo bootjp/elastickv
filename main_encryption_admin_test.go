@@ -41,6 +41,10 @@ func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, erro
 	return 0, nil
 }
 
+type followerEncryptionAdminEngine struct{ stubEncryptionAdminEngine }
+
+func (followerEncryptionAdminEngine) State() raftengine.State { return raftengine.StateFollower }
+
 // TestEncryptionAdminFullNodeID_DistinctPerRaftId pins the
 // PR760 r1 Codex P1 regression: full_node_id must be derived from
 // --raftId (per-node-stable) and NOT from the Raft group id
@@ -134,6 +138,42 @@ func TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_DedicatedTSOGroupAlwaysRefusesMutators(t *testing.T) {
+	want := stubEncryptionAdminEngine{}
+	enabled, engine := encryptionAdminWiringForGroup(
+		dedicatedTSORaftGroupID,
+		true,
+		want,
+	)
+	if enabled || engine == nil {
+		t.Fatalf("dedicated TSO mutator wiring = (%v, %T), want (false, leader view)", enabled, engine)
+	}
+	err := callBootstrapAgainstNewServer(t, enabled, engine)
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("BootstrapEncryption status=%v, want FailedPrecondition; err=%v", got, err)
+	}
+}
+
+func TestEncryptionAdmin_DedicatedTSOGroupResyncRejectsFollower(t *testing.T) {
+	enabled, engine := encryptionAdminWiringForGroup(
+		dedicatedTSORaftGroupID,
+		true,
+		followerEncryptionAdminEngine{},
+	)
+	err := callResyncAgainstNewServer(t, enabled, engine)
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("ResyncSidecar status=%v, want FailedPrecondition; err=%v", got, err)
+	}
+}
+
+func TestEncryptionAdmin_DataGroupPreservesMutatorGate(t *testing.T) {
+	want := stubEncryptionAdminEngine{}
+	enabled, engine := encryptionAdminWiringForGroup(1, true, want)
+	if !enabled || engine == nil {
+		t.Fatalf("data-group mutator wiring = (%v, %T), want (true, non-nil)", enabled, engine)
+	}
+}
+
 func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine encryptionAdminEngine) error {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
@@ -159,6 +199,28 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 		WrappedStorageDek: []byte("w"),
 		WrappedRaftDek:    []byte("w"),
 	})
+	return err
+}
+
+func callResyncAgainstNewServer(t *testing.T, enableMutators bool, engine encryptionAdminEngine) error {
+	t.Helper()
+	listener := bufconn.Listen(1024 * 1024)
+	gs := grpc.NewServer()
+	registerEncryptionAdminServer(gs, 1, "", enableMutators, engine, nil)
+	go func() { _ = gs.Serve(listener) }()
+	t.Cleanup(gs.Stop)
+	conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = pb.NewEncryptionAdminClient(conn).ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
 	return err
 }
 

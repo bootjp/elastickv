@@ -2,10 +2,11 @@
 
 - Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
   bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
-  the minimal TSO-only FSM and follower redirect/admin exposure remain open
+  the minimal TSO-only FSM and runtime group-0 wiring are implemented, while
+  follower redirect/admin exposure and shadow validation remain open
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-11
+- Updated: 2026-07-18
 
 ---
 
@@ -44,13 +45,27 @@ Implemented:
    bridge still issues timestamps from the locally led data shard through
    `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
    until the TSO-leader redirect path exists.
+9. `TSOStateMachine` implements the dedicated-group FSM contract: it accepts
+   HLC lease entries and explicit allocation-floor entries, halt-fails invalid
+   entries, snapshots/restores TSO-owned ceiling/floor state, and classifies
+   full ceiling/floor mirror entries as volatile-only so post-snapshot HLC
+   mirror raises are not lost on duplicate replay skip paths.
+10. Runtime bootstrap instantiates `TSOStateMachine` for `groupID = 0` without
+    opening an MVCC store. Group 0 retains the normal wrap-aware proposer path
+    for Raft-envelope cutovers, while route validation keeps all user data out
+    of the control group. Restore accepts snapshots written by the earlier
+    compatibility `kvFSM`, imports their HLC ceiling, derives a safe allocation
+    floor, and drains the legacy MVCC payload for full CRC verification. The
+    group-0 `EncryptionAdmin` surface is capability-only: mutators are left
+    unwired and return `FailedPrecondition`. During upgrade replay, valid
+    encryption control entries committed by the earlier compatibility FSM are
+    decoded and deterministically rejected without halting the TSO apply loop;
+    malformed control entries still halt fail-closed.
 
 Remaining:
 
-1. Replace the compatibility bridge FSM with the minimal TSO-only FSM that
-   persists only the HLC ceiling.
-2. Add follower redirect/admin exposure for the dedicated TSO leader.
-3. Add Phase B shadow-read validation before making dedicated TSO the only
+1. Add follower redirect/admin exposure for the dedicated TSO leader.
+2. Add Phase B shadow-read validation before making dedicated TSO the only
    production timestamp path.
 
 ### 1.1 Original Limitation
@@ -183,7 +198,10 @@ Node-3 ──┘         │
 
 - `groupID = 0` is reserved for the TSO group; all user-data shards use
   `groupID >= 1`.
-- The TSO FSM applies only HLC lease entries. It carries no key-value storage,
+- The TSO FSM applies HLC lease entries and explicit allocation-floor entries.
+  Allocation floors use a versioned TSO envelope whose first byte remains in
+  the old data-FSM fail-closed range; the full magic prevents an encryption
+  opcode from being interpreted as TSO state. It carries no key-value storage,
   so compaction and snapshot overhead are negligible.
 - Membership mirrors the full cluster so any node can become TSO leader.
 
@@ -191,62 +209,108 @@ Node-3 ──┘         │
 
 ```go
 // TSOStateMachine implements raftengine.StateMachine. It is a minimal FSM
-// that only tracks the HLC physical ceiling; its entire persisted state is a
-// single int64 ceiling value.
+// that tracks TSO-owned HLC physical ceiling and allocation floor state. The
+// shared HLC is a volatile mirror only; snapshots are sourced from the FSM's
+// own fields so data-group lease renewals cannot advance group-0 state outside
+// group-0 consensus.
 //
 // Interface mapping (raftengine.StateMachine vs raw raft.FSM):
 //   Apply([]byte)             ← engine strips log envelope, passes raw payload
 //   Snapshot() (Snapshot, _) ← returns raftengine.Snapshot (WriteTo/Close)
 //   Restore(io.Reader)        ← caller owns and closes the reader
 type TSOStateMachine struct {
-    hlc *HLC
+    hlc             *HLC
+    ceilingMs       atomic.Int64
+    allocationFloor atomic.Uint64
 }
 
-// Apply processes an HLC lease entry. The engine strips the raft.Log
+// Apply processes TSO ceiling/floor entries. The engine strips the raft.Log
 // envelope and passes only the raw command bytes, matching the
 // raftengine.StateMachine.Apply([]byte) signature.
 func (f *TSOStateMachine) Apply(data []byte) any {
-    if len(data) == 0 || data[0] != raftEncodeHLCLease {
-        return nil
+    if len(data) == 0 {
+        return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry,
+            "empty entry"))
     }
-    return f.applyHLCLease(data[1:])
-}
-
-// Snapshot serialises the ceiling as 8 big-endian bytes.
-// Returns raftengine.Snapshot (WriteTo/Close) rather than raft.FSMSnapshot.
-func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
-    var ceiling int64
-    if f.hlc != nil {
-        ceiling = f.hlc.PhysicalCeiling()
-    }
-    return &tsoSnapshot{ceiling: ceiling}, nil
-}
-
-// Restore deserialises the ceiling and updates the shared HLC.
-// The caller owns the reader and is responsible for closing it.
-func (f *TSOStateMachine) Restore(r io.Reader) error {
-    var buf [8]byte
-    if _, err := io.ReadFull(r, buf[:]); err != nil {
-        return err
-    }
-    ceiling := int64(binary.BigEndian.Uint64(buf[:]))
-    if f.hlc != nil && ceiling > 0 {
-        f.hlc.SetPhysicalCeiling(ceiling)
+    switch {
+    case data[0] == raftEncodeHLCLease:
+        if len(data) != hlcLeaseEntryLen {
+            return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+                "expected %d bytes, got %d", hlcLeaseEntryLen, len(data)))
+        }
+        ceiling := int64(binary.BigEndian.Uint64(data[1:]))
+        if ceiling <= 0 {
+            return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+                "non-positive HLC lease ceiling %d", ceiling))
+        }
+        f.applyLeaseCeiling(ceiling)
+    case bytes.HasPrefix(data, []byte(tsoAllocationFloorEnvelope)):
+        if len(data) != len(tsoAllocationFloorEnvelope)+8 {
+            return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+                "invalid allocation-floor envelope length %d", len(data)))
+        }
+        floor := binary.BigEndian.Uint64(data[len(tsoAllocationFloorEnvelope):])
+        if floor == 0 {
+            return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry,
+                "zero TSO allocation floor"))
+        }
+        f.applyAllocationFloor(floor)
+    default:
+        return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+            "unexpected tag 0x%02x", data[0]))
     }
     return nil
 }
 
-// tsoSnapshot implements raftengine.Snapshot. It serialises the HLC physical
-// ceiling as 8 big-endian bytes — the entire persisted state of the TSO group.
+// Snapshot serialises ceiling and allocationFloor as two 8-byte big-endian
+// fields. The source is TSO-applied state, not the shared HLC mirror.
+// Returns raftengine.Snapshot (WriteTo/Close) rather than raft.FSMSnapshot.
+func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
+    return &tsoSnapshot{
+        ceiling:         f.ceilingMs.Load(),
+        allocationFloor: f.allocationFloor.Load(),
+    }, nil
+}
+
+// Restore deserialises ceiling/floor state and mirrors it to the shared HLC.
+// Current snapshots are 16 bytes; legacy 8-byte ceiling snapshots derive the
+// allocation floor from the ceiling used by the previous FSM format.
+// The caller owns the reader and is responsible for closing it.
+func (f *TSOStateMachine) Restore(r io.Reader) error {
+    payload, err := io.ReadAll(io.LimitReader(r, 17))
+    if err != nil {
+        return err
+    }
+    var ceiling int64
+    var floor uint64
+    switch len(payload) {
+    case 8:
+        ceiling = int64(binary.BigEndian.Uint64(payload[:8]))
+        floor = tsoLeaseAllocationFloor(ceiling)
+    case 16:
+        ceiling = int64(binary.BigEndian.Uint64(payload[:8]))
+        floor = binary.BigEndian.Uint64(payload[8:])
+    default:
+        return errors.Newf("expected 8 or 16 snapshot bytes, got %d",
+            len(payload))
+    }
+    f.restoreSnapshotState(ceiling, floor)
+    return nil
+}
+
+// tsoSnapshot implements raftengine.Snapshot. It serialises TSO-owned ceiling
+// and floor state as 16 bytes — the entire persisted state of the TSO group.
 // WriteTo/Close matches the raftengine.Snapshot interface (not Persist/Release
 // from raft.FSMSnapshot).
 type tsoSnapshot struct {
-    ceiling int64
+    ceiling         int64
+    allocationFloor uint64
 }
 
 func (s *tsoSnapshot) WriteTo(w io.Writer) (int64, error) {
-    var buf [8]byte
+    var buf [16]byte
     binary.BigEndian.PutUint64(buf[:], uint64(s.ceiling))
+    binary.BigEndian.PutUint64(buf[8:], s.allocationFloor)
     n, err := w.Write(buf[:])
     return int64(n), err
 }
@@ -633,7 +697,7 @@ least as large as the maximum shard ceiling.
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; TSO-leader-only timestamp issuance and the minimal `TSOStateMachine` remain open | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable, warmed by the HLC renewal bridge, and runs the minimal `TSOStateMachine` without an MVCC store; TSO-leader redirect/admin exposure and TSO-leader-only timestamp issuance remain open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---
@@ -654,6 +718,13 @@ least as large as the maximum shard ceiling.
    leader via gRPC, or support follower reads with a known-safe timestamp
    bound?
 
-5. **Backward compatibility:** Existing snapshots and Raft logs store ceiling
-   values inline in shard FSMs. Migration to a dedicated TSO FSM requires a
-   coordinated snapshot + compaction pass.
+5. **Backward compatibility (resolved for group 0):** Existing group-0 Raft
+   logs already carry compatible HLC lease entries. `TSOStateMachine.Restore`
+   recognizes legacy `kvFSM` snapshot headers, imports the ceiling, derives the
+   allocation floor, and drains the old store payload before Raft resumes log
+   replay. Valid historical encryption control entries are decoded and rejected
+   as obsolete ordinary apply responses, so replay advances without mutating
+   TSO state; new group-0 encryption mutators are disabled at the RPC boundary,
+   while the group-0 engine remains wired as a leader view so read-only sidecar
+   recovery cannot be served from a stale follower. Runtime wiring therefore
+   does not require deleting group-0 state.
