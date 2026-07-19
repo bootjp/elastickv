@@ -158,6 +158,7 @@ func validateExternalSnapshotRestoreOptions(opts ExternalSnapshotRestoreOptions)
 
 func validateExternalSnapshotRestorePeers(peers []Peer) error {
 	seenNodeIDs := make(map[uint64]struct{}, len(peers))
+	seenIDs := make(map[string]struct{}, len(peers))
 	voters := 0
 	for i, peer := range peers {
 		if peer.NodeID == 0 {
@@ -169,10 +170,9 @@ func validateExternalSnapshotRestorePeers(peers []Peer) error {
 		if peer.Suffrage != "" && peer.Suffrage != SuffrageVoter && peer.Suffrage != SuffrageLearner {
 			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has invalid suffrage %q", i, peer.Suffrage)
 		}
-		if _, ok := seenNodeIDs[peer.NodeID]; ok {
-			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has duplicate node id %d", i, peer.NodeID)
+		if err := validateExternalSnapshotRestorePeerIdentity(i, peer, seenNodeIDs, seenIDs); err != nil {
+			return err
 		}
-		seenNodeIDs[peer.NodeID] = struct{}{}
 		if peer.Suffrage != SuffrageLearner {
 			voters++
 		}
@@ -180,6 +180,27 @@ func validateExternalSnapshotRestorePeers(peers []Peer) error {
 	if voters == 0 {
 		return errors.Wrap(ErrExternalSnapshotRestoreInvalid, "at least one voter is required")
 	}
+	return nil
+}
+
+func validateExternalSnapshotRestorePeerIdentity(
+	index int,
+	peer Peer,
+	seenNodeIDs map[uint64]struct{},
+	seenIDs map[string]struct{},
+) error {
+	if _, ok := seenNodeIDs[peer.NodeID]; ok {
+		return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has duplicate node id %d", index, peer.NodeID)
+	}
+	normalizedPeer, err := normalizePersistedPeer(peer)
+	if err != nil {
+		return errors.Wrap(ErrExternalSnapshotRestoreInvalid, err.Error())
+	}
+	if _, ok := seenIDs[normalizedPeer.ID]; ok {
+		return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has duplicate peer id %q", index, normalizedPeer.ID)
+	}
+	seenNodeIDs[peer.NodeID] = struct{}{}
+	seenIDs[normalizedPeer.ID] = struct{}{}
 	return nil
 }
 
