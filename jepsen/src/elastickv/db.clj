@@ -85,17 +85,23 @@
               (str gid "=" (group-addr node raft-groups gid))))
        (clojure.string/join ",")))
 
-(defn- build-raft-redis-map [nodes grpc-port redis-port raft-groups]
+(defn- build-raft-service-map [nodes grpc-port service-port raft-groups]
   (let [groups (when (seq raft-groups) (group-ids raft-groups))]
     (->> nodes
          (mapcat (fn [n]
-                   (let [redis (node-addr n (port-for redis-port n))]
+                   (let [service-addr (node-addr n (port-for service-port n))]
                      (if (seq groups)
                        (map (fn [gid]
-                              (str (group-addr n raft-groups gid) "=" redis))
+                              (str (group-addr n raft-groups gid) "=" service-addr))
                             groups)
-                       [(str (node-addr n (port-for grpc-port n)) "=" redis)]))))
+                       [(str (node-addr n (port-for grpc-port n)) "=" service-addr)]))))
          (clojure.string/join ","))))
+
+(defn- build-raft-redis-map [nodes grpc-port redis-port raft-groups]
+  (build-raft-service-map nodes grpc-port redis-port raft-groups))
+
+(defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
+  (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
 (defn- start-node!
   [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
@@ -114,6 +120,8 @@
         sqs (when sqs-port
               (node-addr node (port-for sqs-port node)))
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
+        raft-dynamo-map (when dynamo
+                          (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
         bootstrap? (= node bootstrap-node)
         args (cond-> ["--address" grpc
                       "--redisAddress" redis
@@ -121,7 +129,8 @@
                       "--raftDataDir" data-dir
                       "--raftEngine" (or raft-engine "etcd")
                       "--raftRedisMap" raft-redis-map]
-               dynamo (conj "--dynamoAddress" dynamo)
+               dynamo (conj "--dynamoAddress" dynamo
+                            "--raftDynamoMap" raft-dynamo-map)
                s3 (conj "--s3Address" s3)
                sqs (conj "--sqsAddress" sqs)
                (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
@@ -151,7 +160,7 @@
     (c/su
       (c/exec :bash "-c"
               (str "tmp=$(mktemp /var/log/elastickv-transport-metrics.XXXXXX); "
-                   "if curl -fsS http://127.0.0.1:9090/metrics "
+                   "if curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:9090/metrics "
                    "| grep -E '^elastickv_raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)' > \"$tmp\"; "
                    "then { printf '# transport metrics snapshot node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; cat \"$tmp\"; } >> " transport-metrics-file "; "
                    "else printf '# metrics unavailable node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " transport-metrics-file "; fi; "

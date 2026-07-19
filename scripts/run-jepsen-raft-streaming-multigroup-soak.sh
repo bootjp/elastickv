@@ -9,9 +9,11 @@ CONCURRENCY="${CONCURRENCY:-30}"
 FAULT_INTERVAL="${FAULT_INTERVAL:-15}"
 SNAPSHOT_COUNT="${SNAPSHOT_COUNT:-64}"
 STORE_ROOT="${STORE_ROOT:-$REPO_ROOT/jepsen/store}"
+GRPC_HOST_PORT="${GRPC_HOST_PORT:-n1:50051}"
 MARKER="$(mktemp "${TMPDIR:-/tmp}/elastickv-streaming-soak.XXXXXX")"
 ROUTE_KEY_BIN="$(mktemp "${TMPDIR:-/tmp}/elastickv-route-key.XXXXXX")"
-trap 'rm -f "$MARKER" "$ROUTE_KEY_BIN"' EXIT
+LIST_ROUTES_BIN="$(mktemp "${TMPDIR:-/tmp}/elastickv-list-routes.XXXXXX")"
+trap 'rm -f "$MARKER" "$ROUTE_KEY_BIN" "$LIST_ROUTES_BIN"' EXIT
 
 if [ -z "$LEIN_BIN" ] || [ ! -x "$LEIN_BIN" ]; then
   echo "lein not found; set LEIN to an executable" >&2
@@ -20,6 +22,7 @@ fi
 
 cd "$REPO_ROOT"
 go build -o "$ROUTE_KEY_BIN" ./cmd/elastickv-route-key
+go build -o "$LIST_ROUTES_BIN" ./cmd/elastickv-list-routes
 T2_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t2)"
 T3_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t3)"
 SHARD_RANGES=":${T2_KEY}=1,${T2_KEY}:${T3_KEY}=2,${T3_KEY}:=3"
@@ -32,6 +35,8 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --nodes n1,n2,n3,n4,n5 \
     --raft-groups 1=50051,2=50052,3=50053 \
     --shard-ranges "$SHARD_RANGES" \
+    --list-routes-bin "$LIST_ROUTES_BIN" \
+    --grpc-host-port "$GRPC_HOST_PORT" \
     --faults partition,kill,pause \
     --fault-interval "$FAULT_INTERVAL" \
     --time-limit "$TIME_LIMIT" \

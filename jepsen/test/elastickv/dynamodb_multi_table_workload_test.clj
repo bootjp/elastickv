@@ -51,6 +51,14 @@
           "/var/log/elastickv-transport-metrics.prom" "elastickv-transport-metrics.prom"}
          (jdb/log-files (ekdb/db) {} "n1"))))
 
+(deftest raft-dynamo-map-covers-every-node-and-group
+  (let [build-map (var-get #'ekdb/build-raft-dynamo-map)]
+    (is (= "n1:50051=n1:8001,n1:50052=n1:8001,n2:50051=n2:8002,n2:50052=n2:8002"
+           (build-map ["n1" "n2"]
+                      50051
+                      {"n1" 8001 "n2" 8002}
+                      {1 50051 2 50052})))))
+
 (deftest host-override-creates-client
   (let [test-map (workload/elastickv-dynamodb-multi-table-test
                    {:dynamo-host "127.0.0.1"
