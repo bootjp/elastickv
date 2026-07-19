@@ -110,8 +110,11 @@ Multi-region blockers:
 ### 2.3 Storage tier (Pebble)
 
 `store/lsm_store.go`: per-shard `pebble.Open`, process-wide shared block cache
-sized to 25% of the node's effective memory budget by default and shared by all
-stores in the process. `ELASTICKV_PEBBLE_CACHE_PERCENT` changes that fraction;
+sized to 25% of the node's hard memory capacity by default and shared by all
+stores in the process. Linux uses the minimum positive cgroup limit found from
+the process leaf through every ancestor, bounded by physical RAM. `GOMEMLIMIT`
+is not used as a total RSS budget because the Pebble cache is off-heap.
+`ELASTICKV_PEBBLE_CACHE_PERCENT` changes the hard-capacity fraction;
 `ELASTICKV_PEBBLE_CACHE_MB` is the absolute-capacity override. WAL sync via
 `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM apply; `nosync` opt-in).
 

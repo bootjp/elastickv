@@ -75,9 +75,9 @@ const (
 	pebbleCacheMBEnv = "ELASTICKV_PEBBLE_CACHE_MB"
 
 	// pebbleCachePercentEnv controls the percentage (1..90) of the node's
-	// effective memory budget reserved for the shared cache when no absolute
-	// MiB override is set. The effective budget is the smallest discovered
-	// GOMEMLIMIT, cgroup limit, or physical-memory size.
+	// hard memory capacity reserved for the shared cache when no absolute MiB
+	// override is set. Linux uses the smallest positive cgroup ancestor limit
+	// or physical-memory size; GOMEMLIMIT remains a Go heap soft limit.
 	pebbleCachePercentEnv = "ELASTICKV_PEBBLE_CACHE_PERCENT"
 
 	defaultPebbleCachePercent = 25

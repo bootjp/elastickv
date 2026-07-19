@@ -41,9 +41,11 @@ What bounds a single elastickv deployment today:
 2. **Per-group memory.** Each Raft group owns a private Pebble store, and
    `NewPebbleStore` → `defaultPebbleOptionsWithCache` now borrows one
    process-wide shared block cache through `processPebbleCacheRef`, defaulting
-   to 25% of the smallest discovered GOMEMLIMIT, cgroup limit, or physical RAM
-   size. N groups on a node therefore share one block-cache LRU instead of
-   reserving an independent fixed-size cache per group.
+   to 25% of the smallest discovered cgroup ancestor limit or physical RAM
+   size. `GOMEMLIMIT` remains a Go heap soft limit and is not treated as total
+   RSS capacity for the off-heap cache. N groups on a node therefore share one
+   block-cache LRU instead of reserving an independent fixed-size cache per
+   group.
    Per-group memtables, WALs, and compaction budgets are still independent.
 
 3. **Leader concentration.** Leadership of each group is elected
@@ -306,8 +308,9 @@ process-wide shared `pebble.Cache` via `processPebbleCacheRef`, and
 `NewPebbleStore` / restore reopen paths hold one explicit store/open reference
 that is released on close or reopen. `ELASTICKV_PEBBLE_CACHE_MB` now sizes the
 node-level shared cache rather than a per-store cache; when it is unset,
-`ELASTICKV_PEBBLE_CACHE_PERCENT` selects the fraction of the node's effective
-memory budget (25% by default).
+`ELASTICKV_PEBBLE_CACHE_PERCENT` selects the fraction of the node's hard
+memory capacity (25% by default). Linux takes the minimum positive cgroup
+limit from the process leaf through every ancestor and physical RAM.
 
 **Remaining problem.** Each group's store still owns independent memtables,
 WALs, flush scheduling, and compaction concurrency. That still caps how many

@@ -106,10 +106,21 @@ func TestMemoryBudgetHelpers(t *testing.T) {
 	require.Equal(t, int64(0), parseMemoryLimitBytes([]byte("invalid")))
 	require.Equal(t, []string{
 		"/sys/fs/cgroup/system.slice/elastickv.service/memory.max",
+		"/sys/fs/cgroup/system.slice/memory.max",
+		"/sys/fs/cgroup/memory.max",
 	}, cgroupMemoryLimitPaths([]byte("0::/system.slice/elastickv.service\n")))
 	require.Equal(t, []string{
 		"/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+		"/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
 	}, cgroupMemoryLimitPaths([]byte("5:cpu,memory:/docker/abc\n")))
+	require.Equal(t, []string{
+		"/sys/fs/cgroup/kubepods/pod-1/container-1/memory.max",
+		"/sys/fs/cgroup/kubepods/pod-1/memory.max",
+		"/sys/fs/cgroup/kubepods/memory.max",
+		"/sys/fs/cgroup/memory.max",
+	}, cgroupAncestorLimitPaths("/sys/fs/cgroup", "kubepods/pod-1/container-1", "memory.max"))
+	require.Empty(t, cgroupAncestorLimitPaths("/sys/fs/cgroup", "../escape", "memory.max"))
 }
 
 // TestSetSmallPebbleCacheForTestRestores verifies the helper reinstates the

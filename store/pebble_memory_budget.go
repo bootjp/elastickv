@@ -3,22 +3,17 @@ package store
 import (
 	"math"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 )
 
 const cgroupFieldCount = 3
 
-// effectiveMemoryBudgetBytes returns the smallest process or platform memory
-// limit visible to the node. GOMEMLIMIT is included because production may
-// deliberately give elastickv a smaller budget than its container or host.
+// effectiveMemoryBudgetBytes returns the hard platform memory capacity visible
+// to the node. GOMEMLIMIT is a Go heap soft limit, not a total RSS budget, and
+// Pebble's manually allocated block cache must not be sized as a fraction of it.
 func effectiveMemoryBudgetBytes() int64 {
-	runtimeLimit := debug.SetMemoryLimit(-1)
-	if runtimeLimit <= 0 || runtimeLimit == math.MaxInt64 {
-		runtimeLimit = 0
-	}
-	return minPositiveMemoryBytes(runtimeLimit, platformMemoryBudgetBytes())
+	return platformMemoryBudgetBytes()
 }
 
 func minPositiveMemoryBytes(values ...int64) int64 {
@@ -51,17 +46,44 @@ func cgroupMemoryLimitPaths(procSelfCgroup []byte) []string {
 		if len(fields) != cgroupFieldCount {
 			continue
 		}
-		relative := strings.TrimPrefix(filepath.Clean(fields[2]), string(filepath.Separator))
+		cleaned := filepath.Clean(string(filepath.Separator) + fields[2])
+		relative := strings.TrimPrefix(cleaned, string(filepath.Separator))
 		if fields[0] == "0" && fields[1] == "" {
-			paths = append(paths, filepath.Join("/sys/fs/cgroup", relative, "memory.max"))
+			paths = append(paths, cgroupAncestorLimitPaths("/sys/fs/cgroup", relative, "memory.max")...)
 			continue
 		}
 		for _, controller := range strings.Split(fields[1], ",") {
 			if controller == "memory" {
-				paths = append(paths, filepath.Join("/sys/fs/cgroup/memory", relative, "memory.limit_in_bytes"))
+				paths = append(paths, cgroupAncestorLimitPaths(
+					"/sys/fs/cgroup/memory",
+					relative,
+					"memory.limit_in_bytes",
+				)...)
 				break
 			}
 		}
 	}
 	return paths
+}
+
+func cgroupAncestorLimitPaths(root, relative, filename string) []string {
+	root = filepath.Clean(root)
+	dir := filepath.Join(root, relative)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+
+	var paths []string
+	for {
+		paths = append(paths, filepath.Join(dir, filename))
+		if dir == root {
+			return paths
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return paths
+		}
+		dir = parent
+	}
 }
