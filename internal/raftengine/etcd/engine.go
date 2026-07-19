@@ -2062,24 +2062,7 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
 		return
 	}
-	contextBytes, err := encodeConfChangeContext(req.id, peer)
-	if err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	cc := raftpb.ConfChange{
-		Type:    confChangeTypePtr(raftpb.ConfChangeRemoveNode),
-		NodeId:  uint64Ptr(peer.NodeID),
-		Context: contextBytes,
-	}
-	if err := e.storePendingConfig(req); err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
-		e.cancelPendingConfig(req.id)
-		req.done <- adminResult{err: errors.WithStack(err)}
-	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeRemoveNode, peer)
 }
 
 func (e *Engine) handleTransferLeadership(req adminRequest) {

@@ -94,6 +94,11 @@ for the configured consecutive verification interval. It is checked again
 before removal and before the fresh deployment. Membership is never removed
 while the old endpoint still answers.
 
+External mode also stops and verifies the target container over the management
+SSH path after the Raft fence is observed. If that management action is not
+available, the operation stops before `RemoveServer` rather than shrinking the
+group with a still-running process.
+
 ### 4.4 Serialized membership changes
 
 RaftAdmin status now reports:
@@ -142,7 +147,7 @@ same state file.
 
 | Stage | Durable fact |
 | --- | --- |
-| 0 | Target identity, address, complete member signature and configuration index, original voter set, operation ID, and archive path recorded |
+| 0 | Target identity, address, complete member signature and configuration index, original voter set, operation ID, canonical data directory, and archive path recorded |
 | 1 | Preflight and any leadership transfer completed |
 | 2 | Old ID owner fenced and endpoint observed down |
 | 3 | Target absent from committed membership |
@@ -153,12 +158,14 @@ same state file.
 | 8 | Target redeployed without join intent |
 | 9 | Stable voter set and application write/read verification completed |
 
-Operations around a stage boundary are idempotent. The chosen data mode is
-stored with the operation and cannot change on resume. For example, a resumed
-stage 2 accepts that removal already committed, stage 5 accepts an already
-committed learner only when its catch-up floor exists, and stage 6 accepts an
-already promoted voter. A conflicting suffrage or voter set aborts instead of
-guessing what happened.
+Operations around a stage boundary are idempotent. The chosen data mode and
+canonical data directory are stored with the operation and cannot change on
+resume. For example, a resumed stage 2 accepts that removal already committed,
+stage 4 safely reruns the target-only learner deployment after a lost rollout
+response, stage 5 accepts an already committed learner only when its catch-up
+floor exists, and stage 6 accepts an already promoted voter. A conflicting
+suffrage, voter set, or data directory aborts instead of guessing what
+happened.
 
 The state file is retained by default as operational evidence. A retained
 stage-9 file is never treated as authorization for a later incident: a new
@@ -236,22 +243,26 @@ replacement state without starting the target.
 stateful fake RaftAdmin, SSH transport, and rolling deploy command. It verifies
 the exact voter-to-absent-to-learner-to-voter sequence, non-zero catch-up floor,
 both deploy modes, forced execute rollout, application verification, durable
-stage 9, and rejection of a completed state as a new operation.
+stage 9, canonical data-directory persistence, external-fence process stop,
+and rejection of a completed state as a new operation.
 
 A negative test makes one surviving voter unreachable in a three-voter group
 and proves the command aborts before the fence action. Another test loses the
 `AddLearner` RPC response after commit and proves the persisted catch-up floor
-allows a safe resume without a duplicate add. Lock ownership is tested so a
-losing control process cannot remove the winner's directory lock. RaftAdmin
-server and CLI tests cover propagation and rendering of the configuration
-index and pending change fields. Existing engine membership tests cover stale
-previous indexes, learner catch-up enforcement, same-ID replacement, and
-persisted membership restart.
+allows a safe resume without a duplicate add. A separate lost-response test
+proves a completed learner rollout is safely repeated from stage 4 rather than
+leaving the group shrunken. Lock ownership is tested so a losing control
+process cannot remove the winner's directory lock. RaftAdmin server and CLI
+tests cover propagation and rendering of the configuration index and pending
+change fields. Existing engine membership tests cover stale previous indexes,
+learner catch-up enforcement, same-ID replacement, and persisted membership
+restart.
 
 Additional negative tests prove that deployment-env replacement controls
 cannot authorize an operation, a configuration-index change after preflight
 aborts before removal, invocation-level timing controls override stale env
-values, and a trailing-slash data path produces a sibling archive.
+values, dot-segment data paths canonicalize to a sibling archive, and a changed
+data directory is rejected on resume.
 
 Production acceptance still requires recording the state file, fence evidence,
 final `raftadmin status`/`configuration`, and the output of the configured

@@ -28,7 +28,7 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 		"RAFT_PORT=50051",
 		"SSH_USER=tester",
 		"CONTAINER_NAME=elastickv",
-		"DATA_DIR=/var/lib/elastickv/",
+		"DATA_DIR=/var/lib/./elastickv/.",
 		"TARGET_NODE=n3",
 		"REPLACEMENT_CONFIRM=n3",
 		"REPLACEMENT_VERIFY_COMMAND=false",
@@ -70,8 +70,10 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 	require.Contains(t, state, "expected_config_index=13\n")
 	require.Contains(t, state, "min_catch_up_index=100\n")
 	require.Contains(t, state, "data_mode=archive\n")
+	require.Contains(t, state, "data_dir=/var/lib/elastickv\n")
 	require.Contains(t, state, "archive_path=/var/lib/elastickv.replacement-n2-")
 	require.NotContains(t, state, "archive_path=/var/lib/elastickv/.replacement")
+	require.Equal(t, "stop\nreset-data\n", mustReadTestFile(t, filepath.Join(stateDir, "remote-actions")))
 
 	resumeCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
 	resumeCmd.Dir = repoRoot
@@ -95,6 +97,43 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 	require.Error(t, resumeErr)
 	require.Contains(t, string(resumeOutput), "replacement state is already complete")
 	require.Equal(t, "n2:n2\nnormal:n2\n", mustReadTestFile(t, filepath.Join(stateDir, "rollouts")), "completed resume must not repeat deployment")
+}
+
+func TestRaftMemberReplaceScriptStopsProcessAfterExternalFence(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	fakeBin := filepath.Join(stateDir, "bin")
+	require.NoError(t, os.Mkdir(fakeBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "member"), []byte("voter\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "config-index"), []byte("10\n"), 0o600))
+
+	raftadmin := writeExecutableTestFile(t, fakeBin, "raftadmin", fakeRaftadminScript)
+	ssh := writeExecutableTestFile(t, fakeBin, "ssh", fakeReplacementSSHScript)
+	rolling := writeExecutableTestFile(t, fakeBin, "rolling-update", fakeReplacementRollingScript)
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("NODES=n1=127.0.0.1,n2=127.0.0.2,n3=127.0.0.3\n"), 0o600))
+
+	output := runReplacementScript(t, repoRoot, []string{
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=external",
+		`REPLACEMENT_FENCE_COMMAND=touch "$FAKE_STATE_DIR/external-fenced"; touch "$FAKE_STATE_DIR/down-n2"`,
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=1",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+		"REPLACEMENT_STABILITY_SECONDS=1",
+		"REPLACEMENT_TIMEOUT_SECONDS=5",
+		"REPLACEMENT_POLL_SECONDS=1",
+		"REPLACEMENT_STATE_FILE=" + filepath.Join(stateDir, "replace.state"),
+		"ROLLING_UPDATE_ENV_FILE=" + envFile,
+		"ROLLING_UPDATE_SCRIPT=" + rolling,
+		"RAFTADMIN_BIN=" + raftadmin,
+		"SSH_BIN=" + ssh,
+		"FAKE_STATE_DIR=" + stateDir,
+	})
+	require.Contains(t, output, "external fence verified; stopping the target process")
+	require.FileExists(t, filepath.Join(stateDir, "external-fenced"))
+	require.Equal(t, "stop\nreset-data\n", mustReadTestFile(t, filepath.Join(stateDir, "remote-actions")))
 }
 
 func TestRaftMemberReplaceScriptRequiresInvocationControls(t *testing.T) {
@@ -239,11 +278,67 @@ func TestRaftMemberReplaceScriptResumesAfterLearnerCommitResponseLoss(t *testing
 	interruptedState := mustReadTestFile(t, stateFile)
 	require.Contains(t, interruptedState, "stage=5\n")
 	require.Contains(t, interruptedState, "min_catch_up_index=100\n", "catch-up floor must precede the membership proposal")
+	require.Contains(t, interruptedState, "data_dir=/var/lib/elastickv\n")
+
+	changedDataDirCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	changedDataDirCmd.Dir = repoRoot
+	changedDataDirEnv := append(append([]string{}, commandEnv...), "DATA_DIR=/srv/elastickv")
+	changedDataDirCmd.Env = append(os.Environ(), changedDataDirEnv...)
+	changedDataDirOutput, changedDataDirErr := changedDataDirCmd.CombinedOutput()
+	require.Error(t, changedDataDirErr)
+	require.Contains(t, string(changedDataDirOutput), "DATA_DIR changed from /var/lib/elastickv to /srv/elastickv")
 
 	resumeOutput := runReplacementScript(t, repoRoot, commandEnv)
 	require.Contains(t, resumeOutput, "target is already a learner; resuming after committed add")
 	require.Contains(t, resumeOutput, "replacement completed: target=n2")
 	require.Equal(t, "voter\n", mustReadTestFile(t, filepath.Join(stateDir, "member")))
+}
+
+func TestRaftMemberReplaceScriptResumesAfterJoinRolloutResponseLoss(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	fakeBin := filepath.Join(stateDir, "bin")
+	require.NoError(t, os.Mkdir(fakeBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "member"), []byte("voter\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "config-index"), []byte("10\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "fail-join-rollout-once"), nil, 0o600))
+
+	raftadmin := writeExecutableTestFile(t, fakeBin, "raftadmin", fakeRaftadminScript)
+	ssh := writeExecutableTestFile(t, fakeBin, "ssh", fakeReplacementSSHScript)
+	rolling := writeExecutableTestFile(t, fakeBin, "rolling-update", fakeReplacementRollingScript)
+	envFile := filepath.Join(stateDir, "deploy.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("NODES=n1=127.0.0.1,n2=127.0.0.2,n3=127.0.0.3\n"), 0o600))
+	stateFile := filepath.Join(stateDir, "replace.state")
+	commandEnv := []string{
+		"TARGET_NODE=n2",
+		"REPLACEMENT_CONFIRM=n2",
+		"REPLACEMENT_FENCE_MODE=container",
+		"REPLACEMENT_FENCE_VERIFY_SECONDS=1",
+		"REPLACEMENT_VERIFY_COMMAND=true",
+		"REPLACEMENT_STABILITY_SECONDS=1",
+		"REPLACEMENT_TIMEOUT_SECONDS=5",
+		"REPLACEMENT_POLL_SECONDS=1",
+		"REPLACEMENT_STATE_FILE=" + stateFile,
+		"ROLLING_UPDATE_ENV_FILE=" + envFile,
+		"ROLLING_UPDATE_SCRIPT=" + rolling,
+		"RAFTADMIN_BIN=" + raftadmin,
+		"SSH_BIN=" + ssh,
+		"FAKE_STATE_DIR=" + stateDir,
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), commandEnv...)
+	output, err := cmd.CombinedOutput()
+	require.Error(t, err, "%s", output)
+	require.Contains(t, mustReadTestFile(t, stateFile), "stage=4\n")
+	require.Equal(t, "absent\n", mustReadTestFile(t, filepath.Join(stateDir, "member")))
+	require.Equal(t, "n2:n2\n", mustReadTestFile(t, filepath.Join(stateDir, "rollouts")))
+
+	resumeOutput := runReplacementScript(t, repoRoot, commandEnv)
+	require.Contains(t, resumeOutput, "replacement completed: target=n2")
+	require.Equal(t, "n2:n2\nn2:n2\nnormal:n2\n", mustReadTestFile(t, filepath.Join(stateDir, "rollouts")))
 }
 
 func TestRaftMemberReplaceScriptDoesNotRemoveAnotherProcessLock(t *testing.T) {
@@ -397,6 +492,7 @@ cat >/dev/null
 while [[ "$#" -gt 0 && "$1" != "--" ]]; do shift; done
 [[ "$#" -ge 2 ]]
 action="$2"
+printf '%s\n' "$action" >> "$FAKE_STATE_DIR/remote-actions"
 case "$action" in
   stop)
     touch "$FAKE_STATE_DIR/down-n2"
@@ -416,5 +512,9 @@ set -euo pipefail
 printf '%s:%s\n' "${RAFT_JOIN_NODE:-normal}" "$ROLLING_ORDER" >> "$FAKE_STATE_DIR/rollouts"
 if [[ "${RAFT_JOIN_NODE:-}" == "n2" ]]; then
   rm -f "$FAKE_STATE_DIR/down-n2"
+  if [[ -f "$FAKE_STATE_DIR/fail-join-rollout-once" ]]; then
+    rm -f "$FAKE_STATE_DIR/fail-join-rollout-once"
+    exit 74
+  fi
 fi
 `

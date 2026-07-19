@@ -32,7 +32,8 @@ Fencing:
   REPLACEMENT_FENCE_MODE=external (default)
     Requires REPLACEMENT_FENCE_COMMAND. The command must prevent the old VM or
     process from returning with stale data. The target Raft RPC must become
-    unreachable before membership removal.
+    unreachable before membership removal. Management SSH must remain available
+    so the command can stop and verify CONTAINER_NAME before removal.
   REPLACEMENT_FENCE_MODE=container
     Stops CONTAINER_NAME over SSH. Use only when the host lifecycle guarantees
     the stopped container cannot restart independently during the operation.
@@ -170,9 +171,6 @@ SSH_USER="${SSH_USER:-${USER:-$(id -un)}}"
 RAFT_PORT="${RAFT_PORT:-50051}"
 CONTAINER_NAME="${CONTAINER_NAME:-elastickv}"
 DATA_DIR="${DATA_DIR:-/var/lib/elastickv}"
-while [[ "$DATA_DIR" != "/" && "$DATA_DIR" == */ ]]; do
-  DATA_DIR="${DATA_DIR%/}"
-done
 RAFTADMIN_BIN="${RAFTADMIN_BIN:-}"
 RAFTADMIN_ALLOW_INSECURE="${RAFTADMIN_ALLOW_INSECURE:-true}"
 RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-5}"
@@ -203,6 +201,7 @@ STATE_EXPECTED_MEMBERS=""
 STATE_EXPECTED_CONFIG_INDEX=0
 STATE_MIN_CATCH_UP_INDEX=0
 STATE_DATA_MODE=""
+STATE_DATA_DIR=""
 VIEW_LEADER_ID=""
 VIEW_LEADER_ADDRESS=""
 VIEW_CONFIG_INDEX=0
@@ -226,11 +225,40 @@ is_uint() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+canonicalize_absolute_path() {
+  local path="$1"
+  local component last
+  local -a components=()
+  local -a normalized=()
+  [[ "$path" == /* ]] || return 1
+  IFS='/' read -r -a components <<< "${path#/}"
+  for component in "${components[@]}"; do
+    case "$component" in
+      ""|.) ;;
+      ..)
+        ((${#normalized[@]} > 0)) || return 1
+        last=$((${#normalized[@]} - 1))
+        unset "normalized[$last]"
+        ;;
+      *) normalized+=("$component") ;;
+    esac
+  done
+  if ((${#normalized[@]} == 0)); then
+    printf '/\n'
+    return 0
+  fi
+  local IFS=/
+  printf '/%s\n' "${normalized[*]}"
+}
+
 validate_settings() {
+  local canonical_data_dir
   [[ -n "$TARGET_NODE" ]] || fail "TARGET_NODE is required"
   [[ "$TARGET_NODE" =~ ^[A-Za-z0-9._-]+$ ]] || fail "TARGET_NODE contains unsupported characters"
   [[ -n "$NODES" ]] || fail "NODES is required"
   [[ "$DATA_DIR" == /* ]] || fail "DATA_DIR must be absolute"
+  canonical_data_dir="$(canonicalize_absolute_path "$DATA_DIR")" || fail "DATA_DIR escapes the filesystem root"
+  DATA_DIR="$canonical_data_dir"
   [[ "$DATA_DIR" != "/" ]] || fail "DATA_DIR must not be the filesystem root"
   state_value_valid "$DATA_DIR" || fail "DATA_DIR contains characters unsupported by the resume state"
   [[ -x "$ROLLING_UPDATE_SCRIPT" ]] || fail "ROLLING_UPDATE_SCRIPT is not executable: $ROLLING_UPDATE_SCRIPT"
@@ -780,6 +808,9 @@ fence_target() {
     external)
       log "running external fence for $TARGET_NODE"
       run_operator_command "$REPLACEMENT_FENCE_COMMAND"
+      wait_target_down || fail "target Raft RPC is still reachable after external fencing"
+      log "external fence verified; stopping the target process before membership removal"
+      remote_target_action stop
       ;;
     container)
       log "stopping target container; host lifecycle must keep it fenced"
@@ -1020,7 +1051,7 @@ write_state() {
   local tmp value
   for value in "$STATE_STAGE" "$STATE_TARGET" "$STATE_TARGET_ADDRESS" "$STATE_OPERATION_ID" \
     "$STATE_ARCHIVE_PATH" "$STATE_EXPECTED_VOTERS" "$STATE_EXPECTED_MEMBERS" \
-    "$STATE_EXPECTED_CONFIG_INDEX" "$STATE_MIN_CATCH_UP_INDEX" "$STATE_DATA_MODE"; do
+    "$STATE_EXPECTED_CONFIG_INDEX" "$STATE_MIN_CATCH_UP_INDEX" "$STATE_DATA_MODE" "$STATE_DATA_DIR"; do
     state_value_valid "$value" || fail "replacement state contains an unsupported value"
   done
   mkdir -p "$(dirname "$REPLACEMENT_STATE_FILE")"
@@ -1036,6 +1067,7 @@ write_state() {
     printf 'expected_config_index=%s\n' "$STATE_EXPECTED_CONFIG_INDEX"
     printf 'min_catch_up_index=%s\n' "$STATE_MIN_CATCH_UP_INDEX"
     printf 'data_mode=%s\n' "$STATE_DATA_MODE"
+    printf 'data_dir=%s\n' "$STATE_DATA_DIR"
   } > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$REPLACEMENT_STATE_FILE"
@@ -1057,6 +1089,7 @@ load_state() {
       expected_config_index) STATE_EXPECTED_CONFIG_INDEX="$value" ;;
       min_catch_up_index) STATE_MIN_CATCH_UP_INDEX="$value" ;;
       data_mode) STATE_DATA_MODE="$value" ;;
+      data_dir) STATE_DATA_DIR="$value" ;;
       "") ;;
       *) fail "unknown key in state file: $key" ;;
     esac
@@ -1069,9 +1102,10 @@ load_state() {
   [[ "$STATE_TARGET" == "$TARGET_NODE" ]] || fail "state file belongs to target $STATE_TARGET, not $TARGET_NODE"
   [[ "$STATE_TARGET_ADDRESS" == "$(node_host_by_id "$TARGET_NODE"):${RAFT_PORT}" ]] || fail "state target address no longer matches NODES"
   [[ -n "$STATE_OPERATION_ID" && -n "$STATE_ARCHIVE_PATH" && -n "$STATE_EXPECTED_VOTERS" && \
-    -n "$STATE_EXPECTED_MEMBERS" ]] || fail "state file is incomplete"
+    -n "$STATE_EXPECTED_MEMBERS" && -n "$STATE_DATA_DIR" ]] || fail "state file is incomplete"
   (( STATE_EXPECTED_CONFIG_INDEX > 0 )) || fail "state file has no expected configuration index"
   [[ "$STATE_DATA_MODE" == "$REPLACEMENT_DATA_MODE" ]] || fail "REPLACEMENT_DATA_MODE changed from $STATE_DATA_MODE to $REPLACEMENT_DATA_MODE"
+  [[ "$STATE_DATA_DIR" == "$DATA_DIR" ]] || fail "DATA_DIR changed from $STATE_DATA_DIR to $DATA_DIR"
   (( STATE_STAGE < 9 )) || fail "replacement state is already complete; archive it or choose a new REPLACEMENT_STATE_FILE"
   log "resuming operation $STATE_OPERATION_ID at stage $STATE_STAGE"
 }
@@ -1119,7 +1153,8 @@ if ! load_state; then
   STATE_TARGET="$TARGET_NODE"
   STATE_TARGET_ADDRESS="${TARGET_HOST}:${RAFT_PORT}"
   STATE_OPERATION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  STATE_ARCHIVE_PATH="${DATA_DIR}.replacement-${TARGET_NODE}-${STATE_OPERATION_ID}"
+  STATE_DATA_DIR="$DATA_DIR"
+  STATE_ARCHIVE_PATH="${STATE_DATA_DIR}.replacement-${TARGET_NODE}-${STATE_OPERATION_ID}"
   STATE_DATA_MODE="$REPLACEMENT_DATA_MODE"
   preflight
   advance 1
@@ -1132,7 +1167,7 @@ fi
 if (( STATE_STAGE < 2 )); then
   fence_target
   advance 2
-elif (( STATE_STAGE < 5 )); then
+elif (( STATE_STAGE < 4 )); then
   wait_target_down || fail "fenced target is reachable again before removal"
 fi
 if (( STATE_STAGE < 3 )); then
