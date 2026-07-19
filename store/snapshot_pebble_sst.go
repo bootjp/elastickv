@@ -35,10 +35,7 @@ const (
 	sstIngestFilePerm              = 0600
 )
 
-var (
-	pebbleSSTIngestSnapshotMagic = [8]byte{'E', 'K', 'V', 'S', 'S', 'T', 'I', '1'}
-	sstIngestTargetFileBytes     = uint64(defaultSSTIngestTargetFileSize)
-)
+var pebbleSSTIngestSnapshotMagic = [8]byte{'E', 'K', 'V', 'S', 'S', 'T', 'I', '1'}
 
 type pebbleSnapshotMetadata struct {
 	LastCommitTS         uint64
@@ -69,12 +66,13 @@ type pebbleSSTIngestFileMeta struct {
 }
 
 type pebbleSSTIngestSnapshot struct {
-	checkpointDir string
-	fallback      *pebbleSnapshot
-	metadata      pebbleSnapshotMetadata
-	log           *slog.Logger
-	once          sync.Once
-	err           error
+	checkpointDir   string
+	fallback        *pebbleSnapshot
+	metadata        pebbleSnapshotMetadata
+	targetFileBytes uint64
+	log             *slog.Logger
+	once            sync.Once
+	err             error
 }
 
 type pebbleSSTIngestBundle struct {
@@ -84,16 +82,17 @@ type pebbleSSTIngestBundle struct {
 }
 
 type pebbleSSTExporter struct {
-	db           *pebble.DB
-	dir          string
-	manifest     pebbleSSTIngestManifest
-	writer       *sstable.Writer
-	currentPath  string
-	currentName  string
-	currentBytes uint64
-	smallest     []byte
-	largest      []byte
-	fileIndex    int
+	db              *pebble.DB
+	dir             string
+	manifest        pebbleSSTIngestManifest
+	writer          *sstable.Writer
+	currentPath     string
+	currentName     string
+	currentBytes    uint64
+	smallest        []byte
+	largest         []byte
+	fileIndex       int
+	targetFileBytes uint64
 }
 
 func resolveSSTIngestSnapshots(raw string) bool {
@@ -105,16 +104,16 @@ func cleanupPebbleSnapshotArtifacts(dir string) error {
 	clean := filepath.Clean(dir)
 	parent := filepath.Dir(clean)
 	base := filepath.Base(clean)
-	if err := recoverPebbleRestoreBackup(clean, filepath.Join(parent, base+"-restore-backup-*")); err != nil {
+	if err := recoverPebbleRestoreBackup(clean); err != nil {
 		return err
 	}
-	patterns := []string{
-		base + "-sst-checkpoint-*",
-		base + "-sst-ingest-*",
-		base + "-sst-receive-*",
+	prefixes := []string{
+		base + "-sst-checkpoint-",
+		base + "-sst-ingest-",
+		base + "-sst-receive-",
 	}
-	for _, pattern := range patterns {
-		matches, err := filepath.Glob(filepath.Join(parent, pattern))
+	for _, prefix := range prefixes {
+		matches, err := siblingPathsWithPrefix(parent, prefix)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -127,13 +126,31 @@ func cleanupPebbleSnapshotArtifacts(dir string) error {
 	return nil
 }
 
-func recoverPebbleRestoreBackup(dir, pattern string) error {
+func siblingPathsWithPrefix(parent, prefix string) ([]string, error) {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.WithStack(err)
+	}
+	paths := make([]string, 0)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			paths = append(paths, filepath.Join(parent, entry.Name()))
+		}
+	}
+	return paths, nil
+}
+
+func recoverPebbleRestoreBackup(dir string) error {
 	if _, err := os.Stat(dir); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return errors.WithStack(err)
 	}
-	backups, err := filepath.Glob(pattern)
+	clean := filepath.Clean(dir)
+	backups, err := siblingPathsWithPrefix(filepath.Dir(clean), filepath.Base(clean)+"-restore-backup-")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -151,8 +168,7 @@ func recoverPebbleRestoreBackup(dir, pattern string) error {
 
 func cleanupPebbleRestoreBackups(dir string) error {
 	clean := filepath.Clean(dir)
-	pattern := filepath.Join(filepath.Dir(clean), filepath.Base(clean)+"-restore-backup-*")
-	backups, err := filepath.Glob(pattern)
+	backups, err := siblingPathsWithPrefix(filepath.Dir(clean), filepath.Base(clean)+"-restore-backup-")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -205,14 +221,19 @@ func (s *pebbleStore) newSSTIngestSnapshot() (Snapshot, error) {
 		_ = os.RemoveAll(checkpointDir)
 		return nil, err
 	}
+	targetFileBytes := s.sstIngestTargetFileBytes
+	if targetFileBytes == 0 {
+		targetFileBytes = defaultSSTIngestTargetFileSize
+	}
 	return &pebbleSSTIngestSnapshot{
 		checkpointDir: checkpointDir,
 		fallback: &pebbleSnapshot{
 			snapshot:     pebbleSnap,
 			lastCommitTS: metadata.LastCommitTS,
 		},
-		metadata: metadata,
-		log:      s.log,
+		metadata:        metadata,
+		targetFileBytes: targetFileBytes,
+		log:             s.log,
 	}, nil
 }
 
@@ -275,7 +296,7 @@ func (s *pebbleSSTIngestSnapshot) WriteTo(w io.Writer) (int64, error) {
 	if s == nil || s.fallback == nil {
 		return 0, errors.New("snapshot is not available")
 	}
-	bundle, err := buildPebbleSSTIngestBundle(s.checkpointDir, s.metadata)
+	bundle, err := buildPebbleSSTIngestBundle(s.checkpointDir, s.metadata, s.targetFileBytes)
 	if err != nil {
 		if s.log != nil {
 			s.log.Warn("failed to build SST ingest snapshot; using legacy stream", "error", err)
@@ -305,7 +326,7 @@ func (s *pebbleSSTIngestSnapshot) Close() error {
 	return errors.WithStack(s.err)
 }
 
-func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMetadata) (*pebbleSSTIngestBundle, error) {
+func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64) (*pebbleSSTIngestBundle, error) {
 	opts, cache := defaultPebbleOptionsWithCache()
 	opts.ReadOnly = true
 	db, err := pebble.Open(checkpointDir, opts)
@@ -328,7 +349,7 @@ func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMet
 		return nil, err
 	}
 
-	manifest, err := exportPebbleSnapshotSSTs(db, exportDir, metadata)
+	manifest, err := exportPebbleSnapshotSSTs(db, exportDir, metadata, targetFileBytes)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -353,10 +374,14 @@ func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMet
 	return bundle, nil
 }
 
-func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSnapshotMetadata) (pebbleSSTIngestManifest, error) {
+func exportPebbleSnapshotSSTs(db *pebble.DB, exportDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64) (pebbleSSTIngestManifest, error) {
+	if targetFileBytes == 0 {
+		targetFileBytes = defaultSSTIngestTargetFileSize
+	}
 	exporter := pebbleSSTExporter{
-		db:  db,
-		dir: exportDir,
+		db:              db,
+		dir:             exportDir,
+		targetFileBytes: targetFileBytes,
 		manifest: pebbleSSTIngestManifest{
 			Version:              sstIngestSnapshotVersion,
 			LastCommitTS:         metadata.LastCommitTS,
@@ -415,7 +440,7 @@ func (e *pebbleSSTExporter) Add(key, value []byte) error {
 			e.manifest.LastCommitTS = commitTS
 		}
 	}
-	if e.currentBytes >= sstIngestTargetFileBytes {
+	if e.currentBytes >= e.targetFileBytes {
 		return e.finishFile()
 	}
 	return nil
@@ -472,19 +497,20 @@ func (e *pebbleSSTExporter) Abort() {
 	}
 }
 
-func inspectSSTIngestFile(path, name string, smallest, largest []byte) (pebbleSSTIngestFileMeta, error) {
+func inspectSSTIngestFile(path, name string, smallest, largest []byte) (_ pebbleSSTIngestFileMeta, retErr error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return pebbleSSTIngestFileMeta{}, errors.WithStack(err)
 	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, errors.WithStack(err))
+		}
+	}()
 	h := sha256.New()
-	size, copyErr := io.Copy(h, f)
-	closeErr := f.Close()
-	if copyErr != nil {
-		return pebbleSSTIngestFileMeta{}, errors.WithStack(copyErr)
-	}
-	if closeErr != nil {
-		return pebbleSSTIngestFileMeta{}, errors.WithStack(closeErr)
+	size, err := io.Copy(h, f)
+	if err != nil {
+		return pebbleSSTIngestFileMeta{}, errors.WithStack(err)
 	}
 	return pebbleSSTIngestFileMeta{
 		Name:     name,
@@ -511,24 +537,31 @@ func (b *pebbleSSTIngestBundle) WriteTo(w io.Writer) (int64, error) {
 		return cw.n, err
 	}
 	for _, file := range b.manifest.Files {
-		path := filepath.Join(b.dir, file.Name)
-		f, err := os.Open(path)
-		if err != nil {
-			return cw.n, errors.WithStack(err)
-		}
-		written, copyErr := io.Copy(cw, f)
-		closeErr := f.Close()
-		if copyErr != nil {
-			return cw.n, errors.WithStack(copyErr)
-		}
-		if closeErr != nil {
-			return cw.n, errors.WithStack(closeErr)
-		}
-		if written != file.Size {
-			return cw.n, errors.WithStack(errors.Newf("SST ingest file %s changed while streaming", file.Name))
+		if err := b.writeFileTo(cw, file); err != nil {
+			return cw.n, err
 		}
 	}
 	return cw.n, nil
+}
+
+func (b *pebbleSSTIngestBundle) writeFileTo(w io.Writer, fileMeta pebbleSSTIngestFileMeta) (retErr error) {
+	f, err := os.Open(filepath.Join(b.dir, fileMeta.Name))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, errors.WithStack(err))
+		}
+	}()
+	written, err := io.Copy(w, f)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if written != fileMeta.Size {
+		return errors.WithStack(errors.Newf("SST ingest file %s changed while streaming", fileMeta.Name))
+	}
+	return nil
 }
 
 func (b *pebbleSSTIngestBundle) Close() error {
@@ -674,26 +707,9 @@ func validateSSTIngestFileMeta(file pebbleSSTIngestFileMeta, index int, previous
 func receiveSSTIngestFiles(r io.Reader, stageDir string, manifest pebbleSSTIngestManifest) ([]string, error) {
 	paths := make([]string, 0, len(manifest.Files))
 	for _, fileMeta := range manifest.Files {
-		path := filepath.Join(stageDir, fileMeta.Name)
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, sstIngestFilePerm)
+		path, err := receiveSSTIngestFile(r, stageDir, fileMeta)
 		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		h := sha256.New()
-		written, copyErr := io.CopyN(io.MultiWriter(file, h), r, fileMeta.Size)
-		syncErr := file.Sync()
-		closeErr := file.Close()
-		if copyErr != nil {
-			return nil, errors.Wrapf(copyErr, "receive SST ingest file %s", fileMeta.Name)
-		}
-		if syncErr != nil {
-			return nil, errors.WithStack(syncErr)
-		}
-		if closeErr != nil {
-			return nil, errors.WithStack(closeErr)
-		}
-		if written != fileMeta.Size || hex.EncodeToString(h.Sum(nil)) != fileMeta.SHA256 {
-			return nil, errors.WithStack(errors.Newf("SST ingest file integrity mismatch: %s", fileMeta.Name))
+			return nil, err
 		}
 		paths = append(paths, path)
 	}
@@ -704,6 +720,31 @@ func receiveSSTIngestFiles(r io.Reader, stageDir string, manifest pebbleSSTInges
 		return nil, errors.WithStack(err)
 	}
 	return paths, nil
+}
+
+func receiveSSTIngestFile(r io.Reader, stageDir string, fileMeta pebbleSSTIngestFileMeta) (_ string, retErr error) {
+	path := filepath.Join(stageDir, fileMeta.Name)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, sstIngestFilePerm)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, errors.WithStack(err))
+		}
+	}()
+	h := sha256.New()
+	written, err := io.CopyN(io.MultiWriter(file, h), r, fileMeta.Size)
+	if err != nil {
+		return "", errors.Wrapf(err, "receive SST ingest file %s", fileMeta.Name)
+	}
+	if err := file.Sync(); err != nil {
+		return "", errors.WithStack(err)
+	}
+	if written != fileMeta.Size || hex.EncodeToString(h.Sum(nil)) != fileMeta.SHA256 {
+		return "", errors.WithStack(errors.Newf("SST ingest file integrity mismatch: %s", fileMeta.Name))
+	}
+	return path, nil
 }
 
 func metadataFromSSTIngestManifest(manifest pebbleSSTIngestManifest) pebbleSnapshotMetadata {

@@ -212,7 +212,8 @@ type pebbleStore struct {
 	// implemented in snapshot_pebble_sst.go. Receivers always understand the
 	// format; senders keep the legacy stream by default for rolling-upgrade
 	// compatibility with older binaries.
-	sstIngestSnapshots bool
+	sstIngestSnapshots       bool
+	sstIngestTargetFileBytes uint64
 	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
@@ -320,10 +321,11 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		writeConflicts:        newWriteConflictCounter(),
-		fsmApplyWriteOpts:     fsmOpts,
-		fsmApplySyncModeLabel: fsmLabel,
-		sstIngestSnapshots:    resolveSSTIngestSnapshots(os.Getenv(sstIngestSnapshotEnv)),
+		writeConflicts:           newWriteConflictCounter(),
+		fsmApplyWriteOpts:        fsmOpts,
+		fsmApplySyncModeLabel:    fsmLabel,
+		sstIngestSnapshots:       resolveSSTIngestSnapshots(os.Getenv(sstIngestSnapshotEnv)),
+		sstIngestTargetFileBytes: defaultSSTIngestTargetFileSize,
 	}
 	for _, opt := range opts {
 		opt(s)

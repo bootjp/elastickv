@@ -40,6 +40,12 @@ func openSSTSnapshotTestStore(t *testing.T, dir string, opts ...PebbleStoreOptio
 	return store
 }
 
+func withSSTIngestTargetFileBytesForTest(target uint64) PebbleStoreOption {
+	return func(store *pebbleStore) {
+		store.sstIngestTargetFileBytes = target
+	}
+}
+
 func writeSSTSnapshotTestData(t *testing.T, store *pebbleStore) {
 	t.Helper()
 	ctx := context.Background()
@@ -63,11 +69,12 @@ func snapshotBytesForTest(t *testing.T, store *pebbleStore) ([]byte, Snapshot) {
 
 func TestPebbleStoreSSTIngestSnapshotRoundTrip(t *testing.T) {
 	setPebbleCacheBytesForTest(t, 8<<20)
-	oldTarget := sstIngestTargetFileBytes
-	sstIngestTargetFileBytes = 128
-	t.Cleanup(func() { sstIngestTargetFileBytes = oldTarget })
-
-	src := openSSTSnapshotTestStore(t, filepath.Join(t.TempDir(), "src"), WithSSTIngestSnapshots(true))
+	src := openSSTSnapshotTestStore(
+		t,
+		filepath.Join(t.TempDir(), "src"),
+		WithSSTIngestSnapshots(true),
+		withSSTIngestTargetFileBytesForTest(128),
+	)
 	writeSSTSnapshotTestData(t, src)
 
 	snapshot, err := src.Snapshot()
@@ -208,7 +215,7 @@ func TestPebbleStoreCleansStaleSSTSnapshotArtifacts(t *testing.T) {
 	})
 
 	t.Run("removes stale artifacts around live store", func(t *testing.T) {
-		dir := filepath.Join(t.TempDir(), "fsm.db")
+		dir := filepath.Join(t.TempDir(), "fsm[1].db")
 		original := openSSTSnapshotTestStore(t, dir)
 		require.NoError(t, original.PutAt(context.Background(), []byte("sentinel"), []byte("keep"), 5, 0))
 		require.NoError(t, original.Close())
