@@ -25,6 +25,9 @@ const (
 	// MigrationPromoteOpcodeEnv enables the internal staged promotion opcode
 	// after every voter is running a compatible build.
 	MigrationPromoteOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"
+	// MigrationCleanupOpcodeEnv enables the internal migration cleanup opcode
+	// after every voter is running a compatible build.
+	MigrationCleanupOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE"
 )
 
 type InternalOption func(*Internal)
@@ -59,6 +62,12 @@ func WithInternalMigrationPromoteGate(gate func(context.Context) error) Internal
 	}
 }
 
+func WithInternalMigrationCleanupGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationCleanupGate = gate
+	}
+}
+
 func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 	return func(i *Internal) {
 		i.routeEngine = engine
@@ -86,6 +95,7 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 		relay:                relay,
 		migrationImportGate:  defaultMigrationImportGate,
 		migrationPromoteGate: defaultMigrationPromoteGate,
+		migrationCleanupGate: defaultMigrationCleanupGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -103,6 +113,7 @@ type Internal struct {
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
+	migrationCleanupGate    func(context.Context) error
 	routeEngine             *distribution.Engine
 	readTracker             *kv.ActiveTimestampTracker
 	migrationExportGroupID  uint64
@@ -465,7 +476,7 @@ func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigratio
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
-	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+	if err := i.verifyMigrationCleanupEnabled(ctx); err != nil {
 		return nil, err
 	}
 	result, err := i.proposeMigrationCleanup(ctx, req)
@@ -564,6 +575,16 @@ func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
 	return nil
 }
 
+func (i *Internal) verifyMigrationCleanupEnabled(ctx context.Context) error {
+	if i.migrationCleanupGate == nil {
+		return nil
+	}
+	if err := i.migrationCleanupGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
 func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
 	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
 	if err := store.ValidatePromotionCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
@@ -593,6 +614,13 @@ func defaultMigrationPromoteGate(context.Context) error {
 	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
 }
 
+func defaultMigrationCleanupGate(context.Context) error {
+	if MigrationCleanupOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup opcode is disabled; enable after every voter is running a build that supports migration cleanup"))
+}
+
 func migrationPromoteOpcodeEnabledFromEnv() bool {
 	return MigrationPromoteOpcodeEnabledFromEnv()
 }
@@ -607,6 +635,12 @@ func MigrationImportOpcodeEnabledFromEnv() bool {
 // opcode is enabled for this process.
 func MigrationPromoteOpcodeEnabledFromEnv() bool {
 	return envFlagEnabled(MigrationPromoteOpcodeEnv)
+}
+
+// MigrationCleanupOpcodeEnabledFromEnv reports whether the migration cleanup
+// opcode is enabled for this process.
+func MigrationCleanupOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationCleanupOpcodeEnv)
 }
 
 func envFlagEnabled(name string) bool {

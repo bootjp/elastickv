@@ -759,3 +759,24 @@ func TestInternalApplyTargetStagedReadinessRejectsArmedZeroMinWriteTS(t *testing
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.Equal(t, uint64(0), proposer.calls)
 }
+
+func TestInternalCleanupMigrationRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	proposer := &applyingMigrationProposer{fsm: kv.NewKvFSMWithHLC(store.NewMVCCStore(), nil)}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationCleanupGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration cleanup disabled for test")
+		}),
+	)
+
+	resp, err := internal.CleanupMigration(context.Background(), &pb.CleanupMigrationRequest{
+		JobId:     9,
+		Mode:      pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
+		KeyFamily: distribution.MigrationFamilyUser,
+	})
+	require.Nil(t, resp)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Zero(t, proposer.calls)
+}

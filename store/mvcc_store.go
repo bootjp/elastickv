@@ -851,12 +851,19 @@ func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
 }
 
 func (s *mvccStore) writeSnapshotFile(f *os.File) error {
-	checksumOffset, err := writeMVCCSnapshotHeader(f)
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	version := mvccSnapshotLegacyVersion
+	if len(s.migrationReadinessCache) != 0 {
+		version = mvccSnapshotVersion
+	}
+	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
 	}
 
-	sum, err := s.writeSnapshotBody(f)
+	sum, err := s.writeSnapshotBodyLocked(f, version)
 	if err != nil {
 		return err
 	}
@@ -864,11 +871,11 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	return finalizeMVCCSnapshotFile(f, checksumOffset, sum)
 }
 
-func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
+func writeMVCCSnapshotHeader(f *os.File, version uint32) (int64, error) {
 	if _, err := f.Write(mvccSnapshotMagic[:]); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	if err := binary.Write(f, binary.LittleEndian, mvccSnapshotVersion); err != nil {
+	if err := binary.Write(f, binary.LittleEndian, version); err != nil {
 		return 0, errors.WithStack(err)
 	}
 	checksumOffset, err := f.Seek(0, io.SeekCurrent)
@@ -881,13 +888,10 @@ func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
 	return checksumOffset, nil
 }
 
-func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
+func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32, error) {
 	hash := crc32.NewIEEE()
 	bw := bufio.NewWriter(f)
 	w := io.MultiWriter(bw, hash)
-
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
 
 	if err := binary.Write(w, binary.LittleEndian, s.lastCommitTS); err != nil {
 		return 0, errors.WithStack(err)
@@ -895,8 +899,10 @@ func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
 	if err := binary.Write(w, binary.LittleEndian, s.minRetainedTS); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	if err := writeMVCCSnapshotReadinessStates(w, s.migrationReadinessCache); err != nil {
-		return 0, err
+	if version >= mvccSnapshotVersion {
+		if err := writeMVCCSnapshotReadinessStates(w, s.migrationReadinessCache); err != nil {
+			return 0, err
+		}
 	}
 	iter := s.tree.Iterator()
 	for iter.Next() {

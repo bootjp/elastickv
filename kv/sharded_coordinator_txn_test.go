@@ -892,6 +892,36 @@ func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	readOnlyStore := &stubMVCCStore{
+		latestTS: map[string]uint64{"x": 5},
+		readiness: []store.TargetStagedReadinessState{{
+			JobID:               7,
+			RouteStart:          []byte("m"),
+			MigrationJobID:      7,
+			MinWriteTSExclusive: 100,
+			Armed:               true,
+			SourceWriteFence:    true,
+			SourceReadFence:     true,
+			RetentionPinTS:      10,
+		}},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	err := coord.validateReadOnlyShards(context.Background(), map[uint64][][]byte{
+		2: {[]byte("x")},
+	}, []uint64{1}, 10)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()

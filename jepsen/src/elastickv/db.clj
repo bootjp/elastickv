@@ -144,7 +144,8 @@
         effective-server-env (cond-> (or server-env {})
                                migration-enabled
                                (merge {"ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE" "true"
-                                       "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE" "true"}))
+                                       "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE" "true"
+                                       "ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE" "true"}))
         daemon-opts (cond-> {:chdir bin-dir
                              :logfile log-file
                              :pidfile pid-file

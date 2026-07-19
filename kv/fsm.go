@@ -760,9 +760,28 @@ func (f *kvFSM) verifyTargetReadinessForReadKeys(ctx context.Context, keys [][]b
 		if isTxnInternalKey(key) {
 			continue
 		}
+		if err := f.verifySourceReadFenceForRange(ctx, key, nextScanCursor(key)); err != nil {
+			return err
+		}
 		if err := f.verifyTargetReadinessForRange(ctx, key, nextScanCursor(key)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifySourceReadFenceForRange(ctx context.Context, start []byte, end []byte) error {
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return errors.WithStack(ErrRouteCutoverPending)
 	}
 	return nil
 }

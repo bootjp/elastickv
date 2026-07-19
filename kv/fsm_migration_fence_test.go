@@ -339,14 +339,14 @@ func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
 	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
 		IsTxn:                true,
 		Phase:                pb.Phase_PREPARE,
-		Ts:                   10,
+		Ts:                   101,
 		ObservedRouteVersion: 1,
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
 			{Op: pb.Op_DEL, Key: key},
 		},
-	}, 10)
+	}, 101)
 	require.NoError(t, err)
 }
 
@@ -831,6 +831,25 @@ func TestFSMPrepareTxnChecksReadKeysForTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
 	_, getErr := fsm.store.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
+}
+
+func TestFSMOnePhaseTxnChecksSourceReadFenceForReadKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	applySourceMigrationControlToFSM(t, fsm, true, true)
+	req := onePhaseReq(10, 20, 0, []byte("b"), []byte("v"))
+	req.ReadKeys = [][]byte{[]byte("n")}
+
+	err := fsm.handleTxnRequest(ctx, req, 20)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, getErr := fsm.store.GetAt(ctx, []byte("b"), ^uint64(0))
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 

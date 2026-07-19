@@ -2088,6 +2088,9 @@ func splitMigrationLocalReadinessGate(context.Context) error {
 	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
 	}
+	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
+	}
 	return nil
 }
 

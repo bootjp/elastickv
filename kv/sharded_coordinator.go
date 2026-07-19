@@ -2465,6 +2465,9 @@ func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.
 		return nil
 	}
 	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
 	routes, catalogVersion, proof := c.currentShardRoutesForRouteRange(gid, routeStart, routeEnd)
 	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, gid, catalogVersion, proof) {
 		return nil
