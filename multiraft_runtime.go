@@ -109,7 +109,7 @@ func (r *raftGroupRuntime) registerGRPC(server grpc.ServiceRegistrar) {
 const raftDirPerm = 0o755
 
 func groupDataDir(baseDir, raftID string, groupID uint64, multi bool) string {
-	if !multi {
+	if !multi && groupID != 0 {
 		return filepath.Join(baseDir, raftID)
 	}
 	return filepath.Join(baseDir, raftID, fmt.Sprintf("group-%d", groupID))

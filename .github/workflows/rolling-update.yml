@@ -2,7 +2,7 @@ name: Rolling update
 
 # Manually-triggered production rollout. Joins the Tailnet, SSHes over
 # MagicDNS into each node, and invokes scripts/rolling-update.sh.
-# See docs/design/2026_04_24_proposed_deploy_via_tailscale.md.
+# See docs/design/2026_04_24_implemented_deploy_via_tailscale.md.
 
 on:
   workflow_dispatch:
@@ -116,7 +116,7 @@ jobs:
           echo "trusted workflow sha: $RUN_SHA"
 
       - name: Checkout trusted deploy script
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ steps.trusted-ref.outputs.checkout_ref }}
           persist-credentials: false
@@ -141,7 +141,7 @@ jobs:
           fi
 
       - name: Join Tailnet (ephemeral)
-        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}

@@ -129,12 +129,18 @@ func (Phase) EnumDescriptor() ([]byte, []int) {
 }
 
 type Mutation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Op            Op                     `protobuf:"varint,1,opt,name=op,proto3,enum=Op" json:"op,omitempty"`
-	Key           []byte                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Op    Op                     `protobuf:"varint,1,opt,name=op,proto3,enum=Op" json:"op,omitempty"`
+	Key   []byte                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	// commit_ts_value_offset, when non-zero, asks the committing leader to write
+	// the resolved transaction commit timestamp into value[offset:offset+8] as a
+	// big-endian uint64 before the request is committed. This is used for values
+	// that durably embed their own creation timestamp but still need leader-side
+	// timestamp allocation after redirect/retry.
+	CommitTsValueOffset uint64 `protobuf:"varint,4,opt,name=commit_ts_value_offset,json=commitTsValueOffset,proto3" json:"commit_ts_value_offset,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *Mutation) Reset() {
@@ -186,6 +192,13 @@ func (x *Mutation) GetValue() []byte {
 		return x.Value
 	}
 	return nil
+}
+
+func (x *Mutation) GetCommitTsValueOffset() uint64 {
+	if x != nil {
+		return x.CommitTsValueOffset
+	}
+	return 0
 }
 
 type Request struct {
@@ -385,6 +398,7 @@ type ForwardResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
 	CommitIndex   uint64                 `protobuf:"varint,2,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	CommitTs      uint64                 `protobuf:"varint,3,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -429,6 +443,13 @@ func (x *ForwardResponse) GetSuccess() bool {
 func (x *ForwardResponse) GetCommitIndex() uint64 {
 	if x != nil {
 		return x.CommitIndex
+	}
+	return 0
+}
+
+func (x *ForwardResponse) GetCommitTs() uint64 {
+	if x != nil {
+		return x.CommitTs
 	}
 	return 0
 }
@@ -533,11 +554,12 @@ var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
 	"\n" +
-	"\x0einternal.proto\"G\n" +
+	"\x0einternal.proto\"|\n" +
 	"\bMutation\x12\x13\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x03.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\fR\x05value\"\xca\x01\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
+	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\"\xca\x01\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -549,10 +571,11 @@ const file_internal_proto_rawDesc = "" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12$\n" +
-	"\brequests\x18\x02 \x03(\v2\b.RequestR\brequests\"N\n" +
+	"\brequests\x18\x02 \x03(\v2\b.RequestR\brequests\"k\n" +
 	"\x0fForwardResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12!\n" +
-	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\"I\n" +
+	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\x12\x1b\n" +
+	"\tcommit_ts\x18\x03 \x01(\x04R\bcommitTs\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +

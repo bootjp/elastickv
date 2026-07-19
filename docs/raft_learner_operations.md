@@ -40,12 +40,27 @@ go run . \
   --address         127.0.0.1:50054 \
   --redisAddress    127.0.0.1:63794 \
   --raftDataDir     /var/lib/elastickv/n4 \
-  --raftJoinAsLearner
+  --raftJoinAsLearner \
+  --raftJoinMembers "n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053,n4=127.0.0.1:50054"
 ```
+
+`--raftJoinMembers` is transport discovery only. Unlike
+`--raftBootstrapMembers`, it does not create an initial `ConfState` and does
+not make the node campaign. The list must describe the current single-group
+membership plus the local joiner, include at least one existing remote member,
+and match the joiner's `--raftId` and `--address`. It is rejected unless
+`--raftJoinAsLearner` is set, and it cannot be combined with any bootstrap
+flag.
 
 The joiner will start, register with the gRPC transport, and wait for
 the leader to fan out the cluster's `ConfState` — it has no
 peer membership of its own yet.
+
+While it waits, the Raft/RaftAdmin port is available so the operator can run
+`add_learner` and inspect status. Redis, DynamoDB, S3, and SQS listeners remain
+closed until the local ID appears in committed membership, a leader is known,
+the local apply index has caught up to its observed commit index, and no
+configuration change is pending.
 
 `--raftJoinAsLearner` does *not* prevent the leader from issuing an
 `AddVoter` for this node. If that happens (operator typo, runaway
@@ -173,6 +188,11 @@ After a successful promote, `raftadmin configuration` shows the peer
 with `suffrage: "voter"` and the cluster's voter count has grown by
 one.
 
+Restart the promoted node without `--raftJoinAsLearner` and
+`--raftJoinMembers`. Its committed `ConfState` and peer inventory are now
+durable in the Raft snapshot/WAL and `etcd-raft-peers.bin`; normal restart must
+use that state rather than the temporary join intent.
+
 ### 6. Sanity checks after promotion
 
 - `raftadmin configuration` lists the new voter.
@@ -180,6 +200,38 @@ one.
   `LEADER` if it later wins an election).
 - A `Propose` against the leader still commits — write traffic is
   uninterrupted by the membership change.
+
+## Replacing a voter with a fresh data dir
+
+Do not erase a voter and run a normal deploy. A wiped node no longer has the
+Raft WAL, snapshot, or `etcd-raft-peers.bin` that identify the committed
+cluster. The normal startup guard intentionally refuses to self-bootstrap in
+that state.
+
+Use this order for a replacement that keeps the same Raft ID:
+
+1. Fence the old process or VM so the old and replacement instances cannot run
+   concurrently with the same Raft ID.
+2. Verify the remaining voters have a leader and can commit a configuration
+   change. Run `remove_server <id>` against that leader and wait until the ID
+   disappears from `configuration`.
+3. Stop the target container and erase or archive only that node's Raft data
+   directory. Never wipe more than one replacement target at a time.
+4. Start the target with `--raftJoinAsLearner` and `--raftJoinMembers`, then
+   follow the add, catch-up, and promote steps above.
+5. Restart the promoted node without the two join flags and verify a write can
+   commit.
+
+For `scripts/rolling-update.sh`, step 4 can be expressed without copying peer
+metadata by selecting exactly one rollout node:
+
+```sh
+ROLLING_ORDER=n4 RAFT_JOIN_NODE=n4 ./scripts/rolling-update.sh
+```
+
+The script derives `--raftJoinMembers` from `NODES` and rejects a join rollout
+that contains another node. After promotion, clear `RAFT_JOIN_NODE` and run the
+same single-node rollout once more to remove the temporary join flags.
 
 ## Removing a learner
 
@@ -205,6 +257,9 @@ voter.
 | `promote learner: rpc error: ... target has not caught up to min_applied_index` | Learner is still replicating. | Wait and retry; lower `min_applied_index` only if you understand the safety implication. |
 | `promote learner: rpc error: ... target has no leader-side progress entry` | The learner is not in the leader's `Progress` map (e.g., raft has not yet processed the AddLearner). | Confirm the prior `add_learner` was committed via `configuration` before issuing `promote_learner`. |
 | `add learner: rpc error: ... has too many pending config changes` | A previous conf change is still in flight. | Wait for it to commit; retry. |
+| `flag --raftJoinMembers requires --raftJoinAsLearner` | Join discovery was configured without learner intent. | Pass both flags for a fresh join, or neither for a normal restart. |
+| `flag --raftJoinMembers cannot be combined with raft bootstrap flags` | Join and new-cluster creation were requested together. | Remove every bootstrap flag; a replacement joins the surviving cluster. |
+| `conf state node id=...: etcd raft peer address is required` | The join list omitted a voter or learner present in the authoritative `ConfState`. | Stop the joiner and restart it with the complete current member inventory plus its own ID/address. Do not insert an empty or guessed address. |
 
 ## Observability
 
@@ -228,3 +283,8 @@ voter.
   caller must forward to the leader. Follower-served reads are an
   explicit non-goal of this milestone and will be addressed in a
   separate proposal.
+- **Recover a cluster that has lost quorum.** Join members are only transport
+  discovery for attaching to a live leader; they are not a force-new-cluster
+  or quorum-recovery mechanism.
+- **Join multiple Raft groups.** The first implementation is single-group. A
+  future per-group join inventory must preserve the same bootstrap separation.

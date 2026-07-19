@@ -1,8 +1,16 @@
 # Deploy via Tailscale + GitHub Actions
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-24
+
+Implemented by `.github/workflows/rolling-update.yml` and
+`docs/deploy_via_tailscale_runbook.md`. The workflow is manually triggered via
+`workflow_dispatch`, joins the tailnet with `tailscale/github-action@v3`,
+configures plain SSH over MagicDNS, renders `NODES` / `SSH_TARGETS` from the
+GitHub production environment, runs SSH reachability checks, supports dry-run,
+verifies the image tag exists, and invokes `scripts/rolling-update.sh` for live
+rollouts.
 
 ---
 
@@ -228,14 +236,22 @@ before production cutover.
 - Tailscale SSH (option A above).
 - A shared `deploy` user with restricted sudo.
 
-## 5. Implementation plan
+## 5. Implementation status
 
-1. Write `.github/workflows/rolling-update.yml` implementing §2.1.
-2. Document the secrets/variables setup in
-   `docs/deploy_via_tailscale_runbook.md`.
-3. Run once with `dry_run: true` on a feature branch to validate secrets
-   wiring without touching prod.
-4. Run once with `dry_run: false` targeting a single node (via the `nodes`
-   input) to prove the happy path.
-5. Cut over: archive the operator-local rolling flow, document the new one
-   as the canonical path.
+Implemented components:
+
+1. `.github/workflows/rolling-update.yml` implements the workflow shape in §2.1:
+   trusted default-branch checkout, GHCR image existence check, ephemeral
+   tailnet join, SSH configuration, rendered `NODES` / `SSH_TARGETS`, dry-run,
+   and live rollout paths.
+2. `docs/deploy_via_tailscale_runbook.md` documents Tailscale node setup,
+   ACLs, OAuth client setup, GitHub production environment secrets/variables,
+   dry-run/live run sequence, rollback, cancellation recovery, and known
+   troubleshooting cases.
+3. `scripts/rolling-update.sh` remains the rollout executor used by the
+   workflow; the workflow now supplies its environment and calls the script in
+   either `--dry-run` or live mode.
+
+Operational cutover is controlled outside the repository by the GitHub
+production environment configuration and the node-level Tailscale/SSH setup
+described in the runbook.

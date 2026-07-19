@@ -60,8 +60,9 @@ func (n NodeIdentity) toProto() *pb.NodeIdentity {
 // GetClusterOverview and GetRaftGroups; remaining RPCs return Unimplemented so
 // the generated client can still compile against older nodes during rollout.
 type AdminServer struct {
-	self    NodeIdentity
-	members []NodeIdentity
+	self         NodeIdentity
+	members      []NodeIdentity
+	capabilities map[string]bool
 
 	groupsMu sync.RWMutex
 	groups   map[uint64]AdminGroup
@@ -89,10 +90,11 @@ type AdminServer struct {
 func NewAdminServer(self NodeIdentity, members []NodeIdentity) *AdminServer {
 	cloned := append([]NodeIdentity(nil), members...)
 	return &AdminServer{
-		self:    self,
-		members: cloned,
-		groups:  make(map[uint64]AdminGroup),
-		now:     time.Now,
+		self:         self,
+		members:      cloned,
+		capabilities: make(map[string]bool),
+		groups:       make(map[uint64]AdminGroup),
+		now:          time.Now,
 	}
 }
 
@@ -129,6 +131,20 @@ func (s *AdminServer) RegisterSampler(sampler KeyVizSampler) {
 	s.groupsMu.Unlock()
 }
 
+// SetCapability exposes a local binary or runtime capability in
+// GetClusterOverview. Disabled capabilities are kept in the map so fan-out
+// callers can distinguish "known false" from an older server that lacks the
+// field or key entirely.
+func (s *AdminServer) SetCapability(name string, enabled bool) {
+	name = strings.TrimSpace(name)
+	if s == nil || name == "" {
+		return
+	}
+	s.groupsMu.Lock()
+	s.capabilities[name] = enabled
+	s.groupsMu.Unlock()
+}
+
 // GetClusterOverview returns the local node identity, the current member
 // list, and per-group leader identity collected from the engines registered
 // via RegisterGroup. The member list is the union of (a) the bootstrap seed
@@ -145,7 +161,21 @@ func (s *AdminServer) GetClusterOverview(
 		Self:         s.self.toProto(),
 		Members:      members,
 		GroupLeaders: leaders,
+		Capabilities: s.snapshotCapabilities(),
 	}, nil
+}
+
+func (s *AdminServer) snapshotCapabilities() map[string]bool {
+	s.groupsMu.RLock()
+	defer s.groupsMu.RUnlock()
+	if len(s.capabilities) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(s.capabilities))
+	for name, enabled := range s.capabilities {
+		out[name] = enabled
+	}
+	return out
 }
 
 // snapshotMembers unions the seed members with the live Configuration of each

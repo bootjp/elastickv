@@ -305,6 +305,42 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 	})
 }
 
+func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		spec            string
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name:         "partition pointer",
+			spec:         "orders.fifo:2=1,0",
+			wantContains: []string{"reserved for TSO", "partition 1"},
+		},
+		{
+			name:            "deterministic queue order",
+			spec:            "zeta.fifo:1=0;alpha.fifo:1=0",
+			wantContains:    []string{"alpha.fifo"},
+			wantNotContains: []string{"zeta.fifo"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := buildSQSFifoPartitionMap([]groupSpec{{id: 0}, {id: 1}}, tc.spec)
+			require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+			for _, want := range tc.wantContains {
+				require.Contains(t, err.Error(), want)
+			}
+			for _, notWant := range tc.wantNotContains {
+				require.NotContains(t, err.Error(), notWant)
+			}
+		})
+	}
+}
+
 func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
@@ -368,10 +404,43 @@ func TestParseRaftGroupPeers(t *testing.T) {
 func TestDefaultGroupID(t *testing.T) {
 	require.Equal(t, uint64(1), defaultGroupID(nil))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))
+	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 0}, {id: 2}}))
+	require.Equal(t, uint64(1), defaultGroupID([]groupSpec{{id: 0}}))
+}
+
+func TestDataGroupIDsExcludeDedicatedTSOGroup(t *testing.T) {
+	require.Equal(t, []uint64{1, 2}, dataGroupIDs([]groupSpec{{id: 0}, {id: 2}, {id: 1}}))
+	require.Empty(t, dataGroupIDs([]groupSpec{{id: 0}}))
+}
+
+func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T) {
+	cfg, err := parseRuntimeConfig(
+		"127.0.0.1:50051",
+		"", "", "", "",
+		"0=127.0.0.1:50050,2=127.0.0.1:50052",
+		"", "", "", "", "", "",
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), cfg.defaultGroup)
+	route, ok := cfg.engine.GetRoute([]byte("user-key"))
+	require.True(t, ok)
+	require.Equal(t, uint64(2), route.GroupID)
+	require.False(t, cfg.multi)
+}
+
+func TestParseRuntimeConfigMultipleDataGroupsEnableMultiDataDirs(t *testing.T) {
+	cfg, err := parseRuntimeConfig(
+		"127.0.0.1:50051",
+		"", "", "", "",
+		"0=127.0.0.1:50050,1=127.0.0.1:50051,2=127.0.0.1:50052",
+		"", "", "", "", "", "",
+	)
+	require.NoError(t, err)
+	require.True(t, cfg.multi)
 }
 
 func TestValidateShardRanges(t *testing.T) {
-	groups := []groupSpec{{id: 1}, {id: 2}}
+	groups := []groupSpec{{id: 0}, {id: 1}, {id: 2}}
 
 	t.Run("valid", func(t *testing.T) {
 		err := validateShardRanges([]rangeSpec{{groupID: 1}}, groups)
@@ -381,5 +450,10 @@ func TestValidateShardRanges(t *testing.T) {
 	t.Run("unknown group", func(t *testing.T) {
 		err := validateShardRanges([]rangeSpec{{groupID: 3}}, groups)
 		require.Error(t, err)
+	})
+
+	t.Run("reserved tso group", func(t *testing.T) {
+		err := validateShardRanges([]rangeSpec{{groupID: 0}}, groups)
+		require.ErrorIs(t, err, ErrShardRangeReservedTSOGroup)
 	})
 }

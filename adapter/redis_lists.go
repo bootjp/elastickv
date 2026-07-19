@@ -100,7 +100,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		meta, metaExists, typ, err := r.listPushSnapshot(ctx, key, readTS)
+		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -115,6 +115,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		if err != nil {
 			return err
 		}
+		ops = append(cleanupElems, ops...)
 		if len(ops) == 0 {
 			newLen = updatedMeta.Len
 			return nil
@@ -137,16 +138,26 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 	return newLen, err
 }
 
-func (r *RedisServer) listPushSnapshot(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, redisValueType, error) {
+func (r *RedisServer) listPushSnapshot(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, redisValueType, []*kv.Elem[kv.OP], error) {
 	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeList)
 	if err != nil {
-		return store.ListMeta{}, false, redisTypeNone, err
+		return store.ListMeta{}, false, redisTypeNone, nil, err
+	}
+	cleanup, expired, err := r.expiredCollectionCleanupForRecreate(ctx, key, readTS, typ, redisTypeList)
+	if err != nil {
+		return store.ListMeta{}, false, redisTypeNone, nil, err
+	}
+	if expired {
+		return store.ListMeta{}, false, redisTypeNone, cleanup, nil
 	}
 	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
-		return store.ListMeta{}, false, redisTypeNone, err
+		return store.ListMeta{}, false, redisTypeNone, nil, err
 	}
-	return meta, exists, typ, nil
+	if len(cleanup) > 0 && exists {
+		typ = redisTypeList
+	}
+	return meta, exists, typ, cleanup, nil
 }
 
 // reusableListPush captures a dispatched list-push attempt so a subsequent
@@ -212,6 +223,11 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	if dispErr == nil {
 		return r.resolveReuseLength(ctx, key, pending), false, nil
 	}
+	// This path owns an exact reusable write set plus PrevCommitTS, so it can
+	// safely opt in to retrying an otherwise-ambiguous forwarded conflict.
+	// Normalize before the typed conflict branch; generic Redis writes keep
+	// raw wire write conflicts fail-closed.
+	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (codex P1): the apply might have
 		// landed at this fresh commitTS but bubbled up as WriteConflict due
@@ -309,14 +325,14 @@ func (r *RedisServer) resolveLengthAfterFreshApply(ctx context.Context, key []by
 	return currentMeta.Len
 }
 
-// firstWriteKey returns the first non-empty element key from ops, or nil
+// firstWriteKey returns the first non-empty Put element key from ops, or nil
 // when there is none. Used after a successful reuse dispatch to probe
 // whether our prior attempt's commit_ts actually landed: attempt 1 writes
 // all its elem keys atomically at the same commit_ts, so any one of them
 // answers the question.
 func firstWriteKey(ops []*kv.Elem[kv.OP]) []byte {
 	for _, e := range ops {
-		if e != nil && len(e.Key) > 0 {
+		if e != nil && e.Op == kv.Put && len(e.Key) > 0 {
 			return e.Key
 		}
 	}
@@ -377,7 +393,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		readTS := r.readTS()
-		meta, metaExists, typ, err := r.listPushSnapshot(ctx, key, readTS)
+		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -393,6 +409,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		if err != nil {
 			return err
 		}
+		ops = append(cleanupElems, ops...)
 		if len(ops) == 0 {
 			newLen = updatedMeta.Len
 			return nil
@@ -410,6 +427,10 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			newLen = updatedMeta.Len
 			return nil
 		}
+		// Preserve the exact attempt for a forwarded conflict only after
+		// restoring its typed form. The next iteration can then reuse these
+		// operations instead of recomputing a second list append.
+		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt for reuse if retryRedisWrite will actually
 		// loop — i.e. the error is one of WriteConflict / TxnLocked. For
 		// errors that escape the loop (transient-leader, context deadline,
