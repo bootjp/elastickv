@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -577,6 +578,7 @@ func startBootstrapE2ENode(
 		shardStore,
 		coordinate,
 		distServer,
+		cfg.engine,
 		cfg.leaderRedis,
 		listeners,
 	)
@@ -660,6 +662,7 @@ func startBootstrapE2EMultiGroupNode(
 		shardStore,
 		coordinate,
 		distServer,
+		cfg.engine,
 		cfg.leaderRedis,
 		listeners,
 	)
@@ -688,6 +691,7 @@ func startRuntimeServersWithBoundListeners(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	leaderRedis map[string]string,
 	listeners bootstrapE2EListeners,
 ) error {
@@ -701,7 +705,7 @@ func startRuntimeServersWithBoundListeners(
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, listeners.grpc); err != nil {
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
@@ -718,6 +722,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	leaderRedis map[string]string,
 	listeners bootstrapE2EMultiGroupListeners,
 ) error {
@@ -730,7 +735,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, listeners.grpc[rt.spec.id]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -747,7 +752,9 @@ func startBoundGRPCServer(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
+	sqsPartitionResolver kv.PartitionResolver,
 	listener net.Listener,
 ) error {
 	if rt == nil || rt.engine == nil {
@@ -762,7 +769,16 @@ func startBoundGRPCServer(
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
-	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
+	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
+		trx,
+		rt.engine,
+		coordinate.Clock(),
+		relay,
+		adapter.WithInternalStore(rt.store),
+		adapter.WithInternalMigrationProposer(rt.engine),
+		adapter.WithInternalRouteEngine(routeEngine),
+		adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)
 	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})

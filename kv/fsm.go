@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -128,6 +129,10 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
+	// RouteOf returns the complete route descriptor covering key.
+	RouteOf(key []byte) (distribution.Route, bool)
+	// IntersectingRoutes returns every route intersecting [start, end).
+	IntersectingRoutes(start, end []byte) []distribution.Route
 	// WriteFencedForKey reports whether key is currently inside a
 	// WriteFenced route in this snapshot.
 	WriteFencedForKey(key []byte) bool
@@ -281,6 +286,8 @@ var ErrUnknownRequestType = errors.New("unknown request type")
 // catches up to the promoted owner.
 var ErrRouteWriteFenced = errors.New("route is write-fenced; retry after route migration")
 
+var ErrRouteWriteTimestampTooLow = errors.New("route write timestamp is below migration floor")
+
 // ErrComposed1Violation is returned by verifyComposed1 when the
 // transaction's commit cannot proceed on this Raft group because the
 // txn's read-set or write-set keys are not owned by this group at
@@ -318,11 +325,10 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
-	if resp, handled := f.applyReservedOpcode(data); handled {
+	ctx := context.TODO()
+	if resp, handled := f.applyReservedOpcode(ctx, data); handled {
 		return resp
 	}
-
-	ctx := context.TODO()
 
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
@@ -364,13 +370,17 @@ func (f *kvFSM) Apply(data []byte) any {
 // opcode with ErrEncryptionApply, which the engine's HaltApply seam
 // recognises as a halt — same fail-closed shape as the Stage 3
 // raft-envelope unwrap path.
-func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
+func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool) {
 	if len(data) == 0 {
 		return nil, false
 	}
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeMigrationImport:
+		return f.applyMigrationImport(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationPromote:
+		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -402,6 +412,14 @@ const (
 	// These entries do not touch the MVCC store; they only advance the shared HLC
 	// physicalCeiling so the logical counter can continue to increment in memory.
 	raftEncodeHLCLease byte = 0x02
+	// raftEncodeMigrationImport carries a target-group range-migration import
+	// batch. Every target voter applies the raw MVCC versions, import ack, and
+	// migration HLC floor before the RPC handler returns success.
+	raftEncodeMigrationImport byte = 0x09
+	// raftEncodeMigrationPromote carries a target-group range-migration staged
+	// data promotion chunk. Every target voter atomically copies staged MVCC
+	// versions into the live keyspace and removes the promoted staged rows.
+	raftEncodeMigrationPromote byte = 0x0b
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
@@ -500,16 +518,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return f.handleDelPrefix(ctx, prefix, commitTS)
 	}
 
-	for _, mut := range r.Mutations {
-		if mut == nil || len(mut.Key) == 0 {
-			return errors.WithStack(ErrInvalidRequest)
-		}
-		// Raw requests should not mutate txn-internal keys.
-		if isTxnInternalKey(mut.Key) {
-			return errors.WithStack(ErrInvalidRequest)
-		}
-	}
-	if err := f.assertNoConflictingTxnLocks(ctx, r.Mutations, nil, 0); err != nil {
+	if err := f.validateRawMutationsForApply(ctx, r, commitTS); err != nil {
 		return err
 	}
 
@@ -523,6 +532,38 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObservers(commitTS, r.Mutations)
+	return nil
+}
+
+func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
+	for _, mut := range r.GetMutations() {
+		if err := f.validateRawMutationForApply(ctx, mut, bypassKeys, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, writeFenceBypassKeys map[string]struct{}, commitTS uint64) error {
+	if mut == nil || len(mut.Key) == 0 {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	// Raw requests should not mutate txn-internal keys.
+	if isTxnInternalKey(mut.Key) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
+		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+			return err
+		}
+		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -540,11 +581,122 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
+	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
+		return err
+	}
+	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
+		return err
+	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
+}
+
+func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	rkey := routeKey(key)
+	if snap.WriteFencedForKey(rkey) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok && snap.WriteFencedIntersects(start, end) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	if !snap.WriteFencedIntersects(start, end) {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorForKey(key []byte, commitTS uint64) error {
+	if f.routes == nil || commitTS == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		for _, route := range snap.IntersectingRoutes(start, end) {
+			if err := verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	rkey := routeKey(key)
+	if route, ok := snap.RouteOf(rkey); ok {
+		if err := verifyRouteWriteTimestampFloorForRoute(route, key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorsForMutations(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) error {
+	bypassKeys := writeFenceBypassKeySet(writeFenceBypassKeys)
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if _, bypass := bypassKeys[string(mut.Key)]; bypass {
+			continue
+		}
+		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteWriteTimestampFloorForPrefix(prefix []byte, commitTS uint64) error {
+	if f.routes == nil || commitTS == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	for _, route := range snap.IntersectingRoutes(start, end) {
+		if err := verifyRouteWriteTimestampFloorForRange(route, prefix, start, end, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteTimestampFloorForRoute(route distribution.Route, key []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, routeKey(key), commitTS, route.MinWriteTSExclusive)
+}
+
+func verifyRouteWriteTimestampFloorForRange(route distribution.Route, key, start, end []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
 }
 
 func routePrefixRange(prefix []byte) ([]byte, []byte) {
@@ -562,6 +714,11 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	}
 	start := routeKey(prefix)
 	return start, prefixScanEnd(start)
+}
+
+// RoutePrefixRange maps a raw key prefix to the routed key range it may touch.
+func RoutePrefixRange(prefix []byte) ([]byte, []byte) {
+	return routePrefixRange(prefix)
 }
 
 func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
@@ -968,19 +1125,22 @@ func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, bypassKeys map
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
-		// routeKey-normalize before OwnerOf so the gate routes the
-		// same way as ShardRouter.ResolveGroup — raw adapter keys
-		// and route catalog ranges live in different lex bands
-		// (issue #930).
-		rKey := routeKey(mut.Key)
-		owner, found := snap.OwnerOf(rKey)
+		ownerKey := composed1OwnerKey(mut.Key)
+		owner, found := snap.OwnerOf(ownerKey)
 		if !found || owner != f.shardGroupID {
 			return errors.Wrapf(ErrComposed1Violation,
 				"%s-version v=%d: key %q (routeKey %q) owned by group %d (found=%v); this FSM serves group %d",
-				phase, snapVer, mut.Key, rKey, owner, found, f.shardGroupID)
+				phase, snapVer, mut.Key, ownerKey, owner, found, f.shardGroupID)
 		}
 	}
 	return nil
+}
+
+func composed1OwnerKey(key []byte) []byte {
+	if start, _, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		return start
+	}
+	return routeKey(key)
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
@@ -1044,7 +1204,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), startTS)
 	if err != nil {
 		return err
 	}
@@ -1114,7 +1274,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), commitTS)
 	if err != nil {
 		return err
 	}
@@ -1128,6 +1288,36 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	}
 	f.notifyApplyObservers(commitTS, uniq)
 	return nil
+}
+
+func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, writeFenceBypassKeys, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) ([]*pb.Mutation, error) {
+	uniq, err := uniqueTxnMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, writeFenceBypassKeys, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
 }
 
 // dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
@@ -1146,7 +1336,53 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, err
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
+	if landed {
+		return true, nil
+	}
+	route, ok := f.currentStagedVisibilityRouteForKey(meta.PrimaryKey)
+	if !ok {
+		return false, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, meta.PrimaryKey)
+	landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
 	return landed, nil
+}
+
+func (f *kvFSM) currentStagedVisibilityRouteForKey(key []byte) (distribution.Route, bool) {
+	if f == nil || f.routes == nil || len(key) == 0 {
+		return distribution.Route{}, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return distribution.Route{}, false
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return distribution.Route{}, false
+	}
+	if route, ok := currentStagedVisibilityRouteForS3BucketAuxiliaryKey(snap, key, f.shardGroupID); ok {
+		return route, true
+	}
+	route, ok := snap.RouteOf(routeKey(key))
+	if !ok || route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
+		return distribution.Route{}, false
+	}
+	return route, true
+}
+
+func currentStagedVisibilityRouteForS3BucketAuxiliaryKey(snap RouteSnapshot, key []byte, shardGroupID uint64) (distribution.Route, bool) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	for _, route := range snap.IntersectingRoutes(start, end) {
+		if route.GroupID == shardGroupID && routeHasStagedVisibility(route) {
+			return route, true
+		}
+	}
+	return distribution.Route{}, false
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
@@ -1169,7 +1405,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueTxnMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), commitTS)
 	if err != nil {
 		return err
 	}

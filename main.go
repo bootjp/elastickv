@@ -1851,6 +1851,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		shardStore:         in.shardStore,
 		coordinate:         adapterCoordinate,
 		distServer:         in.distServer,
+		routeEngine:        in.cfg.engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
 		redisAddress:       *redisAddr,
@@ -2498,6 +2499,7 @@ func startRaftServers(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
+	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
@@ -2505,6 +2507,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	sqsPartitionResolver kv.PartitionResolver,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2538,7 +2541,13 @@ func startRaftServers(
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			internalTimestampOptions(coordinate)...,
+			append(
+				internalTimestampOptions(coordinate),
+				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalRouteEngine(routeEngine),
+				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		if adminServer != nil {
@@ -2880,6 +2889,7 @@ type runtimeServerRunner struct {
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
+	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
 	adminGRPCOpts                   adminGRPCInterceptors
 	redisAddress                    string
@@ -2984,6 +2994,10 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		buckets: newBucketsSource(r.s3Server),
 		roles:   r.roleStore,
 	}
+	var sqsPartitionResolver kv.PartitionResolver
+	if r.sqsPartitionResolver != nil {
+		sqsPartitionResolver = r.sqsPartitionResolver
+	}
 	if err := startRaftServers(
 		r.ctx,
 		r.lc,
@@ -2993,6 +3007,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardStore,
 		r.coordinate,
 		r.distServer,
+		r.routeEngine,
 		r.pubsubRelay,
 		func(groupID uint64) kv.ProposalObserver {
 			return r.metricsRegistry.RaftProposalObserver(groupID)
@@ -3002,6 +3017,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		sqsPartitionResolver,
 	); err != nil {
 		return r.startupFailure(err)
 	}

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,6 +86,29 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, result.Done)
 		require.Equal(t, []MVCCVersion{{Key: []byte("keep"), CommitTS: 20, Value: []byte("legacy-delta")}}, result.Versions)
+	})
+}
+
+func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
+		accepted := false
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          1,
+			AcceptVersion: func(_ []byte, _ []byte) bool {
+				if accepted {
+					return false
+				}
+				accepted = true
+				return true
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
 	})
 }
 
@@ -420,6 +444,72 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidExportCursor)
 		require.Empty(t, res.Versions)
 	})
+}
+
+func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte("z"),
+			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
+	})
+}
+
+func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateExportCursorForRange(
+		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.ErrorIs(t, err, ErrInvalidExportCursor)
+
+	err = ValidateExportCursorForRange(
+		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.NoError(t, err)
+}
+
+func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte("stage|")
+	key := []byte("stage|k")
+	for _, tc := range []struct {
+		name    string
+		cursor  []byte
+		wantErr bool
+	}{
+		{name: "empty cursor"},
+		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
+		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
+		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
+		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
+		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrInvalidExportCursor)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
@@ -829,6 +919,279 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint64(30), floor)
 	})
+}
+
+func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		promoter, ok := st.(MigrationPromoter)
+		require.True(t, ok)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+
+		stage := func(raw string) []byte {
+			return append([]byte("stage|"), []byte(raw)...)
+		}
+		targetKey := func(staged []byte) ([]byte, bool) {
+			return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+		}
+		prefix := []byte("stage|")
+
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("old"), 5, 0))
+		require.NoError(t, st.PutAt(ctx, stage("k"), []byte("v10"), 10, 0))
+		require.NoError(t, st.PutWithTTLAt(ctx, stage("k"), []byte("v20"), 20, 55))
+		require.NoError(t, st.DeleteAt(ctx, stage("k"), 30))
+		require.NoError(t, st.PutAt(ctx, stage("z"), []byte("z15"), 15, 0))
+
+		first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 2,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Equal(t, uint64(2), first.PromotedRows)
+		require.Equal(t, uint64(2), first.TotalPromotedRows)
+		require.Equal(t, uint64(30), first.MaxPromotedTS)
+		require.NotEmpty(t, first.NextCursor)
+		state, ok, err := stateReader.MigrationPromotionState(ctx, 99)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.False(t, state.Done)
+		require.Equal(t, first.NextCursor, state.Cursor)
+		require.Equal(t, uint64(2), state.PromotedRows)
+		require.Equal(t, uint64(30), state.MaxPromotedTS)
+
+		got, err := st.GetAt(ctx, []byte("k"), 25)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v20"), got)
+		_, err = st.GetAt(ctx, []byte("k"), 35)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+
+		stagedLeft, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{
+			{Key: stage("k"), CommitTS: 10, Value: []byte("v10")},
+			{Key: stage("z"), CommitTS: 15, Value: []byte("z15")},
+		}, stagedLeft.Versions)
+
+		second, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, second.Done)
+		require.Empty(t, second.NextCursor)
+		require.Equal(t, uint64(2), second.PromotedRows)
+		require.Equal(t, uint64(4), second.TotalPromotedRows)
+		require.Equal(t, uint64(30), second.MaxPromotedTS)
+		state, ok, err = stateReader.MigrationPromotionState(ctx, 99)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Empty(t, state.Cursor)
+		require.Equal(t, uint64(4), state.PromotedRows)
+		require.Equal(t, uint64(30), state.MaxPromotedTS)
+
+		retry, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       99,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, retry.Done)
+		require.Zero(t, retry.PromotedRows)
+		require.Equal(t, uint64(4), retry.TotalPromotedRows)
+		require.Equal(t, uint64(30), retry.MaxPromotedTS)
+
+		got, err = st.GetAt(ctx, []byte("k"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v10"), got)
+		got, err = st.GetAt(ctx, []byte("z"), 15)
+		require.NoError(t, err)
+		require.Equal(t, []byte("z15"), got)
+
+		stagedLeft, err = st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, stagedLeft.Done)
+		require.Empty(t, stagedLeft.Versions)
+	})
+}
+
+func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		promoter, ok := st.(MigrationPromoter)
+		require.True(t, ok)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+
+		stage := func(raw string) []byte {
+			return append([]byte("stage|"), []byte(raw)...)
+		}
+		targetKey := func(staged []byte) ([]byte, bool) {
+			return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+		}
+		prefix := []byte("stage|")
+
+		require.NoError(t, st.PutAt(ctx, stage("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, stage("z"), []byte("z20"), 20, 0))
+		staleCursor := encodeExportCursor(stage("m"), 1, exportCursorTagEmitted)
+
+		result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+			JobID:       202,
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			Cursor:      staleCursor,
+			MaxVersions: 10,
+			TargetKey:   targetKey,
+		})
+		require.NoError(t, err)
+		require.True(t, result.Done)
+		require.Equal(t, uint64(2), result.PromotedRows)
+		require.Equal(t, uint64(2), result.TotalPromotedRows)
+
+		state, ok, err := stateReader.MigrationPromotionState(ctx, 202)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Equal(t, uint64(2), state.PromotedRows)
+		require.Equal(t, uint64(20), state.MaxPromotedTS)
+
+		got, err := st.GetAt(ctx, []byte("a"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("a10"), got)
+		got, err = st.GetAt(ctx, []byte("z"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("z20"), got)
+		stagedLeft, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    prefix,
+			EndKey:      PrefixScanEnd(prefix),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, stagedLeft.Done)
+		require.Empty(t, stagedLeft.Versions)
+	})
+}
+
+func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			require.NoError(t, st.Close())
+		}
+	})
+	ps, ok := st.(*pebbleStore)
+	require.True(t, ok)
+
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+	prefix := []byte("stage|")
+
+	const promotedTS uint64 = 100
+	require.NoError(t, ps.db.Set(encodeKey(stage("k"), promotedTS), encodeValue([]byte("v100"), false, 0, encStateCleartext), pebble.NoSync))
+	require.Zero(t, ps.LastCommitTS())
+
+	result, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       101,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+	require.Equal(t, uint64(1), result.PromotedRows)
+	require.Equal(t, promotedTS, result.MaxPromotedTS)
+	require.Equal(t, promotedTS, ps.LastCommitTS())
+	state, ok, err := ps.MigrationPromotionState(ctx, 101)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, promotedTS, state.MaxPromotedTS)
+
+	metaTS, err := readPebbleUint64(ps.db, metaLastCommitTSBytes)
+	require.NoError(t, err)
+	require.Equal(t, promotedTS, metaTS)
+	val, err := ps.GetAt(ctx, []byte("k"), ps.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
+
+	require.NoError(t, st.Close())
+	closed = true
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, promotedTS, reopened.LastCommitTS())
+	val, err = reopened.GetAt(ctx, []byte("k"), reopened.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val)
+	reopenedPromoter, ok := reopened.(MigrationPromoter)
+	require.True(t, ok)
+	retry, err := reopenedPromoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       101,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, retry.Done)
+	require.Zero(t, retry.PromotedRows)
+	require.Equal(t, uint64(1), retry.TotalPromotedRows)
+	require.Equal(t, promotedTS, retry.MaxPromotedTS)
+}
+
+func TestPromotionStateCodecPreservesMaxPromotedTS(t *testing.T) {
+	t.Parallel()
+
+	state := PromotionState{
+		Cursor:        []byte("cursor"),
+		Done:          true,
+		PromotedRows:  7,
+		MaxPromotedTS: 42,
+		LastError:     "boom",
+	}
+	decoded, ok := decodePromotionState(encodePromotionState(state))
+	require.True(t, ok)
+	require.Equal(t, state, decoded)
+
+	old := []byte{migrationPromotionDoneFlag}
+	old = binary.BigEndian.AppendUint64(old, 3)
+	old = binary.AppendUvarint(old, lenAsUint64(len("old-cursor")))
+	old = append(old, "old-cursor"...)
+	old = binary.AppendUvarint(old, lenAsUint64(len("old-error")))
+	old = append(old, "old-error"...)
+	decoded, ok = decodePromotionState(old)
+	require.True(t, ok)
+	require.True(t, decoded.Done)
+	require.Equal(t, uint64(3), decoded.PromotedRows)
+	require.Zero(t, decoded.MaxPromotedTS)
+	require.Equal(t, []byte("old-cursor"), decoded.Cursor)
+	require.Equal(t, "old-error", decoded.LastError)
 }
 
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
