@@ -100,7 +100,7 @@ memory each group's private cache/memtable pins.
   shipped in M1 (`distribution/`). Cross-group migration (the part that
   actually relocates data and reduces per-node volume) is implemented by the
   M2 stack recorded in
-  `docs/design/2026_06_11_implemented_hotspot_split_milestone2_migration.md`:
+  [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md):
   a resumable `SplitJob` with
   `PLANNED → BACKFILL → FENCE → DELTA_COPY → CUTOVER → CLEANUP → DONE` phases
   driven by a migrator on the default-group leader. M2 is the required
