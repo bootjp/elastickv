@@ -197,36 +197,19 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
-	if !found {
-		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
-	}
-
-	rawSplitKey := req.GetSplitKey()
-	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
-	if err := validateSplitKey(parent, splitKey); err != nil {
-		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
-		return nil, err
-	}
-	splitJobReadKeys, err := s.splitJobOverlapReadKeys(ctx, snapshot, parent)
+	plan, err := s.planSplitRange(ctx, snapshot, req)
 	if err != nil {
 		return nil, err
 	}
 
-	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
-	if err != nil {
-		return nil, err
-	}
-	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, 0)
-
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, splitJobReadKeys, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), plan.parentID, plan.readKeys, plan.left, plan.right)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.applyEngineSnapshot(saved); err != nil {
 		return nil, err
 	}
-	savedLeft, savedRight, err := splitChildrenFromSnapshot(saved, left.RouteID, right.RouteID)
+	savedLeft, savedRight, err := splitChildrenFromSnapshot(saved, plan.left.RouteID, plan.right.RouteID)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +219,37 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		Left:           toProtoRouteDescriptor(savedLeft),
 		Right:          toProtoRouteDescriptor(savedRight),
 	}, nil
+}
+
+type splitRangePlan struct {
+	parentID uint64
+	readKeys [][]byte
+	left     distribution.RouteDescriptor
+	right    distribution.RouteDescriptor
+}
+
+func (s *DistributionServer) planSplitRange(ctx context.Context, snapshot distribution.CatalogSnapshot, req *pb.SplitRangeRequest) (splitRangePlan, error) {
+	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
+	if !found {
+		return splitRangePlan{}, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
+	}
+
+	rawSplitKey := req.GetSplitKey()
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
+	if err := validateSplitKey(parent, splitKey); err != nil {
+		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
+		return splitRangePlan{}, err
+	}
+	readKeys, err := s.splitJobOverlapReadKeys(ctx, snapshot, parent)
+	if err != nil {
+		return splitRangePlan{}, err
+	}
+	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
+	if err != nil {
+		return splitRangePlan{}, err
+	}
+	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, 0)
+	return splitRangePlan{parentID: parent.RouteID, readKeys: readKeys, left: left, right: right}, nil
 }
 
 func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {

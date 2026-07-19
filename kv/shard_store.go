@@ -557,32 +557,8 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 	if routes, version, ok := s.routesForFilesystemChunkScanWithVersion(start, end); ok {
 		return routes, false, version
 	}
-	if isBroadLegacyListDeltaScan(start) {
-		routes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
-		return routes, false, version
-	}
-	if store.ExtractLegacyListUserKeyFromDeltaScanPrefix(start) != nil {
-		catalogRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
-		return routesForLegacyListDeltaScan(catalogRoutes, start, end), false, version
-	}
-	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
-		if !exact {
-			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
-			return routes, false, version
-		}
-		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
-		if !ok {
-			return []distribution.Route{}, false, version
-		}
-		return []distribution.Route{route}, false, version
-	}
-	// Remaining internal collection scans route by their logical user key.
-	if userKey := scanRouteUserKey(start); userKey != nil {
-		route, version, ok := s.engine.GetRouteWithVersion(userKey)
-		if !ok {
-			return []distribution.Route{}, false, version
-		}
-		return []distribution.Route{route}, false, version
+	if selected, ok := s.routesForInternalScanWithVersion(start, end); ok {
+		return selected.routes, false, selected.version
 	}
 	routes, version := s.engine.GetIntersectingRoutesWithVersion(start, end)
 	// If the scan can include internal list keys (which use a fixed prefix),
@@ -593,6 +569,42 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 	}
 
 	return routes, true, version
+}
+
+type internalScanRouteSelection struct {
+	routes  []distribution.Route
+	version uint64
+}
+
+func (s *ShardStore) routesForInternalScanWithVersion(start []byte, end []byte) (internalScanRouteSelection, bool) {
+	if isBroadLegacyListDeltaScan(start) {
+		routes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
+		return internalScanRouteSelection{routes: routes, version: version}, true
+	}
+	if store.ExtractLegacyListUserKeyFromDeltaScanPrefix(start) != nil {
+		catalogRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
+		return internalScanRouteSelection{routes: routesForLegacyListDeltaScan(catalogRoutes, start, end), version: version}, true
+	}
+	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
+		if !exact {
+			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+			return internalScanRouteSelection{routes: routes, version: version}, true
+		}
+		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
+		if !ok {
+			return internalScanRouteSelection{routes: []distribution.Route{}, version: version}, true
+		}
+		return internalScanRouteSelection{routes: []distribution.Route{route}, version: version}, true
+	}
+	// Remaining internal collection scans route by their logical user key.
+	if userKey := scanRouteUserKey(start); userKey != nil {
+		route, version, ok := s.engine.GetRouteWithVersion(userKey)
+		if !ok {
+			return internalScanRouteSelection{routes: []distribution.Route{}, version: version}, true
+		}
+		return internalScanRouteSelection{routes: []distribution.Route{route}, version: version}, true
+	}
+	return internalScanRouteSelection{}, false
 }
 
 func routesForLegacyListDeltaScan(catalogRoutes []distribution.Route, start []byte, end []byte) []distribution.Route {
