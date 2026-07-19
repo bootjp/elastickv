@@ -119,6 +119,47 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
+func TestShardStoreScanAtWithReadFence_RoutesListAuxiliaryScansByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	shardStore := NewShardStore(engine, groups)
+	userKey := []byte("x")
+	deltaKey := store.ListMetaDeltaKey(userKey, 10, 0)
+	claimKey := store.ListClaimKey(userKey, 1)
+	require.NoError(t, groups[2].Store.PutAt(ctx, deltaKey, []byte("delta"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, claimKey, []byte("claim"), 11, 0))
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		key    []byte
+	}{
+		{name: "delta", prefix: store.ListMetaDeltaScanPrefix(userKey), key: deltaKey},
+		{name: "claim", prefix: store.ListClaimScanPrefix(userKey), key: claimKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kvs, err := shardStore.ScanAtWithReadFence(
+				ctx, tc.prefix, prefixScanEnd(tc.prefix), 10, ^uint64(0), false, 0, engine.Version(), nil, nil,
+			)
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
 func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 

@@ -521,20 +521,8 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
 		return routes, false, version
 	}
-	if routes, version, ok := s.routesForFilesystemUsageScanWithVersion(start, end); ok {
+	if routes, version, ok := s.routesForEncodedScanWithVersion(start, end); ok {
 		return routes, false, version
-	}
-	if routes, version, ok := s.routesForFilesystemChunkScanWithVersion(start, end); ok {
-		return routes, false, version
-	}
-	// For internal list keys, shard routing is based on the logical user key
-	// rather than the raw key prefix.
-	if userKey := store.ExtractListUserKey(start); userKey != nil {
-		route, version, ok := s.engine.GetRouteWithVersion(userKey)
-		if !ok {
-			return []distribution.Route{}, false, version
-		}
-		return []distribution.Route{route}, false, version
 	}
 	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
 		if !exact {
@@ -557,6 +545,36 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 	}
 
 	return routes, true, version
+}
+
+func (s *ShardStore) routesForEncodedScanWithVersion(start []byte, end []byte) ([]distribution.Route, uint64, bool) {
+	if routes, version, ok := s.routesForFilesystemUsageScanWithVersion(start, end); ok {
+		return routes, version, true
+	}
+	if routes, version, ok := s.routesForFilesystemChunkScanWithVersion(start, end); ok {
+		return routes, version, true
+	}
+	userKey := listScanUserKey(start)
+	if userKey == nil {
+		return nil, 0, false
+	}
+	route, version, ok := s.engine.GetRouteWithVersion(userKey)
+	if !ok {
+		return []distribution.Route{}, version, true
+	}
+	return []distribution.Route{route}, version, true
+}
+
+func listScanUserKey(start []byte) []byte {
+	if userKey := store.ExtractListUserKeyFromDeltaScanKey(start); userKey != nil {
+		return userKey
+	}
+	if userKey := store.ExtractListUserKeyFromClaimScanKey(start); userKey != nil {
+		return userKey
+	}
+	// Internal list keys route by their logical user key rather than their raw
+	// storage prefix.
+	return store.ExtractListUserKey(start)
 }
 
 func (s *ShardStore) routesForFencedScanWithVersion(start []byte, end []byte, routeStart []byte, routeEnd []byte) ([]distribution.Route, bool, uint64) {

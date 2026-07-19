@@ -155,6 +155,33 @@ func ExtractListUserKeyFromClaim(key []byte) []byte {
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
 }
 
+// ExtractListUserKeyFromDeltaScanKey extracts the logical user key from a
+// delta scan prefix, a full delta key, or a scan cursor within that prefix.
+func ExtractListUserKeyFromDeltaScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromClaimScanKey extracts the logical user key from a
+// claim scan prefix, a full claim key, or a scan cursor within that prefix.
+func ExtractListUserKeyFromClaimScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListClaimPrefix))
+}
+
+func extractListUserKeyFromScanKey(key []byte, prefix []byte) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	trimmed := key[len(prefix):]
+	if len(trimmed) < wideColKeyLenSize {
+		return nil
+	}
+	userKeyLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+userKeyLen { //nolint:gosec // wideColKeyLenSize and encoded lengths fit in uint32
+		return nil
+	}
+	return trimmed[wideColKeyLenSize : wideColKeyLenSize+userKeyLen]
+}
+
 // PrefixScanEnd returns the exclusive end key for a prefix scan.
 // It increments the last byte of the prefix; if overflow occurs (all 0xFF),
 // it returns a nil slice which callers must interpret as "scan to end of keyspace".
