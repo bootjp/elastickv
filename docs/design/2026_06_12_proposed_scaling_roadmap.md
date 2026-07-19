@@ -4,6 +4,11 @@
 **Author:** bootjp
 **Date:** 2026-06-12
 
+> **Superseded roadmap index:**
+> `2026_06_23_proposed_scaling_roadmap.md` is the current ownership and
+> sequencing authority. This document remains historical input and does not
+> describe the current implementation status of its milestones.
+>
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
 > designed past those ceilings. The roadmap itself is not a single
@@ -11,8 +16,8 @@
 > sibling `*_proposed_*.md` design that will land later as its own PR.
 > Per CLAUDE.md the design-doc-first workflow applies: each milestone
 > below ships its own `*_proposed_*` doc before its implementation
-> starts; this file is the shared north star and the sequencing
-> constraint between them.
+> starts. The June 23 ownership index now records the authoritative
+> requirement-by-requirement disposition and sequencing constraints.
 
 ## 1. Motivation
 

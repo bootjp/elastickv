@@ -4,7 +4,7 @@ Status: Proposed
 Document type: Roadmap ownership index
 Author: bootjp
 Date: 2026-06-23
-Last audited: 2026-07-18 against `origin/main` and GitHub pull requests
+Last audited: 2026-07-19 against `origin/main` and GitHub pull requests
 
 ## 1. Scope
 
@@ -49,7 +49,7 @@ again before merge or deployment.
 | Hotspot split M2 migration | `2026_06_11_proposed_hotspot_split_milestone2_migration.md` | PRs #1084, #1085, #1088, #1090, and #1096 open; supporting stack members have merged | In flight; not on `main` as a complete migration plane |
 | Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PRs #1097 and #1104 open | In flight; not implemented on `main` |
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
-| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1095, #1103, and #1108 open | In flight; stacked series is not on `main` |
+| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064 and #1103 merged; PRs #1095 and #1108 open | Group reservation and state-machine wiring are on `main`; ceiling FSM and durable routing remain in flight |
 | Shared Pebble block cache | PR #1082 | PR #1082 open | In flight; cache sharing only, not all resource-pool work |
 | Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; production multi-group soak evidence remains outstanding |
 | S3 Raft blob offload | `2026_04_25_proposed_s3_raft_blob_offload.md` | PRs #1057 and #1063 open | In flight; payload offload is not on `main` |
