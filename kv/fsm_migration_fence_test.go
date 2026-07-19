@@ -98,7 +98,7 @@ func applyTargetReadinessToFSM(t *testing.T, fsm *kvFSM, state store.TargetStage
 	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
 }
 
-func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, writeFence, readFence bool) {
+func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, readFence bool) {
 	t.Helper()
 	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
 		JobID:               10,
@@ -107,7 +107,7 @@ func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, writeFence, read
 		MigrationJobID:      10,
 		MinWriteTSExclusive: 50,
 		Armed:               true,
-		SourceWriteFence:    writeFence,
+		SourceWriteFence:    true,
 		SourceReadFence:     readFence,
 		RetentionPinTS:      40,
 	})
@@ -306,7 +306,7 @@ func TestFSMDurableSourceFenceRejectsRawWriteDespiteCatalogBypass(t *testing.T) 
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-	applySourceMigrationControlToFSM(t, fsm, true, false)
+	applySourceMigrationControlToFSM(t, fsm, false)
 	key := []byte("n")
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		WriteFenceBypassKeys: [][]byte{key},
@@ -319,7 +319,7 @@ func TestFSMDurableSourceFenceRejectsPrefixWrite(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-	applySourceMigrationControlToFSM(t, fsm, true, false)
+	applySourceMigrationControlToFSM(t, fsm, false)
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("m")}},
 	}, 60)
@@ -381,7 +381,7 @@ func TestFSMDurableSourceFenceRejectsPinnedOnePhaseTxn(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-	applySourceMigrationControlToFSM(t, fsm, true, false)
+	applySourceMigrationControlToFSM(t, fsm, false)
 	key := []byte("n")
 	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
 		IsTxn:                true,
@@ -843,7 +843,7 @@ func TestFSMOnePhaseTxnChecksSourceReadFenceForReadKeys(t *testing.T) {
 		RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive,
 	}})
 	fsm := newComposed1FSM(t, engine, 1)
-	applySourceMigrationControlToFSM(t, fsm, true, true)
+	applySourceMigrationControlToFSM(t, fsm, true)
 	req := onePhaseReq(10, 20, 0, []byte("b"), []byte("v"))
 	req.ReadKeys = [][]byte{[]byte("n")}
 

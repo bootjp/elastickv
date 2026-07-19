@@ -2053,7 +2053,7 @@ func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache
 		}
 		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
 		for _, member := range cfg.Servers {
-			if member.Suffrage != "voter" {
+			if member.Suffrage != raftMemberSuffrageVoter {
 				continue
 			}
 			voter, err := splitMigrationVoter(groupID, member, connCache)
@@ -2323,7 +2323,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 
 func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
 	for _, server := range configuration.Servers {
-		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == "voter") {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == raftMemberSuffrageVoter) {
 			return true
 		}
 	}
