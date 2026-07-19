@@ -26,13 +26,15 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
@@ -48,7 +50,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, adapter.NodeIdentity{}, nil); err == nil {
+	if _, _, err := configureAdminService(tokPath, true, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -60,7 +62,7 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
@@ -75,7 +77,7 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
@@ -86,6 +88,90 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
 	}
 }
+
+func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
+	t.Parallel()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	remote := adapter.NewAdminServer(
+		adapter.NodeIdentity{NodeID: "n2", GRPCAddress: lis.Addr().String()},
+		nil,
+		adapter.WithAdminNodeVersion("v-remote"),
+	)
+	gs := grpc.NewServer()
+	pb.RegisterAdminServer(gs, remote)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+		<-serveErr
+	})
+
+	var cache kv.GRPCConnCache
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+	srv, _, err := configureAdminService(
+		"",
+		true,
+		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
+		nil,
+		&cache,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+	srv.RegisterGroup(1, adminVersionProbeGroup{leader: raftengine.LeaderInfo{
+		ID:      "n2",
+		Address: lis.Addr().String(),
+	}})
+
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	require.Len(t, resp.Groups, 1)
+	require.Empty(t, resp.Groups[0].LeaderNodeVersion)
+	require.Eventually(t, func() bool {
+		resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+		return err == nil && len(resp.Groups) == 1 && resp.Groups[0].LeaderNodeVersion == "v-remote"
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
+	old := adminBuildVersion
+	adminBuildVersion = "v-admin-test"
+	t.Cleanup(func() { adminBuildVersion = old })
+
+	if got := buildVersion(); got != "v-admin-test" {
+		t.Fatalf("buildVersion = %q, want v-admin-test", got)
+	}
+	srv, _, err := configureAdminService(
+		"",
+		true,
+		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+	resp, err := srv.GetNodeVersion(context.Background(), &pb.GetNodeVersionRequest{})
+	require.NoError(t, err)
+	require.Equal(t, "v-admin-test", resp.GetNodeVersion())
+}
+
+type adminVersionProbeGroup struct {
+	leader raftengine.LeaderInfo
+}
+
+func (g adminVersionProbeGroup) Status() raftengine.Status {
+	return raftengine.Status{Leader: g.leader}
+}
+
+func (adminVersionProbeGroup) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+
+func (adminVersionProbeGroup) SnapshotEvery() uint64 { return 0 }
 
 func TestAdminMembersFromBootstrapExcludesSelf(t *testing.T) {
 	t.Parallel()

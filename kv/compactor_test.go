@@ -146,6 +146,44 @@ func TestFSMCompactorRespectsPinnedTimestamp(t *testing.T) {
 	require.Equal(t, []byte("v20"), val)
 }
 
+func TestFSMCompactorScopesBackupPinsByGroup(t *testing.T) {
+	ctx := context.Background()
+	stores := map[uint64]store.MVCCStore{1: store.NewMVCCStore(), 2: store.NewMVCCStore()}
+	for _, st := range stores {
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v20"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v30"), 30, 0))
+	}
+
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	require.NoError(t, tracker.PinWithDeadlineForGroup(
+		backupTrackerTestPinID(1), 1, 20, time.Now().Add(time.Hour),
+	))
+	runtimes := make([]FSMCompactRuntime, 0, len(stores))
+	for groupID, st := range stores {
+		runtimes = append(runtimes, FSMCompactRuntime{
+			GroupID: groupID,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State: raftengine.StateFollower, AppliedIndex: 10, CommitIndex: 10,
+			}},
+			Store: st,
+		})
+	}
+	compactor := NewFSMCompactor(
+		runtimes,
+		WithFSMCompactorActiveTimestampTracker(tracker),
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(ctx))
+
+	value, err := stores[1].GetAt(ctx, []byte("k"), 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v20"), value)
+	_, err = stores[2].GetAt(ctx, []byte("k"), 20)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
+}
+
 func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 	st := store.NewMVCCStore()
 	ctx := context.Background()
