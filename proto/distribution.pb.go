@@ -493,6 +493,7 @@ type RouteDescriptor struct {
 	RaftGroupId   uint64                 `protobuf:"varint,4,opt,name=raft_group_id,json=raftGroupId,proto3" json:"raft_group_id,omitempty"`
 	State         RouteState             `protobuf:"varint,5,opt,name=state,proto3,enum=RouteState" json:"state,omitempty"`
 	ParentRouteId uint64                 `protobuf:"varint,6,opt,name=parent_route_id,json=parentRouteId,proto3" json:"parent_route_id,omitempty"`
+	SplitAtHlc    uint64                 `protobuf:"varint,7,opt,name=split_at_hlc,json=splitAtHlc,proto3" json:"split_at_hlc,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -565,6 +566,13 @@ func (x *RouteDescriptor) GetState() RouteState {
 func (x *RouteDescriptor) GetParentRouteId() uint64 {
 	if x != nil {
 		return x.ParentRouteId
+	}
+	return 0
+}
+
+func (x *RouteDescriptor) GetSplitAtHlc() uint64 {
+	if x != nil {
+		return x.SplitAtHlc
 	}
 	return 0
 }
@@ -1608,14 +1616,16 @@ const file_distribution_proto_rawDesc = "" +
 	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\x15\n" +
 	"\x13GetTimestampRequest\"4\n" +
 	"\x14GetTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xc3\x01\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xe5\x01\n" +
 	"\x0fRouteDescriptor\x12\x19\n" +
 	"\broute_id\x18\x01 \x01(\x04R\arouteId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x03 \x01(\fR\x03end\x12\"\n" +
 	"\rraft_group_id\x18\x04 \x01(\x04R\vraftGroupId\x12!\n" +
 	"\x05state\x18\x05 \x01(\x0e2\v.RouteStateR\x05state\x12&\n" +
-	"\x0fparent_route_id\x18\x06 \x01(\x04R\rparentRouteId\"\xb0\x02\n" +
+	"\x0fparent_route_id\x18\x06 \x01(\x04R\rparentRouteId\x12 \n" +
+	"\fsplit_at_hlc\x18\a \x01(\x04R\n" +
+	"splitAtHlc\"\xb0\x02\n" +
 	"\x17SplitJobBracketProgress\x12\x1d\n" +
 	"\n" +
 	"bracket_id\x18\x01 \x01(\x04R\tbracketId\x12\x16\n" +

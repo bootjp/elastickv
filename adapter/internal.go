@@ -55,7 +55,8 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 
-	if err := i.stampTimestamps(ctx, req); err != nil {
+	commitTS, err := i.stampTimestamps(ctx, req)
+	if err != nil {
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
@@ -73,6 +74,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	return &pb.ForwardResponse{
 		Success:     true,
 		CommitIndex: r.CommitIndex,
+		CommitTs:    commitTS,
 	}, nil
 }
 
@@ -85,15 +87,15 @@ func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) 
 	}, nil
 }
 
-func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) error {
+func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) (uint64, error) {
 	if req == nil {
-		return nil
+		return 0, nil
 	}
 	if req.IsTxn {
 		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
 
-	return i.stampRawTimestamps(ctx, req.Requests)
+	return 0, i.stampRawTimestamps(ctx, req.Requests)
 }
 
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
@@ -172,17 +174,17 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 	return nil
 }
 
-func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) error {
+func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
 	startTS := forwardedTxnStartTS(reqs)
 	if startTS == 0 {
 		ts, err := i.nextTimestamp(ctx, "stampTxnTimestamps startTS")
 		if err != nil {
-			return err
+			return 0, err
 		}
 		startTS = ts
 	}
 	if startTS == ^uint64(0) {
-		return errors.WithStack(ErrTxnTimestampOverflow)
+		return 0, errors.WithStack(ErrTxnTimestampOverflow)
 	}
 
 	// Assign the unified timestamp to all requests in the transaction.
@@ -220,13 +222,49 @@ func forwardedTxnMetaMutation(r *pb.Request, metaPrefix []byte) (*pb.Mutation, b
 	return r.Mutations[0], true
 }
 
-func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) error {
-	type metaToUpdate struct {
-		m    *pb.Mutation
-		meta kv.TxnMeta
+type forwardedTxnMetaToUpdate struct {
+	m    *pb.Mutation
+	meta kv.TxnMeta
+}
+
+func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) (uint64, error) {
+	metaMutations, commitTS, err := collectForwardedTxnMetas(reqs)
+	if err != nil {
+		return 0, err
 	}
 
-	metaMutations := make([]metaToUpdate, 0, len(reqs))
+	if commitTS == 0 && len(metaMutations) > 0 {
+		commitTS, err = i.forwardedTxnCommitTS(ctx, startTS)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	for _, item := range metaMutations {
+		item.meta.CommitTS = commitTS
+		item.m.Value = kv.EncodeTxnMeta(item.meta)
+	}
+	if err := stampRequestMutationCommitTS(reqs, commitTS); err != nil {
+		return 0, err
+	}
+	return commitTS, nil
+}
+
+func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
+	for _, r := range reqs {
+		if r == nil {
+			continue
+		}
+		if err := kv.StampMutationCommitTS(r.Mutations, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, error) {
+	metaMutations := make([]forwardedTxnMetaToUpdate, 0, len(reqs))
+	var commitTS uint64
 	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -238,24 +276,15 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 			continue
 		}
 		if meta.CommitTS != 0 {
+			if commitTS != 0 && commitTS != meta.CommitTS {
+				return nil, 0, errors.WithStack(kv.ErrInvalidRequest)
+			}
+			commitTS = meta.CommitTS
 			continue
 		}
-		metaMutations = append(metaMutations, metaToUpdate{m: m, meta: meta})
+		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
 	}
-	if len(metaMutations) == 0 {
-		return nil
-	}
-
-	commitTS, err := i.forwardedTxnCommitTS(ctx, startTS)
-	if err != nil {
-		return err
-	}
-
-	for _, item := range metaMutations {
-		item.meta.CommitTS = commitTS
-		item.m.Value = kv.EncodeTxnMeta(item.meta)
-	}
-	return nil
+	return metaMutations, commitTS, nil
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

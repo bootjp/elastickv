@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,41 @@ func TestCatalogDeltaCodecRoundTrip(t *testing.T) {
 	decoded, err := DecodeCatalogDelta(raw)
 	require.NoError(t, err)
 	require.Equal(t, delta, decoded)
+}
+
+func TestCatalogDeltaRejectsDeleteRoutePayload(t *testing.T) {
+	t.Parallel()
+
+	for _, route := range []RouteDescriptor{
+		{Start: []byte("unexpected")},
+		{Start: []byte{}},
+	} {
+		_, err := EncodeCatalogDelta(CatalogDelta{
+			PreviousVersion: 1,
+			Version:         2,
+			Mutations: []CatalogRouteMutation{{
+				Op:      CatalogMutationDelete,
+				RouteID: 1,
+				Route:   route,
+			}},
+		})
+		require.ErrorIs(t, err, ErrCatalogInvalidDeltaMutation)
+	}
+}
+
+func TestCatalogDeltaFromProtoRejectsDeleteRoutePayload(t *testing.T) {
+	t.Parallel()
+
+	_, err := catalogDeltaFromProto(&pb.CatalogDeltaRecord{
+		PreviousVersion: 1,
+		Version:         2,
+		Mutations: []*pb.CatalogDeltaMutation{{
+			Op:      pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_DELETE,
+			RouteId: 1,
+			Route:   &pb.RouteDescriptor{},
+		}},
+	})
+	require.ErrorIs(t, err, ErrCatalogWatchEventInvalid)
 }
 
 func TestCatalogStoreSavePublishesContiguousDeltas(t *testing.T) {

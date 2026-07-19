@@ -726,6 +726,10 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),
 		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
 	}
 
 	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})
@@ -739,6 +743,30 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	snapshot, err := engine.storage.Snapshot()
 	require.NoError(t, err)
 	require.Equal(t, payload, snapshot.Data)
+}
+
+func TestApplyReadySnapshotRejectsMissingPeerAddressBeforeRestore(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	fsm := &testStateMachine{}
+	engine := &Engine{
+		storage: storage,
+		fsm:     fsm,
+		dataDir: t.TempDir(),
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	payload := mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})
+	snap := raftTestSnapshot(7, 2, []uint64{1, 2}, payload)
+	err := engine.applyReadySnapshot(&snap)
+	require.ErrorIs(t, err, errPeerAddressRequired)
+	require.Contains(t, err.Error(), "node id=2")
+	require.Zero(t, engine.applied)
+	require.Empty(t, fsm.Applied())
+	stored, snapshotErr := storage.Snapshot()
+	require.NoError(t, snapshotErr)
+	require.Zero(t, stored.GetMetadata().GetIndex())
 }
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
@@ -1169,6 +1197,10 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 		persist: mockstorage.NewStorageRecorder(""),
 		fsm:     fsm,
 		dataDir: t.TempDir(),
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		},
 	}
 	t.Cleanup(release)
 
@@ -1226,7 +1258,7 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 	learner := Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"}
 	context, err := encodeConfChangeContext(17, learner)
 	require.NoError(t, err)
-	next := engine.nextPeersAfterConfigChange(
+	next, err := engine.nextPeersAfterConfigChange(
 		raftpb.ConfChangeAddLearnerNode,
 		learner.NodeID,
 		context,
@@ -1235,6 +1267,7 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 			Learners: []uint64{2},
 		},
 	)
+	require.NoError(t, err)
 
 	// nextPeersAfterConfigChange now annotates Suffrage from the
 	// post-change ConfState so persistConfigState can write a v2
@@ -1246,7 +1279,7 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 	}, next)
 }
 
-func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) {
+func TestNextPeersAfterConfigChangeV2RejectsMismatchedPeerContext(t *testing.T) {
 	engine := &Engine{
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1256,19 +1289,16 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 	context, err := encodeConfChangeContext(17, Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"})
 	require.NoError(t, err)
 
-	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+	next, err := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
 		Context: context,
 		Changes: []*raftpb.ConfChangeSingle{
 			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(2)},
 			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(3)},
 		},
 	}, raftpb.ConfState{Voters: []uint64{1, 2, 3}})
-
-	require.Equal(t, []Peer{
-		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
-		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
-		{NodeID: 3, ID: "3", Address: "", Suffrage: SuffrageVoter},
-	}, next)
+	require.ErrorIs(t, err, errPeerAddressRequired)
+	require.Contains(t, err.Error(), "node id=3")
+	require.Nil(t, next)
 }
 
 func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *testing.T) {
@@ -1279,11 +1309,12 @@ func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *test
 		},
 	}
 
-	next := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
+	next, err := engine.nextPeersAfterConfigChangeV2(raftpb.ConfChangeV2{
 		Changes: []*raftpb.ConfChangeSingle{
 			{Type: confChangeTypePtr(raftpb.ConfChangeAddNode), NodeId: uint64Ptr(2)},
 		},
 	}, raftpb.ConfState{Voters: []uint64{1, 2}})
+	require.NoError(t, err)
 
 	require.Equal(t, []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},

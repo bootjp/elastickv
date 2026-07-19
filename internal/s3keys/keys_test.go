@@ -2,6 +2,7 @@ package s3keys
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -275,11 +276,79 @@ func TestBlobPrefixForUpload_IsPrefixOfBlobKeys(t *testing.T) {
 	require.False(t, bytes.HasPrefix(otherKey, prefix))
 }
 
+func TestChunkRefKey_RoundTripAndRouteKey(t *testing.T) {
+	t.Parallel()
+
+	bucket := string([]byte{'b', 0x00, 'k'})
+	object := string([]byte{'o', 0x00, '/', 'x'})
+	uploadID := string([]byte{'u', 0x00, '1'})
+
+	key := ChunkRefKey(bucket, 11, object, uploadID, 7, 3)
+	gotBucket, gotGen, gotObject, gotUpload, gotPart, gotChunk, ok := ParseChunkRefKey(key)
+	require.True(t, ok)
+	require.Equal(t, bucket, gotBucket)
+	require.Equal(t, uint64(11), gotGen)
+	require.Equal(t, object, gotObject)
+	require.Equal(t, uploadID, gotUpload)
+	require.Equal(t, uint64(7), gotPart)
+	require.Equal(t, uint64(3), gotChunk)
+	require.Equal(t, RouteKey(bucket, 11, object), ExtractRouteKey(key))
+}
+
+func TestChunkBlobKey_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte("chunk data"))
+	key := ChunkBlobKey(sum)
+
+	got, ok := ParseChunkBlobKey(key)
+	require.True(t, ok)
+	require.Equal(t, sum, got)
+	require.False(t, bytes.HasPrefix(key, []byte(BlobPrefix)))
+}
+
+func TestChunkRefValue_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte("chunk data"))
+	value, err := EncodeChunkRefValue(ChunkRefValue{
+		ContentSHA256: sum,
+		Size:          1234,
+		SourcePeer:    "node-a",
+	})
+	require.NoError(t, err)
+
+	got, ok := DecodeChunkRefValue(value)
+	require.True(t, ok)
+	require.Equal(t, sum, got.ContentSHA256)
+	require.Equal(t, uint64(1234), got.Size)
+	require.Equal(t, "node-a", got.SourcePeer)
+}
+
+func TestChunkRefValue_RejectsMalformedValues(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte("chunk data"))
+	value, err := EncodeChunkRefValue(ChunkRefValue{ContentSHA256: sum, Size: 1, SourcePeer: "n1"})
+	require.NoError(t, err)
+
+	for _, malformed := range [][]byte{
+		nil,
+		value[:1],
+		append([]byte{0xff}, value[1:]...),
+		append([]byte{}, value[:len(value)-1]...),
+		append(append([]byte{}, value...), 'x'),
+	} {
+		_, ok := DecodeChunkRefValue(malformed)
+		require.False(t, ok, "value %x should be rejected", malformed)
+	}
+}
+
 // TestPerBucketPrefixes_IsolateByBucketAndGeneration covers the
 // new *PrefixForBucket helpers used by AdminDeleteBucket's
 // DEL_PREFIX safety net (design doc
 // 2026_04_28_implemented_admin_delete_bucket_safety_net.md). For each
-// of the six per-bucket key families, the test pins three
+// of the seven per-bucket key families, the test pins three
 // invariants:
 //
 //  1. Every key constructed under (bucket, gen) starts with the
@@ -340,6 +409,13 @@ func TestPerBucketPrefixes_IsolateByBucketAndGeneration(t *testing.T) {
 			key:         BlobKey(bucket, gen, object, uploadID, 1, 0),
 			keyOther:    BlobKey(other, gen, object, uploadID, 1, 0),
 			keyOtherGen: BlobKey(bucket, otherGen, object, uploadID, 1, 0),
+		},
+		{
+			name:        "chunk_ref",
+			prefix:      ChunkRefPrefixForBucket(bucket, gen),
+			key:         ChunkRefKey(bucket, gen, object, uploadID, 1, 0),
+			keyOther:    ChunkRefKey(other, gen, object, uploadID, 1, 0),
+			keyOtherGen: ChunkRefKey(bucket, otherGen, object, uploadID, 1, 0),
 		},
 		{
 			name:        "gc_upload",

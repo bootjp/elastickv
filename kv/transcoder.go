@@ -19,6 +19,10 @@ type Elem[T OP] struct {
 	Op    T
 	Key   []byte
 	Value []byte
+	// CommitTSValueOffset, when non-zero, asks the coordinator or forwarded
+	// leader to stamp the resolved transaction commit timestamp into Value at
+	// this byte offset before committing the mutation.
+	CommitTSValueOffset uint64
 }
 
 // OperationGroup is a group of operations that should be executed atomically.

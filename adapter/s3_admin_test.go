@@ -386,7 +386,7 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 	gen := summary.Generation
 	require.NotZero(t, gen)
 
-	// Plant orphan keys across the 5 non-manifest per-bucket
+	// Plant orphan keys across the 6 non-manifest per-bucket
 	// prefixes. Each entry is what a concurrent PutObject (or its
 	// in-flight multipart upload state) would leave behind if it
 	// committed in the AdminDeleteBucket race window. The values
@@ -401,6 +401,7 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 		{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-upload-meta")},
 		{Op: kv.Put, Key: s3keys.UploadPartKey(bucket, gen, objectName, uploadID, 1), Value: []byte("orphan-part")},
 		{Op: kv.Put, Key: s3keys.BlobKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk")},
+		{Op: kv.Put, Key: s3keys.ChunkRefKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk-ref")},
 		{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-gc")},
 		{Op: kv.Put, Key: s3keys.RouteKey(bucket, gen, objectName), Value: []byte("orphan-route")},
 	}
@@ -432,6 +433,7 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 		{"upload_meta", s3keys.UploadMetaPrefixForBucket(bucket, gen)},
 		{"upload_part", s3keys.UploadPartPrefixForBucket(bucket, gen)},
 		{"blob", s3keys.BlobPrefixForBucket(bucket, gen)},
+		{"chunk_ref", s3keys.ChunkRefPrefixForBucket(bucket, gen)},
 		{"gc_upload", s3keys.GCUploadPrefixForBucket(bucket, gen)},
 		{"route", s3keys.RoutePrefixForBucket(bucket, gen)},
 	}

@@ -115,6 +115,83 @@ func TestResolveBootstrapConfigGroupPeers(t *testing.T) {
 	})
 }
 
+func TestResolveRaftPeerConfigJoinMembers(t *testing.T) {
+	groups := []groupSpec{{id: 1, address: "10.0.0.12:50051"}}
+	joinMembers := "n1=10.0.0.11:50051,n2=10.0.0.12:50051,n3=10.0.0.13:50051"
+
+	t.Run("join members provide peers without enabling bootstrap", func(t *testing.T) {
+		cfg, err := resolveRaftPeerConfig("n2", groups, "", "", joinMembers, true, false)
+		require.NoError(t, err)
+		require.False(t, cfg.anyBootstrapServers())
+		require.Equal(t, []raftengine.Server{
+			{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+			{Suffrage: "voter", ID: "n2", Address: "10.0.0.12:50051"},
+			{Suffrage: "voter", ID: "n3", Address: "10.0.0.13:50051"},
+		}, cfg.serversForGroup(1))
+		require.Equal(t, cfg.serversForGroup(1), cfg.adminSeed(1))
+		require.Nil(t, cfg.bootstrapSeedForGroup(1))
+
+		bootstrap, peers, seed := bootstrapSettingsForGroup(cfg, 1, false)
+		require.False(t, bootstrap)
+		require.Equal(t, cfg.serversForGroup(1), peers)
+		require.Nil(t, seed)
+	})
+
+	t.Run("requires learner mode", func(t *testing.T) {
+		_, err := resolveRaftPeerConfig("n2", groups, "", "", joinMembers, false, false)
+		require.ErrorIs(t, err, ErrJoinMembersRequireLearner)
+	})
+
+	for _, tc := range []struct {
+		name             string
+		bootstrapMembers string
+		groupPeers       string
+		explicit         bool
+	}{
+		{name: "explicit bootstrap", explicit: true},
+		{name: "bootstrap members", bootstrapMembers: joinMembers},
+		{name: "group peers", groupPeers: "1=n1@10.0.0.11:50051,n2@10.0.0.12:50051"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			_, err := resolveRaftPeerConfig(
+				"n2", groups, tc.bootstrapMembers, tc.groupPeers, joinMembers, true, tc.explicit,
+			)
+			require.ErrorIs(t, err, ErrJoinMembersConflictBootstrap)
+		})
+	}
+
+	t.Run("requires a single group", func(t *testing.T) {
+		_, err := resolveRaftPeerConfig("n2", []groupSpec{
+			{id: 1, address: "10.0.0.12:50051"},
+			{id: 2, address: "10.0.0.12:50052"},
+		}, "", "", joinMembers, true, false)
+		require.ErrorIs(t, err, ErrJoinMembersRequireSingleGroup)
+	})
+
+	t.Run("requires local member", func(t *testing.T) {
+		_, err := resolveRaftPeerConfig(
+			"n2", groups, "", "",
+			"n1=10.0.0.11:50051,n3=10.0.0.13:50051", true, false,
+		)
+		require.ErrorIs(t, err, ErrJoinMembersMissingLocalNode)
+	})
+
+	t.Run("requires matching local address", func(t *testing.T) {
+		_, err := resolveRaftPeerConfig(
+			"n2", groups, "", "",
+			"n1=10.0.0.11:50051,n2=10.0.0.99:50051", true, false,
+		)
+		require.ErrorIs(t, err, ErrJoinMembersLocalAddrMismatch)
+	})
+
+	t.Run("requires a remote member", func(t *testing.T) {
+		_, err := resolveRaftPeerConfig(
+			"n2", groups, "", "", "n2=10.0.0.12:50051", true, false,
+		)
+		require.ErrorIs(t, err, ErrJoinMembersTooFewMembers)
+	})
+}
+
 func TestDurationToTicks(t *testing.T) {
 	t.Parallel()
 

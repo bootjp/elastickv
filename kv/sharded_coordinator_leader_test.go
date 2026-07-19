@@ -66,6 +66,20 @@ func TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader(t *testing.T) {
 	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
 }
 
+func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		0: {Engine: &stubFollowerEngine{}},
+		1: {Engine: stubLeaderEngine{}},
+	}, 1, NewHLC(), nil).WithAllShardGroups(1)
+
+	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
+}
+
 // TestShardedCoordinatorLeaseReadAllGroups_FailsClosedOnUnreadableGroup
 // asserts LeaseReadAllGroups fails closed when ANY group cannot confirm its
 // lease: a partially-fenced multi-shard read is exactly the stale read the

@@ -1,8 +1,10 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -287,17 +289,21 @@ func TestGRPCCatalogWatcherFallsBackWhenWatchRPCIsUnimplemented(t *testing.T) {
 	defer cleanup()
 
 	mirror := distribution.NewEngineWithDefaultRoute()
+	var watchLogs bytes.Buffer
 	watcher := distribution.NewGRPCCatalogWatcher(
 		client,
 		mirror,
 		distribution.WithGRPCCatalogWatcherRetryInterval(time.Millisecond),
+		distribution.WithGRPCCatalogWatcherLogger(slog.New(slog.NewTextHandler(&watchLogs, nil))),
 	)
 	watchCtx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() { errCh <- watcher.Run(watchCtx) }()
 	require.Eventually(t, func() bool { return mirror.Version() == first.Version }, 5*time.Second, 5*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	cancel()
 	require.NoError(t, <-errCh)
+	require.NotContains(t, watchLogs.String(), "catalog watch attempt failed")
 }
 
 func TestCatalogStoreMutationsToOpsRejectsInvalidMutation(t *testing.T) {

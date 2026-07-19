@@ -58,6 +58,7 @@ func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
 		GroupID:       3,
 		State:         RouteStateWriteFenced,
 		ParentRouteID: 2,
+		SplitAtHLC:    123456789,
 	}
 	raw, err := EncodeRouteDescriptor(route)
 	if err != nil {
@@ -78,6 +79,7 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 		GroupID:       2,
 		State:         RouteStateActive,
 		ParentRouteID: 0,
+		SplitAtHLC:    987654321,
 	}
 	raw, err := EncodeRouteDescriptor(route)
 	if err != nil {
@@ -88,6 +90,42 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 		t.Fatalf("decode route: %v", err)
 	}
 	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecDecodesV1WithoutSplitAtHLC(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       5,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw := encodeRouteDescriptorV1ForTest(t, route)
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode v1 route: %v", err)
+	}
+	assertRouteEqual(t, route, got)
+}
+
+func TestRouteDescriptorCodecRejectsV1TrailingBytes(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       6,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+	}
+	raw := encodeRouteDescriptorV1ForTest(t, route)
+	raw = append(raw, 0xff)
+
+	_, err := DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
 }
 
 func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
@@ -104,6 +142,28 @@ func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
 		t.Fatalf("encode route: %v", err)
 	}
 	raw = append(raw, 0xff)
+
+	_, err = DecodeRouteDescriptor(raw)
+	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
+		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
+func TestRouteDescriptorCodecRejectsTruncatedSplitAtHLC(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       1,
+		Start:         []byte("a"),
+		End:           nil,
+		GroupID:       1,
+		State:         RouteStateActive,
+		ParentRouteID: 0,
+		SplitAtHLC:    42,
+	}
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	raw = raw[:len(raw)-1]
 
 	_, err = DecodeRouteDescriptor(raw)
 	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
@@ -175,6 +235,27 @@ func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
 	_, err = DecodeRouteDescriptor(raw)
 	if !errors.Is(err, ErrCatalogInvalidRouteRecord) {
 		t.Fatalf("expected ErrCatalogInvalidRouteRecord, got %v", err)
+	}
+}
+
+func TestRouteDescriptorCloneAndEqualIncludeSplitAtHLC(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:       3,
+		Start:         []byte("a"),
+		End:           []byte("m"),
+		GroupID:       2,
+		State:         RouteStateActive,
+		ParentRouteID: 1,
+		SplitAtHLC:    99,
+	}
+	clone := CloneRouteDescriptor(route)
+	assertRouteEqual(t, route, clone)
+	if !routeDescriptorEqual(route, clone) {
+		t.Fatal("expected clone to compare equal")
+	}
+	clone.SplitAtHLC++
+	if routeDescriptorEqual(route, clone) {
+		t.Fatal("expected SplitAtHLC difference to compare unequal")
 	}
 }
 
@@ -642,6 +723,9 @@ func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	if want.ParentRouteID != got.ParentRouteID {
 		t.Fatalf("parent route id mismatch: want %d, got %d", want.ParentRouteID, got.ParentRouteID)
 	}
+	if want.SplitAtHLC != got.SplitAtHLC {
+		t.Fatalf("split at HLC mismatch: want %d, got %d", want.SplitAtHLC, got.SplitAtHLC)
+	}
 	if want.State != got.State {
 		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)
 	}
@@ -651,4 +735,18 @@ func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	if !bytes.Equal(want.End, got.End) {
 		t.Fatalf("end mismatch: want %q, got %q", want.End, got.End)
 	}
+}
+
+func encodeRouteDescriptorV1ForTest(t *testing.T, route RouteDescriptor) []byte {
+	t.Helper()
+	route.SplitAtHLC = 0
+	raw, err := EncodeRouteDescriptor(route)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	if len(raw) < catalogUint64Bytes+1 {
+		t.Fatalf("encoded route too short: %d", len(raw))
+	}
+	raw[0] = catalogRouteCodecVersionMin
+	return raw[:len(raw)-catalogUint64Bytes]
 }

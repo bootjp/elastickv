@@ -2489,6 +2489,11 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	if dispErr == nil {
 		return pending.results, false, nil
 	}
+	// This path owns an exact reusable write set plus PrevCommitTS, so it can
+	// safely opt in to retrying an otherwise-ambiguous forwarded conflict.
+	// Normalize before the typed conflict branch; the generic retry loop keeps
+	// raw wire write conflicts fail-closed for callers without this protection.
+	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (mirrors dispatchListPushReuse):
 		// the apply might have landed at this fresh commitTS but bubbled
@@ -2643,6 +2648,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		ReadKeys: prepared.readKeys,
 	}
 	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
+		// Preserve the exact attempt for a forwarded conflict only after
+		// restoring its typed form. runTransactionWithDedup can then reuse this
+		// write set instead of replaying the EXEC body from a new snapshot.
+		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt for reuse if retryRedisWrite will
 		// actually loop. Mirrors listPushCoreWithDedup's gating
 		// rationale — errors that escape the loop (transient-leader,

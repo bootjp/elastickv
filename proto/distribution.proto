@@ -44,6 +44,7 @@ message RouteDescriptor {
   uint64 raft_group_id = 4;
   RouteState state = 5;
   uint64 parent_route_id = 6;
+  uint64 split_at_hlc = 7;
 }
 
 enum SplitJobPhase {

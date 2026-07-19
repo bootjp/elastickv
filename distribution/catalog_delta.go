@@ -235,13 +235,23 @@ func validateCatalogDeltaMutation(mutation CatalogRouteMutation) error {
 		}
 		return validateRouteDescriptor(mutation.Route)
 	case CatalogMutationDelete:
-		if mutation.Route.RouteID != 0 {
+		if !catalogDeltaRouteIsZero(mutation.Route) {
 			return errors.WithStack(ErrCatalogInvalidDeltaMutation)
 		}
 		return nil
 	default:
 		return errors.WithStack(ErrCatalogInvalidDeltaMutation)
 	}
+}
+
+func catalogDeltaRouteIsZero(route RouteDescriptor) bool {
+	return route.RouteID == 0 &&
+		route.Start == nil &&
+		route.End == nil &&
+		route.GroupID == 0 &&
+		route.State == 0 &&
+		route.ParentRouteID == 0 &&
+		route.SplitAtHLC == 0
 }
 
 func buildCatalogDelta(existing, desired []RouteDescriptor, previousVersion, version uint64) (CatalogDelta, error) {

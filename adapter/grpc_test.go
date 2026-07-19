@@ -169,6 +169,7 @@ type recordingRawGroupStore struct {
 	keyScanGroup bool
 	fallbackGet  bool
 	fallbackScan bool
+	reverseScan  bool
 }
 
 func (s *recordingRawGroupStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -192,6 +193,14 @@ func (s *recordingRawGroupStore) ScanGroupAt(ctx context.Context, groupID uint64
 	s.scanStart = append([]byte(nil), start...)
 	s.scanEnd = append([]byte(nil), end...)
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingRawGroupStore) ReverseScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scanGroupID = groupID
+	s.scanStart = append([]byte(nil), start...)
+	s.scanEnd = append([]byte(nil), end...)
+	s.reverseScan = true
+	return s.ReverseScanAt(ctx, start, end, limit, ts)
 }
 
 func (s *recordingRawGroupStore) ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
@@ -242,6 +251,34 @@ func TestGRPCServer_RawScanAt_UsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanEnd)
 }
 
+func TestGRPCServer_RawScanAt_UsesExplicitGroupForReverse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 9, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 10, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		Reverse:  true,
+		GroupId:  42,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 2)
+	require.False(t, st.fallbackScan)
+	require.True(t, st.reverseScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
+	require.Equal(t, []byte("b"), resp.GetKv()[0].Key)
+	require.Equal(t, []byte("a"), resp.GetKv()[1].Key)
+}
+
 func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 
@@ -263,6 +300,37 @@ func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
 	require.Empty(t, resp.GetKv()[0].GetValue())
 	require.True(t, st.keyScanGroup)
+	require.False(t, st.fallbackScan)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.Equal(t, []byte("a"), st.scanStart)
+	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
+func TestGRPCServer_RawScanAt_ReverseKeysOnlyUsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value-a"), 9, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("large-value-b"), 10, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		Reverse:  true,
+		GroupId:  42,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 2)
+	require.Equal(t, []byte("b"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+	require.Equal(t, []byte("a"), resp.GetKv()[1].GetKey())
+	require.Empty(t, resp.GetKv()[1].GetValue())
+	require.True(t, st.reverseScan)
 	require.False(t, st.fallbackScan)
 	require.Equal(t, uint64(42), st.scanGroupID)
 	require.Equal(t, []byte("a"), st.scanStart)

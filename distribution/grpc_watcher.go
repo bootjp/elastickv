@@ -124,7 +124,7 @@ func (w *GRPCCatalogWatcher) runAttempt(ctx context.Context) error {
 	if syncErr := w.syncSnapshot(ctx, client); syncErr != nil {
 		return errors.Join(err, errors.Wrap(syncErr, "poll catalog snapshot after unimplemented watch"))
 	}
-	return err
+	return nil
 }
 
 func (w *GRPCCatalogWatcher) validate() error {
@@ -279,6 +279,9 @@ func catalogDeltaFromProto(record *pb.CatalogDeltaRecord) (CatalogDelta, error) 
 		case pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_UNSPECIFIED:
 			return CatalogDelta{}, errors.WithStack(ErrCatalogWatchEventInvalid)
 		case pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_DELETE:
+			if raw.Route != nil {
+				return CatalogDelta{}, errors.WithStack(ErrCatalogWatchEventInvalid)
+			}
 			mutation.Op = CatalogMutationDelete
 		case pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_UPSERT:
 			mutation.Op = CatalogMutationUpsert
