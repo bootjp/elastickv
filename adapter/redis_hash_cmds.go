@@ -162,7 +162,10 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	defer cancel()
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis hash field write: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
 		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
 		if err != nil {
 			return err
@@ -472,7 +475,10 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 }
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis hash field delete: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
@@ -762,7 +768,10 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 }
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis hash increment: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
@@ -831,7 +840,10 @@ func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis incr: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
 		typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err

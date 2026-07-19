@@ -164,7 +164,11 @@ func (s *SQSServer) tryMutateQueueTagsOnce(
 	queueName string,
 	mutate func(*sqsQueueMeta) error,
 ) (bool, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs mutate queue tags: begin read timestamp")
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return false, errors.WithStack(err)

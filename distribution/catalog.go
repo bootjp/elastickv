@@ -240,6 +240,16 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	return s.SnapshotAt(ctx, s.store.LastCommitTS())
 }
 
+// LatestCommitTS returns the local catalog store watermark without reading
+// catalog data. Callers use it as the pre-Phase-D legacy timestamp input before
+// selecting the transaction snapshot through the dedicated TSO.
+func (s *CatalogStore) LatestCommitTS() uint64 {
+	if s == nil || s.store == nil {
+		return 0
+	}
+	return s.store.LastCommitTS()
+}
+
 // SnapshotAt reads a consistent route catalog snapshot at a specific MVCC
 // timestamp.
 func (s *CatalogStore) SnapshotAt(ctx context.Context, ts uint64) (CatalogSnapshot, error) {

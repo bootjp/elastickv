@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -291,6 +292,82 @@ func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
 	require.EqualValues(t, testTSOInitialBase+6, got)
 }
 
+func TestBeginReadTimestampThroughPreservesLegacyBeforePhaseD(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Zero(t, alloc.validateCalls.Load())
+}
+
+func TestBeginReadTimestampThroughValidatesAppliedWatermarkDuringPhaseD(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+	require.Equal(t, uint64(42), alloc.validated.Load())
+}
+
+func TestBeginReadTimestampThroughFailsClosedOnValidationError(t *testing.T) {
+	alloc := &phaseDTestAllocator{
+		next:           testTSOInitialBase,
+		phaseDActive:   true,
+		phaseDRequired: true,
+		validateErr:    ErrTSOTimestampInvalid,
+	}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	_, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
+func TestBeginReadTimestampThroughActivatesPhaseDBeforeValidation(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDRequired: true}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test phase D activation")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Equal(t, uint64(1), alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
+func TestBatchAllocatorDropsPrePhaseDWindowAfterActivation(t *testing.T) {
+	raw := &phaseDWindowTSO{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(raw, testTSOBatchSize)
+	require.NoError(t, err)
+
+	first, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(testTSOInitialBase), first)
+	raw.phaseD = true
+	raw.floor = testTSOInitialBase + testTSOBatchSize - 1
+
+	readTS, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(testTSOInitialBase+testTSOBatchSize), readTS)
+	require.Equal(t, uint64(2), raw.calls.Load())
+}
+
+func TestBeginReadTimestampThroughFindsAllocatorBehindKeyVizDecorator(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
+	coord := WithKeyVizLabel(&Coordinate{tsAllocator: alloc}, keyviz.LabelRedis)
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test decorated read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
 func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
 	t.Parallel()
 
@@ -391,6 +468,71 @@ type fakeTSOAllocator struct {
 	calls    atomic.Uint64
 	leader   bool
 }
+
+type phaseDTestAllocator struct {
+	next           uint64
+	phaseDActive   bool
+	phaseDRequired bool
+	validateErr    error
+	nextCalls      atomic.Uint64
+	validateCalls  atomic.Uint64
+	validated      atomic.Uint64
+}
+
+func (a *phaseDTestAllocator) Next(context.Context) (uint64, error) {
+	a.nextCalls.Add(1)
+	return a.next, nil
+}
+
+func (a *phaseDTestAllocator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	a.nextCalls.Add(1)
+	if a.next <= min {
+		return min + 1, nil
+	}
+	return a.next, nil
+}
+
+func (a *phaseDTestAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls.Add(1)
+	a.validated.Store(timestamp)
+	return a.validateErr
+}
+
+func (a *phaseDTestAllocator) PhaseDActive() bool   { return a.phaseDActive }
+func (a *phaseDTestAllocator) PhaseDRequired() bool { return a.phaseDRequired }
+
+type phaseDWindowTSO struct {
+	nextBase uint64
+	floor    uint64
+	phaseD   bool
+	leader   bool
+	calls    atomic.Uint64
+}
+
+func (a *phaseDWindowTSO) Next(ctx context.Context) (uint64, error) {
+	return a.NextBatch(ctx, 1)
+}
+
+func (a *phaseDWindowTSO) NextBatch(_ context.Context, n int) (uint64, error) {
+	a.calls.Add(1)
+	base := a.nextBase
+	a.nextBase += uint64(n) //nolint:gosec // positive test batch size.
+	return base, nil
+}
+
+func (a *phaseDWindowTSO) IsLeader() bool { return a.leader }
+
+func (a *phaseDWindowTSO) RunLeaseRenewal(ctx context.Context) { <-ctx.Done() }
+
+func (a *phaseDWindowTSO) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	if timestamp <= a.floor {
+		return ErrTSOTimestampInvalid
+	}
+	return nil
+}
+
+func (a *phaseDWindowTSO) PhaseDActive() bool   { return a.phaseD }
+func (a *phaseDWindowTSO) PhaseDRequired() bool { return a.phaseD }
 
 func (f *fakeTSOAllocator) Next(ctx context.Context) (uint64, error) {
 	return f.NextBatch(ctx, 1)

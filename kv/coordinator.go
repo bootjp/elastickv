@@ -68,6 +68,15 @@ func WithTSOAllocator(alloc TimestampAllocator) CoordinatorOption {
 	}
 }
 
+// TimestampAllocator exposes the configured allocator to coordinator
+// decorators without widening the Coordinator interface.
+func (c *Coordinate) TimestampAllocator() TimestampAllocator {
+	if c == nil {
+		return nil
+	}
+	return c.tsAllocator
+}
+
 // LeaseReadObserver records lease-read fast-path vs slow-path outcomes
 // without coupling kv to a concrete monitoring backend. It is called once
 // per LeaseRead invocation that actually evaluates the lease (the initial
@@ -230,6 +239,13 @@ type Coordinate struct {
 }
 
 var _ Coordinator = (*Coordinate)(nil)
+var _ AppliedReadTimestampVoucher = (*Coordinate)(nil)
+
+// VouchAppliedReadTimestamp is a no-op for the single-group coordinator. The
+// sharded coordinator consumes vouchers before cross-group StartTS validation.
+func (c *Coordinate) VouchAppliedReadTimestamp(uint64) error {
+	return nil
+}
 
 type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)

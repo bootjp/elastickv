@@ -126,6 +126,7 @@ var (
 	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
 	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Commit the one-way cutover marker and issue coordinator-owned persistence timestamps through the dedicated TSO leader when group 0 is configured")
 	tsoShadowEnabled                = flag.Bool("tsoShadowEnabled", false, "Serialize legacy HLC issuance through the dedicated TSO; fail closed on TSO errors and switch to TSO values after cutover")
+	tsoPhaseDEnabled                = flag.Bool("tsoPhaseDEnabled", false, "Close the centralized-TSO compatibility window after every group-0 member understands the M7 marker")
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
@@ -2094,6 +2095,9 @@ func configureCoordinatorTSO(
 	if *tsoEnabled && *tsoShadowEnabled {
 		return wiring, errors.New("--tsoEnabled and --tsoShadowEnabled are mutually exclusive")
 	}
+	if *tsoPhaseDEnabled && !*tsoEnabled {
+		return wiring, errors.New("--tsoPhaseDEnabled requires --tsoEnabled")
+	}
 
 	tsoGroup, dedicated := shardGroups[dedicatedTSORaftGroupID]
 	if !dedicated {
@@ -2108,6 +2112,9 @@ func configureCoordinatorTSO(
 
 func configureLegacyCoordinatorTSO(coordinate *kv.ShardedCoordinator) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
+	if *tsoPhaseDEnabled {
+		return wiring, errors.Wrap(kv.ErrTSOGroupRequired, "configure tso phase D")
+	}
 	if *tsoShadowEnabled {
 		return wiring, errors.Wrap(kv.ErrTSOGroupRequired, "configure tso shadow allocator")
 	}
@@ -2143,34 +2150,49 @@ func configureDedicatedCoordinatorTSO(
 		return wiring, errors.Wrap(err, "configure dedicated tso allocator")
 	}
 	wiring.serverAllocator = local
-	cutoverActive := tsoGroup.TSOState.CutoverActive()
-	if !*tsoEnabled && !*tsoShadowEnabled && !cutoverActive {
+	coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
+	coordinate.WithTSOCutoverState(tsoGroup.TSOState)
+	if !dedicatedTSOAllocatorRequired(tsoGroup.TSOState) {
 		return wiring, nil
 	}
 
-	routedOpts := []kv.LeaderRoutedTSOAllocatorOption{
-		kv.WithTSORoutedClock(coordinate.Clock()),
-	}
-	if *tsoEnabled {
-		routedOpts = append(routedOpts, kv.WithTSOCutoverActivation())
-	}
+	routedOpts := dedicatedTSORoutingOptions(coordinate.Clock())
 	routed, err := kv.NewLeaderRoutedTSOAllocator(local, tsoGroup.Engine, routedOpts...)
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure tso leader routing")
 	}
 	wiring.routedAllocator = routed
-	coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
-	return installDedicatedCoordinatorTSO(coordinate, wiring, routed, cutoverActive)
+	return installDedicatedCoordinatorAllocator(coordinate, tsoGroup.TSOState, wiring, routed)
 }
 
-func installDedicatedCoordinatorTSO(
+func dedicatedTSOAllocatorRequired(state *kv.TSOStateMachine) bool {
+	return *tsoEnabled || *tsoShadowEnabled || (state != nil && state.CutoverActive())
+}
+
+func dedicatedTSORoutingOptions(clock *kv.HLC) []kv.LeaderRoutedTSOAllocatorOption {
+	opts := []kv.LeaderRoutedTSOAllocatorOption{kv.WithTSORoutedClock(clock)}
+	if *tsoEnabled {
+		opts = append(opts, kv.WithTSOCutoverActivation())
+	}
+	if *tsoPhaseDEnabled {
+		opts = append(opts, kv.WithTSOPhaseDActivation())
+	}
+	return opts
+}
+
+func installDedicatedCoordinatorAllocator(
 	coordinate *kv.ShardedCoordinator,
+	state *kv.TSOStateMachine,
 	wiring coordinatorTSOWiring,
 	routed *kv.LeaderRoutedTSOAllocator,
-	cutoverActive bool,
 ) (coordinatorTSOWiring, error) {
-	if *tsoShadowEnabled && !cutoverActive {
-		shadow, err := kv.NewShadowTimestampAllocator(coordinate.Clock(), routed, slog.Default())
+	if *tsoShadowEnabled && (state == nil || !state.CutoverActive()) {
+		shadow, err := kv.NewShadowTimestampAllocator(
+			coordinate.Clock(),
+			routed,
+			slog.Default(),
+			kv.WithTSOShadowCutoverState(state),
+		)
 		if err != nil {
 			_ = wiring.Close()
 			return coordinatorTSOWiring{}, errors.Wrap(err, "configure tso shadow allocator")
@@ -2332,6 +2354,7 @@ var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
+var _ kv.AppliedReadTimestampVoucher = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2375,6 +2398,14 @@ func (c startupGatedCoordinator) Clock() *kv.HLC {
 func (c startupGatedCoordinator) TimestampAllocator() kv.TimestampAllocator {
 	alloc, _ := kv.TimestampAllocatorThrough(c.inner)
 	return alloc
+}
+
+func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
+	voucher, ok := c.inner.(kv.AppliedReadTimestampVoucher)
+	if !ok {
+		return errors.WithStack(kv.ErrTSOProtocolUnsupported)
+	}
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp))
 }
 
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

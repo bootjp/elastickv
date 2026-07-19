@@ -278,7 +278,10 @@ func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, a
 func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context, kind string, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis set mutation: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
 		if err := r.validateExactSetKind(kind, key, readTS); err != nil {
 			return err
 		}
@@ -303,49 +306,24 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeSet)
-		if err != nil {
-			return err
-		}
-		cleanupElems, migrationElems, legacyMemberBase, expiredRecreate, err := r.setWideMutationBase(ctx, key, readTS, typ)
-		if err != nil {
-			return err
-		}
-
-		startTS := normalizeStartTS(readTS)
-		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "mutateExactSetWide: allocate commitTS")
+		readTS, err := r.beginTxnStartTS(ctx, "redis set mutation: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
-
-		elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+len(members)+setWideColOverhead)
-		elems = append(elems, cleanupElems...)
-		elems = append(elems, migrationElems...)
-
-		var lenDelta int64
-		var mutErr error
-		elems, changed, lenDelta, mutErr = r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase, expiredRecreate)
-		if mutErr != nil {
-			return mutErr
+		prepared, err := r.prepareExactSetWideMutation(ctx, key, members, add, readTS)
+		if err != nil {
+			return err
 		}
-
-		if changed == 0 && len(migrationElems) == 0 && len(cleanupElems) == 0 {
+		changed = prepared.changed
+		if prepared.skip {
 			return nil
 		}
-
-		elems = appendSetDeltaElems(elems, key, lenDelta, commitTS)
-
-		if len(elems) == 0 {
-			return nil
-		}
-
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
-			StartTS:  startTS,
-			CommitTS: commitTS,
-			ReadKeys: redisTxnWideCreateReadKeys(key, typ, redisTxnWideSetFenceKey),
-			Elems:    elems,
+			StartTS:  prepared.startTS,
+			CommitTS: prepared.commitTS,
+			ReadKeys: redisTxnWideCreateReadKeys(key, prepared.typ, redisTxnWideSetFenceKey),
+			Elems:    prepared.elems,
 		})
 		return cockerrors.WithStack(dispatchErr)
 	}); err != nil {
@@ -353,6 +331,50 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+type exactSetWideMutation struct {
+	typ      redisValueType
+	startTS  uint64
+	commitTS uint64
+	changed  int
+	elems    []*kv.Elem[kv.OP]
+	skip     bool
+}
+
+func (r *RedisServer) prepareExactSetWideMutation(
+	ctx context.Context,
+	key []byte,
+	members [][]byte,
+	add bool,
+	readTS uint64,
+) (exactSetWideMutation, error) {
+	var prepared exactSetWideMutation
+	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeSet)
+	if err != nil {
+		return prepared, err
+	}
+	cleanupElems, migrationElems, legacyMemberBase, expiredRecreate, err := r.setWideMutationBase(ctx, key, readTS, typ)
+	if err != nil {
+		return prepared, err
+	}
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "mutateExactSetWide: allocate commitTS")
+	if err != nil {
+		return prepared, cockerrors.WithStack(err)
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+len(migrationElems)+len(members)+setWideColOverhead)
+	elems = append(elems, cleanupElems...)
+	elems = append(elems, migrationElems...)
+	elems, changed, lenDelta, err := r.applySetMemberMutations(ctx, key, members, add, readTS, elems, legacyMemberBase, expiredRecreate)
+	if err != nil {
+		return prepared, err
+	}
+	elems = appendSetDeltaElems(elems, key, lenDelta, commitTS)
+	return exactSetWideMutation{
+		typ: typ, startTS: startTS, commitTS: commitTS, changed: changed, elems: elems,
+		skip: (changed == 0 && len(migrationElems) == 0 && len(cleanupElems) == 0) || len(elems) == 0,
+	}, nil
 }
 
 func (r *RedisServer) setWideMutationBase(
@@ -718,7 +740,10 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis pfadd: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
 		if err := r.validateExactSetKind(hllKind, cmd.Args[1], readTS); err != nil {
 			return err
 		}

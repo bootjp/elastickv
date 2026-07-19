@@ -116,10 +116,12 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 // silent-no-op semantics and AWS S3.
 func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string) (*s3ObjectManifest, uint64, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin delete object: begin read timestamp")
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteObjectTxn")
 	}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -215,10 +217,12 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 //nolint:cyclop,gocognit,nestif // see comment above
 func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string, body io.Reader, contentType string) (*s3ObjectManifest, uint64, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin put object: begin read timestamp")
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminPutObjectStream")
 	}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 

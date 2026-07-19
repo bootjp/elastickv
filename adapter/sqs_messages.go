@@ -631,7 +631,11 @@ func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, 
 // concurrent DeleteQueue / PurgeQueue could slip in between our read
 // and the write, storing a message under a dead generation.
 func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, body []byte) (*sqsQueueMeta, uint64, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs send message: begin read timestamp")
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, readTS, errors.WithStack(err)
@@ -991,7 +995,12 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, opts 
 // elapses prevents false-empty returns under poison-message backlogs
 // or hot-FIFO-group fan-in.
 func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, opts sqsReceiveOptions) ([]map[string]any, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs receive message: begin read timestamp")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	ctx = readTimestamp.WithDispatchVoucher(ctx)
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1291,7 +1300,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		ReadKeys: readKeys,
 		Elems:    elems,
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil
 		}
@@ -1440,7 +1449,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 	if err != nil {
 		return nil, false, err
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, true, nil
 		}
@@ -1699,7 +1708,11 @@ const (
 // error — silently succeeding would let misrouted deletes ack messages
 // that cannot possibly be deleted on this queue.
 func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs delete message: begin read timestamp")
+	if err != nil {
+		return nil, nil, nil, 0, sqsDeleteProceed, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
@@ -1853,7 +1866,11 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 // be rejected with ReceiptHandleIsInvalid instead of silently
 // mutating the orphan record.
 func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs change message visibility: begin read timestamp")
+	if err != nil {
+		return nil, nil, nil, 0, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, nil, nil, readTS, errors.WithStack(err)

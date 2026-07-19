@@ -733,7 +733,11 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 			return nil, nil, nil, err
 		}
 	}
-	readTS := d.nextTxnReadTS()
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb transact-write: begin read timestamp")
+	if err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	reqs := &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		// Keep transaction start aligned with the snapshot used to evaluate

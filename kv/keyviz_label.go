@@ -90,6 +90,19 @@ func (c keyVizLabeledCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c keyVizLabeledCoordinator) Clock() *HLC { return c.inner.Clock() }
 
+func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
+	alloc, _ := TimestampAllocatorThrough(c.inner)
+	return alloc
+}
+
+func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
+	voucher, ok := c.inner.(AppliedReadTimestampVoucher)
+	if !ok {
+		return errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp))
+}
+
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
 		idx, err := lr.LeaseRead(ctx)

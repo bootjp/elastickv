@@ -99,7 +99,10 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis list push: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
 		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -380,19 +383,18 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 	var newLen int64
 	var pending *reusableListPush
 	err := r.retryRedisWrite(ctx, func() error {
-		if pending != nil {
-			length, drop, dispErr := r.dispatchListPushReuse(ctx, key, pending)
-			if drop {
-				pending = nil
-			}
-			if dispErr != nil {
-				return dispErr
+		length, handled, err := r.tryPendingListPush(ctx, key, &pending)
+		if handled {
+			if err != nil {
+				return err
 			}
 			newLen = length
 			return nil
 		}
-
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis list push: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
 		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -452,6 +454,21 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		return errors.WithStack(dispErr)
 	})
 	return newLen, err
+}
+
+func (r *RedisServer) tryPendingListPush(
+	ctx context.Context,
+	key []byte,
+	pending **reusableListPush,
+) (int64, bool, error) {
+	if *pending == nil {
+		return 0, false, nil
+	}
+	length, drop, err := r.dispatchListPushReuse(ctx, key, *pending)
+	if drop {
+		*pending = nil
+	}
+	return length, true, err
 }
 
 func (r *RedisServer) listRPush(ctx context.Context, key []byte, values [][]byte) (int64, error) {
@@ -675,7 +692,11 @@ func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, l
 
 	var popped []string
 	err := r.retryRedisWrite(ctx, func() error {
-		result, popErr := r.listPopClaimOnce(ctx, key, count, left, r.readTS())
+		readTS, readErr := r.beginTxnStartTS(ctx, "redis list pop: begin read timestamp")
+		if readErr != nil {
+			return errors.WithStack(readErr)
+		}
+		result, popErr := r.listPopClaimOnce(ctx, key, count, left, readTS)
 		if popErr != nil {
 			return popErr
 		}
@@ -824,9 +845,13 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
+	key := cmd.Args[1]
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
+		readTS, err := r.beginTxnStartTS(ctx, "redis ltrim: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
@@ -836,21 +861,24 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeList {
 			return wrongTypeError()
 		}
-		current, err := r.listValuesAt(ctx, cmd.Args[1], readTS)
+		current, err := r.listValuesAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		s, e := normalizeRankRange(start, stop, len(current))
-		trimmed := []string{}
-		if e >= s {
-			trimmed = append(trimmed, current[s:e+1]...)
-		}
-		return r.rewriteListTxn(ctx, cmd.Args[1], readTS, trimmed)
+		return r.rewriteListTxn(ctx, key, readTS, trimListValues(current, start, stop))
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteString("OK")
+}
+
+func trimListValues(current []string, start, stop int) []string {
+	s, e := normalizeRankRange(start, stop, len(current))
+	if e < s {
+		return []string{}
+	}
+	return append([]string{}, current[s:e+1]...)
 }
 
 func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {

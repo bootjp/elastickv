@@ -67,6 +67,11 @@ func validateS3MultipartCompletionParts(parts []s3CompleteMultipartUploadPart, b
 func (s *S3Server) loadS3MultipartCompletion(ctx context.Context, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, error) {
 	completion := s3MultipartCompletion{bucket: bucket, objectKey: objectKey, uploadID: uploadID}
 	readTS := s.readTS()
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 complete multipart upload preparation: begin read timestamp")
+	if err != nil {
+		return completion, errors.WithStack(err)
+	}
+	readTS = readTimestamp.Timestamp()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -164,10 +169,12 @@ func (s *S3Server) commitS3MultipartCompletion(ctx context.Context, completion s
 
 func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, completion s3MultipartCompletion) (*s3ObjectManifest, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 complete multipart upload: begin read timestamp")
 	if err != nil {
 		return nil, errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
 	}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 

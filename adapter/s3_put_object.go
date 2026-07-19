@@ -20,10 +20,12 @@ type s3PutObjectState struct {
 
 func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request, bucket, objectKey string) (*s3PutObjectState, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 put object: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
 	state := &s3PutObjectState{startTS: startTS, readPin: s.pinReadTS(readTS)}
 	prepared := false
 	defer func() {

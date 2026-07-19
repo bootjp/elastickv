@@ -170,6 +170,41 @@ func TestTSOStateMachineAppliesOneWayCutoverMarker(t *testing.T) {
 	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
 }
 
+func TestTSOStateMachineAppliesOneWayPhaseDMarker(t *testing.T) {
+	t.Parallel()
+
+	const floor = uint64(1234)
+	fsm := NewTSOStateMachine(NewHLC())
+
+	err := requireTSOHaltError(t, fsm.Apply(marshalTSOPhaseD(floor)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.False(t, fsm.PhaseDActive())
+
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(floor)))
+	require.True(t, fsm.PhaseDActive())
+	require.Equal(t, floor, fsm.PhaseDFloor())
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(floor)), "phase-D replay must be idempotent")
+
+	err = requireTSOHaltError(t, fsm.Apply(marshalTSOPhaseD(floor+1)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "floor changed")
+	err = requireTSOHaltError(t, fsm.Apply([]byte(tsoPhaseDEnvelope)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+}
+
+func TestTSOStateMachineRejectsPhaseDFloorBelowExistingAllocation(t *testing.T) {
+	t.Parallel()
+
+	fsm := NewTSOStateMachine(NewHLC())
+	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(100)))
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	err := requireTSOHaltError(t, fsm.Apply(marshalTSOPhaseD(99)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "below allocation floor")
+	require.False(t, fsm.PhaseDActive())
+}
+
 func TestTSOStateMachineRejectsInvalidCutoverSnapshotByte(t *testing.T) {
 	t.Parallel()
 
@@ -178,6 +213,29 @@ func TestTSOStateMachineRejectsInvalidCutoverSnapshotByte(t *testing.T) {
 	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader(payload))
 	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
 	require.ErrorContains(t, err, "invalid cutover byte")
+}
+
+func TestTSOStateMachineRejectsInvalidPhaseDSnapshot(t *testing.T) {
+	t.Parallel()
+
+	payload := make([]byte, tsoSnapshotV4Len)
+	payload[tsoSnapshotV2Len] = 1
+	payload[tsoSnapshotV3Len] = 2
+	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader(payload))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "invalid phase-D byte")
+
+	payload[tsoSnapshotV2Len] = 0
+	payload[tsoSnapshotV3Len] = 1
+	err = NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader(payload))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "phase-D active without cutover")
+
+	payload[tsoSnapshotV3Len] = 0
+	binary.BigEndian.PutUint64(payload[tsoSnapshotV3Len+1:], 1)
+	err = NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader(payload))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.ErrorContains(t, err, "inactive phase-D has floor")
 }
 
 func TestTSOStateMachineNilHLCDoesNotPanic(t *testing.T) {
@@ -197,6 +255,9 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	floor := tsoLeaseAllocationFloor(ceilingMs)
 	require.Nil(t, source.Apply(marshalTSOAllocationFloor(floor)))
 	require.Nil(t, source.Apply(marshalTSOCutover()))
+	require.Nil(t, source.Apply(marshalTSOPhaseD(floor)))
+	postPhaseDFloor := floor + 10
+	require.Nil(t, source.Apply(marshalTSOAllocationFloor(postPhaseDFloor)))
 
 	snap, err := source.Snapshot()
 	require.NoError(t, err)
@@ -205,15 +266,17 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	n, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
-	require.EqualValues(t, tsoSnapshotV3Len, n)
-	require.Len(t, buf.Bytes(), tsoSnapshotV3Len)
+	require.EqualValues(t, tsoSnapshotV4Len, n)
+	require.Len(t, buf.Bytes(), tsoSnapshotV4Len)
 
 	targetHLC := NewHLC()
 	target := NewTSOStateMachine(targetHLC)
 	require.NoError(t, target.Restore(bytes.NewReader(buf.Bytes())))
 	require.Equal(t, ceilingMs, targetHLC.PhysicalCeiling())
-	require.Equal(t, floor, targetHLC.Current())
+	require.Equal(t, postPhaseDFloor, targetHLC.Current())
 	require.True(t, target.CutoverActive())
+	require.True(t, target.PhaseDActive())
+	require.Equal(t, floor, target.PhaseDFloor())
 }
 
 func TestTSOStateMachineSnapshotUsesTSOOwnedCeiling(t *testing.T) {
@@ -271,6 +334,26 @@ func TestTSOStateMachineRestoreLegacySnapshotDerivesAllocationFloor(t *testing.T
 	require.NoError(t, NewTSOStateMachine(hlc).Restore(bytes.NewReader(buf[:])))
 	require.Equal(t, ceilingMs, hlc.PhysicalCeiling())
 	require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), hlc.Current())
+}
+
+func TestTSOStateMachineRestoresV3SnapshotWithoutPhaseD(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ceilingMs = int64(1_700_000_654_321)
+		floor     = uint64(4567)
+	)
+	payload := make([]byte, tsoSnapshotV3Len)
+	binary.BigEndian.PutUint64(payload[:hlcLeasePayloadLen], uint64(ceilingMs))
+	binary.BigEndian.PutUint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len], floor)
+	payload[tsoSnapshotV2Len] = 1
+
+	fsm := NewTSOStateMachine(NewHLC())
+	require.NoError(t, fsm.Restore(bytes.NewReader(payload)))
+	require.Equal(t, floor, fsm.AllocationFloor())
+	require.True(t, fsm.CutoverActive())
+	require.False(t, fsm.PhaseDActive())
+	require.Zero(t, fsm.PhaseDFloor())
 }
 
 func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
@@ -353,9 +436,11 @@ func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalHLCLeaseRenew(1_700_000_123_456)))
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOAllocationFloor(1)))
 	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOCutover()))
+	require.True(t, fsm.IsVolatileOnlyPayload(marshalTSOPhaseD(1)))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeHLCLease}))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte(tsoAllocationFloorEnvelope)))
 	require.False(t, fsm.IsVolatileOnlyPayload(append([]byte(tsoCutoverEnvelope), 1)))
+	require.False(t, fsm.IsVolatileOnlyPayload([]byte(tsoPhaseDEnvelope)))
 	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeSingle}))
 }
 

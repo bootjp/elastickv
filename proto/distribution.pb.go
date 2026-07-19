@@ -368,8 +368,11 @@ type GetTimestampRequest struct {
 	// issuance. Once committed, shadow clients return TSO timestamps instead of
 	// legacy HLC candidates, so a rolling cutover cannot reintroduce them.
 	ActivateCutover bool `protobuf:"varint,3,opt,name=activate_cutover,json=activateCutover,proto3" json:"activate_cutover,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// ActivatePhaseD closes the legacy compatibility window after every member
+	// understands the M7 FSM entry. It requires ActivateCutover and is one-way.
+	ActivatePhaseD bool `protobuf:"varint,4,opt,name=activate_phase_d,json=activatePhaseD,proto3" json:"activate_phase_d,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GetTimestampRequest) Reset() {
@@ -423,6 +426,13 @@ func (x *GetTimestampRequest) GetActivateCutover() bool {
 	return false
 }
 
+func (x *GetTimestampRequest) GetActivatePhaseD() bool {
+	if x != nil {
+		return x.ActivatePhaseD
+	}
+	return false
+}
+
 type GetTimestampResponse struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Timestamp uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
@@ -438,6 +448,10 @@ type GetTimestampResponse struct {
 	// CutoverActive reports the durable group-0 cutover marker after applying
 	// this request. Shadow nodes switch to the returned TSO timestamp when true.
 	CutoverActive bool `protobuf:"varint,5,opt,name=cutover_active,json=cutoverActive,proto3" json:"cutover_active,omitempty"`
+	// PhaseDActive reports that legacy per-shard issuance has been retired.
+	PhaseDActive bool `protobuf:"varint,6,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
+	// PhaseDFloor is the allocation floor captured by the Phase-D marker.
+	PhaseDFloor   uint64 `protobuf:"varint,7,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -507,6 +521,132 @@ func (x *GetTimestampResponse) GetCutoverActive() bool {
 	return false
 }
 
+func (x *GetTimestampResponse) GetPhaseDActive() bool {
+	if x != nil {
+		return x.PhaseDActive
+	}
+	return false
+}
+
+func (x *GetTimestampResponse) GetPhaseDFloor() uint64 {
+	if x != nil {
+		return x.PhaseDFloor
+	}
+	return 0
+}
+
+type ValidateTimestampRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ValidateTimestampRequest) Reset() {
+	*x = ValidateTimestampRequest{}
+	mi := &file_distribution_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ValidateTimestampRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ValidateTimestampRequest) ProtoMessage() {}
+
+func (x *ValidateTimestampRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ValidateTimestampRequest.ProtoReflect.Descriptor instead.
+func (*ValidateTimestampRequest) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ValidateTimestampRequest) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+type ValidateTimestampResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Valid           bool                   `protobuf:"varint,1,opt,name=valid,proto3" json:"valid,omitempty"`
+	PhaseDActive    bool                   `protobuf:"varint,2,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
+	PhaseDFloor     uint64                 `protobuf:"varint,3,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
+	AllocationFloor uint64                 `protobuf:"varint,4,opt,name=allocation_floor,json=allocationFloor,proto3" json:"allocation_floor,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ValidateTimestampResponse) Reset() {
+	*x = ValidateTimestampResponse{}
+	mi := &file_distribution_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ValidateTimestampResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ValidateTimestampResponse) ProtoMessage() {}
+
+func (x *ValidateTimestampResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ValidateTimestampResponse.ProtoReflect.Descriptor instead.
+func (*ValidateTimestampResponse) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ValidateTimestampResponse) GetValid() bool {
+	if x != nil {
+		return x.Valid
+	}
+	return false
+}
+
+func (x *ValidateTimestampResponse) GetPhaseDActive() bool {
+	if x != nil {
+		return x.PhaseDActive
+	}
+	return false
+}
+
+func (x *ValidateTimestampResponse) GetPhaseDFloor() uint64 {
+	if x != nil {
+		return x.PhaseDFloor
+	}
+	return 0
+}
+
+func (x *ValidateTimestampResponse) GetAllocationFloor() uint64 {
+	if x != nil {
+		return x.AllocationFloor
+	}
+	return 0
+}
+
 type RouteDescriptor struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RouteId       uint64                 `protobuf:"varint,1,opt,name=route_id,json=routeId,proto3" json:"route_id,omitempty"`
@@ -522,7 +662,7 @@ type RouteDescriptor struct {
 
 func (x *RouteDescriptor) Reset() {
 	*x = RouteDescriptor{}
-	mi := &file_distribution_proto_msgTypes[4]
+	mi := &file_distribution_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -534,7 +674,7 @@ func (x *RouteDescriptor) String() string {
 func (*RouteDescriptor) ProtoMessage() {}
 
 func (x *RouteDescriptor) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[4]
+	mi := &file_distribution_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -547,7 +687,7 @@ func (x *RouteDescriptor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteDescriptor.ProtoReflect.Descriptor instead.
 func (*RouteDescriptor) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{4}
+	return file_distribution_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RouteDescriptor) GetRouteId() uint64 {
@@ -615,7 +755,7 @@ type SplitJobBracketProgress struct {
 
 func (x *SplitJobBracketProgress) Reset() {
 	*x = SplitJobBracketProgress{}
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -627,7 +767,7 @@ func (x *SplitJobBracketProgress) String() string {
 func (*SplitJobBracketProgress) ProtoMessage() {}
 
 func (x *SplitJobBracketProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -640,7 +780,7 @@ func (x *SplitJobBracketProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitJobBracketProgress.ProtoReflect.Descriptor instead.
 func (*SplitJobBracketProgress) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{5}
+	return file_distribution_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *SplitJobBracketProgress) GetBracketId() uint64 {
@@ -740,7 +880,7 @@ type SplitJob struct {
 
 func (x *SplitJob) Reset() {
 	*x = SplitJob{}
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -752,7 +892,7 @@ func (x *SplitJob) String() string {
 func (*SplitJob) ProtoMessage() {}
 
 func (x *SplitJob) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -765,7 +905,7 @@ func (x *SplitJob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitJob.ProtoReflect.Descriptor instead.
 func (*SplitJob) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{6}
+	return file_distribution_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SplitJob) GetJobId() uint64 {
@@ -1007,7 +1147,7 @@ type ListRoutesRequest struct {
 
 func (x *ListRoutesRequest) Reset() {
 	*x = ListRoutesRequest{}
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1019,7 +1159,7 @@ func (x *ListRoutesRequest) String() string {
 func (*ListRoutesRequest) ProtoMessage() {}
 
 func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1032,7 +1172,7 @@ func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesRequest.ProtoReflect.Descriptor instead.
 func (*ListRoutesRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{7}
+	return file_distribution_proto_rawDescGZIP(), []int{9}
 }
 
 type ListRoutesResponse struct {
@@ -1045,7 +1185,7 @@ type ListRoutesResponse struct {
 
 func (x *ListRoutesResponse) Reset() {
 	*x = ListRoutesResponse{}
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1057,7 +1197,7 @@ func (x *ListRoutesResponse) String() string {
 func (*ListRoutesResponse) ProtoMessage() {}
 
 func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1070,7 +1210,7 @@ func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesResponse.ProtoReflect.Descriptor instead.
 func (*ListRoutesResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{8}
+	return file_distribution_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListRoutesResponse) GetCatalogVersion() uint64 {
@@ -1098,7 +1238,7 @@ type SplitRangeRequest struct {
 
 func (x *SplitRangeRequest) Reset() {
 	*x = SplitRangeRequest{}
-	mi := &file_distribution_proto_msgTypes[9]
+	mi := &file_distribution_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1110,7 +1250,7 @@ func (x *SplitRangeRequest) String() string {
 func (*SplitRangeRequest) ProtoMessage() {}
 
 func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[9]
+	mi := &file_distribution_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1123,7 +1263,7 @@ func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeRequest.ProtoReflect.Descriptor instead.
 func (*SplitRangeRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{9}
+	return file_distribution_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SplitRangeRequest) GetExpectedCatalogVersion() uint64 {
@@ -1158,7 +1298,7 @@ type SplitRangeResponse struct {
 
 func (x *SplitRangeResponse) Reset() {
 	*x = SplitRangeResponse{}
-	mi := &file_distribution_proto_msgTypes[10]
+	mi := &file_distribution_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1170,7 +1310,7 @@ func (x *SplitRangeResponse) String() string {
 func (*SplitRangeResponse) ProtoMessage() {}
 
 func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[10]
+	mi := &file_distribution_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1183,7 +1323,7 @@ func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeResponse.ProtoReflect.Descriptor instead.
 func (*SplitRangeResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{10}
+	return file_distribution_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *SplitRangeResponse) GetCatalogVersion() uint64 {
@@ -1217,17 +1357,27 @@ const file_distribution_proto_rawDesc = "" +
 	"\x10GetRouteResponse\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x02 \x01(\fR\x03end\x12\"\n" +
-	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"{\n" +
+	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\xa5\x01\n" +
 	"\x13GetTimestampRequest\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\rR\x05count\x12#\n" +
 	"\rmin_timestamp\x18\x02 \x01(\x04R\fminTimestamp\x12)\n" +
-	"\x10activate_cutover\x18\x03 \x01(\bR\x0factivateCutover\"\xea\x01\n" +
+	"\x10activate_cutover\x18\x03 \x01(\bR\x0factivateCutover\x12(\n" +
+	"\x10activate_phase_d\x18\x04 \x01(\bR\x0eactivatePhaseD\"\xb4\x02\n" +
 	"\x14GetTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12;\n" +
 	"\x1acommitted_by_dedicated_tso\x18\x02 \x01(\bR\x17committedByDedicatedTso\x12\x14\n" +
 	"\x05count\x18\x03 \x01(\rR\x05count\x12:\n" +
 	"\x19previous_allocation_floor\x18\x04 \x01(\x04R\x17previousAllocationFloor\x12%\n" +
-	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\"\xe5\x01\n" +
+	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\x12$\n" +
+	"\x0ephase_d_active\x18\x06 \x01(\bR\fphaseDActive\x12\"\n" +
+	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\"8\n" +
+	"\x18ValidateTimestampRequest\x12\x1c\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xa6\x01\n" +
+	"\x19ValidateTimestampResponse\x12\x14\n" +
+	"\x05valid\x18\x01 \x01(\bR\x05valid\x12$\n" +
+	"\x0ephase_d_active\x18\x02 \x01(\bR\fphaseDActive\x12\"\n" +
+	"\rphase_d_floor\x18\x03 \x01(\x04R\vphaseDFloor\x12)\n" +
+	"\x10allocation_floor\x18\x04 \x01(\x04R\x0fallocationFloor\"\xe5\x01\n" +
 	"\x0fRouteDescriptor\x12\x19\n" +
 	"\broute_id\x18\x01 \x01(\x04R\arouteId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +
@@ -1326,10 +1476,11 @@ const file_distribution_proto_rawDesc = "" +
 	"\x13SplitJobExportPhase\x12\x1f\n" +
 	"\x1bSPLIT_JOB_EXPORT_PHASE_NONE\x10\x00\x12#\n" +
 	"\x1fSPLIT_JOB_EXPORT_PHASE_BACKFILL\x10\x01\x12%\n" +
-	"!SPLIT_JOB_EXPORT_PHASE_DELTA_COPY\x10\x022\xf2\x01\n" +
+	"!SPLIT_JOB_EXPORT_PHASE_DELTA_COPY\x10\x022\xc0\x02\n" +
 	"\fDistribution\x121\n" +
 	"\bGetRoute\x12\x10.GetRouteRequest\x1a\x11.GetRouteResponse\"\x00\x12=\n" +
-	"\fGetTimestamp\x12\x14.GetTimestampRequest\x1a\x15.GetTimestampResponse\"\x00\x127\n" +
+	"\fGetTimestamp\x12\x14.GetTimestampRequest\x1a\x15.GetTimestampResponse\"\x00\x12L\n" +
+	"\x11ValidateTimestamp\x12\x19.ValidateTimestampRequest\x1a\x1a.ValidateTimestampResponse\"\x00\x127\n" +
 	"\n" +
 	"ListRoutes\x12\x12.ListRoutesRequest\x1a\x13.ListRoutesResponse\"\x00\x127\n" +
 	"\n" +
@@ -1348,23 +1499,25 @@ func file_distribution_proto_rawDescGZIP() []byte {
 }
 
 var file_distribution_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_distribution_proto_goTypes = []any{
-	(RouteState)(0),                 // 0: RouteState
-	(SplitJobPhase)(0),              // 1: SplitJobPhase
-	(SplitJobBarrierState)(0),       // 2: SplitJobBarrierState
-	(SplitJobExportPhase)(0),        // 3: SplitJobExportPhase
-	(*GetRouteRequest)(nil),         // 4: GetRouteRequest
-	(*GetRouteResponse)(nil),        // 5: GetRouteResponse
-	(*GetTimestampRequest)(nil),     // 6: GetTimestampRequest
-	(*GetTimestampResponse)(nil),    // 7: GetTimestampResponse
-	(*RouteDescriptor)(nil),         // 8: RouteDescriptor
-	(*SplitJobBracketProgress)(nil), // 9: SplitJobBracketProgress
-	(*SplitJob)(nil),                // 10: SplitJob
-	(*ListRoutesRequest)(nil),       // 11: ListRoutesRequest
-	(*ListRoutesResponse)(nil),      // 12: ListRoutesResponse
-	(*SplitRangeRequest)(nil),       // 13: SplitRangeRequest
-	(*SplitRangeResponse)(nil),      // 14: SplitRangeResponse
+	(RouteState)(0),                   // 0: RouteState
+	(SplitJobPhase)(0),                // 1: SplitJobPhase
+	(SplitJobBarrierState)(0),         // 2: SplitJobBarrierState
+	(SplitJobExportPhase)(0),          // 3: SplitJobExportPhase
+	(*GetRouteRequest)(nil),           // 4: GetRouteRequest
+	(*GetRouteResponse)(nil),          // 5: GetRouteResponse
+	(*GetTimestampRequest)(nil),       // 6: GetTimestampRequest
+	(*GetTimestampResponse)(nil),      // 7: GetTimestampResponse
+	(*ValidateTimestampRequest)(nil),  // 8: ValidateTimestampRequest
+	(*ValidateTimestampResponse)(nil), // 9: ValidateTimestampResponse
+	(*RouteDescriptor)(nil),           // 10: RouteDescriptor
+	(*SplitJobBracketProgress)(nil),   // 11: SplitJobBracketProgress
+	(*SplitJob)(nil),                  // 12: SplitJob
+	(*ListRoutesRequest)(nil),         // 13: ListRoutesRequest
+	(*ListRoutesResponse)(nil),        // 14: ListRoutesResponse
+	(*SplitRangeRequest)(nil),         // 15: SplitRangeRequest
+	(*SplitRangeResponse)(nil),        // 16: SplitRangeResponse
 }
 var file_distribution_proto_depIdxs = []int32{
 	0,  // 0: RouteDescriptor.state:type_name -> RouteState
@@ -1374,20 +1527,22 @@ var file_distribution_proto_depIdxs = []int32{
 	1,  // 4: SplitJob.abandon_from_phase:type_name -> SplitJobPhase
 	2,  // 5: SplitJob.cutover_read_fence_state:type_name -> SplitJobBarrierState
 	2,  // 6: SplitJob.target_staged_readiness_state:type_name -> SplitJobBarrierState
-	9,  // 7: SplitJob.bracket_progress:type_name -> SplitJobBracketProgress
-	8,  // 8: ListRoutesResponse.routes:type_name -> RouteDescriptor
-	8,  // 9: SplitRangeResponse.left:type_name -> RouteDescriptor
-	8,  // 10: SplitRangeResponse.right:type_name -> RouteDescriptor
+	11, // 7: SplitJob.bracket_progress:type_name -> SplitJobBracketProgress
+	10, // 8: ListRoutesResponse.routes:type_name -> RouteDescriptor
+	10, // 9: SplitRangeResponse.left:type_name -> RouteDescriptor
+	10, // 10: SplitRangeResponse.right:type_name -> RouteDescriptor
 	4,  // 11: Distribution.GetRoute:input_type -> GetRouteRequest
 	6,  // 12: Distribution.GetTimestamp:input_type -> GetTimestampRequest
-	11, // 13: Distribution.ListRoutes:input_type -> ListRoutesRequest
-	13, // 14: Distribution.SplitRange:input_type -> SplitRangeRequest
-	5,  // 15: Distribution.GetRoute:output_type -> GetRouteResponse
-	7,  // 16: Distribution.GetTimestamp:output_type -> GetTimestampResponse
-	12, // 17: Distribution.ListRoutes:output_type -> ListRoutesResponse
-	14, // 18: Distribution.SplitRange:output_type -> SplitRangeResponse
-	15, // [15:19] is the sub-list for method output_type
-	11, // [11:15] is the sub-list for method input_type
+	8,  // 13: Distribution.ValidateTimestamp:input_type -> ValidateTimestampRequest
+	13, // 14: Distribution.ListRoutes:input_type -> ListRoutesRequest
+	15, // 15: Distribution.SplitRange:input_type -> SplitRangeRequest
+	5,  // 16: Distribution.GetRoute:output_type -> GetRouteResponse
+	7,  // 17: Distribution.GetTimestamp:output_type -> GetTimestampResponse
+	9,  // 18: Distribution.ValidateTimestamp:output_type -> ValidateTimestampResponse
+	14, // 19: Distribution.ListRoutes:output_type -> ListRoutesResponse
+	16, // 20: Distribution.SplitRange:output_type -> SplitRangeResponse
+	16, // [16:21] is the sub-list for method output_type
+	11, // [11:16] is the sub-list for method input_type
 	11, // [11:11] is the sub-list for extension type_name
 	11, // [11:11] is the sub-list for extension extendee
 	0,  // [0:11] is the sub-list for field type_name
@@ -1404,7 +1559,7 @@ func file_distribution_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_distribution_proto_rawDesc), len(file_distribution_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   11,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

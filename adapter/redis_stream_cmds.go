@@ -247,7 +247,10 @@ func (r *RedisServer) prepareXAdd(
 	key []byte,
 	req xaddRequest,
 ) (string, uint64, []*kv.Elem[kv.OP], error) {
-	readTS := r.readTS()
+	readTS, err := r.xaddReadTimestamp(ctx, key)
+	if err != nil {
+		return "", 0, nil, err
+	}
 	typ, err := r.streamTypeForXAdd(ctx, key, readTS)
 	if err != nil {
 		return "", 0, nil, err
@@ -470,6 +473,21 @@ func (r *RedisServer) streamCleanupForExpiredRecreate(
 	}
 	cleanup = append(cleanup, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	return cleanup, store.StreamMeta{}, false, nil
+}
+
+func (r *RedisServer) xaddReadTimestamp(ctx context.Context, key []byte) (uint64, error) {
+	readTS, err := r.beginTxnStartTS(ctx, "redis xadd: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+	if err != nil {
+		return 0, err
+	}
+	if typ != redisTypeNone && typ != redisTypeStream {
+		return 0, wrongTypeError()
+	}
+	return readTS, nil
 }
 
 // dispatchAndSignalStream dispatches the elems through the coordinator
@@ -811,7 +829,10 @@ func (r *RedisServer) flushLegacyCleanupOnTrimNoOp(
 }
 
 func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis xtrim: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	proceed, err := r.streamTypeForWrite(ctx, key, readTS)
 	if err != nil || !proceed {
 		return 0, err

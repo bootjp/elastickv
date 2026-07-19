@@ -155,7 +155,11 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write legacy: begin read timestamp")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		plan, err := prepare(readTS)
 		if err != nil {
 			return nil, err
@@ -266,7 +270,11 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	tableName string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	readTS := d.nextTxnReadTS()
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write: begin read timestamp")
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	plan, err := prepare(readTS)
 	if err != nil {
 		return nil, nil, err
