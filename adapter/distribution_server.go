@@ -448,6 +448,12 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, errDistributionRouteIDOverflow.Error())
 	}
 	nextRouteID := right.RouteID + 1
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, s.coordinator, readTS, "split range: allocate commitTS")
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "allocate split commit timestamp: %v", err)
+	}
+	left.SplitAtHLC = commitTS
+	right.SplitAtHLC = commitTS
 
 	ops, err := buildCatalogSplitOps(parentID, left, right, nextVersion, nextRouteID)
 	if err != nil {
@@ -472,9 +478,10 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	}
 	ops = append(ops, deltaOps...)
 	resp, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems:   ops,
-		IsTxn:   true,
-		StartTS: readTS,
+		Elems:    ops,
+		IsTxn:    true,
+		StartTS:  readTS,
+		CommitTS: commitTS,
 	})
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
