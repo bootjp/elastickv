@@ -117,7 +117,7 @@ func (p *LeaderProxy) forwardWithRetry(callerCtx context.Context, reqs []*pb.Req
 		// whatever leader is currently visible and returns either a
 		// committed response, a terminal error, or the last transient
 		// leader error for the outer loop to re-poll on.
-		resp, err, done := p.runForwardCycle(parentCtx, reqs, deadline, requestID)
+		resp, err, done := p.runForwardCycle(callerCtx, parentCtx, reqs, deadline, requestID)
 		if done {
 			return resp, err
 		}
@@ -138,6 +138,9 @@ func (p *LeaderProxy) forwardWithRetry(callerCtx context.Context, reqs []*pb.Req
 			return nil, lastErr
 		}
 		waitLeaderProxyBackoff(parentCtx, leaderProxyRetryInterval, deadline)
+		if err := callerCtx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
 		// Re-check the deadline AFTER the back-off: if the budget is
 		// exhausted, do not enter another maxForwardRetries cycle
 		// (which could issue up to three more RPCs, each bounded by
@@ -178,24 +181,26 @@ func waitLeaderProxyBackoff(parentCtx context.Context, interval time.Duration, d
 //   - (nil, nil, false) when the inner loop exited on the deadline
 //     guard before calling forward() at all; caller surfaces
 //     ErrLeaderNotFound for that defensive path.
-func (p *LeaderProxy) runForwardCycle(parentCtx context.Context, reqs []*pb.Request, deadline time.Time, requestID uint64) (*TransactionResponse, error, bool) {
+func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx context.Context, reqs []*pb.Request, deadline time.Time, requestID uint64) (*TransactionResponse, error, bool) {
 	var lastErr error
 	for attempt := 0; attempt < maxForwardRetries; attempt++ {
+		if err := callerCtx.Err(); err != nil {
+			return nil, errors.WithStack(err), true
+		}
 		if !time.Now().Before(deadline) {
 			// Budget expired mid-cycle; do not start another RPC.
 			break
 		}
-		resp, err := p.forward(parentCtx, reqs, requestID)
+		resp, err := p.forward(callerCtx, parentCtx, reqs, requestID)
 		if err == nil {
 			return resp, nil, true
 		}
 		lastErr = err
-		if errors.Is(err, ErrLeaderProxyCircuitOpen) {
-			identity := leaderProxyIdentityFromEngine(p.engine)
-			return nil, err, !p.forwardBreaker.mayRetryAfterOpen(identity, requestID)
+		if callerErr := callerCtx.Err(); callerErr != nil {
+			return nil, errors.WithStack(callerErr), true
 		}
-		if isTransientLeaderError(err) {
-			break
+		if leaveCycle, done := p.forwardFailureDecision(err, requestID); leaveCycle {
+			return nil, err, done
 		}
 	}
 	if lastErr != nil && !isTransientLeaderError(lastErr) {
@@ -204,22 +209,40 @@ func (p *LeaderProxy) runForwardCycle(parentCtx context.Context, reqs []*pb.Requ
 	return nil, lastErr, false
 }
 
-func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request, requestID uint64) (*TransactionResponse, error) {
+func (p *LeaderProxy) forwardFailureDecision(err error, requestID uint64) (leaveCycle bool, done bool) {
+	if errors.Is(err, ErrLeaderProxyCircuitOpen) {
+		identity := leaderProxyIdentityFromEngine(p.engine)
+		return true, !p.forwardBreaker.mayRetryAfterOpen(identity, requestID)
+	}
+	if isTransientLeaderError(err) {
+		return true, false
+	}
+	if !isLeaderProxyBreakerFailure(err) {
+		return false, false
+	}
+	identity := leaderProxyIdentityFromEngine(p.engine)
+	if p.forwardBreaker.mayRetryAfterOpen(identity, requestID) {
+		return true, false
+	}
+	return false, false
+}
+
+func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Context, reqs []*pb.Request, requestID uint64) (*TransactionResponse, error) {
+	if err := callerCtx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	identity := leaderProxyIdentityFromEngine(p.engine)
 	if err := p.forwardBreaker.allow(identity, requestID, time.Now()); err != nil {
 		return nil, err
 	}
 	addr := identity.address
 	if addr == "" {
-		err := errors.WithStack(ErrLeaderNotFound)
-		p.forwardBreaker.record(identity, requestID, err, time.Now())
-		return nil, err
+		return nil, p.recordForwardFailure(callerCtx, identity, requestID, ErrLeaderNotFound)
 	}
 
 	conn, err := p.connCache.ConnFor(addr)
 	if err != nil {
-		p.forwardBreaker.record(identity, requestID, err, time.Now())
-		return nil, err
+		return nil, p.recordForwardFailure(callerCtx, identity, requestID, err)
 	}
 
 	cli := pb.NewInternalClient(conn)
@@ -234,19 +257,23 @@ func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request, req
 		Requests: reqs,
 	})
 	if err != nil {
-		wrapped := errors.WithStack(err)
-		if parentCtx.Err() != nil {
-			p.forwardBreaker.release(identity, requestID)
-			return nil, wrapped
-		}
-		p.forwardBreaker.record(identity, requestID, wrapped, time.Now())
-		return nil, wrapped
+		return nil, p.recordForwardFailure(callerCtx, identity, requestID, err)
 	}
 	p.forwardBreaker.record(identity, requestID, nil, time.Now())
 	if !resp.Success {
 		return nil, ErrInvalidRequest
 	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+}
+
+func (p *LeaderProxy) recordForwardFailure(callerCtx context.Context, identity leaderProxyIdentity, requestID uint64, err error) error {
+	if callerErr := callerCtx.Err(); callerErr != nil {
+		p.forwardBreaker.release(identity, requestID)
+		return errors.WithStack(callerErr)
+	}
+	wrapped := errors.WithStack(err)
+	p.forwardBreaker.record(identity, requestID, wrapped, time.Now())
+	return wrapped
 }
 
 var _ Transactional = (*LeaderProxy)(nil)

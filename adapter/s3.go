@@ -188,6 +188,10 @@ func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
 		return
 	}
+	if isS3ServiceUnavailable(err) {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", "", "")
+		return
+	}
 	writeS3InternalError(w, err)
 }
 
@@ -2520,11 +2524,15 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
 		return
 	}
-	if errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isS3ServiceUnavailable(err) {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)
+}
+
+func isS3ServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 var errUnsupportedCannedAcl = errors.New("unsupported canned ACL")

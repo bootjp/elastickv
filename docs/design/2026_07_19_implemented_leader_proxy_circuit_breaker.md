@@ -103,6 +103,10 @@ Unit coverage pins:
 - late in-flight failure handling;
 - exponential backoff cap;
 - transport and business-error classification; and
+- proxy-budget deadline accounting against a blackholed endpoint;
+- caller cancellation releasing a blackholed half-open probe;
+- recovery-owner half-open success after transport `Unavailable` failures;
+- S3 chunk-upload circuit-open mapping; and
 - the existing short-election and full-budget integration cases.
 
 The race suite covers concurrent breaker access and half-open probe admission.

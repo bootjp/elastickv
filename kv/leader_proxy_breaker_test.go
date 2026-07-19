@@ -23,9 +23,11 @@ func TestLeaderProxyCircuitBreakerOpensAndLimitsHalfOpenProbe(t *testing.T) {
 		require.NoError(t, breaker.allow(identity, 1, now))
 		breaker.record(identity, 1, ErrLeaderNotFound, now)
 	}
+	require.Equal(t, now.Add(leaderProxyBreakerBaseBackoff).UTC().Format(time.RFC3339Nano), breaker.openUntilText)
 
 	err := breaker.allow(identity, 1, now.Add(time.Millisecond))
 	require.ErrorIs(t, err, ErrLeaderProxyCircuitOpen)
+	require.ErrorContains(t, err, breaker.openUntilText)
 	require.True(t, breaker.owns(identity, 1))
 
 	err = breaker.allow(identity, 2, now.Add(time.Millisecond))
@@ -38,6 +40,7 @@ func TestLeaderProxyCircuitBreakerOpensAndLimitsHalfOpenProbe(t *testing.T) {
 	require.ErrorIs(t, breaker.allow(identity, 3, probeAt), ErrLeaderProxyCircuitOpen)
 
 	breaker.record(identity, 2, nil, probeAt)
+	require.Empty(t, breaker.openUntilText)
 	require.NoError(t, breaker.allow(identity, 3, probeAt))
 }
 
@@ -56,6 +59,7 @@ func TestLeaderProxyCircuitBreakerResetsOnLeaderIdentityChange(t *testing.T) {
 	require.ErrorIs(t, breaker.allow(oldLeader, 2, now), ErrLeaderProxyCircuitOpen)
 	require.True(t, breaker.mayRetryAfterOpen(newLeader, 2))
 	require.NoError(t, breaker.allow(newLeader, 2, now))
+	require.Empty(t, breaker.openUntilText)
 	require.False(t, breaker.owns(oldLeader, 1))
 }
 

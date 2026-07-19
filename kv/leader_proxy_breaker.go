@@ -47,6 +47,7 @@ type leaderProxyCircuitBreaker struct {
 	initialized   bool
 	failures      int
 	openUntil     time.Time
+	openUntilText string
 	probeInFlight bool
 	owner         uint64
 }
@@ -57,13 +58,13 @@ func (b *leaderProxyCircuitBreaker) allow(identity leaderProxyIdentity, requestI
 
 	b.resetForIdentityLocked(identity)
 	if now.Before(b.openUntil) {
-		return leaderProxyCircuitOpenError(identity, b.openUntil)
+		return leaderProxyCircuitOpenError(identity, b.openUntilText)
 	}
 	if b.openUntil.IsZero() {
 		return nil
 	}
 	if b.probeInFlight {
-		return leaderProxyCircuitOpenError(identity, b.openUntil)
+		return leaderProxyCircuitOpenError(identity, b.openUntilText)
 	}
 	b.probeInFlight = true
 	b.owner = requestID
@@ -83,6 +84,7 @@ func (b *leaderProxyCircuitBreaker) record(identity leaderProxyIdentity, request
 	if !isLeaderProxyBreakerFailure(err) {
 		b.failures = 0
 		b.openUntil = time.Time{}
+		b.openUntilText = ""
 		b.probeInFlight = false
 		b.owner = 0
 		return
@@ -96,6 +98,7 @@ func (b *leaderProxyCircuitBreaker) record(identity leaderProxyIdentity, request
 		return
 	}
 	b.openUntil = now.Add(leaderProxyBreakerBackoff(b.failures))
+	b.openUntilText = b.openUntil.UTC().Format(time.RFC3339Nano)
 	b.owner = requestID
 }
 
@@ -131,6 +134,7 @@ func (b *leaderProxyCircuitBreaker) reset(identity leaderProxyIdentity) {
 	b.initialized = true
 	b.failures = 0
 	b.openUntil = time.Time{}
+	b.openUntilText = ""
 	b.probeInFlight = false
 	b.owner = 0
 }
@@ -143,14 +147,15 @@ func (b *leaderProxyCircuitBreaker) resetForIdentityLocked(identity leaderProxyI
 	b.initialized = true
 	b.failures = 0
 	b.openUntil = time.Time{}
+	b.openUntilText = ""
 	b.probeInFlight = false
 	b.owner = 0
 }
 
-func leaderProxyCircuitOpenError(identity leaderProxyIdentity, until time.Time) error {
+func leaderProxyCircuitOpenError(identity leaderProxyIdentity, untilText string) error {
 	return errors.Wrapf(ErrLeaderProxyCircuitOpen,
 		"leader id=%q address=%q term=%d unavailable until %s",
-		identity.id, identity.address, identity.term, until.UTC().Format(time.RFC3339Nano))
+		identity.id, identity.address, identity.term, untilText)
 }
 
 func leaderProxyBreakerBackoff(failures int) time.Duration {

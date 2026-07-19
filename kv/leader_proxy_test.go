@@ -13,6 +13,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeInternal struct {
@@ -22,6 +24,8 @@ type fakeInternal struct {
 	calls   int
 	lastReq *pb.ForwardRequest
 	resp    *pb.ForwardResponse
+	err     error
+	failFor int
 }
 
 func (f *fakeInternal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
@@ -29,10 +33,44 @@ func (f *fakeInternal) Forward(_ context.Context, req *pb.ForwardRequest) (*pb.F
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastReq = req
+	if f.err != nil && (f.failFor == 0 || f.calls <= f.failFor) {
+		return nil, f.err
+	}
 	if f.resp != nil {
 		return f.resp, nil
 	}
 	return &pb.ForwardResponse{Success: true, CommitIndex: 0}, nil
+}
+
+func (f *fakeInternal) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func startLeaderProxyBlackhole(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			conn, acceptErr := lis.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				<-stop
+				_ = conn.Close()
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		_ = lis.Close()
+	})
+	return lis.Addr().String()
 }
 
 // stubFollowerEngine is a minimal raftengine.Engine stub that reports the
@@ -305,7 +343,7 @@ func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 	t.Parallel()
 
-	eng := &stubFollowerEngine{leaderAddr: "127.0.0.1:1"}
+	eng := &stubFollowerEngine{leaderAddr: startLeaderProxyBlackhole(t)}
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
@@ -316,11 +354,83 @@ func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 		p.forwardBreaker.record(identity, 1, ErrLeaderNotFound, openedAt)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := p.forward(ctx, []*pb.Request{{IsTxn: false}}, 2)
-	require.ErrorContains(t, err, context.Canceled.Error())
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	proxyCtx, cancelProxy := context.WithTimeout(callerCtx, time.Second)
+	time.AfterFunc(50*time.Millisecond, cancelCaller)
+	_, err := p.forward(callerCtx, proxyCtx, []*pb.Request{{IsTxn: false}}, 2)
+	cancelProxy()
+	require.ErrorIs(t, err, context.Canceled)
 
 	require.NoError(t, p.forwardBreaker.allow(identity, 3, time.Now()))
 	require.True(t, p.forwardBreaker.owns(identity, 3))
+}
+
+func TestLeaderProxy_ProxyBudgetDeadlineCountsTowardBreaker(t *testing.T) {
+	t.Parallel()
+
+	eng := &stubFollowerEngine{leaderAddr: startLeaderProxyBlackhole(t)}
+	p := NewLeaderProxyWithEngine(eng)
+	t.Cleanup(func() { _ = p.connCache.Close() })
+	identity := leaderProxyIdentityFromEngine(eng)
+	reqs := []*pb.Request{{IsTxn: false}}
+
+	for range leaderProxyBreakerFailureThreshold {
+		proxyCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, forwardErr := p.forward(context.Background(), proxyCtx, reqs, 1)
+		cancel()
+		require.Equal(t, codes.DeadlineExceeded, status.Code(forwardErr))
+	}
+
+	require.ErrorIs(t, p.forwardBreaker.allow(identity, 2, time.Now()), ErrLeaderProxyCircuitOpen)
+}
+
+func TestLeaderProxy_CanceledRecoveryOwnerStopsRetrying(t *testing.T) {
+	t.Parallel()
+
+	eng := &stubFollowerEngine{leaderAddr: "127.0.0.1:1"}
+	p := NewLeaderProxyWithEngine(eng)
+	t.Cleanup(func() { _ = p.connCache.Close() })
+	identity := leaderProxyIdentityFromEngine(eng)
+	const requestID = uint64(7)
+	openedAt := time.Now()
+	for range leaderProxyBreakerFailureThreshold {
+		require.NoError(t, p.forwardBreaker.allow(identity, requestID, openedAt))
+		p.forwardBreaker.record(identity, requestID, ErrLeaderNotFound, openedAt)
+	}
+	p.forwardSeq.Store(requestID - 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := p.forwardWithRetry(ctx, []*pb.Request{{IsTxn: false}})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestLeaderProxy_TransportFailureOwnerPerformsHalfOpenProbe(t *testing.T) {
+	t.Parallel()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	svc := &fakeInternal{
+		resp:    &pb.ForwardResponse{Success: true, CommitIndex: 77},
+		err:     status.Error(codes.Unavailable, "startup gate closed"),
+		failFor: leaderProxyBreakerFailureThreshold,
+	}
+	srv := grpc.NewServer()
+	pb.RegisterInternalServer(srv, svc)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() {
+		srv.Stop()
+		_ = lis.Close()
+	})
+
+	eng := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	p := NewLeaderProxyWithEngine(eng)
+	t.Cleanup(func() { _ = p.connCache.Close() })
+
+	resp, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: false}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(77), resp.CommitIndex)
+	require.Equal(t, leaderProxyBreakerFailureThreshold+1, svc.callCount())
 }

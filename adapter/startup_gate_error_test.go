@@ -81,6 +81,13 @@ func TestHTTPAdaptersMapLeaderProxyCircuitOpenTo503(t *testing.T) {
 			},
 			body: "<Code>ServiceUnavailable</Code>",
 		},
+		{
+			name: "s3 chunk upload",
+			call: func(w http.ResponseWriter) {
+				(&S3Server{}).writeS3ChunkUploadError(w, nil, kv.ErrLeaderProxyCircuitOpen, "bucket-a", "key-a")
+			},
+			body: "<Code>ServiceUnavailable</Code>",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
