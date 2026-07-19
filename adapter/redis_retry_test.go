@@ -370,21 +370,26 @@ func TestRetryRedisWriteRetriesWireTransactionErrors(t *testing.T) {
 func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 	t.Parallel()
 
-	tests := []error{
-		status.Error(codes.Unknown, "write conflict"),
-		status.Error(codes.Unknown, "key: user-visible failure"),
-		status.Error(codes.Internal, "key: k: write conflict"),
+	tests := []struct {
+		name    string
+		wireErr error
+	}{
+		{name: "plain unknown", wireErr: status.Error(codes.Unknown, "write conflict")},
+		{name: "unknown non-matching envelope", wireErr: status.Error(codes.Unknown, "key: user-visible failure")},
+		{name: "internal code with matching message", wireErr: status.Error(codes.Internal, "key: k: write conflict")},
 	}
-	for _, wireErr := range tests {
-		attempts := 0
-		srv := &RedisServer{}
-		err := srv.retryRedisWrite(context.Background(), func() error {
-			attempts++
-			return wireErr
-		})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			srv := &RedisServer{}
+			err := srv.retryRedisWrite(context.Background(), func() error {
+				attempts++
+				return tt.wireErr
+			})
 
-		require.ErrorIs(t, err, wireErr)
-		require.Equal(t, 1, attempts)
+			require.ErrorIs(t, err, tt.wireErr)
+			require.Equal(t, 1, attempts)
+		})
 	}
 }
 

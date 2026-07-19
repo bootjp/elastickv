@@ -106,6 +106,10 @@ func parseWireRedisTxnErr(err error) error {
 	}
 	keyText := content
 	detail := ""
+	// TxnLockedError's wire format does not escape the key/detail boundary.
+	// A foreign key containing " (" and ending in ")" is therefore ambiguous;
+	// splitting at the last delimiter preserves the server format, and any
+	// ambiguity affects only the reconstructed display fields, not retry typing.
 	if strings.HasSuffix(content, ")") {
 		if detailStart := strings.LastIndex(content, " ("); detailStart >= 0 {
 			keyText = content[:detailStart]
