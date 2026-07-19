@@ -1020,7 +1020,8 @@ Two-tier hierarchy:
 
 - **KEK (Key Encryption Key).** Held outside the cluster, never on
   the cluster's disks. Sources, in order of preference:
-  1. AWS KMS: `--kekUri=aws-kms://arn:aws:kms:...`. The KMS key never
+  1. AWS KMS: `--kekUri=aws-kms://arn:aws:kms:...:key/...` with an
+     immutable key ARN (mutable alias ARNs are rejected). The KMS key never
      leaves AWS; we call `Encrypt` / `Decrypt` to wrap/unwrap DEKs.
   2. GCP KMS: `--kekUri=gcp-kms://projects/.../keys/...`. Same shape.
   3. HashiCorp Vault Transit: `--kekUri=vault-transit://...`.
@@ -1032,7 +1033,10 @@ Two-tier hierarchy:
      inspection); supported only for tests and CI.
 
   No default. If `--encryption-enabled` is set without a KEK source,
-  the process refuses to start.
+  the process refuses to start. Before encryption mutators are exposed, every
+  configured provider must also complete a random 32-byte DEK wrap/unwrap
+  preflight; this catches credentials, reachability, permission, key-binding,
+  and malformed-response failures before a Raft entry can commit.
 
 - **DEK (Data Encryption Key).** 32-byte AES key. Two DEKs are
   issued in v1: `dek_storage` (used by §4.1) and `dek_raft`

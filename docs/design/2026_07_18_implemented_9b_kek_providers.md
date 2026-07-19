@@ -8,7 +8,8 @@ Date: 2026-07-18
 
 Stage 9B completes the §5.1 KEK source matrix:
 
-- `--kekUri=aws-kms://<key-arn>` uses AWS KMS `Encrypt` / `Decrypt`, derives
+- `--kekUri=aws-kms://<key-arn>` uses an immutable AWS KMS `key/` ARN with
+  `Encrypt` / `Decrypt`, derives
   the client region from the ARN, and binds every request to the fixed
   `elastickv-purpose=dek-wrap-v1` encryption context.
 - `--kekUri=gcp-kms://<crypto-key-resource>` uses Google Cloud KMS with fixed
@@ -16,7 +17,7 @@ Stage 9B completes the §5.1 KEK source matrix:
   wrapped DEK or plaintext DEK is accepted.
 - `--kekUri=vault-transit://<mount>/<key>` uses Vault Transit through standard
   `VAULT_*` client configuration. Binary DEKs are base64 encoded for the API;
-  only versioned `vault:v...` ciphertexts are accepted.
+  only `vault:v<positive-version>:<non-empty-payload>` ciphertexts are accepted.
 - `ELASTICKV_KEK_BASE64` supplies a 32-byte test/CI-only static KEK. The
   variable is unset immediately after the decode attempt, including malformed
   input. It is also unset when source ambiguity is rejected.
@@ -33,6 +34,13 @@ text. The same loaded-state boolean is threaded to the EncryptionAdmin mutator
 gate, so URI and environment providers can bootstrap/rotate while a failed or
 absent provider cannot expose mutating RPCs.
 
+Before that gate can open, startup performs a real random 32-byte DEK
+wrap/unwrap round trip and compares the result in constant time. This proves
+provider reachability, credentials, encrypt/decrypt permission, key binding,
+and response shape on a fresh data directory where no sidecar DEK exists to
+exercise the provider. A failed preflight refuses process start before Raft or
+the mutating RPC surface is available.
+
 Remote wrappers use a 30-second operation deadline and reject nil, empty,
 integrity-invalid, or non-32-byte provider responses before sidecar state can be
 updated. Provider clients are safe for concurrent use and are hidden behind
@@ -48,8 +56,9 @@ Verification includes:
 
 - fake-client unit tests for AWS encryption context, GCP AAD/CRC32C, and Vault
   binary request/response encoding;
-- malformed provider response, wrong DEK length, invalid URI, source conflict,
-  and environment-unset tests;
+- malformed provider response, strict Vault ciphertext, immutable AWS key ARN,
+  wrong DEK length, invalid URI, source conflict, environment-unset, and
+  startup wrap/unwrap preflight tests;
 - a production-wiring integration test that loads the environment KEK through
   the source selector, bootstraps both DEKs, enables the storage envelope,
   writes encrypted data, snapshots it, restores it into an encrypted Pebble

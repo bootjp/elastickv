@@ -32,7 +32,7 @@ type AWSKMSWrapper struct {
 func NewAWSKMSWrapper(ctx context.Context, keyARN string) (*AWSKMSWrapper, error) {
 	parsed, err := arn.Parse(keyARN)
 	if err != nil || parsed.Service != "kms" || parsed.Region == "" || parsed.AccountID == "" ||
-		(!strings.HasPrefix(parsed.Resource, "key/") && !strings.HasPrefix(parsed.Resource, "alias/")) {
+		!strings.HasPrefix(parsed.Resource, "key/") || strings.TrimPrefix(parsed.Resource, "key/") == "" {
 		return nil, errors.Wrapf(ErrInvalidKEKURI, "invalid AWS KMS key ARN %q", keyARN)
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(parsed.Region))

@@ -51,7 +51,9 @@ func TestNewURIWrapperRejectsInvalidTargetsWithoutNetwork(t *testing.T) {
 		"gcp-kms://projects/incomplete",
 		"vault-transit://transit",
 	} {
-		_, err := newURIWrapper(context.Background(), uri)
-		require.ErrorIsf(t, err, ErrInvalidKEKURI, "uri=%q", uri)
+		t.Run(uri, func(t *testing.T) {
+			_, err := newURIWrapper(context.Background(), uri)
+			require.ErrorIsf(t, err, ErrInvalidKEKURI, "uri=%q", uri)
+		})
 	}
 }

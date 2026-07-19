@@ -1620,7 +1620,20 @@ func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
 	}); err != nil {
 		return nil, errors.Wrap(err, "encryption startup guards refused process start")
 	}
+	if err := verifyKEKBeforeMutators(kekWrapper); err != nil {
+		return nil, err
+	}
 	return kekWrapper, nil
+}
+
+func verifyKEKBeforeMutators(wrapper kek.Wrapper) error {
+	if !*encryptionEnabled || *encryptionSidecarPath == "" || wrapper == nil {
+		return nil
+	}
+	if err := kek.VerifyWrapper(wrapper); err != nil {
+		return errors.Wrap(err, "encryption KEK preflight refused process start")
+	}
+	return nil
 }
 
 // loadKEKWrapperFromFlag constructs the configured KEK wrapper from the

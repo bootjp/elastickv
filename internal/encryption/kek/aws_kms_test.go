@@ -82,6 +82,15 @@ func TestAWSKMSWrapperRejectsProviderFailures(t *testing.T) {
 }
 
 func TestNewAWSKMSWrapperRejectsInvalidARNBeforeConfigLoad(t *testing.T) {
-	_, err := NewAWSKMSWrapper(context.Background(), "not-an-arn")
-	require.ErrorIs(t, err, ErrInvalidKEKURI)
+	for _, keyARN := range []string{
+		"not-an-arn",
+		"arn:aws:kms:us-east-1:123456789012:key/",
+		"arn:aws:kms:us-east-1:123456789012:alias/current",
+		"arn:aws:kms:us-east-1:123456789012:alias/",
+	} {
+		t.Run(keyARN, func(t *testing.T) {
+			_, err := NewAWSKMSWrapper(context.Background(), keyARN)
+			require.ErrorIs(t, err, ErrInvalidKEKURI)
+		})
+	}
 }

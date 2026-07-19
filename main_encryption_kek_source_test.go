@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -32,11 +33,39 @@ func TestEncryptionMutatorsEnabledUsesLoadedKEKState(t *testing.T) {
 	require.False(t, encryptionMutatorsEnabled(true))
 }
 
+type failingStartupKEK struct{}
+
+func (failingStartupKEK) Wrap([]byte) ([]byte, error) { return nil, errors.New("provider unavailable") }
+func (failingStartupKEK) Unwrap([]byte) ([]byte, error) {
+	return nil, errors.New("provider unavailable")
+}
+func (failingStartupKEK) Name() string { return "failing" }
+
+func TestVerifyKEKBeforeMutators(t *testing.T) {
+	previousEnabled := *encryptionEnabled
+	previousSidecar := *encryptionSidecarPath
+	t.Cleanup(func() {
+		*encryptionEnabled = previousEnabled
+		*encryptionSidecarPath = previousSidecar
+	})
+
+	*encryptionEnabled = true
+	*encryptionSidecarPath = "/data/encryption/keys.json"
+	require.ErrorIs(t, verifyKEKBeforeMutators(failingStartupKEK{}), kek.ErrKEKPreflightFailed)
+
+	*encryptionEnabled = false
+	require.NoError(t, verifyKEKBeforeMutators(failingStartupKEK{}))
+	*encryptionEnabled = true
+	*encryptionSidecarPath = ""
+	require.NoError(t, verifyKEKBeforeMutators(failingStartupKEK{}))
+}
+
 func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	staticKEK := bytes.Repeat([]byte{0x71}, encryption.KeySize)
 	t.Setenv(kek.EnvVar, base64.StdEncoding.EncodeToString(staticKEK))
 	wrapper, err := kek.NewWrapperFromSources(context.Background(), "", "")
 	require.NoError(t, err)
+	require.NoError(t, kek.VerifyWrapper(wrapper))
 
 	storageDEK := bytes.Repeat([]byte{0x72}, encryption.KeySize)
 	raftDEK := bytes.Repeat([]byte{0x73}, encryption.KeySize)

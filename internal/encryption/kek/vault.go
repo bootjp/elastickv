@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,7 +78,7 @@ func (w *VaultTransitWrapper) Wrap(dek []byte) ([]byte, error) {
 		return nil, errors.Wrap(err, "kek: Vault Transit encrypt")
 	}
 	ciphertext, ok := vaultString(secret, "ciphertext")
-	if !ok || !strings.HasPrefix(ciphertext, "vault:v") {
+	if !ok || !validVaultCiphertext(ciphertext) {
 		return nil, errors.WithStack(ErrInvalidProviderResponse)
 	}
 	return []byte(ciphertext), nil
@@ -89,7 +90,7 @@ func (w *VaultTransitWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 	if w == nil || w.logical == nil {
 		return nil, errors.Wrap(ErrInvalidProviderResponse, "kek: Vault client is nil")
 	}
-	if len(wrapped) == 0 || !strings.HasPrefix(string(wrapped), "vault:v") {
+	if !validVaultCiphertext(string(wrapped)) {
 		return nil, errors.Wrap(ErrInvalidProviderResponse, "kek: invalid Vault ciphertext")
 	}
 	ctx, cancel := requestContext(w.timeout)
@@ -113,6 +114,20 @@ func (w *VaultTransitWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 		return nil, errors.Wrap(err, "kek: Vault plaintext")
 	}
 	return plain, nil
+}
+
+func validVaultCiphertext(ciphertext string) bool {
+	const prefix = "vault:v"
+	if !strings.HasPrefix(ciphertext, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(ciphertext, prefix)
+	separator := strings.IndexByte(rest, ':')
+	if separator <= 0 || separator == len(rest)-1 {
+		return false
+	}
+	version, err := strconv.ParseUint(rest[:separator], 10, 64)
+	return err == nil && version > 0
 }
 
 func vaultString(secret *vaultapi.Secret, field string) (string, bool) {

@@ -11,16 +11,21 @@ import (
 )
 
 type fakeVaultLogical struct {
-	path string
-	data map[string]interface{}
-	dek  []byte
+	path       string
+	data       map[string]interface{}
+	dek        []byte
+	ciphertext string
 }
 
 func (f *fakeVaultLogical) WriteWithContext(_ context.Context, path string, data map[string]interface{}) (*api.Secret, error) {
 	f.path = path
 	f.data = data
 	if _, ok := data["plaintext"]; ok {
-		return &api.Secret{Data: map[string]interface{}{"ciphertext": "vault:v1:ciphertext"}}, nil
+		ciphertext := f.ciphertext
+		if ciphertext == "" {
+			ciphertext = "vault:v1:ciphertext"
+		}
+		return &api.Secret{Data: map[string]interface{}{"ciphertext": ciphertext}}, nil
 	}
 	return &api.Secret{Data: map[string]interface{}{"plaintext": base64.StdEncoding.EncodeToString(f.dek)}}, nil
 }
@@ -50,8 +55,10 @@ func TestParseVaultTarget(t *testing.T) {
 	require.Equal(t, "transit", mount)
 	require.Equal(t, "service/key", keyName)
 	for _, target := range []string{"", "transit", "transit//key", "../key", "transit/../key"} {
-		_, _, err := parseVaultTarget(target)
-		require.ErrorIsf(t, err, ErrInvalidKEKURI, "target=%q", target)
+		t.Run(target, func(t *testing.T) {
+			_, _, err := parseVaultTarget(target)
+			require.ErrorIsf(t, err, ErrInvalidKEKURI, "target=%q", target)
+		})
 	}
 }
 
@@ -62,4 +69,13 @@ func TestVaultTransitWrapperRejectsMalformedResponses(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidDEKLength)
 	_, err = wrapper.Unwrap([]byte("not-vault"))
 	require.ErrorIs(t, err, ErrInvalidProviderResponse)
+	for _, ciphertext := range []string{"vault:v", "vault:v1:", "vault:v0:data", "vault:vx:data"} {
+		t.Run(ciphertext, func(t *testing.T) {
+			invalid := newVaultTransitWrapper(&fakeVaultLogical{dek: bytes.Repeat([]byte{1}, fileKEKSize), ciphertext: ciphertext}, "transit", "key")
+			_, wrapErr := invalid.Wrap(bytes.Repeat([]byte{2}, fileKEKSize))
+			require.ErrorIs(t, wrapErr, ErrInvalidProviderResponse)
+			_, unwrapErr := invalid.Unwrap([]byte(ciphertext))
+			require.ErrorIs(t, unwrapErr, ErrInvalidProviderResponse)
+		})
+	}
 }
