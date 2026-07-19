@@ -1917,6 +1917,23 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
 
+func TestShardStoreScanKeysRouteAtLeaderRefillsAfterStagedControlKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	g := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{1: g})
+	t.Cleanup(func() { _ = st.Close() })
+
+	stagedKey := distribution.MigrationStagedDataKey(9, []byte("shadow"))
+	require.NoError(t, g.Store.PutAt(ctx, stagedKey, []byte("internal"), 1, 0))
+	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
+
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a")}, keys)
+}
+
 func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
 	t.Parallel()
 
@@ -2007,6 +2024,46 @@ func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
 	require.Equal(t, 1, fake.scanCalls)
 	require.Equal(t, uint64(42), fake.lastScanGroupID)
 	require.True(t, fake.lastScanKeysOnly)
+}
+
+func TestShardStoreProxyScanKeysAtCarriesStagedRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		scanResp: &pb.RawScanAtResponse{
+			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	ctx := context.Background()
+	g := &ShardGroup{
+		Engine: &followerProxyEngine{leader: addr},
+		Store:  store.NewMVCCStore(),
+	}
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{42: g})
+	t.Cleanup(func() { _ = st.Close() })
+	route := distribution.Route{
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                42,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+	}
+
+	keys, err := st.scanKeyRouteAtWithReadFence(ctx, route, []byte("a"), []byte("m"), 10, ^uint64(0), false, 7)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("k")}, keys)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(42), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(7), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
+	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	require.True(t, fake.lastScanReq.GetKeysOnly())
 }
 
 func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {

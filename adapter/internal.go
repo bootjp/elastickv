@@ -728,10 +728,14 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		}
 	}
 
-	if err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS); err != nil {
-		return err
+	commitTS, err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err != nil {
+		return 0, err
 	}
-	return i.rejectWriteTimestampFloorTxnRequests(reqs)
+	if err := i.rejectWriteTimestampFloorTxnRequests(reqs); err != nil {
+		return 0, err
+	}
+	return commitTS, nil
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {

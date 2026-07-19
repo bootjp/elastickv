@@ -388,7 +388,7 @@ func TestStampTxnTimestampsRejectsRouteWriteFloor(t *testing.T) {
 		},
 	}}
 
-	err := i.stampTxnTimestamps(context.Background(), reqs)
+	_, err := i.stampTxnTimestamps(context.Background(), reqs)
 	require.ErrorIs(t, err, kv.ErrRouteWriteTimestampTooLow)
 }
 
@@ -427,5 +427,6 @@ func TestStampTxnTimestampsIgnoresMetadataForRouteWriteFloor(t *testing.T) {
 		},
 	}}
 
-	require.NoError(t, i.stampTxnTimestamps(context.Background(), reqs))
+	_, err := i.stampTxnTimestamps(context.Background(), reqs)
+	require.NoError(t, err)
 }

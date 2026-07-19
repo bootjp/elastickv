@@ -618,7 +618,10 @@ func (s *ShardStore) ReverseScanGroupAt(ctx context.Context, groupID uint64, sta
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true)
+	return s.scanRouteAtDirectionWithReadFence(
+		ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true,
+		0, nil, nil,
+	)
 }
 
 // ScanGroupKeysAt scans keys on the explicitly selected Raft group without
@@ -1040,14 +1043,32 @@ func normalizedRouteScanEnd(routeEnd []byte) []byte {
 	return routeEnd
 }
 
-func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
-	out := make([]*store.KVPair, 0)
+type scanRouteOwnerFilterPlan struct {
+	routes             []distribution.Route
+	routeFilterPresent bool
+	filterUsageOwners  bool
+	dedupeByKey        bool
+}
+
+func prepareScanRouteOwnerFilters(routes []distribution.Route, start []byte, end []byte, clampToRoutes bool, routeStart []byte, routeEnd []byte) scanRouteOwnerFilterPlan {
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	filterUsageOwners := !clampToRoutes && !routeFilterPresent && filesystemUsageScanOverlap(start, end)
 	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
 	if !clampToRoutes && !routeFilterPresent {
 		routes, dedupeByKey = prepareUnclampedRawScanRoutes(routes, dedupeByKey)
 	}
+	return scanRouteOwnerFilterPlan{
+		routes:             routes,
+		routeFilterPresent: routeFilterPresent,
+		filterUsageOwners:  filterUsageOwners,
+		dedupeByKey:        dedupeByKey,
+	}
+}
+
+func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0)
+	plan := prepareScanRouteOwnerFilters(routes, start, end, clampToRoutes, routeStart, routeEnd)
+	routes = plan.routes
 	for _, route := range routes {
 		scanStart := start
 		scanEnd := end
@@ -1058,12 +1079,12 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 
 		kvs, err := s.scanRouteAtWithMigrationOwnerFilters(
 			ctx, routes, route, scanStart, scanEnd, limit, ts, false, !clampToRoutes,
-			readRouteVersion, routeStart, routeEnd, filterUsageOwners, dedupeByKey,
+			readRouteVersion, routeStart, routeEnd, plan.filterUsageOwners, plan.dedupeByKey,
 		)
 		if err != nil {
 			return nil, err
 		}
-		if isBroadLegacyListDeltaScan(start) && !routeFilterPresent {
+		if isBroadLegacyListDeltaScan(start) && !plan.routeFilterPresent {
 			kvs = markScanRouteGroup(kvs, route.GroupID, true)
 		}
 		if clampToRoutes {
@@ -1074,7 +1095,7 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 			}
 			continue
 		}
-		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, false, dedupeByKey)
+		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, false, plan.dedupeByKey)
 	}
 	return out, nil
 }
@@ -1318,7 +1339,7 @@ func (s *ShardStore) scanRouteAtWithFilesystemUsageOwnerFilter(
 		if reverse {
 			out = mergeAndTrimReverseScanResults(out, page, limit)
 		} else {
-			out = mergeAndTrimScanResults(out, page, limit)
+			out = mergeAndTrimScanResultsWithOptions(out, page, limit, false, false)
 		}
 		if len(out) >= limit || pageLen < limit || advanceKey == nil {
 			break
@@ -1386,12 +1407,8 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 	routeEnd []byte,
 ) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0)
-	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
-	filterUsageOwners := !clampToRoutes && !routeFilterPresent && filesystemUsageScanOverlap(start, end)
-	dedupeByKey := s3BucketAuxiliaryScanBounds(start, end)
-	if !clampToRoutes && !routeFilterPresent {
-		routes, dedupeByKey = prepareUnclampedRawScanRoutes(routes, dedupeByKey)
-	}
+	plan := prepareScanRouteOwnerFilters(routes, start, end, clampToRoutes, routeStart, routeEnd)
+	routes = plan.routes
 	for i := 0; i < len(routes); i++ {
 		route := routes[i]
 		if clampToRoutes {
@@ -1413,15 +1430,15 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 		// result honours the ReverseScanAt contract.
 		kvs, err := s.scanRouteAtWithMigrationOwnerFilters(
 			ctx, routes, route, start, end, limit, ts, true, true,
-			readRouteVersion, routeStart, routeEnd, filterUsageOwners, dedupeByKey,
+			readRouteVersion, routeStart, routeEnd, plan.filterUsageOwners, plan.dedupeByKey,
 		)
 		if err != nil {
 			return nil, err
 		}
-		if isBroadLegacyListDeltaScan(start) && !routeFilterPresent {
+		if isBroadLegacyListDeltaScan(start) && !plan.routeFilterPresent {
 			kvs = markScanRouteGroup(kvs, route.GroupID, true)
 		}
-		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, true, dedupeByKey)
+		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, true, plan.dedupeByKey)
 	}
 	return out, nil
 }
@@ -1466,8 +1483,17 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 		return s.scanKeysRouteAtLeader(ctx, g, route, start, end, limit, ts)
 	}
 
-	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, nil, nil)
-	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts, groupID, readRouteVersion)
+	routeBoundsPresent := routeHasStagedVisibility(route)
+	var routeStart, routeEnd []byte
+	if routeBoundsPresent {
+		routeStart = route.Start
+		routeEnd = route.End
+	}
+	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
+	return s.proxyScanKeysAt(
+		ctx, g, start, end, limit, ts, groupID, readRouteVersion,
+		routeStart, routeEnd, routeBoundsPresent,
+	)
 }
 
 func (s *ShardStore) scanKeysRouteLocal(
@@ -1532,7 +1558,7 @@ func (s *ShardStore) scanKeysRouteAtLeader(
 		if err != nil {
 			return nil, err
 		}
-		out = mergeAndTrimScanKeys(out, filterTxnInternalKeys(keysFromKVs(kvs)), limit)
+		out = mergeAndTrimScanKeys(out, filterScanInternalKeys(keysFromKVs(kvs)), limit)
 
 		nextCursor, ok := nextKeyScanCursor(keys, end, limit)
 		if !ok {
@@ -1563,7 +1589,7 @@ func (s *ShardStore) scanLockOnlyKeysAtLeader(
 	if err != nil {
 		return nil, err
 	}
-	return filterTxnInternalKeys(keysFromKVs(kvs)), nil
+	return filterScanInternalKeys(keysFromKVs(kvs)), nil
 }
 
 func (s *ShardStore) proxyScanKeysAt(
@@ -1575,9 +1601,15 @@ func (s *ShardStore) proxyScanKeysAt(
 	ts uint64,
 	groupID uint64,
 	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
+	routeBoundsPresent bool,
 ) ([][]byte, error) {
 	return scanKeysWithRefill(start, end, limit, func(cursor []byte, pageLimit int) ([][]byte, error) {
-		return s.proxyRawScanKeysAt(ctx, g, cursor, end, pageLimit, ts, groupID, readRouteVersion)
+		return s.proxyRawScanKeysAt(
+			ctx, g, cursor, end, pageLimit, ts, groupID, readRouteVersion,
+			routeStart, routeEnd, routeBoundsPresent,
+		)
 	})
 }
 
@@ -1602,7 +1634,7 @@ func scanKeysWithRefill(
 			break
 		}
 
-		out = mergeAndTrimScanKeys(out, filterTxnInternalKeys(keys), limit)
+		out = mergeAndTrimScanKeys(out, filterScanInternalKeys(keys), limit)
 
 		nextCursor, ok := nextKeyScanCursor(keys, end, limit)
 		if !ok {
@@ -2906,13 +2938,13 @@ func lastKVKey(kvs []*store.KVPair) []byte {
 	return nil
 }
 
-func filterTxnInternalKeys(keys [][]byte) [][]byte {
+func filterScanInternalKeys(keys [][]byte) [][]byte {
 	if len(keys) == 0 {
 		return keys
 	}
 	out := make([][]byte, 0, len(keys))
 	for _, key := range keys {
-		if key == nil || isTxnInternalKey(key) {
+		if key == nil || isScanInternalKey(key) {
 			continue
 		}
 		out = append(out, key)
@@ -4368,6 +4400,9 @@ func (s *ShardStore) proxyRawScanKeysAt(
 	ts uint64,
 	groupID uint64,
 	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
+	routeBoundsPresent bool,
 ) ([][]byte, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
@@ -4387,13 +4422,16 @@ func (s *ShardStore) proxyRawScanKeysAt(
 	defer cancel()
 	cli := pb.NewRawKVClient(conn)
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey:         start,
-		EndKey:           end,
-		Limit:            int64(limit),
-		Ts:               ts,
-		GroupId:          groupID,
-		ReadRouteVersion: readRouteVersion,
-		KeysOnly:         true,
+		StartKey:           start,
+		EndKey:             end,
+		Limit:              int64(limit),
+		Ts:                 ts,
+		GroupId:            groupID,
+		ReadRouteVersion:   readRouteVersion,
+		KeysOnly:           true,
+		RouteStart:         bytes.Clone(routeStart),
+		RouteEnd:           bytes.Clone(routeEnd),
+		RouteBoundsPresent: routeBoundsPresent,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
