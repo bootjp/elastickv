@@ -107,6 +107,7 @@ var (
 	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
+	raftJoinMembers                 = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
 	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
 	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Issue coordinator-owned persistence timestamps through the local TSO batch allocator instead of direct HLC calls")
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used when --tsoEnabled is true")
@@ -647,7 +648,15 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
-	bootstrapCfg, err := resolveBootstrapConfig(*raftId, cfg.groups, *raftBootstrapMembers, *raftGroupPeers)
+	bootstrapCfg, err := resolveRaftPeerConfig(
+		*raftId,
+		cfg.groups,
+		*raftBootstrapMembers,
+		*raftGroupPeers,
+		*raftJoinMembers,
+		*raftJoinAsLearner,
+		*raftBootstrap,
+	)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
@@ -658,6 +667,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 type raftBootstrapConfig struct {
 	legacyServers []raftengine.Server
 	groupServers  map[uint64][]raftengine.Server
+	joinServers   []raftengine.Server
 }
 
 func (c raftBootstrapConfig) anyBootstrapServers() bool {
@@ -665,10 +675,20 @@ func (c raftBootstrapConfig) anyBootstrapServers() bool {
 }
 
 func (c raftBootstrapConfig) serversForGroup(groupID uint64) []raftengine.Server {
+	if len(c.joinServers) != 0 {
+		return cloneRaftServers(c.joinServers)
+	}
 	if len(c.groupServers) != 0 {
 		return cloneRaftServers(c.groupServers[groupID])
 	}
 	return cloneRaftServers(c.legacyServers)
+}
+
+func (c raftBootstrapConfig) bootstrapsGroup(groupID uint64) bool {
+	if len(c.groupServers) != 0 {
+		return len(c.groupServers[groupID]) > 0
+	}
+	return len(c.legacyServers) > 0
 }
 
 func (c raftBootstrapConfig) bootstrapSeedForGroup(groupID uint64) []raftengine.Server {
@@ -679,6 +699,9 @@ func (c raftBootstrapConfig) bootstrapSeedForGroup(groupID uint64) []raftengine.
 }
 
 func (c raftBootstrapConfig) adminSeed(defaultGroup uint64) []raftengine.Server {
+	if len(c.joinServers) != 0 {
+		return cloneRaftServers(c.joinServers)
+	}
 	if len(c.groupServers) != 0 {
 		return cloneRaftServers(c.groupServers[defaultGroup])
 	}
@@ -903,9 +926,19 @@ var (
 	ErrRaftGroupPeersTooFewVoters         = errors.New("flag --raftGroupPeers group must contain at least two voters")
 	ErrRaftGroupPeersHeterogeneous        = errors.New("flag --raftGroupPeers requires identical raft IDs across groups")
 	ErrNoRaftGroupPeersConfigured         = errors.New("no raft group peers configured")
+	ErrJoinMembersRequireSingleGroup      = errors.New("flag --raftJoinMembers requires exactly one raft group")
+	ErrJoinMembersRequireLearner          = errors.New("flag --raftJoinMembers requires --raftJoinAsLearner")
+	ErrJoinMembersConflictBootstrap       = errors.New("flag --raftJoinMembers cannot be combined with raft bootstrap flags")
+	ErrJoinMembersMissingLocalNode        = errors.New("flag --raftJoinMembers must include local --raftId")
+	ErrJoinMembersLocalAddrMismatch       = errors.New("flag --raftJoinMembers local address must match local raft group address")
+	ErrJoinMembersTooFewMembers           = errors.New("flag --raftJoinMembers must include the local node and at least one existing member")
+	ErrNoJoinMembersConfigured            = errors.New("no raft join members configured")
 )
 
-const minRaftGroupPeerVoters = 2
+const (
+	minRaftGroupPeerVoters = 2
+	minRaftJoinMembers     = 2
+)
 
 func resolveBootstrapConfig(
 	raftID string,
@@ -928,6 +961,59 @@ func resolveBootstrapConfig(
 		return raftBootstrapConfig{}, err
 	}
 	return raftBootstrapConfig{groupServers: groupServers}, nil
+}
+
+func resolveRaftPeerConfig(
+	raftID string,
+	groups []groupSpec,
+	bootstrapMembers string,
+	groupPeersRaw string,
+	joinMembers string,
+	joinAsLearner bool,
+	explicitBootstrap bool,
+) (raftBootstrapConfig, error) {
+	if strings.TrimSpace(joinMembers) == "" {
+		return resolveBootstrapConfig(raftID, groups, bootstrapMembers, groupPeersRaw)
+	}
+	if !joinAsLearner {
+		return raftBootstrapConfig{}, errors.WithStack(ErrJoinMembersRequireLearner)
+	}
+	if explicitBootstrap || strings.TrimSpace(bootstrapMembers) != "" || strings.TrimSpace(groupPeersRaw) != "" {
+		return raftBootstrapConfig{}, errors.WithStack(ErrJoinMembersConflictBootstrap)
+	}
+	servers, err := resolveJoinServers(raftID, groups, joinMembers)
+	if err != nil {
+		return raftBootstrapConfig{}, err
+	}
+	return raftBootstrapConfig{joinServers: servers}, nil
+}
+
+func resolveJoinServers(raftID string, groups []groupSpec, joinMembers string) ([]raftengine.Server, error) {
+	if len(groups) != 1 {
+		return nil, errors.WithStack(ErrJoinMembersRequireSingleGroup)
+	}
+	servers, err := parseRaftBootstrapMembers(joinMembers)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse raft join members")
+	}
+	if len(servers) == 0 {
+		return nil, errors.WithStack(ErrNoJoinMembersConfigured)
+	}
+	if len(servers) < minRaftJoinMembers {
+		return nil, errors.WithStack(ErrJoinMembersTooFewMembers)
+	}
+
+	localAddr := groups[0].address
+	for _, server := range servers {
+		if server.ID != raftID {
+			continue
+		}
+		if server.Address != localAddr {
+			return nil, errors.Wrapf(ErrJoinMembersLocalAddrMismatch, "expected %q got %q", localAddr, server.Address)
+		}
+		return servers, nil
+	}
+	return nil, errors.Wrapf(ErrJoinMembersMissingLocalNode, "raftId=%q", raftID)
 }
 
 func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raftengine.Server, error) {
@@ -1178,7 +1264,7 @@ func bootstrapSettingsForGroup(
 	explicitBootstrap bool,
 ) (bool, []raftengine.Server, []raftengine.Server) {
 	servers := cfg.serversForGroup(groupID)
-	return explicitBootstrap || len(servers) > 0, servers, cfg.bootstrapSeedForGroup(groupID)
+	return explicitBootstrap || cfg.bootstrapsGroup(groupID), servers, cfg.bootstrapSeedForGroup(groupID)
 }
 
 func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
@@ -1471,8 +1557,9 @@ type serversInput struct {
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
-// per-group Raft listeners needed for quorum traffic, waits for any requested
-// startup rotation, then opens the public service listeners.
+// per-group Raft listeners needed for quorum traffic, waits for a fresh join
+// to catch up, prepares the public listeners, waits for any requested startup
+// rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
@@ -1572,7 +1659,13 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	if err := runner.preparePublicServices(); err != nil {
+	if err := preparePublicServicesAfterRaftJoinReady(
+		in.ctx,
+		in.runtimes,
+		*raftId,
+		strings.TrimSpace(*raftJoinMembers) != "",
+		runner.preparePublicServices,
+	); err != nil {
 		return runner.startupFailure(err)
 	}
 	// runner.startRaftTransport() has populated runner.dynamoServer for the
@@ -1607,6 +1700,75 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	}
 	runner.startAdminHTTP()
 	return nil
+}
+
+const raftJoinReadyPollInterval = 100 * time.Millisecond
+
+func preparePublicServicesAfterRaftJoinReady(
+	ctx context.Context,
+	runtimes []*raftGroupRuntime,
+	localID string,
+	enabled bool,
+	prepare func() error,
+) error {
+	if err := waitForRaftJoinReady(ctx, runtimes, localID, enabled); err != nil {
+		return errors.Wrap(err, "wait for fresh raft join before binding public services")
+	}
+	return prepare()
+}
+
+func waitForRaftJoinReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	ticker := time.NewTicker(raftJoinReadyPollInterval)
+	defer ticker.Stop()
+	for {
+		ready, err := raftJoinRuntimesReady(ctx, runtimes, localID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.WithStack(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string) (bool, error) {
+	if len(runtimes) == 0 {
+		return false, nil
+	}
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.engine == nil {
+			return false, nil
+		}
+		configuration, err := runtime.engine.Configuration(ctx)
+		if err != nil {
+			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.spec.id)
+		}
+		if !configurationContainsMember(configuration, localID) {
+			return false, nil
+		}
+		status := runtime.engine.Status()
+		if status.Leader.ID == "" || status.PendingConfChange || status.AppliedIndex < status.CommitIndex {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
+	for _, server := range configuration.Servers {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == "voter") {
+			return true
+		}
+	}
+	return false
 }
 
 func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
