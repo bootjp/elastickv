@@ -1,10 +1,13 @@
 # Design: gRPC Streaming Transport for Raft Messages
 
-> **Status: implemented.**
-> The per-peer dispatch channel foundation from PR #522 remains in place.
-> Regular Raft messages now use a long-lived client-streaming gRPC connection
-> per peer when the remote node supports `SendStream`, with unary `Send`
-> retained as the mixed-version fallback.
+Status: Implemented
+Author: bootjp
+Date: 2026-04-18
+
+The per-peer dispatch channel foundation from PR #522 remains in place.
+Regular Raft messages now use a long-lived client-streaming gRPC connection
+per peer when the remote node supports `SendStream`, with unary `Send`
+retained as the mixed-version fallback.
 
 ## 1. Background and motivation
 
@@ -234,6 +237,7 @@ during the reconnect window, matching the previous drop semantics.
 | 5. Operational kill switch | `ELASTICKV_RAFT_SEND_STREAM=false` forces unary `Send` without unregistering `SendStream` | Implemented |
 | 6. Backward-compat fallback | Empty-stream probe plus `codes.Unimplemented` cache | Implemented |
 | 7. Tests | Server handler, streaming dispatch, legacy-peer fallback, kill switch | Implemented |
+| 8. Multi-group soak evidence | Concurrent TCP groups, disconnect/reconnect, flow-control timeout, recovery, snapshot traffic, and a fail-closed verifier | Implemented |
 
 ---
 
@@ -257,4 +261,112 @@ No dual-write or blue/green deployment is required: the `codes.Unimplemented` pr
 
 - Batch encoding (multiple `EtcdRaftMessage` payloads in one proto message) — independent optimisation.
 - Replacing the current per-lane workers with one biased-select multiplexing worker — an optional scheduler optimization on top of this transport protocol.
-- Snapshot streaming changes — already implemented.
+- Snapshot protocol changes — already implemented. The soak below exercises the existing snapshot stream without changing its wire format.
+
+---
+
+## 8. Multi-node, multi-group soak evidence
+
+### 8.1 Deterministic transport soak
+
+`cmd/elastickv-raft-stream-soak` starts real loopback TCP gRPC servers rather
+than an in-memory mock. Each configured Raft group has its own three-node
+transport mesh. All groups run concurrently through these phases:
+
+1. every directed peer link sends regular `MsgApp` traffic through `SendStream`;
+2. one receiver per group is stopped, the sender observes the broken stream,
+   the receiver restarts on the same address, and a recovery sentinel arrives;
+3. another receiver stops consuming a 1 MiB stream payload until gRPC flow
+   control blocks the sender and its dispatch context expires, then a second
+   recovery sentinel arrives;
+4. every node sends one existing-format `MsgSnap` to its next peer.
+
+The schema-v2 verifier fails unless every group has at least three nodes, every
+directed sender-to-receiver link delivered its configured steady message count,
+a stream reopened, both fault classes were observed, both uniquely indexed
+recovery sentinels reached the receiver handler, and per-node snapshot
+send/receive counts and bytes agree with the configured minimum. Re-run the
+checked-in evidence exactly with:
+
+```bash
+mkdir -p .cache/go .cache/tmp docs/evidence
+GOCACHE="$(pwd)/.cache/go" GOTMPDIR="$(pwd)/.cache/tmp" \
+  go run ./cmd/elastickv-raft-stream-soak \
+    --groups 3 \
+    --nodes 3 \
+    --messages-per-link 8 \
+    --regular-payload-bytes 1024 \
+    --backpressure-payload-bytes 1048576 \
+    --snapshot-payload-bytes 65536 \
+    --timeout 90s \
+    --output docs/evidence/raft_streaming_multigroup_soak.json
+
+GOCACHE="$(pwd)/.cache/go" GOTMPDIR="$(pwd)/.cache/tmp" \
+  go run ./cmd/elastickv-raft-stream-soak \
+    --verify docs/evidence/raft_streaming_multigroup_soak.json
+```
+
+The committed evidence records a passing `3 groups x 3 nodes` run. Each group
+opened all six directed peer streams, recorded at least one successful reopen,
+observed both disconnect and backpressure failures, delivered two recovery
+sentinels, and acknowledged three 64 KiB snapshot streams. Per-sender receive
+counts, TCP ports, and ordered UTC timestamps are retained in the JSON so the
+artifact describes and verifies the actual run.
+
+Focused regression tests:
+
+```bash
+GOCACHE="$(pwd)/.cache/go" GOTMPDIR="$(pwd)/.cache/tmp" \
+  go test ./internal/raftengine/etcd/transportsoak \
+          ./internal/raftengine/etcd \
+          ./monitoring \
+          ./cmd/elastickv-raft-stream-soak -count=1
+```
+
+### 8.2 Full Raft/Jepsen soak
+
+The deterministic command isolates transport lifecycle behavior. The existing
+DynamoDB multi-table Jepsen workload remains the full Raft correctness gate.
+On a standard Jepsen control host with `n1` through `n5` reachable over SSH,
+run:
+
+```bash
+TIME_LIMIT=600 RATE=50 CONCURRENCY=30 FAULT_INTERVAL=15 SNAPSHOT_COUNT=64 \
+  ./scripts/run-jepsen-raft-streaming-multigroup-soak.sh
+```
+
+The script deploys five processes, each hosting groups `1`, `2`, and `3`, and
+routes the four workload tables across all three groups. It enables streaming
+and dispatcher lanes, lowers the snapshot threshold, and applies partition,
+kill, and pause faults. The combined nemesis final generator heals outstanding
+faults before teardown. Jepsen's `LogFiles` collection preserves each server
+log and `elastickv-transport-metrics.prom`. The metrics file appends one final
+counter snapshot for each process lifetime before a kill, plus the final
+process snapshot collected by Jepsen. This preserves evidence when counters
+reset after a kill/restart cycle instead of overwriting the previous lifetime.
+
+The script then runs
+`scripts/verify-raft-streaming-multigroup-metrics.sh` over the newly collected
+node snapshots. It rejects malformed values, missing identity labels, duplicate
+node IDs or addresses, and groups without stream activity from at least three
+distinct nodes. For every expected group it also requires non-zero stream opens,
+successful reconnects, streamed messages, snapshot sends and bytes, and at
+least one backpressure signal (`DeadlineExceeded`, `ResourceExhausted`, a
+dispatcher drop, or a full inbound step queue). The Jepsen history must also be
+valid; the workload process exits non-zero before metrics verification when
+Elle reports an anomaly.
+
+The following Prometheus counters make the evidence independent of log wording:
+
+| Metric | Meaning |
+|---|---|
+| `elastickv_raft_send_stream_opens_total` | Successful outbound stream opens, including reopens |
+| `elastickv_raft_send_stream_reconnects_total` | Successful opens for an address that previously had a stream |
+| `elastickv_raft_send_stream_messages_total` | Regular Raft messages accepted by the stream send path |
+| `elastickv_raft_snapshot_stream_sends_total` | Snapshot streams acknowledged by the peer |
+| `elastickv_raft_snapshot_stream_payload_bytes_total` | Payload bytes in acknowledged snapshot streams |
+
+These counters are observational. They are updated only after successful
+transport operations and are never read by dispatch, fallback, retry, or Raft
+state-machine decisions, so this evidence work does not alter protocol
+semantics.

@@ -1,0 +1,175 @@
+{
+  "schema_version": 2,
+  "started_at": "2026-07-19T09:42:00.117212Z",
+  "finished_at": "2026-07-19T09:42:01.44008Z",
+  "config": {
+    "groups": 3,
+    "nodes_per_group": 3,
+    "messages_per_link": 8,
+    "regular_payload_bytes": 1024,
+    "backpressure_payload_bytes": 1048576,
+    "snapshot_payload_bytes": 65536
+  },
+  "groups": [
+    {
+      "group_id": 1,
+      "nodes": [
+        {
+          "node": 1,
+          "address": "127.0.0.1:63452",
+          "regular_received": 16,
+          "regular_received_by_sender": {
+            "2": 8,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 4,
+          "send_stream_reconnects": 2,
+          "send_stream_messages": 21,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 2,
+          "address": "127.0.0.1:63453",
+          "regular_received": 17,
+          "regular_received_by_sender": {
+            "1": 9,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 3,
+          "address": "127.0.0.1:63454",
+          "regular_received": 18,
+          "regular_received_by_sender": {
+            "1": 10,
+            "2": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        }
+      ],
+      "disconnect_errors": 1,
+      "backpressure_errors": 1,
+      "recovery_messages": 2
+    },
+    {
+      "group_id": 2,
+      "nodes": [
+        {
+          "node": 1,
+          "address": "127.0.0.1:63455",
+          "regular_received": 16,
+          "regular_received_by_sender": {
+            "2": 8,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 4,
+          "send_stream_reconnects": 2,
+          "send_stream_messages": 21,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 2,
+          "address": "127.0.0.1:63456",
+          "regular_received": 17,
+          "regular_received_by_sender": {
+            "1": 9,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 3,
+          "address": "127.0.0.1:63457",
+          "regular_received": 18,
+          "regular_received_by_sender": {
+            "1": 10,
+            "2": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        }
+      ],
+      "disconnect_errors": 1,
+      "backpressure_errors": 1,
+      "recovery_messages": 2
+    },
+    {
+      "group_id": 3,
+      "nodes": [
+        {
+          "node": 1,
+          "address": "127.0.0.1:63458",
+          "regular_received": 16,
+          "regular_received_by_sender": {
+            "2": 8,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 4,
+          "send_stream_reconnects": 2,
+          "send_stream_messages": 21,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 2,
+          "address": "127.0.0.1:63459",
+          "regular_received": 17,
+          "regular_received_by_sender": {
+            "1": 9,
+            "3": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        },
+        {
+          "node": 3,
+          "address": "127.0.0.1:63460",
+          "regular_received": 18,
+          "regular_received_by_sender": {
+            "1": 10,
+            "2": 8
+          },
+          "snapshots_received": 1,
+          "send_stream_opens": 2,
+          "send_stream_reconnects": 0,
+          "send_stream_messages": 16,
+          "snapshot_stream_sends": 1,
+          "snapshot_payload_bytes": 65536
+        }
+      ],
+      "disconnect_errors": 1,
+      "backpressure_errors": 1,
+      "recovery_messages": 2
+    }
+  ],
+  "result": "pass"
+}
