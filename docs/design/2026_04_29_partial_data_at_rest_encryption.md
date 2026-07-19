@@ -1023,7 +1023,8 @@ Two-tier hierarchy:
   1. AWS KMS: `--kekUri=aws-kms://arn:aws:kms:...:key/...` with an
      immutable key ARN (mutable alias ARNs are rejected). The KMS key never
      leaves AWS; we call `Encrypt` / `Decrypt` to wrap/unwrap DEKs.
-  2. GCP KMS: `--kekUri=gcp-kms://projects/.../keys/...`. Same shape.
+  2. GCP KMS: `--kekUri=gcp-kms://projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>`.
+     Same shape.
   3. HashiCorp Vault Transit: `--kekUri=vault-transit://...`.
   4. Static file: `--kekFile=/etc/elastickv/kek.bin` — 32 bytes raw.
      Recommended only when the file lives on a tmpfs or sealed

@@ -16,8 +16,11 @@ Stage 9B completes the §5.1 KEK source matrix:
   AAD. Request and response CRC32C values are supplied and verified before a
   wrapped DEK or plaintext DEK is accepted.
 - `--kekUri=vault-transit://<mount>/<key>` uses Vault Transit through standard
-  `VAULT_*` client configuration. Binary DEKs are base64 encoded for the API;
-  only `vault:v<positive-version>:<non-empty-payload>` ciphertexts are accepted.
+  `VAULT_*` client configuration, including nested mount paths with the final
+  path segment interpreted as the key name. The existing key is read before
+  encrypt to prevent implicit key creation, and encrypt/decrypt use fixed AAD.
+  Binary DEKs are base64 encoded for the API; only
+  `vault:v<positive-version>:<non-empty-payload>` ciphertexts are accepted.
 - `ELASTICKV_KEK_BASE64` supplies a 32-byte test/CI-only static KEK. The
   variable is unset immediately after the decode attempt, including malformed
   input. It is also unset when source ambiguity is rejected.
@@ -55,7 +58,7 @@ unchanged.
 Verification includes:
 
 - fake-client unit tests for AWS encryption context, GCP AAD/CRC32C, and Vault
-  binary request/response encoding;
+  key existence, nested mount, AAD, and binary request/response encoding;
 - malformed provider response, strict Vault ciphertext, immutable AWS key ARN,
   wrong DEK length, invalid URI, source conflict, environment-unset, and
   startup wrap/unwrap preflight tests;

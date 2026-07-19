@@ -13,8 +13,11 @@ import (
 )
 
 type vaultLogicalClient interface {
+	ReadWithContext(context.Context, string) (*vaultapi.Secret, error)
 	WriteWithContext(context.Context, string, map[string]interface{}) (*vaultapi.Secret, error)
 }
+
+var vaultTransitAAD = base64.StdEncoding.EncodeToString([]byte("elastickv-dek-wrap-v1"))
 
 // VaultTransitWrapper wraps DEKs with a Vault Transit symmetric key.
 type VaultTransitWrapper struct {
@@ -57,7 +60,7 @@ func parseVaultTarget(target string) (string, string, error) {
 			return "", "", errors.Wrapf(ErrInvalidKEKURI, "invalid Vault Transit target %q", target)
 		}
 	}
-	return parts[0], strings.Join(parts[1:], "/"), nil
+	return strings.Join(parts[:len(parts)-1], "/"), parts[len(parts)-1], nil
 }
 
 // Wrap base64-encodes the binary DEK for Vault's JSON API and stores Vault's
@@ -71,8 +74,16 @@ func (w *VaultTransitWrapper) Wrap(dek []byte) ([]byte, error) {
 	}
 	ctx, cancel := requestContext(w.timeout)
 	defer cancel()
+	key, err := w.logical.ReadWithContext(ctx, w.mount+"/keys/"+w.keyName)
+	if err != nil {
+		return nil, errors.Wrap(err, "kek: read Vault Transit key")
+	}
+	if _, ok := vaultString(key, "type"); !ok {
+		return nil, errors.Wrap(ErrInvalidProviderResponse, "kek: Vault Transit key does not exist")
+	}
 	secret, err := w.logical.WriteWithContext(ctx, w.mount+"/encrypt/"+w.keyName, map[string]interface{}{
-		"plaintext": base64.StdEncoding.EncodeToString(dek),
+		"plaintext":       base64.StdEncoding.EncodeToString(dek),
+		"associated_data": vaultTransitAAD,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "kek: Vault Transit encrypt")
@@ -96,7 +107,8 @@ func (w *VaultTransitWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 	ctx, cancel := requestContext(w.timeout)
 	defer cancel()
 	secret, err := w.logical.WriteWithContext(ctx, w.mount+"/decrypt/"+w.keyName, map[string]interface{}{
-		"ciphertext": string(wrapped),
+		"ciphertext":      string(wrapped),
+		"associated_data": vaultTransitAAD,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "kek: Vault Transit decrypt")
