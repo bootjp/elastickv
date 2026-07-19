@@ -46,6 +46,15 @@ type stubEncryptionAdminRegistry struct {
 	name string
 }
 
+type stubEncryptionRecoveryEngine struct {
+	raftengine.Engine
+	applied uint64
+}
+
+func (s *stubEncryptionRecoveryEngine) AppliedIndex() uint64 {
+	return s.applied
+}
+
 func (stubEncryptionAdminRegistry) GetRegistryRow([]byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
@@ -100,6 +109,35 @@ func TestWriterRegistryForEncryptionAdminMissingDefaultGroup(t *testing.T) {
 	}, 1)
 	if got != nil {
 		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want nil when default group runtime is missing", got)
+	}
+}
+
+func TestRecoveryStateForEncryptionAdminUsesDefaultGroup(t *testing.T) {
+	defaultEngine := &stubEncryptionRecoveryEngine{applied: 41}
+	otherEngine := &stubEncryptionRecoveryEngine{applied: 99}
+	runtimes := []*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, engine: otherEngine},
+		{spec: groupSpec{id: 1}, engine: defaultEngine},
+	}
+
+	leaderView, appliedIndex := recoveryStateForEncryptionAdmin(runtimes, 1)
+	if leaderView != defaultEngine {
+		t.Fatalf("recoveryStateForEncryptionAdmin selected %T, want default group engine", leaderView)
+	}
+	if appliedIndex == nil {
+		t.Fatal("recoveryStateForEncryptionAdmin returned a nil applied-index callback")
+	}
+	if got := appliedIndex(); got != 41 {
+		t.Fatalf("recoveryStateForEncryptionAdmin applied index = %d, want 41", got)
+	}
+}
+
+func TestRecoveryStateForEncryptionAdminMissingDefaultGroup(t *testing.T) {
+	leaderView, appliedIndex := recoveryStateForEncryptionAdmin([]*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, engine: &stubEncryptionRecoveryEngine{applied: 99}},
+	}, 1)
+	if leaderView != nil || appliedIndex != nil {
+		t.Fatalf("recoveryStateForEncryptionAdmin returned leader=%T callback-present=%t, want both nil", leaderView, appliedIndex != nil)
 	}
 }
 

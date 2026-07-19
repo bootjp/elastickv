@@ -40,7 +40,7 @@ func TestEncryption_CompressesOnlyWhenSmaller(t *testing.T) {
 				t.Fatalf("PutAt: %v", err)
 			}
 
-			var flag byte
+			var version, flag byte
 			f.tamperPebbleValue(t, key, 100, func(raw []byte) []byte {
 				sv, err := decodeValue(raw)
 				if err != nil {
@@ -50,10 +50,16 @@ func TestEncryption_CompressesOnlyWhenSmaller(t *testing.T) {
 				if err != nil {
 					t.Fatalf("DecodeEnvelope: %v", err)
 				}
+				version = env.Version
 				flag = env.Flag
 				return raw
 			})
 			require.Equal(t, tc.compressed, flag&encryption.FlagCompressed != 0)
+			if tc.compressed {
+				require.Equal(t, encryption.EnvelopeVersionV2, version)
+			} else {
+				require.Equal(t, encryption.EnvelopeVersionV1, version)
+			}
 
 			got, err := f.mvcc.GetAt(context.Background(), key, 100)
 			require.NoError(t, err)
@@ -105,7 +111,7 @@ func TestEncryption_RejectsAuthenticatedMalformedSnappy(t *testing.T) {
 	pebbleKey := encodeKey(key, commitTS)
 	var header [valueHeaderSize]byte
 	writeValueHeaderBytes(header[:], false, 0, encStateEncrypted)
-	aad := buildStorageAAD(encryption.EnvelopeVersionV1, encryption.FlagCompressed, f.keyID, header[:], pebbleKey)
+	aad := buildStorageAAD(encryption.EnvelopeVersionV2, encryption.FlagCompressed, f.keyID, header[:], pebbleKey)
 	var nonce [encryption.NonceSize]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		t.Fatalf("rand.Read nonce: %v", err)
@@ -115,7 +121,7 @@ func TestEncryption_RejectsAuthenticatedMalformedSnappy(t *testing.T) {
 		t.Fatalf("Encrypt malformed payload: %v", err)
 	}
 	envelopeBytes, err := (&encryption.Envelope{
-		Version: encryption.EnvelopeVersionV1,
+		Version: encryption.EnvelopeVersionV2,
 		Flag:    encryption.FlagCompressed,
 		KeyID:   f.keyID,
 		Nonce:   nonce,
@@ -142,6 +148,9 @@ func TestEncryption_RejectsAuthenticatedMalformedSnappy(t *testing.T) {
 	if _, err := f.mvcc.GetAt(context.Background(), key, commitTS); !errors.Is(err, ErrEncryptedReadCompression) {
 		t.Fatalf("malformed authenticated Snappy: expected ErrEncryptedReadCompression, got %v", err)
 	}
+	if err := f.mvcc.DeletePrefixAt(context.Background(), []byte("malformed-"), nil, commitTS+1); err != nil {
+		t.Fatalf("visibility-only prefix delete expanded malformed Snappy: %v", err)
+	}
 }
 
 func TestEncryption_RejectsAuthenticatedOversizedSnappyBeforeDecode(t *testing.T) {
@@ -155,7 +164,7 @@ func TestEncryption_RejectsAuthenticatedOversizedSnappyBeforeDecode(t *testing.T
 	pebbleKey := encodeKey(key, commitTS)
 	var header [valueHeaderSize]byte
 	writeValueHeaderBytes(header[:], false, 0, encStateEncrypted)
-	aad := buildStorageAAD(encryption.EnvelopeVersionV1, encryption.FlagCompressed, f.keyID, header[:], pebbleKey)
+	aad := buildStorageAAD(encryption.EnvelopeVersionV2, encryption.FlagCompressed, f.keyID, header[:], pebbleKey)
 	compressed := snappy.Encode(nil, bytes.Repeat([]byte("a"), maxSnapshotValueSize+1))
 	var nonce [encryption.NonceSize]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -166,7 +175,7 @@ func TestEncryption_RejectsAuthenticatedOversizedSnappyBeforeDecode(t *testing.T
 		t.Fatalf("Encrypt oversized payload: %v", err)
 	}
 	envelopeBytes, err := (&encryption.Envelope{
-		Version: encryption.EnvelopeVersionV1,
+		Version: encryption.EnvelopeVersionV2,
 		Flag:    encryption.FlagCompressed,
 		KeyID:   f.keyID,
 		Nonce:   nonce,

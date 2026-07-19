@@ -1000,6 +1000,24 @@ func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_ResyncSidecar_UsesRecoveryLeaderView(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminRecoveryLeaderView(stubLeaderView{
+			state:  raftengine.StateFollower,
+			leader: raftengine.LeaderInfo{ID: "default-leader", Address: "n2:50051"},
+		}),
+	)
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("ResyncSidecar status=%v, want FailedPrecondition from default-group recovery view", status.Code(err))
+	}
+	if !strings.Contains(err.Error(), "default-leader") {
+		t.Fatalf("ResyncSidecar error %q does not identify the default-group leader", err)
+	}
+}
+
 // TestEncryptionAdmin_RotateDEK_VerifyLeader_PreservesContextCodes
 // pins the context-code mapping: when VerifyLeader returns
 // context.Canceled / context.DeadlineExceeded (the caller's ctx

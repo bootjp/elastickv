@@ -452,14 +452,16 @@ the way out.
 Envelope format (single byte stream, stored as the Pebble value):
 
 ```text
-+--------+------+---------+----------+----------------+--------+
-| 0x01   | flag | key_id  | nonce    | ciphertext     | tag    |
-| 1 byte | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
-+--------+------+---------+----------+----------------+--------+
++---------+------+---------+----------+----------------+--------+
+| version | flag | key_id  | nonce    | ciphertext     | tag    |
+| 1 byte  | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
++---------+------+---------+----------+----------------+--------+
 ```
 
-- `0x01` — envelope-version byte. Future authenticated formats reserve
-  `0x02..0x0F` (see §11.3). The byte itself is **not** used to
+- `version` — `0x01` is the original uncompressed format and requires
+  `flag=0`. `0x02` is the compression-capable storage format. Compressed
+  writes use `0x02`, causing V1-only readers to reject rather than return
+  Snappy-framed plaintext during rolling rollback. The byte itself is **not** used to
   discriminate cleartext from ciphertext on the read path — that
   decision lives in MVCC metadata, not in the value bytes (see §7.1).
 - `flag` — bit 0: `1` if `ciphertext` is the encryption of a
@@ -1850,6 +1852,12 @@ so we never pay CPU twice. Because the flag is part of the AES-GCM
 AAD (§4.1), an attacker cannot flip it post-hoc to crash the
 decompressor.
 
+Compressed values use envelope version `0x02`; uncompressed values remain
+version `0x01`. This format split is the reader-capability boundary: a
+pre-compression V1 reader fails closed on V2 instead of serving compressed
+bytes. Visibility-only operations authenticate the envelope and value header
+without allocating the decompressed value.
+
 This is also the reason we cannot rely on Pebble's built-in block
 compression alone: by the time bytes reach Pebble's block writer they
 are already ciphertext, so Pebble's compression is wasted CPU. We
@@ -2675,8 +2683,9 @@ eventual code change.
    top of value-level encryption, accepting the complexity tax. Not
    needed for the v1 threat model.
 
-3. **Envelope-format versioning.** v1 ships envelope version `0x01`.
-   We will reserve `0x02..0x0F` for future authenticated formats
+3. **Envelope-format versioning.** Uncompressed storage and Raft
+   envelopes use `0x01`; compression-capable storage envelopes use
+   `0x02`. We reserve `0x03..0x0F` for future authenticated formats
    (e.g., AES-256-GCM-SIV if nonce-misuse resistance matters,
    ChaCha20-Poly1305 for non-AES-NI hosts). The decrypt path
    dispatches on the version byte; anything unknown errors loudly.

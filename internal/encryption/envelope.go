@@ -8,13 +8,14 @@ import (
 
 // Public constants for the §4.1 wire format.
 const (
-	// EnvelopeVersionV1 is the current envelope format version. §11.3
-	// reserves 0x02..0x0F for future authenticated formats. The current
-	// build only understands 0x01; ANY other version byte (including the
-	// 0x02..0x0F reserved range) causes DecodeEnvelope to return
-	// ErrEnvelopeVersion. Future decoders that know how to handle the
-	// reserved range will widen this check.
+	// EnvelopeVersionV1 is the original uncompressed storage and Raft
+	// format. It rejects FlagCompressed so V1 readers never return a
+	// Snappy frame as user plaintext.
 	EnvelopeVersionV1 byte = 0x01
+	// EnvelopeVersionV2 identifies storage envelopes whose reader
+	// understands the authenticated compression flag. V1-only readers
+	// reject this version before decrypting, making rollback fail closed.
+	EnvelopeVersionV2 byte = 0x02
 
 	// FlagCompressed (bit 0) is set when ciphertext encrypts a Snappy-
 	// compressed plaintext (§6.4). The flag participates in the AAD so a
@@ -82,17 +83,12 @@ type Envelope struct {
 // (uninitialised Version, truncated Body) fails here with a clear
 // stack trace, rather than surfacing later as a confusing
 // DecodeEnvelope or Cipher.Decrypt failure on the read side. Returns:
-//   - ErrEnvelopeVersion if Version is not EnvelopeVersionV1.
+//   - ErrEnvelopeVersion if Version is unsupported.
 //   - ErrEnvelopeShort   if Body is shorter than TagSize (every valid
 //     body must contain at least the GCM tag).
 func (e *Envelope) Encode() ([]byte, error) {
-	if e.Version != EnvelopeVersionV1 {
-		return nil, errors.Wrapf(ErrEnvelopeVersion,
-			"encode: got 0x%02x, want 0x%02x", e.Version, EnvelopeVersionV1)
-	}
-	if e.Flag&^FlagCompressed != 0 {
-		return nil, errors.Wrapf(ErrEnvelopeFlag,
-			"encode: got 0x%02x, allowed mask 0x%02x", e.Flag, FlagCompressed)
+	if err := validateEnvelopeVersionFlag(e.Version, e.Flag); err != nil {
+		return nil, errors.Wrap(err, "encode")
 	}
 	if len(e.Body) < TagSize {
 		return nil, errors.Wrapf(ErrEnvelopeShort,
@@ -116,13 +112,8 @@ func DecodeEnvelope(src []byte) (*Envelope, error) {
 		return nil, errors.Wrapf(ErrEnvelopeShort,
 			"got %d bytes, want >= %d", len(src), HeaderSize+TagSize)
 	}
-	if src[versionOffset] != EnvelopeVersionV1 {
-		return nil, errors.Wrapf(ErrEnvelopeVersion,
-			"got 0x%02x, want 0x%02x", src[versionOffset], EnvelopeVersionV1)
-	}
-	if src[flagOffset]&^FlagCompressed != 0 {
-		return nil, errors.Wrapf(ErrEnvelopeFlag,
-			"got 0x%02x, allowed mask 0x%02x", src[flagOffset], FlagCompressed)
+	if err := validateEnvelopeVersionFlag(src[versionOffset], src[flagOffset]); err != nil {
+		return nil, err
 	}
 	e := &Envelope{
 		Version: src[versionOffset],
@@ -134,6 +125,26 @@ func DecodeEnvelope(src []byte) (*Envelope, error) {
 	copy(body, src[HeaderSize:])
 	e.Body = body
 	return e, nil
+}
+
+func validateEnvelopeVersionFlag(version, flag byte) error {
+	switch version {
+	case EnvelopeVersionV1:
+		if flag != 0 {
+			return errors.Wrapf(ErrEnvelopeFlag,
+				"version 0x%02x requires flag 0x00, got 0x%02x", version, flag)
+		}
+	case EnvelopeVersionV2:
+		if flag&^FlagCompressed != 0 {
+			return errors.Wrapf(ErrEnvelopeFlag,
+				"version 0x%02x got flag 0x%02x, allowed mask 0x%02x", version, flag, FlagCompressed)
+		}
+	default:
+		return errors.Wrapf(ErrEnvelopeVersion,
+			"got 0x%02x, supported versions are 0x%02x and 0x%02x",
+			version, EnvelopeVersionV1, EnvelopeVersionV2)
+	}
+	return nil
 }
 
 // HeaderAADBytes returns the first 6 bytes of the envelope header

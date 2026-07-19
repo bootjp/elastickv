@@ -26,7 +26,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 		{
 			name: "compressed flag set",
 			env: encryption.Envelope{
-				Version: encryption.EnvelopeVersionV1,
+				Version: encryption.EnvelopeVersionV2,
 				Flag:    encryption.FlagCompressed,
 				KeyID:   0xCAFE_F00D,
 				Body:    bytes.Repeat([]byte{0x55}, 64+encryption.TagSize),
@@ -35,7 +35,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 		{
 			name: "max key_id",
 			env: encryption.Envelope{
-				Version: encryption.EnvelopeVersionV1,
+				Version: encryption.EnvelopeVersionV2,
 				Flag:    encryption.FlagCompressed,
 				KeyID:   0xFFFF_FFFF,
 				Body:    bytes.Repeat([]byte{0x77}, 1024+encryption.TagSize),
@@ -120,13 +120,32 @@ func TestEnvelope_Decode_TooShort(t *testing.T) {
 }
 
 func TestEnvelope_Decode_RejectsUnknownVersion(t *testing.T) {
-	for _, version := range []byte{0x00, 0x02, 0x10, 0xFE, 0xFF} {
+	for _, version := range []byte{0x00, 0x03, 0x10, 0xFE, 0xFF} {
 		buf := make([]byte, encryption.HeaderSize+encryption.TagSize)
 		buf[0] = version
 		_, err := encryption.DecodeEnvelope(buf)
 		if !errors.Is(err, encryption.ErrEnvelopeVersion) {
 			t.Fatalf("version=0x%02x: expected ErrEnvelopeVersion, got %v", version, err)
 		}
+	}
+}
+
+func TestEnvelope_V1RejectsCompressedFlag(t *testing.T) {
+	t.Parallel()
+	env := encryption.Envelope{
+		Version: encryption.EnvelopeVersionV1,
+		Flag:    encryption.FlagCompressed,
+		KeyID:   1,
+		Body:    bytes.Repeat([]byte{0x55}, encryption.TagSize),
+	}
+	if _, err := env.Encode(); !errors.Is(err, encryption.ErrEnvelopeFlag) {
+		t.Fatalf("V1 compressed encode: expected ErrEnvelopeFlag, got %v", err)
+	}
+	buf := make([]byte, encryption.HeaderSize+encryption.TagSize)
+	buf[0] = encryption.EnvelopeVersionV1
+	buf[1] = encryption.FlagCompressed
+	if _, err := encryption.DecodeEnvelope(buf); !errors.Is(err, encryption.ErrEnvelopeFlag) {
+		t.Fatalf("V1 compressed decode: expected ErrEnvelopeFlag, got %v", err)
 	}
 }
 
@@ -172,8 +191,8 @@ func TestEnvelope_Decode_DoesNotAliasInput(t *testing.T) {
 }
 
 func TestHeaderAADBytes_Layout(t *testing.T) {
-	got := encryption.HeaderAADBytes(encryption.EnvelopeVersionV1, encryption.FlagCompressed, 0x12345678)
-	want := []byte{0x01, 0x01, 0x12, 0x34, 0x56, 0x78}
+	got := encryption.HeaderAADBytes(encryption.EnvelopeVersionV2, encryption.FlagCompressed, 0x12345678)
+	want := []byte{0x02, 0x01, 0x12, 0x34, 0x56, 0x78}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("HeaderAADBytes layout mismatch:\n  got  %x\n  want %x", got, want)
 	}
@@ -183,8 +202,8 @@ func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
 	// Append onto an existing buffer. The result should be the original
 	// bytes followed by the 6-byte header.
 	prefix := []byte{0xCA, 0xFE}
-	got := encryption.AppendHeaderAADBytes(prefix, encryption.EnvelopeVersionV1, encryption.FlagCompressed, 0x12345678)
-	want := []byte{0xCA, 0xFE, 0x01, 0x01, 0x12, 0x34, 0x56, 0x78}
+	got := encryption.AppendHeaderAADBytes(prefix, encryption.EnvelopeVersionV2, encryption.FlagCompressed, 0x12345678)
+	want := []byte{0xCA, 0xFE, 0x02, 0x01, 0x12, 0x34, 0x56, 0x78}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("AppendHeaderAADBytes mismatch:\n  got  %x\n  want %x", got, want)
 	}
@@ -202,7 +221,7 @@ func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
 
 func TestEnvelope_Encode_RejectsBadVersion(t *testing.T) {
 	env := encryption.Envelope{
-		Version: 0x02, // not EnvelopeVersionV1
+		Version: 0x03,
 		Body:    bytes.Repeat([]byte{0xAA}, encryption.TagSize),
 	}
 	_, err := env.Encode()

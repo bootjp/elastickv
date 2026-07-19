@@ -177,7 +177,7 @@ func TestRaftEnvelope_RejectsStorageCompressionFlag(t *testing.T) {
 	c, keyID := raftFixture(t)
 	nonce := newRandomNonce(t)
 	payload := []byte("raft payload")
-	aad := encryption.BuildRaftAAD(encryption.EnvelopeVersionV1, keyID)
+	aad := encryption.BuildRaftAAD(encryption.EnvelopeVersionV2, keyID)
 	body, err := c.Encrypt(payload, aad, keyID, nonce)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
@@ -185,7 +185,7 @@ func TestRaftEnvelope_RejectsStorageCompressionFlag(t *testing.T) {
 	var nonceArray [encryption.NonceSize]byte
 	copy(nonceArray[:], nonce)
 	encoded, err := (&encryption.Envelope{
-		Version: encryption.EnvelopeVersionV1,
+		Version: encryption.EnvelopeVersionV2,
 		Flag:    encryption.FlagCompressed,
 		KeyID:   keyID,
 		Nonce:   nonceArray,

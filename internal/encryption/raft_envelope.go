@@ -109,6 +109,10 @@ func UnwrapRaftPayload(c *Cipher, encoded []byte) ([]byte, error) {
 		return nil, errors.Wrapf(ErrEnvelopeFlag,
 			"encryption: raft envelope flag must be 0x00, got 0x%02x", env.Flag)
 	}
+	if env.Version != EnvelopeVersionV1 {
+		return nil, errors.Wrapf(ErrEnvelopeVersion,
+			"encryption: raft envelope version must be 0x%02x, got 0x%02x", EnvelopeVersionV1, env.Version)
+	}
 	aad := BuildRaftAAD(env.Version, env.KeyID)
 	plain, err := c.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])
 	if err != nil {

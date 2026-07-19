@@ -35,9 +35,9 @@ var (
 	// current build does not know how to parse. Reserved values per §11.3.
 	ErrEnvelopeVersion = errors.New("encryption: unknown envelope version")
 
-	// ErrEnvelopeFlag indicates an envelope set a flag bit that the current
-	// format does not define. V1 only permits FlagCompressed; accepting other
-	// bits would make future format extensions ambiguous and could route
+	// ErrEnvelopeFlag indicates an envelope set a flag bit that its version
+	// does not define. V1 permits no flags; V2 permits FlagCompressed. Accepting
+	// other combinations would make extensions ambiguous and could route
 	// authenticated plaintext through the wrong post-decrypt transform.
 	ErrEnvelopeFlag = errors.New("encryption: unknown envelope flag bits")
 

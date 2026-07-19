@@ -1279,7 +1279,7 @@ func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool,
 	// This intentionally also runs for cleartext-labelled rows so the
 	// cleartext rebadge guard rejects encrypted envelopes whose encState bit
 	// was flipped before we branch on tombstone or expireAt.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	return !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts), nil
@@ -2617,12 +2617,12 @@ func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, ve
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	// decryptForKey authenticates the value-header bytes when the
+	// authenticateForKey authenticates the value-header bytes when the
 	// entry is encrypted (cleartext entries no-op except for the
 	// rebadge guard). We discard the plaintext — we only need the
 	// authentication side-effect; tombstone / expireAt visibility
 	// is then decided on now-trusted bytes.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {

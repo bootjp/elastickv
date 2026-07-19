@@ -1554,6 +1554,14 @@ func writerRegistryForEncryptionAdmin(runtimes []*raftGroupRuntime, defaultGroup
 	return defaultRuntime.writerRegistry
 }
 
+func recoveryStateForEncryptionAdmin(runtimes []*raftGroupRuntime, defaultGroup uint64) (raftengine.LeaderView, func() uint64) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil {
+		return nil, nil
+	}
+	return defaultRuntime.engine, appliedIndexForEngine(defaultRuntime.engine)
+}
+
 func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
 	applied, ok := engine.(interface{ AppliedIndex() uint64 })
 	if !ok {
@@ -2633,6 +2641,7 @@ func startRaftServers(
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
 	adminWriterRegistry := writerRegistryForEncryptionAdmin(runtimes, defaultGroup)
+	recoveryLeaderView, recoveryAppliedIndex := recoveryStateForEncryptionAdmin(runtimes, defaultGroup)
 	for _, rt := range runtimes {
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
@@ -2685,9 +2694,10 @@ func startRaftServers(
 		// a stable, distinct value. Codex r1 P1 on PR #760.
 		// Stage 6B-2 mutator gate is resolved once above the
 		// per-shard loop. Each shard's own engine remains the raw
-		// Proposer + LeaderView for the cutover marker, while
-		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
-		// path for normal admin entries.
+		// proposer, while recovery leadership and applied-index evidence
+		// come from the default group that owns the shared sidecar and
+		// writer registry. ShardGroup.Proposer() supplies the wrap-aware
+		// post-cutover path for normal admin entries.
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
@@ -2696,7 +2706,8 @@ func startRaftServers(
 			rt.engine,
 			encryptionCapabilityFanout,
 			adapter.WithEncryptionAdminWriterRegistry(adminWriterRegistry),
-			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
+			adapter.WithEncryptionAdminRecoveryLeaderView(recoveryLeaderView),
+			adapter.WithEncryptionAdminLatestAppliedIndex(recoveryAppliedIndex),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)
