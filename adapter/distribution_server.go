@@ -300,13 +300,9 @@ func buildCatalogSplitOps(
 		Key: distribution.CatalogRouteKey(parentID),
 	})
 	for _, route := range []distribution.RouteDescriptor{left, right} {
-		encoded, err := distribution.EncodeRouteDescriptorForCatalogWrite(route, allowRouteDescriptorV2Writes)
+		encoded, patchOffset, err := distribution.EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(route, allowRouteDescriptorV2Writes)
 		if err != nil {
 			return nil, errors.WithStack(err)
-		}
-		patchOffset, err := splitAtHLCPatchOffset(encoded)
-		if err != nil {
-			return nil, err
 		}
 		ops = append(ops, &kv.Elem[kv.OP]{
 			Op:                  kv.Put,
@@ -326,14 +322,6 @@ func buildCatalogSplitOps(
 		Value: distribution.EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return ops, nil
-}
-
-func splitAtHLCPatchOffset(encoded []byte) (uint64, error) {
-	const splitAtHLCTailBytes = 8
-	if len(encoded) < splitAtHLCTailBytes {
-		return 0, errors.WithStack(distribution.ErrCatalogInvalidRouteRecord)
-	}
-	return uint64(len(encoded) - splitAtHLCTailBytes), nil //nolint:gosec // len was checked to be at least splitAtHLCTailBytes.
 }
 
 func splitChildrenFromSnapshot(snapshot distribution.CatalogSnapshot, leftID uint64, rightID uint64) (distribution.RouteDescriptor, distribution.RouteDescriptor, error) {

@@ -196,8 +196,13 @@ func DecodeCatalogNextRouteID(raw []byte) (uint64, error) {
 
 // EncodeRouteDescriptor serializes a route descriptor record.
 func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
+	raw, _, err := encodeRouteDescriptorWithSplitAtHLCOffset(route)
+	return raw, err
+}
+
+func encodeRouteDescriptorWithSplitAtHLCOffset(route RouteDescriptor) ([]byte, uint64, error) {
 	if err := validateRouteDescriptor(route); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	out := make([]byte, 0, routeDescriptorEncodedSize(route))
@@ -221,12 +226,13 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 		out = append(out, route.End...)
 	}
 
+	splitAtHLCOffset := uint64(len(out))
 	if version == catalogRouteCodecVersionV3 {
 		out = appendRouteDescriptorV3Tail(out, route)
 	} else {
 		out = appendU64(out, route.SplitAtHLC)
 	}
-	return out, nil
+	return out, splitAtHLCOffset, nil
 }
 
 func EncodeRouteDescriptorForCatalogWrite(route RouteDescriptor, allowV2 bool) ([]byte, error) {
@@ -234,6 +240,15 @@ func EncodeRouteDescriptorForCatalogWrite(route RouteDescriptor, allowV2 bool) (
 		return nil, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
 	}
 	return EncodeRouteDescriptor(route)
+}
+
+// EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset serializes a route
+// descriptor and returns the byte offset of its SplitAtHLC field.
+func EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(route RouteDescriptor, allowV2 bool) ([]byte, uint64, error) {
+	if routeDescriptorRequiresV2(route) && !allowV2 {
+		return nil, 0, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
+	}
+	return encodeRouteDescriptorWithSplitAtHLCOffset(route)
 }
 
 // DecodeRouteDescriptor deserializes a route descriptor record.

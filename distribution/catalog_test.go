@@ -3,6 +3,7 @@ package distribution
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"math"
 	"testing"
 
@@ -354,6 +355,57 @@ func TestRouteDescriptorHelpersIncludeExtensionFields(t *testing.T) {
 	withoutSplitAt.SplitAtHLC++
 	if routeDescriptorEqual(route, withoutSplitAt) {
 		t.Fatal("expected SplitAtHLC difference to compare unequal")
+	}
+}
+
+func TestRouteDescriptorSplitAtHLCPatchOffsetPreservesV3Fields(t *testing.T) {
+	route := RouteDescriptor{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                1,
+		State:                  RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         42,
+		MinWriteTSExclusive:    99,
+	}
+	raw, offset, err := EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(route, true)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	binary.BigEndian.PutUint64(raw[offset:offset+catalogUint64Bytes], 123)
+
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode route: %v", err)
+	}
+	if got.SplitAtHLC != 123 {
+		t.Fatalf("expected split HLC 123, got %d", got.SplitAtHLC)
+	}
+	if got.MigrationJobID != route.MigrationJobID || got.MinWriteTSExclusive != route.MinWriteTSExclusive || got.StagedVisibilityActive != route.StagedVisibilityActive {
+		t.Fatalf("patch changed V3 migration fields: got %+v", got)
+	}
+}
+
+func TestRouteDescriptorSplitAtHLCPatchOffsetSupportsV2(t *testing.T) {
+	raw, offset, err := EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(RouteDescriptor{
+		RouteID:    1,
+		Start:      []byte("a"),
+		End:        []byte("m"),
+		GroupID:    1,
+		State:      RouteStateActive,
+		SplitAtHLC: 7,
+	}, true)
+	if err != nil {
+		t.Fatalf("encode route: %v", err)
+	}
+	binary.BigEndian.PutUint64(raw[offset:offset+catalogUint64Bytes], 123)
+	got, err := DecodeRouteDescriptor(raw)
+	if err != nil {
+		t.Fatalf("decode route: %v", err)
+	}
+	if got.SplitAtHLC != 123 {
+		t.Fatalf("expected split HLC 123, got %d", got.SplitAtHLC)
 	}
 }
 
