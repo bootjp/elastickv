@@ -136,6 +136,9 @@ func IsStreamEntryKey(key []byte) bool {
 // math.MaxUint32 cannot wrap (uint32(wideColKeyLenSize)+ukLen) and pass a
 // false negative, which would then panic on the trimmed[lo:hi] slice below.
 func ExtractStreamUserKeyFromMeta(key []byte) []byte {
+	if !bytes.HasPrefix(key, streamMetaPrefixBytes) {
+		return nil
+	}
 	trimmed := bytes.TrimPrefix(key, streamMetaPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize {
 		return nil
@@ -147,12 +150,21 @@ func ExtractStreamUserKeyFromMeta(key []byte) []byte {
 	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
 }
 
+// ExtractStreamUserKeyFromEntryScanPrefix extracts the logical user key from
+// the prefix used to scan all entries for a stream.
+func ExtractStreamUserKeyFromEntryScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, streamEntryPrefixBytes, 0, false)
+}
+
 // ExtractStreamUserKeyFromEntry extracts the logical user key from a stream entry key.
 //
 // See ExtractStreamUserKeyFromMeta for the rationale of the uint64 bounds
 // check; the entry variant additionally has to account for the trailing
 // StreamIDBytes (16 bytes) suffix.
 func ExtractStreamUserKeyFromEntry(key []byte) []byte {
+	if !bytes.HasPrefix(key, streamEntryPrefixBytes) {
+		return nil
+	}
 	trimmed := bytes.TrimPrefix(key, streamEntryPrefixBytes)
 	if len(trimmed) < wideColKeyLenSize+StreamIDBytes {
 		return nil

@@ -98,9 +98,12 @@ type txnValue struct {
 }
 
 type stringReplacement struct {
-	key   []byte
-	value []byte
-	ttl   *time.Time
+	key               []byte
+	value             []byte
+	ttl               *time.Time
+	rawTyp            redisValueType
+	rawTypKnown       bool
+	rawPrefixedString bool
 }
 
 type txnContext struct {
@@ -142,7 +145,12 @@ type listTxnState struct {
 	deleted        bool
 	purge          bool
 	purgeMeta      store.ListMeta
-	existingDeltas [][]byte // delta key bytes present at load time; deleted on purge/delete
+	existingDeltas []listDeltaRef // delta keys present at load time; deleted on purge/delete
+}
+
+type listDeltaRef struct {
+	key     []byte
+	groupID uint64
 }
 
 type hashTxnState struct {
@@ -356,18 +364,33 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// truncation: if >MaxDeltaScanLimit deltas exist the transaction cannot
 	// safely enumerate all of them for deletion, so we return ErrDeltaScanTruncated
 	// and let the caller retry after the background compactor has caught up.
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if len(deltaKVs) > store.MaxDeltaScanLimit {
-		return nil, ErrDeltaScanTruncated
-	}
-	existingDeltas := make([][]byte, 0, len(deltaKVs))
-	for _, kv := range deltaKVs {
-		existingDeltas = append(existingDeltas, kv.Key)
+	var existingDeltas []listDeltaRef
+	acceptedDeltas := 0
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		deltaKVs, truncated, err := scanAcceptedDeltaKVsAt(
+			ctx,
+			t.server.store,
+			deltaPrefix,
+			store.MaxDeltaScanLimit,
+			t.startTS,
+			listTxnDeltaFilter(key, deltaPrefix),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if truncated {
+			return nil, ErrDeltaScanTruncated
+		}
+		for _, kv := range deltaKVs {
+			acceptedDeltas++
+			if acceptedDeltas > store.MaxDeltaScanLimit {
+				return nil, ErrDeltaScanTruncated
+			}
+			existingDeltas = append(existingDeltas, listDeltaRef{
+				key:     bytes.Clone(kv.Key),
+				groupID: kv.RouteGroupID,
+			})
+		}
 	}
 
 	st := &listTxnState{
@@ -393,6 +416,15 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	}
 
 	return st, nil
+}
+
+func listTxnDeltaFilter(key []byte, deltaPrefix []byte) func(*store.KVPair) bool {
+	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return nil
+	}
+	return func(pair *store.KVPair) bool {
+		return legacyListDeltaPairForUserKey(pair, key)
+	}
 }
 
 func (t *txnContext) loadHashStateForFields(key []byte, fields [][]byte) (*hashTxnState, error) {
@@ -615,18 +647,48 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 }
 
 func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
+	view, err := t.stagedKeyTypeView(key)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	return view.typ, nil
+}
+
+type txnKeyTypeView struct {
+	typ         redisValueType
+	rawTyp      redisValueType
+	rawTypKnown bool
+}
+
+func (t *txnContext) stagedKeyTypeView(key []byte) (txnKeyTypeView, error) {
 	k := string(key)
-	if _, ok := t.replacers[k]; ok {
-		return redisTypeString, nil
+	if repl, ok := t.replacers[k]; ok {
+		return txnKeyTypeView{
+			typ:         redisTypeString,
+			rawTyp:      repl.rawTyp,
+			rawTypKnown: repl.rawTypKnown,
+		}, nil
 	}
 	if typ, ok := t.stagedPositiveKeyType(k); ok {
-		return typ, nil
+		return txnKeyTypeView{typ: typ}, nil
 	}
 	if t.hasStagedTypeDeletion(k) {
-		return redisTypeNone, nil
+		return txnKeyTypeView{typ: redisTypeNone}, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	rawTyp, err := t.server.rawKeyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return txnKeyTypeView{}, err
+	}
+	typ, err := t.server.applyTTLFilter(t.ctxOrBackground(), key, t.startTS, rawTyp)
+	if err != nil {
+		return txnKeyTypeView{}, err
+	}
+	return txnKeyTypeView{
+		typ:         typ,
+		rawTyp:      rawTyp,
+		rawTypKnown: true,
+	}, nil
 }
 
 func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {
@@ -719,10 +781,11 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	typ, err := t.stagedKeyType(cmd.Args[1])
+	typeView, err := t.stagedKeyTypeView(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
+	typ := typeView.typ
 
 	// NX/XX: skip the write if the key-existence condition is not met.
 	exists := typ != redisTypeNone
@@ -737,7 +800,12 @@ func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
-	t.stageStringReplacement(cmd.Args[1], cmd.Args[2], opts.ttl)
+	t.trackWideCollectionFenceReads(cmd.Args[1])
+	rawPrefixedString, err := t.rawPrefixedStringAtStart(cmd.Args[1], typeView)
+	if err != nil {
+		return redisResult{}, err
+	}
+	t.stageStringReplacementWithRawType(cmd.Args[1], cmd.Args[2], opts.ttl, typeView.rawTyp, typeView.rawTypKnown, rawPrefixedString)
 	return applySetResult(opts, oldValue), nil
 }
 
@@ -775,17 +843,47 @@ func cloneTimePtr(in *time.Time) *time.Time {
 }
 
 func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
+	t.stageStringReplacementWithRawType(key, value, ttl, redisTypeNone, false, false)
+}
+
+func (t *txnContext) stageStringReplacementWithRawType(key, value []byte, ttl *time.Time, rawTyp redisValueType, rawTypKnown bool, rawPrefixedString bool) {
 	if t.replacers == nil {
 		t.replacers = map[string]*stringReplacement{}
 	}
 	k := string(key)
-	t.replacers[k] = &stringReplacement{
-		key:   bytes.Clone(key),
-		value: bytes.Clone(value),
-		ttl:   cloneTimePtr(ttl),
+	if repl, ok := t.replacers[k]; ok {
+		repl.value = bytes.Clone(value)
+		repl.ttl = cloneTimePtr(ttl)
+		if rawTypKnown {
+			repl.rawTyp = rawTyp
+			repl.rawTypKnown = true
+			repl.rawPrefixedString = rawPrefixedString
+		}
+		delete(t.deletedKeys, k)
+		return
 	}
+	repl := &stringReplacement{
+		key:               bytes.Clone(key),
+		value:             bytes.Clone(value),
+		ttl:               cloneTimePtr(ttl),
+		rawTyp:            rawTyp,
+		rawTypKnown:       rawTypKnown,
+		rawPrefixedString: rawPrefixedString,
+	}
+	t.replacers[k] = repl
 	delete(t.deletedKeys, k)
 	delete(t.collectionExpireTypes, k)
+}
+
+func (t *txnContext) rawPrefixedStringAtStart(key []byte, view txnKeyTypeView) (bool, error) {
+	if !view.rawTypKnown || view.rawTyp != redisTypeString {
+		return false, nil
+	}
+	exists, err := t.server.store.ExistsAt(t.ctxOrBackground(), redisStrKey(key), t.startTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
 }
 
 func (t *txnContext) updateStringReplacementTTL(key []byte, ttl *time.Time) bool {
@@ -1625,11 +1723,13 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 	for _, k := range keys {
 		repl := t.replacers[k]
 		t.trackWideCollectionFenceReads(repl.key)
-		deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
-		if err != nil {
-			return nil, err
+		if repl.needsFullLogicalDelete() {
+			deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, deleteElems...)
 		}
-		elems = append(elems, deleteElems...)
 		elems = append(elems, redisTxnWideCollectionFenceElems(repl.key)...)
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -1643,6 +1743,16 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(repl.key), Value: encodeRedisTTL(*repl.ttl)})
 	}
 	return elems, nil
+}
+
+func (r *stringReplacement) needsFullLogicalDelete() bool {
+	if !r.rawTypKnown {
+		return true
+	}
+	if r.rawTyp == redisTypeString {
+		return !r.rawPrefixedString
+	}
+	return isNonStringCollectionType(r.rawTyp)
 }
 
 func (t *txnContext) buildLogicalDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
@@ -1840,7 +1950,7 @@ func appendListDeletionElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTx
 	}
 	// Delete existing delta keys so they do not survive logical delete/purge.
 	for _, dk := range st.existingDeltas {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk.key, GroupID: dk.groupID})
 	}
 	elems = append(elems, redisTxnWideListFenceElem(userKey))
 	return elems
@@ -2516,12 +2626,10 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		// iteration rebuilds from a fresh snapshot.
 		return nil, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): the reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine).
-	if isRetryableRedisTxnErr(dispErr) {
+	// Still ambiguous (lock / other retryable): the reuse may itself have
+	// landed, so the next retry must probe THIS commit_ts. Route-fence
+	// rejections are retryable but pre-apply, so keep the older witness.
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return nil, false, errors.WithStack(dispErr)
@@ -2653,12 +2761,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		// write set instead of replaying the EXEC body from a new snapshot.
 		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt for reuse if retryRedisWrite will
-		// actually loop. Mirrors listPushCoreWithDedup's gating
-		// rationale — errors that escape the loop (transient-leader,
-		// context deadline, FSM apply error) leave pending pointing at
-		// state wasted with the goroutine; ambiguous errors that
-		// escape to the client are out of scope for this loop.
-		if isRetryableRedisTxnErr(dispErr) {
+		// actually loop and the attempt may have landed. Mirrors
+		// listPushCoreWithDedup's gating rationale; route-fence
+		// rejections are retryable but pre-apply.
+		if shouldPreserveRedisTxnAttempt(dispErr) {
 			return nil, &reusableExecTxn{
 				elems:    prepared.elems,
 				startTS:  txn.startTS,

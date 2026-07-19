@@ -899,6 +899,32 @@ func TestDeltaCompactor_DoesNotInheritStaleTTLBeforeDeltaOnlyRecreate(t *testing
 			},
 		},
 		{
+			name:    "list-legacy",
+			key:     []byte("ttl:compact:recreate:list-legacy"),
+			metaKey: store.ListMetaKey,
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("a"), 3, 0))
+				deltaKey := legacyListMetaDeltaKey(key, 3)
+				require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+			},
+			build: func(t *testing.T, c *DeltaCompactor, st store.MVCCStore, key []byte, readTS uint64) []*kv.Elem[kv.OP] {
+				t.Helper()
+				prefix := store.LegacyListMetaDeltaScanPrefix(key)
+				deltas, err := st.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), 10, readTS)
+				require.NoError(t, err)
+				elems, err := c.buildLegacyListCompactElems(ctx, key, deltas, readTS)
+				require.NoError(t, err)
+				return elems
+			},
+			readMeta: func(t *testing.T, raw []byte) (int64, uint64) {
+				t.Helper()
+				meta, err := store.UnmarshalListMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
 			name:    "hash",
 			key:     []byte("ttl:compact:recreate:hash"),
 			metaKey: store.HashMetaKey,
@@ -1187,6 +1213,7 @@ func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
 
 	wantPrefixes := []string{
 		store.ListMetaDeltaPrefix,
+		store.LegacyListMetaDeltaPrefix,
 		store.HashMetaDeltaPrefix,
 		store.SetMetaDeltaPrefix,
 		store.ZSetMetaDeltaPrefix,
@@ -1239,6 +1266,42 @@ func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {
 	for _, dk := range [][]byte{d1Key, d2Key, d3Key} {
 		_, getErr := st.GetAt(ctx, dk, readTS)
 		require.ErrorIs(t, getErr, store.ErrKeyNotFound, "delta key should be deleted after compaction: %s", dk)
+	}
+}
+
+func TestDeltaCompactor_LegacyListDeltaFoldedIntoBaseMeta(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("legacy-list")
+
+	baseMeta := store.ListMeta{Head: 5, Len: 2}
+	baseMeta.Tail = baseMeta.Head + baseMeta.Len
+	metaBytes, err := store.MarshalListMeta(baseMeta)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), metaBytes, 1, 0))
+
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 2})
+	d1Key := legacyListMetaDeltaKey(userKey, 10)
+	d2Key := legacyListMetaDeltaKey(userKey, 11)
+	require.NoError(t, st.PutAt(ctx, d1Key, delta, 10, 0))
+	require.NoError(t, st.PutAt(ctx, d2Key, delta, 11, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	require.NoError(t, err)
+	got, err := store.UnmarshalListMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), got.Head)
+	require.Equal(t, int64(6), got.Len)
+	require.Equal(t, int64(9), got.Tail)
+
+	for _, dk := range [][]byte{d1Key, d2Key} {
+		_, getErr := st.GetAt(ctx, dk, readTS)
+		require.ErrorIs(t, getErr, store.ErrKeyNotFound, "legacy delta key should be deleted after compaction: %s", dk)
 	}
 }
 
@@ -1428,6 +1491,121 @@ func TestDeltaCompactor_ListNoBaseMeta(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	_, err = st.GetAt(ctx, d2Key, readTS)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredRawRows(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i <= deltaCompactorTickScanLimit; i++ {
+		userKey := deltaLookingListMetaUserKeyAt([]byte("compactor-collision"), i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), meta, i, 0))
+	}
+
+	h := c.legacyListHandler()
+	readTS := st.LastCommitTS()
+	require.NoError(t, c.compactHandler(ctx, h, readTS))
+
+	c.cursorMu.Lock()
+	got := bytes.Clone(c.cursors[h.typeName])
+	c.cursorMu.Unlock()
+	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt([]byte("compactor-collision"), deltaCompactorTickScanLimit, 0)), got)
+}
+
+func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredTailAfterBacktrack(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("compactor-tail")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	acceptedKey := legacyListMetaDeltaKey(userKey, 1)
+	require.NoError(t, st.PutAt(ctx, acceptedKey, delta, 1, 0))
+
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(2); i <= deltaCompactorTickScanLimit; i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(userKey, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), meta, i, 0))
+	}
+
+	h := c.legacyListHandler()
+	readTS := st.LastCommitTS()
+	require.NoError(t, c.compactHandler(ctx, h, readTS))
+
+	c.cursorMu.Lock()
+	got := bytes.Clone(c.cursors[h.typeName])
+	c.cursorMu.Unlock()
+	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt(userKey, deltaCompactorTickScanLimit, 0)), got)
+	_, err = st.GetAt(ctx, acceptedKey, readTS)
+	require.NoError(t, err)
+}
+
+func TestDeltaCompactor_LegacyListCursorAdvancesPastRejectedPrefixBeforeAcceptedTail(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("compactor-tail-after-prefix")
+	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i < deltaCompactorTickScanLimit; i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(userKey, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), meta, i, 0))
+	}
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	acceptedKey := legacyListMetaDeltaKey(userKey, deltaCompactorTickScanLimit)
+	require.NoError(t, st.PutAt(ctx, acceptedKey, delta, deltaCompactorTickScanLimit, 0))
+
+	h := c.legacyListHandler()
+	readTS := st.LastCommitTS()
+	require.NoError(t, c.compactHandler(ctx, h, readTS))
+
+	c.cursorMu.Lock()
+	got := bytes.Clone(c.cursors[h.typeName])
+	c.cursorMu.Unlock()
+	require.Equal(t, store.ListMetaKey(deltaLookingListMetaUserKeyAt(userKey, deltaCompactorTickScanLimit-1, 0)), got)
+	_, err = st.GetAt(ctx, acceptedKey, readTS)
+	require.NoError(t, err)
+}
+
+func TestDeltaCompactor_CursorBacktracksBeforeWholeAcceptedTail(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("compactor-accepted-tail")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	d1 := legacyListMetaDeltaKey(userKey, 1)
+	d2 := legacyListMetaDeltaKey(userKey, 2)
+	rawKVs := []*store.KVPair{
+		{Key: d1, Value: delta},
+		{Key: d2, Value: delta},
+	}
+
+	got := deltaCompactorCursorAfterFiltering(rawKVs, rawKVs, nil, true, store.ExtractLegacyListUserKeyFromDelta)
+	require.Nil(t, got)
+}
+
+func TestDeltaCompactor_ListDeltaDeletesPreserveScanRouteGroup(t *testing.T) {
+	t.Parallel()
+
+	_, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	userKey := []byte("compactor-route-group")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	d1 := legacyListMetaDeltaKey(userKey, 1)
+	d2 := legacyListMetaDeltaKey(userKey, 2)
+
+	elems, err := c.buildListCompactElems(ctx, userKey, []*store.KVPair{
+		{Key: d1, Value: delta, RouteGroupID: 7},
+		{Key: d2, Value: delta, RouteGroupID: 7},
+	}, 3)
+	require.NoError(t, err)
+	require.Zero(t, elems[0].GroupID)
+	require.Equal(t, uint64(7), requireElemByKey(t, elems, d1).GroupID)
+	require.Equal(t, uint64(7), requireElemByKey(t, elems, d2).GroupID)
 }
 
 // TestDeltaCompactor_UrgentCompactionTriggeredByChannel verifies that a request

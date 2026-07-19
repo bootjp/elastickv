@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,6 +23,9 @@ const (
 	sentryFlushTimeout          = 2 * time.Second
 	metricsShutdownTimeout      = 5 * time.Second
 	secondaryConcurrencyDivisor = 2
+	elasticKVScriptConcurrency  = 1
+	elasticKVDispatchTimeout    = 10 * time.Second
+	backendTimeoutGrace         = time.Second
 )
 
 func main() {
@@ -57,6 +61,8 @@ func run() error {
 	flag.StringVar(&cfg.SentryEnv, "sentry-env", cfg.SentryEnv, "Sentry environment")
 	flag.Float64Var(&cfg.SentrySampleRate, "sentry-sample", cfg.SentrySampleRate, "Sentry sample rate")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", cfg.MetricsAddr, "Prometheus metrics address")
+	flag.StringVar(&cfg.PProfAddr, "pprof", cfg.PProfAddr, "pprof listen address (empty = disabled)")
+	flag.BoolVar(&cfg.RedisOnlyRaw, "redis-only-raw", cfg.RedisOnlyRaw, "Use raw TCP bridging in redis-only mode")
 	flag.Parse()
 
 	mode, err := parseRuntimeOptions(modeStr, primaryPoolSize, elasticKVPoolSize, secondaryWriteConcurrency, secondaryScriptConcurrency)
@@ -78,33 +84,12 @@ func run() error {
 	sentryReporter := proxy.NewSentryReporter(cfg.SentryDSN, cfg.SentryEnv, cfg.SentrySampleRate, logger)
 	defer sentryReporter.Flush(sentryFlushTimeout)
 
-	// Prometheus
 	reg := prometheus.NewRegistry()
 	metrics := proxy.NewProxyMetrics(reg)
 
-	// Backends
-	primaryOpts := proxy.DefaultBackendOptions()
-	primaryOpts.DB = cfg.PrimaryDB
-	primaryOpts.Password = cfg.PrimaryPassword
-	primaryOpts.PoolSize = primaryPoolSize
-	secondaryOpts := proxy.DefaultElasticKVBackendOptions()
-	secondaryOpts.DB = cfg.SecondaryDB
-	secondaryOpts.Password = cfg.SecondaryPassword
-	secondaryOpts.PoolSize = elasticKVPoolSize
-
-	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
-	if len(secondarySeeds) == 0 {
-		return fmt.Errorf("at least one secondary address is required")
-	}
-
-	var primary, secondary proxy.Backend
-	switch cfg.Mode {
-	case proxy.ModeElasticKVPrimary, proxy.ModeElasticKVOnly:
-		primary = proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger)
-		secondary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
-	case proxy.ModeRedisOnly, proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
-		primary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
-		secondary = proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger)
+	primary, secondary, err := newBackends(cfg, primaryPoolSize, elasticKVPoolSize, logger)
+	if err != nil {
+		return err
 	}
 	defer primary.Close()
 	defer secondary.Close()
@@ -117,36 +102,112 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Start metrics server
-	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-		var lc net.ListenConfig
-		ln, err := lc.Listen(ctx, "tcp", cfg.MetricsAddr)
-		if err != nil {
-			logger.Error("metrics listen failed", "addr", cfg.MetricsAddr, "err", err)
-			return
-		}
-		metricsSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
-		go func() {
-			<-ctx.Done()
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
-			defer shutdownCancel()
-			if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-				logger.Warn("metrics server shutdown error", "err", err)
-			}
-		}()
-		logger.Info("metrics server starting", "addr", cfg.MetricsAddr)
-		if err := metricsSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			logger.Error("metrics server error", "err", err)
-		}
-	}()
+	go serveMetrics(ctx, cfg.MetricsAddr, reg, logger)
+
+	if cfg.PProfAddr != "" {
+		go servePProf(ctx, cfg.PProfAddr, logger)
+	}
 
 	// Start proxy
 	if err := srv.ListenAndServe(ctx); err != nil {
 		return fmt.Errorf("proxy server: %w", err)
 	}
 	return nil
+}
+
+func newBackends(cfg proxy.ProxyConfig, primaryPoolSize, elasticKVPoolSize int, logger *slog.Logger) (proxy.Backend, proxy.Backend, error) {
+	primaryOpts := proxy.DefaultBackendOptions()
+	primaryOpts.DB = cfg.PrimaryDB
+	primaryOpts.Password = cfg.PrimaryPassword
+	primaryOpts.PoolSize = primaryPoolSize
+	secondaryOpts := proxy.DefaultElasticKVBackendOptions()
+	secondaryOpts.DB = cfg.SecondaryDB
+	secondaryOpts.Password = cfg.SecondaryPassword
+	secondaryOpts.PoolSize = elasticKVPoolSize
+	alignElasticKVBackendTimeouts(&secondaryOpts, cfg.SecondaryTimeout)
+
+	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
+
+	switch cfg.Mode {
+	case proxy.ModeElasticKVPrimary:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
+		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
+			proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts), nil
+	case proxy.ModeElasticKVOnly:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
+		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
+			proxy.NewNoopBackend("redis"), nil
+	case proxy.ModeRedisOnly:
+		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
+			proxy.NewNoopBackend("elastickv"), nil
+	case proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
+		if len(secondarySeeds) == 0 {
+			return nil, nil, fmt.Errorf("at least one secondary address is required")
+		}
+		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
+			proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger), nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported mode: %s", cfg.Mode.String())
+	}
+}
+
+func alignElasticKVBackendTimeouts(opts *proxy.BackendOptions, operationTimeout time.Duration) {
+	if opts == nil {
+		return
+	}
+	floor := elasticKVDispatchTimeout
+	if operationTimeout > floor {
+		floor = operationTimeout
+	}
+	floor += backendTimeoutGrace
+	if opts.ReadTimeout > 0 && opts.ReadTimeout < floor {
+		opts.ReadTimeout = floor
+	}
+	if opts.WriteTimeout > 0 && opts.WriteTimeout < floor {
+		opts.WriteTimeout = floor
+	}
+}
+
+func serveMetrics(ctx context.Context, addr string, reg *prometheus.Registry, logger *slog.Logger) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	serveHTTP(ctx, addr, mux, "metrics", logger)
+}
+
+func servePProf(ctx context.Context, addr string, logger *slog.Logger) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	serveHTTP(ctx, addr, mux, "pprof", logger)
+}
+
+func serveHTTP(ctx context.Context, addr string, handler http.Handler, name string, logger *slog.Logger) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		logger.Error(name+" listen failed", "addr", addr, "err", err)
+		return
+	}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn(name+" server shutdown error", "err", err)
+		}
+	}()
+	logger.Info(name+" server starting", "addr", addr)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		logger.Error(name+" server error", "err", err)
+	}
 }
 
 func parseRuntimeOptions(modeStr string, primaryPoolSize, elasticKVPoolSize, secondaryWriteConcurrency, secondaryScriptConcurrency int) (proxy.ProxyMode, error) {
@@ -175,6 +236,9 @@ func deriveSecondaryConcurrency(mode proxy.ProxyMode, primaryPoolSize, elasticKV
 	}
 	if scriptConcurrency == 0 {
 		scriptConcurrency = defaultSecondaryScriptConcurrency(writeConcurrency)
+		if mode != proxy.ModeElasticKVPrimary && scriptConcurrency > elasticKVScriptConcurrency {
+			scriptConcurrency = elasticKVScriptConcurrency
+		}
 	}
 	return writeConcurrency, scriptConcurrency
 }

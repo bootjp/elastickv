@@ -340,6 +340,36 @@ func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(55), st.scanReadRouteVersion)
 }
 
+func TestGRPCServer_ReadsHonorStartupGate(t *testing.T) {
+	t.Parallel()
+
+	blocked := true
+	s := NewGRPCServer(store.NewMVCCStore(), nil, WithGRPCReadGate(func() bool { return blocked }))
+	ctx := context.Background()
+
+	_, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{Limit: 10, Ts: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.Get(ctx, &pb.GetRequest{Key: []byte("k")})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	blocked = false
+	_, err = s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+	require.NoError(t, err)
+	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
+	require.NoError(t, err)
+}
+
 func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
 	t.Parallel()
 

@@ -119,6 +119,102 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
+func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("x") // routes to group 2; raw !lst|* prefixes route to group 1.
+	for _, tc := range []struct {
+		name          string
+		key           []byte
+		scanStart     []byte
+		legacyRouting bool
+	}{
+		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTwoRouteShardStoreForScanTest()
+			deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+			if tc.legacyRouting {
+				require.NoError(t, st.groups[1].Store.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			} else {
+				require.NoError(t, st.PutAt(ctx, tc.key, deltaValue, 1, 0))
+			}
+
+			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
+func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTwoRouteShardStoreForScanTest()
+	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10, 1)
+	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11, 1)
+	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte(store.LegacyListMetaDeltaPrefix), store.PrefixScanEnd([]byte(store.LegacyListMetaDeltaPrefix)), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, leftKey, kvs[0].Key)
+	require.Equal(t, uint64(1), kvs[0].RouteGroupID)
+	require.Equal(t, rightKey, kvs[1].Key)
+	require.Equal(t, uint64(2), kvs[1].RouteGroupID)
+}
+
+func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		key       []byte
+		scanStart []byte
+	}{
+		{name: "hash field", key: store.HashFieldKey([]byte("x"), []byte("f")), scanStart: store.HashFieldScanPrefix([]byte("x"))},
+		{name: "hash delta", key: store.HashMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.HashMetaDeltaScanPrefix([]byte("x"))},
+		{name: "set member", key: store.SetMemberKey([]byte("x"), []byte("m")), scanStart: store.SetMemberScanPrefix([]byte("x"))},
+		{name: "set delta", key: store.SetMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.SetMetaDeltaScanPrefix([]byte("x"))},
+		{name: "zset member", key: store.ZSetMemberKey([]byte("x"), []byte("m")), scanStart: store.ZSetMemberScanPrefix([]byte("x"))},
+		{name: "zset score", key: store.ZSetScoreKey([]byte("x"), 1.5, []byte("m")), scanStart: store.ZSetScoreScanPrefix([]byte("x"))},
+		{name: "zset delta", key: store.ZSetMetaDeltaKey([]byte("x"), 10, 0), scanStart: store.ZSetMetaDeltaScanPrefix([]byte("x"))},
+		{name: "stream meta", key: store.StreamMetaKey([]byte("x")), scanStart: store.StreamMetaKey([]byte("x"))},
+		{name: "stream entry", key: store.StreamEntryKey([]byte("x"), 10, 0), scanStart: store.StreamEntryScanPrefix([]byte("x"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTwoRouteShardStoreForScanTest()
+			require.NoError(t, st.PutAt(ctx, tc.key, []byte("v"), 1, 0))
+
+			kvs, err := st.ScanAt(ctx, tc.scanStart, store.PrefixScanEnd(tc.scanStart), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
+func newTwoRouteShardStoreForScanTest() *ShardStore {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	return NewShardStore(engine, groups)
+}
+
 func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 
@@ -319,7 +415,7 @@ func TestShardStoreScanAtRoutesWideColumnPrefixesByUserKey(t *testing.T) {
 			require.NoError(t, st.PutAt(ctx, tc.key, []byte("value"), 20, 0))
 			kvs, err := st.ScanAt(ctx, tc.prefix, prefixScanEnd(tc.prefix), 10, 20)
 			require.NoError(t, err)
-			require.Equal(t, []*store.KVPair{{Key: tc.key, Value: []byte("value")}}, kvs)
+			require.Equal(t, []*store.KVPair{{Key: tc.key, Value: []byte("value"), RouteGroupID: 2}}, kvs)
 			_, err = groups[1].Store.GetAt(ctx, tc.key, 20)
 			require.ErrorIs(t, err, store.ErrKeyNotFound)
 		})

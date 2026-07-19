@@ -62,6 +62,34 @@ func (b *mockBackend) CallCount() int {
 	return len(b.calls)
 }
 
+func (b *mockBackend) Calls() [][]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([][]any, len(b.calls))
+	for i := range b.calls {
+		out[i] = append([]any(nil), b.calls[i]...)
+	}
+	return out
+}
+
+type refreshableMockBackend struct {
+	*mockBackend
+	refreshMu sync.Mutex
+	refreshes int
+}
+
+func (b *refreshableMockBackend) RefreshLeaderNow(ctx context.Context) {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	b.refreshes++
+}
+
+func (b *refreshableMockBackend) RefreshCount() int {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	return b.refreshes
+}
+
 // Helper to create a doFunc that returns a specific value.
 func makeCmd(val any, err error) func(ctx context.Context, args ...any) *redis.Cmd {
 	return func(ctx context.Context, args ...any) *redis.Cmd {
@@ -623,6 +651,234 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
 }
 
+func TestDualWriter_Blocking_ReplaysBZPopMinAsZRem(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{[]byte("queue"), []byte("job-1"), []byte("42")},
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{[]byte("queue"), []byte("job-1"), []byte("42")}, resp)
+	d.Close()
+
+	assert.Equal(t, [][]any{{[]byte("ZREM"), []byte("queue"), []byte("job-1")}}, secondary.Calls())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "ok")), 0.001)
+}
+
+func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		resp []any
+		want [][]any
+	}{
+		{
+			name: "BLPOP removes first matching element",
+			cmd:  "BLPOP",
+			resp: []any{[]byte("queue"), []byte("job-1")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(1), []byte("job-1")}},
+		},
+		{
+			name: "BRPOP removes last matching element",
+			cmd:  "BRPOP",
+			resp: []any{[]byte("queue"), []byte("job-2")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(-1), []byte("job-2")}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: tc.resp,
+			}
+			secondary := newMockBackend("secondary")
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, [][]byte{[]byte(tc.cmd), []byte("queue"), []byte("5")})
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, tc.want, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("LREM", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_ReplaysListMoveAsEval(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		args [][]byte
+		resp any
+		want []any
+	}{
+		{
+			name: "BRPOPLPUSH removes source tail and pushes destination head",
+			cmd:  "BRPOPLPUSH",
+			args: [][]byte{[]byte("BRPOPLPUSH"), []byte("source"), []byte("dest"), []byte("5")},
+			resp: []byte("job-1"),
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(-1),
+				[]byte("LEFT"),
+				[]byte("job-1"),
+			},
+		},
+		{
+			name: "BLMOVE mirrors requested source and destination sides",
+			cmd:  "BLMOVE",
+			args: [][]byte{
+				[]byte("BLMOVE"), []byte("source"), []byte("dest"),
+				[]byte("LEFT"), []byte("RIGHT"), []byte("5"),
+			},
+			resp: "job-2",
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(1),
+				[]byte("RIGHT"),
+				[]byte("job-2"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: tc.resp,
+			}
+			secondary := newMockBackend("secondary")
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, tc.args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, [][]any{tc.want}, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("EVAL", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_ReplaysBLMPopAsEval(t *testing.T) {
+	tests := []struct {
+		name string
+		args [][]byte
+		resp any
+		want []any
+	}{
+		{
+			name: "left pop removes returned values from head side",
+			args: [][]byte{
+				[]byte("BLMPOP"), []byte("5"), []byte("2"),
+				[]byte("queue-a"), []byte("queue-b"), []byte("LEFT"),
+				[]byte("COUNT"), []byte("2"),
+			},
+			resp: []any{[]byte("queue-b"), []any{[]byte("job-1"), []byte("job-2")}},
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMultiPopReplayScript,
+				int64(1),
+				[]byte("queue-b"),
+				int64(1),
+				[]byte("job-1"),
+				[]byte("job-2"),
+			},
+		},
+		{
+			name: "right pop removes returned values from tail side",
+			args: [][]byte{
+				[]byte("BLMPOP"), []byte("5"), []byte("1"),
+				[]byte("queue"), []byte("RIGHT"),
+			},
+			resp: []any{"queue", []string{"job-3"}},
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMultiPopReplayScript,
+				int64(1),
+				[]byte("queue"),
+				int64(-1),
+				[]byte("job-3"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: tc.resp,
+			}
+			secondary := newMockBackend("secondary")
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 10 * time.Second}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), "BLMPOP", tc.args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, [][]any{tc.want}, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("EVAL", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_XReadDoesNotUseWriteSemaphore(t *testing.T) {
+	primary := &timeoutCapturingBackend{name: "primary", returnValue: []any{}}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	blocker := make(chan struct{})
+	d.goWrite(func() {
+		<-blocker
+	})
+
+	resp, err := d.Blocking(context.Background(), "XREAD", [][]byte{
+		[]byte("XREAD"), []byte("BLOCK"), []byte("1"), []byte("STREAMS"), []byte("jobs"), []byte("0"),
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{}, resp)
+	assert.Empty(t, secondary.Calls())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+
+	close(blocker)
+	d.Close()
+}
+
 func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -688,7 +944,53 @@ func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
 	d.Close()
 }
 
-func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
+func TestDualWriter_Write_WaitsWhenWriteSemFull(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd("OK", nil)
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{Mode: ModeDualWrite, SecondaryWriteConcurrency: 1, SecondaryTimeout: 10 * time.Second}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	blocker := make(chan struct{})
+	d.goAsync(func() {
+		<-blocker
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_, err := d.Write(context.Background(), "SET", [][]byte{
+			[]byte("SET"), []byte("key"), []byte("value"),
+		})
+		assert.NoError(t, err)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("Write returned while the strict secondary write slot was full")
+	case <-time.After(100 * time.Millisecond):
+		// good: the primary succeeded, but strict secondary replay is applying backpressure.
+	}
+
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+
+	close(blocker)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Write did not complete after a secondary write slot was released")
+	}
+	assert.Equal(t, 1, secondary.CallCount())
+	d.Close()
+}
+
+func TestDualWriter_Script_WaitsWhenScriptSemFull(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -707,7 +1009,6 @@ func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 		})
 	}
 
-	// Script should return promptly even when scriptSem is full.
 	done := make(chan struct{})
 	go func() {
 		_, err := d.Script(context.Background(), "EVALSHA", [][]byte{
@@ -719,16 +1020,23 @@ func TestDualWriter_Script_DropsWhenScriptSemFull(t *testing.T) {
 
 	select {
 	case <-done:
-		// good — Script returned without blocking on a full scriptSem
-	case <-time.After(time.Second):
-		t.Fatal("Script blocked when script semaphore was full")
+		t.Fatal("Script returned while the strict script replay slot was full")
+	case <-time.After(100 * time.Millisecond):
+		// good: strict EVALSHA replay is applying backpressure instead of dropping.
 	}
 
-	// The async replay to secondary must be dropped.
 	assert.Equal(t, 0, secondary.CallCount())
-	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncBackpressure), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
 
 	close(blocker)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Script did not complete after a secondary script slot was released")
+	}
+	assert.Equal(t, 1, secondary.CallCount())
 	d.Close()
 }
 
@@ -1024,8 +1332,8 @@ func TestDualWriter_writeSecondary_RetriesReadTSCompacted(t *testing.T) {
 }
 
 func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T) {
-	// When the compacted error is persistent, the retry loop must stop after
-	// maxCompactedRetries+1 attempts so the secondary goroutine returns
+	// When the transient error is persistent, the retry loop must stop after
+	// maxSecondaryTransientRetries+1 attempts so the secondary goroutine returns
 	// instead of burning a scriptSem slot indefinitely.
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -1039,10 +1347,136 @@ func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T
 
 	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
 
-	assert.Equal(t, maxCompactedRetries+1, secondary.CallCount(),
-		"secondary must stop after maxCompactedRetries+1 attempts")
+	assert.Equal(t, maxSecondaryTransientRetries+1, secondary.CallCount(),
+		"secondary must stop after maxSecondaryTransientRetries+1 attempts")
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a persistent compacted error must still be reported as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_RetriesRetryLimitWriteConflict(t *testing.T) {
+	// A hot key can exhaust the secondary Redis adapter's internal OCC retry loop.
+	// Re-sending the command lets the backend choose a fresh timestamp and keeps
+	// dual-write traffic from permanently diverging on a transient conflict.
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	retryLimitErr := testRedisErr("redis txn retry limit exceeded: key: myzset: write conflict")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		if calls < 3 {
+			cmd.SetErr(retryLimitErr)
+			return cmd
+		}
+		cmd.SetVal("OK")
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("ZADD", []any{[]byte("ZADD"), []byte("myzset"), []byte("1"), []byte("member")})
+
+	assert.Equal(t, 3, calls, "secondary must retry transient retry-limit write conflicts")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a retried success must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_RetriesNotLeaderAfterRefresh(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
+	notLeaderErr := testRedisErr("NOTLEADER etcd raft engine is not leader")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		if calls == 1 {
+			cmd.SetErr(notLeaderErr)
+			return cmd
+		}
+		cmd.SetVal("OK")
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 2, calls, "secondary must retry after a not-leader rejection")
+	assert.Equal(t, 1, secondary.RefreshCount(), "not-leader retries must force leader rediscovery before retrying")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a refreshed retry success must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondary_DoesNotRetryUserNotLeaderError(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := &refreshableMockBackend{mockBackend: newMockBackend("secondary")}
+	userErr := testRedisErr("ERR raft engine: not leader")
+	var calls int
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		calls++
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(userErr)
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary("EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 1, calls, "user Redis not-leader text must not be retried")
+	assert.Equal(t, 0, secondary.RefreshCount(), "user Redis not-leader text must not force rediscovery")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
+func TestIsElasticKVNotLeaderErrorClassifiesWireNotLeaderOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "redis wire notleader", err: testRedisErr("NOTLEADER raft engine: not leader"), want: true},
+		{name: "grpc wrapped no redis err prefix", err: errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"), want: true},
+		{name: "grpc wrapped etcd sentinel no redis err prefix", err: errors.New("rpc error: code = FailedPrecondition desc = etcd raft engine is not leader"), want: true},
+		{name: "bare leader not found", err: errors.New("leader not found"), want: true},
+		{name: "lua user err bare raft phrase", err: testRedisErr("raft engine: not leader"), want: false},
+		{name: "lua user err bare etcd phrase", err: testRedisErr("etcd raft engine is not leader"), want: false},
+		{name: "lua user err exact raft phrase", err: testRedisErr("ERR raft engine: not leader"), want: false},
+		{name: "lua user err etcd phrase", err: testRedisErr("ERR etcd raft engine is not leader"), want: false},
+		{name: "lua user err leader not found", err: testRedisErr("ERR leader not found"), want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isElasticKVNotLeaderError(tc.err))
+		})
+	}
+}
+
+func TestDualWriter_ReplaySecondaryPipeline_RecordsReplyErrors(t *testing.T) {
+	primary := newMockBackend("primary")
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(testRedisErr("NOTLEADER etcd raft engine is not leader"))
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.replaySecondaryPipeline([][]any{{[]byte("MULTI")}, {[]byte("SET"), []byte("k"), []byte("v")}, {[]byte("EXEC")}})
+	d.Close()
+
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrorsByReason.WithLabelValues("PIPELINE", "not_leader")), 0.001)
 }
 
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {

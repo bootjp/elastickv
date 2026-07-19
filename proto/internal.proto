@@ -61,6 +61,12 @@ message Request {
   // is plumbing only — the FSM ignores the value, so all existing
   // callers see no behaviour change.
   uint64 observed_route_version = 6;
+  // write_fence_bypass_keys carries point keys whose target group was resolved
+  // outside the byte-route catalog, either by a partition resolver or an
+  // explicit maintenance pin. The FSM skips byte-route write-fence and owner
+  // checks only for those exact point mutations; prefixes and unmarked keys
+  // still fail closed.
+  repeated bytes write_fence_bypass_keys = 7;
 }
 
 message RaftCommand {

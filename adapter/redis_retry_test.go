@@ -550,6 +550,7 @@ func TestRetryPolicyForRedisTxnErr(t *testing.T) {
 
 	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(store.ErrWriteConflict))
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrTxnLocked))
+	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrRouteWriteFenced))
 }
 
 // TestZCard_LegacyBlobZSet verifies that ZCARD inside a Lua script returns the

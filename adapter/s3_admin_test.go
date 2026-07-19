@@ -264,6 +264,56 @@ func TestS3Server_AdminDeleteBucket_HappyPath(t *testing.T) {
 	require.False(t, exists)
 }
 
+func TestS3Server_AdminDeleteBucket_RetriesSafetyNetRouteFence(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := &bucketDeleteSafetyNetFenceCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		failuresRemaining:       1,
+	}
+	server := NewS3Server(nil, "", st, coord, nil)
+	ctx := context.Background()
+
+	summary, err := server.AdminCreateBucket(ctx,
+		fullAdminBucketsPrincipal(), "to-delete", s3AclPrivate)
+	require.NoError(t, err)
+	orphan := s3keys.RouteKey("to-delete", summary.Generation, "orphan")
+	_, err = coord.localAdapterCoordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: orphan, Value: []byte("orphan")}},
+	})
+	require.NoError(t, err)
+
+	err = server.AdminDeleteBucket(ctx,
+		fullAdminBucketsPrincipal(), "to-delete")
+	require.NoError(t, err)
+	require.Equal(t, 2, coord.safetyNetCalls)
+
+	_, err = st.GetAt(ctx, orphan, snapshotTS(coord.Clock(), st))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "safety-net retry must sweep the orphan before acknowledging delete")
+}
+
+func TestS3Server_AdminDeleteBucket_PropagatesPersistentSafetyNetRouteFence(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := &bucketDeleteSafetyNetFenceCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		failuresRemaining:       s3TxnRetryMaxAttempts,
+	}
+	server := NewS3Server(nil, "", st, coord, nil)
+	ctx := context.Background()
+
+	_, err := server.AdminCreateBucket(ctx,
+		fullAdminBucketsPrincipal(), "to-delete", s3AclPrivate)
+	require.NoError(t, err)
+
+	err = server.AdminDeleteBucket(ctx,
+		fullAdminBucketsPrincipal(), "to-delete")
+	require.ErrorIs(t, err, kv.ErrRouteWriteFenced)
+	require.Equal(t, s3TxnRetryMaxAttempts, coord.safetyNetCalls)
+}
+
 func TestS3Server_AdminDeleteBucket_MissingBucket(t *testing.T) {
 	t.Parallel()
 
@@ -273,6 +323,32 @@ func TestS3Server_AdminDeleteBucket_MissingBucket(t *testing.T) {
 	err := server.AdminDeleteBucket(context.Background(),
 		fullAdminBucketsPrincipal(), "no-such")
 	require.ErrorIs(t, err, ErrAdminBucketNotFound)
+}
+
+type bucketDeleteSafetyNetFenceCoordinator struct {
+	*localAdapterCoordinator
+	failuresRemaining int
+	safetyNetCalls    int
+}
+
+func (c *bucketDeleteSafetyNetFenceCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if req != nil && operationGroupHasDelPrefix(req.Elems) {
+		c.safetyNetCalls++
+		if c.failuresRemaining > 0 {
+			c.failuresRemaining--
+			return nil, kv.ErrRouteWriteFenced
+		}
+	}
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+func operationGroupHasDelPrefix(elems []*kv.Elem[kv.OP]) bool {
+	for _, elem := range elems {
+		if elem != nil && elem.Op == kv.DelPrefix {
+			return true
+		}
+	}
+	return false
 }
 
 func TestS3Server_AdminDeleteBucket_RejectsReadOnly(t *testing.T) {

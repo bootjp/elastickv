@@ -244,6 +244,12 @@ type Lifecycle interface {
 	Err() error
 }
 
+// StartupBarrier is an optional capability for engines that can report when
+// their local startup replay has drained far enough for user traffic.
+type StartupBarrier interface {
+	WaitStarted(ctx context.Context) error
+}
+
 type Admin interface {
 	LeaderView
 	StatusReader

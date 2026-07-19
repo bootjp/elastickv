@@ -126,19 +126,19 @@ func retryUntilRegistered(ctx context.Context, what string, fn func() error) err
 func setupDistributionAndRegistration(
 	runCtx context.Context,
 	eg *errgroup.Group,
-	runtimes []*raftGroupRuntime,
+	distCatalog *distribution.CatalogStore,
 	engine *distribution.Engine,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
 	w encryptionWriteWiring,
 	raftID string,
 	sidecarPath string,
-) (*distribution.CatalogStore, error) {
+) error {
 	if err := validateRaftRegistrationStartupEpoch(defaultGroup, w, raftID, sidecarPath); err != nil {
-		return nil, err
+		return err
 	}
 	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
-		return nil, err
+		return err
 	}
 	installRaftRegistrationVerifier(defaultGroup, w, raftID)
 	installRuntimeRaftRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID, sidecarPath)
@@ -153,11 +153,38 @@ func setupDistributionAndRegistration(
 	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
 	// Bootstrap + registration both run under runCtx so a shutdown
 	// cancels the bounded retry rather than hanging.
-	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)
-	if err != nil {
-		return nil, err
+	return ensureDistributionCatalogSnapshot(runCtx, distCatalog, engine)
+}
+
+func ensureDistributionCatalogSnapshot(
+	ctx context.Context,
+	distCatalog *distribution.CatalogStore,
+	engine *distribution.Engine,
+) error {
+	if distCatalog == nil {
+		return errors.New("distribution catalog store is not available")
 	}
-	return distCatalog, nil
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
+		return errors.Wrapf(err, "initialize distribution catalog")
+	}
+	return nil
 }
 
 func installRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w encryptionWriteWiring, raftID string) {

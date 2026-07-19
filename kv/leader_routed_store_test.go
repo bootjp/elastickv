@@ -432,3 +432,39 @@ func TestLeaderRoutedStore_GlobalLastCommitTS_FallsBackWhenNoLeader(t *testing.T
 	ts := s.GlobalLastCommitTS(ctx)
 	require.Equal(t, uint64(7), ts)
 }
+
+func TestLeaderRoutedStore_ExportVersionsUsesLinearizableFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+
+	coord := &stubLeaderCoordinator{isLeader: true, clock: NewHLC()}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	result, err := s.ExportVersions(ctx, store.ExportVersionsOptions{MaxVersions: 10})
+	require.NoError(t, err)
+	require.Len(t, result.Versions, 1)
+	require.Equal(t, []byte("k"), result.Versions[0].Key)
+	require.Equal(t, uint64(10), result.Versions[0].CommitTS)
+	require.Equal(t, 1, coord.linearizableCalls)
+}
+
+func TestLeaderRoutedStore_ExportVersionsFailsClosedWithoutFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+
+	coord := &stubLeaderCoordinator{isLeader: false, clock: NewHLC()}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	result, err := s.ExportVersions(ctx, store.ExportVersionsOptions{MaxVersions: 10})
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+	require.Empty(t, result.Versions)
+	require.Equal(t, 1, coord.linearizableCalls)
+}

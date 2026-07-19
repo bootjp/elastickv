@@ -126,6 +126,21 @@ func TestEngineApplySnapshot_PreservesMigrationRouteFields(t *testing.T) {
 		t.Fatalf("expected 1 intersecting route, got %d", len(intersections))
 	}
 	requireMigrationRouteFields(t, "GetIntersectingRoutes", intersections[0])
+
+	snapshot, ok := e.Current()
+	if !ok {
+		t.Fatal("expected current history snapshot")
+	}
+	historyRoute, ok := snapshot.RouteOf([]byte("m"))
+	if !ok {
+		t.Fatal("expected history route")
+	}
+	requireMigrationRouteFields(t, "RouteHistorySnapshot.RouteOf", historyRoute)
+	historyIntersections := snapshot.IntersectingRoutes([]byte("b"), []byte("c"))
+	if len(historyIntersections) != 1 {
+		t.Fatalf("expected 1 history intersecting route, got %d", len(historyIntersections))
+	}
+	requireMigrationRouteFields(t, "RouteHistorySnapshot.IntersectingRoutes", historyIntersections[0])
 }
 
 func requireMigrationRouteFields(t *testing.T, label string, route Route) {

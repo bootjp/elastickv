@@ -37,7 +37,7 @@ which is a different framing the decoder/encoder do not touch. See
 `2026_05_25_implemented_snapshot_logical_encoder.md` §"Why a separate
 design doc" item 3.
 
-Snapshots are taken automatically every `defaultSnapshotEvery = 10000`
+Snapshots are taken automatically every `defaultSnapshotEvery = 100000`
 log entries (`internal/raftengine/etcd/engine.go:92`) and stored under
 `{dataDir}/fsm-snap/<index>.fsm`. They are crash-consistent by
 construction — the writer takes a Pebble snapshot at the FSM's
@@ -608,7 +608,7 @@ bespoke parser, the format has failed its goal.
 - **Staleness.** Whatever was written between the snapshot's
   `applied_index` and "now" is not in the snapshot, so it is not in
   the decoded output. The gap is bounded by `SnapshotEvery × write_rate`
-  (default 10000 entries; for a write-heavy cluster, seconds; for a
+  (default 100000 entries; for a write-heavy cluster, minutes; for a
   quiet one, hours).
 - **Cadence is not user-controlled.** "Snapshot now" requires a Raft
   trigger; the decoder cannot create a fresh snapshot, only consume

@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -46,8 +47,12 @@ type dedupTestCoordinator struct {
 	// forwarding. It exercises adapter-side type restoration without changing
 	// the underlying landed-vs-not-landed scenario.
 	wireWriteConflicts bool
-	dispatches         int
-	probeNoOps         int
+	// routeFenceAtDispatch makes the named dispatch return ErrRouteWriteFenced
+	// before the FSM dedup probe or apply. It is retryable but cannot be
+	// treated as an ambiguous landing.
+	routeFenceAtDispatch int
+	dispatches           int
+	probeNoOps           int
 	// beforeDispatch, if set, runs at the start of each Dispatch with the
 	// 1-based dispatch number — lets a test inject a concurrent commit
 	// between the adapter's attempts.
@@ -62,22 +67,235 @@ func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bo
 	}
 }
 
+func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 10, Tail: 12, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 3})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 3)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(9), meta.Head)
+	require.Equal(t, int64(5), meta.Len)
+	require.Equal(t, int64(14), meta.Tail)
+}
+
+func TestResolveListMetaEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("list-delta-cap")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, i, 0), delta, i, 0))
+	}
+	legacyTS := uint64(store.MaxDeltaScanLimit + 1)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, legacyTS), delta, legacyTS, 0))
+
+	_, _, err := srv.resolveListMeta(ctx, key, legacyTS)
+	require.ErrorIs(t, err, ErrDeltaScanTruncated)
+}
+
+func TestResolveListMetaDoesNotTreatDeltaLookingMetaValueAsLegacyDelta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := deltaLookingListMetaUserKey([]byte("embedded"))
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, 2)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(4), meta.Head)
+	require.Equal(t, int64(2), meta.Len)
+	require.Equal(t, int64(6), meta.Tail)
+}
+
+func TestResolveListMetaIgnoresLegacyDeltaPrefixCollisionForMissingKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-collision")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), base, 1, 0))
+
+	_, exists, err := srv.resolveListMeta(ctx, key, 2)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+func TestResolveListMetaCountsOnlyAcceptedLegacyDeltasForTruncation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-collision-window")
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
+
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(2); i < uint64(store.MaxDeltaScanLimit+2); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	deltaTS := uint64(store.MaxDeltaScanLimit + 2)
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	meta, exists, err := srv.resolveListMeta(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, int64(2), meta.Len)
+}
+
+func TestProbeListTypeReadsLegacyDeltaPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+
+	typ, found, err := srv.probeListType(ctx, key, 3)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, redisTypeList, typ)
+}
+
+func TestProbeListTypeIgnoresLegacyDeltaPrefixCollision(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type-collision")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), base, 1, 0))
+
+	_, found, err := srv.probeListType(ctx, key, 2)
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+func TestProbeListTypePagesPastLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-type-page")
+	collidingMeta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	for i := uint64(1); i <= uint64(store.MaxDeltaScanLimit); i++ {
+		collidingUserKey := deltaLookingListMetaUserKeyAt(key, i, 0)
+		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), collidingMeta, i, 0))
+	}
+	deltaTS := uint64(store.MaxDeltaScanLimit + 1)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+
+	typ, found, err := srv.probeListType(ctx, key, deltaTS+1)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, redisTypeList, typ)
+}
+
+func TestDeleteListElemsFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	srv := &RedisServer{store: st}
+	key := []byte("legacy-list-delete")
+	collidingUserKey := deltaLookingListMetaUserKey(key)
+	base, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
+	require.NoError(t, err)
+	collidingMetaKey := store.ListMetaKey(collidingUserKey)
+	require.NoError(t, st.PutAt(ctx, collidingMetaKey, base, 1, 0))
+	deltaKey := legacyListMetaDeltaKey(key, 2)
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, deltaKey, delta, 2, 0))
+
+	elems, err := srv.deleteListElems(ctx, key, 3)
+	require.NoError(t, err)
+	deleted := make(map[string]struct{}, len(elems))
+	for _, elem := range elems {
+		if elem.Op == kv.Del {
+			deleted[string(elem.Key)] = struct{}{}
+		}
+	}
+	require.Contains(t, deleted, string(deltaKey))
+	require.NotContains(t, deleted, string(collidingMetaKey))
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], 0)
+	return append(key, seq[:]...)
+}
+
+func deltaLookingListMetaUserKey(fakeUserKey []byte) []byte {
+	return deltaLookingListMetaUserKeyAt(fakeUserKey, 7, 1)
+}
+
+func deltaLookingListMetaUserKeyAt(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.dispatches++
 	n := c.dispatches
 	if c.beforeDispatch != nil {
 		c.beforeDispatch(n)
 	}
+	if c.shouldRouteFence(n) {
+		return nil, kv.ErrRouteWriteFenced
+	}
 	if handled, resp, err := c.maybeProbe(ctx, req); handled {
 		return resp, err
 	}
-	if n == c.ambiguousDispatch && !c.ambiguousLands {
-		// OCC-style pre-reject: nothing is written, definitely did not land.
-		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
-	}
-	if n == c.txnLockedAtDispatch {
-		// Ambiguous lock error, nothing written: definitely did not land.
-		return nil, kv.ErrTxnLocked
+	if err := c.preApplyError(n); err != nil {
+		return nil, c.maybeWireWriteConflict(req, err)
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
@@ -106,6 +324,21 @@ func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.
 		key = minElemKey(req.Elems)
 	}
 	return status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
+}
+
+func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {
+	return dispatch == c.routeFenceAtDispatch
+}
+
+func (c *dedupTestCoordinator) preApplyError(dispatch int) error {
+	switch {
+	case dispatch == c.ambiguousDispatch && !c.ambiguousLands:
+		return store.ErrWriteConflict
+	case dispatch == c.txnLockedAtDispatch:
+		return kv.ErrTxnLocked
+	default:
+		return nil
+	}
 }
 
 // maybeProbe mimics handleOnePhaseTxnRequest's exact-ts dedup check. It
@@ -184,6 +417,27 @@ func TestListPushDedup_LandedPriorAttempt_NoDuplicate(t *testing.T) {
 	val, err := st.GetAt(ctx, listItemKey(key, meta.Head), readTS)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), val)
+}
+
+func TestListPushDedup_RouteFenceRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.routeFenceAtDispatch = 2
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	key := []byte("mylist")
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+	require.Equal(t, 3, coord.dispatches, "attempt 1 landed, route-fenced reuse, then dedup probe retry")
+	require.Equal(t, 1, coord.probeNoOps, "route-fenced reuse must not replace the prior landed probe")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len, "route-fence retry must not append a duplicate")
 }
 
 // TestListPushDedup_PriorAttemptDidNotLand_Applies covers the truncated case:

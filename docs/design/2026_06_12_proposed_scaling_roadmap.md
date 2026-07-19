@@ -131,7 +131,7 @@ Storage breakage at 1–10 TB/shard:
 - Snapshot transfer is a single-stream full-iter scan; at 1 TB it
   is hours, pins SSTs (blocks compaction reclamation), and any raft
   snapshot transfer serializes through it.
-- WAL replay between `defaultSnapshotEvery = 10 000` raft entries
+- WAL replay between `defaultSnapshotEvery = 100 000` raft entries
   can be multi-GiB; with `pebble.Sync` durability path the replay
   is tens of minutes.
 - Pebble L0CompactionThreshold / LBaseMaxBytes / compaction

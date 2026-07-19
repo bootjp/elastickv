@@ -23,6 +23,9 @@ type Elem[T OP] struct {
 	// leader to stamp the resolved transaction commit timestamp into Value at
 	// this byte offset before committing the mutation.
 	CommitTSValueOffset uint64
+	// GroupID optionally pins this mutation to a shard group. Zero preserves
+	// normal key-based routing.
+	GroupID uint64
 }
 
 // OperationGroup is a group of operations that should be executed atomically.

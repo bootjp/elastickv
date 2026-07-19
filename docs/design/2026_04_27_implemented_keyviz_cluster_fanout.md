@@ -46,6 +46,15 @@ This implemented design records both the static-node-list Phase 2-C
 fan-out and the Phase 2-C+ wire/merge extension that now carries
 per-cell Raft group and leader-term identity.
 
+## 1.1 Implementation status
+
+Implemented in `internal/admin/keyviz_fanout.go`,
+`internal/admin/keyviz_handler.go`, `web/admin/src/pages/KeyViz.tsx`,
+and `main.go`'s `--keyvizFanoutNodes` / `--keyvizFanoutTimeout`
+flags. Tests cover fan-out merge and degraded-node handling in
+`internal/admin/keyviz_fanout_test.go` and the admin KeyViz UI
+suite.
+
 ## 2. Scope
 
 ### 2.1 In scope
