@@ -301,3 +301,26 @@ func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 	require.ErrorIs(t, err, ErrLeaderNotFound)
 	require.GreaterOrEqual(t, elapsed, leaderProxyRetryBudget)
 }
+
+func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
+	t.Parallel()
+
+	eng := &stubFollowerEngine{leaderAddr: "127.0.0.1:1"}
+	p := NewLeaderProxyWithEngine(eng)
+	t.Cleanup(func() { _ = p.connCache.Close() })
+
+	identity := leaderProxyIdentityFromEngine(eng)
+	openedAt := time.Now().Add(-2 * leaderProxyBreakerBaseBackoff)
+	for range leaderProxyBreakerFailureThreshold {
+		require.NoError(t, p.forwardBreaker.allow(identity, 1, openedAt))
+		p.forwardBreaker.record(identity, 1, ErrLeaderNotFound, openedAt)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := p.forward(ctx, []*pb.Request{{IsTxn: false}}, 2)
+	require.ErrorContains(t, err, context.Canceled.Error())
+
+	require.NoError(t, p.forwardBreaker.allow(identity, 3, time.Now()))
+	require.True(t, p.forwardBreaker.owns(identity, 3))
+}

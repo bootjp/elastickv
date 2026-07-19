@@ -370,13 +370,14 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 // bridge maps transient leader-churn errors from the kv coordinator
 // (which AdminCreateTable/AdminDeleteTable can return after their
 // initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
-// rather than the generic 500 fallthrough. Codex P2 on PR #634.
+// rather than the generic 500 fallthrough. P2 review on PR #634.
 func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	cases := []struct {
 		name string
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -394,7 +395,7 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 }
 
 // TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
-// the false-positive class Codex P2 flagged: a message that
+// the false-positive class P2 review flagged: a message that
 // happens to contain a leader phrase NOT at the suffix must NOT
 // be classified as leader-churn. Switching from strings.Contains
 // to strings.HasSuffix is what makes this test pass.
@@ -428,8 +429,8 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 }
 
 // TestTranslateAdminItemsError_LeaderChurn is the items-tier
-// counterpart of TestTranslateAdminTablesError_LeaderChurn — Codex
-// P2 on PR #813 flagged that translateAdminItemsError did not
+// counterpart of TestTranslateAdminTablesError_LeaderChurn — P2
+// review on PR #813 flagged that translateAdminItemsError did not
 // classify transient leader-churn errors as 503/retryable, so an
 // election mid-AdminPutItem / AdminGetItem would 500 instead of
 // surfacing through the SPA's retry path.
@@ -439,6 +440,7 @@ func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -496,6 +498,7 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},

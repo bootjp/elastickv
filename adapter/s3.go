@@ -2520,7 +2520,7 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
