@@ -1,6 +1,7 @@
 # Scaling roadmap ownership index
 
-Status: Proposed roadmap index
+Status: Proposed
+Document type: Roadmap ownership index
 Author: bootjp
 Date: 2026-06-23
 Last audited: 2026-07-18 against `origin/main` and GitHub pull requests
