@@ -39,13 +39,14 @@ What bounds a single elastickv deployment today:
    is not wired (see §2(b), §2(e)).
 
 2. **Per-group memory.** Each Raft group owns a private Pebble store, and
-   `NewPebbleStore` → `defaultPebbleOptionsWithCache` allocates a *fresh*
-   block cache per store (`store/lsm_store.go:273-279`, `pebble.NewCache(pebbleCacheBytes)`
-   at `:274`), default 256 MiB (`defaultPebbleCacheBytes` at `:66`). N groups
-   on a node means N × 256 MiB of block cache alone, plus N memtables, N WALs,
-   N compaction budgets. The TODO at `store/lsm_store.go:117-120` records the
-   intended fix (a process-wide shared cache plumbed through `NewPebbleStore`)
-   but it is a comment, not a design.
+   `NewPebbleStore` → `defaultPebbleOptionsWithCache` now borrows one
+   process-wide shared block cache through `processPebbleCacheRef`, defaulting
+   to 25% of the smallest discovered cgroup ancestor limit or physical RAM
+   size. `GOMEMLIMIT` remains a Go heap soft limit and is not treated as total
+   RSS capacity for the off-heap cache. N groups on a node therefore share one
+   block-cache LRU instead of reserving an independent fixed-size cache per
+   group.
+   Per-group memtables, WALs, and compaction budgets are still independent.
 
 3. **Leader concentration.** Leadership of each group is elected
    independently by etcd/raft; nothing spreads leaderships across nodes. One
@@ -136,12 +137,11 @@ memory each group's private cache/memtable pins.
   bounds WAL/snapshot growth to O(manifest), which is the data-volume lever
   for the S3 surface specifically. Still proposed; the legacy `BlobKey`-on-Raft
   path is what runs today.
-- **Shared Pebble cache / resource pools — TODO only, promoted to a design
-  item here.** The `store/lsm_store.go:117-120` TODO is the single biggest
-  per-node memory tax as group count grows: N independent 256 MiB caches with
-  no shared eviction pool. This deserves a real design (see §3, Gap 2), not a
-  comment. It blocks high group counts on a single node, which in turn blocks
-  the "many small ranges" model that split (a) produces.
+- **Shared Pebble cache / resource pools — M1 shipped, follow-ups remain.**
+  The block-cache tax is closed by the process-wide `pebble.Cache` in
+  `store/lsm_store.go`, so group count no longer multiplies block-cache memory.
+  Shared memtable / compaction budgets and per-group fairness still need the
+  follow-up design slices in §3, Gap 2.
 
 ### (b) Write throughput
 
@@ -303,14 +303,21 @@ true multi-node multi-group workloads, tracked as a follow-on rather than a
 bootstrap design blocker.
 
 ### Gap 2 — Shared Pebble cache / resource pools
-**Problem.** Each group's store allocates a private 256 MiB block cache
-(`store/lsm_store.go:273-279`); N groups = N × 256 MiB plus N memtables/WALs,
-with no shared eviction. This caps how many groups (hence how many ranges) one
-node can hold, throttling the "many small ranges" model that split produces.
-**Rough milestones:** (M1) process-wide shared `pebble.Cache` plumbed through
-`NewPebbleStore` (the existing TODO), with per-node sizing. (M2) shared
-memtable / compaction concurrency budget across stores. (M3) per-group
-fairness so one hot group cannot evict everyone else's working set.
+**Status.** M1 is closed: `defaultPebbleOptionsWithCache` now borrows a
+process-wide shared `pebble.Cache` via `processPebbleCacheRef`, and
+`NewPebbleStore` / restore reopen paths hold one explicit store/open reference
+that is released on close or reopen. `ELASTICKV_PEBBLE_CACHE_MB` now sizes the
+node-level shared cache rather than a per-store cache; when it is unset,
+`ELASTICKV_PEBBLE_CACHE_PERCENT` selects the fraction of the node's hard
+memory capacity (25% by default). Linux takes the minimum positive cgroup
+limit from the process leaf through every ancestor and physical RAM.
+
+**Remaining problem.** Each group's store still owns independent memtables,
+WALs, flush scheduling, and compaction concurrency. That still caps how many
+groups one node can hold, but block-cache memory no longer grows as
+N × 256 MiB. **Remaining milestones:** (M2) shared memtable / compaction
+concurrency budget across stores. (M3) per-group fairness so one hot group
+cannot evict everyone else's working set.
 **Depends-on:** none functionally; pairs naturally with Gap 1 (high group
 counts only matter once multi-node groups exist).
 
