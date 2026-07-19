@@ -199,6 +199,65 @@ func TestShardStoreCommittedVersionAtChecksTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		SourceReadFence:     true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	_, err := st.GetAt(ctx, []byte("n"), 60)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, err = st.ScanAt(ctx, []byte("m"), []byte("z"), 60, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreSourceWriteFenceKeepsReadsAvailable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	got, err := st.GetAt(ctx, []byte("n"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+}
+
 func TestShardStoreCommittedVersionAtRechecksTargetReadinessAfterFence(t *testing.T) {
 	ctx := context.Background()
 	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{

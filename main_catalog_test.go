@@ -105,7 +105,7 @@ func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 	gate := newSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
 		probed = append(probed, address)
 		return nil
-	})
+	}, nil)
 
 	require.NoError(t, gate(context.Background()))
 	require.Equal(t, []string{"10.0.0.11:50051", "10.0.0.12:50051"}, probed)
@@ -117,7 +117,7 @@ func TestSplitMigrationCapabilityGateFailsClosedWithoutPeers(t *testing.T) {
 	gate := newSplitMigrationCapabilityGate(nil, time.Second, func(context.Context, string) error {
 		t.Fatal("probe must not run without peers")
 		return nil
-	})
+	}, nil)
 
 	err := gate(context.Background())
 	require.Error(t, err)
@@ -137,7 +137,7 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerMissingCapability(t *tes
 			return status.Error(codes.Unimplemented, "method not found")
 		}
 		return nil
-	})
+	}, nil)
 
 	err := gate(context.Background())
 	require.Error(t, err)
@@ -155,12 +155,49 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerSourceErrors(t *testing.
 	}, time.Second, func(context.Context, string) error {
 		t.Fatal("probe must not run when peer source fails")
 		return nil
-	})
+	}, nil)
 
 	err := gate(context.Background())
 	require.Error(t, err)
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.ErrorContains(t, err, "peers are not available")
+}
+
+func TestSplitMigrationCapabilityGateFailsClosedWhenLocalReadinessFails(t *testing.T) {
+	t.Parallel()
+
+	peers := []splitMigrationCapabilityPeer{
+		{ID: "n1", Address: "10.0.0.11:50051"},
+	}
+	gate := newSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(context.Context, string) error {
+		t.Fatal("probe must not run when local readiness is closed")
+		return nil
+	}, func(context.Context) error {
+		return status.Error(codes.FailedPrecondition, "migration opcode disabled")
+	})
+
+	err := gate(context.Background())
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "local readiness")
+	require.ErrorContains(t, err, "migration opcode disabled")
+}
+
+func TestSplitMigrationLocalReadinessGateRequiresImportAndPromoteOpcodes(t *testing.T) {
+	t.Setenv(adapter.MigrationImportOpcodeEnv, "")
+	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
+	err := splitMigrationLocalReadinessGate(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, adapter.MigrationImportOpcodeEnv)
+
+	t.Setenv(adapter.MigrationImportOpcodeEnv, "1")
+	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "")
+	err = splitMigrationLocalReadinessGate(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, adapter.MigrationPromoteOpcodeEnv)
+
+	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
 }
 
 func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *testing.T) {
@@ -294,7 +331,8 @@ func startSplitMigrationCapabilityTestServer(t *testing.T, resp *pb.GetSplitMigr
 }
 
 type capabilityConfigEngine struct {
-	cfg raftengine.Configuration
+	cfg    raftengine.Configuration
+	leader raftengine.LeaderInfo
 }
 
 func (e capabilityConfigEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
@@ -310,7 +348,7 @@ func (e capabilityConfigEngine) State() raftengine.State {
 }
 
 func (e capabilityConfigEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{}
+	return e.leader
 }
 
 func (e capabilityConfigEngine) VerifyLeader(context.Context) error {

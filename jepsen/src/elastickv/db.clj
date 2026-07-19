@@ -15,6 +15,8 @@
 (def ^:private pid-file "/var/run/elastickv.pid")
 (def ^:private server-bin (str bin-dir "/elastickv"))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
+(def ^:private split-bin (str bin-dir "/elastickv-split"))
+(def ^:private list-routes-bin (str bin-dir "/elastickv-list-routes"))
 
 (def ^:private build-dir
   ;; local (control node) directory for built binaries
@@ -37,7 +39,9 @@
                      "GOPATH" "/home/vagrant/go"
                      "GOCACHE" "/home/vagrant/.cache/go-build"})]
     (doseq [[out-cmd args] [["elastickv" ["go" "build" "-o" (str build-dir "/elastickv") "./cmd/server"]]
-                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]]]
+                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]
+                            ["elastickv-split" ["go" "build" "-o" (str build-dir "/elastickv-split") "./cmd/elastickv-split"]]
+                            ["elastickv-list-routes" ["go" "build" "-o" (str build-dir "/elastickv-list-routes") "./cmd/elastickv-list-routes"]]]]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
           (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
@@ -57,7 +61,7 @@
   (c/on node
     (c/su
       (c/exec :mkdir :-p bin-dir)
-      (doseq [bin ["elastickv" "raftadmin"]]
+      (doseq [bin ["elastickv" "raftadmin" "elastickv-split" "elastickv-list-routes"]]
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
@@ -97,7 +101,7 @@
          (clojure.string/join ","))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine migration-enabled]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -134,7 +138,10 @@
         (apply cu/start-daemon! {:chdir bin-dir
                                  :logfile log-file
                                  :pidfile pid-file
-                                 :background? true}
+                                 :background? true
+                                 :env (when migration-enabled
+                                        {:ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE "true"
+                                         :ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE "true"})}
                args)))))
 
 (defn- stop-node!

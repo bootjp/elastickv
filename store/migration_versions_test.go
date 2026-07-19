@@ -1424,3 +1424,76 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
 	require.ErrorIs(t, err, ErrKeyNotFound)
 }
+
+func TestCleanupVersionsRemovesOnlySelectedCommittedVersions(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v1"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v2"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("keep"), 10, 0))
+
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+		first, err := cleaner.CleanupVersions(ctx, CleanupVersionsOptions{
+			JobID:       1,
+			StartKey:    []byte("a"),
+			EndKey:      []byte("b"),
+			MaxCommitTS: 10,
+			MaxVersions: 1,
+			MaxBytes:    1 << 20,
+		})
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), first.DeletedRows)
+
+		value, err := st.GetAt(ctx, []byte("a"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v2"), value)
+		_, err = st.GetAt(ctx, []byte("a"), 10)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+		value, err = st.GetAt(ctx, []byte("b"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("keep"), value)
+	})
+}
+
+func TestClearMigrationStateRemovesPerJobProofs(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     7,
+			BracketID: 1,
+			BatchSeq:  1,
+			Versions: []MVCCVersion{{
+				Key:      []byte("!dist|migstage|row"),
+				CommitTS: 50,
+				Value:    []byte("v"),
+			}},
+		})
+		require.NoError(t, err)
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+			JobID:                  7,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 2,
+			MigrationJobID:         7,
+			MinWriteTSExclusive:    50,
+			Armed:                  true,
+		}))
+
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+		require.NoError(t, cleaner.ClearMigrationState(ctx, 7, 0))
+		floor, err := st.MigrationHLCFloor(ctx, 7)
+		require.NoError(t, err)
+		require.Zero(t, floor)
+		reader, ok := st.(MigrationTargetReadinessReader)
+		require.True(t, ok)
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		for _, state := range states {
+			require.NotEqual(t, uint64(7), state.JobID)
+		}
+	})
+}

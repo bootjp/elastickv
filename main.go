@@ -764,11 +764,21 @@ func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration
 	return peers
 }
 
-func newSplitMigrationCapabilityGate(source splitMigrationCapabilityPeerSource, timeout time.Duration, probe splitMigrationCapabilityProbe) adapter.SplitMigrationCapabilityGate {
+func newSplitMigrationCapabilityGate(
+	source splitMigrationCapabilityPeerSource,
+	timeout time.Duration,
+	probe splitMigrationCapabilityProbe,
+	localGate adapter.SplitMigrationCapabilityGate,
+) adapter.SplitMigrationCapabilityGate {
 	if probe == nil {
 		probe = probeSplitMigrationCapabilityPeer
 	}
 	return func(ctx context.Context) error {
+		if localGate != nil {
+			if err := localGate(ctx); err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration local readiness is not available: %v", err)
+			}
+		}
 		if source == nil {
 			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
 		}
@@ -1641,9 +1651,15 @@ func prepareDistributionRuntimeServer(
 	if err != nil {
 		return nil, err
 	}
-	in.distServer = adapter.NewDistributionServer(
-		engine,
-		distCatalog,
+	splitPromotionConnCache := &kv.GRPCConnCache{}
+	in.eg.Go(func() error {
+		<-in.ctx.Done()
+		if err := splitPromotionConnCache.Close(); err != nil {
+			return errors.Wrap(err, "close split promotion gRPC connection cache")
+		}
+		return nil
+	})
+	distOptions := []adapter.DistributionServerOption{
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(in.shardGroups)...),
@@ -1651,8 +1667,24 @@ func prepareDistributionRuntimeServer(
 			splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
 			splitMigrationCapabilityProbeTimeout,
 			nil,
+			splitMigrationLocalReadinessGate,
 		)),
-	)
+		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
+			splitPromotionTargetLeaderResolver(in.shardGroups),
+			splitPromotionConnCache,
+		)),
+		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
+			splitMigrationGroupLeaderResolver(in.shardGroups),
+			splitPromotionConnCache,
+		)),
+		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
+			in.shardGroups,
+			splitPromotionConnCache,
+		)),
+		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
+		adapter.WithSplitJobRunnerReady(),
+	}
+	in.distServer = adapter.NewDistributionServer(engine, distCatalog, distOptions...)
 	preparedServer, err := prepareRuntimeServerRunner(waitRotateOnStartup, in)
 	if err != nil {
 		return nil, err
@@ -1695,6 +1727,147 @@ func startDistributionRuntimeAfterTransport(in distributionRuntimeStartupInput) 
 	startFSMCompactorIfEnabled(in.runCtx, in.eg, in.runtimes, in.readTracker)
 	return startPreparedServerAfterStartupRotation(
 		in.waitRotateOnStartup, prepared.serverInput, prepared.preparedServer)
+}
+
+type splitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
+type splitMigrationLeaderResolver func(uint64) (string, error)
+
+func splitPromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) splitPromotionLeaderResolver {
+	return func(job distribution.SplitJob) (string, error) {
+		sg := shardGroups[job.TargetGroupID]
+		if sg == nil || sg.Engine == nil {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		addr := strings.TrimSpace(sg.Engine.Leader().Address)
+		if addr == "" {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		return addr, nil
+	}
+}
+
+func splitMigrationGroupLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) splitMigrationLeaderResolver {
+	return func(groupID uint64) (string, error) {
+		sg := shardGroups[groupID]
+		if sg == nil || sg.Engine == nil {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		addr := strings.TrimSpace(sg.Engine.Leader().Address)
+		if addr == "" {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		return addr, nil
+	}
+}
+
+func splitPromotionClientFactory(resolve splitPromotionLeaderResolver, connCache *kv.GRPCConnCache) adapter.SplitPromotionClientFactory {
+	return func(_ context.Context, job distribution.SplitJob) (adapter.SplitPromotionClient, error) {
+		if resolve == nil {
+			return nil, errors.New("split promotion leader resolver is not configured")
+		}
+		if connCache == nil {
+			return nil, errors.New("split promotion gRPC connection cache is not configured")
+		}
+		addr, err := resolve(job)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		conn, err := connCache.ConnFor(addr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return pb.NewInternalClient(conn), nil
+	}
+}
+
+func splitMigrationClientFactory(resolve splitMigrationLeaderResolver, connCache *kv.GRPCConnCache) adapter.SplitMigrationClientFactory {
+	return func(_ context.Context, job distribution.SplitJob, sourceGroupID uint64) (adapter.SplitMigrationClient, adapter.SplitMigrationClient, error) {
+		if resolve == nil {
+			return nil, nil, errors.New("split migration leader resolver is not configured")
+		}
+		if connCache == nil {
+			return nil, nil, errors.New("split migration gRPC connection cache is not configured")
+		}
+		sourceAddr, err := resolve(sourceGroupID)
+		if err != nil {
+			return nil, nil, err
+		}
+		targetAddr, err := resolve(job.TargetGroupID)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		sourceConn, err := connCache.ConnFor(sourceAddr)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		targetConn, err := connCache.ConnFor(targetAddr)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		return pb.NewInternalClient(sourceConn), pb.NewInternalClient(targetConn), nil
+	}
+}
+
+func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnCache) adapter.SplitMigrationVoterFactory {
+	return func(ctx context.Context, groupID uint64) ([]adapter.SplitMigrationVoter, error) {
+		sg := shardGroups[groupID]
+		if sg == nil || sg.Engine == nil {
+			return nil, errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		if connCache == nil {
+			return nil, errors.New("split migration voter gRPC connection cache is not configured")
+		}
+		cfg, err := sg.Engine.Configuration(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
+		for _, member := range cfg.Servers {
+			if member.Suffrage != "voter" {
+				continue
+			}
+			voter, err := splitMigrationVoter(groupID, member, connCache)
+			if err != nil {
+				return nil, err
+			}
+			voters = append(voters, voter)
+		}
+		if len(voters) == 0 {
+			return nil, errors.Errorf("split migration group %d has no voters", groupID)
+		}
+		return voters, nil
+	}
+}
+
+func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv.GRPCConnCache) (adapter.SplitMigrationVoter, error) {
+	addr := strings.TrimSpace(member.Address)
+	if member.ID == "" || addr == "" {
+		return adapter.SplitMigrationVoter{}, errors.Errorf("split migration group %d has voter with missing id/address", groupID)
+	}
+	conn, err := connCache.ConnFor(addr)
+	if err != nil {
+		return adapter.SplitMigrationVoter{}, errors.WithStack(err)
+	}
+	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: pb.NewInternalClient(conn)}, nil
+}
+
+func splitMigrationLocalReadinessGate(context.Context) error {
+	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationImportOpcodeEnv)
+	}
+	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
+	}
+	return nil
+}
+
+func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
+	if eg == nil || server == nil {
+		return
+	}
+	eg.Go(func() error {
+		return server.RunSplitJobRunner(ctx)
+	})
 }
 
 func prepareRuntimeServerRunner(waitRotateOnStartup startupRotationWaiter, in serversInput) (*preparedRuntimeServer, error) {
@@ -1837,6 +2010,7 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	runner.publicKVGate.markReady()
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -2118,9 +2292,14 @@ func startupRotationGatedMethod(fullMethod string) bool {
 	switch fullMethod {
 	case pb.Internal_Forward_FullMethodName,
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
+		pb.Internal_ImportRangeVersions_FullMethodName,
+		pb.Internal_PromoteStagedVersions_FullMethodName,
+		pb.Internal_CleanupMigration_FullMethodName,
+		pb.Internal_IssueMigrationTimestamp_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_GetSplitMigrationCapability_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
@@ -2356,6 +2535,7 @@ func startRaftServers(
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
+	readTracker *kv.ActiveTimestampTracker,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2394,6 +2574,7 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
+				adapter.WithInternalActiveTimestampTracker(readTracker),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,
 		))
@@ -2863,6 +3044,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 		sqsPartitionResolver,
+		r.readTracker,
 	); err != nil {
 		return r.startupFailure(err)
 	}

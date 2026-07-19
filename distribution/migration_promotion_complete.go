@@ -38,10 +38,7 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 		Routes: normalized,
 	}
 	if out.Job.TargetPromotionDone {
-		if targetClearedDescriptorPresent(out.Job, out.Routes) {
-			return out, nil
-		}
-		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
+		return completeAlreadyPromotedTarget(out, nowMs)
 	}
 
 	cleared, err := clearTargetPromotionRoutes(job, out.Routes)
@@ -59,9 +56,29 @@ func CompleteTargetPromotionState(job SplitJob, routes []RouteDescriptor, nowMs 
 	return out, nil
 }
 
+func completeAlreadyPromotedTarget(out TargetPromotionCompletion, nowMs int64) (TargetPromotionCompletion, error) {
+	if !targetClearedDescriptorPresent(out.Job, out.Routes) {
+		return TargetPromotionCompletion{}, errors.WithStack(ErrMigrationPromotionTargetAbsent)
+	}
+	// Preserve compatibility for jobs terminalized by older binaries, but do
+	// not move a current CLEANUP job to DONE until source and target cleanup
+	// proofs have been removed by the runner.
+	if out.Job.Phase == SplitJobPhaseDone && out.Job.TerminalAtMs <= 0 {
+		out.Changed = true
+		out.Job.TerminalAtMs = nowMs
+	}
+	if out.Changed {
+		out.Job.UpdatedAtMs = nowMs
+	}
+	return out, nil
+}
+
 func normalizePromotionCompletionInput(job SplitJob, routes []RouteDescriptor) ([]RouteDescriptor, error) {
 	if err := validateSplitJob(job); err != nil {
 		return nil, err
+	}
+	if job.Phase == SplitJobPhaseDone && job.TargetPromotionDone {
+		return normalizeRoutes(routes)
 	}
 	if job.Phase != SplitJobPhaseCleanup {
 		return nil, errors.WithStack(ErrMigrationPromotionNotReady)
@@ -227,12 +244,17 @@ func (s *CatalogStore) promotionCompleteAlreadyAppliedAt(ctx context.Context, ts
 }
 
 func promotionCompleteJobMatchesExpected(expected SplitJob, expectedRaw []byte, current SplitJob) (bool, error) {
-	if expected.TargetPromotionDone || !current.TargetPromotionDone || current.PromotionCompletedTS == 0 {
+	if expected.TargetPromotionDone ||
+		!current.TargetPromotionDone ||
+		current.PromotionCompletedTS == 0 ||
+		(current.Phase != expected.Phase && current.Phase != SplitJobPhaseDone) {
 		return false, nil
 	}
 	normalized := CloneSplitJob(current)
+	normalized.Phase = expected.Phase
 	normalized.TargetPromotionDone = expected.TargetPromotionDone
 	normalized.PromotionCompletedTS = expected.PromotionCompletedTS
+	normalized.TerminalAtMs = expected.TerminalAtMs
 	normalized.UpdatedAtMs = expected.UpdatedAtMs
 	raw, err := EncodeSplitJob(normalized)
 	if err != nil {
@@ -270,7 +292,9 @@ func (s *CatalogStore) buildPromotionCompleteMutations(
 	if err != nil {
 		return savePlan{}, nil, 0, err
 	}
-	completion.Job.PromotionCompletedTS = commitTS
+	if completion.Job.PromotionCompletedTS == 0 {
+		completion.Job.PromotionCompletedTS = commitTS
+	}
 	encodedJob, err := EncodeSplitJob(completion.Job)
 	if err != nil {
 		return savePlan{}, nil, 0, err

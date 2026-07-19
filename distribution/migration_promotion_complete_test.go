@@ -22,6 +22,7 @@ func TestCompleteTargetPromotionStateClearsStagedFieldsAndRetainsFloor(t *testin
 	require.True(t, result.Job.TargetPromotionDone)
 	require.Zero(t, result.Job.PromotionCompletedTS)
 	require.Equal(t, int64(1000), result.Job.UpdatedAtMs)
+	require.Zero(t, result.Job.TerminalAtMs)
 	require.Equal(t, SplitJobPhaseCleanup, result.Job.Phase)
 
 	target := routeByID(t, result.Routes, 3)
@@ -50,8 +51,10 @@ func TestCompleteTargetPromotionStateAcceptsAlreadyClearedDescriptor(t *testing.
 	result, err := CompleteTargetPromotionState(job, routes, 1100)
 	require.NoError(t, err)
 	require.False(t, result.Changed)
+	require.Equal(t, SplitJobPhaseCleanup, result.Job.Phase)
 	require.Equal(t, uint64(900), result.Job.PromotionCompletedTS)
 	require.Equal(t, int64(1000), result.Job.UpdatedAtMs)
+	require.Zero(t, result.Job.TerminalAtMs)
 
 	target := routeByID(t, result.Routes, 3)
 	require.False(t, target.StagedVisibilityActive)
@@ -75,6 +78,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionCommitsRouteAndJobTogether(t
 	require.NoError(t, err)
 	require.Equal(t, saved.Version+1, snapshot.Version)
 	require.True(t, completed.TargetPromotionDone)
+	require.Equal(t, SplitJobPhaseCleanup, completed.Phase)
 	require.Greater(t, completed.PromotionCompletedTS, before.ReadTS)
 	require.Equal(t, int64(1000), completed.UpdatedAtMs)
 
@@ -127,6 +131,7 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionIsIdempotentAfterClearedDesc
 	require.NoError(t, err)
 	job := promotionCompleteTestJob()
 	job.TargetPromotionDone = true
+	job.Phase = SplitJobPhaseCleanup
 	job.PromotionCompletedTS = 900
 	job.UpdatedAtMs = 1000
 	require.NoError(t, cs.CreateSplitJob(ctx, job))
@@ -134,11 +139,31 @@ func TestCatalogStoreCompleteSplitJobTargetPromotionIsIdempotentAfterClearedDesc
 	snapshot, completed, err := cs.CompleteSplitJobTargetPromotion(ctx, saved.Version, job, 1100)
 	require.NoError(t, err)
 	require.Equal(t, saved.Version, snapshot.Version)
-	assertSplitJobEqual(t, job, completed)
+	require.Equal(t, SplitJobPhaseCleanup, completed.Phase)
+	require.Equal(t, uint64(900), completed.PromotionCompletedTS)
+	require.Equal(t, int64(1000), completed.UpdatedAtMs)
+	require.Zero(t, completed.TerminalAtMs)
 
 	loaded, err := cs.Snapshot(ctx)
 	require.NoError(t, err)
 	require.Equal(t, saved.Version, loaded.Version)
+}
+
+func TestCompleteTargetPromotionStateBackfillsMissingTerminalTime(t *testing.T) {
+	t.Parallel()
+
+	job := promotionCompleteTestJob()
+	job.TargetPromotionDone = true
+	job.Phase = SplitJobPhaseDone
+	routes := promotionCompleteTestRoutes()
+	routes[1].StagedVisibilityActive = false
+	routes[1].MigrationJobID = 0
+
+	result, err := CompleteTargetPromotionState(job, routes, 1200)
+	require.NoError(t, err)
+	require.True(t, result.Changed)
+	require.Equal(t, int64(1200), result.Job.TerminalAtMs)
+	require.Equal(t, int64(1200), result.Job.UpdatedAtMs)
 }
 
 func TestCatalogStoreCompleteSplitJobTargetPromotionRejectsStaleInputs(t *testing.T) {
