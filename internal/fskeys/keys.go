@@ -1,0 +1,439 @@
+package fskeys
+
+import (
+	"bytes"
+	"encoding/binary"
+)
+
+const (
+	u64Bytes               = 8
+	orderedTerminatorBytes = 2
+	orderedZeroEscape      = 0xff
+
+	inodePrefix    = "!fs|ino|"
+	dirPrefix      = "!fs|dir|"
+	dirVerPrefix   = "!fs|dirv|"
+	homePrefix     = "!fs|home|"
+	chunkPrefix    = "!fs|chk|"
+	refPrefix      = "!fs|ref|"
+	refFencePrefix = "!fs|reffence|"
+	intentPrefix   = "!fs|intent|"
+	moveJobPrefix  = "!fs|job|move|"
+	usageKey       = "!fs|usage"
+
+	chunkRoutePrefix = "!fs|route|chk|"
+	usageRoutePrefix = "!fs|usage|route|"
+
+	chunkRouteKeyBytes = len(chunkRoutePrefix) + 2*u64Bytes
+)
+
+var (
+	chunkPrefixBytes      = []byte(chunkPrefix)
+	chunkRoutePrefixBytes = []byte(chunkRoutePrefix)
+	usageRoutePrefixBytes = []byte(usageRoutePrefix)
+)
+
+// InodeKey returns the metadata key for an inode.
+func InodeKey(inode uint64) []byte {
+	return appendU64Key([]byte(inodePrefix), inode)
+}
+
+// InodeAllPrefix returns the scan prefix for every inode metadata row.
+func InodeAllPrefix() []byte {
+	return []byte(inodePrefix)
+}
+
+// HomeKey returns the home-placement key for an inode.
+func HomeKey(inode uint64) []byte {
+	return appendU64Key([]byte(homePrefix), inode)
+}
+
+// HomeAllPrefix returns the scan prefix for every durable file placement row.
+func HomeAllPrefix() []byte {
+	return []byte(homePrefix)
+}
+
+// HomeInodeFromKey extracts the inode from one exact home-placement key.
+func HomeInodeFromKey(key []byte) (uint64, bool) {
+	prefix := []byte(homePrefix)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+u64Bytes {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(prefix):]), true
+}
+
+// DirVersionKey returns the mutation-version key for a directory inode.
+func DirVersionKey(parent uint64) []byte {
+	return appendU64Key([]byte(dirVerPrefix), parent)
+}
+
+// DirEntryPrefix returns the scan prefix for a directory's entries.
+func DirEntryPrefix(parent uint64) []byte {
+	return appendU64Key([]byte(dirPrefix), parent)
+}
+
+// DirEntryKey returns the key for one directory entry. Names are encoded as an
+// order-preserving binary segment so readdir scans stay lexicographic by raw
+// name bytes.
+func DirEntryKey(parent uint64, name []byte) []byte {
+	out := DirEntryPrefix(parent)
+	return appendOrderedBytes(out, name)
+}
+
+// DirEntryNameFromKey decodes a name from a key produced by DirEntryKey.
+func DirEntryNameFromKey(parent uint64, key []byte) ([]byte, bool) {
+	prefix := DirEntryPrefix(parent)
+	if !bytes.HasPrefix(key, prefix) {
+		return nil, false
+	}
+	name, rest, ok := decodeOrderedBytes(key[len(prefix):])
+	if !ok || len(rest) != 0 {
+		return nil, false
+	}
+	return name, true
+}
+
+// ChunkKey returns the payload key for one file chunk.
+func ChunkKey(homeSlot, inode, chunkIndex uint64) []byte {
+	out := make([]byte, 0, len(chunkPrefix)+3*u64Bytes)
+	out = append(out, []byte(chunkPrefix)...)
+	out = appendU64(out, homeSlot)
+	out = appendU64(out, inode)
+	out = appendU64(out, chunkIndex)
+	return out
+}
+
+// ChunkPrefix returns the scan prefix for every chunk of an inode on one home.
+func ChunkPrefix(homeSlot, inode uint64) []byte {
+	out := make([]byte, 0, len(chunkPrefix)+2*u64Bytes)
+	out = append(out, []byte(chunkPrefix)...)
+	out = appendU64(out, homeSlot)
+	out = appendU64(out, inode)
+	return out
+}
+
+// ChunkAllPrefix returns the scan prefix for every file chunk payload.
+func ChunkAllPrefix() []byte {
+	return []byte(chunkPrefix)
+}
+
+// ChunkIndexFromKey extracts the chunk index from one exact file chunk key.
+func ChunkIndexFromKey(homeSlot, inode uint64, key []byte) (uint64, bool) {
+	prefix := ChunkPrefix(homeSlot, inode)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+u64Bytes {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(prefix):]), true
+}
+
+// ChunkPartsFromKey decodes one exact chunk payload key.
+func ChunkPartsFromKey(key []byte) (homeSlot uint64, inode uint64, chunkIndex uint64, ok bool) {
+	if !bytes.HasPrefix(key, chunkPrefixBytes) || len(key) != len(chunkPrefixBytes)+3*u64Bytes {
+		return 0, 0, 0, false
+	}
+	rest := key[len(chunkPrefixBytes):]
+	return binary.BigEndian.Uint64(rest[:u64Bytes]),
+		binary.BigEndian.Uint64(rest[u64Bytes : 2*u64Bytes]),
+		binary.BigEndian.Uint64(rest[2*u64Bytes:]), true
+}
+
+// IsChunkRouteDomainKey reports whether key is in the virtual chunk routing
+// domain used to keep all chunks of a file on the same shard group.
+func IsChunkRouteDomainKey(key []byte) bool {
+	return bytes.HasPrefix(key, chunkRoutePrefixBytes)
+}
+
+// ChunkRouteKey returns the logical route domain for every chunk of the same
+// file home. It intentionally excludes chunkIndex so range splitting does not
+// scatter one file's chunks across routes under normal placement.
+func ChunkRouteKey(homeSlot, inode uint64) []byte {
+	out := make([]byte, 0, len(chunkRoutePrefix)+2*u64Bytes)
+	out = append(out, chunkRoutePrefixBytes...)
+	out = appendU64(out, homeSlot)
+	out = appendU64(out, inode)
+	return out
+}
+
+// ChunkRouteAllPrefix returns the virtual route prefix for all file homes.
+func ChunkRouteAllPrefix() []byte {
+	return append([]byte(nil), chunkRoutePrefixBytes...)
+}
+
+// ChunkRouteHomeFromKey extracts the home slot from a full chunk route key.
+func ChunkRouteHomeFromKey(key []byte) (uint64, bool) {
+	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) < len(chunkRoutePrefixBytes)+u64Bytes {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(chunkRoutePrefixBytes):]), true
+}
+
+// ChunkRoutePartsFromKey decodes one exact virtual file route key.
+func ChunkRoutePartsFromKey(key []byte) (homeSlot uint64, inode uint64, ok bool) {
+	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) != chunkRouteKeyBytes {
+		return 0, 0, false
+	}
+	rest := key[len(chunkRoutePrefixBytes):]
+	return binary.BigEndian.Uint64(rest[:u64Bytes]), binary.BigEndian.Uint64(rest[u64Bytes:]), true
+}
+
+// ExtractRouteKey normalizes filesystem keys with virtual route domains.
+// Non-virtual keys return nil and keep the caller's default routing.
+func ExtractRouteKey(key []byte) []byte {
+	if route := extractUsageRouteKey(key); route != nil {
+		return route
+	}
+	if !bytes.HasPrefix(key, chunkPrefixBytes) {
+		return nil
+	}
+	rest := key[len(chunkPrefixBytes):]
+	if len(rest) < 3*u64Bytes {
+		return nil
+	}
+	out := make([]byte, 0, len(chunkRoutePrefixBytes)+2*u64Bytes)
+	out = append(out, chunkRoutePrefixBytes...)
+	out = append(out, rest[:2*u64Bytes]...)
+	return out
+}
+
+func extractUsageRouteKey(key []byte) []byte {
+	if !bytes.HasPrefix(key, usageRoutePrefixBytes) {
+		return nil
+	}
+	route, rest, ok := decodeOrderedBytes(key[len(usageRoutePrefixBytes):])
+	if !ok || len(rest) != 0 || len(route) == 0 {
+		return nil
+	}
+	return route
+}
+
+// ChunkScanRouteBounds maps raw chunk scan bounds to the virtual chunk route
+// domain. The caller still scans raw chunk keys, but route selection uses these
+// bounds so a ShardStore scan reaches the groups selected for ChunkKey writes.
+func ChunkScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
+	routeStart, ok := chunkScanBound(start)
+	if !ok {
+		return nil, nil, false
+	}
+	routeEnd, ok := chunkScanRouteEnd(start, end, routeStart)
+	if !ok {
+		return nil, nil, false
+	}
+	return routeStart, routeEnd, true
+}
+
+func chunkScanRouteEnd(start []byte, end []byte, routeStart []byte) ([]byte, bool) {
+	if end == nil {
+		return nil, false
+	}
+	if bytes.Equal(end, prefixEnd(chunkPrefixBytes)) {
+		return prefixEnd(chunkRoutePrefixBytes), true
+	}
+	routeEnd, ok := chunkScanBound(end)
+	if !ok {
+		if bytes.Compare(start, end) < 0 {
+			if routeEnd := carriedChunkScanRouteEnd(routeStart, end); routeEnd != nil {
+				return routeEnd, true
+			}
+		}
+		return nil, false
+	}
+	if bytes.Equal(routeStart, routeEnd) && bytes.Compare(start, end) < 0 {
+		return prefixEnd(routeStart), true
+	}
+	if !bytes.Equal(routeStart, routeEnd) && chunkScanEndIncludesRoute(end, routeEnd) {
+		return prefixEnd(routeEnd), true
+	}
+	return routeEnd, true
+}
+
+func chunkScanEndIncludesRoute(end []byte, routeEnd []byte) bool {
+	if len(routeEnd) != chunkRouteKeyBytes {
+		return false
+	}
+	firstChunk := make([]byte, 0, len(chunkPrefixBytes)+3*u64Bytes)
+	firstChunk = append(firstChunk, chunkPrefixBytes...)
+	firstChunk = append(firstChunk, routeEnd[len(chunkRoutePrefixBytes):]...)
+	firstChunk = appendU64(firstChunk, 0)
+	return bytes.Compare(end, firstChunk) > 0
+}
+
+func carriedChunkScanRouteEnd(routeStart []byte, end []byte) []byte {
+	if len(routeStart) != chunkRouteKeyBytes {
+		return nil
+	}
+	rawPrefix := make([]byte, 0, len(chunkPrefixBytes)+2*u64Bytes)
+	rawPrefix = append(rawPrefix, chunkPrefixBytes...)
+	rawPrefix = append(rawPrefix, routeStart[len(chunkRoutePrefixBytes):]...)
+	if !bytes.Equal(end, prefixEnd(rawPrefix)) {
+		return nil
+	}
+	return prefixEnd(routeStart)
+}
+
+func chunkScanBound(key []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(key, chunkPrefixBytes) {
+		return nil, false
+	}
+	rest := key[len(chunkPrefixBytes):]
+	if len(rest) == 0 {
+		return append([]byte(nil), chunkRoutePrefixBytes...), true
+	}
+	if len(rest) < 2*u64Bytes {
+		out := make([]byte, 0, len(chunkRoutePrefixBytes)+len(rest))
+		out = append(out, chunkRoutePrefixBytes...)
+		out = append(out, rest...)
+		return out, true
+	}
+	out := make([]byte, 0, len(chunkRoutePrefixBytes)+2*u64Bytes)
+	out = append(out, chunkRoutePrefixBytes...)
+	out = append(out, rest[:2*u64Bytes]...)
+	return out, true
+}
+
+// NormalizeSplitBoundary snaps filesystem chunk-domain split candidates to the
+// file boundary used by routeKey. This prevents a split key from bisecting one
+// file's chunk-domain route.
+func NormalizeSplitBoundary(key []byte) []byte {
+	if routeKey := ExtractRouteKey(key); routeKey != nil {
+		return routeKey
+	}
+	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) <= chunkRouteKeyBytes {
+		return key
+	}
+	out := make([]byte, chunkRouteKeyBytes)
+	copy(out, key[:chunkRouteKeyBytes])
+	return out
+}
+
+// RefKey returns an open-handle lease key.
+func RefKey(inode uint64, clientID []byte, fhID uint64) []byte {
+	out := make([]byte, 0, len(refPrefix)+2*u64Bytes+len(clientID)+orderedTerminatorBytes)
+	out = append(out, []byte(refPrefix)...)
+	out = appendU64(out, inode)
+	out = appendOrderedBytes(out, clientID)
+	out = appendU64(out, fhID)
+	return out
+}
+
+// RefPrefix returns the scan prefix for open-handle leases on an inode.
+func RefPrefix(inode uint64) []byte {
+	return appendU64Key([]byte(refPrefix), inode)
+}
+
+// RefAllPrefix returns the scan prefix for every open-handle lease.
+func RefAllPrefix() []byte {
+	return []byte(refPrefix)
+}
+
+// RefFenceKey serializes inode GC against newly-created open-handle refs.
+func RefFenceKey(inode uint64) []byte {
+	return appendU64Key([]byte(refFencePrefix), inode)
+}
+
+// UsageKey returns the filesystem-wide StatFS counter key.
+func UsageKey() []byte {
+	return []byte(usageKey)
+}
+
+// UsageRouteAllPrefix returns the scan prefix for routed StatFS usage counters.
+func UsageRouteAllPrefix() []byte {
+	return []byte(usageRoutePrefix)
+}
+
+// IsUsageRouteKey reports whether key is a routed StatFS usage counter.
+func IsUsageRouteKey(key []byte) bool {
+	return bytes.HasPrefix(key, usageRoutePrefixBytes)
+}
+
+// UsageRouteKey returns a StatFS usage counter key routed with routeKey.
+func UsageRouteKey(routeKey []byte) []byte {
+	out := make([]byte, 0, len(usageRoutePrefix)+len(routeKey)+orderedTerminatorBytes)
+	out = append(out, usageRoutePrefixBytes...)
+	return appendOrderedBytes(out, routeKey)
+}
+
+// IntentKey returns a crash-recovery intent key.
+func IntentKey(intentID []byte) []byte {
+	out := make([]byte, 0, len(intentPrefix)+len(intentID)+orderedTerminatorBytes)
+	out = append(out, []byte(intentPrefix)...)
+	return appendOrderedBytes(out, intentID)
+}
+
+// IntentAllPrefix returns the scan prefix for all recovery intents.
+func IntentAllPrefix() []byte {
+	return []byte(intentPrefix)
+}
+
+// MoveJobKey returns a whole-file migration job key.
+func MoveJobKey(jobID []byte) []byte {
+	out := make([]byte, 0, len(moveJobPrefix)+len(jobID)+orderedTerminatorBytes)
+	out = append(out, []byte(moveJobPrefix)...)
+	return appendOrderedBytes(out, jobID)
+}
+
+// MoveJobAllPrefix returns the scan prefix for all file migration jobs.
+func MoveJobAllPrefix() []byte {
+	return []byte(moveJobPrefix)
+}
+
+func appendU64Key(prefix []byte, v uint64) []byte {
+	out := make([]byte, 0, len(prefix)+u64Bytes)
+	out = append(out, prefix...)
+	return appendU64(out, v)
+}
+
+func appendU64(dst []byte, v uint64) []byte {
+	var buf [u64Bytes]byte
+	binary.BigEndian.PutUint64(buf[:], v)
+	return append(dst, buf[:]...)
+}
+
+func prefixEnd(prefix []byte) []byte {
+	if len(prefix) == 0 {
+		return nil
+	}
+	out := append([]byte(nil), prefix...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] == ^byte(0) {
+			continue
+		}
+		out[i]++
+		return out[:i+1]
+	}
+	return nil
+}
+
+func appendOrderedBytes(dst []byte, src []byte) []byte {
+	for _, b := range src {
+		if b == 0 {
+			dst = append(dst, 0, orderedZeroEscape)
+			continue
+		}
+		dst = append(dst, b)
+	}
+	return append(dst, 0, 0)
+}
+
+func decodeOrderedBytes(src []byte) ([]byte, []byte, bool) {
+	out := make([]byte, 0, len(src))
+	for i := 0; i < len(src); i++ {
+		b := src[i]
+		if b != 0 {
+			out = append(out, b)
+			continue
+		}
+		if i+1 >= len(src) {
+			return nil, nil, false
+		}
+		switch src[i+1] {
+		case 0:
+			return out, src[i+2:], true
+		case orderedZeroEscape:
+			out = append(out, 0)
+			i++
+		default:
+			return nil, nil, false
+		}
+	}
+	return nil, nil, false
+}

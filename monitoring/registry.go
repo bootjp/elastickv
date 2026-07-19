@@ -23,6 +23,7 @@ type Registry struct {
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
+	fs            *FileSystemMetrics
 	s3            *S3Metrics
 	hlc           *HLCMetrics
 	hlcObserver   *HLCObserver
@@ -52,6 +53,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
+	r.fs = newFileSystemMetrics(registerer)
 	r.s3 = newS3Metrics(registerer)
 	r.hlc = newHLCMetrics(registerer)
 	r.hlcObserver = newHLCObserver(r.hlc)
@@ -218,6 +220,15 @@ func (r *Registry) SQSObserver() *SQSObserver {
 		return nil
 	}
 	return r.sqsObserver
+}
+
+// FileSystemObserver returns the filesystem operational metrics observer backed
+// by this registry.
+func (r *Registry) FileSystemObserver() FileSystemObserver {
+	if r == nil {
+		return nil
+	}
+	return r.fs
 }
 
 // S3PutAdmissionObserver returns the S3 PUT admission metrics observer backed

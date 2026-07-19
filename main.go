@@ -24,6 +24,8 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/internal/filesystem/fuseadapter"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -53,6 +55,10 @@ const (
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
+
+	defaultFilesystemRootMode              = 0o755
+	defaultFilesystemPlacementScanInterval = 30 * time.Second
+	defaultFilesystemLeaseReapInterval     = 30 * time.Second
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -100,6 +106,15 @@ var (
 	metricsToken                    = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddr                       = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
 	pprofToken                      = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
+	filesystemMount                 = flag.String("filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
+	filesystemClientID              = flag.String("filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
+	filesystemCapacity              = flag.Uint64("filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
+	filesystemMaxFiles              = flag.Uint64("filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")
+	filesystemRootMode              = flag.Uint("filesystemRootMode", defaultFilesystemRootMode, "Root directory permission mode for first initialization")
+	filesystemRootUID               = flag.Uint("filesystemRootUID", 0, "Root directory owner UID for first initialization")
+	filesystemRootGID               = flag.Uint("filesystemRootGID", 0, "Root directory owner GID for first initialization")
+	filesystemPlacementScanInterval = flag.Duration("filesystemPlacementScanInterval", defaultFilesystemPlacementScanInterval, "Interval for filesystem placement and recovery-state metrics; non-positive disables periodic scans")
+	filesystemLeaseReapInterval     = flag.Duration("filesystemLeaseReapInterval", defaultFilesystemLeaseReapInterval, "Interval for reclaiming expired filesystem open-handle leases; non-positive disables periodic reaping")
 	raftId                          = flag.String("raftId", "", "Node id used by Raft")
 	raftEngineName                  = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
 	raftDir                         = flag.String("raftDataDir", "data/", "Raft data dir")
@@ -547,6 +562,7 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
@@ -580,6 +596,7 @@ func run() error {
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
+		cleanup:                         &cleanup,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -630,6 +647,202 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 				return nil
 			}
 		})
+	}
+}
+
+type filesystemStartConfig struct {
+	mountPoint string
+	clientID   string
+	rootMode   uint32
+	rootUID    uint32
+	rootGID    uint32
+}
+
+func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
+	config := filesystemStartConfig{mountPoint: strings.TrimSpace(*filesystemMount)}
+	if config.mountPoint == "" {
+		return config, nil
+	}
+	if *filesystemRootMode > 0o7777 || *filesystemRootUID > math.MaxUint32 || *filesystemRootGID > math.MaxUint32 {
+		return filesystemStartConfig{}, errors.New("filesystem root mode, uid, or gid is out of range")
+	}
+	config.clientID = strings.TrimSpace(*filesystemClientID)
+	if config.clientID == "" {
+		config.clientID = strings.TrimSpace(*raftId)
+	}
+	if config.clientID == "" {
+		return filesystemStartConfig{}, errors.New("filesystem client ID is required")
+	}
+	config.rootMode = uint32(*filesystemRootMode)
+	config.rootUID = uint32(*filesystemRootUID)
+	config.rootGID = uint32(*filesystemRootGID)
+	return config, nil
+}
+
+func startFilesystemIfEnabled(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cleanup *internalutil.CleanupStack,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	observer monitoring.FileSystemObserver,
+) error {
+	config, err := filesystemStartConfigFromFlags()
+	if err != nil {
+		return err
+	}
+	if config.mountPoint == "" {
+		return nil
+	}
+	if eg == nil || cleanup == nil {
+		return errors.New("filesystem lifecycle is required")
+	}
+	service, err := filesystem.NewService(
+		shardStore,
+		coordinate,
+		filesystem.WithCapacity(*filesystemCapacity),
+		filesystem.WithMaxFiles(*filesystemMaxFiles),
+		filesystem.WithOperationalObserver(observer),
+	)
+	if err != nil {
+		return errors.Wrap(err, "create filesystem service")
+	}
+	if err := service.InitializeRoot(
+		ctx,
+		config.rootMode,
+		config.rootUID,
+		config.rootGID,
+	); err != nil {
+		return errors.Wrap(err, "initialize filesystem root")
+	}
+	server, serveDone, err := mountFilesystemService(service, config)
+	if err != nil {
+		return err
+	}
+	installFilesystemServerLifecycle(ctx, eg, cleanup, server, serveDone, config.mountPoint)
+	startFilesystemPlacementCollector(ctx, eg, service, *filesystemPlacementScanInterval)
+	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
+	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
+	return nil
+}
+
+func mountFilesystemService(
+	service *filesystem.Service,
+	config filesystemStartConfig,
+) (*fuseadapter.Server, <-chan struct{}, error) {
+	frontend := fuseadapter.New(service, []byte(config.clientID))
+	server, err := fuseadapter.Mount(config.mountPoint, frontend, nil)
+	if err != nil {
+		frontend.Close()
+		return nil, nil, errors.Wrap(err, "mount filesystem frontend")
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		server.Serve()
+	}()
+	if err := server.WaitMount(); err != nil {
+		_ = server.Unmount()
+		<-serveDone
+		return nil, nil, errors.Wrap(err, "wait for filesystem FUSE mount")
+	}
+	return server, serveDone, nil
+}
+
+func installFilesystemServerLifecycle(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cleanup *internalutil.CleanupStack,
+	server *fuseadapter.Server,
+	serveDone <-chan struct{},
+	mountPoint string,
+) {
+	unmount := sync.OnceValue(server.Unmount)
+	cleanup.Add(func() {
+		if err := unmount(); err != nil {
+			slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+		}
+	})
+	eg.Go(func() error {
+		select {
+		case <-ctx.Done():
+			if err := unmount(); err != nil {
+				slog.WarnContext(ctx, "filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+			}
+			<-serveDone
+			return nil
+		case <-serveDone:
+			return errors.New("filesystem FUSE server stopped unexpectedly")
+		}
+	})
+}
+
+func startFilesystemPlacementCollector(
+	ctx context.Context,
+	eg *errgroup.Group,
+	service *filesystem.Service,
+	interval time.Duration,
+) {
+	if eg == nil || service == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if _, err := service.ListFilePlacementStats(ctx); err != nil && ctx.Err() == nil {
+				slog.WarnContext(ctx, "filesystem placement scan failed", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	})
+}
+
+type filesystemLeaseReaper interface {
+	ReapExpiredOpenHandleLeases(context.Context, int) (filesystem.LeaseReapStats, error)
+}
+
+func startFilesystemLeaseReaper(
+	ctx context.Context,
+	eg *errgroup.Group,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) {
+	if eg == nil || reaper == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		return runFilesystemLeaseReaper(ctx, reaper, interval)
+	})
+}
+
+func runFilesystemLeaseReaper(
+	ctx context.Context,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		stats, err := reaper.ReapExpiredOpenHandleLeases(ctx, 0)
+		if err != nil && ctx.Err() == nil {
+			slog.WarnContext(ctx, "filesystem lease reaper failed", "err", err)
+		}
+		if stats.ExpiredRefs > 0 || stats.OrphanedInodesGCed > 0 {
+			slog.InfoContext(ctx, "filesystem lease reaper reclaimed state",
+				"expired_refs", stats.ExpiredRefs,
+				"orphaned_inodes_gced", stats.OrphanedInodesGCed,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1541,6 +1754,7 @@ type serversInput struct {
 	cfg                runtimeConfig
 	encWiring          encryptionWriteWiring
 	redisApplyObserver *adapter.RedisApplyObserver
+	cleanup            *internalutil.CleanupStack
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
@@ -1699,7 +1913,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	runner.startAdminHTTP()
-	return nil
+	return startFilesystemIfEnabled(
+		in.ctx,
+		in.eg,
+		in.cleanup,
+		in.shardStore,
+		in.coordinate,
+		in.metricsRegistry.FileSystemObserver(),
+	)
 }
 
 const raftJoinReadyPollInterval = 100 * time.Millisecond

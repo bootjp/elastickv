@@ -3,11 +3,14 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -22,6 +25,7 @@ type DistributionServer struct {
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
 	readTracker *kv.ActiveTimestampTracker
+	fsObserver  DistributionFilesystemObserver
 	reloadRetry struct {
 		attempts int
 		interval time.Duration
@@ -31,6 +35,12 @@ type DistributionServer struct {
 
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
+
+type DistributionFilesystemObserver interface {
+	ObserveFilePinnedHotspot(reason string)
+}
+
+const DistributionFilePinnedHotspotSplitBoundary = "split_boundary"
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -43,6 +53,12 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.readTracker = tracker
+	}
+}
+
+func WithDistributionFilesystemObserver(observer DistributionFilesystemObserver) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.fsObserver = observer
 	}
 }
 
@@ -102,7 +118,7 @@ func (s *DistributionServer) UpdateRoute(start, end []byte, group uint64) {
 
 // GetRoute returns route for a key.
 func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteRequest) (*pb.GetRouteResponse, error) {
-	r, ok := s.engine.GetRoute(req.Key)
+	r, ok := s.engine.GetRoute(kv.RouteKey(req.Key))
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
 	}
@@ -158,8 +174,10 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
 
-	splitKey := distribution.CloneBytes(req.GetSplitKey())
+	rawSplitKey := req.GetSplitKey()
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
 	if err := validateSplitKey(parent, splitKey); err != nil {
+		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
 		return nil, err
 	}
 
@@ -189,6 +207,28 @@ func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 		return nil
 	}
 	return s.readTracker.Pin(ts)
+}
+
+func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte, splitKey []byte, err error) {
+	if s == nil || s.fsObserver == nil || bytes.Equal(rawSplitKey, splitKey) || !isSplitBoundaryError(err) {
+		return
+	}
+	if !fskeys.IsChunkRouteDomainKey(splitKey) {
+		return
+	}
+	s.fsObserver.ObserveFilePinnedHotspot(DistributionFilePinnedHotspotSplitBoundary)
+	if homeSlot, inode, ok := fskeys.ChunkRoutePartsFromKey(splitKey); ok {
+		slog.Warn("filesystem file-pinned hotspot rejected split",
+			"reason", DistributionFilePinnedHotspotSplitBoundary,
+			"home_slot", homeSlot,
+			"inode", inode,
+		)
+	}
+}
+
+func isSplitBoundaryError(err error) bool {
+	return status.Code(errors.Cause(err)) == codes.InvalidArgument &&
+		strings.Contains(err.Error(), errDistributionSplitKeyAtBoundary.Error())
 }
 
 func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {

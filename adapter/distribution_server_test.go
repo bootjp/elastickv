@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -35,6 +36,25 @@ func TestDistributionServerGetRoute_HitAndMiss(t *testing.T) {
 	require.Equal(t, uint64(0), miss.RaftGroupId)
 	require.Nil(t, miss.Start)
 	require.Nil(t, miss.End)
+}
+
+func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRoute(context.Background(), &pb.GetRouteRequest{
+		Key: fskeys.ChunkKey(home, inode, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, routeKey, resp.Start)
+	require.Equal(t, uint64(2), resp.RaftGroupId)
 }
 
 func TestDistributionServerGetTimestamp_IsMonotonic(t *testing.T) {
@@ -191,6 +211,173 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	rightRoute, ok := engine.GetRoute([]byte("h"))
 	require.True(t, ok)
 	require.Equal(t, uint64(4), rightRoute.RouteID)
+}
+
+func TestDistributionServerSplitRange_SnapsFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               fskeys.ChunkKey(11, 22, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
+func TestDistributionServerSplitRange_SnapsTxnWrappedFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+	txnChunkKey := append([]byte(kv.TxnKeyPrefix+"lock|"), fskeys.ChunkKey(11, 22, 99)...)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               txnChunkKey,
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
+func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	routeStart := fskeys.ChunkRouteKey(11, 22)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     fskeys.ChunkRouteKey(11, 23),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	observer := &recordingDistributionFilesystemObserver{}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithDistributionFilesystemObserver(observer),
+	)
+	insideSameFile := append(append([]byte(nil), routeStart...), 0x01)
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               insideSameFile,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+	require.Equal(t, []string{DistributionFilePinnedHotspotSplitBoundary}, observer.reasons)
+}
+
+func TestDistributionServerSplitRange_DoesNotRecordNonFilesystemNormalizedBoundary(t *testing.T) {
+	t.Parallel()
+
+	routeStart := []byte("queue")
+	tests := []struct {
+		name     string
+		splitKey []byte
+	}{
+		{
+			name:     "list item",
+			splitKey: store.ListItemKey(routeStart, 1),
+		},
+		{
+			name:     "txn wrapped list item",
+			splitKey: append([]byte(kv.TxnKeyPrefix+"lock|"), store.ListItemKey(routeStart, 1)...),
+		},
+		{
+			name:     "txn wrapped redis internal key",
+			splitKey: []byte(kv.TxnKeyPrefix + "lock|!redis|string|queue"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+				{
+					RouteID: 1,
+					Start:   routeStart,
+					End:     []byte("queuez"),
+					GroupID: 1,
+					State:   distribution.RouteStateActive,
+				},
+			})
+			require.NoError(t, err)
+
+			observer := &recordingDistributionFilesystemObserver{}
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+				WithDistributionFilesystemObserver(observer),
+			)
+
+			_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               tt.splitKey,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+			require.Empty(t, observer.reasons)
+		})
+	}
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
@@ -753,4 +940,12 @@ func (s *distributionCoordinatorStub) LeaseRead(ctx context.Context) (uint64, er
 
 func (s *distributionCoordinatorStub) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return s.LinearizableRead(ctx)
+}
+
+type recordingDistributionFilesystemObserver struct {
+	reasons []string
+}
+
+func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
+	o.reasons = append(o.reasons, reason)
 }

@@ -44,6 +44,10 @@ type rawGroupScanner interface {
 	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
 
+type rawGroupReverseScanner interface {
+	ReverseScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
 type rawGroupKeyScanner interface {
 	ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error)
 }
@@ -183,14 +187,7 @@ func (r *GRPCServer) rawScanValuesAt(ctx context.Context, req *pb.RawScanAtReque
 	var res []*store.KVPair
 	var err error
 	if groupID := req.GetGroupId(); groupID != 0 {
-		if req.GetReverse() {
-			return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
-		}
-		groupScanner, ok := r.store.(rawGroupScanner)
-		if !ok {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw scan with explicit group requires a group-aware store"))
-		}
-		res, err = groupScanner.ScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+		res, err = r.rawScanAtExplicitGroup(ctx, req, groupID, limit, readTS)
 	} else if req.GetReverse() {
 		res, err = r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	} else {
@@ -204,18 +201,7 @@ func (r *GRPCServer) rawScanValuesAt(ctx context.Context, req *pb.RawScanAtReque
 
 func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
 	if groupID := req.GetGroupId(); groupID != 0 {
-		if req.GetReverse() {
-			return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
-		}
-		groupScanner, ok := r.store.(rawGroupKeyScanner)
-		if !ok {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with explicit group requires a group-aware store"))
-		}
-		keys, err := groupScanner.ScanGroupKeysAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		return keys, nil
+		return r.rawScanExplicitGroupKeysAt(ctx, req, groupID, limit, readTS)
 	}
 	if req.GetReverse() {
 		kvs, err := r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
@@ -228,11 +214,63 @@ func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest
 	return keys, errors.WithStack(err)
 }
 
+func (r *GRPCServer) rawScanExplicitGroupKeysAt(
+	ctx context.Context,
+	req *pb.RawScanAtRequest,
+	groupID uint64,
+	limit int,
+	readTS uint64,
+) ([][]byte, error) {
+	if req.GetReverse() {
+		groupScanner, ok := r.store.(rawGroupReverseScanner)
+		if !ok {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "reverse raw key scan with explicit group requires a group-aware store"))
+		}
+		kvs, err := groupScanner.ReverseScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return storeKeysFromKVPairs(kvs), nil
+	}
+	groupScanner, ok := r.store.(rawGroupKeyScanner)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with explicit group requires a group-aware store"))
+	}
+	keys, err := groupScanner.ScanGroupKeysAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return keys, nil
+}
+
 func rawScanErrorResponse(err error) (*pb.RawScanAtResponse, error) {
 	if errors.Is(err, store.ErrReadTSCompacted) {
 		return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
 	}
 	return &pb.RawScanAtResponse{Kv: nil}, errors.WithStack(err)
+}
+
+func (r *GRPCServer) rawScanAtExplicitGroup(
+	ctx context.Context,
+	req *pb.RawScanAtRequest,
+	groupID uint64,
+	limit int,
+	readTS uint64,
+) ([]*store.KVPair, error) {
+	if req.GetReverse() {
+		groupScanner, ok := r.store.(rawGroupReverseScanner)
+		if !ok {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "reverse raw scan with explicit group requires a group-aware store"))
+		}
+		res, err := groupScanner.ReverseScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+		return res, errors.WithStack(err)
+	}
+	groupScanner, ok := r.store.(rawGroupScanner)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw scan with explicit group requires a group-aware store"))
+	}
+	res, err := groupScanner.ScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	return res, errors.WithStack(err)
 }
 
 func rawScanLimit(limit64 int64) (int, error) {
