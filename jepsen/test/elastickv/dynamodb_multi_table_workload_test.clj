@@ -1,6 +1,9 @@
 (ns elastickv.dynamodb-multi-table-workload-test
   (:require [clojure.test :refer :all]
+            [elastickv.cli :as cli]
+            [elastickv.db :as ekdb]
             [jepsen.client :as client]
+            [jepsen.db :as jdb]
             [elastickv.dynamodb-multi-table-workload :as workload]))
 
 (deftest builds-test-spec
@@ -21,6 +24,32 @@
                    {:local true
                     :nodes ["n1"]})]
     (is (some? (:nemesis test-map)))))
+
+(deftest distributed-test-retains-nemesis-healing-generator
+  (let [test-map (workload/elastickv-dynamodb-multi-table-test
+                   {:faults [:partition :kill :pause]})]
+    (is (some? (:final-generator test-map))
+        "partition, kill, and pause faults must be healed before evidence collection")))
+
+(deftest transport-soak-options-enable-server-environment
+  (let [prepare (var-get #'workload/prepare-dynamo-opts)
+        opts    (prepare {:nodes cli/default-nodes-str
+                          :faults "partition,kill,pause"
+                          :ssh-user "vagrant"
+                          :ssh-key "/home/vagrant/.ssh/id_rsa"
+                          :dynamo-port 8000
+                          :redis-port 6379
+                          :raft-snapshot-count 64
+                          :raft-dispatcher-lanes true})]
+    (is (= {"ELASTICKV_RAFT_SEND_STREAM" "true"
+            "ELASTICKV_RAFT_SNAPSHOT_COUNT" "64"
+            "ELASTICKV_RAFT_DISPATCHER_LANES" "true"}
+           (:server-env opts)))))
+
+(deftest db-collects-log-and-cumulative-transport-evidence
+  (is (= {"/var/log/elastickv.log" "elastickv.log"
+          "/var/log/elastickv-transport-metrics.prom" "elastickv-transport-metrics.prom"}
+         (jdb/log-files (ekdb/db) {} "n1"))))
 
 (deftest host-override-creates-client
   (let [test-map (workload/elastickv-dynamodb-multi-table-test

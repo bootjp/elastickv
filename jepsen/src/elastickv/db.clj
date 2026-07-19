@@ -12,6 +12,7 @@
 (def ^:private bin-dir "/opt/elastickv/bin")
 (def ^:private data-dir "/var/lib/elastickv")
 (def ^:private log-file "/var/log/elastickv.log")
+(def ^:private transport-metrics-file "/var/log/elastickv-transport-metrics.prom")
 (def ^:private pid-file "/var/run/elastickv.pid")
 (def ^:private server-bin (str bin-dir "/elastickv"))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
@@ -97,7 +98,7 @@
          (clojure.string/join ","))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -114,8 +115,7 @@
               (node-addr node (port-for sqs-port node)))
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         bootstrap? (= node bootstrap-node)
-        args (cond-> [server-bin
-                      "--address" grpc
+        args (cond-> ["--address" grpc
                       "--redisAddress" redis
                       "--raftId" (name node)
                       "--raftDataDir" data-dir
@@ -127,15 +127,16 @@
                (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
-               bootstrap? (conj "--raftBootstrap"))]
+               bootstrap? (conj "--raftBootstrap"))
+        daemon-opts (cond-> {:chdir bin-dir
+                             :logfile log-file
+                             :pidfile pid-file
+                             :background? true}
+                      (seq server-env) (assoc :env server-env))]
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
-        (apply cu/start-daemon! {:chdir bin-dir
-                                 :logfile log-file
-                                 :pidfile pid-file
-                                 :background? true}
-               args)))))
+        (apply cu/start-daemon! daemon-opts server-bin args)))))
 
 (defn- stop-node!
   [node]
@@ -143,6 +144,18 @@
     (c/su
       (cu/stop-daemon! pid-file)
       (c/exec :rm :-f pid-file))))
+
+(defn- snapshot-transport-metrics!
+  [node]
+  (c/on node
+    (c/su
+      (c/exec :bash "-c"
+              (str "tmp=$(mktemp /var/log/elastickv-transport-metrics.XXXXXX); "
+                   "if curl -fsS http://127.0.0.1:9090/metrics "
+                   "| grep -E '^elastickv_raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)' > \"$tmp\"; "
+                   "then { printf '# transport metrics snapshot node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; cat \"$tmp\"; } >> " transport-metrics-file "; "
+                   "else printf '# metrics unavailable node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " transport-metrics-file "; fi; "
+                   "rm -f \"$tmp\"")))))
 
 (defn- wait-for-grpc!
   "Wait until the given node listens on grpc port."
@@ -170,7 +183,8 @@
     (upload-binaries! test node)
     (c/on node
       (c/su
-        (c/exec :mkdir :-p data-dir)))
+        (c/exec :mkdir :-p data-dir)
+        (c/exec :rm :-f log-file transport-metrics-file)))
     (start-node! test node (merge {:data-dir data-dir
                                    :grpc-port (or (:grpc-port opts) 50051)
                                    :redis-port (or (:redis-port opts) 6379)
@@ -207,13 +221,21 @@
 
   (teardown! [_ _test node]
     (try
+      (snapshot-transport-metrics! node)
+      (catch Throwable t
+        (warn t "transport metrics snapshot failed")))
+    (try
       (stop-node! node)
       (catch Throwable t
         (warn t "teardown stop failed")))
     (c/on node
       (c/su
-        (c/exec :rm :-rf data-dir)
-        (c/exec :rm :-f log-file))))
+        (c/exec :rm :-rf data-dir))))
+
+  db/LogFiles
+  (log-files [_ _test _node]
+    {log-file "elastickv.log"
+     transport-metrics-file "elastickv-transport-metrics.prom"})
 
   db/Kill
   (start! [this test node]
@@ -229,6 +251,10 @@
     (info "node started" node)
     this)
   (kill! [this _test node]
+    (try
+      (snapshot-transport-metrics! node)
+      (catch Throwable t
+        (warn t "transport metrics snapshot before kill failed")))
     (stop-node! node)
     this)
 
@@ -250,6 +276,7 @@
   "Constructs an ElastickvDB with optional opts.
    opts: {:grpc-port 50051 :redis-port 6379
           :raft-groups {1 50051 2 50052}
-          :shard-ranges \":m=1,m:=2\"}"
+          :shard-ranges \":m=1,m:=2\"
+          :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
   ([] (->ElastickvDB {}))
   ([opts] (->ElastickvDB opts)))
