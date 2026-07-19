@@ -215,10 +215,15 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	var id string
-	if err := r.retryRedisWrite(ctx, func() error {
-		id, err = r.xaddTxn(ctx, cmd.Args[1], req)
-		return err
-	}); err != nil {
+	if r.onePhaseTxnDedup {
+		id, err = r.xaddTxnWithDedup(ctx, cmd.Args[1], req)
+	} else {
+		err = r.retryRedisWrite(ctx, func() error {
+			id, err = r.xaddTxn(ctx, cmd.Args[1], req)
+			return err
+		})
+	}
+	if err != nil {
 		writeRedisError(conn, err)
 		return
 	}
@@ -226,34 +231,50 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
+	id, readTS, elems, err := r.prepareXAdd(ctx, key, req)
+	if err != nil {
+		return "", err
+	}
+	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+}
+
+// prepareXAdd fixes one XADD attempt's stream ID and exact write set at a
+// single read snapshot. The dedup path retains this result across retries so a
+// forwarded ambiguous conflict cannot resolve "*" again and append a second
+// entry after the first attempt already landed.
+func (r *RedisServer) prepareXAdd(
+	ctx context.Context,
+	key []byte,
+	req xaddRequest,
+) (string, uint64, []*kv.Elem[kv.OP], error) {
 	readTS := r.readTS()
 	typ, err := r.streamTypeForXAdd(ctx, key, readTS)
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 
 	legacyCleanup, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 	legacyCleanup, meta, metaFound, err = r.streamCleanupForExpiredRecreate(
 		ctx, key, readTS, typ, legacyCleanup, meta, metaFound)
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 
 	id, parsedID, err := resolveXAddID(meta, metaFound, req.id)
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 
 	if err := xaddEnforceMaxWideColumn(key, meta.Length, req.maxLen); err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 
 	entryValue, err := marshalStreamEntry(newRedisStreamEntry(id, req.fields))
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 
 	// Capacity hint covers: stream cleanup Dels + one entry Put + one meta
@@ -272,7 +293,7 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 
 	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1)
 	if err != nil {
-		return "", err
+		return "", 0, nil, err
 	}
 	elems = append(elems, trim...)
 	elems = appendMaxLenZeroSelfDel(elems, req.maxLen, key, parsedID)
@@ -284,11 +305,147 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 		ExpireAt: meta.ExpireAt,
 	})
 	if err != nil {
-		return "", cockerrors.WithStack(err)
+		return "", 0, nil, cockerrors.WithStack(err)
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
-	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+	return id, readTS, elems, nil
+}
+
+// reusableXAdd captures the exact ID and write set from an XADD attempt. A
+// retry carries commitTS as PrevCommitTS so the FSM can no-op when that attempt
+// already landed instead of resolving "*" against newer stream metadata and
+// appending a duplicate entry.
+type reusableXAdd struct {
+	elems    []*kv.Elem[kv.OP]
+	startTS  uint64
+	commitTS uint64
+	probeKey []byte
+	id       string
+}
+
+// xaddTxnWithDedup retries XADD only through exact write-set reuse. This is the
+// opt-in counterpart to retryRedisWrite's fail-closed treatment of raw wire
+// write conflicts: the retained write set and PrevCommitTS make a retry safe
+// even when the forwarded response was lost after the leader applied it.
+func (r *RedisServer) xaddTxnWithDedup(ctx context.Context, key []byte, req xaddRequest) (string, error) {
+	var id string
+	var pending *reusableXAdd
+	err := r.retryRedisWrite(ctx, func() error {
+		if pending != nil {
+			nextID, drop, reuseErr := r.dispatchXAddReuse(ctx, key, pending)
+			if drop {
+				pending = nil
+			}
+			if reuseErr != nil {
+				return reuseErr
+			}
+			id = nextID
+			return nil
+		}
+
+		nextID, next, firstErr := r.firstXAddAttempt(ctx, key, req)
+		if next != nil {
+			pending = next
+		}
+		if firstErr != nil {
+			return firstErr
+		}
+		id = nextID
+		return nil
+	})
+	return id, err
+}
+
+func (r *RedisServer) firstXAddAttempt(
+	ctx context.Context,
+	key []byte,
+	req xaddRequest,
+) (string, *reusableXAdd, error) {
+	id, readTS, elems, err := r.prepareXAdd(ctx, key, req)
+	if err != nil {
+		return "", nil, err
+	}
+	startTS := normalizeStartTS(readTS)
+	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "redis xadd first-attempt: allocate commitTS")
+	if err != nil {
+		return "", nil, cockerrors.WithStack(err)
+	}
+	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  startTS,
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	if dispErr == nil {
+		r.streamWaiters.Signal(key)
+		return id, nil, nil
+	}
+
+	// This path owns the exact ID and write set, so it can safely restore a
+	// forwarded conflict to its typed form before entering retryRedisWrite.
+	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if !isRetryableRedisTxnErr(dispErr) {
+		return "", nil, cockerrors.WithStack(dispErr)
+	}
+	return "", &reusableXAdd{
+		elems:    elems,
+		startTS:  startTS,
+		commitTS: commitTS,
+		probeKey: kv.PrimaryKeyForElems(elems),
+		id:       id,
+	}, cockerrors.WithStack(dispErr)
+}
+
+// dispatchXAddReuse re-dispatches one captured XADD write set. A conflict on
+// the fresh commitTS is probed before pending is dropped: if the apply landed,
+// returning success is the only outcome that avoids appending the same logical
+// request again; if it did not land, a fresh snapshot may safely recompute.
+func (r *RedisServer) dispatchXAddReuse(
+	ctx context.Context,
+	key []byte,
+	pending *reusableXAdd,
+) (id string, drop bool, err error) {
+	commitTS, allocErr := r.nextCommitTSAfter(ctx, pending.startTS, "redis xadd reuse: allocate commitTS")
+	if allocErr != nil {
+		return "", false, cockerrors.WithStack(allocErr)
+	}
+	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:        true,
+		StartTS:      pending.startTS,
+		CommitTS:     commitTS,
+		PrevCommitTS: pending.commitTS,
+		Elems:        pending.elems,
+	})
+	if dispErr == nil {
+		r.streamWaiters.Signal(key)
+		return pending.id, false, nil
+	}
+
+	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if errors.Is(dispErr, store.ErrWriteConflict) {
+		if len(pending.probeKey) == 0 {
+			return "", false, cockerrors.Wrap(dispErr, "redis xadd reuse: missing dedup probe key")
+		}
+		landed, probeErr := r.store.CommittedVersionAt(ctx, pending.probeKey, commitTS)
+		if probeErr != nil {
+			// Whether this reuse applied is unknowable. Fail closed rather than
+			// recompute and risk a duplicate append.
+			return "", false, cockerrors.Wrap(probeErr, "redis xadd reuse: self-conflict probe")
+		}
+		if landed {
+			pending.commitTS = commitTS
+			r.streamWaiters.Signal(key)
+			return pending.id, false, nil
+		}
+		return "", true, cockerrors.WithStack(dispErr)
+	}
+	if isRetryableRedisTxnErr(dispErr) {
+		// A lock response did not apply, but carrying the fresh commitTS keeps
+		// the retry correct if a future retryable transport shape is added.
+		pending.commitTS = commitTS
+	}
+	return "", false, cockerrors.WithStack(dispErr)
 }
 
 func redisTTLMillisExpired(ttlMs uint64) bool {

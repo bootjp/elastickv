@@ -33,6 +33,7 @@ message GetClusterOverviewResponse {
   repeated NodeIdentity members = 2;
   repeated GroupLeader group_leaders = 3;
   uint64 aggregate_qps = 4;
+  map<string, bool> capabilities = 5;
 }
 
 message RaftGroupState {

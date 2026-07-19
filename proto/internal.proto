@@ -27,6 +27,12 @@ message Mutation {
   Op op = 1;
   bytes key = 2;
   bytes value = 3;
+  // commit_ts_value_offset, when non-zero, asks the committing leader to write
+  // the resolved transaction commit timestamp into value[offset:offset+8] as a
+  // big-endian uint64 before the request is committed. This is used for values
+  // that durably embed their own creation timestamp but still need leader-side
+  // timestamp allocation after redirect/retry.
+  uint64 commit_ts_value_offset = 4;
 }
 
 enum Phase {
@@ -70,6 +76,7 @@ message ForwardRequest {
 message ForwardResponse {
   bool success = 1;
   uint64 commit_index = 2;
+  uint64 commit_ts = 3;
 }
 
 message RelayPublishRequest {

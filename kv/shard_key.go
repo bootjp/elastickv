@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 )
@@ -51,8 +52,12 @@ var (
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 )
 
-// routeKey normalizes internal keys (e.g., list metadata/items) to the logical
+// RouteKey normalizes internal keys (e.g., list metadata/items) to the logical
 // user key used for shard routing.
+func RouteKey(key []byte) []byte {
+	return routeKey(key)
+}
+
 func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil
@@ -79,6 +84,9 @@ func normalizeRouteKey(key []byte) []byte {
 	if user := s3keys.ExtractRouteKey(key); user != nil {
 		return user
 	}
+	if user := fskeys.ExtractRouteKey(key); user != nil {
+		return user
+	}
 	if user := store.ExtractListUserKey(key); user != nil {
 		return user
 	}
@@ -95,7 +103,7 @@ func redisWideColumnRouteKey(key []byte) []byte {
 	return redisZSetRouteKey(key)
 }
 
-func redisWideColumnScanRouteKey(key []byte) []byte {
+func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
 	for _, prefix := range [][]byte{
 		[]byte(store.HashMetaDeltaPrefix),
 		[]byte(store.HashMetaPrefix),
@@ -108,22 +116,37 @@ func redisWideColumnScanRouteKey(key []byte) []byte {
 		[]byte(store.ZSetMemberPrefix),
 		[]byte(store.ZSetScorePrefix),
 	} {
-		if user := wideColumnScanUserKey(key, prefix); user != nil {
-			return user
+		if !bytes.HasPrefix(key, prefix) {
+			continue
 		}
+		user := wideColumnScanUserKey(key, prefix)
+		if user == nil {
+			return prefix, nil, nil, true, false
+		}
+		prefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		return prefix, user, key[:prefixLen], true, true
 	}
-	return nil
+	return nil, nil, nil, false, false
 }
 
 func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
-	userKey := redisWideColumnScanRouteKey(start)
-	if userKey == nil {
+	prefix, userKey, userPrefix, owned, parsed := redisWideColumnScanRouteParts(start)
+	if !owned {
 		return nil, nil, false, false
 	}
-	if exactEnd := prefixScanEnd(start); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+	if !parsed {
+		return nil, nil, false, true
+	}
+	if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
 		return userKey, nil, true, true
 	}
-	return userKey, prefixScanEnd(userKey), false, true
+	if bytes.Equal(start, userPrefix) && end != nil && bytes.Compare(end, prefixScanEnd(prefix)) <= 0 {
+		return userKey, prefixScanEnd(userKey), false, true
+	}
+	// Physical wide-column cursors include a field/member suffix. Their raw
+	// ordering cannot be projected to a logical user-key lower bound, so the
+	// remaining namespace must fan out to every logical route.
+	return nil, nil, false, true
 }
 
 func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
