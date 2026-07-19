@@ -158,12 +158,21 @@ func parsedS3Scope(name string, ok bool, key []byte) (Scope, bool, error) {
 }
 
 func isRedisBackupKey(key []byte) bool {
+	if hasAnyBackupPrefix(key,
+		RedisHashMetaDeltaPrefix,
+		ListMetaDeltaPrefix,
+		ListClaimPrefix,
+		RedisSetMetaDeltaPrefix,
+		RedisZSetMetaDeltaPrefix,
+		RedisZSetScorePrefix,
+	) {
+		return false
+	}
 	prefixes := [...]string{
-		RedisHashMetaDeltaPrefix, RedisHashMetaPrefix, RedisHashFieldPrefix,
-		ListMetaDeltaPrefix, ListMetaPrefix, ListItemPrefix, ListClaimPrefix,
-		RedisSetMetaDeltaPrefix, RedisSetMetaPrefix, RedisSetMemberPrefix,
-		RedisZSetMetaDeltaPrefix, RedisZSetMetaPrefix, RedisZSetMemberPrefix,
-		RedisZSetScorePrefix, RedisZSetLegacyBlobPrefix,
+		RedisHashMetaPrefix, RedisHashFieldPrefix,
+		ListMetaPrefix, ListItemPrefix,
+		RedisSetMetaPrefix, RedisSetMemberPrefix,
+		RedisZSetMetaPrefix, RedisZSetMemberPrefix, RedisZSetLegacyBlobPrefix,
 		RedisStreamMetaPrefix, RedisStreamEntryPrefix,
 		RedisStringPrefix, RedisHLLPrefix, RedisTTLPrefix,
 	}
@@ -225,25 +234,51 @@ func (d *LiveDecoder) Finalize() (DecodeCounters, error) {
 }
 
 // FinalizedScopeCounts replaces streamed counts for adapters whose encoders
-// make relational keep/drop decisions during Finalize. S3 is authoritative
-// here because orphan chunks and stale-generation objects are only known after
-// the complete bucket state has been assembled.
+// make relational keep/drop decisions during Finalize. The encoder counts are
+// authoritative because orphan and stale records are only known after the
+// complete adapter state has been assembled.
 func (d *LiveDecoder) FinalizedScopeCounts(streamed map[Scope]uint64) (map[Scope]uint64, error) {
 	if d == nil || d.d == nil || !d.finalized {
 		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live decoder is not finalized")
 	}
 	out := make(map[Scope]uint64, len(streamed))
 	for scope, count := range streamed {
-		if scope.Adapter != adapterS3 || d.d.s3 == nil {
+		if !adapterFinalizesScopeCounts(scope.Adapter) {
 			out[scope] = count
 		}
 	}
-	if d.d.s3 != nil {
-		for name, count := range d.d.s3.RetainedRecordCounts() {
+	d.d.addFinalizedScopeCounts(out)
+	return out, nil
+}
+
+func adapterFinalizesScopeCounts(adapter string) bool {
+	switch adapter {
+	case adapterDynamoDB, adapterS3, adapterRedis, adapterSQS:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *dispatcher) addFinalizedScopeCounts(out map[Scope]uint64) {
+	if d.ddb != nil {
+		for name, count := range d.ddb.RetainedRecordCounts() {
+			out[Scope{Adapter: adapterDynamoDB, Name: name}] = count
+		}
+	}
+	if d.s3 != nil {
+		for name, count := range d.s3.RetainedRecordCounts() {
 			out[Scope{Adapter: adapterS3, Name: name}] = count
 		}
 	}
-	return out, nil
+	if d.redis != nil {
+		out[Scope{Adapter: adapterRedis, Name: "db_0"}] = d.redis.RetainedRecordCount()
+	}
+	if d.sqs != nil {
+		for name, count := range d.sqs.RetainedRecordCounts() {
+			out[Scope{Adapter: adapterSQS, Name: name}] = count
+		}
+	}
 }
 
 func (s Scope) String() string {

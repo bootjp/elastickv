@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"sync"
@@ -403,6 +404,70 @@ func TestRunLiveBackupRejectsS3ScopeWithOnlyOrphanRecords(t *testing.T) {
 		t.Fatalf("err=%v, want ErrCompactionDuringDump", err)
 	}
 	assertLiveBackupHasNoManifest(t, root)
+}
+
+func TestRunLiveBackupRejectsFinalizeDroppedScopes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		adapter  string
+		scope    string
+		adapters AdapterSet
+		record   *pb.BackupKV
+	}{
+		{
+			name:     "deleted SQS queue generation",
+			adapter:  adapterSQS,
+			scope:    "deleted-queue",
+			adapters: AdapterSet{SQS: true},
+			record: &pb.BackupKV{
+				Key:   []byte(SQSQueueGenPrefix + base64.RawURLEncoding.EncodeToString([]byte("deleted-queue"))),
+				Value: []byte("2"),
+			},
+		},
+		{
+			name:     "DynamoDB items without schema",
+			adapter:  adapterDynamoDB,
+			scope:    "deleted-table",
+			adapters: AdapterSet{DynamoDB: true},
+			record: &pb.BackupKV{
+				Key: EncodeDDBItemKey("deleted-table", 1, "orphan", ""),
+				Value: encodeItemValue(t, &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+					"id": sAttr("orphan"),
+				}}),
+			},
+		},
+		{
+			name:     "Redis stream entries without meta",
+			adapter:  adapterRedis,
+			scope:    "db_0",
+			adapters: AdapterSet{Redis: true},
+			record: &pb.BackupKV{
+				Key:   streamEntryKey("orphan", 1, 0),
+				Value: encodeStreamEntryValue(t, "1-0", []string{"field", "value"}),
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rpc := successfulLiveBackupRPC()
+			rpc.listed = []*pb.BackupScope{{Adapter: tc.adapter, Scope: tc.scope}}
+			rpc.begin.ExpectedKeys = []*pb.BackupExpectedKeys{{Adapter: tc.adapter, Scope: tc.scope, KeyCount: 1}}
+			rpc.records = []*pb.BackupKV{tc.record}
+			root := filepath.Join(t.TempDir(), "dump")
+
+			_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+				OutputRoot: root,
+				Adapters:   tc.adapters,
+				TTL:        time.Minute,
+			})
+			if !errors.Is(err, ErrCompactionDuringDump) {
+				t.Fatalf("err=%v, want ErrCompactionDuringDump", err)
+			}
+			assertLiveBackupHasNoManifest(t, root)
+		})
+	}
 }
 
 func crossAdapterLiveBackupRPC(t *testing.T) (*fakeLiveBackupRPC, []byte) {

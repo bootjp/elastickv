@@ -76,6 +76,7 @@ type ddbTableState struct {
 	name       string
 	schema     *pb.DynamoTableSchema
 	itemsByGen map[uint64][]*pb.DynamoItem
+	retained   uint64
 }
 
 func ensureItemsByGen(m map[uint64][]*pb.DynamoItem) map[uint64][]*pb.DynamoItem {
@@ -210,6 +211,18 @@ func (d *DDBEncoder) Finalize() error {
 	return nil
 }
 
+// RetainedRecordCounts reports source records represented by each emitted
+// table after schema and generation filtering.
+func (d *DDBEncoder) RetainedRecordCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(d.tables))
+	for _, st := range d.tables {
+		if st.schema != nil {
+			out[st.name] = st.retained
+		}
+	}
+	return out
+}
+
 func totalItemsAcrossGens(m map[uint64][]*pb.DynamoItem) int {
 	total := 0
 	for _, items := range m {
@@ -247,7 +260,19 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	if err != nil {
 		return err
 	}
-	return d.writeEffectiveDDBItems(itemsDir, st.name, hashKey, rangeKey, items)
+	if err := d.writeEffectiveDDBItems(itemsDir, st.name, hashKey, rangeKey, items); err != nil {
+		return err
+	}
+	st.retained = 1 + retainedDDBItemRecords(st.itemsByGen, emitOrder)
+	return nil
+}
+
+func retainedDDBItemRecords(itemsByGen map[uint64][]*pb.DynamoItem, emitOrder []uint64) uint64 {
+	var count uint64
+	for _, generation := range emitOrder {
+		count += uint64(len(itemsByGen[generation]))
+	}
+	return count
 }
 
 func ddbGenerationEmitOrder(activeGen, migrationSourceGen uint64) []uint64 {

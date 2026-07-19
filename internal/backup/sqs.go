@@ -121,6 +121,7 @@ type sqsQueueState struct {
 	// means we have an orphan-only queue and the orphan branch
 	// already drops messages). Codex P1 round 10.
 	activeGen uint64
+	genSeen   bool
 	// internalBuf accumulates side records in their on-disk shape if
 	// includeSideRecords is on. Each line is the encoded prefix +
 	// hex(rest-of-key) + value (b64) — implementation-grade detail
@@ -336,7 +337,9 @@ func (s *SQSEncoder) HandleQueueGen(key, value []byte) error {
 	if err != nil {
 		return errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
-	s.queueState(encoded).activeGen = gen
+	st := s.queueState(encoded)
+	st.activeGen = gen
+	st.genSeen = true
 	return nil
 }
 
@@ -437,6 +440,24 @@ func (s *SQSEncoder) Finalize() error {
 		}
 	}
 	return firstErr
+}
+
+// RetainedRecordCounts reports source records represented by each emitted
+// queue after metadata and generation filtering.
+func (s *SQSEncoder) RetainedRecordCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(s.queues))
+	for _, st := range s.queues {
+		if st.meta == nil {
+			continue
+		}
+		count := uint64(1)
+		if st.genSeen {
+			count++
+		}
+		visible, _ := filterStaleGenMessages(st.messages, st.activeGen)
+		out[st.name] = count + uint64(len(visible))
+	}
+	return out
 }
 
 // flushOrphanQueueSideRecords emits buffered side records for a queue

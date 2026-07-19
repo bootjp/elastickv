@@ -107,6 +107,7 @@ type redisStreamState struct {
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
+	externalTTL    bool
 }
 
 // HandleStreamMeta processes one !stream|meta|<userKey> record.
@@ -182,6 +183,7 @@ func (r *RedisDB) streamState(userKey []byte) *redisStreamState {
 	if expireAtMs, ok := r.claimPendingTTL(userKey); ok {
 		st.expireAtMs = expireAtMs
 		st.hasTTL = true
+		st.externalTTL = true
 	}
 	r.streams[uk] = st
 	r.kindByKey[uk] = redisKindStream
