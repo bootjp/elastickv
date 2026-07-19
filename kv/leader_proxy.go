@@ -110,6 +110,7 @@ func (p *LeaderProxy) forwardWithRetry(callerCtx context.Context, reqs []*pb.Req
 	parentCtx, cancelParent := context.WithDeadline(callerCtx, deadline)
 	defer cancelParent()
 	requestID := p.forwardSeq.Add(1)
+	defer p.forwardBreaker.releaseRequest(requestID)
 
 	var lastErr error
 	for {

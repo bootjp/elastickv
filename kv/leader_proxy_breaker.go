@@ -63,11 +63,16 @@ func (b *leaderProxyCircuitBreaker) allow(identity leaderProxyIdentity, requestI
 	if b.openUntil.IsZero() {
 		return nil
 	}
+	if b.owner != 0 && b.owner != requestID {
+		return leaderProxyCircuitOpenError(identity, b.openUntilText)
+	}
 	if b.probeInFlight {
 		return leaderProxyCircuitOpenError(identity, b.openUntilText)
 	}
 	b.probeInFlight = true
-	b.owner = requestID
+	if b.owner == 0 {
+		b.owner = requestID
+	}
 	return nil
 }
 
@@ -102,13 +107,24 @@ func (b *leaderProxyCircuitBreaker) record(identity leaderProxyIdentity, request
 	b.owner = requestID
 }
 
-// release abandons a half-open probe without treating caller cancellation as
+// release abandons recovery ownership without treating caller cancellation as
 // evidence that the leader is unhealthy. The next request may take the probe.
 func (b *leaderProxyCircuitBreaker) release(identity leaderProxyIdentity, requestID uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if !b.initialized || b.identity != identity || b.owner != requestID || !b.probeInFlight {
+	if !b.initialized || b.identity != identity || b.owner != requestID {
+		return
+	}
+	b.probeInFlight = false
+	b.owner = 0
+}
+
+func (b *leaderProxyCircuitBreaker) releaseRequest(requestID uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.owner != requestID {
 		return
 	}
 	b.probeInFlight = false

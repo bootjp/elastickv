@@ -35,11 +35,12 @@ func TestLeaderProxyCircuitBreakerOpensAndLimitsHalfOpenProbe(t *testing.T) {
 	require.False(t, breaker.owns(identity, 2))
 
 	probeAt := now.Add(leaderProxyBreakerBaseBackoff)
-	require.NoError(t, breaker.allow(identity, 2, probeAt))
-	require.True(t, breaker.owns(identity, 2))
+	require.ErrorIs(t, breaker.allow(identity, 2, probeAt), ErrLeaderProxyCircuitOpen)
+	require.True(t, breaker.owns(identity, 1))
+	require.NoError(t, breaker.allow(identity, 1, probeAt))
 	require.ErrorIs(t, breaker.allow(identity, 3, probeAt), ErrLeaderProxyCircuitOpen)
 
-	breaker.record(identity, 2, nil, probeAt)
+	breaker.record(identity, 1, nil, probeAt)
 	require.Empty(t, breaker.openUntilText)
 	require.NoError(t, breaker.allow(identity, 3, probeAt))
 }
@@ -97,8 +98,9 @@ func TestLeaderProxyCircuitBreakerIgnoresLateFailureFromSuppressedRequest(t *tes
 	breaker.record(identity, 2, ErrLeaderNotFound, now.Add(leaderProxyBreakerBaseBackoff))
 
 	require.True(t, breaker.owns(identity, 1))
-	require.NoError(t, breaker.allow(identity, 2, now.Add(leaderProxyBreakerBaseBackoff)))
-	require.True(t, breaker.owns(identity, 2))
+	require.ErrorIs(t, breaker.allow(identity, 2, now.Add(leaderProxyBreakerBaseBackoff)), ErrLeaderProxyCircuitOpen)
+	require.True(t, breaker.owns(identity, 1))
+	require.NoError(t, breaker.allow(identity, 1, now.Add(leaderProxyBreakerBaseBackoff)))
 }
 
 func TestLeaderProxyCircuitBreakerReleasesCanceledHalfOpenProbe(t *testing.T) {
@@ -113,11 +115,11 @@ func TestLeaderProxyCircuitBreakerReleasesCanceledHalfOpenProbe(t *testing.T) {
 		breaker.record(identity, 1, ErrLeaderNotFound, now)
 	}
 	probeAt := now.Add(leaderProxyBreakerBaseBackoff)
-	require.NoError(t, breaker.allow(identity, 2, probeAt))
+	require.NoError(t, breaker.allow(identity, 1, probeAt))
 
-	breaker.release(identity, 2)
+	breaker.release(identity, 1)
 
-	require.False(t, breaker.owns(identity, 2))
+	require.False(t, breaker.owns(identity, 1))
 	require.NoError(t, breaker.allow(identity, 3, probeAt))
 	require.True(t, breaker.owns(identity, 3))
 }
@@ -136,21 +138,24 @@ func TestLeaderProxyCircuitBreakerAllowsOneConcurrentHalfOpenProbe(t *testing.T)
 	const requests = 32
 	start := make(chan struct{})
 	var allowed atomic.Int32
+	var allowedOwner atomic.Uint64
 	var wg sync.WaitGroup
-	for requestID := uint64(2); requestID < requests+2; requestID++ {
+	for requestID := uint64(1); requestID <= requests; requestID++ {
 		wg.Add(1)
-		go func() {
+		go func(requestID uint64) {
 			defer wg.Done()
 			<-start
 			if breaker.allow(identity, requestID, now.Add(leaderProxyBreakerBaseBackoff)) == nil {
 				allowed.Add(1)
+				allowedOwner.Store(requestID)
 			}
-		}()
+		}(requestID)
 	}
 	close(start)
 	wg.Wait()
 
 	require.Equal(t, int32(1), allowed.Load())
+	require.Equal(t, uint64(1), allowedOwner.Load())
 }
 
 func TestLeaderProxyBreakerBackoffIsBounded(t *testing.T) {

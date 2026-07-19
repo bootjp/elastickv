@@ -68,7 +68,9 @@ identity are ignored after a newer identity has been observed.
 
 Caller cancellation and caller-deadline expiry are not leader health signals.
 They release an acquired half-open probe without incrementing or clearing the
-failure count, so another live request can probe the same identity.
+failure count. A recovery owner that exits during backoff also releases its
+reservation, so another live request can probe the same identity without
+allowing a later request to steal an active owner's probe.
 
 Any change in leader ID, address, or term resets the breaker immediately. A
 verified local-leader commit also resets it.
@@ -106,7 +108,9 @@ Unit coverage pins:
 - proxy-budget deadline accounting against a blackholed endpoint;
 - caller cancellation releasing a blackholed half-open probe;
 - recovery-owner half-open success after transport `Unavailable` failures;
-- S3 chunk-upload circuit-open mapping; and
+- recovery-owner reservation under concurrent half-open admission;
+- S3 chunk-upload and create-multipart circuit-open mapping;
+- SQS JSON and Query protocol service-unavailable mapping; and
 - the existing short-election and full-budget integration cases.
 
 The race suite covers concurrent breaker access and half-open probe admission.

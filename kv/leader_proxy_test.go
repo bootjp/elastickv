@@ -357,7 +357,7 @@ func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 	callerCtx, cancelCaller := context.WithCancel(context.Background())
 	proxyCtx, cancelProxy := context.WithTimeout(callerCtx, time.Second)
 	time.AfterFunc(50*time.Millisecond, cancelCaller)
-	_, err := p.forward(callerCtx, proxyCtx, []*pb.Request{{IsTxn: false}}, 2)
+	_, err := p.forward(callerCtx, proxyCtx, []*pb.Request{{IsTxn: false}}, 1)
 	cancelProxy()
 	require.ErrorIs(t, err, context.Canceled)
 
@@ -404,6 +404,7 @@ func TestLeaderProxy_CanceledRecoveryOwnerStopsRetrying(t *testing.T) {
 	_, err := p.forwardWithRetry(ctx, []*pb.Request{{IsTxn: false}})
 
 	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, p.forwardBreaker.owns(identity, requestID))
 }
 
 func TestLeaderProxy_TransportFailureOwnerPerformsHalfOpenProbe(t *testing.T) {

@@ -1208,7 +1208,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 		},
 	}); err != nil {
-		writeS3InternalError(w, err)
+		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}
 	writeS3XML(w, http.StatusOK, s3InitiateMultipartUploadResult{

@@ -250,7 +250,7 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrPurgeInProgress, rateLimit.Error())
 		return
 	}
-	if errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isSQSServiceUnavailable(err) {
 		writeSQSError(w, http.StatusServiceUnavailable, sqsErrServiceUnavailable, "service unavailable")
 		return
 	}
@@ -262,6 +262,10 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 	// chain) and return a generic 500 body.
 	slog.Error("sqs adapter internal error", "err", err)
 	writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure, "internal error")
+}
+
+func isSQSServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 func writeSQSJSON(w http.ResponseWriter, payload any) {
