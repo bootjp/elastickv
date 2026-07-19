@@ -45,6 +45,18 @@ type ExternalSnapshotRestoreResult struct {
 	Peers         int
 }
 
+// PhysicalSnapshotRestoreOptions describes a complete FSM payload previously
+// emitted by the Raft state machine. Unlike ExternalSnapshotRestoreOptions, the
+// input already contains the KV snapshot header and must not be wrapped again.
+type PhysicalSnapshotRestoreOptions struct {
+	InputFSMPath          string
+	DataDir               string
+	Index                 uint64
+	Term                  uint64
+	Peers                 []Peer
+	ExpectedPayloadSHA256 string
+}
+
 // PrepareExternalSnapshotRestore seeds a fresh etcd-raft data directory from
 // an externally produced EKVPBBL1 FSM payload. The input file is the raw payload
 // emitted by elastickv-snapshot-encode; this helper writes the runtime
@@ -54,6 +66,34 @@ func PrepareExternalSnapshotRestore(opts ExternalSnapshotRestoreOptions) (*Exter
 	if err := validateExternalSnapshotRestoreOptions(opts); err != nil {
 		return nil, err
 	}
+	return prepareExternalSnapshotRestore(opts, writeExternalFSMSnapshotFile)
+}
+
+// PreparePhysicalSnapshotRestore seeds a fresh etcd-raft data directory from
+// a complete, opaque FSM payload. Store format dispatch remains in
+// StateMachine.Restore, so legacy, SST-ingest, and future receiver-compatible
+// payloads all use the same path without this package parsing their internals.
+func PreparePhysicalSnapshotRestore(opts PhysicalSnapshotRestoreOptions) (*ExternalSnapshotRestoreResult, error) {
+	externalOpts := ExternalSnapshotRestoreOptions{
+		InputFSMPath:          opts.InputFSMPath,
+		DataDir:               opts.DataDir,
+		Index:                 opts.Index,
+		Term:                  opts.Term,
+		Peers:                 opts.Peers,
+		ExpectedPayloadSHA256: opts.ExpectedPayloadSHA256,
+	}
+	if err := validateExternalSnapshotRestoreOptions(externalOpts); err != nil {
+		return nil, err
+	}
+	return prepareExternalSnapshotRestore(externalOpts, writePhysicalFSMSnapshotFile)
+}
+
+type externalSnapshotFileWriter func(inputPath, fsmSnapDir string, index uint64, ceilingMs uint64) (uint32, int64, string, error)
+
+func prepareExternalSnapshotRestore(
+	opts ExternalSnapshotRestoreOptions,
+	writeSnapshot externalSnapshotFileWriter,
+) (*ExternalSnapshotRestoreResult, error) {
 	destDataDir, tempDir, err := prepareExternalSnapshotRestoreDest(opts.DataDir)
 	if err != nil {
 		return nil, err
@@ -66,7 +106,7 @@ func PrepareExternalSnapshotRestore(opts ExternalSnapshotRestoreOptions) (*Exter
 	}()
 
 	fsmSnapDir := filepath.Join(tempDir, fsmSnapDirName)
-	crc, payloadBytes, payloadSHA, err := writeExternalFSMSnapshotFile(opts.InputFSMPath, fsmSnapDir, opts.Index, opts.SnapshotCeilingMs)
+	crc, payloadBytes, payloadSHA, err := writeSnapshot(opts.InputFSMPath, fsmSnapDir, opts.Index, opts.SnapshotCeilingMs)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +197,15 @@ func ensureExternalRestorePathAbsent(path string, kind string) error {
 }
 
 func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ceilingMs uint64) (uint32, int64, string, error) {
+	header := encodeExternalRestoreSnapshotHeader(ceilingMs)
+	return writePreparedFSMSnapshotFile(inputPath, fsmSnapDir, index, header[:])
+}
+
+func writePhysicalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, _ uint64) (uint32, int64, string, error) {
+	return writePreparedFSMSnapshotFile(inputPath, fsmSnapDir, index, nil)
+}
+
+func writePreparedFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, prefix []byte) (uint32, int64, string, error) {
 	if err := os.MkdirAll(fsmSnapDir, defaultDirPerm); err != nil {
 		return 0, 0, "", errors.WithStack(err)
 	}
@@ -180,7 +229,7 @@ func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ce
 		_ = os.Remove(tmpPath)
 	}()
 
-	crc, bytesWritten, payloadSHA, err := copyExternalPayloadWithHeaderAndFooter(in, tmpFile, ceilingMs)
+	crc, bytesWritten, payloadSHA, err := copySnapshotPayloadWithPrefixAndFooter(in, tmpFile, prefix)
 	if err != nil {
 		return 0, 0, "", err
 	}
@@ -223,16 +272,17 @@ func requireRegularFile(f *os.File, path string) error {
 	return nil
 }
 
-func copyExternalPayloadWithHeaderAndFooter(in io.Reader, out *os.File, ceilingMs uint64) (uint32, int64, string, error) {
+func copySnapshotPayloadWithPrefixAndFooter(in io.Reader, out *os.File, prefix []byte) (uint32, int64, string, error) {
 	bw := bufio.NewWriterSize(out, fsmWriteBufSize)
 	crcHash := crc32.New(crc32cTable)
 	payloadHash := sha256.New()
-	header := encodeExternalRestoreSnapshotHeader(ceilingMs)
-	if _, err := bw.Write(header[:]); err != nil {
-		return 0, 0, "", errors.WithStack(err)
-	}
-	if _, err := crcHash.Write(header[:]); err != nil {
-		return 0, 0, "", errors.WithStack(err)
+	if len(prefix) != 0 {
+		if _, err := bw.Write(prefix); err != nil {
+			return 0, 0, "", errors.WithStack(err)
+		}
+		if _, err := crcHash.Write(prefix); err != nil {
+			return 0, 0, "", errors.WithStack(err)
+		}
 	}
 	n, err := io.Copy(io.MultiWriter(bw, crcHash, payloadHash), in)
 	if err != nil {

@@ -402,8 +402,8 @@ TBD).**
   rows) so they do not pile up in L0 between compactor runs —
   reuses the existing TTL helper path.
 
-**M4 — Disaster-recovery snapshot offload (`*_proposed_*` doc
-TBD).**
+**M4 — Disaster-recovery snapshot offload
+([`2026_07_19_proposed_physical_snapshot_object_offload.md`](2026_07_19_proposed_physical_snapshot_object_offload.md)).**
 - Periodic per-shard Pebble snapshot uploaded to an S3-compatible
   bucket (the S3 adapter already speaks the protocol).
 - Restore is `s3 fetch → pebble.Ingest`; combined with M1's
