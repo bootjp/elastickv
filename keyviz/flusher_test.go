@@ -83,6 +83,59 @@ func TestRunFlusherAttachesAlignedHotKeysWindow(t *testing.T) {
 	<-done
 }
 
+func TestFlushWindowKeepsHotKeyAndCounterInSameColumn(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	s := NewMemSampler(MemSamplerOptions{
+		Step:              time.Minute,
+		HistoryColumns:    4,
+		HotKeysEnabled:    true,
+		HotKeysPerRoute:   8,
+		HotKeysSampleRate: 1,
+		HotKeysQueueSize:  32,
+		HotKeysMaxKeyLen:  64,
+		Now:               func() time.Time { return now },
+	})
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunHotKeysAggregator(ctx, s)
+	}()
+
+	s.flushMu.Lock()
+	observed := make(chan struct{})
+	go func() {
+		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+		close(observed)
+	}()
+	select {
+	case <-observed:
+		t.Fatal("Observe crossed a hot-key flush boundary")
+	case <-time.After(20 * time.Millisecond):
+	}
+	s.flushMu.Unlock()
+	select {
+	case <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("Observe remained blocked after the flush boundary opened")
+	}
+	require.True(t, s.flushWindow(ctx, now.Add(time.Minute)))
+
+	columns := s.Snapshot(time.Time{}, time.Time{})
+	require.Len(t, columns, 1)
+	require.Len(t, columns[0].Rows, 1)
+	require.Equal(t, uint64(1), columns[0].Rows[0].Writes)
+	require.Len(t, columns[0].HotKeys, 1)
+	require.Equal(t, uint64(1), columns[0].HotKeys[0].SampledN)
+	require.Len(t, columns[0].HotKeys[0].Entries, 1)
+	require.Equal(t, []byte("hot"), columns[0].HotKeys[0].Entries[0].Key)
+
+	cancel()
+	<-done
+}
+
 // TestRunFlusherNilSamplerWaitsCtx asserts the nil-sampler contract
 // (RunFlusher just blocks on ctx.Done so callers can hard-wire it
 // regardless of whether keyviz is enabled).

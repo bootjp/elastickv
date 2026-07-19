@@ -14,11 +14,11 @@
 //
 // Hot-path properties (see design §5.1, §10):
 //
-//   - Observe is a single atomic.Pointer[routeTable].Load, a plain map
-//     lookup against an immutable snapshot, and at most two
-//     atomic.AddUint64 calls (one for the count, one for bytes —
-//     skipped when both keyLen and valueLen are zero). No allocation,
-//     no mutex.
+//   - With hot-key tracking disabled, Observe is a single
+//     atomic.Pointer[routeTable].Load, a plain map lookup against an immutable
+//     snapshot, and at most two atomic.AddUint64 calls. Hot-key tracking adds a
+//     read lock to writes so sampled events stay aligned with their counter
+//     window.
 //   - Flush drains the per-route counters with atomic.SwapUint64; no
 //     pointer retirement, so a late writer cannot race past the snapshot
 //     and lose counts.
@@ -202,9 +202,10 @@ type MemSamplerOptions struct {
 type MemSampler struct {
 	opts MemSamplerOptions
 	now  func() time.Time
-	// flushMu serializes explicit and background flushes and protects the
-	// committed window lower boundary.
-	flushMu     sync.Mutex
+	// flushMu serializes explicit and background flushes, protects the
+	// committed window lower boundary, and aligns enabled hot-key events with
+	// the counter window drained by that flush.
+	flushMu     sync.RWMutex
 	lastFlushAt time.Time
 
 	// table holds the immutable map of currently-tracked routes. The
@@ -662,6 +663,14 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int, la
 	if s == nil {
 		return
 	}
+	if s.hotKeys != nil && op == OpWrite {
+		s.flushMu.RLock()
+		defer s.flushMu.RUnlock()
+	}
+	s.observe(routeID, key, op, valueLen, label)
+}
+
+func (s *MemSampler) observe(routeID uint64, key []byte, op Op, valueLen int, label Label) {
 	if !s.opts.KeyVizLabelsEnabled {
 		label = LabelLegacy
 	}

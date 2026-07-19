@@ -2,15 +2,57 @@ package main
 
 import (
 	"context"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateDemoAutoSplitDetectorConfigRejectsNonFiniteValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(*autosplit.Config)
+	}{
+		{name: "threshold nan", mutate: func(cfg *autosplit.Config) { cfg.ThresholdOpsMin = math.NaN() }},
+		{name: "write weight infinity", mutate: func(cfg *autosplit.Config) { cfg.WriteWeight = math.Inf(1) }},
+		{name: "read weight nan", mutate: func(cfg *autosplit.Config) { cfg.ReadWeight = math.NaN() }},
+		{name: "top key share nan", mutate: func(cfg *autosplit.Config) { cfg.TopKeyShare = math.NaN() }},
+		{name: "top key floor infinity", mutate: func(cfg *autosplit.Config) { cfg.TopKeyAbsoluteFloor = math.Inf(1) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := autosplit.DefaultConfig()
+			test.mutate(&cfg)
+			require.Error(t, validateDemoAutoSplitDetectorConfig(cfg))
+		})
+	}
+}
+
+func TestDemoSamplerRouteResolverNormalizesInternalKeys(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	routeID, ok := demoSamplerRouteResolver(engine)([]byte("!redis|meta|z"))
+
+	require.True(t, ok)
+	require.Equal(t, uint64(2), routeID)
+}
 
 func TestEffectiveDemoMetricsToken(t *testing.T) {
 	require.Equal(t, "custom-token", effectiveDemoMetricsToken(" custom-token "))

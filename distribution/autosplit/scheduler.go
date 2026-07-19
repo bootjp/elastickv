@@ -509,7 +509,7 @@ func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, 
 	if decision.SplitOrigin != SplitOriginIsolationCompound {
 		return first.CatalogVersion, nil
 	}
-	if !validIntermediateChild(first.Right, decision) {
+	if !validCompoundIntermediate(first, decision) {
 		return first.CatalogVersion, errors.New("autosplit: split response did not contain the expected compound intermediate child")
 	}
 
@@ -530,13 +530,23 @@ func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, 
 	return second.CatalogVersion, nil
 }
 
-func validIntermediateChild(route distribution.RouteDescriptor, decision Decision) bool {
-	return route.RouteID != 0 &&
-		route.State == distribution.RouteStateActive &&
-		route.GroupID == decision.RouteGroupID &&
-		bytes.Equal(route.Start, decision.SplitKey) &&
-		bytes.Equal(route.End, decision.RouteEnd) &&
-		splitKeyInsideRoute(route, decision.SecondSplitKey)
+func validCompoundIntermediate(result SplitResult, decision Decision) bool {
+	left, right := result.Left, result.Right
+	if !validCompoundChildTopology(left, right, decision) {
+		return false
+	}
+	parent := distribution.RouteDescriptor{Start: left.Start, End: right.End}
+	return splitKeyInsideRoute(parent, right.Start) &&
+		splitKeyInsideRoute(right, decision.SecondSplitKey)
+}
+
+func validCompoundChildTopology(left, right distribution.RouteDescriptor, decision Decision) bool {
+	return left.RouteID != 0 && right.RouteID != 0 && left.RouteID != right.RouteID &&
+		left.State == distribution.RouteStateActive && right.State == distribution.RouteStateActive &&
+		left.GroupID == decision.RouteGroupID && right.GroupID == decision.RouteGroupID &&
+		bytes.Equal(left.Start, decision.RouteStart) &&
+		bytes.Equal(left.End, right.Start) &&
+		bytes.Equal(right.End, decision.RouteEnd)
 }
 
 func (s *Scheduler) executePendingCompound(

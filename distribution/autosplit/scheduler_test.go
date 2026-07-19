@@ -1,6 +1,7 @@
 package autosplit
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -384,6 +385,36 @@ func TestSchedulerExecutesCompoundIsolationBackToBack(t *testing.T) {
 	require.Len(t, source.snapshot.Routes, 3)
 }
 
+func TestSchedulerCompoundUsesNormalizedCommittedBoundary(t *testing.T) {
+	t.Parallel()
+	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	splitter := &fakeSplitter{
+		normalizeSplitKey: func(key []byte) []byte {
+			if bytes.Equal(key, []byte("m")) {
+				return []byte("l")
+			}
+			return key
+		},
+	}
+	splitter.onSuccess = func(req SplitRequest, result SplitResult) {
+		applyFakeSplit(source, req, result)
+	}
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+
+	version, err := scheduler.executeDecision(context.Background(), 7, testCompoundDecision())
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), version)
+	require.Len(t, splitter.requests, 2)
+	require.Equal(t, []byte("m"), splitter.requests[0].SplitKey)
+	require.Equal(t, []byte("l"), splitter.requests[1].ParentStart)
+	require.Equal(t, []byte{'m', 0}, splitter.requests[1].SplitKey)
+	require.Empty(t, scheduler.pendingCompounds)
+}
+
 func TestSchedulerRetriesPendingCompoundWithoutNewSamplerColumn(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
@@ -625,10 +656,11 @@ func (f *fakeCatalogSnapshotSource) Snapshot(context.Context) (distribution.Cata
 }
 
 type fakeSplitter struct {
-	requests  []SplitRequest
-	err       error
-	failAt    map[int]error
-	onSuccess func(SplitRequest, SplitResult)
+	requests          []SplitRequest
+	err               error
+	failAt            map[int]error
+	normalizeSplitKey func([]byte) []byte
+	onSuccess         func(SplitRequest, SplitResult)
 }
 
 func (f *fakeSplitter) SplitRange(_ context.Context, req SplitRequest) (SplitResult, error) {
@@ -639,15 +671,19 @@ func (f *fakeSplitter) SplitRange(_ context.Context, req SplitRequest) (SplitRes
 	if err := f.failAt[len(f.requests)]; err != nil {
 		return SplitResult{}, err
 	}
+	splitKey := req.SplitKey
+	if f.normalizeSplitKey != nil {
+		splitKey = f.normalizeSplitKey(splitKey)
+	}
 	baseID := req.RouteID*100 + uint64(len(f.requests))*2
 	result := SplitResult{
 		CatalogVersion: req.ExpectedCatalogVersion + 1,
 		Left: distribution.RouteDescriptor{
-			RouteID: baseID, Start: distribution.CloneBytes(req.ParentStart), End: distribution.CloneBytes(req.SplitKey),
+			RouteID: baseID, Start: distribution.CloneBytes(req.ParentStart), End: distribution.CloneBytes(splitKey),
 			GroupID: req.ParentGroupID, State: distribution.RouteStateActive,
 		},
 		Right: distribution.RouteDescriptor{
-			RouteID: baseID + 1, Start: distribution.CloneBytes(req.SplitKey), End: distribution.CloneBytes(req.ParentEnd),
+			RouteID: baseID + 1, Start: distribution.CloneBytes(splitKey), End: distribution.CloneBytes(req.ParentEnd),
 			GroupID: req.ParentGroupID, State: distribution.RouteStateActive,
 		},
 	}

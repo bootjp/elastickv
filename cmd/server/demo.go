@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -384,7 +385,14 @@ func validateDemoAutoSplitDetectorConfig(cfg autosplit.Config) error {
 	if err := validateDemoAutoSplitWeights(cfg.WriteWeight, cfg.ReadWeight); err != nil {
 		return err
 	}
-	if cfg.ThresholdOpsMin <= 0 {
+	if err := validateDemoAutoSplitDetectorLimits(cfg); err != nil {
+		return err
+	}
+	return validateDemoAutoSplitHotKeyThresholds(cfg)
+}
+
+func validateDemoAutoSplitDetectorLimits(cfg autosplit.Config) error {
+	if !isFiniteDemoAutoSplitFloat(cfg.ThresholdOpsMin) || cfg.ThresholdOpsMin <= 0 {
 		return errors.New("--autoSplitThreshold must be positive")
 	}
 	if cfg.CandidateWindows <= 0 {
@@ -396,20 +404,29 @@ func validateDemoAutoSplitDetectorConfig(cfg autosplit.Config) error {
 	if cfg.MaxSplitsPerCycle <= 0 {
 		return errors.New("--autoSplitMaxPerCycle must be positive")
 	}
-	if cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
+	return nil
+}
+
+func validateDemoAutoSplitHotKeyThresholds(cfg autosplit.Config) error {
+	if !isFiniteDemoAutoSplitFloat(cfg.TopKeyShare) || cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
 		return errors.New("--autoSplitTopKeyShare must be in (0, 1]")
 	}
-	if cfg.TopKeyAbsoluteFloor < 0 {
+	if !isFiniteDemoAutoSplitFloat(cfg.TopKeyAbsoluteFloor) || cfg.TopKeyAbsoluteFloor < 0 {
 		return errors.New("--autoSplitTopKeyAbsoluteFloor must be non-negative")
 	}
 	return nil
 }
 
 func validateDemoAutoSplitWeights(writeWeight, readWeight float64) error {
-	if writeWeight < 0 || readWeight < 0 || (writeWeight == 0 && readWeight == 0) {
+	if !isFiniteDemoAutoSplitFloat(writeWeight) || !isFiniteDemoAutoSplitFloat(readWeight) ||
+		writeWeight < 0 || readWeight < 0 || (writeWeight == 0 && readWeight == 0) {
 		return errors.New("--autoSplitWriteWeight and --autoSplitReadWeight must be non-negative and at least one must be positive")
 	}
 	return nil
+}
+
+func isFiniteDemoAutoSplitFloat(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 func validateDemoAutoSplitSchedulerConfig(cfg autosplit.SchedulerConfig) error {
@@ -568,11 +585,15 @@ func setupDemoDistributionRuntime(
 		runtime.reconciler.Reconcile(initialSnapshot.Routes)
 		runtime.autoSplitCfg.Reconciler = runtime.reconciler
 	}
-	coordinator.WithSamplerRouteResolver(runtime.sampler, func(key []byte) (uint64, bool) {
-		route, ok := runtime.engine.GetRoute(key)
-		return route.RouteID, ok && route.State == distribution.RouteStateActive
-	})
+	coordinator.WithSamplerRouteResolver(runtime.sampler, demoSamplerRouteResolver(runtime.engine))
 	return runtime, nil
+}
+
+func demoSamplerRouteResolver(engine *distribution.Engine) func([]byte) (uint64, bool) {
+	return func(key []byte) (uint64, bool) {
+		route, ok := engine.GetRoute(kv.RouteKey(key))
+		return route.RouteID, ok && route.State == distribution.RouteStateActive
+	}
 }
 
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
