@@ -1,6 +1,6 @@
 # Pebble SST Ingest Snapshot Transfer
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-07-19
 
