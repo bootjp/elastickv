@@ -317,6 +317,25 @@ func TestChunkRefKey_RoundTripAndRouteKey(t *testing.T) {
 	require.Equal(t, RouteKey(bucket, 11, object), ExtractRouteKey(key))
 }
 
+func TestVersionedChunkRefKey_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	key := VersionedChunkRefKey("bucket", 11, "object", "upload", 7, 3, 99)
+	bucket, generation, object, uploadID, partNo, chunkNo, partVersion, ok := ParseVersionedChunkRefKey(key)
+	require.True(t, ok)
+	require.Equal(t, "bucket", bucket)
+	require.Equal(t, uint64(11), generation)
+	require.Equal(t, "object", object)
+	require.Equal(t, "upload", uploadID)
+	require.Equal(t, uint64(7), partNo)
+	require.Equal(t, uint64(3), chunkNo)
+	require.Equal(t, uint64(99), partVersion)
+	require.Equal(t, RouteKey("bucket", 11, "object"), ExtractRouteKey(key))
+
+	unversioned := VersionedChunkRefKey("bucket", 11, "object", "upload", 7, 3, 0)
+	require.Equal(t, ChunkRefKey("bucket", 11, "object", "upload", 7, 3), unversioned)
+}
+
 func TestChunkBlobKey_RoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -347,6 +366,28 @@ func TestChunkRefValue_RoundTrip(t *testing.T) {
 	require.Equal(t, "node-a", got.SourcePeer)
 }
 
+func TestChunkRefValueV2_RoundTripWriteTimeReplicas(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte("chunk data"))
+	want := ChunkRefValue{
+		ContentSHA256: sum,
+		Size:          1234,
+		SourcePeer:    "node-a",
+		ReplicaPeers: []ChunkRefPeer{
+			{NodeID: "node-a", Address: "10.0.0.1:50051"},
+			{NodeID: "node-b", Address: "10.0.0.2:50051"},
+		},
+	}
+	value, err := EncodeChunkRefValue(want)
+	require.NoError(t, err)
+	require.Equal(t, chunkRefValueVersionV2, value[0])
+
+	got, ok := DecodeChunkRefValue(value)
+	require.True(t, ok)
+	require.Equal(t, want, got)
+}
+
 func TestChunkRefValue_RejectsMalformedValues(t *testing.T) {
 	t.Parallel()
 
@@ -364,6 +405,19 @@ func TestChunkRefValue_RejectsMalformedValues(t *testing.T) {
 		_, ok := DecodeChunkRefValue(malformed)
 		require.False(t, ok, "value %x should be rejected", malformed)
 	}
+
+	v2, err := EncodeChunkRefValue(ChunkRefValue{
+		ContentSHA256: sum,
+		Size:          1,
+		SourcePeer:    "n1",
+		ReplicaPeers:  []ChunkRefPeer{{NodeID: "n1", Address: "n1:50051"}},
+	})
+	require.NoError(t, err)
+	replicaCountOffset := chunkRefValueFixedBytes + len("n1")
+	v2[replicaCountOffset] = 0xff
+	v2[replicaCountOffset+1] = 0xff
+	_, ok := DecodeChunkRefValue(v2)
+	require.False(t, ok, "impossible replica count must be rejected before allocation")
 }
 
 // TestPerBucketPrefixes_IsolateByBucketAndGeneration covers the

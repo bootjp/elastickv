@@ -115,6 +115,25 @@ func ChunkRefKey(bucket string, generation uint64, object string, uploadID strin
 	return buildObjectKey(chunkRefPrefixBytes, bucket, generation, object, uploadID, partNo, chunkNo)
 }
 
+// VersionedChunkRefKey returns the chunk reference key for one immutable part
+// attempt. A zero version preserves the original key shape for existing data
+// and single PUTs whose upload ID is already unique.
+func VersionedChunkRefKey(bucket string, generation uint64, object string, uploadID string, partNo uint64, chunkNo uint64, partVersion uint64) []byte {
+	if partVersion == 0 {
+		return ChunkRefKey(bucket, generation, object, uploadID, partNo, chunkNo)
+	}
+	out := make([]byte, 0, len(ChunkRefPrefix)+len(bucket)+len(object)+len(uploadID)+buildObjectExtraBytes+4*u64Bytes)
+	out = append(out, chunkRefPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	out = appendU64(out, partNo)
+	out = appendU64(out, chunkNo)
+	out = appendU64(out, partVersion)
+	return out
+}
+
 // VersionedBlobKey returns the blob key for a specific part attempt identified by
 // partVersion (typically the part's commit timestamp). When partVersion is 0 the
 // result is identical to BlobKey, preserving backward compatibility with data

@@ -478,11 +478,31 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
+func adminTokenProtectedMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, adminMethodPrefix)
+}
+
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
 // "authorization: Bearer <token>" metadata against the supplied token. An
 // empty token disables enforcement; callers should pair that mode with a
 // --adminInsecureNoAuth flag so operators knowingly opt in.
 func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	return bearerTokenAuth(token, adminTokenProtectedMethod, "admin")
+}
+
+// S3BlobPeerTokenAuth protects the peer-only blob transport with a credential
+// distinct from the read-only Admin token.
+func S3BlobPeerTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	return bearerTokenAuth(token, func(fullMethod string) bool {
+		return strings.HasPrefix(fullMethod, "/"+pb.S3BlobFetch_ServiceDesc.ServiceName+"/")
+	}, "S3 blob peer")
+}
+
+func bearerTokenAuth(
+	token string,
+	protected func(string) bool,
+	credentialName string,
+) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	if token == "" {
 		return nil, nil
 	}
@@ -501,7 +521,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 			return status.Error(codes.Unauthenticated, "authorization is not a bearer token")
 		}
 		if subtle.ConstantTimeCompare([]byte(got), expected) != 1 {
-			return status.Error(codes.Unauthenticated, "invalid admin token")
+			return status.Errorf(codes.Unauthenticated, "invalid %s token", credentialName)
 		}
 		return nil
 	}
@@ -511,7 +531,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !protected(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		if err := check(ctx); err != nil {
@@ -525,7 +545,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !protected(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		if err := check(ss.Context()); err != nil {

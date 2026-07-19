@@ -650,9 +650,9 @@ func scanRouteUserKey(start []byte) []byte {
 }
 
 var scanRouteUserKeyExtractors = []func([]byte) []byte{
-	store.ExtractListUserKeyFromDeltaScanPrefix,
+	store.ExtractListUserKeyFromDeltaScanKey,
+	store.ExtractListUserKeyFromClaimScanKey,
 	store.ExtractListUserKey,
-	store.ExtractListUserKeyFromClaimScanPrefix,
 	store.ExtractHashUserKeyFromField,
 	store.ExtractHashUserKeyFromDeltaScanPrefix,
 	store.ExtractSetUserKeyFromMember,
@@ -3084,6 +3084,18 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 	}
 	g, ok := s.groups[route.GroupID]
 	return g, ok
+}
+
+// LocalStoreForKey returns this process's store for the key's owning group
+// without a leader fence or network proxy. It is reserved for node-local
+// auxiliary state such as content-addressed S3 chunk blobs; replicated state
+// must continue through the normal ShardStore or Coordinator paths.
+func (s *ShardStore) LocalStoreForKey(key []byte) (store.MVCCStore, bool) {
+	g, ok := s.groupForKey(key)
+	if !ok || g == nil || g.Store == nil {
+		return nil, false
+	}
+	return g.Store, true
 }
 
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {

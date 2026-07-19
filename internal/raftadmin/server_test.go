@@ -360,6 +360,45 @@ func TestRegisterOperationalServicesPublishesLeaderHealth(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+func TestRegisterOperationalServicesPublishesStaticServingHealth(t *testing.T) {
+	t.Parallel()
+
+	engine := &fakeEngine{
+		status:  raftengine.Status{State: raftengine.StateFollower},
+		serving: false,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	RegisterOperationalServicesWithInterceptorAndStaticServing(ctx, server, engine, []string{"RawKV"}, []string{"S3BlobFetch"}, nil)
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(server.Stop)
+
+	conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := healthpb.NewHealthClient(conn)
+	require.Eventually(t, func() bool {
+		resp, checkErr := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "S3BlobFetch"})
+		return checkErr == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		resp, checkErr := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "RawKV"})
+		return checkErr == nil && resp.Status == healthpb.HealthCheckResponse_NOT_SERVING
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 type stateOnlyEngine struct {
 	state raftengine.State
 }

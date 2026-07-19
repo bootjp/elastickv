@@ -162,6 +162,7 @@ var (
 	// SigV4 access keys).
 	adminTokenFile      = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
 	adminInsecureNoAuth = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	s3BlobPeerTokenFile = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
 
 	// Admin HTTP listener flags (PR #545's parallel work merged into
 	// main; serves the cookie/SigV4-authenticated admin dashboard).
@@ -2079,6 +2080,8 @@ func setupAdminService(
 	srv, icept, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
+		*s3BlobPeerTokenFile,
+		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
 	)
@@ -2086,7 +2089,7 @@ func setupAdminService(
 		return nil, adminGRPCInterceptors{}, err
 	}
 	if srv == nil {
-		return nil, adminGRPCInterceptors{}, nil
+		return nil, icept, nil
 	}
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
@@ -2158,8 +2161,9 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 // ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
 // silent overwrites (gRPC-Go: last option of the same type wins).
 type adminGRPCInterceptors struct {
-	unary  []grpc.UnaryServerInterceptor
-	stream []grpc.StreamServerInterceptor
+	unary              []grpc.UnaryServerInterceptor
+	stream             []grpc.StreamServerInterceptor
+	s3BlobFetchEnabled bool
 }
 
 func (a adminGRPCInterceptors) empty() bool {
@@ -2175,6 +2179,7 @@ var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2234,6 +2239,22 @@ func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	return 0
 }
 
+func (c startupGatedCoordinator) RaftMembers(ctx context.Context) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembers(ctx) //nolint:wrapcheck // Preserve membership lookup errors.
+}
+
+func (c startupGatedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembersForKey(ctx, key) //nolint:wrapcheck // Preserve membership lookup errors.
+}
+
 type startupPublicKVGate struct {
 	ready        atomic.Bool
 	blockMutator func() bool
@@ -2257,6 +2278,20 @@ func (g *startupPublicKVGate) unaryInterceptor(
 		return nil, status.Error(codes.Unavailable, "startup rotation has not completed")
 	}
 	return handler(ctx, req)
+}
+
+func (g *startupPublicKVGate) streamInterceptor(
+	srv interface{},
+	stream grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler,
+) error {
+	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
+		// Return a raw gRPC status so clients and retry policy see Unavailable.
+		//nolint:wrapcheck
+		return status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return handler(srv, stream)
 }
 
 func (g *startupPublicKVGate) blocked() bool {
@@ -2284,7 +2319,8 @@ func startupRotationGatedMethod(fullMethod string) bool {
 		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
 		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
 		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
-		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName:
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+		pb.S3BlobFetch_PushChunkBlob_FullMethodName:
 		return true
 	default:
 		return strings.HasPrefix(fullMethod, "/RawKV/") ||
@@ -2300,34 +2336,79 @@ func startupRotationGatedMethod(fullMethod string) bool {
 func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
+	s3BlobPeerTokenPath string,
+	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	if tokenPath == "" && !insecureNoAuth {
-		return nil, adminGRPCInterceptors{}, nil
+	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath)
+	if err != nil {
+		return nil, adminGRPCInterceptors{}, err
 	}
+	var srv *adapter.AdminServer
+	if auth.adminEnabled {
+		srv = adapter.NewAdminServer(self, members)
+		srv.SetCapability(
+			adapter.S3BlobOffloadCapabilityName,
+			s3BlobOffloadAdminCapability(auth.adminToken, auth.peerToken, s3BlobOffloadEnabled),
+		)
+	}
+	var icept adminGRPCInterceptors
+	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
+	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
+	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
+	icept.s3BlobFetchEnabled = auth.peerToken != ""
+	return srv, icept, nil
+}
+
+type nodeGRPCAuthConfig struct {
+	adminToken   string
+	peerToken    string
+	adminEnabled bool
+}
+
+func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath string) (nodeGRPCAuthConfig, error) {
 	if tokenPath != "" && insecureNoAuth {
-		return nil, adminGRPCInterceptors{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
+		return nodeGRPCAuthConfig{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
 	}
-	token := ""
+	var cfg nodeGRPCAuthConfig
+	cfg.adminEnabled = tokenPath != "" || insecureNoAuth
 	if tokenPath != "" {
 		loaded, err := loadAdminTokenFile(tokenPath)
 		if err != nil {
-			return nil, adminGRPCInterceptors{}, err
+			return nodeGRPCAuthConfig{}, err
 		}
-		token = loaded
+		cfg.adminToken = loaded
 	}
-	srv := adapter.NewAdminServer(self, members)
-	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability())
-	unary, stream := adapter.AdminTokenAuth(token)
-	var icept adminGRPCInterceptors
+	if peerTokenPath != "" {
+		loaded, err := loadS3BlobPeerTokenFile(peerTokenPath)
+		if err != nil {
+			return nodeGRPCAuthConfig{}, err
+		}
+		cfg.peerToken = loaded
+	}
+	if cfg.adminToken != "" && cfg.peerToken == cfg.adminToken {
+		return nodeGRPCAuthConfig{}, errors.New("S3 blob peer token must differ from the read-only admin token")
+	}
+	return cfg, nil
+}
+
+func appendGRPCBearerInterceptors(
+	icept *adminGRPCInterceptors,
+	unary grpc.UnaryServerInterceptor,
+	stream grpc.StreamServerInterceptor,
+) {
 	if unary != nil {
 		icept.unary = append(icept.unary, unary)
 	}
 	if stream != nil {
 		icept.stream = append(icept.stream, stream)
 	}
-	return srv, icept, nil
+}
+
+func s3BlobOffloadAdminCapability(adminToken, peerToken string, enabled bool) bool {
+	return adapter.S3BlobOffloadLocalCapability() && enabled && adminToken != "" && peerToken != ""
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
@@ -2338,6 +2419,14 @@ func loadAdminTokenFile(path string) (string, error) {
 	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
 	if err != nil {
 		return "", errors.Wrap(err, "load admin token")
+	}
+	return tok, nil
+}
+
+func loadS3BlobPeerTokenFile(path string) (string, error) {
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "S3 blob peer token")
+	if err != nil {
+		return "", errors.Wrap(err, "load S3 blob peer token")
 	}
 	return tok, nil
 }
@@ -2489,6 +2578,26 @@ func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime 
 	return out
 }
 
+func registerS3BlobFetchServer(
+	registrar grpc.ServiceRegistrar,
+	enabled bool,
+	st store.MVCCStore,
+	observer adapter.S3BlobOffloadObserver,
+	clock *kv.HLC,
+	pushBlocked func() bool,
+) []string {
+	if !enabled {
+		return nil
+	}
+	pb.RegisterS3BlobFetchServer(registrar, adapter.NewS3BlobFetchServer(
+		st,
+		observer,
+		adapter.WithS3BlobFetchClock(clock),
+		adapter.WithS3BlobFetchPushBlocked(pushBlocked),
+	))
+	return []string{"S3BlobFetch"}
+}
+
 func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -2505,6 +2614,8 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	s3BlobObserver adapter.S3BlobOffloadObserver,
+	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -2533,6 +2644,14 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
+		staticServingServices := registerS3BlobFetchServer(
+			gs,
+			adminGRPCOpts.s3BlobFetchEnabled,
+			rt.store,
+			s3BlobObserver,
+			coordinate.Clock(),
+			s3BlobPushBlocked,
+		)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2576,7 +2695,14 @@ func startRaftServers(
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook
 		// (nil when encryption is not wired); raftadmin.Server invokes
 		// it before AddVoter/AddLearner propose the conf-change.
-		internalraftadmin.RegisterOperationalServicesWithInterceptor(ctx, gs, rt.engine, []string{"RawKV"}, confChangeInterceptor)
+		internalraftadmin.RegisterOperationalServicesWithInterceptorAndStaticServing(
+			ctx,
+			gs,
+			rt.engine,
+			[]string{"RawKV"},
+			staticServingServices,
+			confChangeInterceptor,
+		)
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
@@ -2978,6 +3104,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	adminGRPCOpts := r.adminGRPCOpts
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
+		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
+	}
+	var s3BlobPushBlocked func() bool
+	if r.publicKVGate != nil {
+		s3BlobPushBlocked = r.publicKVGate.blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
@@ -3002,6 +3133,8 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.metricsRegistry.S3BlobOffloadObserver(),
+		s3BlobPushBlocked,
 	); err != nil {
 		return r.startupFailure(err)
 	}
@@ -3010,17 +3143,53 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	blobCluster, err := r.newS3BlobCluster()
+	if err != nil {
+		return err
+	}
 	s3Server, err := newS3Server(
 		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
 		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
 		r.metricsRegistry.S3PutAdmissionObserver(),
 		r.metricsRegistry.S3BlobOffloadObserver(),
+		blobCluster,
+		r.publicKVGate.blocked,
 	)
 	if err != nil {
+		if blobCluster != nil {
+			_ = blobCluster.Close()
+		}
 		return err
 	}
 	r.s3Server = s3Server
 	return nil
+}
+
+func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
+	if r == nil || strings.TrimSpace(r.s3Address) == "" {
+		return nil, nil
+	}
+	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.New("S3 blob offload requires raft membership discovery")
+	}
+	adminToken := ""
+	if strings.TrimSpace(*adminTokenFile) != "" {
+		loaded, err := loadAdminTokenFile(*adminTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		adminToken = loaded
+	}
+	peerToken := ""
+	if strings.TrimSpace(*s3BlobPeerTokenFile) != "" {
+		loaded, err := loadS3BlobPeerTokenFile(*s3BlobPeerTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		peerToken = loaded
+	}
+	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken, peerToken), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {

@@ -687,6 +687,41 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	return nil
 }
 
+// ApplyMutationsPreservingLastCommitTS validates and writes versions without
+// advancing the store-wide LastCommitTS watermark. This is for local auxiliary
+// data whose timestamps mirror a remote Raft leader's commit order but must not
+// advertise that this replica has applied ordinary Raft entries up to that
+// timestamp.
+func (s *mvccStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
+		return err
+	}
+
+	for _, mut := range mutations {
+		switch mut.Op {
+		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
+			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
+		case OpTypeDelete:
+			s.deleteVersionLocked(mut.Key, commitTS)
+		default:
+			return errors.WithStack(ErrUnknownOp)
+		}
+		s.log.InfoContext(ctx, "apply mutation preserving last commit timestamp",
+			slog.String("key", string(mut.Key)),
+			slog.Uint64("commit_ts", commitTS),
+			slog.Bool("delete", mut.Op == OpTypeDelete),
+		)
+	}
+
+	return nil
+}
+
 func (s *mvccStore) checkConflictsLocked(mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
 	for _, mut := range mutations {
 		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {

@@ -432,6 +432,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
 		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
 		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+		pb.S3BlobFetch_PushChunkBlob_FullMethodName,
 	}
 
 	for _, method := range blockedMethods {
@@ -500,6 +501,42 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 				t.Fatalf("%s handler did not run after startup gate opened", method)
 			}
 		})
+	}
+}
+
+func TestStartupPublicKVGate_BlocksMutatorStreamsUntilReady(t *testing.T) {
+	t.Parallel()
+	gate := &startupPublicKVGate{}
+
+	handlerCalled := false
+	handler := func(interface{}, grpc.ServerStream) error {
+		handlerCalled = true
+		return nil
+	}
+	err := gate.streamInterceptor(
+		nil,
+		nil,
+		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
+		handler,
+	)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("PushChunkBlob before ready err=%v, want Unavailable", err)
+	}
+	if handlerCalled {
+		t.Fatal("stream handler ran before startup gate opened")
+	}
+
+	gate.markReady()
+	if err := gate.streamInterceptor(
+		nil,
+		nil,
+		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
+		handler,
+	); err != nil {
+		t.Fatalf("PushChunkBlob after ready err=%v", err)
+	}
+	if !handlerCalled {
+		t.Fatal("stream handler did not run after startup gate opened")
 	}
 }
 
@@ -587,6 +624,9 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 		s3Address:       heldS3.Addr().String(),
 		s3PathStyleOnly: true,
 		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
+		coordinate: startupGatedCoordinator{
+			inner: &stubStartupCoordinator{clock: kv.NewHLC()},
+		},
 	}
 	if err := runner.prepareAdminForwardServers(); err != nil {
 		t.Fatalf("prepareAdminForwardServers: %v", err)
