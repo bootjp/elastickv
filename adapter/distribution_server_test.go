@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -105,6 +106,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 			GroupID:       2,
 			State:         distribution.RouteStateWriteFenced,
 			ParentRouteID: 1,
+			SplitAtHLC:    99,
 		},
 		{
 			RouteID:       1,
@@ -131,6 +133,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	require.Equal(t, uint64(2), resp.Routes[1].RouteId)
 	require.Nil(t, resp.Routes[1].End)
 	require.Equal(t, pb.RouteState_ROUTE_STATE_WRITE_FENCED, resp.Routes[1].State)
+	require.Equal(t, uint64(99), resp.Routes[1].SplitAtHlc)
 }
 
 func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
@@ -194,6 +197,8 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, []byte("m"), resp.Right.End)
 	require.Equal(t, uint64(1), resp.Right.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Right.ParentRouteId)
+	require.NotZero(t, resp.Left.SplitAtHlc)
+	require.Equal(t, resp.Left.SplitAtHlc, resp.Right.SplitAtHlc)
 
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
@@ -203,6 +208,9 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(3), snapshot.Routes[0].RouteID)
 	require.Equal(t, uint64(4), snapshot.Routes[1].RouteID)
 	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
+	require.NotZero(t, snapshot.Routes[0].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, snapshot.Routes[1].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, resp.Left.SplitAtHlc)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))
@@ -491,6 +499,20 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
+	require.Zero(t, coordinator.lastRequestedCommitTS)
+	require.NotZero(t, coordinator.lastCommitTS)
+	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
+
+	snapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	left, found := findRouteByID(snapshot.Routes, resp.Left.RouteId)
+	require.True(t, found)
+	right, found := findRouteByID(snapshot.Routes, resp.Right.RouteId)
+	require.True(t, found)
+	require.Equal(t, coordinator.lastCommitTS, left.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -567,7 +589,7 @@ func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
 	require.Equal(t, uint64(6), second.Right.RouteId)
 }
 
-func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing.T) {
+func TestDistributionServerSplitRange_ReturnsExactCommittedSplitVersion(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -606,8 +628,20 @@ func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing
 		SplitKey:               []byte("g"),
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), resp.CatalogVersion)
-	require.Equal(t, uint64(3), engine.Version())
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+	require.Equal(t, uint64(2), engine.Version())
+	require.Equal(t, uint64(3), resp.Left.RouteId)
+	require.Equal(t, uint64(4), resp.Right.RouteId)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	committed, err := catalog.SnapshotAt(ctx, coordinator.lastCommitTS)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), committed.Version)
+
+	latest, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), latest.Version)
 }
 
 func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {
@@ -775,20 +809,24 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 }
 
 type distributionCoordinatorStub struct {
-	store           store.MVCCStore
-	leader          bool
-	nextTS          uint64
-	lastStartTS     uint64
-	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
-	asyncApplyDone  chan error
-	asyncApplyDelay time.Duration
-	dispatchCalls   int
+	store                 store.MVCCStore
+	leader                bool
+	clock                 *kv.HLC
+	nextTS                uint64
+	lastStartTS           uint64
+	lastCommitTS          uint64
+	lastRequestedCommitTS uint64
+	afterDispatch         func(context.Context, store.MVCCStore, uint64) error
+	asyncApplyDone        chan error
+	asyncApplyDelay       time.Duration
+	dispatchCalls         int
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
 	return &distributionCoordinatorStub{
 		store:  st,
 		leader: leader,
+		clock:  kv.NewHLC(),
 	}
 }
 
@@ -797,10 +835,15 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
-	startTS, commitTS := s.nextTimestamps(reqs.StartTS)
+	s.lastRequestedCommitTS = reqs.CommitTS
+	startTS, commitTS := s.nextTimestamps(reqs.StartTS, reqs.CommitTS)
 	s.lastStartTS = startTS
+	s.lastCommitTS = commitTS
 
-	mutations, err := coordinatorStubMutations(reqs.Elems)
+	if err := kv.ValidateElemCommitTSPatches(reqs.Elems, commitTS); err != nil {
+		return nil, err
+	}
+	mutations, err := coordinatorStubMutations(reqs.Elems, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -814,12 +857,12 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 				done <- err
 			}
 		}()
-		return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+		return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 	}
 	if err := s.applyDispatch(ctx, mutations, startTS, commitTS); err != nil {
 		return nil, err
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+	return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 }
 
 func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[kv.OP]) error {
@@ -832,7 +875,13 @@ func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[k
 	return nil
 }
 
-func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64) (uint64, uint64) {
+func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCommitTS uint64) (uint64, uint64) {
+	if requestedCommitTS != 0 {
+		if s.clock != nil {
+			s.clock.Observe(requestedCommitTS)
+		}
+		return startTS, requestedCommitTS
+	}
 	if s.nextTS == 0 {
 		s.nextTS = s.store.LastCommitTS() + 1
 	}
@@ -861,10 +910,10 @@ func (s *distributionCoordinatorStub) applyDispatch(
 	return nil
 }
 
-func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
+func coordinatorStubMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
-		mutation, err := coordinatorStubMutation(elem)
+		mutation, err := coordinatorStubMutation(elem, commitTS)
 		if err != nil {
 			return nil, err
 		}
@@ -873,16 +922,20 @@ func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation,
 	return mutations, nil
 }
 
-func coordinatorStubMutation(elem *kv.Elem[kv.OP]) (*store.KVPairMutation, error) {
+func coordinatorStubMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPairMutation, error) {
 	if elem == nil {
 		return nil, kv.ErrInvalidRequest
 	}
 	switch elem.Op {
 	case kv.Put:
+		value := distribution.CloneBytes(elem.Value)
+		if elem.CommitTSValueOffset != 0 {
+			binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:elem.CommitTSValueOffset+8], commitTS)
+		}
 		return &store.KVPairMutation{
 			Op:    store.OpTypePut,
 			Key:   distribution.CloneBytes(elem.Key),
-			Value: distribution.CloneBytes(elem.Value),
+			Value: value,
 		}, nil
 	case kv.Del:
 		return &store.KVPairMutation{
@@ -927,7 +980,7 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 }
 
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
-	return nil
+	return s.clock
 }
 
 func (s *distributionCoordinatorStub) LinearizableRead(_ context.Context) (uint64, error) {

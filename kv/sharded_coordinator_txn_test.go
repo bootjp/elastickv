@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -107,12 +108,14 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	}, 1, NewHLC(), nil)
 
 	startTS := uint64(10)
+	value1 := make([]byte, 16)
+	value2 := make([]byte, 16)
 	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
-			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+			{Op: Put, Key: []byte("b"), Value: value1, CommitTSValueOffset: 4},
+			{Op: Put, Key: []byte("x"), Value: value2, CommitTSValueOffset: 4},
 		},
 	})
 	require.NoError(t, err)
@@ -134,9 +137,9 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Len(t, g1Prepare.Mutations, 2)
 	require.Len(t, g2Prepare.Mutations, 2)
 	require.Equal(t, []byte("b"), g1Prepare.Mutations[1].Key)
-	require.Equal(t, []byte("v1"), g1Prepare.Mutations[1].Value)
 	require.Equal(t, []byte("x"), g2Prepare.Mutations[1].Key)
-	require.Equal(t, []byte("v2"), g2Prepare.Mutations[1].Value)
+	require.Zero(t, g1Prepare.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, g2Prepare.Mutations[1].CommitTsValueOffset)
 
 	prepareMeta1 := requestTxnMeta(t, g1Prepare)
 	prepareMeta2 := requestTxnMeta(t, g2Prepare)
@@ -166,6 +169,12 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Zero(t, commitMeta2.LockTTLms)
 	require.Greater(t, commitMeta1.CommitTS, startTS)
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
+	require.Equal(t, commitMeta1.CommitTS, binary.BigEndian.Uint64(g1Prepare.Mutations[1].Value[4:12]))
+	require.Equal(t, commitMeta1.CommitTS, binary.BigEndian.Uint64(g2Prepare.Mutations[1].Value[4:12]))
+	require.Zero(t, g1Commit.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, g2Commit.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, binary.BigEndian.Uint64(value1[4:12]))
+	require.Zero(t, binary.BigEndian.Uint64(value2[4:12]))
 }
 
 func TestShardedCoordinatorDispatchTxn_SingleShardUsesOnePhase(t *testing.T) {
