@@ -1637,6 +1637,19 @@ func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
 	require.False(t, engine.hasPendingConfChange())
 }
 
+func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
+	engine := &Engine{}
+	engine.markPendingConfChange(12)
+	done := make(chan adminResult, 1)
+	req := adminRequest{id: 17, done: done}
+
+	engine.proposeMembershipChange(req, raftpb.ConfChangeRemoveNode, Peer{NodeID: 2, ID: "n2"})
+
+	result := <-done
+	require.ErrorIs(t, result.err, errMembershipConfChangePending)
+	require.Empty(t, engine.pendingConfigs)
+}
+
 func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {

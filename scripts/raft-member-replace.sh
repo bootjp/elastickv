@@ -342,7 +342,9 @@ parse_nodes() {
     [[ -n "$node_id" && -n "$node_host" ]] || fail "invalid NODES entry: $pair"
     [[ "$node_id" =~ ^[A-Za-z0-9._-]+$ ]] || fail "raft ID contains unsupported characters: $node_id"
     [[ "$node_host" != *'|'* ]] || fail "raft host contains unsupported characters: $node_host"
-    contains_value "$node_id" "${NODE_IDS[@]}" && fail "duplicate raft ID in NODES: $node_id"
+    if (( ${#NODE_IDS[@]} > 0 )) && contains_value "$node_id" "${NODE_IDS[@]}"; then
+      fail "duplicate raft ID in NODES: $node_id"
+    fi
     NODE_IDS+=("$node_id")
     NODE_HOSTS+=("$node_host")
   done
@@ -487,8 +489,8 @@ adopt_committed_target_change() {
   actual_signature="$(configuration_signature "$VIEW_CONFIGURATION")"
   [[ "$actual_signature" == "$expected_signature" ]] || \
     fail "$context observed an unexpected membership after a lost response"
-  (( VIEW_CONFIG_INDEX > STATE_EXPECTED_CONFIG_INDEX )) || \
-    fail "$context did not advance the configuration index"
+  (( VIEW_CONFIG_INDEX >= STATE_EXPECTED_CONFIG_INDEX )) || \
+    fail "$context regressed the configuration index"
   STATE_EXPECTED_MEMBERS="$actual_signature"
   STATE_EXPECTED_CONFIG_INDEX="$VIEW_CONFIG_INDEX"
   write_state
@@ -700,15 +702,16 @@ wait_for_leader() {
 }
 
 wait_target_down() {
-  local elapsed=0 down_for=0
+  local elapsed=0 down_since=-1
   while (( elapsed < REPLACEMENT_TIMEOUT_SECONDS )); do
     if ! status_for "$STATE_TARGET_ADDRESS" >/dev/null; then
-      down_for=$((down_for + REPLACEMENT_POLL_SECONDS))
-      if (( down_for >= REPLACEMENT_FENCE_VERIFY_SECONDS )); then
+      if (( down_since < 0 )); then
+        down_since=$elapsed
+      elif (( elapsed - down_since >= REPLACEMENT_FENCE_VERIFY_SECONDS )); then
         return 0
       fi
     else
-      down_for=0
+      down_since=-1
     fi
     sleep "$REPLACEMENT_POLL_SECONDS"
     elapsed=$((elapsed + REPLACEMENT_POLL_SECONDS))
@@ -770,14 +773,37 @@ if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/
   sudo_cmd=(sudo -n)
 fi
 
+run_privileged() {
+  if (( ${#sudo_cmd[@]} > 0 )); then
+    "${sudo_cmd[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
+container_running() {
+  local running
+  if ! running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)"; then
+    echo "cannot inspect container state: $container" >&2
+    return 1
+  fi
+  case "$running" in
+    true|false) printf '%s\n' "$running" ;;
+    *) echo "invalid container running state: $running" >&2; return 1 ;;
+  esac
+}
+
 case "$action" in
   stop)
-    docker stop "$container" >/dev/null 2>&1 || true
-    running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || echo false)"
+    running="$(container_running)"
+    if [[ "$running" == "true" ]]; then
+      docker stop "$container" >/dev/null
+    fi
+    running="$(container_running)"
     [[ "$running" == "false" ]]
     ;;
   reset-data)
-    docker_running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || echo false)"
+    docker_running="$(container_running)"
     [[ "$docker_running" == "false" ]]
     if [[ "$data_mode" == "archive" ]]; then
       if [[ -e "$archive_path" && -e "$data_dir" ]]; then
@@ -785,12 +811,12 @@ case "$action" in
         exit 1
       fi
       if [[ -e "$data_dir" ]]; then
-        "${sudo_cmd[@]}" mv "$data_dir" "$archive_path"
+        run_privileged mv "$data_dir" "$archive_path"
       fi
       [[ -e "$archive_path" ]] || { echo "target data directory was absent and no archive exists" >&2; exit 1; }
     else
       if [[ -e "$data_dir" ]]; then
-        "${sudo_cmd[@]}" rm -rf --one-file-system "$data_dir"
+        run_privileged rm -rf --one-file-system "$data_dir"
       fi
       [[ ! -e "$data_dir" ]]
     fi

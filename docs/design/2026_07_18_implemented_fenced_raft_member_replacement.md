@@ -97,7 +97,9 @@ while the old endpoint still answers.
 External mode also stops and verifies the target container over the management
 SSH path after the Raft fence is observed. If that management action is not
 available, the operation stops before `RemoveServer` rather than shrinking the
-group with a still-running process.
+group with a still-running process. Docker inspection must itself succeed;
+missing containers, daemon failures, and permission errors are not interpreted
+as proof that the process is stopped.
 
 ### 4.4 Serialized membership changes
 
@@ -112,9 +114,12 @@ configuration index. Every `remove_server`, `add_learner`, and
 adopts a newer index merely because another topology change committed. After
 each successful change, the command verifies the exact expected post-change
 signature before persisting the returned index for the next stage. The engine
-therefore rejects a concurrent topology change instead of applying a stale
-plan. A resume after a lost RPC response is accepted only when the complete
-member signature matches the one transition that was in flight.
+rejects every new add, promote, or remove proposal while an earlier
+configuration entry remains unapplied, so etcd/raft cannot silently rewrite a
+racing proposal to a no-op. A resume after a lost RPC response is accepted only
+when the complete member signature matches the one transition that was in
+flight. It also accepts an equal saved/live configuration index when that
+signature already proves the metadata write completed before the stage write.
 
 ### 4.5 Catch-up before promotion
 
@@ -262,7 +267,9 @@ Additional negative tests prove that deployment-env replacement controls
 cannot authorize an operation, a configuration-index change after preflight
 aborts before removal, invocation-level timing controls override stale env
 values, dot-segment data paths canonicalize to a sibling archive, and a changed
-data directory is rejected on resume.
+data directory is rejected on resume. Engine coverage also proves a membership
+proposal is rejected while the pending configuration fence is active; the
+shell resume test covers the equal-index metadata-before-stage crash window.
 
 Production acceptance still requires recording the state file, fence evidence,
 final `raftadmin status`/`configuration`, and the output of the configured

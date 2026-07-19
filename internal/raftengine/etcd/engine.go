@@ -143,6 +143,7 @@ var (
 	errLeadershipTransferNoHealthyTarget   = errors.Mark(errors.New("etcd raft leadership transfer has no healthy target"), raftengine.ErrLeadershipTransferNoHealthyTarget)
 	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
 	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
+	errMembershipConfChangePending         = errors.New("etcd raft membership change blocked by pending config change")
 	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
 	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
@@ -2030,9 +2031,13 @@ func (e *Engine) handlePromoteLearner(req adminRequest) {
 
 // proposeMembershipChange wraps the encode + storePendingConfig +
 // ProposeConfChange dance shared by AddVoter / AddLearner /
-// PromoteLearner. The caller has already validated the leader and
+// PromoteLearner / RemoveServer. The caller has already validated the leader and
 // prevIndex preconditions in handleAdmin.
 func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	if e.hasPendingConfChange() {
+		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
+		return
+	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}

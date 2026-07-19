@@ -280,6 +280,18 @@ func TestRaftMemberReplaceScriptResumesAfterLearnerCommitResponseLoss(t *testing
 	require.Contains(t, interruptedState, "min_catch_up_index=100\n", "catch-up floor must precede the membership proposal")
 	require.Contains(t, interruptedState, "data_dir=/var/lib/elastickv\n")
 
+	// Simulate the old two-write window where the membership metadata reached
+	// disk but the stage advance did not. Equal index plus the expected
+	// signature must be accepted so an interrupted replacement remains resumable.
+	interruptedState = strings.Replace(interruptedState, "expected_config_index=11\n", "expected_config_index=12\n", 1)
+	interruptedState = strings.Replace(
+		interruptedState,
+		"expected_members=n1|127.0.0.1:50051|voter,n3|127.0.0.3:50051|voter\n",
+		"expected_members=n1|127.0.0.1:50051|voter,n2|127.0.0.2:50051|learner,n3|127.0.0.3:50051|voter\n",
+		1,
+	)
+	require.NoError(t, os.WriteFile(stateFile, []byte(interruptedState), 0o600))
+
 	changedDataDirCmd := exec.CommandContext(t.Context(), "bash", "scripts/raft-member-replace.sh", "--execute")
 	changedDataDirCmd.Dir = repoRoot
 	changedDataDirEnv := append(append([]string{}, commandEnv...), "DATA_DIR=/srv/elastickv")
