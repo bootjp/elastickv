@@ -111,6 +111,20 @@ func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
 			wantErr: ErrExternalSnapshotRestoreInvalid,
 		},
 		{
+			name: "invalid peer suffrage",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers[0].Suffrage = "observer"
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "learner only membership",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers[0].Suffrage = SuffrageLearner
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
 			name: "copied payload sha mismatch",
 			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
 				opts.ExpectedPayloadSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"

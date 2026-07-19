@@ -183,4 +183,3 @@ old path is absent before requesting review.
   independently restorable per-group physical snapshots.
 - Continuous WAL archiving, incremental backup, or cross-region authority and
   fencing.
-

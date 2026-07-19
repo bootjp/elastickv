@@ -63,10 +63,11 @@ type PhysicalSnapshotRestoreOptions struct {
 // fsm-snap/<index>.fsm form by appending the CRC32C footer and persists the
 // matching EKVT token snapshot under snap/.
 func PrepareExternalSnapshotRestore(opts ExternalSnapshotRestoreOptions) (*ExternalSnapshotRestoreResult, error) {
-	if err := validateExternalSnapshotRestoreOptions(opts); err != nil {
+	normalized, err := normalizeExternalSnapshotRestoreOptions(opts)
+	if err != nil {
 		return nil, err
 	}
-	return prepareExternalSnapshotRestore(opts, writeExternalFSMSnapshotFile)
+	return prepareExternalSnapshotRestore(normalized, writeExternalFSMSnapshotFile)
 }
 
 // PreparePhysicalSnapshotRestore seeds a fresh etcd-raft data directory from
@@ -82,10 +83,11 @@ func PreparePhysicalSnapshotRestore(opts PhysicalSnapshotRestoreOptions) (*Exter
 		Peers:                 opts.Peers,
 		ExpectedPayloadSHA256: opts.ExpectedPayloadSHA256,
 	}
-	if err := validateExternalSnapshotRestoreOptions(externalOpts); err != nil {
+	normalized, err := normalizeExternalSnapshotRestoreOptions(externalOpts)
+	if err != nil {
 		return nil, err
 	}
-	return prepareExternalSnapshotRestore(externalOpts, writePhysicalFSMSnapshotFile)
+	return prepareExternalSnapshotRestore(normalized, writePhysicalFSMSnapshotFile)
 }
 
 type externalSnapshotFileWriter func(inputPath, fsmSnapDir string, index uint64, ceilingMs uint64) (uint32, int64, string, error)
@@ -150,19 +152,46 @@ func validateExternalSnapshotRestoreOptions(opts ExternalSnapshotRestoreOptions)
 	case len(opts.Peers) == 0:
 		return errors.Wrap(ErrExternalSnapshotRestoreInvalid, "at least one peer is required")
 	}
-	for i, peer := range opts.Peers {
+	return validateExternalSnapshotRestorePeers(opts.Peers)
+}
+
+func validateExternalSnapshotRestorePeers(peers []Peer) error {
+	seenNodeIDs := make(map[uint64]struct{}, len(peers))
+	voters := 0
+	for i, peer := range peers {
 		if peer.NodeID == 0 {
 			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has zero node id", i)
 		}
-	}
-	seenNodeIDs := make(map[uint64]struct{}, len(opts.Peers))
-	for i, peer := range opts.Peers {
+		if strings.TrimSpace(peer.Address) == "" {
+			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has empty address", i)
+		}
+		if peer.Suffrage != "" && peer.Suffrage != SuffrageVoter && peer.Suffrage != SuffrageLearner {
+			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has invalid suffrage %q", i, peer.Suffrage)
+		}
 		if _, ok := seenNodeIDs[peer.NodeID]; ok {
 			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has duplicate node id %d", i, peer.NodeID)
 		}
 		seenNodeIDs[peer.NodeID] = struct{}{}
+		if peer.Suffrage != SuffrageLearner {
+			voters++
+		}
+	}
+	if voters == 0 {
+		return errors.Wrap(ErrExternalSnapshotRestoreInvalid, "at least one voter is required")
 	}
 	return nil
+}
+
+func normalizeExternalSnapshotRestoreOptions(opts ExternalSnapshotRestoreOptions) (ExternalSnapshotRestoreOptions, error) {
+	if err := validateExternalSnapshotRestoreOptions(opts); err != nil {
+		return ExternalSnapshotRestoreOptions{}, err
+	}
+	peers, err := normalizePersistedPeers(opts.Peers)
+	if err != nil {
+		return ExternalSnapshotRestoreOptions{}, errors.Wrap(ErrExternalSnapshotRestoreInvalid, err.Error())
+	}
+	opts.Peers = peers
+	return opts, nil
 }
 
 func prepareExternalSnapshotRestoreDest(destDataDir string) (string, string, error) {
@@ -316,7 +345,7 @@ const (
 )
 
 func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestoreOptions, token []byte) error {
-	confState := confStateForPeers(opts.Peers)
+	confState := confStateForSnapshotRestorePeers(opts.Peers)
 	state := persistedState{
 		HardState: raftpb.HardState{
 			Term:   proto.Uint64(opts.Term),
@@ -347,6 +376,19 @@ func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestore
 		return err
 	}
 	return savePersistedPeers(tempDir, opts.Index, opts.Peers)
+}
+
+func confStateForSnapshotRestorePeers(peers []Peer) raftpb.ConfState {
+	voters := make([]uint64, 0, len(peers))
+	learners := make([]uint64, 0)
+	for _, peer := range peers {
+		if peer.Suffrage == SuffrageLearner {
+			learners = append(learners, peer.NodeID)
+			continue
+		}
+		voters = append(voters, peer.NodeID)
+	}
+	return raftpb.ConfState{Voters: voters, Learners: learners}
 }
 
 func snapPath(snapDir string, term, index uint64) string {

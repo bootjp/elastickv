@@ -9,6 +9,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	etcdsnap "go.etcd.io/etcd/server/v3/etcdserver/api/snap"
+	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
+	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestPreparePhysicalSnapshotRestoreAndExportOpaquePayload(t *testing.T) {
@@ -66,6 +70,44 @@ func TestPreparePhysicalSnapshotRestoreAndExportOpaquePayload(t *testing.T) {
 	require.ErrorIs(t, err, ErrPersistedSnapshotExportUsed)
 	require.NoError(t, export.Close())
 	require.NoError(t, export.Close())
+}
+
+func TestPreparePhysicalSnapshotRestoreNormalizesLearnerMembership(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "physical.fsm")
+	require.NoError(t, os.WriteFile(input, []byte("EKVTHLC1opaque"), 0o600))
+	dataDir := filepath.Join(root, "raft")
+	inputPeers := []Peer{
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:12003"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002", Suffrage: SuffrageLearner},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"},
+	}
+
+	_, err := PreparePhysicalSnapshotRestore(PhysicalSnapshotRestoreOptions{
+		InputFSMPath: input,
+		DataDir:      dataDir,
+		Index:        42,
+		Term:         7,
+		Peers:        inputPeers,
+	})
+	require.NoError(t, err)
+
+	snapshot, err := etcdsnap.New(zap.NewNop(), filepath.Join(dataDir, snapDirName)).
+		LoadNewestAvailable([]*walpb.Snapshot{{Index: proto.Uint64(42), Term: proto.Uint64(7)}})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 3}, snapshot.GetMetadata().GetConfState().GetVoters())
+	require.Equal(t, []uint64{2}, snapshot.GetMetadata().GetConfState().GetLearners())
+
+	persisted, ok, err := loadPersistedPeersState(dataDir)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002", Suffrage: SuffrageLearner},
+		{NodeID: 3, ID: "n3", Address: "127.0.0.1:12003", Suffrage: SuffrageVoter},
+	}, persisted.Peers)
+	require.NoError(t, validateOpenPeers(*snapshot, persisted.Peers, persisted, true))
+	require.Equal(t, uint64(3), inputPeers[0].NodeID, "normalization must not mutate caller input")
 }
 
 func TestPersistedSnapshotExportDetectsPayloadCorruptionDuringStream(t *testing.T) {
