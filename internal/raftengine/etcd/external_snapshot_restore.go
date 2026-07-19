@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -379,15 +380,12 @@ func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestore
 }
 
 func confStateForSnapshotRestorePeers(peers []Peer) raftpb.ConfState {
-	voters := make([]uint64, 0, len(peers))
-	learners := make([]uint64, 0)
-	for _, peer := range peers {
-		if peer.Suffrage == SuffrageLearner {
-			learners = append(learners, peer.NodeID)
-			continue
-		}
-		voters = append(voters, peer.NodeID)
+	voters, learnerSet := splitPeersBySuffrage(peers)
+	learners := make([]uint64, 0, len(learnerSet))
+	for nodeID := range learnerSet {
+		learners = append(learners, nodeID)
 	}
+	slices.Sort(learners)
 	return raftpb.ConfState{Voters: voters, Learners: learners}
 }
 

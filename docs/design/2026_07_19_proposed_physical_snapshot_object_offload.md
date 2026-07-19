@@ -10,8 +10,8 @@ This design owns storage-tier milestone M4 from the scaling roadmap: periodic,
 per-Raft-group physical snapshots stored in an external S3-compatible object
 store, bounded retention, and restore into a fresh elastickv data directory.
 
-The design depends on the Pebble SST ingest snapshot transfer contract from PR
-#1130. It does not copy, parse, or reimplement that format. The object layer
+The design depends on the Pebble SST ingest snapshot transfer contract from
+PR `#1130`. It does not copy, parse, or reimplement that format. The object layer
 treats the complete FSM payload as opaque bytes. On restore, `kvFSM.Restore`
 dispatches the inner store payload to the existing receiver, so `EKVSSTI1`
 uses the same manifest validation and `pebble.DB.Ingest` path as routine Raft
