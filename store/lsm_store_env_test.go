@@ -10,16 +10,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setSmallPebbleCacheForTest swaps the package-level pebbleCacheBytes value
-// to 16 MiB for the duration of a single test and restores it during
-// t.Cleanup. The real sizing happens in init() from the node memory budget and
-// ELASTICKV_PEBBLE_CACHE_*; tests use this helper without relying on process
-// env state.
-func setSmallPebbleCacheForTest(t *testing.T) {
+// setPebbleCacheBytesForTest swaps the package-level cache capacity for one
+// test. defaultPebbleOptionsWithCache replaces the process cache lazily when
+// it observes a different capacity, so callers retain the production sharing
+// and reference-counting path.
+func setPebbleCacheBytesForTest(t *testing.T, capacity int64) {
 	t.Helper()
 	prev := pebbleCacheBytes
-	pebbleCacheBytes = 16 << 20
+	pebbleCacheBytes = capacity
 	t.Cleanup(func() { pebbleCacheBytes = prev })
+}
+
+func setSmallPebbleCacheForTest(t *testing.T) {
+	t.Helper()
+	setPebbleCacheBytesForTest(t, 16<<20)
 }
 
 // TestPebbleCacheEnvOverride covers the absolute and percentage-based cache
