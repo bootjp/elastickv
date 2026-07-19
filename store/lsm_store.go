@@ -195,19 +195,20 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 //     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
 //     metaAppliedIndex below a concurrent per-Apply value.
 //  4. mtx           – guards the in-memory metadata fields
-//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
+//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS, migrationReadinessCache).
 type pebbleStore struct {
-	db                   *pebble.DB
-	cache                *pebble.Cache // owns one ref; Unref on Close / reopen.
-	dbMu                 sync.RWMutex  // guards s.db pointer – see lock ordering above
-	log                  *slog.Logger
-	lastCommitTS         uint64
-	minRetainedTS        uint64
-	pendingMinRetainedTS uint64
-	mtx                  sync.RWMutex
-	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
-	maintenanceMu        sync.Mutex
-	dir                  string
+	db                      *pebble.DB
+	cache                   *pebble.Cache // owns one ref; Unref on Close / reopen.
+	dbMu                    sync.RWMutex  // guards s.db pointer – see lock ordering above
+	log                     *slog.Logger
+	lastCommitTS            uint64
+	minRetainedTS           uint64
+	pendingMinRetainedTS    uint64
+	migrationReadinessCache []TargetStagedReadinessState
+	mtx                     sync.RWMutex
+	applyMu                 sync.Mutex // serializes ApplyMutations: conflict check → commit
+	maintenanceMu           sync.Mutex
+	dir                     string
 	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
@@ -354,9 +355,15 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
+	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	if err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 
 	return s, nil
 }
@@ -3039,6 +3046,7 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 	s.lastCommitTS = 0
 	s.minRetainedTS = 0
 	s.pendingMinRetainedTS = 0
+	s.migrationReadinessCache = nil
 	if setErr := writePebbleUint64(s.db, metaLastCommitTSBytes, 0, pebble.NoSync); setErr != nil {
 		return errors.WithStack(setErr)
 	}
@@ -3209,22 +3217,34 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, error) {
-	expectedChecksum, err := readMVCCSnapshotHeader(r)
+func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, []TargetStagedReadinessState, error) {
+	expectedChecksum, version, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, 0, 0, nil, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
 	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, 0, 0, nil, err
 	}
-	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, nil
+	readinessStates, err := readMVCCSnapshotReadinessStates(body, version)
+	if err != nil {
+		return nil, nil, 0, 0, 0, nil, err
+	}
+	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64) (string, error) {
+func writeStreamingMVCCRestoreTempDB(
+	dir string,
+	body io.Reader,
+	hash hash.Hash32,
+	expectedChecksum uint32,
+	lastCommitTS uint64,
+	minRetainedTS uint64,
+	readinessStates []TargetStagedReadinessState,
+) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
@@ -3244,6 +3264,10 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 		_ = os.RemoveAll(tmpDir)
 	}
 
+	if err := writePebbleTargetReadinessStates(tmpDB, readinessStates); err != nil {
+		cleanupTmp()
+		return "", err
+	}
 	if err := writeMVCCEntriesToDB(body, tmpDB); err != nil {
 		cleanupTmp()
 		return "", err
@@ -3263,13 +3287,22 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 	return tmpDir, nil
 }
 
+func writePebbleTargetReadinessStates(db *pebble.DB, states []TargetStagedReadinessState) error {
+	for _, state := range states {
+		if err := db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), pebble.NoSync); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, err := readStreamingMVCCRestoreHeader(r)
+	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates)
 	if err != nil {
 		return err
 	}
@@ -3356,9 +3389,15 @@ func (s *pebbleStore) swapInTempDB(tmpDir string) error {
 		cleanupOnSwapFail()
 		return err
 	}
+	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	if err != nil {
+		cleanupOnSwapFail()
+		return err
+	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 	return nil
 }
 

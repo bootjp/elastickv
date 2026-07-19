@@ -293,6 +293,13 @@ Add RPCs:
 2. Job phases: BACKFILL/FENCE/DELTA/CUTOVER
 3. Manual split with target-group relocation
 
+Status: partial. SplitJob catalog/codec, MVCC export/import primitives, staged
+visibility, write-fence checks, target readiness, and target-promotion catalog
+components exist in the M2 stack, but no production runner advances cross-group
+jobs to `DONE` yet. M2 remains open in
+[`2026_06_11_partial_hotspot_split_milestone2_migration.md`](2026_06_11_partial_hotspot_split_milestone2_migration.md)
+until the cross-group acceptance criteria and Jepsen workload pass.
+
 ### Milestone 3: Automation
 
 1. Access aggregation

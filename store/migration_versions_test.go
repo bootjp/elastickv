@@ -57,6 +57,42 @@ func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
 	})
 }
 
+func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
+		retention, ok := st.(RetentionController)
+		require.True(t, ok)
+		retention.SetMinRetainedTS(20)
+
+		_, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			ReadTS:               15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		_, err = st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Versions, 1)
+	})
+}
+
 func TestExportVersionsExcludesTxnLocks(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -1033,6 +1069,138 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 	})
 }
 
+func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+		reader, ok := st.(MigrationTargetReadinessReader)
+		require.True(t, ok)
+
+		state := TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+			Armed:                  true,
+		}
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{state}, states)
+
+		states[0].RouteStart[0] = 'x'
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []byte("a"), states[0].RouteStart)
+
+		updated := state
+		updated.MinWriteTSExclusive = 101
+		updated.RouteStart = []byte("b")
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, updated))
+
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{updated}, states)
+
+		exported, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("!"),
+			EndKey:      []byte("~"),
+			MaxVersions: 100,
+		})
+		require.NoError(t, err)
+		require.Empty(t, exported.Versions)
+	})
+}
+
+func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+
+		err := writer.ApplyTargetStagedReadiness(context.Background(), TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			Armed:                  true,
+		})
+		require.ErrorContains(t, err, "min_write_ts_exclusive")
+	})
+}
+
+func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
+}
+
+func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-prefix-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	pebbleStore, ok := st.(*pebbleStore)
+	require.True(t, ok)
+	junkKey := append([]byte(migrationReadyPrefix), []byte("side-record")...)
+	require.NoError(t, pebbleStore.db.Set(junkKey, []byte("not-readiness-state"), pebbleStore.directApplyWriteOpts()))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
+}
+
 func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -1278,4 +1446,77 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	require.Equal(t, []byte("stale"), res.AckedCursor)
 	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
 	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+func TestCleanupVersionsRemovesOnlySelectedCommittedVersions(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v1"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v2"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("keep"), 10, 0))
+
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+		first, err := cleaner.CleanupVersions(ctx, CleanupVersionsOptions{
+			JobID:       1,
+			StartKey:    []byte("a"),
+			EndKey:      []byte("b"),
+			MaxCommitTS: 10,
+			MaxVersions: 1,
+			MaxBytes:    1 << 20,
+		})
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), first.DeletedRows)
+
+		value, err := st.GetAt(ctx, []byte("a"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v2"), value)
+		_, err = st.GetAt(ctx, []byte("a"), 10)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+		value, err = st.GetAt(ctx, []byte("b"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("keep"), value)
+	})
+}
+
+func TestClearMigrationStateRemovesPerJobProofs(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     7,
+			BracketID: 1,
+			BatchSeq:  1,
+			Versions: []MVCCVersion{{
+				Key:      []byte("!dist|migstage|row"),
+				CommitTS: 50,
+				Value:    []byte("v"),
+			}},
+		})
+		require.NoError(t, err)
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+			JobID:                  7,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 2,
+			MigrationJobID:         7,
+			MinWriteTSExclusive:    50,
+			Armed:                  true,
+		}))
+
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+		require.NoError(t, cleaner.ClearMigrationState(ctx, 7, 0))
+		floor, err := st.MigrationHLCFloor(ctx, 7)
+		require.NoError(t, err)
+		require.Zero(t, floor)
+		reader, ok := st.(MigrationTargetReadinessReader)
+		require.True(t, ok)
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		for _, state := range states {
+			require.NotEqual(t, uint64(7), state.JobID)
+		}
+	})
 }

@@ -114,6 +114,36 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
 }
 
+func TestShardStoreLeaderGetAtChecksReadinessBeforeResolvingPendingLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	route := distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}
+	shardStore, group := newReadinessShardStore(t, route)
+	applyTargetReadiness(t, group)
+
+	lockTS := uint64(1)
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, txnLockKey(key), encodeTxnLock(txnLock{
+		StartTS:    lockTS,
+		PrimaryKey: key,
+	}), lockTS, 0))
+
+	resolvedRoute, _, ok := shardStore.routeAndGroupForKey(key)
+	require.True(t, ok)
+	_, err := shardStore.leaderGetAt(ctx, group, resolvedRoute, key, ^uint64(0))
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, lockErr := group.Store.GetAt(ctx, txnLockKey(key), ^uint64(0))
+	require.NoError(t, lockErr)
+}
+
 func TestShardStoreGetAt_ReturnsTxnLockedForPendingCrossShardTxn(t *testing.T) {
 	t.Parallel()
 
@@ -669,6 +699,104 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLockWithoutCommittedValue(t 
 	require.Len(t, kvs, 1)
 	require.Equal(t, secondaryKey, kvs[0].Key)
 	require.Equal(t, []byte("v2"), kvs[0].Value)
+}
+
+func TestShardStorePhysicalLimitScanPreservesRouteProofDuringLockResolution(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+
+	st1 := store.NewMVCCStore()
+	fsm := NewKvFSMWithHLC(st1, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
+	applyFSM, ok := fsm.(*kvFSM)
+	require.True(t, ok)
+	txn := &localApplyTransactional{fsm: applyFSM}
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: st1, Txn: txn},
+	}
+	shardStore := NewShardStore(engine, groups)
+	applyTargetReadiness(t, groups[1])
+
+	startTS := uint64(101)
+	commitTS := uint64(120)
+	primaryKey := []byte("b")
+	secondaryKey := []byte("c")
+	require.NoError(t, st1.PutAt(ctx, secondaryKey, []byte("old"), 1, 0))
+	prepare := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_PUT, Key: primaryKey, Value: []byte("vp")},
+			{Op: pb.Op_PUT, Key: secondaryKey, Value: []byte("vs")},
+		},
+	}
+	_, err := groups[1].Txn.Commit(ctx, []*pb.Request{prepare})
+	require.NoError(t, err)
+	commitPrimary := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primaryKey},
+		},
+	}
+	_, err = groups[1].Txn.Commit(ctx, []*pb.Request{commitPrimary})
+	require.NoError(t, err)
+
+	route, ok := engine.GetRoute(secondaryKey)
+	require.True(t, ok)
+	kvs, _, err := shardStore.scanRouteAtLeaderPhysicalLimit(ctx, groups[1], route, []byte(""), nil, 10, 10, commitTS, false)
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, kvp := range kvs {
+		got[string(kvp.Key)] = string(kvp.Value)
+	}
+	require.Equal(t, "vs", got[string(secondaryKey)])
+
+	_, lockErr := st1.GetAt(ctx, txnLockKey(secondaryKey), ^uint64(0))
+	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
+}
+
+type localApplyTransactional struct {
+	fsm *kvFSM
+}
+
+func (t *localApplyTransactional) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	for _, req := range reqs {
+		if err := t.fsm.handleTxnRequest(ctx, req, txnRequestResolveTS(req)); err != nil {
+			return nil, err
+		}
+	}
+	return &TransactionResponse{}, nil
+}
+
+func (t *localApplyTransactional) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	return t.Commit(ctx, reqs)
+}
+
+func txnRequestResolveTS(req *pb.Request) uint64 {
+	meta, _, err := extractTxnMeta(req.GetMutations())
+	if err == nil && meta.CommitTS != 0 {
+		return meta.CommitTS
+	}
+	return req.GetTs()
 }
 
 func TestShardStoreScanAt_FiltersTxnInternalKeysWithoutRaft(t *testing.T) {

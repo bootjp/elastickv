@@ -10,6 +10,11 @@ service Internal {
   rpc ExportRangeVersions(ExportRangeVersionsRequest) returns (stream ExportRangeVersionsResponse) {}
   rpc ImportRangeVersions(ImportRangeVersionsRequest) returns (ImportRangeVersionsResponse) {}
   rpc PromoteStagedVersions(PromoteStagedVersionsRequest) returns (PromoteStagedVersionsResponse) {}
+  rpc ApplyTargetStagedReadiness(TargetStagedReadinessRequest) returns (TargetStagedReadinessResponse) {}
+  rpc ProbeMigrationLocks(ProbeMigrationLocksRequest) returns (ProbeMigrationLocksResponse) {}
+  rpc CleanupMigration(CleanupMigrationRequest) returns (CleanupMigrationResponse) {}
+  rpc ProbeMigrationState(ProbeMigrationStateRequest) returns (ProbeMigrationStateResponse) {}
+  rpc IssueMigrationTimestamp(IssueMigrationTimestampRequest) returns (IssueMigrationTimestampResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -156,4 +161,106 @@ message PromoteStagedVersionsResponse {
   bool done = 2;
   uint64 promoted_rows = 3;
   uint64 max_promoted_ts = 4;
+}
+
+message TargetStagedReadinessRequest {
+  uint64 job_id = 1;
+  bytes route_start = 2;
+  bytes route_end = 3;
+  uint64 expected_cutover_version = 4;
+  uint64 migration_job_id = 5;
+  uint64 min_write_ts_exclusive = 6;
+  bool armed = 7;
+  // Source-side controls reuse the same Raft-replicated durable record. They
+  // are ignored by target staged-readiness checks.
+  bool source_write_fence = 8;
+  bool source_read_fence = 9;
+  uint64 retention_pin_ts = 10;
+  bool track_writes = 11;
+  uint64 min_admitted_ts = 12;
+}
+
+message TargetStagedReadinessResponse {
+  uint64 min_admitted_ts = 1;
+}
+
+message ProbeMigrationLocksRequest {
+  bytes route_start = 1;
+  bytes route_end = 2;
+  uint32 limit = 3;
+}
+
+message ProbeMigrationLocksResponse {
+  uint32 pending_count = 1;
+}
+
+enum MigrationCleanupMode {
+  MIGRATION_CLEANUP_MODE_UNSPECIFIED = 0;
+  MIGRATION_CLEANUP_MODE_VERSIONS = 1;
+  MIGRATION_CLEANUP_MODE_METADATA = 2;
+}
+
+message CleanupMigrationRequest {
+  uint64 job_id = 1;
+  MigrationCleanupMode mode = 2;
+  bytes range_start = 3;
+  bytes range_end = 4;
+  bytes cursor = 5;
+  uint64 max_commit_ts = 6;
+  uint32 max_versions = 7;
+  uint64 max_bytes = 8;
+  uint64 max_scanned_bytes = 9;
+  uint32 key_family = 10;
+  bytes route_start = 11;
+  bytes route_end = 12;
+  bool exclude_known_internal = 13;
+  repeated bytes exclude_prefixes = 14;
+  bool requires_route_key_check = 15;
+  bool requires_decoded_s3 = 16;
+}
+
+message CleanupMigrationResponse {
+  bytes next_cursor = 1;
+  bool done = 2;
+  uint64 deleted_rows = 3;
+  uint64 deleted_bytes = 4;
+  uint64 scanned_bytes = 5;
+}
+
+enum MigrationStateProbeKind {
+  MIGRATION_STATE_PROBE_KIND_UNSPECIFIED = 0;
+  MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED = 1;
+  MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED = 2;
+  MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED = 3;
+  MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED = 4;
+  MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED = 5;
+}
+
+message ProbeMigrationStateRequest {
+  uint64 job_id = 1;
+  MigrationStateProbeKind kind = 2;
+  bytes route_start = 3;
+  bytes route_end = 4;
+  uint64 expected_catalog_version = 5;
+  uint64 expected_group_id = 6;
+  uint64 migration_job_id = 7;
+  uint64 min_write_ts_exclusive = 8;
+  bool source_write_fence = 9;
+  bool source_read_fence = 10;
+  bool track_writes = 11;
+  uint64 retention_pin_ts = 12;
+  int64 read_drain_not_before_ms = 13;
+}
+
+message ProbeMigrationStateResponse {
+  bool ready = 1;
+  uint64 catalog_version = 2;
+  uint64 min_admitted_ts = 3;
+}
+
+message IssueMigrationTimestampRequest {}
+
+message IssueMigrationTimestampResponse {
+  uint64 timestamp = 1;
+  uint64 last_commit_ts = 2;
 }

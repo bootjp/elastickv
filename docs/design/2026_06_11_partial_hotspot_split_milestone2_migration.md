@@ -1,11 +1,13 @@
 # Hotspot Shard Split — Milestone 2: Migration Plane
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-06-11
 
 Parent: [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md).
 M1 (control plane) is as-built in [2026_02_18_implemented_hotspot_split_milestone1_pr.md](2026_02_18_implemented_hotspot_split_milestone1_pr.md).
+
+Current implementation status: partial. The SplitJob catalog/codec, versioned route descriptor storage, range export/import primitives, staged-read visibility, write-fence checks, target readiness, and target-promotion catalog pieces have landed or are covered by the active M2 stack. The feature is not implemented end to end until a production runner advances cross-group jobs to `DONE`, `ListRoutes` exposes the moved child on its target group after cutover, and the Jepsen cross-group split workload passes the acceptance criteria in §13.
 
 ## 1. Background
 
@@ -1281,9 +1283,9 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 
 ## 14. Lifecycle
 
-This document begins as `*_proposed_*`. Per CLAUDE.md:
+This document is `*_partial_*` because M2-PR1 and later component slices have landed, but the cross-group migration plane is not complete end to end.
 
-- Rename to `*_partial_*` after M2-PR1 lands; track per-PR landing under §11.
-- Rename to `*_implemented_*` after M2-PR7 ships and the parent partial doc's M2 row is checked off.
+- Track per-PR landing under §11.
+- Rename to `*_implemented_*` only after the acceptance criteria in §13 pass: cross-group `StartSplitMigration` reaches `phase=DONE`, `ListRoutes` shows the target-group child after cutover, leader-kill recovery is automatic, and the Jepsen split workload is green.
 
 `git mv` is used so history follows.

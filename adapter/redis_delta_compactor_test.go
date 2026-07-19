@@ -1684,8 +1684,11 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 		require.NoError(t, st.PutAt(ctx, dKey, delta, i+1, 0))
 	}
 
-	// Queue and process the urgent compaction.
-	c.TriggerUrgentCompaction("hash", userKey)
+	// Exercise the urgent pagination loop directly. Running through c.Run would
+	// also start an initial background SyncOnce; the local test coordinator applies
+	// elems one-by-one instead of atomically, so a test read can observe the meta
+	// update before all delete elems have been applied under the race detector.
+	c.compactUrgentKey(ctx, urgentCompactionRequest{typeName: "hash", userKey: userKey})
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

@@ -19,11 +19,16 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName               = "/Internal/Forward"
-	Internal_RelayPublish_FullMethodName          = "/Internal/RelayPublish"
-	Internal_ExportRangeVersions_FullMethodName   = "/Internal/ExportRangeVersions"
-	Internal_ImportRangeVersions_FullMethodName   = "/Internal/ImportRangeVersions"
-	Internal_PromoteStagedVersions_FullMethodName = "/Internal/PromoteStagedVersions"
+	Internal_Forward_FullMethodName                    = "/Internal/Forward"
+	Internal_RelayPublish_FullMethodName               = "/Internal/RelayPublish"
+	Internal_ExportRangeVersions_FullMethodName        = "/Internal/ExportRangeVersions"
+	Internal_ImportRangeVersions_FullMethodName        = "/Internal/ImportRangeVersions"
+	Internal_PromoteStagedVersions_FullMethodName      = "/Internal/PromoteStagedVersions"
+	Internal_ApplyTargetStagedReadiness_FullMethodName = "/Internal/ApplyTargetStagedReadiness"
+	Internal_ProbeMigrationLocks_FullMethodName        = "/Internal/ProbeMigrationLocks"
+	Internal_CleanupMigration_FullMethodName           = "/Internal/CleanupMigration"
+	Internal_ProbeMigrationState_FullMethodName        = "/Internal/ProbeMigrationState"
+	Internal_IssueMigrationTimestamp_FullMethodName    = "/Internal/IssueMigrationTimestamp"
 )
 
 // InternalClient is the client API for Internal service.
@@ -36,6 +41,11 @@ type InternalClient interface {
 	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
 	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
 	PromoteStagedVersions(ctx context.Context, in *PromoteStagedVersionsRequest, opts ...grpc.CallOption) (*PromoteStagedVersionsResponse, error)
+	ApplyTargetStagedReadiness(ctx context.Context, in *TargetStagedReadinessRequest, opts ...grpc.CallOption) (*TargetStagedReadinessResponse, error)
+	ProbeMigrationLocks(ctx context.Context, in *ProbeMigrationLocksRequest, opts ...grpc.CallOption) (*ProbeMigrationLocksResponse, error)
+	CleanupMigration(ctx context.Context, in *CleanupMigrationRequest, opts ...grpc.CallOption) (*CleanupMigrationResponse, error)
+	ProbeMigrationState(ctx context.Context, in *ProbeMigrationStateRequest, opts ...grpc.CallOption) (*ProbeMigrationStateResponse, error)
+	IssueMigrationTimestamp(ctx context.Context, in *IssueMigrationTimestampRequest, opts ...grpc.CallOption) (*IssueMigrationTimestampResponse, error)
 }
 
 type internalClient struct {
@@ -105,6 +115,56 @@ func (c *internalClient) PromoteStagedVersions(ctx context.Context, in *PromoteS
 	return out, nil
 }
 
+func (c *internalClient) ApplyTargetStagedReadiness(ctx context.Context, in *TargetStagedReadinessRequest, opts ...grpc.CallOption) (*TargetStagedReadinessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TargetStagedReadinessResponse)
+	err := c.cc.Invoke(ctx, Internal_ApplyTargetStagedReadiness_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ProbeMigrationLocks(ctx context.Context, in *ProbeMigrationLocksRequest, opts ...grpc.CallOption) (*ProbeMigrationLocksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeMigrationLocksResponse)
+	err := c.cc.Invoke(ctx, Internal_ProbeMigrationLocks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) CleanupMigration(ctx context.Context, in *CleanupMigrationRequest, opts ...grpc.CallOption) (*CleanupMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CleanupMigrationResponse)
+	err := c.cc.Invoke(ctx, Internal_CleanupMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ProbeMigrationState(ctx context.Context, in *ProbeMigrationStateRequest, opts ...grpc.CallOption) (*ProbeMigrationStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeMigrationStateResponse)
+	err := c.cc.Invoke(ctx, Internal_ProbeMigrationState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) IssueMigrationTimestamp(ctx context.Context, in *IssueMigrationTimestampRequest, opts ...grpc.CallOption) (*IssueMigrationTimestampResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueMigrationTimestampResponse)
+	err := c.cc.Invoke(ctx, Internal_IssueMigrationTimestamp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility.
@@ -115,6 +175,11 @@ type InternalServer interface {
 	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
 	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
 	PromoteStagedVersions(context.Context, *PromoteStagedVersionsRequest) (*PromoteStagedVersionsResponse, error)
+	ApplyTargetStagedReadiness(context.Context, *TargetStagedReadinessRequest) (*TargetStagedReadinessResponse, error)
+	ProbeMigrationLocks(context.Context, *ProbeMigrationLocksRequest) (*ProbeMigrationLocksResponse, error)
+	CleanupMigration(context.Context, *CleanupMigrationRequest) (*CleanupMigrationResponse, error)
+	ProbeMigrationState(context.Context, *ProbeMigrationStateRequest) (*ProbeMigrationStateResponse, error)
+	IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -139,6 +204,21 @@ func (UnimplementedInternalServer) ImportRangeVersions(context.Context, *ImportR
 }
 func (UnimplementedInternalServer) PromoteStagedVersions(context.Context, *PromoteStagedVersionsRequest) (*PromoteStagedVersionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PromoteStagedVersions not implemented")
+}
+func (UnimplementedInternalServer) ApplyTargetStagedReadiness(context.Context, *TargetStagedReadinessRequest) (*TargetStagedReadinessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyTargetStagedReadiness not implemented")
+}
+func (UnimplementedInternalServer) ProbeMigrationLocks(context.Context, *ProbeMigrationLocksRequest) (*ProbeMigrationLocksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeMigrationLocks not implemented")
+}
+func (UnimplementedInternalServer) CleanupMigration(context.Context, *CleanupMigrationRequest) (*CleanupMigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CleanupMigration not implemented")
+}
+func (UnimplementedInternalServer) ProbeMigrationState(context.Context, *ProbeMigrationStateRequest) (*ProbeMigrationStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeMigrationState not implemented")
+}
+func (UnimplementedInternalServer) IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueMigrationTimestamp not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -244,6 +324,96 @@ func _Internal_PromoteStagedVersions_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ApplyTargetStagedReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TargetStagedReadinessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ApplyTargetStagedReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ApplyTargetStagedReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ApplyTargetStagedReadiness(ctx, req.(*TargetStagedReadinessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ProbeMigrationLocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeMigrationLocksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProbeMigrationLocks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProbeMigrationLocks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProbeMigrationLocks(ctx, req.(*ProbeMigrationLocksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_CleanupMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CleanupMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).CleanupMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_CleanupMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).CleanupMigration(ctx, req.(*CleanupMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ProbeMigrationState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeMigrationStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProbeMigrationState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProbeMigrationState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProbeMigrationState(ctx, req.(*ProbeMigrationStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_IssueMigrationTimestamp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueMigrationTimestampRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).IssueMigrationTimestamp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_IssueMigrationTimestamp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).IssueMigrationTimestamp(ctx, req.(*IssueMigrationTimestampRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -266,6 +436,26 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PromoteStagedVersions",
 			Handler:    _Internal_PromoteStagedVersions_Handler,
+		},
+		{
+			MethodName: "ApplyTargetStagedReadiness",
+			Handler:    _Internal_ApplyTargetStagedReadiness_Handler,
+		},
+		{
+			MethodName: "ProbeMigrationLocks",
+			Handler:    _Internal_ProbeMigrationLocks_Handler,
+		},
+		{
+			MethodName: "CleanupMigration",
+			Handler:    _Internal_CleanupMigration_Handler,
+		},
+		{
+			MethodName: "ProbeMigrationState",
+			Handler:    _Internal_ProbeMigrationState_Handler,
+		},
+		{
+			MethodName: "IssueMigrationTimestamp",
+			Handler:    _Internal_IssueMigrationTimestamp_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
