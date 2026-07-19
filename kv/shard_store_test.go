@@ -677,7 +677,6 @@ func TestCaptureBackupRouteSnapshotAtUsesDurableCatalogTimestamp(t *testing.T) {
 		1: {Store: store.NewMVCCStore()},
 		2: {Store: store.NewMVCCStore()},
 	}
-	shards := NewShardStore(engine, groups)
 	catalog := distribution.NewCatalogStore(groups[1].Store)
 	old, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
@@ -692,9 +691,37 @@ func TestCaptureBackupRouteSnapshotAtUsesDurableCatalogTimestamp(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, engine.ApplySnapshot(current))
 
-	snapshot, err := shards.CaptureBackupRouteSnapshotAt(ctx, oldReadTS)
+	snapshot, err := CaptureBackupRouteSnapshotAt(ctx, catalog, oldReadTS)
 	require.NoError(t, err)
 	require.Len(t, snapshot.routes, 2)
+	require.Equal(t, uint64(1), snapshot.routes[0].GroupID)
+	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
+}
+
+func TestCaptureBackupRouteSnapshotAtReadsRowsFromCatalogOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	owner := store.NewMVCCStore()
+	wronglyRouted := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(owner)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+
+	// A live shard router could send the reserved route-row prefix to group 2.
+	// The backup reader must stay on the durable catalog owner instead.
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 2)
+	_ = NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: owner},
+		2: {Store: wronglyRouted},
+	})
+
+	snapshot, err := CaptureBackupRouteSnapshotAt(ctx, catalog, owner.LastCommitTS())
+	require.NoError(t, err)
+	require.Len(t, snapshot.routes, len(saved.Routes))
 	require.Equal(t, uint64(1), snapshot.routes[0].GroupID)
 	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
 }

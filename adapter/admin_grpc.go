@@ -724,7 +724,8 @@ var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
 func adminAuthenticatedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
-		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName
+		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
+		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
 }
 
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing

@@ -1,9 +1,12 @@
 package kv
 
 import (
+	"bytes"
+	"context"
 	"testing"
 	"time"
 
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -140,6 +143,143 @@ func TestApplyBackupObservesPinnedReadTimestamp(t *testing.T) {
 		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
 	}))))
 	require.GreaterOrEqual(t, hlc.Current(), readTS)
+}
+
+func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	readTS := uint64(100)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	tests := []struct {
+		name string
+		req  *pb.Request
+	}{
+		{
+			name: "raw",
+			req: &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+				Op: pb.Op_PUT, Key: []byte("raw"), Value: []byte("stale"),
+			}}},
+		},
+		{
+			name: "one phase",
+			req: &pb.Request{IsTxn: true, Phase: pb.Phase_NONE, Ts: readTS - 2, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("one-phase"), CommitTS: readTS - 1,
+				})},
+				{Op: pb.Op_PUT, Key: []byte("one-phase"), Value: []byte("stale")},
+			}},
+		},
+		{
+			name: "prepare",
+			req: &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: readTS - 1, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("prepare"), LockTTLms: defaultTxnLockTTLms,
+				})},
+				{Op: pb.Op_PUT, Key: []byte("prepare"), Value: []byte("stale")},
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requireBackupTimestampFenced(t, applyBackupTestRequest(t, fsm, tc.req))
+		})
+	}
+}
+
+func TestApplyBackupAllowsResolutionOfPrePinTransaction(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+	primary := []byte("primary")
+	startTS := uint64(30)
+	commitTS := uint64(40)
+	prepare := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+		})},
+		{Op: pb.Op_PUT, Key: primary, Value: []byte("committed")},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, prepare))
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: 50, Deadline: time.Now().Add(time.Hour),
+	}))))
+	commit := &pb.Request{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, CommitTS: commitTS,
+		})},
+		{Op: pb.Op_PUT, Key: primary},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, commit))
+	value, err := fsm.store.GetAt(context.Background(), primary, 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("committed"), value)
+}
+
+func TestBackupTimestampFloorSurvivesSnapshotRestore(t *testing.T) {
+	srcStore := store.NewMVCCStore()
+	src, ok := NewKvFSMWithHLCAndTracker(
+		srcStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, haltApplyOf(src.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+	snapshot, err := srcStore.Snapshot()
+	require.NoError(t, err)
+	defer snapshot.Close()
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+
+	dstStore := store.NewMVCCStore()
+	dst, ok := NewKvFSMWithHLCAndTracker(
+		dstStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw.Bytes())))
+	requireBackupTimestampFenced(t, applyBackupTestRequest(t, dst, &pb.Request{Ts: 74, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("late"), Value: []byte("stale"),
+	}}}))
+}
+
+func TestBackupTimestampFloorRejectsDelayedRaftProposal(t *testing.T) {
+	st := store.NewMVCCStore()
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	r, stop := newSingleRaft(t, "backup-floor-delayed", NewKvFSMWithHLCAndTracker(st, NewHLC(), tracker))
+	t.Cleanup(stop)
+	readTS := uint64(500)
+	result, err := r.ProposeAdmin(context.Background(), EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Nil(t, result.Response)
+
+	txn := NewTransactionWithProposer(r)
+	_, err = txn.Commit(context.Background(), []*pb.Request{{
+		Ts: readTS - 1,
+		Mutations: []*pb.Mutation{{
+			Op: pb.Op_PUT, Key: []byte("delayed"), Value: []byte("stale"),
+		}},
+	}})
+	require.ErrorIs(t, err, ErrBackupTimestampFenced)
+	_, err = st.GetAt(context.Background(), []byte("delayed"), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func applyBackupTestRequest(t *testing.T, fsm *kvFSM, req *pb.Request) any {
+	t.Helper()
+	payload, err := marshalRaftCommand([]*pb.Request{req})
+	require.NoError(t, err)
+	return fsm.Apply(payload)
+}
+
+func requireBackupTimestampFenced(t *testing.T, resp any) {
+	t.Helper()
+	err, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, err, ErrBackupTimestampFenced)
 }
 
 func TestApplyBackupReserveEnforcesCapacityAndUnreserveReleases(t *testing.T) {

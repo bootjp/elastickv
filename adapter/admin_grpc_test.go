@@ -1021,18 +1021,26 @@ func TestAdminTokenAuthSkipsOtherServices(t *testing.T) {
 	}
 }
 
-func TestAdminTokenAuthProtectsForwardAdminProposal(t *testing.T) {
+func TestAdminTokenAuthProtectsInternalAdminMethods(t *testing.T) {
 	t.Parallel()
 	unary, _ := AdminTokenAuth("s3cret")
-	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_ForwardAdminProposal_FullMethodName}
 	handler := func(_ context.Context, _ any) (any, error) { return "ok", nil }
-
-	_, err := unary(context.Background(), nil, info, handler)
-	require.Equal(t, codes.Unauthenticated, status.Code(err))
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer s3cret"))
-	resp, err := unary(ctx, nil, info, handler)
-	require.NoError(t, err)
-	require.Equal(t, "ok", resp)
+	methods := []string{
+		pb.Internal_ForwardAdminProposal_FullMethodName,
+		pb.Internal_ForwardLeaseRead_FullMethodName,
+	}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+			info := &grpc.UnaryServerInfo{FullMethod: method}
+			_, err := unary(context.Background(), nil, info, handler)
+			require.Equal(t, codes.Unauthenticated, status.Code(err))
+			ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer s3cret"))
+			resp, err := unary(ctx, nil, info, handler)
+			require.NoError(t, err)
+			require.Equal(t, "ok", resp)
+		})
+	}
 }
 
 func TestAdminTokenAuthEmptyTokenDisabled(t *testing.T) {

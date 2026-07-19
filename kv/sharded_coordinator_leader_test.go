@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -11,18 +12,25 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 type leaseReadForwardServer struct {
 	pb.UnimplementedInternalServer
-	calls atomic.Int32
+	calls         atomic.Int32
+	mu            sync.Mutex
+	authorization []string
 }
 
 func (s *leaseReadForwardServer) ForwardLeaseRead(
-	context.Context,
-	*pb.ForwardLeaseReadRequest,
+	ctx context.Context,
+	_ *pb.ForwardLeaseReadRequest,
 ) (*pb.ForwardLeaseReadResponse, error) {
 	s.calls.Add(1)
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.mu.Lock()
+	s.authorization = append([]string(nil), md.Get("authorization")...)
+	s.mu.Unlock()
 	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44}, nil
 }
 
@@ -102,12 +110,16 @@ func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *t
 	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
 	group := &ShardGroup{Engine: follower, Store: store.NewMVCCStore()}
 	proxy := NewLeaderProxyForShardGroup(group)
+	group.SetLeaderReadToken("admin-secret")
 	t.Cleanup(func() { require.NoError(t, proxy.Close()) })
 	group.Txn = proxy
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: group}, 1, NewHLC(), nil)
 
 	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
 	require.Equal(t, int32(1), service.calls.Load())
+	service.mu.Lock()
+	require.Equal(t, []string{"Bearer admin-secret"}, service.authorization)
+	service.mu.Unlock()
 }
 
 func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *testing.T) {

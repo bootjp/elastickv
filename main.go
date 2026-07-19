@@ -535,6 +535,7 @@ func run() error {
 	if err := configureCoordinatorTSO(coordinate); err != nil {
 		return err
 	}
+	readTracker.SetBackupTimestampFloorObserver(coordinate.ObserveTimestampFloor)
 
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
@@ -613,7 +614,7 @@ func run() error {
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
-		distServer: distServer, readTracker: readTracker,
+		distServer: distServer, distCatalog: distCatalog, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
 		cleanup:                         &cleanup,
@@ -1830,6 +1831,7 @@ type serversInput struct {
 	shardStore         *kv.ShardStore
 	coordinate         kv.Coordinator
 	distServer         *adapter.DistributionServer
+	distCatalog        *distribution.CatalogStore
 	readTracker        *kv.ActiveTimestampTracker
 	metricsRegistry    *monitoring.Registry
 	cfg                runtimeConfig
@@ -1873,7 +1875,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	connCache = prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
 	adminServer, adminGRPCOpts, err := setupAdminService(
 		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
-		in.shardStore, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
+		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
 	)
 	if err != nil {
 		return err
@@ -2115,6 +2117,7 @@ func setupAdminService(
 	shardGroups map[uint64]*kv.ShardGroup,
 	bootstrapServers []raftengine.Server,
 	shardStore *kv.ShardStore,
+	distCatalog *distribution.CatalogStore,
 	coordinate kv.Coordinator,
 	readTracker *kv.ActiveTimestampTracker,
 	keyvizSampler *keyviz.MemSampler,
@@ -2134,7 +2137,8 @@ func setupAdminService(
 		members,
 		connCache,
 		adminBackupDependencies{
-			store: shardStore, coordinate: coordinate, tracker: readTracker,
+			store:      &adminBackupStore{ShardStore: shardStore, catalog: distCatalog},
+			shardStore: shardStore, coordinate: coordinate, tracker: readTracker,
 		},
 	)
 	if err != nil {
@@ -2146,6 +2150,7 @@ func setupAdminService(
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
 		if group := shardGroups[rt.spec.id]; group != nil {
+			group.SetLeaderReadToken(icept.token)
 			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(
 				rt.engine,
 				group.Proposer(),
@@ -2380,9 +2385,23 @@ func startupRotationGatedMethod(fullMethod string) bool {
 // --adminInsecureNoAuth so operators have to opt into the unauthenticated
 // mode explicitly.
 type adminBackupDependencies struct {
-	store      *kv.ShardStore
+	store      adapter.BackupStore
+	shardStore *kv.ShardStore
 	coordinate kv.Coordinator
 	tracker    *kv.ActiveTimestampTracker
+}
+
+type adminBackupStore struct {
+	*kv.ShardStore
+	catalog *distribution.CatalogStore
+}
+
+func (s *adminBackupStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
+	if s == nil {
+		return kv.BackupRouteSnapshot{}, errors.New("backup store is unavailable")
+	}
+	snapshot, err := kv.CaptureBackupRouteSnapshotAt(ctx, s.catalog, ts)
+	return snapshot, errors.Wrap(err, "capture backup route snapshot")
 }
 
 func configureAdminService(
@@ -2447,7 +2466,7 @@ func adminServerOptions(
 		opts = append(opts,
 			adapter.WithAdminBackupControl(
 				deps.store,
-				adminBackupReadFence(deps.coordinate, deps.store),
+				adminBackupReadFence(deps.coordinate, deps.shardStore),
 				adminBackupPeerProbe(connCache),
 				deps.tracker,
 				tokenKey,

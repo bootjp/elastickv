@@ -259,10 +259,6 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	if readTS == 0 || readTS == ^uint64(0) {
 		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "%s", "backup read fence returned an invalid timestamp")
 	}
-	routes, err := s.backupStore.CaptureBackupRouteSnapshotAt(ctx, readTS)
-	if err != nil {
-		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
-	}
 	pinID, err := newBackupPinID()
 	if err != nil {
 		return preparedBackup{}, status.Errorf(codes.Internal, "generate backup pin id: %v", err)
@@ -272,6 +268,15 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	commits, err := s.pinBackupGroups(ctx, groups, controlGroup, pinID, readTS, deadline)
 	if err != nil {
 		return preparedBackup{}, err
+	}
+	// Capture catalog ownership only after every data group has applied the
+	// pin's timestamp floor. A preallocated catalog write at or below readTS
+	// either lands before this point and is visible here, or is rejected by the
+	// floor; it cannot race the captured route view after this call returns.
+	routes, err := s.backupStore.CaptureBackupRouteSnapshotAt(ctx, readTS)
+	if err != nil {
+		s.compensateBackupRelease(controlGroup, groups, pinID)
+		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
 	}
 	return preparedBackup{
 		groups: groups, commits: commits, controlGroup: controlGroup,
@@ -573,6 +578,11 @@ func (s *AdminServer) snapshotBackupGroups() ([]backupGroup, error) {
 	s.groupsMu.RLock()
 	groups := make([]backupGroup, 0, len(s.groups))
 	for id, group := range s.groups {
+		// Group zero is reserved for TSO state and has no user keyspace.
+		// Backup tokens also reserve zero as an invalid group ID.
+		if id == 0 {
+			continue
+		}
 		proposer := s.backupProposers[id]
 		if group == nil || proposer == nil {
 			s.groupsMu.RUnlock()

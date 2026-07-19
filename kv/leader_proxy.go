@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -28,6 +29,7 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 type LeaderProxy struct {
 	engine raftengine.Engine
 	tm     *TransactionManager
+	group  *ShardGroup
 
 	connCache GRPCConnCache
 }
@@ -256,6 +258,9 @@ func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (uint64, e
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
+	if token := p.group.forwardedLeaderReadToken(); token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+	}
 	resp, err := pb.NewInternalClient(conn).ForwardLeaseRead(ctx, &pb.ForwardLeaseReadRequest{})
 	if err != nil {
 		return 0, errors.WithStack(err)

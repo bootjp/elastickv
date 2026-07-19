@@ -63,6 +63,31 @@ type ShardGroup struct {
 	// leaderRead forwards a read barrier to this group's current leader when
 	// the local replica is a follower. It is installed with the LeaderProxy.
 	leaderRead func(context.Context) (uint64, error)
+	// leaderReadToken authenticates follower-to-leader lease-read RPCs. Admin
+	// service setup publishes it once before the public listeners are opened.
+	leaderReadToken atomic.Pointer[string]
+}
+
+// SetLeaderReadToken configures the bearer token used by forwarded lease-read
+// RPCs. An empty token preserves explicitly configured insecure admin mode.
+func (g *ShardGroup) SetLeaderReadToken(token string) {
+	if token == "" {
+		g.leaderReadToken.Store(nil)
+		return
+	}
+	t := token
+	g.leaderReadToken.Store(&t)
+}
+
+func (g *ShardGroup) forwardedLeaderReadToken() string {
+	if g == nil {
+		return ""
+	}
+	token := g.leaderReadToken.Load()
+	if token == nil {
+		return ""
+	}
+	return *token
 }
 
 // Proposer returns the wrap-aware proposer chain installed by
@@ -213,6 +238,7 @@ func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *Lead
 	p := &LeaderProxy{
 		engine: g.Engine,
 		tm:     NewTransactionWithProposer(g.proposer, opts...),
+		group:  g,
 	}
 	g.leaderRead = p.forwardLeaseRead
 	return p
@@ -380,6 +406,9 @@ type ShardedCoordinator struct {
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
 	tsAllocator TimestampAllocator
+	// timestampFloor is the highest replicated backup cut observed by this
+	// process. It deduplicates the same cut as each local shard applies its pin.
+	timestampFloor atomic.Uint64
 	// timestampGroup pins IsTimestampLeader to a dedicated Raft group when
 	// timestampGroupConfigured is true. Nil/false preserves the M3 bridge
 	// behavior where any locally-led shard group can issue TSO timestamps.
@@ -466,6 +495,29 @@ func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedC
 func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
 	c.tsAllocator = alloc
 	return c
+}
+
+// ObserveTimestampFloor advances the process clock past a replicated backup
+// cut and invalidates any cached TSO batch that could still contain values at
+// or below it. Claims returned before invalidation remain protected by the
+// FSM's durable backup timestamp floor.
+func (c *ShardedCoordinator) ObserveTimestampFloor(ts uint64) {
+	if c == nil || ts == 0 {
+		return
+	}
+	for {
+		floor := c.timestampFloor.Load()
+		if ts <= floor {
+			return
+		}
+		if c.timestampFloor.CompareAndSwap(floor, ts) {
+			break
+		}
+	}
+	if c.clock != nil {
+		c.clock.Observe(ts)
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 // WithTimestampGroup pins timestamp issuance leadership to one Raft group.

@@ -120,6 +120,7 @@ type backupTestStore struct {
 	scanDelay    time.Duration
 	keyCloseErr  error
 	pairCloseErr error
+	captureErr   error
 }
 
 func (s *backupTestStore) CaptureBackupRouteSnapshotAt(_ context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
@@ -130,7 +131,7 @@ func (s *backupTestStore) CaptureBackupRouteSnapshotAt(_ context.Context, ts uin
 	if onCapture != nil {
 		onCapture()
 	}
-	return kv.BackupRouteSnapshot{}, nil
+	return kv.BackupRouteSnapshot{}, s.captureErr
 }
 
 func (s *backupTestStore) NewBackupKeyScannerAtSnapshot(_ kv.BackupRouteSnapshot, ts uint64, _ int) kv.BackupKeyScanner {
@@ -308,16 +309,35 @@ func TestBeginBackupLifecycleAndBaselineAtPinnedTimestamp(t *testing.T) {
 	}
 }
 
+func TestSnapshotBackupGroupsExcludesReservedTSOGroup(t *testing.T) {
+	t.Parallel()
+	groups := map[uint64]*backupTestGroup{
+		0: {status: raftengine.Status{AppliedIndex: 100}, every: 10_000},
+		1: {status: raftengine.Status{AppliedIndex: 100}, every: 10_000},
+	}
+	proposers := map[uint64]*backupTestProposer{
+		0: newBackupTestProposer(),
+		1: newBackupTestProposer(),
+	}
+	srv := newBackupControlTestServer(t, &backupTestStore{}, groups, proposers, nil)
+
+	got, err := srv.snapshotBackupGroups()
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(1), got[0].id)
+}
+
 func TestBeginBackupCapturesRouteSnapshotAfterReadFence(t *testing.T) {
 	t.Parallel()
 	stage := atomic.Int32{}
+	proposer := newBackupTestProposer()
 	store := &backupTestStore{}
 	store.onCapture = func() {
 		require.Equal(t, int32(1), stage.Load())
+		require.Equal(t, []byte{backupSubtypeReserve, backupSubtypePin}, proposer.subtypes())
 		stage.Store(2)
 	}
 	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
-	proposer := newBackupTestProposer()
 	probe := func(context.Context, string) (BackupPeerVersion, error) {
 		return BackupPeerVersion{NodeVersion: "test", BackupProtocolVersion: backupProtocolVersionV1}, nil
 	}
@@ -340,6 +360,28 @@ func TestBeginBackupCapturesRouteSnapshotAfterReadFence(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(2), stage.Load())
 	require.Equal(t, []uint64{42}, store.capturedTS)
+}
+
+func TestBeginBackupCompensatesWhenPinnedRouteCaptureFails(t *testing.T) {
+	t.Parallel()
+	store := &backupTestStore{captureErr: stderrors.New("catalog unavailable")}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(
+		t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: proposer},
+		nil,
+	)
+
+	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, []byte{
+		backupSubtypeReserve,
+		backupSubtypePin,
+		backupSubtypeRelease,
+		backupSubtypeUnreserve,
+	}, proposer.subtypes())
 }
 
 func TestBeginBackupRenewsWhileBaselineRuns(t *testing.T) {

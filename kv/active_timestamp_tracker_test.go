@@ -1,11 +1,24 @@
 package kv
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestActiveTimestampTrackerNotifiesBackupTimestampFloor(t *testing.T) {
+	t.Parallel()
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	var observed atomic.Uint64
+	tracker.SetBackupTimestampFloorObserver(observed.Store)
+
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(
+		backupTrackerTestPinID(1), 7, 42, time.Now().Add(time.Hour),
+	))
+	require.Equal(t, uint64(42), observed.Load())
+}
 
 func TestActiveTimestampTrackerOldest(t *testing.T) {
 	tracker := NewActiveTimestampTracker()
