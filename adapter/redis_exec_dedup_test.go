@@ -93,6 +93,7 @@ func TestExecDedup_GenuineConflictRebuildsAndApplies(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
+	coord.wireWriteConflicts = true                // forwarded conflict loses its typed chain
 	key := []byte("k")
 
 	// Before dispatch 2 (the reuse), inject a concurrent SET so the reuse

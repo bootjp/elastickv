@@ -46,7 +46,7 @@ var (
 func isRetryableRedisTxnErr(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
-		wireRedisTxnErrKind(err) != redisTxnWireErrNone
+		wireRedisTxnErrKind(err) == redisTxnWireErrLocked
 }
 
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
@@ -68,8 +68,11 @@ const (
 // leader redirect crosses gRPC. Forward currently returns transaction failures
 // as a status, which strips the typed ErrWriteConflict / ErrTxnLocked chain.
 // Match only the exact server-generated key error envelope and normalize the
-// storage key before rebuilding the typed error so terminal retry paths cannot
-// expose the internal key layout to Redis clients.
+// storage key before rebuilding the typed error. Wire write conflicts are not
+// generally retryable: a lost forwarding response can turn an already-applied
+// write into a later self-conflict. Reuse-aware callers explicitly normalize
+// them before retrying; all other callers return the normalized error without
+// replaying the operation or exposing the internal key layout.
 func wireRedisTxnStatus(err error) (*status.Status, bool) {
 	type grpcStatusCarrier interface {
 		GRPCStatus() *status.Status
@@ -168,11 +171,17 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if err == nil {
 			return nil
 		}
-		if !isRetryableRedisTxnErr(err) {
+		// Classify the original transport shape before normalization. A wire
+		// write conflict is ambiguous — the forwarded apply may already have
+		// landed — so the generic loop must return it without replaying. Wire
+		// TxnLocked remains retryable because the lock rejection did not apply
+		// the transaction. Reuse-aware callers convert wire conflicts to typed
+		// errors before returning them here.
+		retryable := isRetryableRedisTxnErr(err)
+		err = normalizeRetryableRedisTxnErr(err)
+		if !retryable {
 			return err
 		}
-
-		err = normalizeRetryableRedisTxnErr(err)
 		nextPolicy := retryPolicyForRedisTxnErr(err)
 		if attempt == 0 || nextPolicy != policy {
 			backoff = nextPolicy.initialBackoff
