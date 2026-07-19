@@ -108,6 +108,8 @@ func (f *fakeEngine) Configuration(context.Context) (raftengine.Configuration, e
 	return f.config, nil
 }
 
+func (f *fakeEngine) SnapshotEvery() uint64 { return 10_000 }
+
 func (f *fakeEngine) CheckServing(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -389,6 +391,8 @@ func (s stateOnlyEngine) Status() raftengine.Status { return raftengine.Status{S
 func (s stateOnlyEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
+
+func (s stateOnlyEngine) SnapshotEvery() uint64 { return 10_000 }
 
 func TestCurrentHealthStatusFallsBackToLocalState(t *testing.T) {
 	t.Parallel()

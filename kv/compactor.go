@@ -230,7 +230,7 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	}
 
 	lastCommitTS := runtime.Store.LastCommitTS()
-	safeMinTS, ok := c.targetMinTS(lastCommitTS, retention.MinRetainedTS(), now)
+	safeMinTS, ok := c.targetMinTS(runtime.GroupID, lastCommitTS, retention.MinRetainedTS(), now)
 	if !ok {
 		return nil
 	}
@@ -325,11 +325,11 @@ func (c *FSMCompactor) handleCompactError(ctx context.Context, groupID uint64, s
 	)
 }
 
-func (c *FSMCompactor) targetMinTS(lastCommitTS, minRetainedTS uint64, now time.Time) (uint64, bool) {
+func (c *FSMCompactor) targetMinTS(groupID, lastCommitTS, minRetainedTS uint64, now time.Time) (uint64, bool) {
 	if lastCommitTS == 0 {
 		return 0, false
 	}
-	safeMinTS := c.safeMinTS(now)
+	safeMinTS := c.safeMinTS(groupID, now)
 	if safeMinTS == 0 {
 		return 0, false
 	}
@@ -461,14 +461,14 @@ func fsmCompactionBudgetExhausted(err error, workCtx, parentCtx context.Context)
 	return workCtx.Err() != nil
 }
 
-func (c *FSMCompactor) safeMinTS(now time.Time) uint64 {
+func (c *FSMCompactor) safeMinTS(groupID uint64, now time.Time) uint64 {
 	cutoff := hlcTimestampFromTime(now.Add(-c.retentionWindow))
 	if cutoff == 0 {
 		return 0
 	}
 	oldest := uint64(0)
 	if c.tracker != nil {
-		oldest = c.tracker.Oldest()
+		oldest = c.tracker.OldestForGroup(groupID)
 	}
 	if oldest != 0 && oldest <= cutoff {
 		return oldest - 1

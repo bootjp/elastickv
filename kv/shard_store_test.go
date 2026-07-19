@@ -49,6 +49,8 @@ func (e *followerProxyEngine) Status() raftengine.Status {
 	}
 }
 
+func (e *followerProxyEngine) SnapshotEvery() uint64 { return 0 }
+
 func (e *followerProxyEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }

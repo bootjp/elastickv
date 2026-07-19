@@ -12,6 +12,11 @@ service Admin {
   rpc GetAdapterSummary (GetAdapterSummaryRequest) returns (GetAdapterSummaryResponse) {}
   rpc GetKeyVizMatrix (GetKeyVizMatrixRequest) returns (GetKeyVizMatrixResponse) {}
   rpc GetRouteDetail (GetRouteDetailRequest) returns (GetRouteDetailResponse) {}
+  rpc BeginBackup (BeginBackupRequest) returns (BeginBackupResponse) {}
+  rpc RenewBackup (RenewBackupRequest) returns (RenewBackupResponse) {}
+  rpc EndBackup (EndBackupRequest) returns (EndBackupResponse) {}
+  rpc ListAdaptersAndScopes (ListAdaptersAndScopesRequest) returns (ListAdaptersAndScopesResponse) {}
+  rpc GetNodeVersion (GetNodeVersionRequest) returns (GetNodeVersionResponse) {}
   rpc StreamEvents (StreamEventsRequest) returns (stream StreamEventsEvent) {}
 }
 
@@ -47,6 +52,9 @@ message RaftGroupState {
   // engine is a follower that has never heard from a leader); UIs should
   // render that case as "unknown" rather than "contacted at epoch".
   int64 last_contact_unix_ms = 6;
+  // leader_node_version is populated asynchronously from the leader's Admin
+  // GetNodeVersion RPC. Empty means unknown/unreachable/cache miss.
+  string leader_node_version = 7;
 }
 
 message GetRaftGroupsRequest {}
@@ -153,6 +161,63 @@ message GetRouteDetailRequest {
 message GetRouteDetailResponse {
   KeyVizRow row = 1;
   repeated AdapterSummary per_adapter = 2;
+}
+
+message BackupShardApplied {
+  uint64 raft_group_id = 1;
+  uint64 applied_index = 2;
+}
+
+message BackupExpectedKeys {
+  string adapter = 1;
+  string scope = 2;
+  uint64 key_count = 3;
+}
+
+message BeginBackupRequest {
+  uint64 ttl_ms = 1;
+}
+
+message BeginBackupResponse {
+  uint64 read_ts = 1;
+  bytes pin_token = 2;
+  uint64 ttl_ms_effective = 3;
+  repeated BackupShardApplied shards = 4;
+  repeated BackupExpectedKeys expected_keys = 5;
+}
+
+message RenewBackupRequest {
+  bytes pin_token = 1;
+  uint64 ttl_ms = 2;
+}
+
+message RenewBackupResponse {
+  uint64 ttl_ms_effective = 1;
+}
+
+message EndBackupRequest {
+  bytes pin_token = 1;
+}
+
+message EndBackupResponse {}
+
+message ListAdaptersAndScopesRequest {
+  bytes pin_token = 1;
+}
+
+message BackupScope {
+  string adapter = 1;
+  string scope = 2;
+}
+
+message ListAdaptersAndScopesResponse {
+  repeated BackupScope scopes = 1;
+}
+
+message GetNodeVersionRequest {}
+
+message GetNodeVersionResponse {
+  string node_version = 1;
 }
 
 message StreamEventsRequest {}

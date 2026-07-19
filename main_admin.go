@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -33,16 +34,43 @@ const (
 	adminWriteTimeout      = 10 * time.Second
 	adminIdleTimeout       = 30 * time.Second
 	adminShutdownTimeout   = 5 * time.Second
-
-	// adminBuildVersion is surfaced in GET /admin/api/v1/cluster. Until
-	// we wire real ldflags-injected build info, a placeholder is fine.
-	adminBuildVersion = "dev"
 )
 
-// buildVersion returns the elastickv binary version for admin purposes.
-// It is intentionally a function, not a constant, so build tooling can
-// link-replace it via -ldflags in the future.
-func buildVersion() string { return adminBuildVersion }
+// adminBuildVersion is surfaced by both GET /admin/api/v1/cluster and the
+// Admin gRPC GetNodeVersion RPC. Release builds may stamp it with:
+//
+//	-ldflags "-X main.adminBuildVersion=<version-or-git-sha>"
+var adminBuildVersion = "dev"
+
+const (
+	buildInfoVCSRevisionKey = "vcs.revision"
+	buildInfoVCSModifiedKey = "vcs.modified"
+)
+
+func buildVersion() string {
+	if version := strings.TrimSpace(adminBuildVersion); version != "" && version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		revision := ""
+		modified := false
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case buildInfoVCSRevisionKey:
+				revision = strings.TrimSpace(setting.Value)
+			case buildInfoVCSModifiedKey:
+				modified = setting.Value == "true"
+			}
+		}
+		if revision != "" {
+			if modified {
+				return revision + "-modified"
+			}
+			return revision
+		}
+	}
+	return "dev"
+}
 
 // adminListenerConfig is the subset of startup inputs that goes into the
 // admin listener. Collecting them in a struct keeps the main.go call site

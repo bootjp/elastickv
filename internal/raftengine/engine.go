@@ -235,6 +235,10 @@ type ConfigReader interface {
 	Configuration(ctx context.Context) (Configuration, error)
 }
 
+type SnapshotReader interface {
+	SnapshotEvery() uint64
+}
+
 type HealthReader interface {
 	CheckServing(ctx context.Context) error
 }
@@ -303,5 +307,6 @@ type Engine interface {
 	LeaderView
 	StatusReader
 	ConfigReader
+	SnapshotReader
 	io.Closer
 }

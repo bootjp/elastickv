@@ -447,7 +447,8 @@ func (noopEngine) Status() raftengine.Status                          { return r
 func (noopEngine) Configuration(_ context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (noopEngine) Close() error { return nil }
+func (noopEngine) SnapshotEvery() uint64 { return 10_000 }
+func (noopEngine) Close() error          { return nil }
 
 func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
 	t.Parallel()
