@@ -185,6 +185,11 @@ func (s *S3Server) localS3ChunkBlob(ctx context.Context, routeKey []byte, digest
 	return payload, true, nil
 }
 
+func (s *S3Server) localS3ChunkBlobExists(ctx context.Context, routeKey []byte, digest [s3ChunkBlobSHA256Bytes]byte) (bool, error) {
+	_, exists, err := s.localS3ChunkBlob(ctx, routeKey, digest)
+	return exists, err
+}
+
 func (s *S3Server) fetchS3ChunkBlob(ctx context.Context, routeKey []byte, ref s3keys.ChunkRefValue) ([]byte, error) {
 	if s == nil || s.blobCluster == nil {
 		return nil, s3BlobUnavailable("s3 chunkblob peer client is not configured")
@@ -281,9 +286,8 @@ func (s *S3Server) storeFetchedS3ChunkBlob(ctx context.Context, routeKey []byte,
 	if !ok || localStore == nil {
 		return s3BlobUnavailable("s3 chunkblob local store is unavailable")
 	}
-	repairTS, err := s.nextTxnCommitTS(ctx, commitTS)
-	if err != nil {
-		return errors.Wrap(err, "allocate s3 chunkblob repair timestamp")
+	if commitTS == 0 {
+		return s3BlobUnavailable("s3 chunkblob repair commit timestamp is unavailable")
 	}
 	server := NewS3BlobFetchServer(
 		localStore,
@@ -291,7 +295,7 @@ func (s *S3Server) storeFetchedS3ChunkBlob(ctx context.Context, routeKey []byte,
 		WithS3BlobFetchClock(s.clock()),
 		WithS3BlobFetchPushBlocked(s.blobPushBlocked),
 	)
-	return server.storeChunkBlob(ctx, digest, payload, repairTS)
+	return server.repairChunkBlob(ctx, digest, payload, commitTS)
 }
 
 func (s *S3Server) observeS3ChunkBlobMismatch() {
