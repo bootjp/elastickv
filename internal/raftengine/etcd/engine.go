@@ -1196,6 +1196,50 @@ func (e *Engine) DispatchErrorCount() uint64 {
 	return e.dispatchErrorCount.Load()
 }
 
+// SendStreamOpenCount returns successful outbound SendStream opens, including
+// reconnects. The transport counters are monotonic for the engine lifetime.
+func (e *Engine) SendStreamOpenCount() uint64 {
+	if e == nil || e.transport == nil {
+		return 0
+	}
+	return e.transport.Stats().SendStreamOpens
+}
+
+// SendStreamReconnectCount returns successful SendStream opens for peer
+// addresses that had previously held a stream.
+func (e *Engine) SendStreamReconnectCount() uint64 {
+	if e == nil || e.transport == nil {
+		return 0
+	}
+	return e.transport.Stats().SendStreamReconnects
+}
+
+// SendStreamMessageCount returns regular Raft messages accepted by gRPC's
+// SendStream send path.
+func (e *Engine) SendStreamMessageCount() uint64 {
+	if e == nil || e.transport == nil {
+		return 0
+	}
+	return e.transport.Stats().SendStreamMessages
+}
+
+// SnapshotStreamSendCount returns snapshot streams acknowledged by peers.
+func (e *Engine) SnapshotStreamSendCount() uint64 {
+	if e == nil || e.transport == nil {
+		return 0
+	}
+	return e.transport.Stats().SnapshotStreamSends
+}
+
+// SnapshotPayloadByteCount returns payload bytes in acknowledged snapshot
+// streams.
+func (e *Engine) SnapshotPayloadByteCount() uint64 {
+	if e == nil || e.transport == nil {
+		return 0
+	}
+	return e.transport.Stats().SnapshotPayloadBytes
+}
+
 // DispatchErrorCountsByCode returns a snapshot of dispatch-error
 // counts keyed by grpc status code ("Unavailable",
 // "DeadlineExceeded", "ResourceExhausted", ...). Sum of values
