@@ -48,7 +48,8 @@ type luaScriptContext struct {
 	// buggy script from probing unbounded unique non-existent keys and
 	// blowing up memory. Once full, further misses fall back to the
 	// server-side probe (still correct, just not cached).
-	negativeType map[string]bool
+	negativeType      map[string]bool
+	negativeTypeLimit int
 
 	// keyTypeProbeCount counts how many times the server-side keyTypeAt
 	// helper was invoked during this Eval. Only read by tests via
@@ -261,21 +262,22 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	}
 	startTS := server.readTS()
 	return &luaScriptContext{
-		server:       server,
-		startTS:      startTS,
-		readPin:      server.pinReadTS(startTS),
-		ctx:          ctx,
-		touched:      map[string]struct{}{},
-		deleted:      map[string]bool{},
-		everDeleted:  map[string]bool{},
-		negativeType: map[string]bool{},
-		strings:      map[string]*luaStringState{},
-		lists:        map[string]*luaListState{},
-		hashes:       map[string]*luaHashState{},
-		sets:         map[string]*luaSetState{},
-		zsets:        map[string]*luaZSetState{},
-		streams:      map[string]*luaStreamState{},
-		ttls:         map[string]*luaTTLState{},
+		server:            server,
+		startTS:           startTS,
+		readPin:           server.pinReadTS(startTS),
+		ctx:               ctx,
+		touched:           map[string]struct{}{},
+		deleted:           map[string]bool{},
+		everDeleted:       map[string]bool{},
+		negativeType:      map[string]bool{},
+		negativeTypeLimit: maxNegativeTypeCacheEntries,
+		strings:           map[string]*luaStringState{},
+		lists:             map[string]*luaListState{},
+		hashes:            map[string]*luaHashState{},
+		sets:              map[string]*luaSetState{},
+		zsets:             map[string]*luaZSetState{},
+		streams:           map[string]*luaStreamState{},
+		ttls:              map[string]*luaTTLState{},
 	}, nil
 }
 
@@ -479,7 +481,7 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	if err != nil {
 		return redisTypeNone, err
 	}
-	if typ == redisTypeNone && len(c.negativeType) < maxNegativeTypeCacheEntries {
+	if typ == redisTypeNone && len(c.negativeType) < c.effectiveNegativeTypeLimit() {
 		// Pin the absence result for the rest of this Eval so repeated
 		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
 		// does not re-run the ~8-seek rawKeyTypeAt probe on every
@@ -491,6 +493,13 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 		c.negativeType[string(key)] = true
 	}
 	return typ, nil
+}
+
+func (c *luaScriptContext) effectiveNegativeTypeLimit() int {
+	if c.negativeTypeLimit > 0 {
+		return c.negativeTypeLimit
+	}
+	return maxNegativeTypeCacheEntries
 }
 
 func (c *luaScriptContext) ensureKeyNotExpired(key []byte) error {
