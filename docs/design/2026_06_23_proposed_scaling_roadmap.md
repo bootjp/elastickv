@@ -202,38 +202,18 @@ memory each group's private cache/memtable pins.
 
 ### (d) Cross-group transactions at scale
 
-- **Per-group HLC vs centralized TSO.** Today the ceiling is renewed only on
-  the default group (§1.5); the TSO doc
-  (`docs/design/2026_04_16_partial_centralized_tso.md`) has shipped the
-  near-term fix (renew on all led groups, in parallel — its M1) and still
-  leaves the dedicated TSO Raft group with a batch allocator open.
-  **Assessment of whether TSO is still needed once groups multiply:** the
-  near-term per-group fix (TSO doc §6) was *necessary regardless* — it is the
-  minimum correctness fix the moment a node leads a non-default group it is
-  member of, and it has landed before multi-node multi-group bootstrap (b)
-  makes that topology reachable. The *full* dedicated-TSO component (TSO doc
-  M6–M7) is a larger component, but the need for a shared ordering source is
-  not a throughput/amortization question once cross-node cross-group
-  transactions are possible: with the per-group fix in place, every node's
-  timestamps are self-monotonic, but **global** monotonicity across coordinator
-  nodes is still not guaranteed without a shared oracle (TSO doc §6
-  "Guarantee"). Cross-group transactions (`kv/transaction.go`,
-  `kv/txn_codec.go`) whose timestamps can be allocated by different ingress /
-  coordinator nodes need a single ordering source for OCC commit-ts
-  comparability, regardless of where the participating groups' current leaders
-  live. `LeaderProxy.Commit` / `Internal.Forward` preserve non-zero timestamps,
-  so leader co-location does not prove single-clock allocation. (The shared-snapshot
-  invariant — every operation in one txn reading at the *same* `startTS` — is
-  already upheld: `nextStartTS` allocates one `startTS` for the whole txn and
-  propagates it via `reqs.StartTS` to every participating group; the gap is the
-  cross-*coordinator* comparability of the per-txn `commitTS`, not the per-txn
-  `startTS`. See OQ-1.) So: per-group renewal fix is in-scope-soon and
-  load-bearing for one node leading multiple groups; before enabling any
-  cross-group transaction mode in which more than one coordinator node can issue
-  `startTS` / `commitTS`, the roadmap must either pull the dedicated TSO group
-  forward or land a narrower single-oracle bridge that pins cross-group
-  timestamp allocation to one designated leader. Until such txns are enabled,
-  the per-group fix plus the shared-`*HLC` property remains adequate.
+- **Per-group HLC vs centralized TSO.** The centralized TSO design
+  (`docs/design/2026_04_16_implemented_centralized_tso.md`) has shipped M1-M8:
+  all-led-group compatibility renewal, the dedicated group-0 FSM, leader-routed
+  durable windows, one-way cutover and Phase D, runtime mode reload, and
+  operational gates. The shared ordering source is available for cross-node
+  cross-group transactions. Deployments that remain in `legacy` still have
+  only per-node monotonicity; before enabling multiple coordinator nodes for
+  cross-group issuance, they must complete the documented `shadow -> cutover`
+  sequence. `LeaderProxy.Commit` / `Internal.Forward` preserve non-zero
+  timestamps, and one `startTS` remains shared by every transaction participant.
+  Phase D additionally validates a caller-supplied cross-shard `StartTS` at the
+  group-0 leader before commit allocation.
 
 ### (e) Cluster size / membership
 

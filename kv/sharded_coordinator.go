@@ -1629,11 +1629,11 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 	if min == ^uint64(0) {
 		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
 	}
-	if c.tsAllocator != nil {
+	if allocator, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		if min > 0 {
-			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
+			return nextTimestampAfterFromAllocator(ctx, allocator, min, label)
 		}
-		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+		return nextTimestampFromAllocator(ctx, allocator, label)
 	}
 	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
 		return 0, errors.Wrap(ErrTSOAllocatorRequired,
@@ -1663,7 +1663,8 @@ func (c *ShardedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64,
 }
 
 func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64) (uint64, error) {
-	if c.clock == nil && c.tsAllocator == nil {
+	_, allocatorConfigured := resolveTimestampAllocator(c.tsAllocator)
+	if c.clock == nil && !allocatorConfigured {
 		nextTS := startTS + 1
 		if nextTS == 0 {
 			return 0, nil
@@ -1725,7 +1726,8 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
-	if c.clock == nil && c.tsAllocator == nil {
+	_, allocatorConfigured := resolveTimestampAllocator(c.tsAllocator)
+	if c.clock == nil && !allocatorConfigured {
 		return maxTS + 1, nil
 	}
 	ts, err := c.allocateTimestampAfter(ctx, "allocate sharded startTS", maxTS)
@@ -2195,7 +2197,7 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 }
 
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
-	if c.tsAllocator != nil {
+	if _, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		return 0, nil
 	}
 	return c.allocateTimestamp(ctx, "allocate sharded raw log ts")

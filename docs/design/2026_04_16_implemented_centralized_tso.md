@@ -1,13 +1,16 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1-M7 are implemented, including the dedicated group-0
-  FSM, leader-routed durable windows, strict term bootstrap, serialized shadow
-  migration, one-way rolling cutover, durable Phase-D retirement, and
-  cross-shard SSI timestamp validation. Runtime config reload and production
-  latency/alerting work remain open.
-- Author: bootjp
-- Date: 2026-04-16
-- Updated: 2026-07-19
+Status: Implemented
+Author: bootjp
+Date: 2026-04-16
+Updated: 2026-07-19
+
+M1-M8 implement the central subsystem: the dedicated group-0 FSM,
+leader-routed durable windows, strict term bootstrap, serialized shadow
+migration, one-way cutover and Phase-D retirement, validated cross-shard
+timestamps, one-way runtime mode reload, production metrics and alerts, and
+write-fanout benchmark evidence. The topology and clock-policy extensions in
+Section 9 are intentional non-goals and do not leave central scope incomplete.
 
 ---
 
@@ -137,11 +140,20 @@ Implemented:
 19. `BatchAllocator` validates cached candidates once Phase D is required. A
     candidate at/below the Phase-D floor invalidates the entire local window and
     forces a refill above the marker before any timestamp is returned.
-
-Remaining:
-
-1. Runtime config reload for the mode switch; current flags are startup-only.
-2. Production benchmark, divergence metrics, and alert thresholds.
+20. `--tsoModeFile` polls an atomically replaced `legacy`, `shadow`, `cutover`,
+    or `phase-d` mode. Live transitions must be adjacent and one-way. Invalid
+    files, skipped phases, and process-local rollbacks leave the active allocator
+    unchanged. Applied group-0 markers override a stale local mode immediately
+    on allocator resolution, before the next poll can run.
+21. The production registry exports reserve/validation latency by local or
+    remote path and outcome, shadow comparison/divergence, process mode, every
+    reload outcome, and durable marker state. Checked Prometheus rules define
+    warning and critical latency/error thresholds, persistent reload failure,
+    mode divergence, and the 15-minute zero-overlap cutover gate.
+22. `BenchmarkTSOWriteFanout` models 16 concurrent coordinators, 1/3/8-way
+    writes, a 1 ms remote TSO commit, and batch sizes 1/64/256. Three-run
+    evidence supports the existing default batch size 256 and is recorded in
+    `docs/centralized_tso_operations.md`.
 
 ### 1.1 Original Limitation
 
@@ -748,8 +760,10 @@ approach enables a live cutover.
 
 ### 7.3 Phase C — Durable TSO Cutover
 
-- The startup flag `--tsoEnabled` switches coordinator issuance to the
-  leader-routed allocator. Runtime config reload remains future work.
+- The backward-compatible startup flag `--tsoEnabled`, or runtime mode file
+  value `cutover`, switches coordinator issuance to the leader-routed allocator.
+  A live transition is accepted only after `shadow`; restart recovery may start
+  directly in cutover when the durable marker already exists.
 - The first production refill commits the group-0 cutover marker before
   committing and returning its timestamp window.
 - The marker is encoded in a versioned TSO-specific envelope whose leading
@@ -765,12 +779,13 @@ approach enables a live cutover.
 
 - Roll every member to a binary that understands the Phase-D entry and
   `ValidateTimestamp` RPC. Run all members on the dedicated TSO path before
-  enabling `--tsoPhaseDEnabled`; an older member would correctly halt on the
-  unknown control entry, so mixed-version activation is prohibited.
-- The first allocation with `--tsoPhaseDEnabled` commits cutover (if needed),
-  then the Phase-D marker and its pre-Phase-D floor, then a new allocation
-  window strictly above that floor. The switch is one-way and survives restart
-  through the TSO V4 snapshot.
+  enabling `--tsoPhaseDEnabled` or reloading `phase-d`; an older member would
+  correctly halt on the unknown control entry, so mixed-version activation is
+  prohibited.
+- The first allocation with Phase D requested commits cutover (if needed), then
+  the Phase-D marker and its pre-Phase-D floor, then a new allocation window
+  strictly above that floor. The switch is one-way and survives restart through
+  the TSO V4 snapshot.
 - `ShardedCoordinator` dynamically stops data-group ceiling proposals and
   fails closed instead of issuing from its legacy HLC. It continues group-0
   renewal only. Shadow mode observes durable cutover and directly uses the
@@ -812,6 +827,29 @@ candidate is returned. Once the cutover marker applies, shadow callers stop
 returning legacy candidates. Independently, every new TSO leader term fences
 its first window above the strict maximum committed data timestamp.
 
+### 7.6 Runtime Reload and Operational Gates
+
+`DynamicTimestampAllocator` publishes the process-selected allocator through
+an atomic pointer. Before resolving that pointer, it checks the consensus-owned
+cutover and Phase-D markers. An applied marker selects the batch/routed TSO path
+and enables matching remote confirmation immediately, so a stale `legacy` or
+`shadow` file cannot mint a legacy timestamp while waiting for the next poll.
+A request that resolved its preceding mode before local marker apply may finish,
+but every subsequent resolution observes the one-way durable override.
+
+`TSORuntimeController` accepts only adjacent one-way live transitions:
+
+```text
+legacy -> shadow -> cutover -> phase-d
+```
+
+The initial process mode may be later in the sequence for restart recovery.
+No-op polls refresh the durable-state gauges, and every failed poll increments
+its bounded reload-result counter even when duplicate log messages are
+suppressed. Exact rollout gates, alert expressions, atomic file replacement,
+and benchmark evidence are maintained in
+`docs/centralized_tso_operations.md`.
+
 ---
 
 ## 8. Milestones
@@ -825,20 +863,24 @@ its first window above the strict maximum committed data timestamp.
 | M5 — shipped | Preserve the default-group `LocalTSOAllocator` compatibility bridge when group 0 is absent; route coordinator-owned timestamp call sites through the allocator abstraction. | Medium |
 | M6 — shipped | Run the dedicated group-0 FSM, fence each new TSO leader term above all authoritative data-group commit floors, redirect follower requests to the TSO leader over gRPC, synchronously serialize fail-closed shadow issuance, and commit the one-way rolling cutover marker before production windows. | Low |
 | M7 — shipped | Commit the durable Phase-D floor marker, preserve V3 snapshots until activation, retire data-shard HLC renewal and legacy/shadow issuance after cutover, activate before read validation while preserving exact applied snapshots through timestamp-bound per-dispatch vouchers, invalidate pre-Phase-D batch windows, and validate unvouched caller-supplied cross-shard SSI timestamps at the group-0 leader from activation onward. | Low |
+| M8 — shipped | Atomically reload one-way runtime modes, make durable markers override stale local mode before allocation, expose production latency/divergence/state metrics, install checked alert thresholds, and validate the default batch size with concurrent write-fanout evidence. | Low |
 
 ---
 
-## 9. Open Questions
+## 9. Resolved Questions and Future Extensions
 
-1. **TSO RTT when TSO leader ≠ write leader:** What batch size minimises tail
-   latency? Needs benchmarking against realistic write fan-out.
+1. **TSO RTT when TSO leader differs from the write leader (resolved):** The
+   concurrent benchmark covers 1/3/8 fan-out legs with a modeled 1 ms remote
+   TSO commit. Batch size 1 exposes serialized refill tails, while default 256
+   keeps the recorded p99 below the 50 ms warning threshold.
 
-2. **TSO group membership:** Should all cluster nodes join the TSO group, or
-   should a dedicated subset (e.g. 3 out of N) be used to reduce Raft traffic?
+2. **TSO group membership (intentional future extension):** Choosing all nodes
+   or a dedicated subset is a topology policy outside the central timestamp
+   subsystem. The implemented routing and fail-closed term fence support either.
 
-3. **Clock floor semantics:** `max(now, ceiling)` vs. `ceiling + 1` — the
-   stricter form (`ceiling + 1`) guarantees no overlap even if wall clocks
-   drift, at the cost of one extra millisecond per renewal window.
+3. **Clock floor semantics (intentional future extension):** The implementation
+   retains the existing floor formula. Changing to `ceiling + 1` is an
+   independent HLC policy decision, not unfinished centralized-TSO scope.
 
 4. **Non-leader TSO requests (resolved):** Followers redirect to the current
    group-0 leader through `Distribution.GetTimestamp`. Timestamp allocation is

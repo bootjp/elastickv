@@ -661,12 +661,11 @@ does not keep this document in `partial`.
    mitigation, the doc lifecycle (Section 8.2) ties promotion to specs
    landing, so a stale `partial` status is a visible signal.
 
-5. **Choice of TSO model.** The HLC spec models the current
-   per-shard-leader ceiling. The centralized TSO proposal
-   (`2026_04_16_partial_centralized_tso.md`) would change that. The two
-   docs are independent; if/when centralized TSO lands, `HLC.tla` (or a
-   sibling `TSO.tla`) is updated as part of that PR. We do **not** block
-   this proposal on the TSO decision.
+5. **Choice of TSO model.** The HLC spec continues to model the compatibility
+   per-shard-leader ceiling, while the implemented centralized TSO
+   (`2026_04_16_implemented_centralized_tso.md`) owns the production ordering
+   path. A sibling `TSO.tla` remains an independent future extension; runtime
+   transition safety is pinned by the TSO FSM, routing, reload, and race tests.
 
 6. **TLC tool licensing and binary distribution.** `tla2tools.jar` is
    MIT-licensed but not in any package manager we already depend on.
@@ -716,8 +715,8 @@ does not keep this document in `partial`.
 - `distribution/engine.go`, `distribution/catalog.go`,
   `distribution/watcher.go` — route catalog.
 - `docs/architecture_overview.md` — system-level diagrams.
-- `docs/design/2026_04_16_partial_centralized_tso.md` — the TSO proposal
-  that this spec is independent of (Section 9, risk 5).
+- `docs/design/2026_04_16_implemented_centralized_tso.md` — the implemented TSO
+  design that this spec is independent of (Section 9, risk 5).
 - Diego Ongaro's Raft TLA+ specification — reference for the abstract
   `Raft.tla` interface.
 - CockroachDB and TiDB MVCC / HLC TLA+ models — public prior art for

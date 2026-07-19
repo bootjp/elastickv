@@ -252,6 +252,21 @@ func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator,
 	}
 }
 
+type currentTimestampAllocatorProvider interface {
+	currentTimestampAllocator() TimestampAllocator
+}
+
+func resolveTimestampAllocator(alloc TimestampAllocator) (TimestampAllocator, bool) {
+	for range 4 {
+		provider, ok := alloc.(currentTimestampAllocatorProvider)
+		if !ok {
+			return alloc, alloc != nil
+		}
+		alloc = provider.currentTimestampAllocator()
+	}
+	return alloc, alloc != nil
+}
+
 func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {
 	return TimestampAllocatorThrough(coord)
 }

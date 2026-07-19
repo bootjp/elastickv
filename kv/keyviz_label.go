@@ -91,7 +91,7 @@ func (c keyVizLabeledCoordinator) RaftLeaderForKey(key []byte) string {
 func (c keyVizLabeledCoordinator) Clock() *HLC { return c.inner.Clock() }
 
 func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
-	alloc, _ := TimestampAllocatorThrough(c.inner)
+	alloc, _ := ConfiguredTimestampAllocatorThrough(c.inner)
 	return alloc
 }
 

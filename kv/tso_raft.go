@@ -5,6 +5,7 @@ import (
 	stderrors "errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -389,27 +390,34 @@ type LeaderRoutedTSOAllocator struct {
 	remoteRequest  tsoRemoteRequest
 	retryBudget    time.Duration
 	retryInterval  time.Duration
-	activate       bool
-	activatePhaseD bool
+	activation     atomic.Uint32
 	clock          *HLC
 	remoteValidate tsoRemoteValidation
+	observer       TSOObserver
 }
+
+const (
+	tsoActivationInactive uint32 = iota
+	tsoActivationCutover
+	tsoActivationPhaseD
+)
 
 type LeaderRoutedTSOAllocatorOption func(*LeaderRoutedTSOAllocator)
 
 func WithTSOCutoverActivation() LeaderRoutedTSOAllocatorOption {
-	return func(a *LeaderRoutedTSOAllocator) { a.activate = true }
+	return func(a *LeaderRoutedTSOAllocator) { a.setActivation(true, false) }
 }
 
 func WithTSOPhaseDActivation() LeaderRoutedTSOAllocatorOption {
-	return func(a *LeaderRoutedTSOAllocator) {
-		a.activate = true
-		a.activatePhaseD = true
-	}
+	return func(a *LeaderRoutedTSOAllocator) { a.setActivation(true, true) }
 }
 
 func WithTSORoutedClock(clock *HLC) LeaderRoutedTSOAllocatorOption {
 	return func(a *LeaderRoutedTSOAllocator) { a.clock = clock }
+}
+
+func WithTSOObserver(observer TSOObserver) LeaderRoutedTSOAllocatorOption {
+	return func(a *LeaderRoutedTSOAllocator) { a.observer = observer }
 }
 
 func NewLeaderRoutedTSOAllocator(
@@ -459,7 +467,8 @@ func (a *LeaderRoutedTSOAllocator) NextBatchAfter(ctx context.Context, n int, mi
 }
 
 func (a *LeaderRoutedTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error) {
-	reservation, err := a.nextReservation(ctx, n, min, a.activate, a.activatePhaseD, a.activate)
+	activate, activatePhaseD := a.activationState()
+	reservation, err := a.nextReservation(ctx, n, min, activate, activatePhaseD, activate)
 	if err != nil {
 		return 0, err
 	}
@@ -524,19 +533,28 @@ func (a *LeaderRoutedTSOAllocator) tryBatch(
 ) (TSOReservation, error) {
 	var empty TSOReservation
 	if a.local.IsLeader() {
-		return a.tryLocalBatch(ctx, n, min, activate, activatePhaseD, requireReservation)
+		started := time.Now()
+		reservation, err := a.tryLocalBatch(ctx, n, min, activate, activatePhaseD, requireReservation)
+		a.observeRequest("reserve", "local", err, time.Since(started))
+		return reservation, err
 	}
 	addr := leaderAddrFromEngine(a.leader)
 	if addr == "" {
-		return empty, errors.WithStack(ErrLeaderNotFound)
+		err := errors.WithStack(ErrLeaderNotFound)
+		a.observeRequest("reserve", "remote", err, 0)
+		return empty, err
 	}
+	started := time.Now()
 	reservation, err := a.remoteRequest(ctx, addr, n, min, activate, activatePhaseD)
 	if err != nil {
+		a.observeRequest("reserve", "remote", err, time.Since(started))
 		return empty, err
 	}
 	if err := validateTSOReservation(reservation, n, min, requireReservation); err != nil {
+		a.observeRequest("reserve", "remote", err, time.Since(started))
 		return empty, err
 	}
+	a.observeRequest("reserve", "remote", nil, time.Since(started))
 	return reservation, nil
 }
 
@@ -629,13 +647,18 @@ func (a *LeaderRoutedTSOAllocator) ValidateDurableTimestamp(ctx context.Context,
 			if !ok {
 				return errors.WithStack(ErrTSOProtocolUnsupported)
 			}
+			started := time.Now()
 			lastErr = errors.WithStack(validator.ValidateDurableTimestamp(ctx, timestamp))
+			a.observeRequest("validate", "local", lastErr, time.Since(started))
 		} else {
 			addr := leaderAddrFromEngine(a.leader)
 			if addr == "" {
 				lastErr = errors.WithStack(ErrLeaderNotFound)
+				a.observeRequest("validate", "remote", lastErr, 0)
 			} else {
+				started := time.Now()
 				lastErr = a.remoteValidate(ctx, addr, timestamp)
+				a.observeRequest("validate", "remote", lastErr, time.Since(started))
 			}
 		}
 		if lastErr == nil {
@@ -679,7 +702,8 @@ func (a *LeaderRoutedTSOAllocator) PhaseDActive() bool {
 }
 
 func (a *LeaderRoutedTSOAllocator) PhaseDRequired() bool {
-	return a != nil && (a.activatePhaseD || a.PhaseDActive())
+	_, activatePhaseD := a.activationState()
+	return a != nil && (activatePhaseD || a.PhaseDActive())
 }
 
 func (a *LeaderRoutedTSOAllocator) observeReservation(reservation TSOReservation) {
@@ -688,6 +712,65 @@ func (a *LeaderRoutedTSOAllocator) observeReservation(reservation TSOReservation
 	}
 	end := reservation.Base + uint64(reservation.Count) - 1 //nolint:gosec // validated reservation.
 	a.clock.Observe(end)
+	if a.observer != nil {
+		a.observer.ObserveTSODurableState(reservation.CutoverActive, reservation.PhaseDActive)
+	}
+}
+
+// setActivation atomically publishes the durable markers future reservations
+// must request. In-flight reservations may complete under the prior mode; all
+// such modes still use group 0, and committed markers remain one-way.
+func (a *LeaderRoutedTSOAllocator) setActivation(cutover, phaseD bool) {
+	if a == nil {
+		return
+	}
+	state := tsoActivationInactive
+	if cutover || phaseD {
+		state = tsoActivationCutover
+	}
+	if phaseD {
+		state = tsoActivationPhaseD
+	}
+	a.activation.Store(state)
+}
+
+// promoteActivation advances the requested durable marker without allowing a
+// concurrent observer to lower an already-requested Phase D activation.
+func (a *LeaderRoutedTSOAllocator) promoteActivation(cutover, phaseD bool) {
+	if a == nil {
+		return
+	}
+	target := tsoActivationInactive
+	if cutover || phaseD {
+		target = tsoActivationCutover
+	}
+	if phaseD {
+		target = tsoActivationPhaseD
+	}
+	for current := a.activation.Load(); current < target; current = a.activation.Load() {
+		if a.activation.CompareAndSwap(current, target) {
+			return
+		}
+	}
+}
+
+func (a *LeaderRoutedTSOAllocator) activationState() (bool, bool) {
+	if a == nil {
+		return false, false
+	}
+	state := a.activation.Load()
+	return state >= tsoActivationCutover, state >= tsoActivationPhaseD
+}
+
+func (a *LeaderRoutedTSOAllocator) observeRequest(operation, path string, err error, duration time.Duration) {
+	if a == nil || a.observer == nil {
+		return
+	}
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	a.observer.ObserveTSORequest(operation, path, outcome, duration)
 }
 
 func validateRoutedTSOWindow(base uint64, n int, min uint64) error {
@@ -794,16 +877,21 @@ func nonNilTSOContext(ctx context.Context) context.Context {
 // and retried; once the durable cutover marker is active, the allocator returns
 // the reserved TSO timestamp directly so rolling restarts cannot mix sources.
 type ShadowTimestampAllocator struct {
-	legacy  *HLC
-	shadow  TSOShadowReservationAllocator
-	cutover tsoCutoverState
-	log     *slog.Logger
+	legacy   *HLC
+	shadow   TSOShadowReservationAllocator
+	cutover  tsoCutoverState
+	log      *slog.Logger
+	observer TSOObserver
 }
 
 type ShadowTimestampAllocatorOption func(*ShadowTimestampAllocator)
 
 func WithTSOShadowCutoverState(state tsoCutoverState) ShadowTimestampAllocatorOption {
 	return func(a *ShadowTimestampAllocator) { a.cutover = state }
+}
+
+func WithTSOShadowObserver(observer TSOObserver) ShadowTimestampAllocatorOption {
+	return func(a *ShadowTimestampAllocator) { a.observer = observer }
 }
 
 func NewShadowTimestampAllocator(
@@ -848,6 +936,7 @@ func (a *ShadowTimestampAllocator) NextAfter(ctx context.Context, min uint64) (u
 func (a *ShadowTimestampAllocator) nextAfter(ctx context.Context, min uint64) (uint64, error) {
 	ctx = nonNilTSOContext(ctx)
 	if a.cutover != nil && a.cutover.CutoverActive() {
+		a.observeShadowComparison("cutover_active", 0)
 		return a.nextDedicatedAfter(ctx, min)
 	}
 	a.legacy.Observe(min)
@@ -861,6 +950,7 @@ func (a *ShadowTimestampAllocator) nextAfter(ctx context.Context, min uint64) (u
 		}
 		reservation, err := a.shadow.ValidateShadowTimestamp(ctx, legacyTS)
 		if err != nil {
+			a.observeShadowComparison("error", 0)
 			a.log.ErrorContext(ctx, "tso shadow allocation failed",
 				slog.Uint64("legacy_ts", legacyTS),
 				slog.Any("err", err),
@@ -869,11 +959,14 @@ func (a *ShadowTimestampAllocator) nextAfter(ctx context.Context, min uint64) (u
 		}
 		a.legacy.Observe(reservation.Base)
 		if reservation.CutoverActive {
+			a.observeShadowComparison("cutover_active", 0)
 			return reservation.Base, nil
 		}
 		if legacyTS > reservation.PreviousAllocationFloor {
+			a.observeShadowComparison("legacy_ahead", legacyTS-reservation.PreviousAllocationFloor)
 			return legacyTS, nil
 		}
+		a.observeShadowComparison("legacy_overlap", reservation.PreviousAllocationFloor-legacyTS)
 		a.log.WarnContext(ctx, "tso shadow discarded overlapping legacy timestamp",
 			slog.Uint64("legacy_ts", legacyTS),
 			slog.Uint64("previous_tso_floor", reservation.PreviousAllocationFloor),
@@ -910,4 +1003,10 @@ func (a *ShadowTimestampAllocator) PhaseDRequired() bool {
 
 func (a *ShadowTimestampAllocator) Close() error {
 	return nil
+}
+
+func (a *ShadowTimestampAllocator) observeShadowComparison(result string, divergence uint64) {
+	if a != nil && a.observer != nil {
+		a.observer.ObserveTSOShadowComparison(result, divergence)
+	}
 }
