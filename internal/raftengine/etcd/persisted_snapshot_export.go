@@ -117,6 +117,8 @@ func (e *PersistedSnapshotExport) Metadata() PersistedSnapshotExportMetadata {
 	if e.metadata.ConfState != nil {
 		if cloned, ok := proto.Clone(e.metadata.ConfState).(*raftpb.ConfState); ok {
 			out.ConfState = cloned
+		} else {
+			out.ConfState = nil
 		}
 	}
 	return out
