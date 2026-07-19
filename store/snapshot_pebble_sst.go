@@ -66,13 +66,14 @@ type pebbleSSTIngestFileMeta struct {
 }
 
 type pebbleSSTIngestSnapshot struct {
-	checkpointDir   string
-	fallback        *pebbleSnapshot
-	metadata        pebbleSnapshotMetadata
-	targetFileBytes uint64
-	log             *slog.Logger
-	once            sync.Once
-	err             error
+	checkpointDir      string
+	fallback           *pebbleSnapshot
+	metadata           pebbleSnapshotMetadata
+	targetFileBytes    uint64
+	disableCompression bool
+	log                *slog.Logger
+	once               sync.Once
+	err                error
 }
 
 type pebbleSSTIngestBundle struct {
@@ -231,9 +232,10 @@ func (s *pebbleStore) newSSTIngestSnapshot() (Snapshot, error) {
 			snapshot:     pebbleSnap,
 			lastCommitTS: metadata.LastCommitTS,
 		},
-		metadata:        metadata,
-		targetFileBytes: targetFileBytes,
-		log:             s.log,
+		metadata:           metadata,
+		targetFileBytes:    targetFileBytes,
+		disableCompression: s.cipher != nil,
+		log:                s.log,
 	}, nil
 }
 
@@ -296,7 +298,7 @@ func (s *pebbleSSTIngestSnapshot) WriteTo(w io.Writer) (int64, error) {
 	if s == nil || s.fallback == nil {
 		return 0, errors.New("snapshot is not available")
 	}
-	bundle, err := buildPebbleSSTIngestBundle(s.checkpointDir, s.metadata, s.targetFileBytes)
+	bundle, err := buildPebbleSSTIngestBundle(s.checkpointDir, s.metadata, s.targetFileBytes, s.disableCompression)
 	if err != nil {
 		if s.log != nil {
 			s.log.Warn("failed to build SST ingest snapshot; using legacy stream", "error", err)
@@ -326,8 +328,8 @@ func (s *pebbleSSTIngestSnapshot) Close() error {
 	return errors.WithStack(s.err)
 }
 
-func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64) (*pebbleSSTIngestBundle, error) {
-	opts, cache := defaultPebbleOptionsWithCache(false)
+func buildPebbleSSTIngestBundle(checkpointDir string, metadata pebbleSnapshotMetadata, targetFileBytes uint64, disableCompression bool) (*pebbleSSTIngestBundle, error) {
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	opts.ReadOnly = true
 	db, err := pebble.Open(checkpointDir, opts)
 	if err != nil {
@@ -593,7 +595,7 @@ func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader) error {
 		return err
 	}
 	metadata := metadataFromSSTIngestManifest(manifest)
-	if err := ingestSSTSnapshotIntoTempDB(tmpDir, paths, metadata); err != nil {
+	if err := ingestSSTSnapshotIntoTempDB(tmpDir, paths, metadata, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return err
 	}
@@ -760,8 +762,8 @@ func metadataFromSSTIngestManifest(manifest pebbleSSTIngestManifest) pebbleSnaps
 	return metadata
 }
 
-func ingestSSTSnapshotIntoTempDB(tmpDir string, paths []string, metadata pebbleSnapshotMetadata) error {
-	opts, cache := defaultPebbleOptionsWithCache(false)
+func ingestSSTSnapshotIntoTempDB(tmpDir string, paths []string, metadata pebbleSnapshotMetadata, disableCompression bool) error {
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	db, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
