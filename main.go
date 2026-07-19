@@ -2294,6 +2294,7 @@ func configureAdminService(
 		token = loaded
 	}
 	srv := adapter.NewAdminServer(self, members)
+	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability())
 	unary, stream := adapter.AdminTokenAuth(token)
 	var icept adminGRPCInterceptors
 	if unary != nil {
@@ -2989,6 +2990,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
 		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
 		r.metricsRegistry.S3PutAdmissionObserver(),
+		r.metricsRegistry.S3BlobOffloadObserver(),
 	)
 	if err != nil {
 		return err
