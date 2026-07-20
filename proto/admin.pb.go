@@ -282,6 +282,7 @@ type GetClusterOverviewResponse struct {
 	Members       []*NodeIdentity        `protobuf:"bytes,2,rep,name=members,proto3" json:"members,omitempty"`
 	GroupLeaders  []*GroupLeader         `protobuf:"bytes,3,rep,name=group_leaders,json=groupLeaders,proto3" json:"group_leaders,omitempty"`
 	AggregateQps  uint64                 `protobuf:"varint,4,opt,name=aggregate_qps,json=aggregateQps,proto3" json:"aggregate_qps,omitempty"`
+	Capabilities  map[string]bool        `protobuf:"bytes,5,rep,name=capabilities,proto3" json:"capabilities,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -342,6 +343,13 @@ func (x *GetClusterOverviewResponse) GetAggregateQps() uint64 {
 		return x.AggregateQps
 	}
 	return 0
+}
+
+func (x *GetClusterOverviewResponse) GetCapabilities() map[string]bool {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
 }
 
 type RaftGroupState struct {
@@ -1366,12 +1374,16 @@ const file_admin_proto_rawDesc = "" +
 	"\x0eleader_node_id\x18\x02 \x01(\tR\fleaderNodeId\x12\x1f\n" +
 	"\vleader_term\x18\x03 \x01(\x04R\n" +
 	"leaderTerm\"\x1b\n" +
-	"\x19GetClusterOverviewRequest\"\xc0\x01\n" +
+	"\x19GetClusterOverviewRequest\"\xd4\x02\n" +
 	"\x1aGetClusterOverviewResponse\x12!\n" +
 	"\x04self\x18\x01 \x01(\v2\r.NodeIdentityR\x04self\x12'\n" +
 	"\amembers\x18\x02 \x03(\v2\r.NodeIdentityR\amembers\x121\n" +
 	"\rgroup_leaders\x18\x03 \x03(\v2\f.GroupLeaderR\fgroupLeaders\x12#\n" +
-	"\raggregate_qps\x18\x04 \x01(\x04R\faggregateQps\"\xf4\x01\n" +
+	"\raggregate_qps\x18\x04 \x01(\x04R\faggregateQps\x12Q\n" +
+	"\fcapabilities\x18\x05 \x03(\v2-.GetClusterOverviewResponse.CapabilitiesEntryR\fcapabilities\x1a?\n" +
+	"\x11CapabilitiesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\bR\x05value:\x028\x01\"\xf4\x01\n" +
 	"\x0eRaftGroupState\x12\"\n" +
 	"\rraft_group_id\x18\x01 \x01(\x04R\vraftGroupId\x12$\n" +
 	"\x0eleader_node_id\x18\x02 \x01(\tR\fleaderNodeId\x12\x1f\n" +
@@ -1485,7 +1497,7 @@ func file_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_admin_proto_goTypes = []any{
 	(KeyVizSeries)(0),                  // 0: KeyVizSeries
 	(SampleRole)(0),                    // 1: SampleRole
@@ -1508,39 +1520,41 @@ var file_admin_proto_goTypes = []any{
 	(*StreamEventsEvent)(nil),          // 18: StreamEventsEvent
 	(*RouteTransition)(nil),            // 19: RouteTransition
 	(*KeyVizColumn)(nil),               // 20: KeyVizColumn
+	nil,                                // 21: GetClusterOverviewResponse.CapabilitiesEntry
 }
 var file_admin_proto_depIdxs = []int32{
 	2,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
 	2,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
 	3,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
-	6,  // 3: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
-	9,  // 4: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
-	1,  // 5: KeyVizRow.sample_roles:type_name -> SampleRole
-	0,  // 6: GetKeyVizMatrixRequest.series:type_name -> KeyVizSeries
-	12, // 7: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
-	12, // 8: GetRouteDetailResponse.row:type_name -> KeyVizRow
-	9,  // 9: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
-	19, // 10: StreamEventsEvent.route_transition:type_name -> RouteTransition
-	20, // 11: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
-	0,  // 12: KeyVizColumn.series:type_name -> KeyVizSeries
-	12, // 13: KeyVizColumn.rows:type_name -> KeyVizRow
-	4,  // 14: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
-	7,  // 15: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
-	10, // 16: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
-	13, // 17: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
-	15, // 18: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
-	17, // 19: Admin.StreamEvents:input_type -> StreamEventsRequest
-	5,  // 20: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
-	8,  // 21: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
-	11, // 22: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
-	14, // 23: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
-	16, // 24: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
-	18, // 25: Admin.StreamEvents:output_type -> StreamEventsEvent
-	20, // [20:26] is the sub-list for method output_type
-	14, // [14:20] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	21, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
+	6,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
+	9,  // 5: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
+	1,  // 6: KeyVizRow.sample_roles:type_name -> SampleRole
+	0,  // 7: GetKeyVizMatrixRequest.series:type_name -> KeyVizSeries
+	12, // 8: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
+	12, // 9: GetRouteDetailResponse.row:type_name -> KeyVizRow
+	9,  // 10: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
+	19, // 11: StreamEventsEvent.route_transition:type_name -> RouteTransition
+	20, // 12: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
+	0,  // 13: KeyVizColumn.series:type_name -> KeyVizSeries
+	12, // 14: KeyVizColumn.rows:type_name -> KeyVizRow
+	4,  // 15: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
+	7,  // 16: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
+	10, // 17: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
+	13, // 18: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
+	15, // 19: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
+	17, // 20: Admin.StreamEvents:input_type -> StreamEventsRequest
+	5,  // 21: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
+	8,  // 22: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
+	11, // 23: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
+	14, // 24: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
+	16, // 25: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
+	18, // 26: Admin.StreamEvents:output_type -> StreamEventsEvent
+	21, // [21:27] is the sub-list for method output_type
+	15, // [15:21] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_admin_proto_init() }
@@ -1558,7 +1572,7 @@ func file_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_admin_proto_rawDesc), len(file_admin_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   19,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

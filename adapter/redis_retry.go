@@ -5,11 +5,14 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -41,7 +44,14 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
+<<<<<<< HEAD
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
+=======
+	return errors.Is(err, store.ErrWriteConflict) ||
+		errors.Is(err, kv.ErrTxnLocked) ||
+		wireRedisTxnErrKind(err) == redisTxnWireErrLocked ||
+		errors.Is(err, kv.ErrRouteWriteFenced)
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func shouldPreserveRedisTxnAttempt(err error) bool {
@@ -49,10 +59,92 @@ func shouldPreserveRedisTxnAttempt(err error) bool {
 }
 
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
-	if errors.Is(err, kv.ErrTxnLocked) {
+	if errors.Is(err, kv.ErrTxnLocked) || wireRedisTxnErrKind(err) == redisTxnWireErrLocked {
 		return redisTxnLockedRetryPolicy
 	}
 	return redisWriteConflictRetryPolicy
+}
+
+type redisTxnWireErrKind uint8
+
+const (
+	redisTxnWireErrNone redisTxnWireErrKind = iota
+	redisTxnWireErrWriteConflict
+	redisTxnWireErrLocked
+)
+
+// parseWireRedisTxnErr restores transaction error typing after an internal
+// leader redirect crosses gRPC. Forward currently returns transaction failures
+// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked chain.
+// Match only the exact server-generated key error envelope and normalize the
+// storage key before rebuilding the typed error. Wire write conflicts are not
+// generally retryable: a lost forwarding response can turn an already-applied
+// write into a later self-conflict. Reuse-aware callers explicitly normalize
+// them before retrying; all other callers return the normalized error without
+// replaying the operation or exposing the internal key layout.
+func wireRedisTxnStatus(err error) (*status.Status, bool) {
+	type grpcStatusCarrier interface {
+		GRPCStatus() *status.Status
+	}
+	var carrier grpcStatusCarrier
+	if !errors.As(err, &carrier) {
+		return nil, false
+	}
+	st := carrier.GRPCStatus()
+	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
+		return nil, false
+	}
+	return st, true
+}
+
+func parseWireRedisTxnErr(err error) error {
+	st, ok := wireRedisTxnStatus(err)
+	if !ok {
+		return nil
+	}
+	msg := st.Message()
+	if !strings.HasPrefix(msg, "key: ") {
+		return nil
+	}
+
+	if content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+store.ErrWriteConflict.Error()); ok {
+		logicalKey := normalizeRetryableRedisTxnKey([]byte(content))
+		return errors.WithStack(store.NewWriteConflictError(logicalKey))
+	}
+
+	content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+kv.ErrTxnLocked.Error())
+	if !ok {
+		return nil
+	}
+	keyText := content
+	detail := ""
+	// TxnLockedError's wire format does not escape the key/detail boundary.
+	// A foreign key containing " (" and ending in ")" is therefore ambiguous;
+	// splitting at the last delimiter preserves the server format, and any
+	// ambiguity affects only the reconstructed display fields, not retry typing.
+	if strings.HasSuffix(content, ")") {
+		if detailStart := strings.LastIndex(content, " ("); detailStart >= 0 {
+			keyText = content[:detailStart]
+			detail = content[detailStart+2 : len(content)-1]
+		}
+	}
+	logicalKey := normalizeRetryableRedisTxnKey([]byte(keyText))
+	if detail != "" {
+		return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
+	}
+	return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+}
+
+func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
+	parsed := parseWireRedisTxnErr(err)
+	switch {
+	case errors.Is(parsed, store.ErrWriteConflict):
+		return redisTxnWireErrWriteConflict
+	case errors.Is(parsed, kv.ErrTxnLocked):
+		return redisTxnWireErrLocked
+	default:
+		return redisTxnWireErrNone
+	}
 }
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
@@ -88,11 +180,17 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if err == nil {
 			return nil
 		}
-		if !isRetryableRedisTxnErr(err) {
+		// Classify the original transport shape before normalization. A wire
+		// write conflict is ambiguous — the forwarded apply may already have
+		// landed — so the generic loop must return it without replaying. Wire
+		// TxnLocked remains retryable because the lock rejection did not apply
+		// the transaction. Reuse-aware callers convert wire conflicts to typed
+		// errors before returning them here.
+		retryable := isRetryableRedisTxnErr(err)
+		err = normalizeRetryableRedisTxnErr(err)
+		if !retryable {
 			return err
 		}
-
-		err = normalizeRetryableRedisTxnErr(err)
 		nextPolicy := retryPolicyForRedisTxnErr(err)
 		if attempt == 0 || nextPolicy != policy {
 			backoff = nextPolicy.initialBackoff
@@ -111,6 +209,9 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 }
 
 func normalizeRetryableRedisTxnErr(err error) error {
+	if parsed := parseWireRedisTxnErr(err); parsed != nil {
+		return parsed
+	}
 	if key, detail, ok := kv.TxnLockedDetails(err); ok {
 		logicalKey := normalizeRetryableRedisTxnKey(key)
 		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {

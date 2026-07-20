@@ -196,6 +196,7 @@ func marshalHLCLeaseRenew(ceilingMs int64) []byte {
 
 type CoordinateResponse struct {
 	CommitIndex uint64
+	CommitTS    uint64
 }
 
 type Coordinate struct {
@@ -1086,6 +1087,9 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
+	if err := ValidateElemCommitTSPatches(reqs, commitTS); err != nil {
+		return nil, err
+	}
 
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu, eliminating the TOCTOU
@@ -1104,6 +1108,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
+		CommitTS:    commitTS,
 	}, nil
 }
 
@@ -1130,6 +1135,7 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 	}
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
+		CommitTS:    ts,
 	}, nil
 }
 
@@ -1242,6 +1248,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
+		CommitTS:    r.CommitTs,
 	}, nil
 }
 
@@ -1294,10 +1301,15 @@ func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {
 func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	switch req.Op {
 	case Put:
+		value := req.Value
+		if req.CommitTSValueOffset != 0 {
+			value = bytes.Clone(req.Value)
+		}
 		return &pb.Mutation{
-			Op:    pb.Op_PUT,
-			Key:   req.Key,
-			Value: req.Value,
+			Op:                  pb.Op_PUT,
+			Key:                 req.Key,
+			Value:               value,
+			CommitTsValueOffset: req.CommitTSValueOffset,
 		}
 	case Del:
 		return &pb.Mutation{
@@ -1336,6 +1348,12 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 	})
 	for _, req := range reqs {
 		muts = append(muts, elemToMutation(req))
+	}
+	if commitTS != 0 {
+		// stamp errors are validated before commit by dispatchTxn and
+		// Internal.Forward; this best-effort call keeps the helper nil-error
+		// compatible for existing tests that construct raw requests directly.
+		_ = StampMutationCommitTS(muts, commitTS)
 	}
 	return &pb.Request{
 		IsTxn:                true,

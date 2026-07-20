@@ -252,6 +252,25 @@
         (str "expected earlier :info increment to remain admissible, got: "
              result))))
 
+(deftest pre-read-info-zadd-can-feed-zincrby-before-later-zadd
+  ;; The final ZADD resets the score observed by the read, but it must not
+  ;; discard an earlier :info ZADD that is needed to explain an intervening
+  ;; committed ZINCRBY reply. This ordering appeared in the scheduled Jepsen
+  ;; history: info ZADD 29, ZINCRBY +9 -> 38, then ZADD 35.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 29] :index 0}
+                 {:type :info   :process 0 :f :zadd :value ["m1" 29] :index 1}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 9] :index 2}
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 38.0] :index 3}
+                 {:type :invoke :process 2 :f :zadd :value ["m1" 35] :index 4}
+                 {:type :ok     :process 2 :f :zadd :value ["m1" 35] :index 5}
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 35.0]] :index 7}]
+        result (run-checker history)]
+    (is (:valid? result)
+        (str "expected dependent :info ZADD to remain admissible, got: "
+             result))))
+
 (deftest pre-read-info-zincrby-superseded-by-later-zadd
   ;; A pre-read :info ZINCRBY is uncertainty only until a later committed
   ;; state-changing op strictly follows it before the read. The later ZADD

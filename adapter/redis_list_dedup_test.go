@@ -4,11 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+<<<<<<< HEAD
+=======
+	"errors"
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // dedupTestCoordinator drives the option-2 one-phase idempotency path
@@ -39,6 +45,14 @@ type dedupTestCoordinator struct {
 	// WITHOUT applying — an ambiguous retryable error distinct from
 	// WriteConflict, exercising the "advance pending.commitTS and retry" branch.
 	txnLockedAtDispatch int
+<<<<<<< HEAD
+=======
+	// wireWriteConflicts converts every typed write conflict this test
+	// coordinator returns into the keyed gRPC status produced by leader
+	// forwarding. It exercises adapter-side type restoration without changing
+	// the underlying landed-vs-not-landed scenario.
+	wireWriteConflicts bool
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	// routeFenceAtDispatch makes the named dispatch return ErrRouteWriteFenced
 	// before the FSM dedup probe or apply. It is retryable but cannot be
 	// treated as an ambiguous landing.
@@ -287,26 +301,44 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return resp, err
 	}
 	if err := c.preApplyError(n); err != nil {
+<<<<<<< HEAD
 		return nil, err
+=======
+		return nil, c.maybeWireWriteConflict(req, err)
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, c.maybeWireWriteConflict(req, err)
 	}
 	if n == c.ambiguousDispatch && c.ambiguousLands {
 		// The apply LANDED, but the adapter sees an ambiguous retryable error.
-		return nil, store.ErrWriteConflict
+		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
 	}
 	if n == c.landThenWriteConflictAtDispatch {
 		// The apply LANDED, but leadership churn surfaces the commit as
 		// store.ErrWriteConflict — the original bug class. The adapter's
 		// self-inflicted-conflict guard must probe our just-committed
 		// commit_ts before treating this as a third-party conflict.
-		return nil, store.ErrWriteConflict
+		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
 	}
 	return resp, nil
 }
 
+<<<<<<< HEAD
+=======
+func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.OP], err error) error {
+	if !c.wireWriteConflicts || !errors.Is(err, store.ErrWriteConflict) {
+		return err
+	}
+	key, ok := store.WriteConflictKey(err)
+	if !ok || len(key) == 0 {
+		key = minElemKey(req.Elems)
+	}
+	return status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {
 	return dispatch == c.routeFenceAtDispatch
 }
@@ -460,6 +492,7 @@ func TestListPushDedup_GenuineConflictRecomputes(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
+	coord.wireWriteConflicts = true                // forwarded conflict loses its typed chain
 	key := []byte("mylist")
 	// Before the reuse (dispatch 2), simulate another client's RPUSH landing
 	// at seq 0 so the reuse conflicts and must recompute.

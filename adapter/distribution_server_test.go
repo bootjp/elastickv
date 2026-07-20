@@ -3,12 +3,20 @@ package adapter
 import (
 	"bytes"
 	"context"
+<<<<<<< HEAD
+=======
+	"encoding/binary"
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"errors"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+<<<<<<< HEAD
+=======
+	"github.com/bootjp/elastickv/internal/fskeys"
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -43,6 +51,28 @@ func TestDistributionServerGetRoute_HitAndMiss(t *testing.T) {
 	require.Nil(t, miss.End)
 }
 
+<<<<<<< HEAD
+=======
+func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRoute(context.Background(), &pb.GetRouteRequest{
+		Key: fskeys.ChunkKey(home, inode, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, routeKey, resp.Start)
+	require.Equal(t, uint64(2), resp.RaftGroupId)
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +202,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 			StagedVisibilityActive: true,
 			MigrationJobID:         42,
 			MinWriteTSExclusive:    99,
+			SplitAtHLC:             100,
 		},
 		{
 			RouteID:       1,
@@ -201,6 +232,7 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	require.True(t, resp.Routes[1].StagedVisibilityActive)
 	require.Equal(t, uint64(42), resp.Routes[1].MigrationJobId)
 	require.Equal(t, uint64(99), resp.Routes[1].MinWriteTsExclusive)
+	require.Equal(t, uint64(100), resp.Routes[1].SplitAtHlc)
 }
 
 func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
@@ -1506,6 +1538,8 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(1), resp.Right.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Right.ParentRouteId)
 	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
+	require.NotZero(t, resp.Left.SplitAtHlc)
+	require.Equal(t, resp.Left.SplitAtHlc, resp.Right.SplitAtHlc)
 
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
@@ -1517,6 +1551,9 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(4), snapshot.Routes[1].RouteID)
 	require.Equal(t, uint64(99), snapshot.Routes[1].MinWriteTSExclusive)
 	require.Equal(t, uint64(2), snapshot.Routes[2].RouteID)
+	require.NotZero(t, snapshot.Routes[0].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, snapshot.Routes[1].SplitAtHLC)
+	require.Equal(t, snapshot.Routes[0].SplitAtHLC, resp.Left.SplitAtHlc)
 
 	require.Equal(t, uint64(2), engine.Version())
 	leftRoute, ok := engine.GetRoute([]byte("b"))
@@ -1527,6 +1564,173 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, uint64(4), rightRoute.RouteID)
 	require.Equal(t, uint64(99), rightRoute.MinWriteTSExclusive)
+}
+
+func TestDistributionServerSplitRange_SnapsFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               fskeys.ChunkKey(11, 22, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
+func TestDistributionServerSplitRange_SnapsTxnWrappedFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+	txnChunkKey := append([]byte(kv.TxnKeyPrefix+"lock|"), fskeys.ChunkKey(11, 22, 99)...)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               txnChunkKey,
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
+func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	routeStart := fskeys.ChunkRouteKey(11, 22)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     fskeys.ChunkRouteKey(11, 23),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	observer := &recordingDistributionFilesystemObserver{}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithDistributionFilesystemObserver(observer),
+	)
+	insideSameFile := append(append([]byte(nil), routeStart...), 0x01)
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               insideSameFile,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+	require.Equal(t, []string{DistributionFilePinnedHotspotSplitBoundary}, observer.reasons)
+}
+
+func TestDistributionServerSplitRange_DoesNotRecordNonFilesystemNormalizedBoundary(t *testing.T) {
+	t.Parallel()
+
+	routeStart := []byte("queue")
+	tests := []struct {
+		name     string
+		splitKey []byte
+	}{
+		{
+			name:     "list item",
+			splitKey: store.ListItemKey(routeStart, 1),
+		},
+		{
+			name:     "txn wrapped list item",
+			splitKey: append([]byte(kv.TxnKeyPrefix+"lock|"), store.ListItemKey(routeStart, 1)...),
+		},
+		{
+			name:     "txn wrapped redis internal key",
+			splitKey: []byte(kv.TxnKeyPrefix + "lock|!redis|string|queue"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			baseStore := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(baseStore)
+			saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+				{
+					RouteID: 1,
+					Start:   routeStart,
+					End:     []byte("queuez"),
+					GroupID: 1,
+					State:   distribution.RouteStateActive,
+				},
+			})
+			require.NoError(t, err)
+
+			observer := &recordingDistributionFilesystemObserver{}
+			s := NewDistributionServer(
+				distribution.NewEngine(),
+				catalog,
+				WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+				WithDistributionFilesystemObserver(observer),
+			)
+
+			_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+				ExpectedCatalogVersion: saved.Version,
+				RouteId:                1,
+				SplitKey:               tt.splitKey,
+			})
+			require.Error(t, err)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+			require.Empty(t, observer.reasons)
+		})
+	}
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
@@ -1772,6 +1976,20 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
+	require.Zero(t, coordinator.lastRequestedCommitTS)
+	require.NotZero(t, coordinator.lastCommitTS)
+	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
+
+	snapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	left, found := findRouteByID(snapshot.Routes, resp.Left.RouteId)
+	require.True(t, found)
+	right, found := findRouteByID(snapshot.Routes, resp.Right.RouteId)
+	require.True(t, found)
+	require.Equal(t, coordinator.lastCommitTS, left.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -1848,7 +2066,7 @@ func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
 	require.Equal(t, uint64(6), second.Right.RouteId)
 }
 
-func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing.T) {
+func TestDistributionServerSplitRange_ReturnsExactCommittedSplitVersion(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1887,8 +2105,20 @@ func TestDistributionServerSplitRange_AllowsVersionAdvanceAfterCommit(t *testing
 		SplitKey:               []byte("g"),
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), resp.CatalogVersion)
-	require.Equal(t, uint64(3), engine.Version())
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+	require.Equal(t, uint64(2), engine.Version())
+	require.Equal(t, uint64(3), resp.Left.RouteId)
+	require.Equal(t, uint64(4), resp.Right.RouteId)
+	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
+	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	committed, err := catalog.SnapshotAt(ctx, coordinator.lastCommitTS)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), committed.Version)
+
+	latest, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), latest.Version)
 }
 
 func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {
@@ -2289,6 +2519,7 @@ func (s *splitPromotionClientStub) PromoteStagedVersions(
 }
 
 type distributionCoordinatorStub struct {
+<<<<<<< HEAD
 	store           store.MVCCStore
 	leader          bool
 	dispatchErr     error
@@ -2304,12 +2535,32 @@ type distributionCoordinatorStub struct {
 	asyncApplyDone  chan error
 	asyncApplyDelay time.Duration
 	dispatchCalls   int
+=======
+	store                 store.MVCCStore
+	leader                bool
+	clock                 *kv.HLC
+	dispatchErr           error
+	nextTS                uint64
+	timestampNext         uint64
+	timestampErr          error
+	timestampCalls        int
+	lastStartTS           uint64
+	lastCommitTS          uint64
+	lastRequestedCommitTS uint64
+	lastReadKeys          [][]byte
+	beforeApply           func(context.Context, store.MVCCStore) error
+	afterDispatch         func(context.Context, store.MVCCStore, uint64) error
+	asyncApplyDone        chan error
+	asyncApplyDelay       time.Duration
+	dispatchCalls         int
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
 	return &distributionCoordinatorStub{
 		store:  st,
 		leader: leader,
+		clock:  kv.NewHLC(),
 	}
 }
 
@@ -2318,6 +2569,10 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
+<<<<<<< HEAD
+=======
+	s.lastRequestedCommitTS = reqs.CommitTS
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if s.dispatchErr != nil {
 		return nil, s.dispatchErr
 	}
@@ -2327,7 +2582,10 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	readKeys := cloneDistributionReadKeys(reqs.ReadKeys)
 	s.lastReadKeys = readKeys
 
-	mutations, err := coordinatorStubMutations(reqs.Elems)
+	if err := kv.ValidateElemCommitTSPatches(reqs.Elems, commitTS); err != nil {
+		return nil, err
+	}
+	mutations, err := coordinatorStubMutations(reqs.Elems, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2341,12 +2599,12 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 				done <- err
 			}
 		}()
-		return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+		return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 	}
 	if err := s.applyDispatch(ctx, mutations, readKeys, startTS, commitTS); err != nil {
 		return nil, err
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+	return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 }
 
 func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[kv.OP]) error {
@@ -2361,6 +2619,12 @@ func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[k
 
 func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCommitTS uint64) (uint64, uint64) {
 	if requestedCommitTS != 0 {
+<<<<<<< HEAD
+=======
+		if s.clock != nil {
+			s.clock.Observe(requestedCommitTS)
+		}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		if s.nextTS <= requestedCommitTS {
 			s.nextTS = requestedCommitTS + 1
 		}
@@ -2430,10 +2694,14 @@ func requireReadKeysNotContain(t *testing.T, readKeys [][]byte, want []byte) {
 	}
 }
 
+<<<<<<< HEAD
 func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
+=======
+func coordinatorStubMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
-		mutation, err := coordinatorStubMutation(elem)
+		mutation, err := coordinatorStubMutation(elem, commitTS)
 		if err != nil {
 			return nil, err
 		}
@@ -2442,16 +2710,20 @@ func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation,
 	return mutations, nil
 }
 
-func coordinatorStubMutation(elem *kv.Elem[kv.OP]) (*store.KVPairMutation, error) {
+func coordinatorStubMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPairMutation, error) {
 	if elem == nil {
 		return nil, kv.ErrInvalidRequest
 	}
 	switch elem.Op {
 	case kv.Put:
+		value := distribution.CloneBytes(elem.Value)
+		if elem.CommitTSValueOffset != 0 {
+			binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:elem.CommitTSValueOffset+8], commitTS)
+		}
 		return &store.KVPairMutation{
 			Op:    store.OpTypePut,
 			Key:   distribution.CloneBytes(elem.Key),
-			Value: distribution.CloneBytes(elem.Value),
+			Value: value,
 		}, nil
 	case kv.Del:
 		return &store.KVPairMutation{
@@ -2496,7 +2768,27 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 }
 
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
-	return nil
+	return s.clock
+}
+
+func (s *distributionCoordinatorStub) Next(ctx context.Context) (uint64, error) {
+	return s.NextAfter(ctx, 0)
+}
+
+func (s *distributionCoordinatorStub) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	s.timestampCalls++
+	if s.timestampErr != nil {
+		return 0, s.timestampErr
+	}
+	next := s.timestampNext
+	if next == 0 {
+		next = s.store.LastCommitTS() + 1
+	}
+	if next <= min {
+		next = min + 1
+	}
+	s.timestampNext = next + 1
+	return next, nil
 }
 
 func (s *distributionCoordinatorStub) Next(ctx context.Context) (uint64, error) {
@@ -2529,4 +2821,12 @@ func (s *distributionCoordinatorStub) LeaseRead(ctx context.Context) (uint64, er
 
 func (s *distributionCoordinatorStub) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return s.LinearizableRead(ctx)
+}
+
+type recordingDistributionFilesystemObserver struct {
+	reasons []string
+}
+
+func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
+	o.reasons = append(o.reasons, reason)
 }

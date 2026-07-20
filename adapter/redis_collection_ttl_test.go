@@ -142,6 +142,41 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 	}
 }
 
+func TestListMetaExpireElemsIncludesLegacyDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("ttl:list:legacy-delta")
+	deltaKey := legacyListMetaDeltaKey(key, 2)
+	require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 2, 0))
+
+	elems, exists, err := server.listMetaExpireElems(ctx, key, 2, 1234)
+
+	require.NoError(t, err)
+	require.True(t, exists)
+	meta, err := store.UnmarshalListMeta(elemValueForKey(t, elems, store.ListMetaKey(key)))
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, uint64(1234), meta.ExpireAt)
+	require.True(t, elemDelKeysContain(elems, deltaKey))
+}
+
+func TestExpiredTTLIndexPrecedesLegacyListDeltaOnlyCollection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st}
+	key := []byte("ttl:list:legacy-delta-recreate")
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 1, 0))
+	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 3), store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+
+	stale, err := expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, st, server, key, redisTypeList, 3)
+
+	require.NoError(t, err)
+	require.True(t, stale)
+}
+
 func TestRedisCollectionExpireHandlesLegacyBlobs(t *testing.T) {
 	t.Parallel()
 

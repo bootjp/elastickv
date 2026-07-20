@@ -211,12 +211,13 @@ func (s *LeaderRoutedStore) proxyRawScanAtWithReadFence(
 	return out, nil
 }
 
-func (s *LeaderRoutedStore) proxyRawScanKeysAt(
+func (s *LeaderRoutedStore) proxyRawScanKeysAtWithReadFence(
 	ctx context.Context,
 	start []byte,
 	end []byte,
 	limit int,
 	ts uint64,
+	readRouteVersion uint64,
 ) ([][]byte, error) {
 	addr := s.leaderAddrForKey(start)
 	if addr == "" {
@@ -232,11 +233,12 @@ func (s *LeaderRoutedStore) proxyRawScanKeysAt(
 	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
 	defer cancel()
 	resp, err := cli.RawScanAt(ctx, &pb.RawScanAtRequest{
-		StartKey: start,
-		EndKey:   end,
-		Limit:    int64(limit),
-		Ts:       ts,
-		KeysOnly: true,
+		StartKey:         start,
+		EndKey:           end,
+		Limit:            int64(limit),
+		Ts:               ts,
+		ReadRouteVersion: readRouteVersion,
+		KeysOnly:         true,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -417,18 +419,25 @@ func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte
 }
 
 func (s *LeaderRoutedStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	return s.ScanKeysAtWithReadFence(ctx, start, end, limit, ts, 0, 0)
+}
+
+func (s *LeaderRoutedStore) ScanKeysAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64) ([][]byte, error) {
 	if s == nil || s.local == nil {
 		return [][]byte{}, nil
 	}
 	if limit <= 0 {
 		return [][]byte{}, nil
 	}
+	if groupID != 0 {
+		return nil, store.ErrNotSupported
+	}
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if ok {
 		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
 		return keys, errors.WithStack(err)
 	}
-	return s.proxyRawScanKeysAt(ctx, start, end, limit, ts)
+	return s.proxyRawScanKeysAtWithReadFence(ctx, start, end, limit, ts, readRouteVersion)
 }
 
 func (s *LeaderRoutedStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {

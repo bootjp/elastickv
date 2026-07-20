@@ -125,6 +125,32 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 	})
 }
 
+<<<<<<< HEAD
+=======
+func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
+		accepted := false
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          1,
+			AcceptVersion: func(_ []byte, _ []byte) bool {
+				if accepted {
+					return false
+				}
+				accepted = true
+				return true
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
+	})
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

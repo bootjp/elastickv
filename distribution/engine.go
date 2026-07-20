@@ -357,13 +357,23 @@ func (e *Engine) UpdateRoute(start, end []byte, group uint64) {
 
 // GetRoute finds a route for the given key using right half-open intervals.
 func (e *Engine) GetRoute(key []byte) (Route, bool) {
+	route, _, ok := e.GetRouteWithVersion(key)
+	return route, ok
+}
+
+// GetRouteWithVersion finds a route and returns the catalog version from the
+// same locked snapshot. Callers can use the version as a read-routing fence.
+func (e *Engine) GetRouteWithVersion(key []byte) (Route, uint64, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	idx := e.routeIndex(key)
 	if idx < 0 {
-		return Route{}, false
+		return Route{}, e.catalogVersion, false
 	}
-	return e.routes[idx], true
+	route := e.routes[idx]
+	route.Start = CloneBytes(route.Start)
+	route.End = CloneBytes(route.End)
+	return route, e.catalogVersion, true
 }
 
 // NextTimestamp returns a monotonic increasing timestamp.
@@ -387,6 +397,13 @@ func (e *Engine) Stats() []Route {
 // - rStart < end (or end is nil, meaning unbounded scan)
 // - start < rEnd (or rEnd is nil, meaning unbounded route)
 func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
+	routes, _ := e.GetIntersectingRoutesWithVersion(start, end)
+	return routes
+}
+
+// GetIntersectingRoutesWithVersion returns intersecting routes and the catalog
+// version from the same locked snapshot.
+func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, uint64) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -404,8 +421,25 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		}
 		// Route intersects with scan range
 		result = append(result, cloneRoute(*r))
+<<<<<<< HEAD
+=======
 	}
-	return result
+	return result, e.catalogVersion
+}
+
+func cloneRoute(r Route) Route {
+	return Route{
+		RouteID:                r.RouteID,
+		Start:                  CloneBytes(r.Start),
+		End:                    CloneBytes(r.End),
+		GroupID:                r.GroupID,
+		State:                  r.State,
+		StagedVisibilityActive: r.StagedVisibilityActive,
+		MigrationJobID:         r.MigrationJobID,
+		MinWriteTSExclusive:    r.MinWriteTSExclusive,
+		Load:                   r.Load,
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
+	}
 }
 
 func cloneRoute(r Route) Route {

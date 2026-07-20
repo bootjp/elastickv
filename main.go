@@ -24,6 +24,8 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/internal/filesystem/fuseadapter"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -54,7 +56,14 @@ const (
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
 
+<<<<<<< HEAD
 	splitMigrationCapabilityProbeTimeout = 2 * time.Second
+=======
+	defaultFilesystemRootMode              = 0o755
+	defaultFilesystemPlacementScanInterval = 30 * time.Second
+	defaultFilesystemLeaseReapInterval     = 30 * time.Second
+	splitMigrationCapabilityProbeTimeout   = 2 * time.Second
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -102,6 +111,15 @@ var (
 	metricsToken                    = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
 	pprofAddr                       = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
 	pprofToken                      = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
+	filesystemMount                 = flag.String("filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
+	filesystemClientID              = flag.String("filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
+	filesystemCapacity              = flag.Uint64("filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
+	filesystemMaxFiles              = flag.Uint64("filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")
+	filesystemRootMode              = flag.Uint("filesystemRootMode", defaultFilesystemRootMode, "Root directory permission mode for first initialization")
+	filesystemRootUID               = flag.Uint("filesystemRootUID", 0, "Root directory owner UID for first initialization")
+	filesystemRootGID               = flag.Uint("filesystemRootGID", 0, "Root directory owner GID for first initialization")
+	filesystemPlacementScanInterval = flag.Duration("filesystemPlacementScanInterval", defaultFilesystemPlacementScanInterval, "Interval for filesystem placement and recovery-state metrics; non-positive disables periodic scans")
+	filesystemLeaseReapInterval     = flag.Duration("filesystemLeaseReapInterval", defaultFilesystemLeaseReapInterval, "Interval for reclaiming expired filesystem open-handle leases; non-positive disables periodic reaping")
 	raftId                          = flag.String("raftId", "", "Node id used by Raft")
 	raftEngineName                  = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
 	raftDir                         = flag.String("raftDataDir", "data/", "Raft data dir")
@@ -109,6 +127,7 @@ var (
 	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
+	raftJoinMembers                 = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
 	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
 	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Issue coordinator-owned persistence timestamps through the local TSO batch allocator instead of direct HLC calls")
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used when --tsoEnabled is true")
@@ -497,6 +516,7 @@ func run() error {
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
+		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
 	if err := configureCoordinatorTSO(coordinate); err != nil {
 		return err
@@ -517,6 +537,67 @@ func run() error {
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
+<<<<<<< HEAD
+=======
+	// setupDistributionCatalog + the Stage 7a process-start registration
+	// gate are bundled so run() has a single startup-fault path: a
+	// registry-read / behind-epoch failure fails the process
+	// synchronously here, BEFORE the gRPC servers serve, so writes never
+	// run with no registration gate installed.
+	distCatalog, err := setupDistributionAndRegistration(
+		runCtx, eg, runtimes, cfg.engine,
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
+	if err != nil {
+		cancel()
+		return err
+	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(sampler, cfg.engine)
+
+	eg.Go(func() error {
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+	})
+	startKeyVizFlusher(runCtx, eg, sampler)
+	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
+	startMemoryWatchdog(runCtx, eg, cancel)
+	splitMigrationConnCache := &kv.GRPCConnCache{}
+	cleanup.Add(func() { _ = splitMigrationConnCache.Close() })
+	distServer := adapter.NewDistributionServer(
+		cfg.engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(coordinate),
+		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
+		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(shardGroups)...),
+		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
+			splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
+			splitMigrationCapabilityProbeTimeout,
+			nil,
+			splitMigrationLocalReadinessGate,
+		)),
+		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
+			splitPromotionTargetLeaderResolver(shardGroups),
+			splitMigrationConnCache,
+		)),
+		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
+			splitMigrationGroupLeaderResolver(shardGroups),
+			splitMigrationConnCache,
+		)),
+		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
+			shardGroups,
+			splitMigrationConnCache,
+		)),
+		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
+		adapter.WithSplitJobRunnerReady(),
+	)
+	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
+	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -548,6 +629,7 @@ func run() error {
 		readTracker:     readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
+		cleanup:                         &cleanup,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -625,6 +707,202 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 	}
 }
 
+type filesystemStartConfig struct {
+	mountPoint string
+	clientID   string
+	rootMode   uint32
+	rootUID    uint32
+	rootGID    uint32
+}
+
+func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
+	config := filesystemStartConfig{mountPoint: strings.TrimSpace(*filesystemMount)}
+	if config.mountPoint == "" {
+		return config, nil
+	}
+	if *filesystemRootMode > 0o7777 || *filesystemRootUID > math.MaxUint32 || *filesystemRootGID > math.MaxUint32 {
+		return filesystemStartConfig{}, errors.New("filesystem root mode, uid, or gid is out of range")
+	}
+	config.clientID = strings.TrimSpace(*filesystemClientID)
+	if config.clientID == "" {
+		config.clientID = strings.TrimSpace(*raftId)
+	}
+	if config.clientID == "" {
+		return filesystemStartConfig{}, errors.New("filesystem client ID is required")
+	}
+	config.rootMode = uint32(*filesystemRootMode)
+	config.rootUID = uint32(*filesystemRootUID)
+	config.rootGID = uint32(*filesystemRootGID)
+	return config, nil
+}
+
+func startFilesystemIfEnabled(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cleanup *internalutil.CleanupStack,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	observer monitoring.FileSystemObserver,
+) error {
+	config, err := filesystemStartConfigFromFlags()
+	if err != nil {
+		return err
+	}
+	if config.mountPoint == "" {
+		return nil
+	}
+	if eg == nil || cleanup == nil {
+		return errors.New("filesystem lifecycle is required")
+	}
+	service, err := filesystem.NewService(
+		shardStore,
+		coordinate,
+		filesystem.WithCapacity(*filesystemCapacity),
+		filesystem.WithMaxFiles(*filesystemMaxFiles),
+		filesystem.WithOperationalObserver(observer),
+	)
+	if err != nil {
+		return errors.Wrap(err, "create filesystem service")
+	}
+	if err := service.InitializeRoot(
+		ctx,
+		config.rootMode,
+		config.rootUID,
+		config.rootGID,
+	); err != nil {
+		return errors.Wrap(err, "initialize filesystem root")
+	}
+	server, serveDone, err := mountFilesystemService(service, config)
+	if err != nil {
+		return err
+	}
+	installFilesystemServerLifecycle(ctx, eg, cleanup, server, serveDone, config.mountPoint)
+	startFilesystemPlacementCollector(ctx, eg, service, *filesystemPlacementScanInterval)
+	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
+	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
+	return nil
+}
+
+func mountFilesystemService(
+	service *filesystem.Service,
+	config filesystemStartConfig,
+) (*fuseadapter.Server, <-chan struct{}, error) {
+	frontend := fuseadapter.New(service, []byte(config.clientID))
+	server, err := fuseadapter.Mount(config.mountPoint, frontend, nil)
+	if err != nil {
+		frontend.Close()
+		return nil, nil, errors.Wrap(err, "mount filesystem frontend")
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		server.Serve()
+	}()
+	if err := server.WaitMount(); err != nil {
+		_ = server.Unmount()
+		<-serveDone
+		return nil, nil, errors.Wrap(err, "wait for filesystem FUSE mount")
+	}
+	return server, serveDone, nil
+}
+
+func installFilesystemServerLifecycle(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cleanup *internalutil.CleanupStack,
+	server *fuseadapter.Server,
+	serveDone <-chan struct{},
+	mountPoint string,
+) {
+	unmount := sync.OnceValue(server.Unmount)
+	cleanup.Add(func() {
+		if err := unmount(); err != nil {
+			slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+		}
+	})
+	eg.Go(func() error {
+		select {
+		case <-ctx.Done():
+			if err := unmount(); err != nil {
+				slog.WarnContext(ctx, "filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+			}
+			<-serveDone
+			return nil
+		case <-serveDone:
+			return errors.New("filesystem FUSE server stopped unexpectedly")
+		}
+	})
+}
+
+func startFilesystemPlacementCollector(
+	ctx context.Context,
+	eg *errgroup.Group,
+	service *filesystem.Service,
+	interval time.Duration,
+) {
+	if eg == nil || service == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if _, err := service.ListFilePlacementStats(ctx); err != nil && ctx.Err() == nil {
+				slog.WarnContext(ctx, "filesystem placement scan failed", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	})
+}
+
+type filesystemLeaseReaper interface {
+	ReapExpiredOpenHandleLeases(context.Context, int) (filesystem.LeaseReapStats, error)
+}
+
+func startFilesystemLeaseReaper(
+	ctx context.Context,
+	eg *errgroup.Group,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) {
+	if eg == nil || reaper == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		return runFilesystemLeaseReaper(ctx, reaper, interval)
+	})
+}
+
+func runFilesystemLeaseReaper(
+	ctx context.Context,
+	reaper filesystemLeaseReaper,
+	interval time.Duration,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		stats, err := reaper.ReapExpiredOpenHandleLeases(ctx, 0)
+		if err != nil && ctx.Err() == nil {
+			slog.WarnContext(ctx, "filesystem lease reaper failed", "err", err)
+		}
+		if stats.ExpiredRefs > 0 || stats.OrphanedInodesGCed > 0 {
+			slog.InfoContext(ctx, "filesystem lease reaper reclaimed state",
+				"expired_refs", stats.ExpiredRefs,
+				"orphaned_inodes_gced", stats.OrphanedInodesGCed,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
 func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if *raftId == "" {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.New("flag --raftId is required")
@@ -640,7 +918,15 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
-	bootstrapCfg, err := resolveBootstrapConfig(*raftId, cfg.groups, *raftBootstrapMembers, *raftGroupPeers)
+	bootstrapCfg, err := resolveRaftPeerConfig(
+		*raftId,
+		cfg.groups,
+		*raftBootstrapMembers,
+		*raftGroupPeers,
+		*raftJoinMembers,
+		*raftJoinAsLearner,
+		*raftBootstrap,
+	)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
@@ -651,6 +937,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 type raftBootstrapConfig struct {
 	legacyServers []raftengine.Server
 	groupServers  map[uint64][]raftengine.Server
+	joinServers   []raftengine.Server
 }
 
 func (c raftBootstrapConfig) anyBootstrapServers() bool {
@@ -658,10 +945,20 @@ func (c raftBootstrapConfig) anyBootstrapServers() bool {
 }
 
 func (c raftBootstrapConfig) serversForGroup(groupID uint64) []raftengine.Server {
+	if len(c.joinServers) != 0 {
+		return cloneRaftServers(c.joinServers)
+	}
 	if len(c.groupServers) != 0 {
 		return cloneRaftServers(c.groupServers[groupID])
 	}
 	return cloneRaftServers(c.legacyServers)
+}
+
+func (c raftBootstrapConfig) bootstrapsGroup(groupID uint64) bool {
+	if len(c.groupServers) != 0 {
+		return len(c.groupServers[groupID]) > 0
+	}
+	return len(c.legacyServers) > 0
 }
 
 func (c raftBootstrapConfig) bootstrapSeedForGroup(groupID uint64) []raftengine.Server {
@@ -672,6 +969,9 @@ func (c raftBootstrapConfig) bootstrapSeedForGroup(groupID uint64) []raftengine.
 }
 
 func (c raftBootstrapConfig) adminSeed(defaultGroup uint64) []raftengine.Server {
+	if len(c.joinServers) != 0 {
+		return cloneRaftServers(c.joinServers)
+	}
 	if len(c.groupServers) != 0 {
 		return cloneRaftServers(c.groupServers[defaultGroup])
 	}
@@ -889,7 +1189,7 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGrou
 		leaderDynamo:        leaderDynamo,
 		leaderSQS:           leaderSQS,
 		sqsFifoPartitionMap: sqsFifoPartitionMap,
-		multi:               len(groups) > 1,
+		multi:               dataGroupsNeedMultiDirs(groups),
 	}, nil
 }
 
@@ -997,6 +1297,9 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 	if len(parsed) == 0 {
 		return parsed, nil
 	}
+	if err := validateSQSFifoPartitionMapNoDedicatedTSOGroup(parsed); err != nil {
+		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
+	}
 	groupIDs := make(map[string]struct{}, len(groups))
 	for _, g := range groups {
 		groupIDs[strconv.FormatUint(g.id, 10)] = struct{}{}
@@ -1005,6 +1308,20 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
 	}
 	return parsed, nil
+}
+
+func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsFifoQueueRouting) error {
+	for _, queue := range slices.Sorted(maps.Keys(partitionMap)) {
+		routing := partitionMap[queue]
+		for partition, group := range routing.groups {
+			if group == strconv.FormatUint(dedicatedTSORaftGroupID, 10) {
+				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+					"queue %q partition %d: group %q is reserved for TSO",
+					queue, partition, group)
+			}
+		}
+	}
+	return nil
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
@@ -1042,9 +1359,19 @@ var (
 	ErrRaftGroupPeersTooFewVoters         = errors.New("flag --raftGroupPeers group must contain at least two voters")
 	ErrRaftGroupPeersHeterogeneous        = errors.New("flag --raftGroupPeers requires identical raft IDs across groups")
 	ErrNoRaftGroupPeersConfigured         = errors.New("no raft group peers configured")
+	ErrJoinMembersRequireSingleGroup      = errors.New("flag --raftJoinMembers requires exactly one raft group")
+	ErrJoinMembersRequireLearner          = errors.New("flag --raftJoinMembers requires --raftJoinAsLearner")
+	ErrJoinMembersConflictBootstrap       = errors.New("flag --raftJoinMembers cannot be combined with raft bootstrap flags")
+	ErrJoinMembersMissingLocalNode        = errors.New("flag --raftJoinMembers must include local --raftId")
+	ErrJoinMembersLocalAddrMismatch       = errors.New("flag --raftJoinMembers local address must match local raft group address")
+	ErrJoinMembersTooFewMembers           = errors.New("flag --raftJoinMembers must include the local node and at least one existing member")
+	ErrNoJoinMembersConfigured            = errors.New("no raft join members configured")
 )
 
-const minRaftGroupPeerVoters = 2
+const (
+	minRaftGroupPeerVoters = 2
+	minRaftJoinMembers     = 2
+)
 
 func resolveBootstrapConfig(
 	raftID string,
@@ -1067,6 +1394,59 @@ func resolveBootstrapConfig(
 		return raftBootstrapConfig{}, err
 	}
 	return raftBootstrapConfig{groupServers: groupServers}, nil
+}
+
+func resolveRaftPeerConfig(
+	raftID string,
+	groups []groupSpec,
+	bootstrapMembers string,
+	groupPeersRaw string,
+	joinMembers string,
+	joinAsLearner bool,
+	explicitBootstrap bool,
+) (raftBootstrapConfig, error) {
+	if strings.TrimSpace(joinMembers) == "" {
+		return resolveBootstrapConfig(raftID, groups, bootstrapMembers, groupPeersRaw)
+	}
+	if !joinAsLearner {
+		return raftBootstrapConfig{}, errors.WithStack(ErrJoinMembersRequireLearner)
+	}
+	if explicitBootstrap || strings.TrimSpace(bootstrapMembers) != "" || strings.TrimSpace(groupPeersRaw) != "" {
+		return raftBootstrapConfig{}, errors.WithStack(ErrJoinMembersConflictBootstrap)
+	}
+	servers, err := resolveJoinServers(raftID, groups, joinMembers)
+	if err != nil {
+		return raftBootstrapConfig{}, err
+	}
+	return raftBootstrapConfig{joinServers: servers}, nil
+}
+
+func resolveJoinServers(raftID string, groups []groupSpec, joinMembers string) ([]raftengine.Server, error) {
+	if len(groups) != 1 {
+		return nil, errors.WithStack(ErrJoinMembersRequireSingleGroup)
+	}
+	servers, err := parseRaftBootstrapMembers(joinMembers)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse raft join members")
+	}
+	if len(servers) == 0 {
+		return nil, errors.WithStack(ErrNoJoinMembersConfigured)
+	}
+	if len(servers) < minRaftJoinMembers {
+		return nil, errors.WithStack(ErrJoinMembersTooFewMembers)
+	}
+
+	localAddr := groups[0].address
+	for _, server := range servers {
+		if server.ID != raftID {
+			continue
+		}
+		if server.Address != localAddr {
+			return nil, errors.Wrapf(ErrJoinMembersLocalAddrMismatch, "expected %q got %q", localAddr, server.Address)
+		}
+		return servers, nil
+	}
+	return nil, errors.Wrapf(ErrJoinMembersMissingLocalNode, "raftId=%q", raftID)
 }
 
 func resolveBootstrapServers(raftID string, groups []groupSpec, bootstrapMembers string) ([]raftengine.Server, error) {
@@ -1211,6 +1591,7 @@ func buildShardGroups(
 	// NewApplier install a private per-applier cache, silently
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
+	multi = effectiveMultiDataDirs(groups, multi)
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
@@ -1317,7 +1698,7 @@ func bootstrapSettingsForGroup(
 	explicitBootstrap bool,
 ) (bool, []raftengine.Server, []raftengine.Server) {
 	servers := cfg.serversForGroup(groupID)
-	return explicitBootstrap || len(servers) > 0, servers, cfg.bootstrapSeedForGroup(groupID)
+	return explicitBootstrap || cfg.bootstrapsGroup(groupID), servers, cfg.bootstrapSeedForGroup(groupID)
 }
 
 func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
@@ -1594,6 +1975,7 @@ type serversInput struct {
 	cfg                runtimeConfig
 	encWiring          encryptionWriteWiring
 	redisApplyObserver *adapter.RedisApplyObserver
+	cleanup            *internalutil.CleanupStack
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
@@ -1609,6 +1991,7 @@ type serversInput struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
+<<<<<<< HEAD
 type preparedRuntimeServer struct {
 	runner    *runtimeServerRunner
 	connCache *kv.GRPCConnCache
@@ -1729,6 +2112,8 @@ func startDistributionRuntimeAfterTransport(in distributionRuntimeStartupInput) 
 		in.waitRotateOnStartup, prepared.serverInput, prepared.preparedServer)
 }
 
+=======
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 type splitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
 type splitMigrationLeaderResolver func(uint64) (string, error)
 
@@ -1823,7 +2208,11 @@ func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache
 		}
 		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
 		for _, member := range cfg.Servers {
+<<<<<<< HEAD
 			if member.Suffrage != "voter" {
+=======
+			if member.Suffrage != raftMemberSuffrageVoter {
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 				continue
 			}
 			voter, err := splitMigrationVoter(groupID, member, connCache)
@@ -1858,6 +2247,12 @@ func splitMigrationLocalReadinessGate(context.Context) error {
 	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
 	}
+<<<<<<< HEAD
+=======
+	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	return nil
 }
 
@@ -1870,7 +2265,15 @@ func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, se
 	})
 }
 
+<<<<<<< HEAD
 func prepareRuntimeServerRunner(waitRotateOnStartup startupRotationWaiter, in serversInput) (*preparedRuntimeServer, error) {
+=======
+// startServersAfterStartupRotation wires up the AdminServer, starts the
+// per-group Raft listeners needed for quorum traffic, waits for a fresh join
+// to catch up, prepares the public listeners, waits for any requested startup
+// rotation, then starts serving public traffic.
+func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
 		return nil, err
@@ -1977,8 +2380,18 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 	if prepared == nil || prepared.runner == nil {
 		return errors.New("runtime server runner is not prepared")
 	}
+<<<<<<< HEAD
 	runner := prepared.runner
 	if err := runner.preparePublicServices(); err != nil {
+=======
+	if err := preparePublicServicesAfterRaftJoinReady(
+		in.ctx,
+		in.runtimes,
+		*raftId,
+		strings.TrimSpace(*raftJoinMembers) != "",
+		runner.preparePublicServices,
+	); err != nil {
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		return runner.startupFailure(err)
 	}
 	// runner.startRaftTransport() has populated runner.dynamoServer for the
@@ -2009,13 +2422,93 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
+<<<<<<< HEAD
 	runner.publicKVGate.markReady()
+=======
+	publicKVGate.markReady()
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
 	runner.startAdminHTTP()
-	return nil
+	return startFilesystemIfEnabled(
+		in.ctx,
+		in.eg,
+		in.cleanup,
+		in.shardStore,
+		in.coordinate,
+		in.metricsRegistry.FileSystemObserver(),
+	)
+}
+
+const raftJoinReadyPollInterval = 100 * time.Millisecond
+
+func preparePublicServicesAfterRaftJoinReady(
+	ctx context.Context,
+	runtimes []*raftGroupRuntime,
+	localID string,
+	enabled bool,
+	prepare func() error,
+) error {
+	if err := waitForRaftJoinReady(ctx, runtimes, localID, enabled); err != nil {
+		return errors.Wrap(err, "wait for fresh raft join before binding public services")
+	}
+	return prepare()
+}
+
+func waitForRaftJoinReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	ticker := time.NewTicker(raftJoinReadyPollInterval)
+	defer ticker.Stop()
+	for {
+		ready, err := raftJoinRuntimesReady(ctx, runtimes, localID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.WithStack(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string) (bool, error) {
+	if len(runtimes) == 0 {
+		return false, nil
+	}
+	for _, runtime := range runtimes {
+		if runtime == nil || runtime.engine == nil {
+			return false, nil
+		}
+		configuration, err := runtime.engine.Configuration(ctx)
+		if err != nil {
+			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.spec.id)
+		}
+		if !configurationContainsMember(configuration, localID) {
+			return false, nil
+		}
+		status := runtime.engine.Status()
+		if status.Leader.ID == "" || status.PendingConfChange || status.AppliedIndex < status.CommitIndex {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
+	for _, server := range configuration.Servers {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == raftMemberSuffrageVoter) {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForRaftStartupAfterTransport(ctx context.Context, runtimes []*raftGroupRuntime) error {
@@ -2039,6 +2532,8 @@ func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
 	if !*tsoEnabled {
 		return nil
 	}
+	// Group 0 is reserved for TSO state, but data-shard leaders must keep
+	// issuing timestamps locally until a TSO-leader redirect path exists.
 	tso, err := kv.NewLocalTSOAllocator(coordinate)
 	if err != nil {
 		return errors.Wrap(err, "configure tso allocator")
@@ -2346,6 +2841,7 @@ func configureAdminService(
 		token = loaded
 	}
 	srv := adapter.NewAdminServer(self, members)
+	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability())
 	unary, stream := adapter.AdminTokenAuth(token)
 	var icept adminGRPCInterceptors
 	if unary != nil {
@@ -3057,6 +3553,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
 		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
 		r.metricsRegistry.S3PutAdmissionObserver(),
+		r.metricsRegistry.S3BlobOffloadObserver(),
 	)
 	if err != nil {
 		return err

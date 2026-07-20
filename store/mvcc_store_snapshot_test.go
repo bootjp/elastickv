@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,7 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	defer snap.Close()
 
 	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotLegacyVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
 
 	// Mutate source after snapshot so restore must reflect snapshot point-in-time.
 	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
@@ -70,6 +72,10 @@ func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
 	require.NoError(t, err)
 	defer snap.Close()
 	raw := snapshotBytes(t, snap)
+<<<<<<< HEAD
+=======
+	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 	dst := newTestMVCCStore(t)
 	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{

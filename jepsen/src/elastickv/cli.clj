@@ -34,8 +34,11 @@
                      (into {})))]
    [nil "--shard-ranges RANGES" "Shard ranges (start:end=groupID,...)"
     :default nil]
-   [nil "--faults LIST" "Comma separated faults (partition,kill,clock)."
+   [nil "--faults LIST" "Comma separated faults (partition,kill,pause,clock)."
     :default "partition,kill,clock"]
+   [nil "--fault-interval SECONDS" "Seconds between nemesis operations."
+    :default 40
+    :parse-fn #(Double/parseDouble %)]
    [nil "--ssh-key PATH" "SSH private key path."
     :default "/home/vagrant/.ssh/id_rsa"]
    [nil "--ssh-user USER" "SSH username."

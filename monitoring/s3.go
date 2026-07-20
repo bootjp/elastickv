@@ -14,6 +14,16 @@ const (
 	s3PutAdmissionProtocolFixed   = "fixed-length"
 	s3PutAdmissionProtocolChunked = "chunked"
 	s3PutAdmissionProtocolUnknown = "unknown"
+
+	s3BlobOffloadModeLegacy  = "legacy"
+	s3BlobOffloadModeOffload = "offload"
+	s3BlobOffloadModeUnknown = "unknown"
+
+	s3BlobOffloadReasonFlagDisabled      = "flag_disabled"
+	s3BlobOffloadReasonCapabilityMissing = "capability_missing"
+	s3BlobOffloadReasonDataPathDisabled  = "data_path_disabled"
+	s3BlobOffloadReasonEnabled           = "enabled"
+	s3BlobOffloadReasonUnknown           = "unknown"
 )
 
 type S3PutAdmissionObserver interface {
@@ -22,10 +32,21 @@ type S3PutAdmissionObserver interface {
 	ObserveS3PutAdmissionWait(stage, protocol string, duration time.Duration)
 }
 
+type S3BlobOffloadObserver interface {
+	ObserveS3BlobOffloadDecision(mode, reason string)
+	ObserveS3ChunkBlobReplicationDegraded()
+	ObserveS3ChunkBlobSHAMismatch()
+	ObserveS3ChunkBlobUnrecoverable()
+}
+
 type S3Metrics struct {
-	putAdmissionInflightBytes prometheus.Gauge
-	putAdmissionRejections    *prometheus.CounterVec
-	putAdmissionWait          *prometheus.HistogramVec
+	putAdmissionInflightBytes    prometheus.Gauge
+	putAdmissionRejections       *prometheus.CounterVec
+	putAdmissionWait             *prometheus.HistogramVec
+	blobOffloadWriteDecisions    *prometheus.CounterVec
+	chunkBlobReplicationDegraded prometheus.Counter
+	chunkBlobSHAMismatches       prometheus.Counter
+	chunkBlobUnrecoverableReads  prometheus.Counter
 }
 
 func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
@@ -51,11 +72,40 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 			},
 			[]string{"stage", "protocol"},
 		),
+		blobOffloadWriteDecisions: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_s3_blob_offload_write_decisions_total",
+				Help: "Total S3 write-path blob offload decisions by selected mode and fallback reason.",
+			},
+			[]string{"mode", "reason"},
+		),
+		chunkBlobReplicationDegraded: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "elastickv_s3_chunkblob_replication_degraded_total",
+				Help: "Total S3 chunkblob writes that could not reach the configured replication target but remained recoverable.",
+			},
+		),
+		chunkBlobSHAMismatches: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "elastickv_s3_chunkblob_sha_mismatch_total",
+				Help: "Total S3 chunkblob reads or writes rejected because the stored payload did not match its content SHA-256.",
+			},
+		),
+		chunkBlobUnrecoverableReads: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "elastickv_s3_chunkblob_unrecoverable_total",
+				Help: "Total S3 chunkblob reads that could not recover the referenced content from any available peer.",
+			},
+		),
 	}
 	registerer.MustRegister(
 		m.putAdmissionInflightBytes,
 		m.putAdmissionRejections,
 		m.putAdmissionWait,
+		m.blobOffloadWriteDecisions,
+		m.chunkBlobReplicationDegraded,
+		m.chunkBlobSHAMismatches,
+		m.chunkBlobUnrecoverableReads,
 	)
 	return m
 }
@@ -90,12 +140,64 @@ func (m *S3Metrics) ObserveS3PutAdmissionWait(stage, protocol string, duration t
 	).Observe(duration.Seconds())
 }
 
+func (m *S3Metrics) ObserveS3BlobOffloadDecision(mode, reason string) {
+	if m == nil {
+		return
+	}
+	m.blobOffloadWriteDecisions.WithLabelValues(
+		normalizeS3BlobOffloadMode(mode),
+		normalizeS3BlobOffloadReason(reason),
+	).Inc()
+}
+
+func (m *S3Metrics) ObserveS3ChunkBlobReplicationDegraded() {
+	if m == nil {
+		return
+	}
+	m.chunkBlobReplicationDegraded.Inc()
+}
+
+func (m *S3Metrics) ObserveS3ChunkBlobSHAMismatch() {
+	if m == nil {
+		return
+	}
+	m.chunkBlobSHAMismatches.Inc()
+}
+
+func (m *S3Metrics) ObserveS3ChunkBlobUnrecoverable() {
+	if m == nil {
+		return
+	}
+	m.chunkBlobUnrecoverableReads.Inc()
+}
+
 func normalizeS3PutAdmissionStage(stage string) string {
 	switch stage {
 	case s3PutAdmissionStagePrereserve, s3PutAdmissionStagePerBatch:
 		return stage
 	default:
 		return s3PutAdmissionStageUnknown
+	}
+}
+
+func normalizeS3BlobOffloadMode(mode string) string {
+	switch mode {
+	case s3BlobOffloadModeLegacy, s3BlobOffloadModeOffload:
+		return mode
+	default:
+		return s3BlobOffloadModeUnknown
+	}
+}
+
+func normalizeS3BlobOffloadReason(reason string) string {
+	switch reason {
+	case s3BlobOffloadReasonFlagDisabled,
+		s3BlobOffloadReasonCapabilityMissing,
+		s3BlobOffloadReasonDataPathDisabled,
+		s3BlobOffloadReasonEnabled:
+		return reason
+	default:
+		return s3BlobOffloadReasonUnknown
 	}
 }
 

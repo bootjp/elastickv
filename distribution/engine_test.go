@@ -282,6 +282,34 @@ func assertStagedRouteMetadata(t *testing.T, route Route) {
 	if !route.StagedVisibilityActive || route.MigrationJobID != 42 || route.MinWriteTSExclusive != 99 {
 		t.Fatalf("staged route metadata was not preserved: %+v", route)
 	}
+<<<<<<< HEAD
+=======
+}
+
+func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 12,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 11, Start: []byte("m"), GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	route, version, ok := e.GetRouteWithVersion([]byte("z"))
+	if !ok || route.GroupID != 2 || version != 12 {
+		t.Fatalf("unexpected atomic route lookup: route=%+v version=%d ok=%v", route, version, ok)
+	}
+
+	routes, version := e.GetIntersectingRoutesWithVersion([]byte("a"), []byte("z"))
+	if len(routes) != 2 || version != 12 {
+		t.Fatalf("unexpected atomic range lookup: routes=%+v version=%d", routes, version)
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {

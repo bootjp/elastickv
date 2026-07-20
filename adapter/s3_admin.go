@@ -491,6 +491,7 @@ func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.
 		{Op: kv.DelPrefix, Key: s3keys.UploadMetaPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadPartPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.BlobPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.ChunkRefPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.GCUploadPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.RoutePrefixForBucket(bucket, generation)},
 	}

@@ -36,6 +36,11 @@ type HotPathMetrics struct {
 	dispatchErrorsTotal       *prometheus.CounterVec
 	dispatchErrorsByCodeTotal *prometheus.CounterVec
 	stepQueueFullTotal        *prometheus.CounterVec
+	sendStreamOpensTotal      *prometheus.CounterVec
+	sendStreamReconnectsTotal *prometheus.CounterVec
+	sendStreamMessagesTotal   *prometheus.CounterVec
+	snapshotStreamSendsTotal  *prometheus.CounterVec
+	snapshotPayloadBytesTotal *prometheus.CounterVec
 	luaFastPathTotal          *prometheus.CounterVec
 }
 
@@ -99,6 +104,44 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_step_queue_full_total",
 				Help: "Inbound raft messages that found the selected step queue full. Blocking replication messages wait for space; best-effort messages may still be rejected. Indicates the raft loop is starved.",
+<<<<<<< HEAD
+=======
+			},
+			[]string{"group"},
+		),
+		sendStreamOpensTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_send_stream_opens_total",
+				Help: "Successful outbound Raft SendStream opens, including reconnects.",
+			},
+			[]string{"group"},
+		),
+		sendStreamReconnectsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_send_stream_reconnects_total",
+				Help: "Successful outbound Raft SendStream reopens for peer addresses previously streamed to.",
+			},
+			[]string{"group"},
+		),
+		sendStreamMessagesTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_send_stream_messages_total",
+				Help: "Regular Raft messages accepted by the outbound SendStream path.",
+			},
+			[]string{"group"},
+		),
+		snapshotStreamSendsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_snapshot_stream_sends_total",
+				Help: "Outbound Raft snapshot streams acknowledged by peers.",
+			},
+			[]string{"group"},
+		),
+		snapshotPayloadBytesTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_raft_snapshot_stream_payload_bytes_total",
+				Help: "Payload bytes in outbound Raft snapshot streams acknowledged by peers.",
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 			},
 			[]string{"group"},
 		),
@@ -124,6 +167,11 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 		m.dispatchErrorsTotal,
 		m.dispatchErrorsByCodeTotal,
 		m.stepQueueFullTotal,
+		m.sendStreamOpensTotal,
+		m.sendStreamReconnectsTotal,
+		m.sendStreamMessagesTotal,
+		m.snapshotStreamSendsTotal,
+		m.snapshotPayloadBytesTotal,
 		m.luaFastPathTotal,
 	)
 	return m
@@ -257,6 +305,11 @@ type DispatchCounterSource interface {
 	DispatchDropCount() uint64
 	DispatchErrorCount() uint64
 	StepQueueFullCount() uint64
+	SendStreamOpenCount() uint64
+	SendStreamReconnectCount() uint64
+	SendStreamMessageCount() uint64
+	SnapshotStreamSendCount() uint64
+	SnapshotPayloadByteCount() uint64
 	// DispatchErrorCountsByCode returns a snapshot of dispatch error
 	// counts keyed by grpc status code ("Unavailable",
 	// "DeadlineExceeded", ...). Sum of values equals
@@ -286,9 +339,14 @@ type DispatchCollector struct {
 }
 
 type dispatchSnapshot struct {
-	drops     uint64
-	errors    uint64
-	stepFulls uint64
+	drops                uint64
+	errors               uint64
+	stepFulls            uint64
+	streamOpens          uint64
+	streamReconnects     uint64
+	streamMessages       uint64
+	snapshotStreamSends  uint64
+	snapshotPayloadBytes uint64
 	// byCode keeps the last-seen per-grpc-code error totals so the
 	// collector can emit monotonic deltas per code on each poll. nil
 	// until the first observation.
@@ -340,37 +398,46 @@ func (c *DispatchCollector) observeOnce(sources []DispatchSource) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, src := range sources {
-		if src.Source == nil {
-			continue
-		}
-		curr := dispatchSnapshot{
-			drops:     src.Source.DispatchDropCount(),
-			errors:    src.Source.DispatchErrorCount(),
-			stepFulls: src.Source.StepQueueFullCount(),
-			byCode:    src.Source.DispatchErrorCountsByCode(),
-		}
-		prev := c.previous[src.GroupID]
-		group := strconv.FormatUint(src.GroupID, 10)
-		// The engine's counters are monotonic; still, guard against
-		// wraparound / replacement of the underlying engine (e.g. a
-		// test reopens it) by only advancing the Prometheus counter
-		// when the current value is strictly greater than the last
-		// snapshot. A smaller value means the source was reset and
-		// we restart the delta baseline without emitting negative.
-		if curr.drops > prev.drops {
-			c.metrics.dispatchDroppedTotal.WithLabelValues(group).Add(float64(curr.drops - prev.drops))
-		}
-		if curr.errors > prev.errors {
-			c.metrics.dispatchErrorsTotal.WithLabelValues(group).Add(float64(curr.errors - prev.errors))
-		}
-		if curr.stepFulls > prev.stepFulls {
-			c.metrics.stepQueueFullTotal.WithLabelValues(group).Add(float64(curr.stepFulls - prev.stepFulls))
-		}
-		for code, count := range curr.byCode {
-			if prevCount := prev.byCode[code]; count > prevCount {
-				c.metrics.dispatchErrorsByCodeTotal.WithLabelValues(group, code).Add(float64(count - prevCount))
-			}
-		}
-		c.previous[src.GroupID] = curr
+		c.observeSource(src)
+	}
+}
+
+func (c *DispatchCollector) observeSource(src DispatchSource) {
+	if src.Source == nil {
+		return
+	}
+	curr := dispatchSnapshot{
+		drops:                src.Source.DispatchDropCount(),
+		errors:               src.Source.DispatchErrorCount(),
+		stepFulls:            src.Source.StepQueueFullCount(),
+		streamOpens:          src.Source.SendStreamOpenCount(),
+		streamReconnects:     src.Source.SendStreamReconnectCount(),
+		streamMessages:       src.Source.SendStreamMessageCount(),
+		snapshotStreamSends:  src.Source.SnapshotStreamSendCount(),
+		snapshotPayloadBytes: src.Source.SnapshotPayloadByteCount(),
+		byCode:               src.Source.DispatchErrorCountsByCode(),
+	}
+	prev := c.previous[src.GroupID]
+	group := strconv.FormatUint(src.GroupID, 10)
+
+	addCounterDelta(c.metrics.dispatchDroppedTotal.WithLabelValues(group), curr.drops, prev.drops)
+	addCounterDelta(c.metrics.dispatchErrorsTotal.WithLabelValues(group), curr.errors, prev.errors)
+	addCounterDelta(c.metrics.stepQueueFullTotal.WithLabelValues(group), curr.stepFulls, prev.stepFulls)
+	addCounterDelta(c.metrics.sendStreamOpensTotal.WithLabelValues(group), curr.streamOpens, prev.streamOpens)
+	addCounterDelta(c.metrics.sendStreamReconnectsTotal.WithLabelValues(group), curr.streamReconnects, prev.streamReconnects)
+	addCounterDelta(c.metrics.sendStreamMessagesTotal.WithLabelValues(group), curr.streamMessages, prev.streamMessages)
+	addCounterDelta(c.metrics.snapshotStreamSendsTotal.WithLabelValues(group), curr.snapshotStreamSends, prev.snapshotStreamSends)
+	addCounterDelta(c.metrics.snapshotPayloadBytesTotal.WithLabelValues(group), curr.snapshotPayloadBytes, prev.snapshotPayloadBytes)
+	for code, count := range curr.byCode {
+		addCounterDelta(c.metrics.dispatchErrorsByCodeTotal.WithLabelValues(group, code), count, prev.byCode[code])
+	}
+	c.previous[src.GroupID] = curr
+}
+
+// addCounterDelta also handles a source reset: a value below the previous
+// sample becomes the new baseline and emits no negative Prometheus delta.
+func addCounterDelta(counter prometheus.Counter, current, previous uint64) {
+	if current > previous {
+		counter.Add(float64(current - previous))
 	}
 }

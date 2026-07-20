@@ -1,8 +1,15 @@
 # Scaling roadmap — multi-region, route scale-out, storage tier, coordinator
 
-**Status:** Proposed (no implementation yet).
+**Status:** Proposed. Superseded by [2026_06_23_proposed_scaling_roadmap.md](2026_06_23_proposed_scaling_roadmap.md).
 **Author:** bootjp
 **Date:** 2026-06-12
+
+> This document is retained as the original sequencing and SLO record. It is
+> not an implementation specification and must not be used as the scope for a
+> combined implementation PR. The
+> [2026-06-23 roadmap](2026_06_23_proposed_scaling_roadmap.md) audits the current
+> implementation, closes completed prerequisites, and tracks the remaining
+> work as separate design documents and milestone PRs.
 
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
@@ -336,9 +343,15 @@ control-plane (`*_proposed_*` doc TBD).**
 
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
+<<<<<<< HEAD
 - M2's hotspot-split migration dependency is implemented in
   [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md), including
   the monotone-merge primitive.
+=======
+- M2 depends on the M2 hotspot-split migration contract
+  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
+  being implemented so the monotone-merge primitive exists.
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
 - M4 depends on M2 and M3.
@@ -531,7 +544,11 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
+<<<<<<< HEAD
 [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md)) is the
+=======
+`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits

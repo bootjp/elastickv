@@ -17,6 +17,15 @@
     (is (= #{:start-cross-group-split :verify-cross-group-split}
            (nemesis/fs (:nemesis package))))))
 
+<<<<<<< HEAD
+=======
+(deftest split-register-keys-cover-both-routes
+  (let [split-key (var-get (ns-resolve 'elastickv.split-workload 'split-key))
+        register-keys (var-get (ns-resolve 'elastickv.split-workload 'register-keys))]
+    (is (some #(neg? (compare % split-key)) register-keys))
+    (is (some #(not (neg? (compare % split-key))) register-keys))))
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 (deftest split-nemesis-starts-cross-group-job
   (let [calls (atom [])]
     (with-redefs [shell/sh (fn [& args]

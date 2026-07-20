@@ -147,6 +147,37 @@ func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	}, stream.responses[0].GetVersions())
 }
 
+<<<<<<< HEAD
+=======
+func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	userKey := []byte("target-list")
+	key := legacyListMetaDeltaKey(userKey, 10)
+	value := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, key, value, 10, 0))
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte("target"),
+		RouteEnd:        []byte("target-list\x00"),
+		KeyFamily:       distribution.MigrationFamilyLegacyListMetaDelta,
+		RangeStart:      []byte(store.LegacyListMetaDeltaPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(store.LegacyListMetaDeltaPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: key, CommitTs: 10, Value: value, KeyFamily: distribution.MigrationFamilyLegacyListMetaDelta},
+	}, stream.responses[0].GetVersions())
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestInternalExportRangeVersionsUsesAppliedReadFence(t *testing.T) {
 	t.Parallel()
 
@@ -731,3 +762,27 @@ func TestInternalApplyTargetStagedReadinessRejectsArmedZeroMinWriteTS(t *testing
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.Equal(t, uint64(0), proposer.calls)
 }
+<<<<<<< HEAD
+=======
+
+func TestInternalCleanupMigrationRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	proposer := &applyingMigrationProposer{fsm: kv.NewKvFSMWithHLC(store.NewMVCCStore(), nil)}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationCleanupGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration cleanup disabled for test")
+		}),
+	)
+
+	resp, err := internal.CleanupMigration(context.Background(), &pb.CleanupMigrationRequest{
+		JobId:     9,
+		Mode:      pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
+		KeyFamily: distribution.MigrationFamilyUser,
+	})
+	require.Nil(t, resp)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Zero(t, proposer.calls)
+}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete

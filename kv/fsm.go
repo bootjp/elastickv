@@ -760,6 +760,12 @@ func (f *kvFSM) verifyTargetReadinessForReadKeys(ctx context.Context, keys [][]b
 		if isTxnInternalKey(key) {
 			continue
 		}
+<<<<<<< HEAD
+=======
+		if err := f.verifySourceReadFenceForRange(ctx, key, nextScanCursor(key)); err != nil {
+			return err
+		}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		if err := f.verifyTargetReadinessForRange(ctx, key, nextScanCursor(key)); err != nil {
 			return err
 		}
@@ -767,6 +773,25 @@ func (f *kvFSM) verifyTargetReadinessForReadKeys(ctx context.Context, keys [][]b
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+func (f *kvFSM) verifySourceReadFenceForRange(ctx context.Context, start []byte, end []byte) error {
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
+	return nil
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (f *kvFSM) verifyTargetReadinessForTxnFootprint(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, primaryKey []byte) error {
 	if len(primaryKey) != 0 && !isTxnInternalKey(primaryKey) {
 		if err := f.verifyTargetReadinessForRange(ctx, primaryKey, nextScanCursor(primaryKey)); err != nil {
@@ -988,13 +1013,20 @@ func rawPrefixMayContainRouteMappedKeys(prefix []byte) bool {
 	return false
 }
 
+<<<<<<< HEAD
 var routeMappedRawPrefixes = [][]byte{
+=======
+var routeMappedRawPrefixes = append([][]byte{
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	[]byte(redisInternalRoutePrefix),
 	[]byte(DynamoTableMetaPrefix),
 	[]byte(DynamoTableGenerationPrefix),
 	[]byte(DynamoItemPrefix),
 	[]byte(DynamoGSIPrefix),
+<<<<<<< HEAD
 	[]byte(sqsInternalPrefix),
+=======
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	[]byte(store.ListMetaPrefix),
 	[]byte(store.ListItemPrefix),
 	[]byte(store.ListMetaDeltaPrefix),
@@ -1019,7 +1051,11 @@ var routeMappedRawPrefixes = [][]byte{
 	[]byte(s3keys.BlobPrefix),
 	[]byte(s3keys.GCUploadPrefix),
 	[]byte(s3keys.RoutePrefix),
+<<<<<<< HEAD
 }
+=======
+}, sqsConcreteInternalPrefixBytes...)
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 var ErrNotImplemented = errors.New("not implemented")
 

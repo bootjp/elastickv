@@ -183,9 +183,16 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenLocalReadinessFails(t *testi
 	require.ErrorContains(t, err, "migration opcode disabled")
 }
 
+<<<<<<< HEAD
 func TestSplitMigrationLocalReadinessGateRequiresImportAndPromoteOpcodes(t *testing.T) {
 	t.Setenv(adapter.MigrationImportOpcodeEnv, "")
 	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
+=======
+func TestSplitMigrationLocalReadinessGateRequiresMigrationOpcodes(t *testing.T) {
+	t.Setenv(adapter.MigrationImportOpcodeEnv, "")
+	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
+	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	err := splitMigrationLocalReadinessGate(context.Background())
 	require.Error(t, err)
 	require.ErrorContains(t, err, adapter.MigrationImportOpcodeEnv)
@@ -197,6 +204,15 @@ func TestSplitMigrationLocalReadinessGateRequiresImportAndPromoteOpcodes(t *test
 	require.ErrorContains(t, err, adapter.MigrationPromoteOpcodeEnv)
 
 	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
+<<<<<<< HEAD
+=======
+	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "")
+	err = splitMigrationLocalReadinessGate(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, adapter.MigrationCleanupOpcodeEnv)
+
+	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
 }
 

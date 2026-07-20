@@ -19,6 +19,13 @@ type Elem[T OP] struct {
 	Op    T
 	Key   []byte
 	Value []byte
+<<<<<<< HEAD
+=======
+	// CommitTSValueOffset, when non-zero, asks the coordinator or forwarded
+	// leader to stamp the resolved transaction commit timestamp into Value at
+	// this byte offset before committing the mutation.
+	CommitTSValueOffset uint64
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	// GroupID optionally pins this mutation to a shard group. Zero preserves
 	// normal key-based routing.
 	GroupID uint64

@@ -89,16 +89,32 @@ func TestLeaseReadObserverZeroValueIsNoop(t *testing.T) {
 // uint64s so tests can advance counters without touching the etcd
 // engine directly.
 type fakeDispatchSource struct {
-	drops      atomic.Uint64
-	errors     atomic.Uint64
-	stepFulls  atomic.Uint64
-	byCodeMu   sync.Mutex
-	byCodeVals map[string]uint64
+	drops                atomic.Uint64
+	errors               atomic.Uint64
+	stepFulls            atomic.Uint64
+	streamOpens          atomic.Uint64
+	streamReconnects     atomic.Uint64
+	streamMessages       atomic.Uint64
+	snapshotStreamSends  atomic.Uint64
+	snapshotPayloadBytes atomic.Uint64
+	byCodeMu             sync.Mutex
+	byCodeVals           map[string]uint64
 }
 
-func (f *fakeDispatchSource) DispatchDropCount() uint64  { return f.drops.Load() }
-func (f *fakeDispatchSource) DispatchErrorCount() uint64 { return f.errors.Load() }
-func (f *fakeDispatchSource) StepQueueFullCount() uint64 { return f.stepFulls.Load() }
+func (f *fakeDispatchSource) DispatchDropCount() uint64   { return f.drops.Load() }
+func (f *fakeDispatchSource) DispatchErrorCount() uint64  { return f.errors.Load() }
+func (f *fakeDispatchSource) StepQueueFullCount() uint64  { return f.stepFulls.Load() }
+func (f *fakeDispatchSource) SendStreamOpenCount() uint64 { return f.streamOpens.Load() }
+func (f *fakeDispatchSource) SendStreamReconnectCount() uint64 {
+	return f.streamReconnects.Load()
+}
+func (f *fakeDispatchSource) SendStreamMessageCount() uint64 { return f.streamMessages.Load() }
+func (f *fakeDispatchSource) SnapshotStreamSendCount() uint64 {
+	return f.snapshotStreamSends.Load()
+}
+func (f *fakeDispatchSource) SnapshotPayloadByteCount() uint64 {
+	return f.snapshotPayloadBytes.Load()
+}
 
 func (f *fakeDispatchSource) DispatchErrorCountsByCode() map[string]uint64 {
 	f.byCodeMu.Lock()
@@ -133,6 +149,11 @@ func TestDispatchCollectorMirrorsDeltas(t *testing.T) {
 	src.drops.Store(3)
 	src.errors.Store(2)
 	src.stepFulls.Store(1)
+	src.streamOpens.Store(4)
+	src.streamReconnects.Store(2)
+	src.streamMessages.Store(30)
+	src.snapshotStreamSends.Store(3)
+	src.snapshotPayloadBytes.Store(4096)
 	collector.ObserveOnce(sources)
 
 	// A second pass with no change must NOT double-count.
@@ -150,10 +171,30 @@ elastickv_raft_dispatch_errors_total{group="1",node_address="10.0.0.1:50051",nod
 # HELP elastickv_raft_step_queue_full_total Inbound raft messages that found the selected step queue full. Blocking replication messages wait for space; best-effort messages may still be rejected. Indicates the raft loop is starved.
 # TYPE elastickv_raft_step_queue_full_total counter
 elastickv_raft_step_queue_full_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 1
+# HELP elastickv_raft_send_stream_opens_total Successful outbound Raft SendStream opens, including reconnects.
+# TYPE elastickv_raft_send_stream_opens_total counter
+elastickv_raft_send_stream_opens_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 4
+# HELP elastickv_raft_send_stream_reconnects_total Successful outbound Raft SendStream reopens for peer addresses previously streamed to.
+# TYPE elastickv_raft_send_stream_reconnects_total counter
+elastickv_raft_send_stream_reconnects_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
+# HELP elastickv_raft_send_stream_messages_total Regular Raft messages accepted by the outbound SendStream path.
+# TYPE elastickv_raft_send_stream_messages_total counter
+elastickv_raft_send_stream_messages_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 30
+# HELP elastickv_raft_snapshot_stream_sends_total Outbound Raft snapshot streams acknowledged by peers.
+# TYPE elastickv_raft_snapshot_stream_sends_total counter
+elastickv_raft_snapshot_stream_sends_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 3
+# HELP elastickv_raft_snapshot_stream_payload_bytes_total Payload bytes in outbound Raft snapshot streams acknowledged by peers.
+# TYPE elastickv_raft_snapshot_stream_payload_bytes_total counter
+elastickv_raft_snapshot_stream_payload_bytes_total{group="1",node_address="10.0.0.1:50051",node_id="n1"} 4096
 `),
 		"elastickv_raft_dispatch_dropped_total",
 		"elastickv_raft_dispatch_errors_total",
 		"elastickv_raft_step_queue_full_total",
+		"elastickv_raft_send_stream_opens_total",
+		"elastickv_raft_send_stream_reconnects_total",
+		"elastickv_raft_send_stream_messages_total",
+		"elastickv_raft_snapshot_stream_sends_total",
+		"elastickv_raft_snapshot_stream_payload_bytes_total",
 	)
 	require.NoError(t, err)
 }

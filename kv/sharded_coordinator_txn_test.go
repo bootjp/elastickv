@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -353,6 +354,32 @@ func TestShardedCoordinatorDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 }
 
+func TestShardedCoordinatorDelPrefixBroadcast_UsesConfiguredAllShardGroups(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	tsoTxn := &recordingTransactional{}
+	dataTxn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		0: {Txn: tsoTxn},
+		1: {Txn: dataTxn},
+	}, 1, NewHLC(), nil).WithAllShardGroups(1)
+
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: DelPrefix, Key: []byte("tenant/")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Empty(t, tsoTxn.requests)
+	require.Len(t, dataTxn.requests, 1)
+	require.Equal(t, pb.Op_DEL_PREFIX, dataTxn.requests[0].Mutations[0].Op)
+	require.Equal(t, []byte("tenant/"), dataTxn.requests[0].Mutations[0].Key)
+}
+
 func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing.T) {
 	t.Parallel()
 
@@ -379,12 +406,14 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	}, 1, NewHLC(), nil)
 
 	startTS := uint64(10)
+	value1 := make([]byte, 16)
+	value2 := make([]byte, 16)
 	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
-			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+			{Op: Put, Key: []byte("b"), Value: value1, CommitTSValueOffset: 4},
+			{Op: Put, Key: []byte("x"), Value: value2, CommitTSValueOffset: 4},
 		},
 	})
 	require.NoError(t, err)
@@ -406,9 +435,9 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Len(t, g1Prepare.Mutations, 2)
 	require.Len(t, g2Prepare.Mutations, 2)
 	require.Equal(t, []byte("b"), g1Prepare.Mutations[1].Key)
-	require.Equal(t, []byte("v1"), g1Prepare.Mutations[1].Value)
 	require.Equal(t, []byte("x"), g2Prepare.Mutations[1].Key)
-	require.Equal(t, []byte("v2"), g2Prepare.Mutations[1].Value)
+	require.Zero(t, g1Prepare.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, g2Prepare.Mutations[1].CommitTsValueOffset)
 
 	prepareMeta1 := requestTxnMeta(t, g1Prepare)
 	prepareMeta2 := requestTxnMeta(t, g2Prepare)
@@ -438,6 +467,12 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Zero(t, commitMeta2.LockTTLms)
 	require.Equal(t, prepareMeta1.CommitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitMeta1.CommitTS, commitMeta2.CommitTS)
+	require.Equal(t, commitMeta1.CommitTS, binary.BigEndian.Uint64(g1Prepare.Mutations[1].Value[4:12]))
+	require.Equal(t, commitMeta1.CommitTS, binary.BigEndian.Uint64(g2Prepare.Mutations[1].Value[4:12]))
+	require.Zero(t, g1Commit.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, g2Commit.Mutations[1].CommitTsValueOffset)
+	require.Zero(t, binary.BigEndian.Uint64(value1[4:12]))
+	require.Zero(t, binary.BigEndian.Uint64(value2[4:12]))
 }
 
 func TestShardedCoordinatorDispatchTxn_SingleShardUsesOnePhase(t *testing.T) {
@@ -857,6 +892,39 @@ func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+<<<<<<< HEAD
+=======
+func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	readOnlyStore := &stubMVCCStore{
+		latestTS: map[string]uint64{"x": 5},
+		readiness: []store.TargetStagedReadinessState{{
+			JobID:               7,
+			RouteStart:          []byte("m"),
+			MigrationJobID:      7,
+			MinWriteTSExclusive: 100,
+			Armed:               true,
+			SourceWriteFence:    true,
+			SourceReadFence:     true,
+			RetentionPinTS:      10,
+		}},
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {Store: readOnlyStore, Engine: noopEngine{}},
+	}, 1, NewHLC(), nil)
+
+	err := coord.validateReadOnlyShards(context.Background(), map[uint64][][]byte{
+		2: {[]byte("x")},
+	}, []uint64{1}, 10)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()

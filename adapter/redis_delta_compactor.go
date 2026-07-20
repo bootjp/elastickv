@@ -837,7 +837,11 @@ func (c *DeltaCompactor) legacyListHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractLegacyListUserKeyFromDelta,
 		acceptDeltaKV:    isListMetaDeltaKV,
 		deltaKeyPrefixFn: store.LegacyListMetaDeltaScanPrefix,
+<<<<<<< HEAD
 		buildElems:       c.buildListCompactElems,
+=======
+		buildElems:       c.buildLegacyListCompactElems,
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 }
 
@@ -846,6 +850,14 @@ func isListMetaDeltaKV(pair *store.KVPair) bool {
 }
 
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	return c.buildListCompactElemsWithDeltaPrefix(ctx, userKey, deltaKVs, readTS, store.ListMetaDeltaScanPrefix(userKey))
+}
+
+func (c *DeltaCompactor) buildLegacyListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	return c.buildListCompactElemsWithDeltaPrefix(ctx, userKey, deltaKVs, readTS, store.LegacyListMetaDeltaScanPrefix(userKey))
+}
+
+func (c *DeltaCompactor) buildListCompactElemsWithDeltaPrefix(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64, deltaScanPrefix []byte) ([]*kv.Elem[kv.OP], error) {
 	// Read base metadata (may not exist if all state is in deltas).
 	baseMeta, rawBaseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
 	if err != nil {
@@ -853,7 +865,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	}
 	expireAt, err := compactedMetaExpireAt(
 		ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt,
-		deltaKVs, store.ListMetaDeltaScanPrefix(userKey),
+		deltaKVs, deltaScanPrefix,
 	)
 	if err != nil {
 		return nil, err

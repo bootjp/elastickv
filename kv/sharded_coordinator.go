@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -374,8 +375,19 @@ type ShardedCoordinator struct {
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
 	tsAllocator TimestampAllocator
-	store       store.MVCCStore
-	log         *slog.Logger
+	// timestampGroup pins IsTimestampLeader to a dedicated Raft group when
+	// timestampGroupConfigured is true. Nil/false preserves the M3 bridge
+	// behavior where any locally-led shard group can issue TSO timestamps.
+	timestampGroup           uint64
+	timestampGroupConfigured bool
+	// allShardGroupIDs, when configured, is the explicit set of data groups
+	// that whole-keyspace operations must visit. It lets callers keep
+	// non-data groups (for example a reserved timestamp group) in c.groups
+	// without letting Scan fences or DEL_PREFIX broadcasts touch them.
+	allShardGroupIDs         []uint64
+	allShardGroupsConfigured bool
+	store                    store.MVCCStore
+	log                      *slog.Logger
 	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
@@ -448,6 +460,27 @@ func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedC
 // path unless this is wired explicitly.
 func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
 	c.tsAllocator = alloc
+	return c
+}
+
+// WithTimestampGroup pins timestamp issuance leadership to one Raft group.
+// Callers should only enable this once a data-shard leader can redirect
+// timestamp allocation to that group; otherwise data leaders would stop being
+// able to commit writes when they do not also lead the timestamp group.
+func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
+	c.timestampGroup = groupID
+	c.timestampGroupConfigured = true
+	return c
+}
+
+// WithAllShardGroups restricts whole-keyspace operations to the supplied data
+// groups. When unset, the coordinator preserves the legacy behaviour and uses
+// every group it owns.
+func (c *ShardedCoordinator) WithAllShardGroups(groupIDs ...uint64) *ShardedCoordinator {
+	c.allShardGroupIDs = slices.Clone(groupIDs)
+	slices.Sort(c.allShardGroupIDs)
+	c.allShardGroupIDs = slices.Compact(c.allShardGroupIDs)
+	c.allShardGroupsConfigured = true
 	return c
 }
 
@@ -1107,9 +1140,16 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 }
 
 // dispatchDelPrefixBroadcast validates and broadcasts DEL_PREFIX operations
+<<<<<<< HEAD
 // to every shard group. Each element becomes a separate pb.Request (the FSM's
 // extractDelPrefix processes only the first DEL_PREFIX mutation per request).
 // All requests are batched into a single Commit call per shard group.
+=======
+// to every configured all-shard data group. Each element becomes a separate
+// pb.Request (the FSM's extractDelPrefix processes only the first DEL_PREFIX
+// mutation per request). All requests are batched into a single Commit call
+// per shard group.
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP], observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
@@ -1322,8 +1362,13 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefix(prefix []byte, c
 	return nil
 }
 
+<<<<<<< HEAD
 // broadcastToAllGroups sends the same set of requests to every shard group in
 // parallel and returns the maximum commit index.
+=======
+// broadcastToAllGroups sends the same set of requests to every configured
+// all-shard data group in parallel and returns the maximum commit index.
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests []*pb.Request) (*CoordinateResponse, error) {
 	var (
 		maxIndex atomic.Uint64
@@ -1331,7 +1376,11 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 		errMu    sync.Mutex
 		wg       sync.WaitGroup
 	)
-	for _, g := range c.groups {
+	groups, err := c.allShardGroups()
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
 		wg.Add(1)
 		go func(g *ShardGroup) {
 			defer wg.Done()
@@ -1380,6 +1429,12 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err != nil {
 		return nil, err
 	}
+<<<<<<< HEAD
+=======
+	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
+		return nil, err
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if err := c.rejectWriteTimestampFloorPointElems(elems, commitTS); err != nil {
 		return nil, err
 	}
@@ -1392,6 +1447,12 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// preserving SSI.
 		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
 	}
+<<<<<<< HEAD
+=======
+	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
+		return nil, err
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup)
 }
 
@@ -1463,7 +1524,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
 }
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {
@@ -1519,7 +1580,49 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	if resp == nil {
 		return &CoordinateResponse{}, nil
 	}
-	return &CoordinateResponse{CommitIndex: resp.CommitIndex}, nil
+	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
+	if len(readKeys) == 0 {
+		return readKeys
+	}
+	var out [][]byte
+	for _, key := range readKeys {
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, elems []*Elem[OP]) [][]byte {
+	var out [][]byte
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, elem.Key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
 }
 
 func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
@@ -1939,12 +2042,42 @@ func (c *ShardedCoordinator) IsTimestampLeader() bool {
 	if c == nil {
 		return false
 	}
-	for _, g := range c.groups {
-		if isLeaderEngine(engineForGroup(g)) {
+	if c.timestampGroupConfigured {
+		return isLeaderEngine(engineForGroup(c.groups[c.timestampGroup]))
+	}
+	for _, groupID := range c.timestampBridgeCandidateGroupIDs() {
+		if isLeaderEngine(engineForGroup(c.groups[groupID])) {
 			return true
 		}
 	}
 	return false
+}
+
+func (c *ShardedCoordinator) timestampBridgeCandidateGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if c.allShardGroupsConfigured {
+		ids := make([]uint64, 0, len(c.allShardGroupIDs))
+		for _, groupID := range c.allShardGroupIDs {
+			if groupID == 0 {
+				continue
+			}
+			if _, ok := c.groups[groupID]; ok {
+				ids = append(ids, groupID)
+			}
+		}
+		return ids
+	}
+	ids := make([]uint64, 0, len(c.groups))
+	for groupID := range c.groups {
+		if groupID == 0 {
+			continue
+		}
+		ids = append(ids, groupID)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 func (c *ShardedCoordinator) invalidateTimestampWindow() {
@@ -2033,25 +2166,64 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
-// LeaseReadAllGroups establishes the lease freshness bound on every shard
-// group this coordinator owns. Multi-shard reads (Scan, GSI/whole-table
-// Query) visit all intersecting routes across all groups (see
-// ShardStore.ScanAt), so fencing only the default group would let those
-// reads sample a snapshot on a non-default group without the freshness
-// bound. It fails closed on the first group that cannot confirm its lease,
-// since a partially-fenced read is exactly the stale read this guards
-// against. Group iteration order is unspecified; correctness does not
-// depend on it because every group must succeed.
+// LeaseReadAllGroups establishes the lease freshness bound on every configured
+// all-shard data group. Multi-shard reads (Scan, GSI/whole-table Query) visit
+// all intersecting data routes across all groups (see ShardStore.ScanAt), so
+// fencing only the default group would let those reads sample a snapshot on a
+// non-default group without the freshness bound. It fails closed on the first
+// group that cannot confirm its lease, since a partially-fenced read is exactly
+// the stale read this guards against. Group iteration order is deterministic
+// but correctness does not depend on it because every configured group must
+// succeed.
 func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
-	if len(c.groups) == 0 {
-		return errors.WithStack(ErrLeaderNotFound)
+	groups, err := c.allShardGroups()
+	if err != nil {
+		return err
 	}
-	for _, g := range c.groups {
+	for _, g := range groups {
 		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) allShardGroups() ([]*ShardGroup, error) {
+	if c == nil || len(c.groups) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	if c.allShardGroupsConfigured {
+		return c.configuredAllShardGroups()
+	}
+	return c.ownedAllShardGroups()
+}
+
+func (c *ShardedCoordinator) configuredAllShardGroups() ([]*ShardGroup, error) {
+	if len(c.allShardGroupIDs) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	out := make([]*ShardGroup, 0, len(c.allShardGroupIDs))
+	for _, gid := range c.allShardGroupIDs {
+		g, ok := c.groups[gid]
+		if !ok || g == nil {
+			return nil, errors.WithStack(ErrLeaderNotFound)
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+func (c *ShardedCoordinator) ownedAllShardGroups() ([]*ShardGroup, error) {
+	gids := slices.Sorted(maps.Keys(c.groups))
+	out := make([]*ShardGroup, 0, len(gids))
+	for _, gid := range gids {
+		g := c.groups[gid]
+		if g == nil {
+			return nil, errors.WithStack(ErrLeaderNotFound)
+		}
+		out = append(out, g)
+	}
+	return out, nil
 }
 
 // observeLeaseRead forwards a hit / miss signal to observer when it
@@ -2352,6 +2524,12 @@ func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.
 		return nil
 	}
 	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
+<<<<<<< HEAD
+=======
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	routes, catalogVersion, proof := c.currentShardRoutesForRouteRange(gid, routeStart, routeEnd)
 	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, gid, catalogVersion, proof) {
 		return nil
@@ -2529,6 +2707,12 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err != nil {
 		return nil, err
 	}
+<<<<<<< HEAD
+=======
+	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
+		return nil, err
+	}
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
 }

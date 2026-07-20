@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
@@ -50,6 +51,17 @@ var (
 var grpcNewClient = grpc.NewClient
 
 type MessageHandler func(context.Context, raftpb.Message) error
+
+// TransportStats is a monotonic snapshot of successful streaming transport
+// activity. The counters are observational only: no dispatch or retry decision
+// depends on them.
+type TransportStats struct {
+	SendStreamOpens      uint64
+	SendStreamReconnects uint64
+	SendStreamMessages   uint64
+	SnapshotStreamSends  uint64
+	SnapshotPayloadBytes uint64
+}
 
 type peerStream struct {
 	mu     sync.Mutex
@@ -113,6 +125,7 @@ type GRPCTransport struct {
 	streamSupported     map[string]bool
 	streamUnsupported   map[string]bool
 	streamUnsupportedAt map[string]time.Time
+	streamOpenedBefore  map[string]struct{}
 	sendStreamDisabled  bool
 	sendStreamCtx       context.Context
 	sendStreamCancel    context.CancelFunc
@@ -135,6 +148,15 @@ type GRPCTransport struct {
 	// dispatch workers run simultaneously.
 	bridgeSem       chan struct{}
 	snapshotSendSem chan struct{}
+<<<<<<< HEAD
+=======
+
+	sendStreamOpenCount      atomic.Uint64
+	sendStreamReconnectCount atomic.Uint64
+	sendStreamMessageCount   atomic.Uint64
+	snapshotStreamSendCount  atomic.Uint64
+	snapshotPayloadByteCount atomic.Uint64
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {
@@ -164,6 +186,7 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		streamSupported:     make(map[string]bool),
 		streamUnsupported:   make(map[string]bool),
 		streamUnsupportedAt: make(map[string]time.Time),
+		streamOpenedBefore:  make(map[string]struct{}),
 		sendStreamDisabled:  sendStreamDisabled,
 		sendStreamCtx:       sendStreamCtx,
 		sendStreamCancel:    sendStreamCancel,
@@ -171,6 +194,33 @@ func NewGRPCTransport(peers []Peer) *GRPCTransport {
 		bridgeSem:           make(chan struct{}, defaultBridgeMaterializeLimit),
 		snapshotSendSem:     make(chan struct{}, 1),
 	}
+}
+
+// Stats returns a point-in-time copy of the transport's monotonic streaming
+// counters. It is safe to call concurrently with dispatch.
+func (t *GRPCTransport) Stats() TransportStats {
+	if t == nil {
+		return TransportStats{}
+	}
+	return TransportStats{
+		SendStreamOpens:      t.sendStreamOpenCount.Load(),
+		SendStreamReconnects: t.sendStreamReconnectCount.Load(),
+		SendStreamMessages:   t.sendStreamMessageCount.Load(),
+		SnapshotStreamSends:  t.snapshotStreamSendCount.Load(),
+		SnapshotPayloadBytes: t.snapshotPayloadByteCount.Load(),
+	}
+}
+
+func (t *GRPCTransport) recordSnapshotStreamSend(payloadBytes uint64) {
+	t.snapshotStreamSendCount.Add(1)
+	t.snapshotPayloadByteCount.Add(payloadBytes)
+}
+
+func snapshotPayloadByteCount(size int64) uint64 {
+	if size <= 0 {
+		return 0
+	}
+	return uint64(size) //nolint:gosec // size is explicitly checked non-negative above.
 }
 
 func sendStreamEnabledFromEnv() bool {
@@ -477,6 +527,7 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	if _, err := stream.CloseAndRecv(); err != nil {
 		return errors.WithStack(err)
 	}
+	t.recordSnapshotStreamSend(snapshotPayloadByteCount(counter.n))
 	slog.Info("etcd raft snapshot stream sent",
 		"index", index,
 		"to", msg.GetTo(),
@@ -620,6 +671,7 @@ func (t *GRPCTransport) dispatchRegularStream(ctx context.Context, address strin
 	}
 	err = stream.stream.Send(req)
 	if err == nil {
+		t.sendStreamMessageCount.Add(1)
 		err = stream.terminalErr()
 	}
 	stream.mu.Unlock()
@@ -705,6 +757,12 @@ func (t *GRPCTransport) openPeerStream(ctx context.Context, address string, clie
 		return existing, nil
 	}
 	t.streams[address] = opened
+	if _, reopened := t.streamOpenedBefore[address]; reopened {
+		t.sendStreamReconnectCount.Add(1)
+	} else {
+		t.streamOpenedBefore[address] = struct{}{}
+	}
+	t.sendStreamOpenCount.Add(1)
 	go func() {
 		<-opened.done
 		t.closePeerStream(address, opened)
@@ -967,8 +1025,11 @@ func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) er
 	if err := sendSnapshotChunks(stream, header, payload, t.chunkSize()); err != nil {
 		return err
 	}
-	_, err = stream.CloseAndRecv()
-	return errors.WithStack(err)
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return errors.WithStack(err)
+	}
+	t.recordSnapshotStreamSend(uint64(len(payload)))
+	return nil
 }
 
 func (t *GRPCTransport) sendSnapshotSpool(ctx context.Context, msg raftpb.Message, spool *snapshotSpool) error {
@@ -992,8 +1053,11 @@ func (t *GRPCTransport) sendSnapshotSpool(ctx context.Context, msg raftpb.Messag
 	if err := sendSnapshotReaderChunks(stream, header, reader, t.chunkSize()); err != nil {
 		return err
 	}
-	_, err = stream.CloseAndRecv()
-	return errors.WithStack(err)
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return errors.WithStack(err)
+	}
+	t.recordSnapshotStreamSend(snapshotPayloadByteCount(spool.size))
+	return nil
 }
 
 func (t *GRPCTransport) clientFor(to uint64) (pb.EtcdRaftClient, error) {

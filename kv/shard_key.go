@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 )
@@ -76,6 +77,10 @@ var (
 		dynamoRouteKey,
 		sqsRouteKey,
 		s3keys.ExtractRouteKey,
+<<<<<<< HEAD
+=======
+		fskeys.ExtractRouteKey,
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		listRouteKey,
 		hashRouteKey,
 		setRouteKey,
@@ -85,8 +90,12 @@ var (
 	}
 )
 
-// routeKey normalizes internal keys (e.g., list metadata/items) to the logical
+// RouteKey normalizes internal keys (e.g., list metadata/items) to the logical
 // user key used for shard routing.
+func RouteKey(key []byte) []byte {
+	return routeKey(key)
+}
+
 func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil
@@ -106,7 +115,11 @@ func normalizeRouteKey(key []byte) []byte {
 	return key
 }
 
+<<<<<<< HEAD
 func redisWideColumnScanRouteKey(key []byte) []byte {
+=======
+func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	for _, prefix := range [][]byte{
 		[]byte(store.HashMetaDeltaPrefix),
 		[]byte(store.HashMetaPrefix),
@@ -119,11 +132,37 @@ func redisWideColumnScanRouteKey(key []byte) []byte {
 		[]byte(store.ZSetMemberPrefix),
 		[]byte(store.ZSetScorePrefix),
 	} {
-		if user := wideColumnScanUserKey(key, prefix); user != nil {
-			return user
+		if !bytes.HasPrefix(key, prefix) {
+			continue
 		}
+		user := wideColumnScanUserKey(key, prefix)
+		if user == nil {
+			return prefix, nil, nil, true, false
+		}
+		prefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		return prefix, user, key[:prefixLen], true, true
 	}
-	return nil
+	return nil, nil, nil, false, false
+}
+
+func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
+	prefix, userKey, userPrefix, owned, parsed := redisWideColumnScanRouteParts(start)
+	if !owned {
+		return nil, nil, false, false
+	}
+	if !parsed {
+		return nil, nil, false, true
+	}
+	if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+		return userKey, nil, true, true
+	}
+	if bytes.Equal(start, userPrefix) && end != nil && bytes.Compare(end, prefixScanEnd(prefix)) <= 0 {
+		return userKey, prefixScanEnd(userKey), false, true
+	}
+	// Physical wide-column cursors include a field/member suffix. Their raw
+	// ordering cannot be projected to a logical user-key lower bound, so the
+	// remaining namespace must fan out to every logical route.
+	return nil, nil, false, true
 }
 
 func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
@@ -135,11 +174,21 @@ func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 		return nil
 	}
 	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
+<<<<<<< HEAD
 	if uint64(keyLen) > uint64(len(rest)-wideColumnEncodedKeyLengthSize) { //nolint:gosec // non-negative slice length fits uint64.
 		return nil
 	}
 	return rest[wideColumnEncodedKeyLengthSize : uint32(wideColumnEncodedKeyLengthSize)+keyLen]
 }
+=======
+	rest = rest[wideColumnEncodedKeyLengthSize:]
+	if uint64(keyLen) > uint64(len(rest)) {
+		return nil
+	}
+	return rest[:keyLen]
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func redisRouteKey(key []byte) []byte {
 	if !bytes.HasPrefix(key, redisInternalRoutePrefixBytes) {
 		return nil

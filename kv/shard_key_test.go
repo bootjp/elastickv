@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -30,6 +31,16 @@ func TestRouteKey_NormalizesTxnWrappedS3Key(t *testing.T) {
 
 	embedded := s3keys.UploadPartKey("bucket-a", 7, "path/to/object", "upload-1", 3)
 	require.Equal(t, s3keys.RouteKey("bucket-a", 7, "path/to/object"), routeKey(txnLockKey(embedded)))
+}
+
+func TestRouteKey_NormalizesFilesystemChunkKey(t *testing.T) {
+	t.Parallel()
+
+	want := fskeys.ChunkRouteKey(11, 22)
+	require.Equal(t, want, routeKey(fskeys.ChunkKey(11, 22, 1)))
+	require.Equal(t, want, routeKey(fskeys.ChunkKey(11, 22, 99)))
+	require.Equal(t, want, routeKey(txnLockKey(fskeys.ChunkKey(11, 22, 7))))
+	require.Equal(t, fskeys.InodeKey(22), routeKey(fskeys.InodeKey(22)))
 }
 
 func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
@@ -65,6 +76,37 @@ func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
 		require.Equal(t, userKey, routeKey(raw))
 		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
 	}
+}
+
+func TestRedisWideColumnScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.HashFieldPrefix)
+	familyEnd := prefixScanEnd(prefix)
+	start := store.HashFieldScanPrefix([]byte("alice"))
+	cursor := append(append([]byte(nil), start...), []byte("field\x00")...)
+
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "bare family", start: prefix},
+		{name: "physical cursor", start: cursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(tc.start, familyEnd)
+			require.True(t, ok)
+			require.False(t, exact)
+			require.Nil(t, routeStart)
+			require.Nil(t, routeEnd)
+		})
+	}
+
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, prefixScanEnd(start))
+	require.True(t, ok)
+	require.True(t, exact)
+	require.Equal(t, []byte("alice"), routeStart)
+	require.Nil(t, routeEnd)
 }
 
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
@@ -321,6 +363,21 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 			wantEnd:   nil,
 		},
 		{
+<<<<<<< HEAD
+=======
+			name:      "raw sqs-looking user prefix",
+			prefix:    []byte("!sqs|foo"),
+			wantStart: []byte("!sqs|foo"),
+			wantEnd:   prefixScanEnd([]byte("!sqs|foo")),
+		},
+		{
+			name:      "concrete sqs storage prefix",
+			prefix:    []byte(sqsMsgDataPrefix),
+			wantStart: sqsGlobalRouteKey,
+			wantEnd:   prefixScanEnd(sqsGlobalRouteKey),
+		},
+		{
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 			name:      "s3 bucket cleanup prefix",
 			prefix:    s3keys.ObjectManifestPrefixForBucket("bucket", 2),
 			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),

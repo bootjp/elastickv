@@ -521,6 +521,15 @@ Cold bootstrap (`--raftBootstrap` plus optionally `--raftBootstrapMembers`):
 Joining an existing cluster as a learner:
 
 - New CLI flag (per group): `--raftJoinAsLearner` (default `false`).
+- `--raftJoinMembers id=addr,...` supplies the full single-group peer address
+  inventory used by a fresh joiner's transport. It is deliberately separate
+  from `--raftBootstrapMembers`: join members leave `Bootstrap=false` and the
+  initial `ConfState` empty. The flag requires `--raftJoinAsLearner`, includes
+  the local ID/address plus at least one existing remote member, and is mutually
+  exclusive with every bootstrap flag. This closes the post-design startup gap
+  where the self-bootstrap guard correctly rejected an empty fresh data dir but
+  the only peer-list flag incorrectly implied new-cluster bootstrap. See
+  `2026_07_18_implemented_raft_fresh_learner_join.md`.
 - **Enforcement is local and post-apply, not pre-propose.** The flag
   does *not* attempt to block the leader from issuing a
   `ConfChangeAddNode` for this node. Doing so would either require a
@@ -544,9 +553,9 @@ Joining an existing cluster as a learner:
   3. The flag is therefore primarily an **operator alarm**, not a
      consensus-level enforcement. The runbook makes this explicit.
 - Operationally:
-  1. Operator brings up the joiner with `--raftJoinAsLearner` and the
-     peer list it knows about (existing voters; the joiner's own
-     `--raftId` is the local node).
+  1. Operator brings up the joiner with `--raftJoinAsLearner` and
+     `--raftJoinMembers` containing the current voters plus the joiner's own
+     `--raftId` and address.
   2. The joiner starts but stays in follower-no-config until the leader
      fans out the new `ConfState` via `MsgApp` / `MsgSnap`.
   3. Operator calls `raftadmin <leader> add_learner <id> <address>`.
@@ -555,9 +564,10 @@ Joining an existing cluster as a learner:
      `promote_learner` with `min_applied_index` set to a recent leader
      commit index. The engine re-verifies against
      `Progress[nodeID].Match` before proposing.
-- This flow does **not** require a new `--raftBootstrapMembers` syntax.
-  The joiner does not appear in any cold-bootstrap member list; it only
-  enters the cluster's `ConfState` via the explicit `add_learner` RPC.
+- This flow does **not** overload `--raftBootstrapMembers`. The joiner only
+  enters the cluster's `ConfState` via the explicit `add_learner` RPC;
+  `--raftJoinMembers` is transport discovery and durable address inventory,
+  not a cold-bootstrap member list.
 
 ### 4.6 Quorum, lease reads, and the ack tracker
 

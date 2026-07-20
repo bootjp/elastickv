@@ -711,6 +711,36 @@ func TestShardedCoordinatorRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t
 	}
 }
 
+<<<<<<< HEAD
+=======
+func TestShardedCoordinatorAllowsRawSQSLookingDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("!sqs|foo")}},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, g1Txn.requests)
+	require.NotEmpty(t, g2Txn.requests)
+}
+
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestShardedCoordinatorAllowsS3BucketDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 

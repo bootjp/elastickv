@@ -12,6 +12,8 @@ const (
 	UploadMetaPrefix       = "!s3|upload|meta|"
 	UploadPartPrefix       = "!s3|upload|part|"
 	BlobPrefix             = "!s3|blob|"
+	ChunkRefPrefix         = "!s3|chunkref|"
+	ChunkBlobPrefix        = "!s3|chunkblob|"
 	GCUploadPrefix         = "!s3|gc|upload|"
 	RoutePrefix            = "!s3route|"
 
@@ -33,6 +35,8 @@ var (
 	uploadMetaPrefixBytes       = []byte(UploadMetaPrefix)
 	uploadPartPrefixBytes       = []byte(UploadPartPrefix)
 	blobPrefixBytes             = []byte(BlobPrefix)
+	chunkRefPrefixBytes         = []byte(ChunkRefPrefix)
+	chunkBlobPrefixBytes        = []byte(ChunkBlobPrefix)
 	gcUploadPrefixBytes         = []byte(GCUploadPrefix)
 	routePrefixBytes            = []byte(RoutePrefix)
 )
@@ -107,6 +111,10 @@ func BlobKey(bucket string, generation uint64, object string, uploadID string, p
 	return buildObjectKey(blobPrefixBytes, bucket, generation, object, uploadID, partNo, chunkNo)
 }
 
+func ChunkRefKey(bucket string, generation uint64, object string, uploadID string, partNo uint64, chunkNo uint64) []byte {
+	return buildObjectKey(chunkRefPrefixBytes, bucket, generation, object, uploadID, partNo, chunkNo)
+}
+
 // VersionedBlobKey returns the blob key for a specific part attempt identified by
 // partVersion (typically the part's commit timestamp). When partVersion is 0 the
 // result is identical to BlobKey, preserving backward compatibility with data
@@ -163,6 +171,18 @@ func BlobPrefixForUpload(bucket string, generation uint64, object string, upload
 	return out
 }
 
+// ChunkRefPrefixForUpload returns the key prefix that covers all offload
+// chunk references for a specific multipart upload.
+func ChunkRefPrefixForUpload(bucket string, generation uint64, object string, uploadID string) []byte {
+	out := make([]byte, 0, len(ChunkRefPrefix)+len(bucket)+len(object)+len(uploadID)+u64Bytes+buildObjectExtraBytes)
+	out = append(out, chunkRefPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	return out
+}
+
 // ParseUploadPartKey extracts bucket, generation, object, uploadID, and partNo from a part descriptor key.
 func ParseUploadPartKey(key []byte) (bucket string, generation uint64, object string, uploadID string, partNo uint64, ok bool) {
 	if !bytes.HasPrefix(key, uploadPartPrefixBytes) {
@@ -205,8 +225,8 @@ func ObjectManifestPrefixForBucket(bucket string, generation uint64) []byte {
 }
 
 // UploadMetaPrefixForBucket / UploadPartPrefixForBucket /
-// BlobPrefixForBucket / GCUploadPrefixForBucket / RoutePrefixForBucket
-// each isolate to a single bucket+generation tuple. Used by
+// BlobPrefixForBucket / ChunkRefPrefixForBucket / GCUploadPrefixForBucket /
+// RoutePrefixForBucket each isolate to a single bucket+generation tuple. Used by
 // AdminDeleteBucket's DEL_PREFIX safety net (design doc
 // 2026_04_28_implemented_admin_delete_bucket_safety_net.md): the bucket-
 // must-be-empty empty-probe is racy against concurrent PutObject, so
@@ -228,6 +248,10 @@ func UploadPartPrefixForBucket(bucket string, generation uint64) []byte {
 
 func BlobPrefixForBucket(bucket string, generation uint64) []byte {
 	return bucketScopedPrefix(blobPrefixBytes, bucket, generation)
+}
+
+func ChunkRefPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(chunkRefPrefixBytes, bucket, generation)
 }
 
 func GCUploadPrefixForBucket(bucket string, generation uint64) []byte {
@@ -490,6 +514,8 @@ func objectScopedPrefix(key []byte) []byte {
 		return uploadPartPrefixBytes
 	case bytes.HasPrefix(key, blobPrefixBytes):
 		return blobPrefixBytes
+	case bytes.HasPrefix(key, chunkRefPrefixBytes):
+		return chunkRefPrefixBytes
 	case bytes.HasPrefix(key, gcUploadPrefixBytes):
 		return gcUploadPrefixBytes
 	default:

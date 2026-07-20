@@ -899,6 +899,32 @@ func TestDeltaCompactor_DoesNotInheritStaleTTLBeforeDeltaOnlyRecreate(t *testing
 			},
 		},
 		{
+			name:    "list-legacy",
+			key:     []byte("ttl:compact:recreate:list-legacy"),
+			metaKey: store.ListMetaKey,
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				t.Helper()
+				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("a"), 3, 0))
+				deltaKey := legacyListMetaDeltaKey(key, 3)
+				require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+			},
+			build: func(t *testing.T, c *DeltaCompactor, st store.MVCCStore, key []byte, readTS uint64) []*kv.Elem[kv.OP] {
+				t.Helper()
+				prefix := store.LegacyListMetaDeltaScanPrefix(key)
+				deltas, err := st.ScanAt(ctx, prefix, store.PrefixScanEnd(prefix), 10, readTS)
+				require.NoError(t, err)
+				elems, err := c.buildLegacyListCompactElems(ctx, key, deltas, readTS)
+				require.NoError(t, err)
+				return elems
+			},
+			readMeta: func(t *testing.T, raw []byte) (int64, uint64) {
+				t.Helper()
+				meta, err := store.UnmarshalListMeta(raw)
+				require.NoError(t, err)
+				return meta.Len, meta.ExpireAt
+			},
+		},
+		{
 			name:    "hash",
 			key:     []byte("ttl:compact:recreate:hash"),
 			metaKey: store.HashMetaKey,
@@ -1664,6 +1690,7 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 	// update before all delete elems have been applied under the race detector.
 	c.compactUrgentKey(ctx, urgentCompactionRequest{typeName: "hash", userKey: userKey})
 
+<<<<<<< HEAD
 	readTS := st.LastCommitTS()
 	raw, err := st.GetAt(ctx, store.HashMetaKey(userKey), readTS)
 	require.NoError(t, err)
@@ -1674,6 +1701,35 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 	// No delta keys should remain after pagination compaction.
 	prefix := store.HashMetaDeltaScanPrefix(userKey)
 	end := store.PrefixScanEnd(prefix)
+=======
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = c.Run(runCtx) }()
+
+	prefix := store.HashMetaDeltaScanPrefix(userKey)
+	end := store.PrefixScanEnd(prefix)
+
+	// Wait until the base meta holds the accumulated total and the consumed
+	// delta keys are gone, so slow race-enabled CI has one explicit completion
+	// condition for the whole urgent pagination loop.
+	// The pagination loop should take two passes: first 1025, then 9.
+	require.Eventually(t, func() bool {
+		readTS := st.LastCommitTS()
+		raw, err := st.GetAt(ctx, store.HashMetaKey(userKey), readTS)
+		if err != nil {
+			return false
+		}
+		got, err := store.UnmarshalHashMeta(raw)
+		if err != nil || got.Len != int64(totalDeltasU64) {
+			return false
+		}
+		remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
+		return err == nil && len(remaining) == 0
+	}, 5*time.Second, 20*time.Millisecond, "all %d delta keys should be compacted into base meta", totalDeltasU64)
+
+	// No delta keys should remain after pagination compaction.
+	readTS := st.LastCommitTS()
+>>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all delta keys must be deleted after urgent compaction")

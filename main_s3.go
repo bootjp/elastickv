@@ -33,10 +33,12 @@ func startS3Server(
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
 	putAdmissionObserver adapter.S3PutAdmissionObserver,
+	blobOffloadObserver adapter.S3BlobOffloadObserver,
 ) (*adapter.S3Server, error) {
 	s3Server, _, err := prepareS3Server(
 		ctx, lc, s3Addr, shardStore, coordinate, leaderS3, region,
 		credentialsFile, pathStyleOnly, readTracker, putAdmissionObserver,
+		blobOffloadObserver,
 	)
 	if err != nil {
 		return nil, err
@@ -57,10 +59,11 @@ func prepareS3Server(
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
 	putAdmissionObserver adapter.S3PutAdmissionObserver,
+	blobOffloadObserver adapter.S3BlobOffloadObserver,
 ) (*adapter.S3Server, net.Listener, error) {
 	s3Server, err := newS3Server(
 		s3Addr, shardStore, coordinate, leaderS3, region, credentialsFile,
-		pathStyleOnly, readTracker, putAdmissionObserver,
+		pathStyleOnly, readTracker, putAdmissionObserver, blobOffloadObserver,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -82,6 +85,7 @@ func newS3Server(
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
 	putAdmissionObserver adapter.S3PutAdmissionObserver,
+	blobOffloadObserver adapter.S3BlobOffloadObserver,
 ) (*adapter.S3Server, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
 	if s3Addr == "" {
@@ -108,6 +112,7 @@ func newS3Server(
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
 		adapter.WithS3PutAdmissionObserver(putAdmissionObserver),
+		adapter.WithS3BlobOffloadObserver(blobOffloadObserver),
 	)
 	return s3Server, nil
 }
