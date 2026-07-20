@@ -391,6 +391,7 @@ func isTransientLeaderRedisError(err error) bool {
 	if errors.Is(err, ErrLeaderNotFound) ||
 		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, kv.ErrLeaderProxyCircuitOpen) ||
 		errors.Is(err, raftengine.ErrNotLeader) ||
 		errors.Is(err, raftengine.ErrLeadershipLost) ||
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
@@ -412,15 +413,16 @@ func isTransientLeaderRedisError(err error) bool {
 }
 
 // redisLeaderErrorPhrases mirrors kv.leaderErrorPhrases (the kv
-// package keeps it unexported). Any new transient-leader phrase the
-// kv layer treats as retryable should also flip a NOTLEADER prefix
-// on the Redis wire so Carmine's with-exceptions catches it; keep
-// in lockstep.
+// package keeps it unexported) and adds adapter-visible availability
+// sentinels such as the leader-proxy circuit. The circuit is deliberately
+// not coordinator-retryable, but Redis clients still need NOTLEADER so they
+// can retry without treating it as a command failure.
 var redisLeaderErrorPhrases = []string{
 	"not leader",
 	"leader not found",
 	"leadership lost",
 	"leadership transfer in progress",
+	"leader proxy circuit open",
 }
 
 // hasTransientLeaderSuffix is the suffix-match fallback for

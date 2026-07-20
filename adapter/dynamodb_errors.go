@@ -3,6 +3,7 @@ package adapter
 import (
 	"net/http"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
 	"google.golang.org/grpc/codes"
@@ -39,7 +40,7 @@ func writeDynamoErrorFromErr(w http.ResponseWriter, err error) {
 		writeDynamoError(w, apiErr.status, apiErr.errorType, apiErr.message)
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable {
 		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "service unavailable")
 		return
 	}
