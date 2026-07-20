@@ -119,6 +119,7 @@ type S3Server struct {
 	blobLocalStores      S3BlobLocalStoreResolver
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
+	blobBackfiller       *S3BlobBackfiller
 }
 
 type s3BucketMeta struct {
@@ -406,12 +407,22 @@ func (s *S3Server) Run() error {
 }
 
 func (s *S3Server) Stop() {
+	if s != nil && s.blobBackfiller != nil {
+		s.blobBackfiller.Stop()
+	}
 	if s != nil && s.blobCluster != nil {
 		_ = s.blobCluster.Close()
 	}
 	if s != nil && s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
 	}
+}
+
+func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
+	if s == nil || s.blobBackfiller == nil {
+		return nil
+	}
+	return s.blobBackfiller.Start(ctx, s)
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
