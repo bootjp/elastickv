@@ -892,8 +892,6 @@ func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
-<<<<<<< HEAD
-=======
 func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
 	t.Parallel()
 
@@ -924,7 +922,6 @@ func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()

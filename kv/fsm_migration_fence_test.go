@@ -98,11 +98,7 @@ func applyTargetReadinessToFSM(t *testing.T, fsm *kvFSM, state store.TargetStage
 	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
 }
 
-<<<<<<< HEAD
-func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, writeFence, readFence bool) {
-=======
 func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, readFence bool) {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	t.Helper()
 	applyTargetReadinessToFSM(t, fsm, store.TargetStagedReadinessState{
 		JobID:               10,
@@ -111,11 +107,7 @@ func applySourceMigrationControlToFSM(t *testing.T, fsm *kvFSM, readFence bool) 
 		MigrationJobID:      10,
 		MinWriteTSExclusive: 50,
 		Armed:               true,
-<<<<<<< HEAD
-		SourceWriteFence:    writeFence,
-=======
 		SourceWriteFence:    true,
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		SourceReadFence:     readFence,
 		RetentionPinTS:      40,
 	})
@@ -314,11 +306,7 @@ func TestFSMDurableSourceFenceRejectsRawWriteDespiteCatalogBypass(t *testing.T) 
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-<<<<<<< HEAD
-	applySourceMigrationControlToFSM(t, fsm, true, false)
-=======
 	applySourceMigrationControlToFSM(t, fsm, false)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	key := []byte("n")
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		WriteFenceBypassKeys: [][]byte{key},
@@ -331,11 +319,7 @@ func TestFSMDurableSourceFenceRejectsPrefixWrite(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-<<<<<<< HEAD
-	applySourceMigrationControlToFSM(t, fsm, true, false)
-=======
 	applySourceMigrationControlToFSM(t, fsm, false)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("m")}},
 	}, 60)
@@ -348,33 +332,21 @@ func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
 	engine := distribution.NewEngine()
 	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
 		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
-<<<<<<< HEAD
-		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
-=======
 		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced, MinWriteTSExclusive: 100},
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	})
 	fsm := newComposed1FSM(t, engine, 1)
 	key := []byte("z")
 	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
 		IsTxn:                true,
 		Phase:                pb.Phase_PREPARE,
-<<<<<<< HEAD
-		Ts:                   10,
-=======
 		Ts:                   101,
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		ObservedRouteVersion: 1,
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
 			{Op: pb.Op_DEL, Key: key},
 		},
-<<<<<<< HEAD
-	}, 10)
-=======
 	}, 101)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	require.NoError(t, err)
 }
 
@@ -409,11 +381,7 @@ func TestFSMDurableSourceFenceRejectsPinnedOnePhaseTxn(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFencedFSM(t)
-<<<<<<< HEAD
-	applySourceMigrationControlToFSM(t, fsm, true, false)
-=======
 	applySourceMigrationControlToFSM(t, fsm, false)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	key := []byte("n")
 	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
 		IsTxn:                true,
@@ -866,8 +834,6 @@ func TestFSMPrepareTxnChecksReadKeysForTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
-<<<<<<< HEAD
-=======
 func TestFSMOnePhaseTxnChecksSourceReadFenceForReadKeys(t *testing.T) {
 	t.Parallel()
 
@@ -887,7 +853,6 @@ func TestFSMOnePhaseTxnChecksSourceReadFenceForReadKeys(t *testing.T) {
 	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestFSMPrepareTxnSkipsRemotePrimaryForTargetReadiness(t *testing.T) {
 	t.Parallel()
 

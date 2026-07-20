@@ -3,20 +3,14 @@ package adapter
 import (
 	"bytes"
 	"context"
-<<<<<<< HEAD
-=======
 	"encoding/binary"
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"errors"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
-<<<<<<< HEAD
-=======
 	"github.com/bootjp/elastickv/internal/fskeys"
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -51,8 +45,6 @@ func TestDistributionServerGetRoute_HitAndMiss(t *testing.T) {
 	require.Nil(t, miss.End)
 }
 
-<<<<<<< HEAD
-=======
 func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) {
 	t.Parallel()
 
@@ -72,7 +64,6 @@ func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) 
 	require.Equal(t, uint64(2), resp.RaftGroupId)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	t.Parallel()
 
@@ -2519,23 +2510,6 @@ func (s *splitPromotionClientStub) PromoteStagedVersions(
 }
 
 type distributionCoordinatorStub struct {
-<<<<<<< HEAD
-	store           store.MVCCStore
-	leader          bool
-	dispatchErr     error
-	nextTS          uint64
-	timestampNext   uint64
-	timestampErr    error
-	timestampCalls  int
-	lastStartTS     uint64
-	lastCommitTS    uint64
-	lastReadKeys    [][]byte
-	beforeApply     func(context.Context, store.MVCCStore) error
-	afterDispatch   func(context.Context, store.MVCCStore, uint64) error
-	asyncApplyDone  chan error
-	asyncApplyDelay time.Duration
-	dispatchCalls   int
-=======
 	store                 store.MVCCStore
 	leader                bool
 	clock                 *kv.HLC
@@ -2553,7 +2527,6 @@ type distributionCoordinatorStub struct {
 	asyncApplyDone        chan error
 	asyncApplyDelay       time.Duration
 	dispatchCalls         int
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
@@ -2569,10 +2542,7 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		return nil, err
 	}
 	s.dispatchCalls++
-<<<<<<< HEAD
-=======
 	s.lastRequestedCommitTS = reqs.CommitTS
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if s.dispatchErr != nil {
 		return nil, s.dispatchErr
 	}
@@ -2619,12 +2589,9 @@ func (s *distributionCoordinatorStub) validateDispatch(reqs *kv.OperationGroup[k
 
 func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCommitTS uint64) (uint64, uint64) {
 	if requestedCommitTS != 0 {
-<<<<<<< HEAD
-=======
 		if s.clock != nil {
 			s.clock.Observe(requestedCommitTS)
 		}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		if s.nextTS <= requestedCommitTS {
 			s.nextTS = requestedCommitTS + 1
 		}
@@ -2694,11 +2661,7 @@ func requireReadKeysNotContain(t *testing.T, readKeys [][]byte, want []byte) {
 	}
 }
 
-<<<<<<< HEAD
-func coordinatorStubMutations(elems []*kv.Elem[kv.OP]) ([]*store.KVPairMutation, error) {
-=======
 func coordinatorStubMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
 		mutation, err := coordinatorStubMutation(elem, commitTS)
@@ -2769,26 +2732,6 @@ func (s *distributionCoordinatorStub) RaftLeaderForKey(_ []byte) string {
 
 func (s *distributionCoordinatorStub) Clock() *kv.HLC {
 	return s.clock
-}
-
-func (s *distributionCoordinatorStub) Next(ctx context.Context) (uint64, error) {
-	return s.NextAfter(ctx, 0)
-}
-
-func (s *distributionCoordinatorStub) NextAfter(_ context.Context, min uint64) (uint64, error) {
-	s.timestampCalls++
-	if s.timestampErr != nil {
-		return 0, s.timestampErr
-	}
-	next := s.timestampNext
-	if next == 0 {
-		next = s.store.LastCommitTS() + 1
-	}
-	if next <= min {
-		next = min + 1
-	}
-	s.timestampNext = next + 1
-	return next, nil
 }
 
 func (s *distributionCoordinatorStub) Next(ctx context.Context) (uint64, error) {

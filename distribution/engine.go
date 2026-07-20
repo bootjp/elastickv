@@ -421,25 +421,8 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 		}
 		// Route intersects with scan range
 		result = append(result, cloneRoute(*r))
-<<<<<<< HEAD
-=======
 	}
 	return result, e.catalogVersion
-}
-
-func cloneRoute(r Route) Route {
-	return Route{
-		RouteID:                r.RouteID,
-		Start:                  CloneBytes(r.Start),
-		End:                    CloneBytes(r.End),
-		GroupID:                r.GroupID,
-		State:                  r.State,
-		StagedVisibilityActive: r.StagedVisibilityActive,
-		MigrationJobID:         r.MigrationJobID,
-		MinWriteTSExclusive:    r.MinWriteTSExclusive,
-		Load:                   r.Load,
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
-	}
 }
 
 func cloneRoute(r Route) Route {

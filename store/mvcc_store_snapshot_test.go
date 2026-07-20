@@ -72,10 +72,7 @@ func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
 	require.NoError(t, err)
 	defer snap.Close()
 	raw := snapshotBytes(t, snap)
-<<<<<<< HEAD
-=======
 	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 	dst := newTestMVCCStore(t)
 	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{

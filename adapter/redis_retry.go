@@ -44,14 +44,10 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
-<<<<<<< HEAD
-	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
-=======
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
 		wireRedisTxnErrKind(err) == redisTxnWireErrLocked ||
 		errors.Is(err, kv.ErrRouteWriteFenced)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func shouldPreserveRedisTxnAttempt(err error) bool {

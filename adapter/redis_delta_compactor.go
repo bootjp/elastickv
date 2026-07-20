@@ -837,11 +837,7 @@ func (c *DeltaCompactor) legacyListHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractLegacyListUserKeyFromDelta,
 		acceptDeltaKV:    isListMetaDeltaKV,
 		deltaKeyPrefixFn: store.LegacyListMetaDeltaScanPrefix,
-<<<<<<< HEAD
-		buildElems:       c.buildListCompactElems,
-=======
 		buildElems:       c.buildLegacyListCompactElems,
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 }
 

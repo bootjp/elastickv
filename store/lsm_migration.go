@@ -219,12 +219,9 @@ func advancePebbleExportPastCurrentUserKey(
 }
 
 func pebbleExportCanStopAtEndKey(startKey, endKey, userKey []byte) bool {
-<<<<<<< HEAD
-=======
 	// Pebble orders userKey||invertedCommitTS physically. The empty logical key
 	// can therefore appear after non-empty keys; a leading range must keep
 	// scanning or it can silently omit that key.
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if len(startKey) == 0 {
 		return false
 	}

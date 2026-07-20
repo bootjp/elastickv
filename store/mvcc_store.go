@@ -899,15 +899,10 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 	if err := binary.Write(w, binary.LittleEndian, s.minRetainedTS); err != nil {
 		return 0, errors.WithStack(err)
 	}
-<<<<<<< HEAD
-	if err := writeMVCCSnapshotReadinessStates(w, s.migrationReadinessCache); err != nil {
-		return 0, err
-=======
 	if version >= mvccSnapshotVersion {
 		if err := writeMVCCSnapshotReadinessStates(w, s.migrationReadinessCache); err != nil {
 			return 0, err
 		}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 	iter := s.tree.Iterator()
 	for iter.Next() {

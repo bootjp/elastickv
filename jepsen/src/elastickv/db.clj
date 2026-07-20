@@ -108,11 +108,7 @@
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
 (defn- start-node!
-<<<<<<< HEAD
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine migration-enabled]}]
-=======
   [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled]}]
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -158,18 +154,7 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
-<<<<<<< HEAD
-        (apply cu/start-daemon! {:chdir bin-dir
-                                 :logfile log-file
-                                 :pidfile pid-file
-                                 :background? true
-                                 :env (when migration-enabled
-                                        {:ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE "true"
-                                         :ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE "true"})}
-               args)))))
-=======
         (apply cu/start-daemon! daemon-opts server-bin args)))))
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 (defn- stop-node!
   [node]

@@ -5,10 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-<<<<<<< HEAD
-=======
 	"sync"
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"testing"
 	"time"
 
@@ -21,8 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-<<<<<<< HEAD
-=======
 type exportCountingStore struct {
 	store.MVCCStore
 	exportCalls int
@@ -33,7 +28,6 @@ func (s *exportCountingStore) ExportVersions(ctx context.Context, opts store.Exp
 	return s.MVCCStore.ExportVersions(ctx, opts)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 	t.Helper()
 
@@ -1160,8 +1154,6 @@ func TestShardStoreScanAndLatestCommitTS_MergeStagedVisibility(t *testing.T) {
 	require.Equal(t, uint64(40), ts)
 }
 
-<<<<<<< HEAD
-=======
 func TestShardStoreStagedVisibilityScanUsesTwoRangeExports(t *testing.T) {
 	t.Parallel()
 
@@ -1203,7 +1195,6 @@ func TestShardStoreScanAt_FiltersStagedShadowRowsFromLiveCandidates(t *testing.T
 	require.Equal(t, []*store.KVPair{{Key: rawKey, Value: []byte("staged")}}, kvs)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestShardStoreStagedVisibilityPreservesCompactionErrors(t *testing.T) {
 	t.Parallel()
 
@@ -1319,8 +1310,6 @@ func TestShardStoreScanAt_RoutesS3BucketAuxiliaryStagedVisibility(t *testing.T) 
 	}
 }
 
-<<<<<<< HEAD
-=======
 func TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone(t *testing.T) {
 	t.Parallel()
 
@@ -1359,7 +1348,6 @@ func TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone(t *testing.T) {
 	require.Empty(t, kvs)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
 	t.Parallel()
 
@@ -2688,8 +2676,6 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
 	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
-<<<<<<< HEAD
-=======
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -2707,7 +2693,6 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterStagedControlKeys(t *testing
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
 
 	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }

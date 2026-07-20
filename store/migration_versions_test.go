@@ -125,8 +125,6 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 	})
 }
 
-<<<<<<< HEAD
-=======
 func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -150,7 +148,6 @@ func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
 	})
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

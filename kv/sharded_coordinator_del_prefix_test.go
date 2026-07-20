@@ -711,8 +711,6 @@ func TestShardedCoordinatorRejectsBroadInternalDelPrefixWhenRouteIsWriteFenced(t
 	}
 }
 
-<<<<<<< HEAD
-=======
 func TestShardedCoordinatorAllowsRawSQSLookingDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 
@@ -740,7 +738,6 @@ func TestShardedCoordinatorAllowsRawSQSLookingDelPrefixWhenUnrelatedRouteIsWrite
 	require.NotEmpty(t, g2Txn.requests)
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestShardedCoordinatorAllowsS3BucketDelPrefixWhenUnrelatedRouteIsWriteFenced(t *testing.T) {
 	t.Parallel()
 

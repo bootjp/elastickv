@@ -98,17 +98,10 @@ memory each group's private cache/memtable pins.
 
 - **Range split — distribute a range across groups.** Same-group split
   shipped in M1 (`distribution/`). Cross-group migration (the part that
-<<<<<<< HEAD
   actually relocates data and reduces per-node volume) is implemented by the
   M2 stack recorded in
   [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md):
   a resumable `SplitJob` with
-=======
-  actually relocates data and reduces per-node volume) is tracked by **PR #945**
-  and the active M2 stack
-  (`docs/design/2026_06_11_partial_hotspot_split_milestone2_migration.md`,
-  branch `docs/hotspot-split-m2-proposal`): a resumable `SplitJob` with
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
   `PLANNED → BACKFILL → FENCE → DELTA_COPY → CUTOVER → CLEANUP → DONE` phases
   driven by a migrator on the default-group leader. M2 is the required
   ownership-migration mechanism, but it reduces per-node bytes only when the

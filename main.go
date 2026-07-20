@@ -56,14 +56,10 @@ const (
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
 
-<<<<<<< HEAD
-	splitMigrationCapabilityProbeTimeout = 2 * time.Second
-=======
 	defaultFilesystemRootMode              = 0o755
 	defaultFilesystemPlacementScanInterval = 30 * time.Second
 	defaultFilesystemLeaseReapInterval     = 30 * time.Second
 	splitMigrationCapabilityProbeTimeout   = 2 * time.Second
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -537,8 +533,6 @@ func run() error {
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
-<<<<<<< HEAD
-=======
 	// setupDistributionCatalog + the Stage 7a process-start registration
 	// gate are bundled so run() has a single startup-fault path: a
 	// registry-read / behind-epoch failure fails the process
@@ -597,7 +591,6 @@ func run() error {
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -621,42 +614,17 @@ func run() error {
 		slog.Default(),
 	)
 	cleanup.Add(rotateOnStartupDeregister)
-
-	serverInput := serversInput{
+	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
-		readTracker:     readTracker,
+		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
 		cleanup:                         &cleanup,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
-	}
-	runtimeStartup, err := prepareDistributionRuntimeServer(
-		waitRotateOnStartup, serverInput, cfg.engine, runtimes, coordinate, readTracker)
-	if err != nil {
-		cancel()
-		return err
-	}
-	if err := startDistributionRuntimeAfterTransport(distributionRuntimeStartupInput{
-		runCtx:              runCtx,
-		eg:                  eg,
-		cancel:              cancel,
-		runtimes:            runtimes,
-		engine:              cfg.engine,
-		coordinate:          coordinate,
-		defaultGroup:        shardGroups[cfg.defaultGroup],
-		encWiring:           encWiring,
-		raftID:              *raftId,
-		sidecarPath:         *encryptionSidecarPath,
-		sampler:             sampler,
-		clock:               clock,
-		metricsRegistry:     metricsRegistry,
-		readTracker:         readTracker,
-		waitRotateOnStartup: waitRotateOnStartup,
-		prepared:            runtimeStartup,
 	}); err != nil {
 		return err
 	}
@@ -1991,129 +1959,6 @@ type serversInput struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
-<<<<<<< HEAD
-type preparedRuntimeServer struct {
-	runner    *runtimeServerRunner
-	connCache *kv.GRPCConnCache
-}
-
-type preparedDistributionRuntime struct {
-	catalog        *distribution.CatalogStore
-	serverInput    serversInput
-	preparedServer *preparedRuntimeServer
-}
-
-type distributionRuntimeStartupInput struct {
-	runCtx              context.Context
-	eg                  *errgroup.Group
-	cancel              context.CancelFunc
-	runtimes            []*raftGroupRuntime
-	engine              *distribution.Engine
-	coordinate          *kv.ShardedCoordinator
-	defaultGroup        *kv.ShardGroup
-	encWiring           encryptionWriteWiring
-	raftID              string
-	sidecarPath         string
-	sampler             *keyviz.MemSampler
-	clock               *kv.HLC
-	metricsRegistry     *monitoring.Registry
-	readTracker         *kv.ActiveTimestampTracker
-	waitRotateOnStartup startupRotationWaiter
-	prepared            *preparedDistributionRuntime
-}
-
-func prepareDistributionRuntimeServer(
-	waitRotateOnStartup startupRotationWaiter,
-	in serversInput,
-	engine *distribution.Engine,
-	runtimes []*raftGroupRuntime,
-	coordinate *kv.ShardedCoordinator,
-	readTracker *kv.ActiveTimestampTracker,
-) (*preparedDistributionRuntime, error) {
-	distCatalog, err := distributionCatalogStoreForEngine(runtimes, engine)
-	if err != nil {
-		return nil, err
-	}
-	splitPromotionConnCache := &kv.GRPCConnCache{}
-	in.eg.Go(func() error {
-		<-in.ctx.Done()
-		if err := splitPromotionConnCache.Close(); err != nil {
-			return errors.Wrap(err, "close split promotion gRPC connection cache")
-		}
-		return nil
-	})
-	distOptions := []adapter.DistributionServerOption{
-		adapter.WithDistributionCoordinator(coordinate),
-		adapter.WithDistributionActiveTimestampTracker(readTracker),
-		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(in.shardGroups)...),
-		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
-			splitMigrationCapabilityPeerSourceForRuntimes(runtimes),
-			splitMigrationCapabilityProbeTimeout,
-			nil,
-			splitMigrationLocalReadinessGate,
-		)),
-		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
-			splitPromotionTargetLeaderResolver(in.shardGroups),
-			splitPromotionConnCache,
-		)),
-		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
-			splitMigrationGroupLeaderResolver(in.shardGroups),
-			splitPromotionConnCache,
-		)),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
-			in.shardGroups,
-			splitPromotionConnCache,
-		)),
-		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
-		adapter.WithSplitJobRunnerReady(),
-	}
-	in.distServer = adapter.NewDistributionServer(engine, distCatalog, distOptions...)
-	preparedServer, err := prepareRuntimeServerRunner(waitRotateOnStartup, in)
-	if err != nil {
-		return nil, err
-	}
-	return &preparedDistributionRuntime{
-		catalog:        distCatalog,
-		serverInput:    in,
-		preparedServer: preparedServer,
-	}, nil
-}
-
-func startDistributionRuntimeAfterTransport(in distributionRuntimeStartupInput) error {
-	prepared := in.prepared
-	if prepared == nil || prepared.preparedServer == nil || prepared.preparedServer.runner == nil {
-		return errors.New("distribution runtime server is not prepared")
-	}
-	if err := prepared.preparedServer.runner.startRaftTransport(); err != nil {
-		return err
-	}
-	if err := waitForRaftStartupAfterTransport(in.runCtx, in.runtimes); err != nil {
-		return prepared.preparedServer.runner.startupFailure(err)
-	}
-	// setupDistributionCatalog + the Stage 7a process-start registration
-	// gate are bundled so startup faults flow through one path. This now
-	// runs after raft transport is bound, but before public listeners serve.
-	if err := setupDistributionAndRegistration(
-		in.runCtx, in.eg, prepared.catalog, in.engine,
-		in.coordinate, in.defaultGroup, in.encWiring, in.raftID, in.sidecarPath); err != nil {
-		in.cancel()
-		return err
-	}
-	seedKeyVizRoutes(in.sampler, in.engine)
-	in.eg.Go(func() error {
-		return runDistributionCatalogWatcher(in.runCtx, prepared.catalog, in.engine)
-	})
-	startKeyVizFlusher(in.runCtx, in.eg, in.sampler)
-	startKeyVizLeaderTermPublisher(in.runCtx, in.eg, in.sampler, in.runtimes)
-	startMemoryWatchdog(in.runCtx, in.eg, in.cancel)
-	startMonitoringCollectors(in.runCtx, in.metricsRegistry, in.runtimes, in.clock)
-	startFSMCompactorIfEnabled(in.runCtx, in.eg, in.runtimes, in.readTracker)
-	return startPreparedServerAfterStartupRotation(
-		in.waitRotateOnStartup, prepared.serverInput, prepared.preparedServer)
-}
-
-=======
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 type splitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
 type splitMigrationLeaderResolver func(uint64) (string, error)
 
@@ -2208,11 +2053,7 @@ func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache
 		}
 		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
 		for _, member := range cfg.Servers {
-<<<<<<< HEAD
-			if member.Suffrage != "voter" {
-=======
 			if member.Suffrage != raftMemberSuffrageVoter {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 				continue
 			}
 			voter, err := splitMigrationVoter(groupID, member, connCache)
@@ -2247,12 +2088,9 @@ func splitMigrationLocalReadinessGate(context.Context) error {
 	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
 	}
-<<<<<<< HEAD
-=======
 	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	return nil
 }
 
@@ -2265,18 +2103,14 @@ func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, se
 	})
 }
 
-<<<<<<< HEAD
-func prepareRuntimeServerRunner(waitRotateOnStartup startupRotationWaiter, in serversInput) (*preparedRuntimeServer, error) {
-=======
 // startServersAfterStartupRotation wires up the AdminServer, starts the
 // per-group Raft listeners needed for quorum traffic, waits for a fresh join
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// roleStore + connCache are gated on *adminEnabled. With admin
 	// disabled, building either is wasted work AND a security
@@ -2373,17 +2207,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 		publicKVGate:                    publicKVGate,
 	}
-	return &preparedRuntimeServer{runner: &runner, connCache: connCache}, nil
-}
-
-func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput, prepared *preparedRuntimeServer) error {
-	if prepared == nil || prepared.runner == nil {
-		return errors.New("runtime server runner is not prepared")
+	if err := runner.startRaftTransport(); err != nil {
+		return err
 	}
-<<<<<<< HEAD
-	runner := prepared.runner
-	if err := runner.preparePublicServices(); err != nil {
-=======
 	if err := preparePublicServicesAfterRaftJoinReady(
 		in.ctx,
 		in.runtimes,
@@ -2391,7 +2217,6 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 		strings.TrimSpace(*raftJoinMembers) != "",
 		runner.preparePublicServices,
 	); err != nil {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		return runner.startupFailure(err)
 	}
 	// runner.startRaftTransport() has populated runner.dynamoServer for the
@@ -2410,23 +2235,17 @@ func startPreparedServerAfterStartupRotation(waitRotateOnStartup startupRotation
 		Nodes:   parseCSV(*keyvizFanoutNodes),
 		Timeout: *keyvizFanoutTimeout,
 	}
-	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, prepared.connCache, in.keyvizSampler, fanoutCfg)
+	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
 	if err != nil {
 		return runner.startupFailure(err)
 	}
 	runner.adminHTTP = adminHTTP
-	if runner.publicKVGate != nil {
-		runner.publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
-	}
+	publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
-<<<<<<< HEAD
-	runner.publicKVGate.markReady()
-=======
 	publicKVGate.markReady()
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
@@ -2509,23 +2328,6 @@ func configurationContainsMember(configuration raftengine.Configuration, localID
 		}
 	}
 	return false
-}
-
-func waitForRaftStartupAfterTransport(ctx context.Context, runtimes []*raftGroupRuntime) error {
-	for _, rt := range runtimes {
-		if rt == nil {
-			continue
-		}
-		engine := rt.snapshotEngine()
-		barrier, ok := engine.(raftengine.StartupBarrier)
-		if !ok {
-			continue
-		}
-		if err := barrier.WaitStarted(ctx); err != nil {
-			return errors.Wrapf(err, "wait for raft group %d startup", rt.spec.id)
-		}
-	}
-	return nil
 }
 
 func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
@@ -3020,7 +2822,6 @@ func startRaftServers(
 	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
-	readGate func() bool,
 	distServer *adapter.DistributionServer,
 	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
@@ -3057,7 +2858,7 @@ func startRaftServers(
 		}
 		gs := grpc.NewServer(opts...)
 		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
-		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate, adapter.WithGRPCReadGate(readGate))
+		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
@@ -3335,7 +3136,8 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 	return nil
 }
 
-func distributionCatalogStoreForEngine(
+func setupDistributionCatalog(
+	ctx context.Context,
 	runtimes []*raftGroupRuntime,
 	engine *distribution.Engine,
 ) (*distribution.CatalogStore, error) {
@@ -3347,20 +3149,25 @@ func distributionCatalogStoreForEngine(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	return distCatalog, nil
-}
-
-func setupDistributionCatalog(
-	ctx context.Context,
-	runtimes []*raftGroupRuntime,
-	engine *distribution.Engine,
-) (*distribution.CatalogStore, error) {
-	distCatalog, err := distributionCatalogStoreForEngine(runtimes, engine)
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureDistributionCatalogSnapshot(ctx, distCatalog, engine); err != nil {
-		return nil, err
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
+		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
 }
@@ -3505,10 +3312,8 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		return r.startupFailure(err)
 	}
 	adminGRPCOpts := r.adminGRPCOpts
-	var readGate func() bool
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
-		readGate = r.publicKVGate.blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
@@ -3527,7 +3332,6 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardGroups,
 		r.shardStore,
 		r.coordinate,
-		readGate,
 		r.distServer,
 		r.routeEngine,
 		r.pubsubRelay,

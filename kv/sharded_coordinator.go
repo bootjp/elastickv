@@ -1140,16 +1140,10 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 }
 
 // dispatchDelPrefixBroadcast validates and broadcasts DEL_PREFIX operations
-<<<<<<< HEAD
-// to every shard group. Each element becomes a separate pb.Request (the FSM's
-// extractDelPrefix processes only the first DEL_PREFIX mutation per request).
-// All requests are batched into a single Commit call per shard group.
-=======
 // to every configured all-shard data group. Each element becomes a separate
 // pb.Request (the FSM's extractDelPrefix processes only the first DEL_PREFIX
 // mutation per request). All requests are batched into a single Commit call
 // per shard group.
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP], observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
@@ -1362,13 +1356,8 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefix(prefix []byte, c
 	return nil
 }
 
-<<<<<<< HEAD
-// broadcastToAllGroups sends the same set of requests to every shard group in
-// parallel and returns the maximum commit index.
-=======
 // broadcastToAllGroups sends the same set of requests to every configured
 // all-shard data group in parallel and returns the maximum commit index.
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests []*pb.Request) (*CoordinateResponse, error) {
 	var (
 		maxIndex atomic.Uint64
@@ -1429,12 +1418,9 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
-=======
 	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
 		return nil, err
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if err := c.rejectWriteTimestampFloorPointElems(elems, commitTS); err != nil {
 		return nil, err
 	}
@@ -1447,12 +1433,9 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// preserving SSI.
 		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
 	}
-<<<<<<< HEAD
-=======
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup)
 }
 
@@ -1581,48 +1564,6 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return &CoordinateResponse{}, nil
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
-}
-
-func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
-	if len(readKeys) == 0 {
-		return readKeys
-	}
-	var out [][]byte
-	for _, key := range readKeys {
-		alias, ok := c.stagedVisibilityReadKeyAlias(gid, key)
-		if !ok {
-			continue
-		}
-		if out == nil {
-			out = append([][]byte(nil), readKeys...)
-		}
-		out = append(out, alias)
-	}
-	if out == nil {
-		return readKeys
-	}
-	return out
-}
-
-func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, elems []*Elem[OP]) [][]byte {
-	var out [][]byte
-	for _, elem := range elems {
-		if elem == nil {
-			continue
-		}
-		alias, ok := c.stagedVisibilityReadKeyAlias(gid, elem.Key)
-		if !ok {
-			continue
-		}
-		if out == nil {
-			out = append([][]byte(nil), readKeys...)
-		}
-		out = append(out, alias)
-	}
-	if out == nil {
-		return readKeys
-	}
-	return out
 }
 
 func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
@@ -2524,12 +2465,9 @@ func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.
 		return nil
 	}
 	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
-<<<<<<< HEAD
-=======
 	if sourceReadFenceApplies(states, routeStart, routeEnd) {
 		return errors.WithStack(ErrRouteCutoverPending)
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	routes, catalogVersion, proof := c.currentShardRoutesForRouteRange(gid, routeStart, routeEnd)
 	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, gid, catalogVersion, proof) {
 		return nil
@@ -2707,12 +2645,9 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
-=======
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
 }

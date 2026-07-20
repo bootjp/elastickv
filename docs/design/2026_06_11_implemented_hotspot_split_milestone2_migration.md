@@ -1,21 +1,13 @@
 # Hotspot Shard Split — Milestone 2: Migration Plane
 
-<<<<<<<< HEAD:docs/design/2026_06_11_implemented_hotspot_split_milestone2_migration.md
 Status: Implemented
-========
-Status: Partial
->>>>>>>> origin/design/hotspot-split-m2-promotion-complete:docs/design/2026_06_11_partial_hotspot_split_milestone2_migration.md
 Author: bootjp
 Date: 2026-06-11
 
 Parent: [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md).
 M1 (control plane) is as-built in [2026_02_18_implemented_hotspot_split_milestone1_pr.md](2026_02_18_implemented_hotspot_split_milestone1_pr.md).
 
-<<<<<<<< HEAD:docs/design/2026_06_11_implemented_hotspot_split_milestone2_migration.md
 Current implementation status: implemented. The M2 stack provides the durable SplitJob catalog, versioned route descriptors, resumable range export/import, staged/live visibility, source write and read fences, current-voter readiness and cleanup barriers, constant-time route cutover, incremental target promotion, bounded source/target cleanup, terminal `DONE` history, and the deterministic cross-group Jepsen workload. PR #1096 completed the production runner and lifecycle wiring. Automatic hotspot detection and split scheduling remain M3 scope; the broader route-shuffle and fault campaign remains M4 scope.
-========
-Current implementation status: partial. The SplitJob catalog/codec, versioned route descriptor storage, range export/import primitives, staged-read visibility, write-fence checks, target readiness, and target-promotion catalog pieces have landed or are covered by the active M2 stack. The feature is not implemented end to end until a production runner advances cross-group jobs to `DONE`, `ListRoutes` exposes the moved child on its target group after cutover, and the Jepsen cross-group split workload passes the acceptance criteria in §13.
->>>>>>>> origin/design/hotspot-split-m2-promotion-complete:docs/design/2026_06_11_partial_hotspot_split_milestone2_migration.md
 
 ## 1. Background
 
@@ -1291,7 +1283,6 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 
 ## 14. Lifecycle
 
-<<<<<<<< HEAD:docs/design/2026_06_11_implemented_hotspot_split_milestone2_migration.md
 This document is `*_implemented_*` because the M2 cross-group migration plane is complete as a central subsystem. The production runner now resumes durable jobs across leadership changes, drives every phase through `CLEANUP`, waits for current source and target voter proofs, publishes the target route, removes bounded migration state, and moves the job to `DONE` history. The deterministic Jepsen split workload exercises the cross-group operation alongside leader-kill and partition fault packages.
 
 The remaining work is intentionally outside M2's central scope:
@@ -1299,11 +1290,5 @@ The remaining work is intentionally outside M2's central scope:
 - M3 owns automatic hotspot detection, target selection, and split scheduling.
 - M4 owns the broader route-shuffle nemesis matrix and production-scale fault campaigns.
 - Reverse migration after CUTOVER and concurrent migration jobs remain future extensions.
-========
-This document is `*_partial_*` because M2-PR1 and later component slices have landed, but the cross-group migration plane is not complete end to end.
-
-- Track per-PR landing under §11.
-- Rename to `*_implemented_*` only after the acceptance criteria in §13 pass: cross-group `StartSplitMigration` reaches `phase=DONE`, `ListRoutes` shows the target-group child after cutover, leader-kill recovery is automatic, and the Jepsen split workload is green.
->>>>>>>> origin/design/hotspot-split-m2-promotion-complete:docs/design/2026_06_11_partial_hotspot_split_milestone2_migration.md
 
 `git mv` is used so history follows.

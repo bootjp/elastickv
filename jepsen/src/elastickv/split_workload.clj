@@ -23,11 +23,7 @@
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 (def ^:private split-key "m2-split")
-<<<<<<< HEAD
-(def ^:private register-keys ["m2-left" "m2-right"])
-=======
 (def ^:private register-keys ["m2-left" "m2-target"])
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 
 (defn- helper-path [name]
   (str (System/getProperty "user.dir") "/target/elastickv-jepsen/" name))

@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-<<<<<<< HEAD
-=======
 	"errors"
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -45,14 +42,11 @@ type dedupTestCoordinator struct {
 	// WITHOUT applying — an ambiguous retryable error distinct from
 	// WriteConflict, exercising the "advance pending.commitTS and retry" branch.
 	txnLockedAtDispatch int
-<<<<<<< HEAD
-=======
 	// wireWriteConflicts converts every typed write conflict this test
 	// coordinator returns into the keyed gRPC status produced by leader
 	// forwarding. It exercises adapter-side type restoration without changing
 	// the underlying landed-vs-not-landed scenario.
 	wireWriteConflicts bool
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	// routeFenceAtDispatch makes the named dispatch return ErrRouteWriteFenced
 	// before the FSM dedup probe or apply. It is retryable but cannot be
 	// treated as an ambiguous landing.
@@ -301,11 +295,7 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return resp, err
 	}
 	if err := c.preApplyError(n); err != nil {
-<<<<<<< HEAD
-		return nil, err
-=======
 		return nil, c.maybeWireWriteConflict(req, err)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
@@ -325,8 +315,6 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	return resp, nil
 }
 
-<<<<<<< HEAD
-=======
 func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.OP], err error) error {
 	if !c.wireWriteConflicts || !errors.Is(err, store.ErrWriteConflict) {
 		return err
@@ -338,7 +326,6 @@ func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.
 	return status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {
 	return dispatch == c.routeFenceAtDispatch
 }

@@ -77,10 +77,7 @@ var (
 		dynamoRouteKey,
 		sqsRouteKey,
 		s3keys.ExtractRouteKey,
-<<<<<<< HEAD
-=======
 		fskeys.ExtractRouteKey,
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		listRouteKey,
 		hashRouteKey,
 		setRouteKey,
@@ -115,11 +112,7 @@ func normalizeRouteKey(key []byte) []byte {
 	return key
 }
 
-<<<<<<< HEAD
-func redisWideColumnScanRouteKey(key []byte) []byte {
-=======
 func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	for _, prefix := range [][]byte{
 		[]byte(store.HashMetaDeltaPrefix),
 		[]byte(store.HashMetaPrefix),
@@ -174,13 +167,6 @@ func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 		return nil
 	}
 	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
-<<<<<<< HEAD
-	if uint64(keyLen) > uint64(len(rest)-wideColumnEncodedKeyLengthSize) { //nolint:gosec // non-negative slice length fits uint64.
-		return nil
-	}
-	return rest[wideColumnEncodedKeyLengthSize : uint32(wideColumnEncodedKeyLengthSize)+keyLen]
-}
-=======
 	rest = rest[wideColumnEncodedKeyLengthSize:]
 	if uint64(keyLen) > uint64(len(rest)) {
 		return nil
@@ -188,7 +174,6 @@ func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 	return rest[:keyLen]
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func redisRouteKey(key []byte) []byte {
 	if !bytes.HasPrefix(key, redisInternalRoutePrefixBytes) {
 		return nil

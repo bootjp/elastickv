@@ -554,17 +554,10 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
 		return exportCursorTagScanned
 	}
-<<<<<<< HEAD
-	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
-		return exportCursorTagScanned
-	}
-	if opts.MaxCommitTSInclusive != 0 && version.TS > opts.MaxCommitTSInclusive {
-=======
 	if opts.MaxCommitTSInclusive != 0 && version.TS > opts.MaxCommitTSInclusive {
 		return exportCursorTagScanned
 	}
 	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		return exportCursorTagScanned
 	}
 	result.Versions = append(result.Versions, MVCCVersion{

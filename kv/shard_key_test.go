@@ -363,8 +363,6 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 			wantEnd:   nil,
 		},
 		{
-<<<<<<< HEAD
-=======
 			name:      "raw sqs-looking user prefix",
 			prefix:    []byte("!sqs|foo"),
 			wantStart: []byte("!sqs|foo"),
@@ -377,7 +375,6 @@ func TestRoutePrefixRangeTreatsBroadMappedPrefixesAsFullKeyspace(t *testing.T) {
 			wantEnd:   prefixScanEnd(sqsGlobalRouteKey),
 		},
 		{
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 			name:      "s3 bucket cleanup prefix",
 			prefix:    s3keys.ObjectManifestPrefixForBucket("bucket", 2),
 			wantStart: s3keys.RoutePrefixForBucket("bucket", 2),

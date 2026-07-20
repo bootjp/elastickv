@@ -147,8 +147,6 @@ func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	}, stream.responses[0].GetVersions())
 }
 
-<<<<<<< HEAD
-=======
 func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *testing.T) {
 	t.Parallel()
 
@@ -177,7 +175,6 @@ func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *
 	}, stream.responses[0].GetVersions())
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func TestInternalExportRangeVersionsUsesAppliedReadFence(t *testing.T) {
 	t.Parallel()
 
@@ -762,8 +759,6 @@ func TestInternalApplyTargetStagedReadinessRejectsArmedZeroMinWriteTS(t *testing
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.Equal(t, uint64(0), proposer.calls)
 }
-<<<<<<< HEAD
-=======
 
 func TestInternalCleanupMigrationRejectsWhenOpcodeGateClosed(t *testing.T) {
 	t.Parallel()
@@ -785,4 +780,3 @@ func TestInternalCleanupMigrationRejectsWhenOpcodeGateClosed(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.Zero(t, proposer.calls)
 }
->>>>>>> origin/design/hotspot-split-m2-promotion-complete

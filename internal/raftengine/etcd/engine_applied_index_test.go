@@ -390,12 +390,9 @@ func TestPersistReadyWithSnapshot_BumpsAppliedIndexAfterWALSnapshot(t *testing.T
 		persist:    persist,
 		dataDir:    t.TempDir(),
 		fsmSnapDir: fsmSnapDir,
-<<<<<<< HEAD
-=======
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
 		},
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 
 	snap := appliedIndexTestSnapshot(index, encodeSnapshotToken(index, crc))
@@ -422,12 +419,9 @@ func TestPersistReadyWithSnapshot_BumpErrorAfterWALSnapshotSurfaces(t *testing.T
 		persist:    persist,
 		dataDir:    t.TempDir(),
 		fsmSnapDir: fsmSnapDir,
-<<<<<<< HEAD
-=======
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
 		},
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	}
 
 	snap := appliedIndexTestSnapshot(index, encodeSnapshotToken(index, crc))

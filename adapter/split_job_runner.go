@@ -1188,11 +1188,7 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
 	}
-<<<<<<< HEAD
-	left, right := splitCatalogRoutes(sourceRoute, job.SplitKey, leftID, rightID)
-=======
 	left, right := splitCatalogRoutes(sourceRoute, job.SplitKey, leftID, rightID, job.FenceTS)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	right.State = distribution.RouteStateWriteFenced
 	snapshot, err = s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, snapshot.Version, sourceRoute.RouteID, nil, left, right)
 	if err != nil {

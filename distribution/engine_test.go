@@ -282,8 +282,6 @@ func assertStagedRouteMetadata(t *testing.T, route Route) {
 	if !route.StagedVisibilityActive || route.MigrationJobID != 42 || route.MinWriteTSExclusive != 99 {
 		t.Fatalf("staged route metadata was not preserved: %+v", route)
 	}
-<<<<<<< HEAD
-=======
 }
 
 func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
@@ -309,7 +307,6 @@ func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
 	if len(routes) != 2 || version != 12 {
 		t.Fatalf("unexpected atomic range lookup: routes=%+v version=%d", routes, version)
 	}
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {

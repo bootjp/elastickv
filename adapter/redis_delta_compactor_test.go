@@ -1690,18 +1690,6 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 	// update before all delete elems have been applied under the race detector.
 	c.compactUrgentKey(ctx, urgentCompactionRequest{typeName: "hash", userKey: userKey})
 
-<<<<<<< HEAD
-	readTS := st.LastCommitTS()
-	raw, err := st.GetAt(ctx, store.HashMetaKey(userKey), readTS)
-	require.NoError(t, err)
-	got, err := store.UnmarshalHashMeta(raw)
-	require.NoError(t, err)
-	require.Equal(t, int64(totalDeltasU64), got.Len, "all %d delta keys should be compacted into base meta", totalDeltasU64)
-
-	// No delta keys should remain after pagination compaction.
-	prefix := store.HashMetaDeltaScanPrefix(userKey)
-	end := store.PrefixScanEnd(prefix)
-=======
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { _ = c.Run(runCtx) }()
@@ -1729,7 +1717,6 @@ func TestDeltaCompactor_UrgentCompactionPagination(t *testing.T) {
 
 	// No delta keys should remain after pagination compaction.
 	readTS := st.LastCommitTS()
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	remaining, err := st.ScanAt(ctx, prefix, end, int(totalDeltasU64)+1, readTS)
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all delta keys must be deleted after urgent compaction")

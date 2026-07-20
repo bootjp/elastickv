@@ -104,8 +104,6 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_step_queue_full_total",
 				Help: "Inbound raft messages that found the selected step queue full. Blocking replication messages wait for space; best-effort messages may still be rejected. Indicates the raft loop is starved.",
-<<<<<<< HEAD
-=======
 			},
 			[]string{"group"},
 		),
@@ -141,7 +139,6 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_snapshot_stream_payload_bytes_total",
 				Help: "Payload bytes in outbound Raft snapshot streams acknowledged by peers.",
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 			},
 			[]string{"group"},
 		),

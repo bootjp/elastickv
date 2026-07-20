@@ -148,15 +148,12 @@ type GRPCTransport struct {
 	// dispatch workers run simultaneously.
 	bridgeSem       chan struct{}
 	snapshotSendSem chan struct{}
-<<<<<<< HEAD
-=======
 
 	sendStreamOpenCount      atomic.Uint64
 	sendStreamReconnectCount atomic.Uint64
 	sendStreamMessageCount   atomic.Uint64
 	snapshotStreamSendCount  atomic.Uint64
 	snapshotPayloadByteCount atomic.Uint64
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 }
 
 func NewGRPCTransport(peers []Peer) *GRPCTransport {

@@ -12,10 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
-<<<<<<< HEAD
-=======
 	"github.com/bootjp/elastickv/internal/fskeys"
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -33,10 +30,7 @@ type DistributionServer struct {
 	catalog                     *distribution.CatalogStore
 	coordinator                 kv.Coordinator
 	readTracker                 *kv.ActiveTimestampTracker
-<<<<<<< HEAD
-=======
 	fsObserver                  DistributionFilesystemObserver
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	readBlocked                 func() bool
 	migrationCapabilityGate     SplitMigrationCapabilityGate
 	splitJobRunnerReady         bool
@@ -56,15 +50,12 @@ type DistributionServer struct {
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
 
-<<<<<<< HEAD
-=======
 type DistributionFilesystemObserver interface {
 	ObserveFilePinnedHotspot(reason string)
 }
 
 const DistributionFilePinnedHotspotSplitBoundary = "split_boundary"
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 // SplitMigrationCapabilityGate reports whether this node can safely create
 // migration-only side effects. A nil gate keeps StartSplitMigration fail-closed.
 type SplitMigrationCapabilityGate func(context.Context) error
@@ -119,15 +110,12 @@ func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) 
 	}
 }
 
-<<<<<<< HEAD
-=======
 func WithDistributionFilesystemObserver(observer DistributionFilesystemObserver) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.fsObserver = observer
 	}
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func WithDistributionReadGate(blocked func() bool) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.readBlocked = blocked
@@ -477,11 +465,7 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 	if err := s.requireReadReady(); err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
-	r, ok := s.engine.GetRoute(req.Key)
-=======
 	r, ok := s.engine.GetRoute(kv.RouteKey(req.Key))
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
 	}
@@ -795,34 +779,12 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-<<<<<<< HEAD
-	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
-	if !found {
-		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
-	}
-
-	splitKey := distribution.CloneBytes(req.GetSplitKey())
-	if err := validateSplitKey(parent, splitKey); err != nil {
-		return nil, err
-	}
-	splitJobReadKeys, err := s.splitJobOverlapReadKeys(ctx, snapshot, parent)
-	if err != nil {
-		return nil, err
-	}
-
-	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
-=======
 	plan, err := s.planSplitRange(ctx, snapshot, req)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if err != nil {
 		return nil, err
 	}
 
-<<<<<<< HEAD
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, splitJobReadKeys, left, right)
-=======
 	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), plan.parentID, plan.readKeys, plan.left, plan.right)
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 	if err != nil {
 		return nil, err
 	}
@@ -879,8 +841,6 @@ func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return s.readTracker.Pin(ts)
 }
 
-<<<<<<< HEAD
-=======
 func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte, splitKey []byte, err error) {
 	if s == nil || s.fsObserver == nil || bytes.Equal(rawSplitKey, splitKey) || !isSplitBoundaryError(err) {
 		return
@@ -903,7 +863,6 @@ func isSplitBoundaryError(err error) bool {
 		strings.Contains(err.Error(), errDistributionSplitKeyAtBoundary.Error())
 }
 
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 func releaseReadPin(token *kv.ActiveTimestampToken) {
 	if token == nil {
 		return
@@ -947,21 +906,13 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
-<<<<<<< HEAD
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-=======
 	resp, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		Elems:    ops,
 		IsTxn:    true,
 		StartTS:  readTS,
 		ReadKeys: readKeys,
-<<<<<<< HEAD
-	}); err != nil {
-=======
 	})
 	if err != nil {
->>>>>>> origin/design/hotspot-split-m2-promotion-complete
 		if errors.Is(err, store.ErrWriteConflict) {
 			return distribution.CatalogSnapshot{}, grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
 		}
@@ -1877,19 +1828,6 @@ func toProtoRouteDescriptor(route distribution.RouteDescriptor) *pb.RouteDescrip
 		MigrationJobId:         route.MigrationJobID,
 		MinWriteTsExclusive:    route.MinWriteTSExclusive,
 		SplitAtHlc:             route.SplitAtHLC,
-	}
-}
-
-func toProtoRoute(route distribution.Route) *pb.RouteDescriptor {
-	return &pb.RouteDescriptor{
-		RouteId:                route.RouteID,
-		Start:                  distribution.CloneBytes(route.Start),
-		End:                    distribution.CloneBytes(route.End),
-		RaftGroupId:            route.GroupID,
-		State:                  toProtoRouteState(route.State),
-		StagedVisibilityActive: route.StagedVisibilityActive,
-		MigrationJobId:         route.MigrationJobID,
-		MinWriteTsExclusive:    route.MinWriteTSExclusive,
 	}
 }
 
