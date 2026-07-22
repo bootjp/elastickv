@@ -153,13 +153,15 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyStreamTTL(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	raw, err := st.GetAt(ctx, store.StreamMetaKey(key), readTS)
 	require.NoError(t, err)
-	require.Len(t, raw, redisWideMetaInlineSizeBytes)
+	require.Len(t, raw, store.StreamMetaTrimBinarySize)
 	meta, err := store.UnmarshalStreamMeta(raw)
 	require.NoError(t, err)
 	require.Zero(t, meta.Length)
 	require.Zero(t, meta.LastMs)
 	require.Zero(t, meta.LastSeq)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+	require.Zero(t, meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
 	_, err = st.GetAt(ctx, store.StreamEntryKey(key, 1700000000000, 5), readTS)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 
@@ -531,6 +533,66 @@ func TestDeltaCompactor_TTLInlineMigratesOnNonDefaultShardLeader(t *testing.T) {
 	meta, err := store.UnmarshalHashMeta(raw)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+type localLeaderGroupCompactionCoordinator struct {
+	*shardOnlyLeaderCompactionCoordinator
+	groupIDs []uint64
+}
+
+func (c *localLeaderGroupCompactionCoordinator) LocalLeaderGroupIDs() []uint64 {
+	return append([]uint64(nil), c.groupIDs...)
+}
+
+type recordingTTLInlineGroupScanStore struct {
+	store.MVCCStore
+	fullStarts  []string
+	groupScans  []uint64
+	groupStarts []string
+}
+
+func (s *recordingTTLInlineGroupScanStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.fullStarts = append(s.fullStarts, string(start))
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func (s *recordingTTLInlineGroupScanStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.groupScans = append(s.groupScans, groupID)
+	s.groupStarts = append(s.groupStarts, string(start))
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	key := []byte("ttl:migrate:group-scan")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	require.Contains(t, st.groupScans, uint64(2))
+	require.Contains(t, st.groupStarts, store.HashMetaPrefix)
+	require.NotContains(t, st.fullStarts, store.HashMetaPrefix,
+		"sharded ttl migration should scan candidate metadata with ScanGroupAt")
+	raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
 }
 

@@ -1665,6 +1665,22 @@ func (c *ShardedCoordinator) timestampBridgeCandidateGroupIDs() []uint64 {
 	return ids
 }
 
+// LocalLeaderGroupIDs returns the configured data shard groups this process
+// currently leads. Background maintenance uses this to avoid issuing
+// whole-keyspace scans from every node and proxying those scans back to the
+// same hot leaders.
+func (c *ShardedCoordinator) LocalLeaderGroupIDs() []uint64 {
+	ids := c.timestampBridgeCandidateGroupIDs()
+	out := make([]uint64, 0, len(ids))
+	for _, gid := range ids {
+		g, ok := c.groups[gid]
+		if ok && isLeaderEngine(engineForGroup(g)) {
+			out = append(out, gid)
+		}
+	}
+	return out
+}
+
 func (c *ShardedCoordinator) invalidateTimestampWindow() {
 	if c == nil {
 		return
