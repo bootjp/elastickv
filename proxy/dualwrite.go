@@ -510,7 +510,7 @@ func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapse
 		d.sentry.CaptureException(sErr, "secondary_write_failure", argsToBytes(iArgs))
 	}
 	warnArgs := []any{"cmd", cmd, "err", sErr, "elapsed", elapsed, "attempts", attempts}
-	if (cmd == "EVALSHA" || cmd == "EVALSHA_RO") && len(iArgs) > 1 {
+	if (cmd == cmdEvalSHA || cmd == cmdEvalSHARO) && len(iArgs) > 1 {
 		switch v := iArgs[1].(type) {
 		case []byte:
 			warnArgs = append(warnArgs, "sha", string(v))
