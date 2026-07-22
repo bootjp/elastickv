@@ -178,6 +178,10 @@ type tsoLeaseRenewer interface {
 	RunHLCLeaseRenewal(context.Context)
 }
 
+type tsoLeaseProposer interface {
+	ProposeHLCLease(context.Context, int64) error
+}
+
 type LocalTSOAllocator struct {
 	coord        tsoCoordinator
 	pollInterval time.Duration
@@ -241,7 +245,30 @@ func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint6
 		clock.Observe(min)
 	}
 	base, err := clock.NextBatchFenced(n)
+	if errors.Is(err, ErrCeilingExpired) {
+		if renewErr := a.renewExpiredCeiling(ctx); renewErr != nil {
+			return 0, errors.Wrap(renewErr, "tso renew expired HLC lease")
+		}
+		if min > 0 {
+			clock.Observe(min)
+		}
+		base, err = clock.NextBatchFenced(n)
+	}
 	return base, errors.Wrap(err, "tso next batch")
+}
+
+func (a *LocalTSOAllocator) renewExpiredCeiling(ctx context.Context) error {
+	proposer, ok := a.coord.(tsoLeaseProposer)
+	if !ok {
+		return errors.WithStack(ErrCeilingExpired)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+	defer cancel()
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	return errors.Wrap(proposer.ProposeHLCLease(pctx, ceilingMs), "propose HLC lease")
 }
 
 func (a *LocalTSOAllocator) IsLeader() bool {

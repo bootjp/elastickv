@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -367,6 +368,25 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	requireRenewalDone(t, third)
 	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
 		"the group must be eligible for renewal after the in-flight proposal finishes")
+}
+
+func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testing.T) {
+	t.Parallel()
+	eng0 := newShardedLeaseEngine(300)
+	eng1 := newShardedLeaseEngine(100)
+	distEngine := distribution.NewEngine()
+	distEngine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(distEngine, map[uint64]*ShardGroup{
+		0: {Engine: eng0},
+		1: {Engine: eng1},
+	}, 1, NewHLC(), nil).WithTimestampGroup(0)
+
+	err := coord.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng0.proposeCalls.Load())
+	require.Equal(t, int32(0), eng1.proposeCalls.Load())
+	require.True(t, coord.groups[0].lease.valid(monoclock.Now()),
+		"a synchronous timestamp renewal must warm the timestamp group's lease")
 }
 
 func hlcRenewalInFlight(coord *ShardedCoordinator, gid uint64) bool {

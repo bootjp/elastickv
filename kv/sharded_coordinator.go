@@ -2338,6 +2338,40 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
+func (c *ShardedCoordinator) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var firstErr error
+	for _, gid := range c.timestampLeaseRenewalGroupIDs() {
+		group := c.groups[gid]
+		if group == nil || group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		if err := c.proposeHLCLeaseToGroup(ctx, gid, group, ceilingMs); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		return nil
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return errors.WithStack(ErrLeaderNotFound)
+}
+
+func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if c.timestampGroupConfigured {
+		return []uint64{c.timestampGroup}
+	}
+	return c.timestampBridgeCandidateGroupIDs()
+}
+
 // renewHLCLeases starts one renewal proposal for every shard group this node
 // currently leads. It does not wait for those proposals before returning; the
 // returned channel closes when the launched proposals finish and exists for
@@ -2418,6 +2452,16 @@ func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
 // lease -- doing so would force every read onto the slow path.
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	if err := c.proposeHLCLeaseToGroup(ctx, gid, group, ceilingMs); err != nil {
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", gid),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+	}
+}
+
+func (c *ShardedCoordinator) proposeHLCLeaseToGroup(ctx context.Context, gid uint64, group *ShardGroup, ceilingMs int64) error {
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
 	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
@@ -2430,16 +2474,12 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, grou
 		if isLeadershipLossError(err) {
 			group.lease.invalidate()
 		}
-		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", gid),
-			slog.Int64("ceiling_ms", ceilingMs),
-			slog.Any("err", err),
-		)
-		return
+		return errors.Wrapf(err, "hlc lease renewal group %d", gid)
 	}
 	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
 		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
+	return nil
 }
 
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {
