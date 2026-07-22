@@ -17,7 +17,7 @@ Date: 2026-04-29
 | 5B | RotateDEK + RegisterEncryptionWriter (leader-only Proposer wiring) + `rotate-dek` / `register-writer` CLI + ResyncSidecar leader guard | shipped | PR #756 |
 | 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | shipped | PR #759 |
 | 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | shipped | PR #760 |
-| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | deferred | — |
+| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode. The CLI now accepts repeated `--discover-from=<grpc_addr>` entries, polls `GetCapability`, validates `encryption_capable`, `full_node_id != 0`, and `local_epoch <= 0xFFFF`, then builds the bootstrap writer batch before proposing `BootstrapEncryption`. Explicit `--writer` mode remains available and is mutually exclusive with discovery mode. | shipped | this PR |
 | 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. | shipped | earlier PRs |
 | 6B | §6.5 KEK plumbing — `--kekFile` file-backed wrapper + thread `KEKUnwrapper` into the applier so `ApplyBootstrap` / `ApplyRotation` KEK-unwrap + `--encryption-enabled` flag (default off) + mutating-RPC wiring in `registerEncryptionAdminServer` gated on (`--encryption-enabled` AND `--kekFile` AND `--encryptionSidecarPath`). `--kekUri` remains Stage 9 provider work. | shipped | earlier PRs |
 | 6C-1 | Subset of §9.1 startup refusal guards that depend only on flags + sidecar state: sidecar present without `--encryption-enabled` (`ErrSidecarPresentWithoutFlag`, downgrade prevention), `--encryption-enabled` without `--kekFile` (`ErrKEKRequiredWithFlag`, fail-fast), KEK loaded but sidecar wrapped DEKs do not unwrap (`ErrKEKMismatch`, operator-error catch). `internal/encryption/startup.go`'s `CheckStartupGuards` runs once in `main.go run()` before `buildShardGroups`. | shipped | PR #778 |
@@ -41,12 +41,14 @@ flag does not exist yet, and there is no admin RPC to propose a
 bootstrap entry. Stage 5 ships the operator-facing surface (admin
 RPCs + CLI + gRPC wiring); Stage 6 flips it on under a cluster flag.
 
-Stage 5E (capability fan-out helper) is deferred — its scope is
-narrowly the §5.6 step 1a auto-batch CLI convenience and does not
-gate any Stage 6 work. The existing CLI accepts the writer batch
-explicitly today (PR #759), which is sufficient for hand-authored
-bootstraps; the auto-batch helper can land any time after Stage 6F
-without changing the on-disk or wire format.
+Stage 5E (capability fan-out helper) is shipped as an operator
+convenience: `encryption bootstrap --discover-from=...` polls
+`GetCapability` on every supplied member endpoint and projects the
+reports into the §5.6 step 1a writer batch. The original explicit
+`--writer=<full_node_id>:<local_epoch>` path remains for
+hand-authored bootstraps and offline runbooks. The helper changes
+only CLI request construction; it does not alter the on-disk or
+wire format.
 
 ### Stage 6 sub-milestone rationale
 

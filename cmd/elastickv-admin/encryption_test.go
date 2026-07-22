@@ -176,6 +176,8 @@ type stubMutatorServer struct {
 	rotateCalls             []*pb.RotateDEKRequest
 	registerCalls           []*pb.RegisterEncryptionWriterRequest
 	bootstrapCalls          []*pb.BootstrapEncryptionRequest
+	capability              *pb.CapabilityReport
+	capabilityErr           error
 	enableEnvelopeCalls     []*pb.EnableStorageEnvelopeRequest
 	enableEnvelopeResp      *pb.EnableStorageEnvelopeResponse
 	enableRaftEnvelopeCalls []*pb.EnableRaftEnvelopeRequest
@@ -206,6 +208,19 @@ func (s *stubMutatorServer) BootstrapEncryption(_ context.Context, req *pb.Boots
 		return nil, s.returnErr
 	}
 	return &pb.BootstrapEncryptionResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func (s *stubMutatorServer) GetCapability(context.Context, *pb.Empty) (*pb.CapabilityReport, error) {
+	if s.capabilityErr != nil {
+		return nil, s.capabilityErr
+	}
+	if s.capability != nil {
+		return s.capability, nil
+	}
+	return &pb.CapabilityReport{
+		EncryptionCapable: true,
+		FullNodeId:        1,
+	}, nil
 }
 
 func (s *stubMutatorServer) EnableStorageEnvelope(_ context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
@@ -264,6 +279,133 @@ func TestRunEncryptionBootstrap_HappyPath(t *testing.T) {
 		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(stub.bootstrapCalls))
 	}
 	assertBootstrapCallMatches(t, stub.bootstrapCalls[0])
+}
+
+func TestRunEncryptionBootstrap_DiscoverFromHappyPath(t *testing.T) {
+	t.Parallel()
+	leader := &stubMutatorServer{
+		appliedIndex: 117,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+	follower := &stubMutatorServer{
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        22,
+			LocalEpoch:        5,
+		},
+	}
+	followerAddr := startCustomEncryptionAdminTestServer(t, follower)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", leaderAddr,
+		"--timeout", "3s",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--discover-from", leaderAddr,
+		"--discover-from", followerAddr,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionBootstrap: %v", err)
+	}
+	if !strings.Contains(buf.String(), "writers=2") {
+		t.Errorf("output missing writers=2, got:\n%s", buf.String())
+	}
+	if len(leader.bootstrapCalls) != 1 {
+		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
+	}
+	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
+}
+
+func TestRunEncryptionBootstrap_RejectsWriterAndDiscoverFrom(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--writer", "11:0",
+		"--discover-from", "127.0.0.1:50051",
+	}, &buf)
+	if err == nil {
+		t.Fatal("runEncryptionBootstrap returned nil, want mutually-exclusive writer source error")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error %q does not mention mutually exclusive writer sources", err)
+	}
+}
+
+func TestRunEncryptionBootstrap_DiscoverFromRejectsBadCapability(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		capability *pb.CapabilityReport
+		want       string
+	}{
+		{
+			name: "not capable",
+			capability: &pb.CapabilityReport{
+				EncryptionCapable: false,
+				FullNodeId:        11,
+			},
+			want: "not encryption_capable",
+		},
+		{
+			name: "zero full node id",
+			capability: &pb.CapabilityReport{
+				EncryptionCapable: true,
+				FullNodeId:        0,
+			},
+			want: "full_node_id=0",
+		},
+		{
+			name: "local epoch above uint16",
+			capability: &pb.CapabilityReport{
+				EncryptionCapable: true,
+				FullNodeId:        11,
+				LocalEpoch:        70000,
+			},
+			want: "exceeds 0xFFFF",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			leader := &stubMutatorServer{appliedIndex: 117}
+			leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+			peer := &stubMutatorServer{capability: tc.capability}
+			peerAddr := startCustomEncryptionAdminTestServer(t, peer)
+
+			var buf bytes.Buffer
+			err := runEncryptionBootstrap([]string{
+				"--endpoint", leaderAddr,
+				"--timeout", "3s",
+				"--storage-dek-id", "1",
+				"--raft-dek-id", "2",
+				"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+				"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+				"--discover-from", peerAddr,
+			}, &buf)
+			if err == nil {
+				t.Fatalf("runEncryptionBootstrap returned nil, want %q error", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err, tc.want)
+			}
+			if len(leader.bootstrapCalls) != 0 {
+				t.Errorf("BootstrapEncryption calls=%d, want 0 after discovery rejection", len(leader.bootstrapCalls))
+			}
+		})
+	}
 }
 
 func assertBootstrapCallMatches(t *testing.T, call *pb.BootstrapEncryptionRequest) {

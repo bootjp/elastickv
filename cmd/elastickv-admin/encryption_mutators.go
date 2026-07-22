@@ -427,13 +427,10 @@ func requireUint16Plus1(v uint, name string) error {
 
 // runEncryptionBootstrap invokes EncryptionAdmin.BootstrapEncryption.
 // The operator provides the wrapped DEK pair (base64), the two
-// dek_ids, and the §5.6 step 1a writer batch as repeated
-// --writer=<full_node_id>:<local_epoch> flag values. Cluster-wide
-// capability fan-out (computing the batch automatically by
-// dialing every member's GetCapability) is deferred to a later
-// CLI iteration; for now the operator runs `encryption status`
-// against each member to gather the batch and passes it
-// explicitly.
+// dek_ids, and either an explicit §5.6 step 1a writer batch via
+// repeated --writer=<full_node_id>:<local_epoch> flags or a
+// repeated --discover-from=<grpc_addr> list whose GetCapability
+// reports are projected into that batch.
 func runEncryptionBootstrap(args []string, out io.Writer) error {
 	parsed, endpoint, err := parseBootstrapArgs(args)
 	if err != nil {
@@ -453,21 +450,33 @@ func runEncryptionBootstrap(args []string, out io.Writer) error {
 			fmt.Fprintf(os.Stderr, "encryption: close connection: %v\n", err)
 		}
 	}()
-	resp, err := client.BootstrapEncryption(ctx, parsed)
+	if len(parsed.discoverFrom) > 0 {
+		batch, err := discoverBootstrapWriterBatch(ctx, parsed.discoverFrom)
+		if err != nil {
+			return err
+		}
+		parsed.request.WriterBatch = batch
+	}
+	resp, err := client.BootstrapEncryption(ctx, parsed.request)
 	if err != nil {
 		return errors.Wrap(err, "BootstrapEncryption")
 	}
 	if _, err := fmt.Fprintf(out, "bootstrapped storage_dek_id=%d raft_dek_id=%d writers=%d applied_index=%d\n",
-		parsed.StorageDekId, parsed.RaftDekId, len(parsed.WriterBatch), resp.AppliedIndex); err != nil {
+		parsed.request.StorageDekId, parsed.request.RaftDekId, len(parsed.request.WriterBatch), resp.AppliedIndex); err != nil {
 		return errors.Wrap(err, "write result")
 	}
 	return nil
 }
 
+type parsedBootstrap struct {
+	request      *pb.BootstrapEncryptionRequest
+	discoverFrom []string
+}
+
 // parseBootstrapArgs returns the validated proto request and the
 // shared endpoint flags. A nil request with no error means the
 // caller requested --help; runEncryptionBootstrap then exits 0.
-func parseBootstrapArgs(args []string) (*pb.BootstrapEncryptionRequest, *encryptionEndpointFlags, error) {
+func parseBootstrapArgs(args []string) (*parsedBootstrap, *encryptionEndpointFlags, error) {
 	fs := flag.NewFlagSet("encryption bootstrap", flag.ContinueOnError)
 	endpoint := newEncryptionEndpointFlags(fs)
 	storageDEKID := fs.Uint("storage-dek-id", 0, "Storage DEK key id; must be non-zero and differ from --raft-dek-id")
@@ -476,6 +485,8 @@ func parseBootstrapArgs(args []string) (*pb.BootstrapEncryptionRequest, *encrypt
 	wrappedRaftB64 := fs.String("wrapped-raft-dek", "", "Base64 of the KEK-wrapped raft DEK")
 	var writerFlags stringSliceFlag
 	fs.Var(&writerFlags, "writer", "Writer-registry entry as <full_node_id>:<local_epoch>; repeat per member")
+	var discoverFromFlags stringSliceFlag
+	fs.Var(&discoverFromFlags, "discover-from", "gRPC address of a member to poll with GetCapability for the writer batch; repeat per member")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil, endpoint, nil
@@ -489,20 +500,35 @@ func parseBootstrapArgs(args []string) (*pb.BootstrapEncryptionRequest, *encrypt
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(writerFlags) == 0 {
-		return nil, nil, errors.New("encryption: at least one --writer=<full_node_id>:<local_epoch> is required")
-	}
-	batch, err := parseWriterBatch(writerFlags)
+	batch, discoverFrom, err := parseBootstrapWriterSource(writerFlags, discoverFromFlags)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &pb.BootstrapEncryptionRequest{
-		StorageDekId:      narrowUint32(*storageDEKID),
-		RaftDekId:         narrowUint32(*raftDEKID),
-		WrappedStorageDek: wrappedStorage,
-		WrappedRaftDek:    wrappedRaft,
-		WriterBatch:       batch,
+	return &parsedBootstrap{
+		request: &pb.BootstrapEncryptionRequest{
+			StorageDekId:      narrowUint32(*storageDEKID),
+			RaftDekId:         narrowUint32(*raftDEKID),
+			WrappedStorageDek: wrappedStorage,
+			WrappedRaftDek:    wrappedRaft,
+			WriterBatch:       batch,
+		},
+		discoverFrom: discoverFrom,
 	}, endpoint, nil
+}
+
+func parseBootstrapWriterSource(writerFlags, discoverFromFlags stringSliceFlag) ([]*pb.WriterRegistryEntry, []string, error) {
+	if len(writerFlags) > 0 && len(discoverFromFlags) > 0 {
+		return nil, nil, errors.New("encryption: --writer and --discover-from are mutually exclusive writer-batch sources")
+	}
+	if len(writerFlags) == 0 && len(discoverFromFlags) == 0 {
+		return nil, nil, errors.New("encryption: at least one --writer=<full_node_id>:<local_epoch> or --discover-from=<grpc_addr> is required")
+	}
+	if len(writerFlags) > 0 {
+		batch, err := parseWriterBatch(writerFlags)
+		return batch, nil, err
+	}
+	discoverFrom, err := parseDiscoverFromFlags(discoverFromFlags)
+	return nil, discoverFrom, err
 }
 
 func validateBootstrapDEKIDs(storage, raft uint) error {
@@ -576,6 +602,99 @@ func parseWriterBatch(raw []string) ([]*pb.WriterRegistryEntry, error) {
 	}
 	return out, nil
 }
+
+func parseDiscoverFromFlags(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	for i, entry := range raw {
+		addr := strings.TrimSpace(entry)
+		if addr == "" {
+			return nil, errors.Errorf("encryption: --discover-from[%d] must be a non-empty gRPC address", i)
+		}
+		out = append(out, addr)
+	}
+	return out, nil
+}
+
+func discoverBootstrapWriterBatch(ctx context.Context, addrs []string) ([]*pb.WriterRegistryEntry, error) {
+	batch := make([]*pb.WriterRegistryEntry, 0, len(addrs))
+	for i, addr := range addrs {
+		report, err := getBootstrapCapability(ctx, addr)
+		if err != nil {
+			return nil, err
+		}
+		entry, err := writerEntryFromCapability(i, addr, report)
+		if err != nil {
+			return nil, err
+		}
+		batch = append(batch, entry)
+	}
+	if err := validateBootstrapWriterBatch(batch); err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+func getBootstrapCapability(ctx context.Context, addr string) (*pb.CapabilityReport, error) {
+	timeout := encryptionDialTimeout
+	endpoint := &encryptionEndpointFlags{endpoint: &addr, timeout: &timeout}
+	client, closeFn, err := dialEncryption(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	report, rpcErr := client.GetCapability(ctx, &pb.Empty{})
+	closeErr := closeFn()
+	if rpcErr != nil {
+		return nil, errors.Wrapf(rpcErr, "GetCapability %s", addr)
+	}
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "encryption: close discovery connection to %s: %v\n", addr, closeErr)
+	}
+	return report, nil
+}
+
+func writerEntryFromCapability(index int, addr string, report *pb.CapabilityReport) (*pb.WriterRegistryEntry, error) {
+	if report == nil {
+		return nil, errors.Errorf("encryption: --discover-from[%d]=%s returned nil CapabilityReport", index, addr)
+	}
+	if !report.GetEncryptionCapable() {
+		return nil, errors.Errorf("encryption: --discover-from[%d]=%s is not encryption_capable", index, addr)
+	}
+	fullNodeID := report.GetFullNodeId()
+	if fullNodeID == 0 {
+		return nil, errors.Errorf("encryption: --discover-from[%d]=%s returned full_node_id=0", index, addr)
+	}
+	localEpoch := report.GetLocalEpoch()
+	if localEpoch > math.MaxUint16 {
+		return nil, errors.Errorf("encryption: --discover-from[%d]=%s local_epoch=%d exceeds 0xFFFF", index, addr, localEpoch)
+	}
+	return &pb.WriterRegistryEntry{
+		FullNodeId: fullNodeID,
+		LocalEpoch: localEpoch,
+	}, nil
+}
+
+func validateBootstrapWriterBatch(batch []*pb.WriterRegistryEntry) error {
+	if len(batch) == 0 {
+		return errors.New("encryption: discovered writer batch is empty")
+	}
+	seenFull := make(map[uint64]int, len(batch))
+	seenNodeID := make(map[uint64]uint64, len(batch))
+	for i, entry := range batch {
+		fullNodeID := entry.GetFullNodeId()
+		if prev, ok := seenFull[fullNodeID]; ok {
+			return errors.Errorf("encryption: discovered writer_batch[%d] duplicates full_node_id %d already present at index %d", i, fullNodeID, prev)
+		}
+		seenFull[fullNodeID] = i
+		nodeID16 := fullNodeID & nodeID16Mask
+		if prevFull, ok := seenNodeID[nodeID16]; ok {
+			return errors.Errorf("encryption: discovered writer_batch[%d].full_node_id=%d collides with %d on uint16 node_id 0x%04x", i, fullNodeID, prevFull, nodeID16)
+		}
+		seenNodeID[nodeID16] = fullNodeID
+	}
+	return nil
+}
+
+const nodeID16Mask uint64 = 0xFFFF
 
 // uint32Mask is the defence-in-depth narrowing mask for the
 // uint→uint32 conversion below; named so the magic-number linter
