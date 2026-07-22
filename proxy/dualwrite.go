@@ -297,8 +297,9 @@ func (d *DualWriter) Read(ctx context.Context, cmd string, args [][]byte) (any, 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
 }
 
-// Blocking forwards a blocking command to the primary only.
-// Optionally sends a short-timeout version to secondary for warmup.
+// Blocking forwards a blocking command to the primary. Read-only blocking
+// commands are not replayed to the secondary; mutating blocking commands keep a
+// bounded secondary replay so the secondary observes the same consumption.
 // cmd must be the pre-uppercased command name.
 func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (any, error) {
 	iArgs := bytesArgsToInterfaces(args)
@@ -320,8 +321,7 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	// Warmup: send to secondary with short timeout (fire-and-forget, bounded)
-	if d.hasSecondaryWrite() {
+	if d.hasSecondaryWrite() && shouldReplayBlockingToSecondary(cmd) {
 		d.goWrite(func(ctx context.Context) {
 			sCtx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()

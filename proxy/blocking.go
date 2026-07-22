@@ -52,3 +52,7 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 	}
 	return time.Duration(millis) * time.Millisecond
 }
+
+func shouldReplayBlockingToSecondary(cmd string) bool {
+	return !strings.EqualFold(cmd, "XREAD")
+}
