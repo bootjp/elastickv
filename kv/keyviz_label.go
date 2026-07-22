@@ -123,3 +123,10 @@ func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	}
 	return 0
 }
+
+func (c keyVizLabeledCoordinator) LocalLeaderGroupIDs() []uint64 {
+	if lg, ok := c.inner.(interface{ LocalLeaderGroupIDs() []uint64 }); ok {
+		return lg.LocalLeaderGroupIDs()
+	}
+	return nil
+}
