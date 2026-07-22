@@ -636,6 +636,62 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
 }
 
+func TestDualWriter_Blocking_ReplaysMutatingBlockingCommand(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
+	d.Close()
+
+	assert.Equal(t, 1, secondary.CallCount())
+	secondary.mu.Lock()
+	got := append([]any(nil), secondary.calls[0]...)
+	secondary.mu.Unlock()
+	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, got)
+}
+
+func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"stream-result"},
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	resp, err := d.Blocking(context.Background(), "XREAD", [][]byte{
+		[]byte("XREAD"), []byte("BLOCK"), []byte("1000"), []byte("STREAMS"), []byte("jobs"), []byte("0"),
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{"stream-result"}, resp)
+	d.Close()
+
+	assert.Equal(t, 0, secondary.CallCount())
+}
+
 func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
