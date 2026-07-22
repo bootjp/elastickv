@@ -18,6 +18,9 @@ const (
 	streamMetaLegacyBinarySize = 24
 	streamMetaBinarySize       = 32
 	streamMetaTrimBinarySize   = 48
+	// StreamMetaTrimBinarySize is the current fixed binary size for StreamMeta:
+	// Len(8) || LastMs(8) || LastSeq(8) || ExpireAtMs(8) || TrimmedMs(8) || TrimmedSeq(8).
+	StreamMetaTrimBinarySize = streamMetaTrimBinarySize
 	// StreamIDBytes is the fixed size of the binary StreamID suffix on an entry key:
 	// 8 bytes big-endian ms || 8 bytes big-endian seq. Big-endian so lex order
 	// over the raw key bytes matches the (ms, seq) numeric order used by XADD / XRANGE.

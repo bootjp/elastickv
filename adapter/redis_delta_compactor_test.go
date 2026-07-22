@@ -153,7 +153,7 @@ func TestDeltaCompactor_TTLInlineMigratesLegacyStreamTTL(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	raw, err := st.GetAt(ctx, store.StreamMetaKey(key), readTS)
 	require.NoError(t, err)
-	require.Len(t, raw, redisStreamMetaTrimSizeBytes)
+	require.Len(t, raw, store.StreamMetaTrimBinarySize)
 	meta, err := store.UnmarshalStreamMeta(raw)
 	require.NoError(t, err)
 	require.Zero(t, meta.Length)

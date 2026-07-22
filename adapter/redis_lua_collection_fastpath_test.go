@@ -209,7 +209,10 @@ func TestLua_SISMEMBER_FastPathHit(t *testing.T) {
 
 	var got any
 	err := retryNotLeader(ctx, func() error {
-		leaderRDB := redisClientForCurrentLeader(t, nodes)
+		leaderRDB, leaderErr := redisClientForCurrentLeader(t, nodes)
+		if leaderErr != nil {
+			return leaderErr
+		}
 		defer func() { _ = leaderRDB.Close() }()
 
 		var evalErr error
@@ -223,7 +226,7 @@ func TestLua_SISMEMBER_FastPathHit(t *testing.T) {
 	require.Equal(t, int64(1), got)
 }
 
-func redisClientForCurrentLeader(t *testing.T, nodes []Node) *redis.Client {
+func redisClientForCurrentLeader(t *testing.T, nodes []Node) (*redis.Client, error) {
 	t.Helper()
 	for _, view := range nodes {
 		leaderAddr := view.engine.Leader().Address
@@ -232,11 +235,11 @@ func redisClientForCurrentLeader(t *testing.T, nodes []Node) *redis.Client {
 		}
 		for _, n := range nodes {
 			if n.raftAddress == leaderAddr {
-				return redis.NewClient(&redis.Options{Addr: n.redisAddress})
+				return redis.NewClient(&redis.Options{Addr: n.redisAddress}), nil
 			}
 		}
 	}
-	return redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	return nil, ErrLeaderNotFound
 }
 
 func TestLua_SISMEMBER_HonorsInScriptSAdd(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	cockroachdberr "github.com/cockroachdb/errors"
 	gproto "google.golang.org/protobuf/proto"
 )
@@ -55,10 +56,6 @@ const (
 	redisStreamMetaSize = 24
 	// redisStreamMetaInlineTTLSize is the current shape with trailing ExpireAtMs(8).
 	redisStreamMetaInlineTTLSize = 32
-	// redisStreamMetaTrimCursorSize extends the inline TTL shape with
-	// TrimmedMs(8) || TrimmedSeq(8), a live-side performance cursor that
-	// is intentionally omitted from logical JSONL output.
-	redisStreamMetaTrimCursorSize = 48
 
 	// redisStreamIDBytes is the per-entry-key suffix size: ms(8)
 	// || seq(8). Mirrors store.StreamIDBytes.
@@ -128,10 +125,10 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	}
 	if len(value) != redisStreamMetaSize &&
 		len(value) != redisStreamMetaInlineTTLSize &&
-		len(value) != redisStreamMetaTrimCursorSize {
+		len(value) != store.StreamMetaTrimBinarySize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamMeta,
 			"length %d not in {%d,%d,%d}",
-			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, redisStreamMetaTrimCursorSize)
+			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, store.StreamMetaTrimBinarySize)
 	}
 	rawLen := binary.BigEndian.Uint64(value[0:8])
 	if rawLen > math.MaxInt64 {
@@ -143,7 +140,9 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	st.lastMs = binary.BigEndian.Uint64(value[8:16])
 	st.lastSeq = binary.BigEndian.Uint64(value[16:24])
 	st.metaSeen = true
-	if len(value) == redisStreamMetaInlineTTLSize || len(value) == redisStreamMetaTrimCursorSize {
+	// The trim-cursor shape is store.StreamMetaTrimBinarySize; backup accepts
+	// it for compatibility but omits TrimmedMs/TrimmedSeq from logical JSONL.
+	if len(value) == redisStreamMetaInlineTTLSize || len(value) == store.StreamMetaTrimBinarySize {
 		expireAtMs := binary.BigEndian.Uint64(value[24:32])
 		st.expireAtMs = expireAtMs
 		st.hasTTL = expireAtMs != 0

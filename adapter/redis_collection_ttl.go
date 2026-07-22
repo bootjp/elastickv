@@ -16,7 +16,6 @@ const (
 	redisSimpleMetaInlineSizeBytes = 16
 	redisWideMetaLegacySizeBytes   = 24
 	redisWideMetaInlineSizeBytes   = 32
-	redisStreamMetaTrimSizeBytes   = 48
 )
 
 func redisExpireAtMillis(expireAt time.Time) uint64 {
@@ -72,7 +71,7 @@ func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readT
 }
 
 func isStreamInlineMeta(raw []byte) bool {
-	return len(raw) == redisWideMetaInlineSizeBytes || len(raw) == redisStreamMetaTrimSizeBytes
+	return len(raw) == redisWideMetaInlineSizeBytes || len(raw) == store.StreamMetaTrimBinarySize
 }
 
 func (r *RedisServer) simpleInlineTTLAt(

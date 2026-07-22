@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	gproto "google.golang.org/protobuf/proto"
 )
@@ -49,7 +50,7 @@ func encodeStreamMetaValue(length int64, lastMs, lastSeq uint64) []byte {
 }
 
 func encodeStreamMetaValueWithTrimCursor(length int64, lastMs, lastSeq, expireAtMs, trimmedMs, trimmedSeq uint64) []byte {
-	v := make([]byte, redisStreamMetaTrimCursorSize)
+	v := make([]byte, store.StreamMetaTrimBinarySize)
 	binary.BigEndian.PutUint64(v[0:8], uint64(length)) //nolint:gosec
 	binary.BigEndian.PutUint64(v[8:16], lastMs)
 	binary.BigEndian.PutUint64(v[16:24], lastSeq)
