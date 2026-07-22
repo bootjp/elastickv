@@ -203,7 +203,7 @@ func secondaryScriptConcurrency(cfg ProxyConfig) int {
 }
 
 func secondaryBlockingReplayConcurrency(cfg ProxyConfig) int {
-	return configuredConcurrencyOrDefault(cfg.SecondaryBlockingReplayConcurrency, maxBlockingReplayGoroutines)
+	return cfg.SecondaryBlockingReplayConcurrency
 }
 
 func secondaryWriteQueueCapacity(cfg ProxyConfig) int {
@@ -215,9 +215,13 @@ func secondaryScriptQueueCapacity(cfg ProxyConfig) int {
 }
 
 func secondaryBlockingReplayQueueCapacity(cfg ProxyConfig) int {
+	concurrency := secondaryBlockingReplayConcurrency(cfg)
+	if concurrency <= 0 {
+		return 0
+	}
 	return configuredQueueCapacityOrDefault(
 		cfg.SecondaryBlockingReplayQueueCapacity,
-		secondaryBlockingReplayConcurrency(cfg),
+		concurrency,
 	)
 }
 
@@ -717,6 +721,9 @@ func (d *DualWriter) goScript(fn func(context.Context)) {
 // goBlockingReplay queues fn for bounded secondary replay of mutating blocking
 // commands without consuming the normal secondary write workers.
 func (d *DualWriter) goBlockingReplay(fn func(context.Context)) {
+	if cap(d.blockingReplaySem) == 0 {
+		return
+	}
 	d.enqueueAsync(d.blockingReplayQueue, d.blockingReplayQueueSlots, asyncQueueBlocking, fn)
 }
 

@@ -38,6 +38,7 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryQueueSize(t *testing.T) {
 
 func TestValidateSecondaryConcurrency(t *testing.T) {
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeDualWrite, 128, 8, 4, 2, 4))
+	require.NoError(t, validateSecondaryConcurrency(proxy.ModeDualWrite, 128, 1, 1, 1, 0))
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeRedisOnly, 1, 1, 100, 100, 100))
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeElasticKVOnly, 1, 1, 100, 100, 100))
 
@@ -117,13 +118,13 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			wantBlockingConcurrency: 6,
 		},
 		{
-			name:                    "small pool stays usable",
+			name:                    "small pool disables blocking replay",
 			mode:                    proxy.ModeDualWrite,
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       1,
 			wantWriteConcurrency:    1,
 			wantScriptConcurrency:   1,
-			wantBlockingConcurrency: 1,
+			wantBlockingConcurrency: 0,
 		},
 	}
 

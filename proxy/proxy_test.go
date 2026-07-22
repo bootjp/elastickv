@@ -655,7 +655,11 @@ func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
 			d := NewDualWriter(
 				primary,
 				secondary,
-				ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+				ProxyConfig{
+					Mode:                               ModeDualWrite,
+					SecondaryTimeout:                   time.Second,
+					SecondaryBlockingReplayConcurrency: 1,
+				},
 				metrics,
 				newTestSentry(),
 				testLogger,
@@ -696,7 +700,11 @@ func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
 	d := NewDualWriter(
 		primary,
 		secondary,
-		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   time.Second,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
 		metrics,
 		newTestSentry(),
 		testLogger,
@@ -722,7 +730,11 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 	d := NewDualWriter(
 		primary,
 		secondary,
-		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 30 * time.Millisecond},
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   30 * time.Millisecond,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
 		metrics,
 		newTestSentry(),
 		testLogger,
@@ -792,7 +804,11 @@ func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {
 	d := NewDualWriter(
 		primary,
 		secondary,
-		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   time.Second,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
 		metrics,
 		newTestSentry(),
 		testLogger,
@@ -839,6 +855,32 @@ func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {
 	d.Close()
 
 	assert.Equal(t, 0, secondary.CallCount())
+}
+
+func TestDualWriter_Blocking_DoesNotReplayWhenBlockingReplayDisabled(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
+	d.Close()
+
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
 }
 
 func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {

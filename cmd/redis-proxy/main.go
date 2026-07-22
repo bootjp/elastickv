@@ -291,7 +291,11 @@ func defaultSecondaryScriptConcurrency(writeConcurrency int) int {
 }
 
 func defaultSecondaryBlockingReplayConcurrency(poolSize, writeConcurrency int) int {
-	return atLeastOne(poolSize - writeConcurrency)
+	remaining := poolSize - writeConcurrency
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func atLeastOne(n int) int {

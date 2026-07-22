@@ -67,7 +67,7 @@ type ProxyConfig struct {
 	// script writes within SecondaryWriteConcurrency. Zero keeps the package default.
 	SecondaryScriptConcurrency int
 	// SecondaryBlockingReplayConcurrency limits concurrent secondary replays for
-	// mutating blocking commands such as BZPOP. Zero keeps the package default.
+	// mutating blocking commands such as BZPOP. Zero disables blocking replays.
 	SecondaryBlockingReplayConcurrency int
 	// SecondaryWriteQueueCapacity bounds queued non-script secondary writes.
 	// Zero derives a capacity from SecondaryWriteConcurrency.
@@ -89,14 +89,15 @@ type ProxyConfig struct {
 // DefaultConfig returns a ProxyConfig with sensible defaults.
 func DefaultConfig() ProxyConfig {
 	return ProxyConfig{
-		ListenAddr:          ":6479",
-		PrimaryAddr:         "localhost:6379",
-		SecondaryAddr:       "localhost:6380",
-		Mode:                ModeDualWrite,
-		SecondaryTimeout:    defaultSecondaryTimeout,
-		ShadowTimeout:       defaultShadowTimeout,
-		SentrySampleRate:    1.0,
-		MetricsAddr:         ":9191",
-		PubSubCompareWindow: defaultPubSubCompareWindow,
+		ListenAddr:                         ":6479",
+		PrimaryAddr:                        "localhost:6379",
+		SecondaryAddr:                      "localhost:6380",
+		Mode:                               ModeDualWrite,
+		SecondaryTimeout:                   defaultSecondaryTimeout,
+		SecondaryBlockingReplayConcurrency: maxBlockingReplayGoroutines,
+		ShadowTimeout:                      defaultShadowTimeout,
+		SentrySampleRate:                   1.0,
+		MetricsAddr:                        ":9191",
+		PubSubCompareWindow:                defaultPubSubCompareWindow,
 	}
 }
