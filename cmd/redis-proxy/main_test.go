@@ -93,7 +93,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       4,
 			wantWriteConcurrency:    64,
 			wantScriptConcurrency:   32,
-			wantBlockingConcurrency: 8,
+			wantBlockingConcurrency: 20,
 		},
 		{
 			name:                    "large remaining pool caps blocking replay",
@@ -103,7 +103,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			writeConcurrency:        80,
 			wantWriteConcurrency:    80,
 			wantScriptConcurrency:   40,
-			wantBlockingConcurrency: 8,
+			wantBlockingConcurrency: 20,
 		},
 		{
 			name:                    "explicit write keeps derived script",
