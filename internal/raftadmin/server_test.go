@@ -202,14 +202,16 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 				ID:      "node-1",
 				Address: "127.0.0.1:50051",
 			},
-			Term:              7,
-			CommitIndex:       10,
-			AppliedIndex:      9,
-			LastLogIndex:      12,
-			LastSnapshotIndex: 8,
-			FSMPending:        1,
-			NumPeers:          2,
-			LastContact:       0,
+			Term:               7,
+			CommitIndex:        10,
+			AppliedIndex:       9,
+			LastLogIndex:       12,
+			LastSnapshotIndex:  8,
+			FSMPending:         1,
+			NumPeers:           2,
+			LastContact:        0,
+			ConfigurationIndex: 6,
+			PendingConfChange:  true,
 		},
 		config: raftengine.Configuration{
 			Servers: []raftengine.Server{
@@ -225,6 +227,11 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.Equal(t, pb.RaftAdminState_RAFT_ADMIN_STATE_LEADER, statusResp.State)
 	require.Equal(t, "node-1", statusResp.LeaderId)
 	require.Equal(t, uint64(10), statusResp.CommitIndex)
+	require.Equal(t, uint64(6), statusResp.ConfigurationIndex)
+	require.True(t, statusResp.PendingConfChange)
+	engine.mu.Lock()
+	engine.status.PendingConfChange = false
+	engine.mu.Unlock()
 
 	cfgResp, err := server.Configuration(context.Background(), &pb.RaftAdminConfigurationRequest{})
 	require.NoError(t, err)
@@ -532,6 +539,82 @@ func TestServer_AddVoter_NilInterceptorSkipsPreStep(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Equal(t, 1, len(engine.addVoterCalls))
+}
+
+func TestServer_AddMemberRejectsPendingConfigBeforeInterceptor(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		call func(*Server) error
+	}{
+		{
+			name: "voter",
+			call: func(server *Server) error {
+				_, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
+				return err
+			},
+		},
+		{
+			name: "learner",
+			call: func(server *Server) error {
+				_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "n42", Address: "127.0.0.1:9999"})
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			engine := &fakeEngine{status: raftengine.Status{PendingConfChange: true}}
+			interceptor := &recordingInterceptor{}
+			server := NewServerWithInterceptor(engine, interceptor)
+
+			err := test.call(server)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, raftengine.ErrMembershipChangePending.Error())
+			require.Empty(t, interceptor.calls)
+			require.Empty(t, engine.addVoterCalls)
+			require.Empty(t, engine.addLearnerCalls)
+		})
+	}
+}
+
+func TestServerSerializesMembershipInterceptorAndProposal(t *testing.T) {
+	t.Parallel()
+
+	firstProposalEntered := make(chan struct{})
+	releaseFirstProposal := make(chan struct{})
+	interceptorCalls := make(chan string, 2)
+	engine := &fakeEngine{addVoterHook: func() {
+		close(firstProposalEntered)
+		<-releaseFirstProposal
+	}}
+	interceptor := &recordingInterceptor{preHook: func(id string) { interceptorCalls <- id }}
+	server := NewServerWithInterceptor(engine, interceptor)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n1", Address: "127.0.0.1:9001"})
+		firstDone <- err
+	}()
+	require.Equal(t, "n1", <-interceptorCalls)
+	<-firstProposalEntered
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "n2", Address: "127.0.0.1:9002"})
+		secondDone <- err
+	}()
+	select {
+	case id := <-interceptorCalls:
+		require.Failf(t, "concurrent interceptor ran", "interceptor for %s ran before the first membership proposal completed", id)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirstProposal)
+	require.NoError(t, <-firstDone)
+	require.Equal(t, "n2", <-interceptorCalls)
+	require.NoError(t, <-secondDone)
 }
 
 // TestServer_AddLearner_InterceptorContract is the symmetric set for
