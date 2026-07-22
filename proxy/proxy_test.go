@@ -782,6 +782,21 @@ func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing
 		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
 }
 
+func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
+	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
+	assert.Positive(t, limit)
+
+	var spent time.Duration
+	backoff := compactedRetryInitialBackoff
+	for range limit {
+		spent += retryBackoffWithMaxJitter(backoff)
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+
+	assert.LessOrEqual(t, spent, blockingReplayNoEffectRetryWindow)
+	assert.Greater(t, spent+retryBackoffWithMaxJitter(backoff), blockingReplayNoEffectRetryWindow)
+}
+
 func TestDualWriter_BlockingReplayDoesNotConsumeWriteWorkers(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",

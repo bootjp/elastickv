@@ -594,11 +594,19 @@ func noEffectReplayRetryLimit(ctx context.Context, maxWindow time.Duration) int 
 	}
 	limit := 0
 	for spent, backoff := time.Duration(0), compactedRetryInitialBackoff; spent+backoff <= window; {
+		sleepBudget := retryBackoffWithMaxJitter(backoff)
+		if spent+sleepBudget > window {
+			break
+		}
 		limit++
-		spent += backoff
+		spent += sleepBudget
 		backoff = nextCompactedRetryBackoff(backoff)
 	}
 	return limit
+}
+
+func retryBackoffWithMaxJitter(backoff time.Duration) time.Duration {
+	return backoff + backoff/compactedRetryJitterDivisor
 }
 
 func positiveIntReplayRetryWindow(ctx context.Context, maxWindow time.Duration) time.Duration {
