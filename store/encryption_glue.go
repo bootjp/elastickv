@@ -4,6 +4,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/golang/snappy"
 )
 
 // ErrUnsupportedStoreForWriterRegistry is returned by
@@ -103,6 +104,15 @@ func WriterRegistryFor(s MVCCStore) (encryption.WriterRegistryStore, error) {
 // Callers can disambiguate it from any other read error with errors.Is.
 var ErrEncryptedReadIntegrity = errors.New("store: encrypted value failed integrity check (GCM tag mismatch); refusing to surface plaintext")
 
+// ErrEncryptedReadCompression is returned when an authenticated envelope is
+// marked as Snappy-compressed but its decrypted body is not a valid Snappy
+// stream. Disk corruption normally fails GCM first; reaching this sentinel
+// means a writer produced a malformed authenticated payload, so reads fail
+// closed instead of surfacing the compressed bytes as user data.
+var ErrEncryptedReadCompression = errors.New("store: authenticated encrypted value contains an invalid Snappy payload")
+
+const minEncryptionCompressionSize = 32
+
 // NonceFactory produces unique 12-byte AES-GCM nonces for the storage
 // envelope (§4.1). The factory is responsible for the cluster-wide
 // uniqueness invariant across `(node_id, local_epoch, write_count)` —
@@ -149,6 +159,11 @@ type ActiveStorageKeyID func() (uint32, bool)
 // cluster that flipped from active back to inactive (not a path
 // the design supports) would still decrypt old envelopes correctly.
 type StorageEnvelopeActive func() bool
+
+// StorageEnvelopeV2Active reports whether every current voter and learner can
+// read V2 storage envelopes. When wired and false, encrypted writes remain V1
+// and uncompressed so a rolling-upgrade peer can still read snapshots.
+type StorageEnvelopeV2Active func() bool
 
 // StorageRegistered reports whether this process load's §4.1 writer
 // registration has committed for the currently-active storage DEK
@@ -222,6 +237,19 @@ func WithStorageEnvelopeGate(active StorageEnvelopeActive) PebbleStoreOption {
 			return
 		}
 		s.storageEnvelopeActive = active
+	}
+}
+
+// WithStorageEnvelopeV2Gate prevents V2 writes until the cluster-wide
+// capability fan-out has observed support from every voter and learner.
+// Reads always accept both V1 and V2. A nil gate preserves the standalone
+// and test-fixture behavior from before capability negotiation was wired.
+func WithStorageEnvelopeV2Gate(active StorageEnvelopeV2Active) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		if active == nil {
+			return
+		}
+		s.storageEnvelopeV2Active = active
 	}
 }
 
@@ -345,17 +373,23 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 		return nil, 0, errors.Wrap(err, "store: nonce factory")
 	}
 	nonce := nonceArr[:]
-	// flag = 0: Snappy compression deferred to Stage 9 per design §4.1.
-	const envelopeFlag byte = 0
+	payload, envelopeFlag := plaintext, byte(0)
+	if s.storageEnvelopeV2Active == nil || s.storageEnvelopeV2Active() {
+		payload, envelopeFlag = compressForEncryption(plaintext)
+	}
+	envelopeVersion := encryption.EnvelopeVersionV1
+	if envelopeFlag&encryption.FlagCompressed != 0 {
+		envelopeVersion = encryption.EnvelopeVersionV2
+	}
 	var hdr [valueHeaderSize]byte
 	writeValueHeaderBytes(hdr[:], false /*tombstone*/, expireAt, encStateEncrypted)
-	aad := buildStorageAAD(encryption.EnvelopeVersionV1, envelopeFlag, keyID, hdr[:], pebbleKey)
-	ciphertextAndTag, err := s.cipher.Encrypt(plaintext, aad, keyID, nonce)
+	aad := buildStorageAAD(envelopeVersion, envelopeFlag, keyID, hdr[:], pebbleKey)
+	ciphertextAndTag, err := s.cipher.Encrypt(payload, aad, keyID, nonce)
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "store: encrypt value")
 	}
 	env := encryption.Envelope{
-		Version: encryption.EnvelopeVersionV1,
+		Version: envelopeVersion,
 		Flag:    envelopeFlag,
 		KeyID:   keyID,
 		Nonce:   nonceArr,
@@ -388,6 +422,18 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 // tombstone / expireAt visibility checks AFTER decrypt succeeds —
 // the values they observe pre-decrypt are not yet authenticated.
 func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byte) ([]byte, error) {
+	return s.decryptForKeyMode(pebbleKey, sv, body, true)
+}
+
+// authenticateForKey authenticates the envelope and value header without
+// expanding compressed plaintext. Visibility-only callers use this before
+// branching on tombstone or expiry fields.
+func (s *pebbleStore) authenticateForKey(pebbleKey []byte, sv storedValue, body []byte) error {
+	_, err := s.decryptForKeyMode(pebbleKey, sv, body, false)
+	return err
+}
+
+func (s *pebbleStore) decryptForKeyMode(pebbleKey []byte, sv storedValue, body []byte, decompress bool) ([]byte, error) {
 	if sv.EncState == encStateCleartext {
 		if err := s.rejectRebadgedEnvelope(pebbleKey, sv, body); err != nil {
 			return nil, err
@@ -413,6 +459,12 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 		}
 		return nil, errors.Wrap(err, "store: decrypt value")
 	}
+	if decompress {
+		plain, err = decompressAuthenticatedValue(plain, env.Flag)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// AES-GCM Open returns a nil dst slice for an empty plaintext;
 	// upstream callers (notably ExistsAt) distinguish "key absent"
 	// from "key present with empty value" via val != nil. Normalize
@@ -422,6 +474,50 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 		plain = []byte{}
 	}
 	return plain, nil
+}
+
+// decompressAuthenticatedValue inspects the Snappy length prefix before any
+// output allocation. Callers must authenticate the envelope before reaching
+// this helper; the compressed bytes are otherwise attacker-controlled.
+func decompressAuthenticatedValue(plain []byte, flag byte) ([]byte, error) {
+	if flag&encryption.FlagCompressed == 0 {
+		return plain, nil
+	}
+	decodedLen, err := snappy.DecodedLen(plain)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.WithSecondaryError(ErrEncryptedReadCompression, err),
+			"store: inspect compressed encrypted value")
+	}
+	if decodedLen > maxSnapshotValueSize {
+		return nil, errors.Wrapf(
+			ErrEncryptedReadCompression,
+			"store: compressed encrypted value expands to %d bytes, maximum is %d",
+			decodedLen,
+			maxSnapshotValueSize)
+	}
+	decoded, err := snappy.Decode(nil, plain)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.WithSecondaryError(ErrEncryptedReadCompression, err),
+			"store: decompress encrypted value")
+	}
+	return decoded, nil
+}
+
+// compressForEncryption applies §6.4's compress-then-encrypt policy. Snappy
+// output is used only when it is strictly smaller than the original bytes;
+// already-compressed and small payloads stay uncompressed so encryption never
+// increases CPU and storage cost for a larger intermediate representation.
+func compressForEncryption(plaintext []byte) ([]byte, byte) {
+	if len(plaintext) < minEncryptionCompressionSize {
+		return plaintext, 0
+	}
+	compressed := snappy.Encode(nil, plaintext)
+	if len(compressed) >= len(plaintext) {
+		return plaintext, 0
+	}
+	return compressed, encryption.FlagCompressed
 }
 
 // rejectRebadgedEnvelope is the cleartext-branch guard for the §4.1
@@ -444,11 +540,9 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 // uses, instead of trusting the on-disk header bytes the attacker
 // could have flipped:
 //
-//   - envelope_version = EnvelopeVersionV1 (the encrypt path's
-//     fixed value; trusting on-disk would let a corrupted version
-//     byte force the body through DecodeEnvelope's error path)
-//   - flag             = 0 (Snappy compression is deferred; the
-//     encrypt path's fixed value)
+//   - version/flag = V1/uncompressed or V2/Snappy-compressed (the two
+//     combinations emitted by the encrypt path; trusting on-disk would
+//     let corrupted format bytes bypass the trial)
 //   - tombstone        = false (the encrypt path never wraps
 //     tombstones, so any on-disk tombstone bit on an encrypted
 //     entry is necessarily attacker-supplied)
@@ -496,12 +590,20 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 	}
 	for _, kid := range s.cipher.LoadedKeyIDs() {
 		for _, candidateExpire := range candidateExpireAts {
-			var hdr [valueHeaderSize]byte
-			writeValueHeaderBytes(hdr[:], false /*canonical*/, candidateExpire, encStateEncrypted)
-			aad := buildStorageAAD(encryption.EnvelopeVersionV1, 0 /*flag canonical*/, kid, hdr[:], pebbleKey)
-			if _, err := s.cipher.Decrypt(ct, aad, kid, nonce); err == nil {
-				return errors.Wrap(ErrEncryptedReadIntegrity,
-					"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
+			for _, candidate := range []struct {
+				version byte
+				flag    byte
+			}{
+				{version: encryption.EnvelopeVersionV1},
+				{version: encryption.EnvelopeVersionV2, flag: encryption.FlagCompressed},
+			} {
+				var hdr [valueHeaderSize]byte
+				writeValueHeaderBytes(hdr[:], false /*canonical*/, candidateExpire, encStateEncrypted)
+				aad := buildStorageAAD(candidate.version, candidate.flag, kid, hdr[:], pebbleKey)
+				if _, err := s.cipher.Decrypt(ct, aad, kid, nonce); err == nil {
+					return errors.Wrap(ErrEncryptedReadIntegrity,
+						"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
+				}
 			}
 		}
 	}

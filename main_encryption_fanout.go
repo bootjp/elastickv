@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
@@ -22,6 +23,8 @@ import (
 // and the cutover fails closed. 5s is generous for a small-cluster
 // GetCapability round-trip.
 const capabilityFanoutTimeout = 5 * time.Second
+
+const storageEnvelopeV2CapabilityRetryInterval = 5 * time.Second
 
 // buildEncryptionCapabilityFanout builds the §4 capability fan-out
 // closure shared across every shard's EncryptionAdmin server, or nil
@@ -44,6 +47,53 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 		return nil
 	})
 	return buildCapabilityFanoutFn(runtimes, fanoutConnCache, capabilityFanoutTimeout)
+}
+
+// startStorageEnvelopeV2CapabilityMonitor keeps encrypted writes on V1 until
+// a fresh live-membership fan-out confirms V2 reader support on every voter
+// and learner. Activation is sticky because existing V2 rows remain part of
+// snapshots after the first V2 write.
+func startStorageEnvelopeV2CapabilityMonitor(
+	ctx context.Context,
+	eg *errgroup.Group,
+	capabilityFanout adapter.CapabilityFanoutFn,
+	wiring encryptionWriteWiring,
+) {
+	if eg == nil || capabilityFanout == nil || wiring.cache == nil || wiring.storageEnvelopeV2Active == nil {
+		return
+	}
+	eg.Go(func() error {
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-timer.C:
+			}
+			if tryActivateStorageEnvelopeV2Writes(ctx, capabilityFanout, wiring) {
+				return nil
+			}
+			timer.Reset(storageEnvelopeV2CapabilityRetryInterval)
+		}
+	})
+}
+
+func tryActivateStorageEnvelopeV2Writes(
+	ctx context.Context,
+	capabilityFanout adapter.CapabilityFanoutFn,
+	wiring encryptionWriteWiring,
+) bool {
+	if _, bootstrapped := wiring.cache.ActiveStorageKeyID(); !bootstrapped {
+		return false
+	}
+	result, err := capabilityFanout(ctx)
+	if err != nil || !result.StorageEnvelopeV2Ready() {
+		return false
+	}
+	wiring.activateStorageEnvelopeV2Writes()
+	slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation")
+	return true
 }
 
 // buildCapabilityFanoutFn assembles the adapter.CapabilityFanoutFn the

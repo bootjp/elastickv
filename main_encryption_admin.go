@@ -2,7 +2,9 @@ package main
 
 import (
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -62,6 +64,33 @@ import (
 // that consumes it.
 func encryptionMutatorsEnabled() bool {
 	return *encryptionEnabled && *kekFile != "" && *encryptionSidecarPath != ""
+}
+
+func encryptionAdminMutatorAuthority(enabled bool, groupID, defaultGroup uint64) bool {
+	return enabled && groupID == defaultGroup
+}
+
+func encryptionAdminOptionsForRuntime(
+	mutatorAuthority bool,
+	rt *raftGroupRuntime,
+	shardGroups map[uint64]*kv.ShardGroup,
+	writerRegistry encryption.WriterRegistryStore,
+	recoveryLeaderView raftengine.LeaderView,
+	recoveryAppliedIndex func() uint64,
+	encWiring encryptionWriteWiring,
+) []adapter.EncryptionAdminServerOption {
+	opts := []adapter.EncryptionAdminServerOption{
+		adapter.WithEncryptionAdminWriterRegistry(writerRegistry),
+		adapter.WithEncryptionAdminRecoveryLeaderView(recoveryLeaderView),
+		adapter.WithEncryptionAdminLatestAppliedIndex(recoveryAppliedIndex),
+	}
+	if !mutatorAuthority {
+		return opts
+	}
+	return append(opts,
+		adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
+		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+	)
 }
 
 // encryptionAdminEngine is the subset of raftengine.Engine the
@@ -150,8 +179,10 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 		if capabilityFanout != nil {
 			opts = append(opts, adapter.WithEncryptionAdminCapabilityFanout(capabilityFanout))
 		}
-		opts = append(opts, extraOpts...)
 	}
+	// Read-only recovery options are valid on every shard listener. The caller
+	// only includes mutator-specific options for the default-group authority.
+	opts = append(opts, extraOpts...)
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {
 		panic(errors.Wrap(err, "encryption admin server validation"))

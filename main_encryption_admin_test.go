@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	pb "github.com/bootjp/elastickv/proto"
@@ -41,6 +42,29 @@ func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, erro
 	return 0, nil
 }
 
+type stubEncryptionAdminRegistry struct {
+	name string
+}
+
+type stubEncryptionRecoveryEngine struct {
+	raftengine.Engine
+	applied uint64
+}
+
+func (s *stubEncryptionRecoveryEngine) AppliedIndex() uint64 {
+	return s.applied
+}
+
+func (stubEncryptionAdminRegistry) GetRegistryRow([]byte) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (stubEncryptionAdminRegistry) SetRegistryRow(_, _ []byte) error {
+	return nil
+}
+
+var _ encryption.WriterRegistryStore = stubEncryptionAdminRegistry{}
+
 // TestEncryptionAdminFullNodeID_DistinctPerRaftId pins the
 // PR760 r1 Codex P1 regression: full_node_id must be derived from
 // --raftId (per-node-stable) and NOT from the Raft group id
@@ -62,6 +86,70 @@ func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
 			t.Fatalf("DeriveNodeID(%q) = DeriveNodeID(%q) = %d; full_node_id must be distinct across raftIds — BootstrapEncryption uniqueness would reject", id, dup, got)
 		}
 		seen[got] = id
+	}
+}
+
+func TestWriterRegistryForEncryptionAdminUsesDefaultGroup(t *testing.T) {
+	defaultRegistry := stubEncryptionAdminRegistry{name: "default"}
+	otherRegistry := stubEncryptionAdminRegistry{name: "other"}
+	runtimes := []*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, writerRegistry: otherRegistry},
+		{spec: groupSpec{id: 1}, writerRegistry: defaultRegistry},
+	}
+
+	got := writerRegistryForEncryptionAdmin(runtimes, 1)
+	if got != defaultRegistry {
+		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want default group registry %#v", got, defaultRegistry)
+	}
+}
+
+func TestWriterRegistryForEncryptionAdminMissingDefaultGroup(t *testing.T) {
+	got := writerRegistryForEncryptionAdmin([]*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, writerRegistry: stubEncryptionAdminRegistry{name: "other"}},
+	}, 1)
+	if got != nil {
+		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want nil when default group runtime is missing", got)
+	}
+}
+
+func TestEncryptionAdminMutatorAuthorityOnlyDefaultGroup(t *testing.T) {
+	if encryptionAdminMutatorAuthority(true, 2, 1) {
+		t.Fatal("non-default group received encryption mutator authority")
+	}
+	if !encryptionAdminMutatorAuthority(true, 1, 1) {
+		t.Fatal("default group did not receive encryption mutator authority")
+	}
+	if encryptionAdminMutatorAuthority(false, 1, 1) {
+		t.Fatal("disabled encryption mutators received authority")
+	}
+}
+
+func TestRecoveryStateForEncryptionAdminUsesDefaultGroup(t *testing.T) {
+	defaultEngine := &stubEncryptionRecoveryEngine{applied: 41}
+	otherEngine := &stubEncryptionRecoveryEngine{applied: 99}
+	runtimes := []*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, engine: otherEngine},
+		{spec: groupSpec{id: 1}, engine: defaultEngine},
+	}
+
+	leaderView, appliedIndex := recoveryStateForEncryptionAdmin(runtimes, 1)
+	if leaderView != defaultEngine {
+		t.Fatalf("recoveryStateForEncryptionAdmin selected %T, want default group engine", leaderView)
+	}
+	if appliedIndex == nil {
+		t.Fatal("recoveryStateForEncryptionAdmin returned a nil applied-index callback")
+	}
+	if got := appliedIndex(); got != 41 {
+		t.Fatalf("recoveryStateForEncryptionAdmin applied index = %d, want 41", got)
+	}
+}
+
+func TestRecoveryStateForEncryptionAdminMissingDefaultGroup(t *testing.T) {
+	leaderView, appliedIndex := recoveryStateForEncryptionAdmin([]*raftGroupRuntime{
+		{spec: groupSpec{id: 2}, engine: &stubEncryptionRecoveryEngine{applied: 99}},
+	}, 1)
+	if leaderView != nil || appliedIndex != nil {
+		t.Fatalf("recoveryStateForEncryptionAdmin returned leader=%T callback-present=%t, want both nil", leaderView, appliedIndex != nil)
 	}
 }
 

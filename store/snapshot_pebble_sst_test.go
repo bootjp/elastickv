@@ -12,6 +12,8 @@ import (
 	"testing/iotest"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +40,12 @@ func openSSTSnapshotTestStore(t *testing.T, dir string, opts ...PebbleStoreOptio
 		}
 	})
 	return store
+}
+
+func TestSSTExportCompressionPolicy(t *testing.T) {
+	t.Parallel()
+	require.Nil(t, sstExportCompression(false))
+	require.Same(t, sstable.NoCompression, sstExportCompression(true))
 }
 
 func withSSTIngestTargetFileBytesForTest(target uint64) PebbleStoreOption {
@@ -120,6 +128,35 @@ func TestPebbleStoreSSTIngestSnapshotRoundTrip(t *testing.T) {
 
 	require.NoError(t, snapshot.Close())
 	require.NoDirExists(t, checkpointDir)
+}
+
+func TestPebbleStoreEncryptedSSTIngestSnapshotRoundTrip(t *testing.T) {
+	setPebbleCacheBytesForTest(t, 8<<20)
+	const keyID = uint32(7)
+	ks := encryption.NewKeystore()
+	require.NoError(t, ks.Set(keyID, bytes.Repeat([]byte{0x47}, encryption.KeySize)))
+	cipher, err := encryption.NewCipher(ks)
+	require.NoError(t, err)
+	encryptionOption := func(epoch uint16) PebbleStoreOption {
+		return WithEncryption(cipher, NewCounterNonceFactory(1, epoch), func() (uint32, bool) {
+			return keyID, true
+		})
+	}
+
+	src := openSSTSnapshotTestStore(t, filepath.Join(t.TempDir(), "src"),
+		WithSSTIngestSnapshots(true), encryptionOption(1))
+	writeSSTSnapshotTestData(t, src)
+	raw, snapshot := snapshotBytesForTest(t, src)
+	sstSnapshot, ok := snapshot.(*pebbleSSTIngestSnapshot)
+	require.True(t, ok)
+	require.True(t, sstSnapshot.disableCompression)
+	require.NoError(t, snapshot.Close())
+
+	dst := openSSTSnapshotTestStore(t, filepath.Join(t.TempDir(), "dst"), encryptionOption(2))
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	value, err := dst.GetAt(context.Background(), []byte("alpha"), 100)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("alpha", 32), string(value))
 }
 
 func TestPebbleStoreSSTIngestSnapshotCorruptionPreservesDestination(t *testing.T) {

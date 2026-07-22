@@ -1476,6 +1476,7 @@ func buildShardGroups(
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
+		runtime.writerRegistry = reg
 		runtimes = append(runtimes, runtime)
 		// Stage 6E-2c: route every shard group's TransactionManager
 		// through NewLeaderProxyForShardGroup so the proposer chain
@@ -1551,6 +1552,22 @@ func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]
 		return nil
 	}
 	return proposerForGroup(rt, shardGroups)
+}
+
+func writerRegistryForEncryptionAdmin(runtimes []*raftGroupRuntime, defaultGroup uint64) encryption.WriterRegistryStore {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil {
+		return nil
+	}
+	return defaultRuntime.writerRegistry
+}
+
+func recoveryStateForEncryptionAdmin(runtimes []*raftGroupRuntime, defaultGroup uint64) (raftengine.LeaderView, func() uint64) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if defaultRuntime == nil {
+		return nil, nil
+	}
+	return defaultRuntime.engine, appliedIndexForEngine(defaultRuntime.engine)
 }
 
 func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
@@ -1868,6 +1885,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		redisApplyObserver: in.redisApplyObserver,
 		s3BlobBackfiller:   in.s3BlobBackfiller,
 		dynamoAddress:      *dynamoAddr,
+		defaultGroup:       in.cfg.defaultGroup,
 		leaderDynamo:       in.cfg.leaderDynamo,
 		s3Address:          *s3Addr,
 		leaderS3:           in.cfg.leaderS3,
@@ -2621,6 +2639,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	defaultGroup uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
@@ -2631,7 +2650,11 @@ func startRaftServers(
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, encryptionCapabilityFanout, encWiring)
+	adminWriterRegistry := writerRegistryForEncryptionAdmin(runtimes, defaultGroup)
+	recoveryLeaderView, recoveryAppliedIndex := recoveryStateForEncryptionAdmin(runtimes, defaultGroup)
 	for _, rt := range runtimes {
+		mutatorAuthority := encryptionAdminMutatorAuthority(enableMutators, rt.spec.id, defaultGroup)
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
 		opts = append(opts, baseOpts...)
@@ -2683,19 +2706,27 @@ func startRaftServers(
 		// a stable, distinct value. Codex r1 P1 on PR #760.
 		// Stage 6B-2 mutator gate is resolved once above the
 		// per-shard loop. Each shard's own engine remains the raw
-		// Proposer + LeaderView for the cutover marker, while
-		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
-		// path for normal admin entries.
+		// proposer, while recovery leadership and applied-index evidence
+		// come from the default group that owns the shared sidecar and
+		// writer registry. ShardGroup.Proposer() supplies the wrap-aware
+		// post-cutover path for normal admin entries.
+		adminOpts := encryptionAdminOptionsForRuntime(
+			mutatorAuthority,
+			rt,
+			shardGroups,
+			adminWriterRegistry,
+			recoveryLeaderView,
+			recoveryAppliedIndex,
+			encWiring,
+		)
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
 			*encryptionSidecarPath,
-			enableMutators,
+			mutatorAuthority,
 			rt.engine,
 			encryptionCapabilityFanout,
-			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
-			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
-			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+			adminOpts...,
 		)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
@@ -3023,6 +3054,7 @@ type runtimeServerRunner struct {
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
 	dynamoAddress                   string
+	defaultGroup                    uint64
 	leaderDynamo                    map[string]string
 	s3Address                       string
 	leaderS3                        map[string]string
@@ -3141,6 +3173,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.defaultGroup,
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		s3BlobPushBlocked,
 	); err != nil {

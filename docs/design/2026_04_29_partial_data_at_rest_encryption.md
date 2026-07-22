@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–6 and Stage 8 shipped (5E deferred); Stage 7 partially shipped; Stage 9 open
+Status: Partial — Stages 0–8 and 9A shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -30,9 +30,10 @@ Date: 2026-04-29
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate + production storage-envelope write-path wiring | shipped | `2026_05_18_implemented_6d_enable_storage_envelope.md` + `2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md` |
 | 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself) + production runtime wiring for startup/apply-time wrap install and post-cutover admin proposals + 6C-4 fail-closed guards. | shipped | 2026_05_31_implemented_6e_enable_raft_envelope.md |
 | 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal on the default encryption Raft group. The leader rotates every active DEK purpose once before listeners open; followers keep an in-memory pending request and fire only if they acquire leadership in the same process uptime. | shipped | this PR |
-| 7 | Writer registry + deterministic nonce (§4.1). Implemented slices: process-start registration, storage-layer registration gate, runtime re-registration for cutover and rotation, and conf-change-time pre-registration. Still open: §5.5 registry projection in `GetSidecarState` / `ResyncSidecar` (`WriterRegistryForCaller`). | partial | `2026_05_26_implemented_7a_process_start_registration.md` + `2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md` + `2026_05_28_implemented_7b_runtime_reregistration.md` + `2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md` + `2026_05_29_implemented_7c_confchange_time_registration.md` |
+| 7 | Writer registry + deterministic nonce (§4.1). Covers process-start registration, storage-layer registration gate, runtime re-registration for cutover and rotation, conf-change-time pre-registration, and §5.5 registry projection in `GetSidecarState` / `ResyncSidecar` (`WriterRegistryForCaller`). | shipped | `2026_05_26_implemented_7a_process_start_registration.md` + `2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md` + `2026_05_28_implemented_7b_runtime_reregistration.md` + `2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md` + `2026_05_29_implemented_7c_confchange_time_registration.md` + `2026_07_11_implemented_7d_sidecar_registry_projection.md` |
 | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | shipped | [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) + [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md) |
-| 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
+| 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
+| 9B+ | KMS-backed wrappers, rotation/retire/rewrite, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -451,14 +452,16 @@ the way out.
 Envelope format (single byte stream, stored as the Pebble value):
 
 ```text
-+--------+------+---------+----------+----------------+--------+
-| 0x01   | flag | key_id  | nonce    | ciphertext     | tag    |
-| 1 byte | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
-+--------+------+---------+----------+----------------+--------+
++---------+------+---------+----------+----------------+--------+
+| version | flag | key_id  | nonce    | ciphertext     | tag    |
+| 1 byte  | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
++---------+------+---------+----------+----------------+--------+
 ```
 
-- `0x01` — envelope-version byte. Future authenticated formats reserve
-  `0x02..0x0F` (see §11.3). The byte itself is **not** used to
+- `version` — `0x01` is the original uncompressed format and requires
+  `flag=0`. `0x02` is the compression-capable storage format. Compressed
+  writes use `0x02`, causing V1-only readers to reject rather than return
+  Snappy-framed plaintext during rolling rollback. The byte itself is **not** used to
   discriminate cleartext from ciphertext on the read path — that
   decision lives in MVCC metadata, not in the value bytes (see §7.1).
 - `flag` — bit 0: `1` if `ciphertext` is the encryption of a
@@ -1849,6 +1852,12 @@ so we never pay CPU twice. Because the flag is part of the AES-GCM
 AAD (§4.1), an attacker cannot flip it post-hoc to crash the
 decompressor.
 
+Compressed values use envelope version `0x02`; uncompressed values remain
+version `0x01`. This format split is the reader-capability boundary: a
+pre-compression V1 reader fails closed on V2 instead of serving compressed
+bytes. Visibility-only operations authenticate the envelope and value header
+without allocating the decompressed value.
+
 This is also the reason we cannot rely on Pebble's built-in block
 compression alone: by the time bytes reach Pebble's block writer they
 are already ciphertext, so Pebble's compression is wasted CPU. We
@@ -2674,8 +2683,9 @@ eventual code change.
    top of value-level encryption, accepting the complexity tax. Not
    needed for the v1 threat model.
 
-3. **Envelope-format versioning.** v1 ships envelope version `0x01`.
-   We will reserve `0x02..0x0F` for future authenticated formats
+3. **Envelope-format versioning.** Uncompressed storage and Raft
+   envelopes use `0x01`; compression-capable storage envelopes use
+   `0x02`. We reserve `0x03..0x0F` for future authenticated formats
    (e.g., AES-256-GCM-SIV if nonce-misuse resistance matters,
    ChaCha20-Poly1305 for non-AES-NI hosts). The decrypt path
    dispatches on the version byte; anything unknown errors loudly.

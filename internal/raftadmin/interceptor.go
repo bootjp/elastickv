@@ -22,7 +22,7 @@ import "context"
 type MembershipChangeInterceptor interface {
 	// PreAddMember runs on the leader before AddVoter/AddLearner
 	// proposes the conf-change. The raftID is the same string the
-	// caller passed in the AddVoter/AddLearner request (the
-	// `Id` field).
-	PreAddMember(ctx context.Context, raftID string) error
+	// caller passed in the AddVoter/AddLearner request. address is the
+	// target node's Raft/gRPC endpoint and may be used for capability checks.
+	PreAddMember(ctx context.Context, raftID, address string) error
 }

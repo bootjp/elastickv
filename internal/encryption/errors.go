@@ -35,6 +35,12 @@ var (
 	// current build does not know how to parse. Reserved values per §11.3.
 	ErrEnvelopeVersion = errors.New("encryption: unknown envelope version")
 
+	// ErrEnvelopeFlag indicates an envelope set a flag bit that its version
+	// does not define. V1 permits no flags; V2 permits FlagCompressed. Accepting
+	// other combinations would make extensions ambiguous and could route
+	// authenticated plaintext through the wrong post-decrypt transform.
+	ErrEnvelopeFlag = errors.New("encryption: unknown envelope flag bits")
+
 	// ErrNilKeystore indicates NewCipher was called with a nil Keystore.
 	// Surfaced at construction time so a wiring mistake is caught
 	// before the first Encrypt/Decrypt would otherwise nil-deref panic.
