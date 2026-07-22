@@ -36,10 +36,12 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
 | `-elastickv-pool-size` | `4` | ElasticKV backend connection pool size |
-| `-secondary-write-concurrency` | `0` | Maximum concurrent asynchronous secondary writes. `0` derives half of the secondary backend pool size, minimum `1` |
-| `-secondary-script-concurrency` | `0` | Maximum concurrent asynchronous secondary Lua-script writes. `0` derives half of `-secondary-write-concurrency`, minimum `1` |
+| `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
+| `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives half of the shared write limit, minimum `1` |
+| `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
+| `-secondary-script-queue-size` | `0` | Bounded queue for secondary Lua-script writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
-| `-secondary-timeout` | `5s` | Secondary write timeout |
+| `-secondary-timeout` | `5s` | End-to-end secondary write deadline, including queue wait |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
 | `-sentry-dsn` | (empty) | Sentry DSN (empty = disabled) |
 | `-sentry-env` | (empty) | Sentry environment name |
@@ -368,6 +370,16 @@ Available at `/metrics` on the address specified by `-metrics`.
 | `proxy_divergences_total` | Counter | Shadow read mismatches (labels: command, kind) |
 | `proxy_migration_gap_total` | Counter | Expected mismatches from incomplete migration (labels: command) |
 | `proxy_async_drops_total` | Counter | Async operations dropped due to backpressure |
+| `proxy_async_drops_by_queue_total{queue,reason}` | Counter | Drops split by `write`/`script`/`shadow` and `queue_full`/`expired` |
+| `proxy_async_queue_depth{queue}` | Gauge | Async operations waiting for worker capacity |
+| `proxy_async_queue_capacity{queue}` | Gauge | Configured queue capacity |
+| `proxy_async_queue_delay_seconds{queue}` | Histogram | Time spent waiting for worker capacity |
+| `proxy_async_workers_active{queue}` | Gauge | Active async workers by queue |
+| `proxy_backend_pool_limit{backend}` | Gauge | Configured connection limit for the active backend pool |
+| `proxy_backend_pool_connections{backend,state}` | Gauge | Current total and idle go-redis connections |
+| `proxy_backend_pool_pending_requests{backend}` | Gauge | Requests waiting for a backend connection |
+| `proxy_backend_pool_events{backend,event}` | Gauge | Active-pool hits, misses, waits, timeouts, unusable, and stale counts |
+| `proxy_backend_pool_wait_duration_seconds{backend}` | Gauge | Cumulative wait duration for the active backend pool |
 | `proxy_active_connections` | Gauge | Current active client connections |
 | `proxy_pubsub_shadow_divergences_total` | Counter | Pub/Sub shadow message mismatches (labels: kind) |
 | `proxy_pubsub_shadow_errors_total` | Counter | Pub/Sub shadow operation errors |
@@ -401,11 +413,12 @@ groups:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Connection pool size | 128 | go-redis pool size per backend |
+| Redis connection pool size | 128 | Default go-redis pool size for Redis |
+| ElasticKV connection pool size | 4 | Default per-leader pool; keep within the server per-peer connection limit |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
-| Async write goroutine limit | 4096 | Max concurrent secondary writes |
+| Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |
 | PubSub compare window | 2s | Message matching window |
 | PubSub sweep interval | 500ms | Expired message scan interval |
@@ -424,9 +437,10 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ## Troubleshooting
 
 ### Secondary writes are falling behind
-- Check `proxy_async_drops_total`. If increasing, the goroutine limit is being hit.
-- Reduce `-secondary-timeout` to fail fast on slow secondaries.
-- Investigate secondary (ElasticKV) performance.
+- Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
+- Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
+- Increase the ElasticKV pool only together with `ELASTICKV_REDIS_PER_PEER_CONNECTIONS`; keep `-secondary-write-concurrency` at or below the pool size.
+- A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count
 - Also check `proxy_migration_gap_total`. Pre-migration missing keys are counted as gaps, not divergences.

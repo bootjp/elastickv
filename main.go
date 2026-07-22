@@ -288,8 +288,9 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
 const (
-	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
-	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	lockResolverEnabledEnvVar        = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar        = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	redisDeltaCompactorEnabledEnvVar = "ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED"
 )
 
 const bytesPerMiB = 1024 * 1024
@@ -396,6 +397,14 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 		return
 	}
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
+}
+
+func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator) *adapter.DeltaCompactor {
+	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
+		return adapter.NewDeltaCompactor(shardStore, coordinate)
+	}
+	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
+	return nil
 }
 
 func run() error {
@@ -2758,16 +2767,19 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := adapter.NewDeltaCompactor(shardStore, coordinate)
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate)
+	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
-		adapter.WithRedisCompactor(deltaCompactor),
 		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
 		adapter.WithRedisApplyObserver(redisApplyObserver),
-	)
+	}
+	if deltaCompactor != nil {
+		redisOpts = append(redisOpts, adapter.WithRedisCompactor(deltaCompactor))
+	}
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, redisOpts...)
 	// Wire the bounded Lua VM pool into Prometheus. The metrics
 	// (hits/misses/drops/idle/max_idle) are read at scrape time via
 	// CounterFunc / GaugeFunc, so the EVAL hot path stays
