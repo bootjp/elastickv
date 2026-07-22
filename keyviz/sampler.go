@@ -216,6 +216,9 @@ type MemSampler struct {
 	// (Flush) acquire it; Observe never touches it.
 	historyMu sync.Mutex
 	history   *ringBuffer
+	// lastFlushAt is the lower boundary for the next committed matrix
+	// column. Guarded by historyMu with history.
+	lastFlushAt time.Time
 
 	// retiredSlots holds slots that RemoveRoute removed from the live
 	// table. Each entry is drained for `remaining` Flushes — a grace
@@ -425,10 +428,13 @@ func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members [
 	return
 }
 
-// MatrixColumn is one slice of the heatmap at a single flush time.
+// MatrixColumn is one committed heatmap window.
 type MatrixColumn struct {
-	At   time.Time
-	Rows []MatrixRow
+	// WindowStart and At delimit the committed half-open sampler
+	// interval. Rows contain counters drained for (WindowStart, At].
+	WindowStart time.Time
+	At          time.Time
+	Rows        []MatrixRow
 }
 
 // MatrixRow is a single route or virtual bucket's counter snapshot
@@ -509,10 +515,11 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		now = time.Now
 	}
 	s := &MemSampler{
-		opts:       opts,
-		now:        now,
-		history:    newRingBuffer(opts.HistoryColumns),
-		groupTerms: map[uint64]uint64{},
+		opts:        opts,
+		now:         now,
+		history:     newRingBuffer(opts.HistoryColumns),
+		lastFlushAt: now(),
+		groupTerms:  map[uint64]uint64{},
 	}
 	s.table.Store(newEmptyRouteTable())
 	if opts.HotKeysEnabled {
@@ -1229,6 +1236,11 @@ func (s *MemSampler) Flush() {
 	})
 
 	s.historyMu.Lock()
+	col.WindowStart = s.lastFlushAt
+	if !col.WindowStart.Before(col.At) {
+		col.WindowStart = col.At.Add(-s.opts.Step)
+	}
+	s.lastFlushAt = col.At
 	s.history.Push(col)
 	s.historyMu.Unlock()
 }

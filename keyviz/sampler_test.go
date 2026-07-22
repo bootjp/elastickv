@@ -78,6 +78,40 @@ func TestObserveAndFlushBasic(t *testing.T) {
 	}
 }
 
+func TestFlushStampsWindowStart(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	start := clk.Now()
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
+		t.Fatal("RegisterRoute(1) returned false")
+	}
+
+	clk.Advance(time.Second)
+	s.Observe(1, []byte("a"), OpWrite, 0, LabelLegacy)
+	s.Flush()
+
+	clk.Advance(2 * time.Second)
+	s.Observe(1, []byte("a"), OpWrite, 0, LabelLegacy)
+	s.Flush()
+
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 2 {
+		t.Fatalf("got %d columns, want 2", len(cols))
+	}
+	if !cols[0].WindowStart.Equal(start) {
+		t.Fatalf("first WindowStart = %v, want %v", cols[0].WindowStart, start)
+	}
+	if !cols[1].WindowStart.Equal(cols[0].At) {
+		t.Fatalf("second WindowStart = %v, want previous At %v", cols[1].WindowStart, cols[0].At)
+	}
+
+	cols[0].WindowStart = time.Time{}
+	fresh := s.Snapshot(time.Time{}, time.Time{})
+	if !fresh[0].WindowStart.Equal(start) {
+		t.Fatalf("snapshot did not deep-copy WindowStart: got %v want %v", fresh[0].WindowStart, start)
+	}
+}
+
 // TestNoCountsLostAcrossFlush asserts the SwapUint64 flush protocol
 // doesn't drop counts even when many goroutines hammer Observe across
 // the flush boundary. Repeats the exercise N times to flush out
