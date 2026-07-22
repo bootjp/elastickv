@@ -23,6 +23,7 @@ import (
 // adapter/redis_storage_codec.go:
 //   - !stream|meta|<userKeyLen(4)><userKey>
 //     → BE Length(8) || LastMs(8) || LastSeq(8) [|| ExpireAtMs(8)]
+//     [|| TrimmedMs(8) || TrimmedSeq(8)]
 //   - !stream|entry|<userKeyLen(4)><userKey><ms(8)><seq(8)>
 //     → magic-prefixed pb.RedisStreamEntry protobuf with fields
 //     {id string, fields []string} where Fields is the
@@ -54,6 +55,10 @@ const (
 	redisStreamMetaSize = 24
 	// redisStreamMetaInlineTTLSize is the current shape with trailing ExpireAtMs(8).
 	redisStreamMetaInlineTTLSize = 32
+	// redisStreamMetaTrimCursorSize extends the inline TTL shape with
+	// TrimmedMs(8) || TrimmedSeq(8), a live-side performance cursor that
+	// is intentionally omitted from logical JSONL output.
+	redisStreamMetaTrimCursorSize = 48
 
 	// redisStreamIDBytes is the per-entry-key suffix size: ms(8)
 	// || seq(8). Mirrors store.StreamIDBytes.
@@ -111,18 +116,22 @@ type redisStreamState struct {
 
 // HandleStreamMeta processes one !stream|meta|<userKey> record.
 // Value layout: Length(8) || LastMs(8) || LastSeq(8), optionally followed
-// by inline ExpireAtMs(8). The encoder uses the meta's last_ms / last_seq
-// verbatim in the JSONL _meta terminator so a restorer can replay them into
-// the same XADD '*' monotonicity window. Length mismatches against the
-// observed entry count surface as `redis_stream_length_mismatch` at flush time.
+// by inline ExpireAtMs(8), and optionally by a live-side trim cursor. The
+// encoder uses the meta's last_ms / last_seq verbatim in the JSONL _meta
+// terminator so a restorer can replay them into the same XADD '*' monotonicity
+// window. Length mismatches against the observed entry count surface as
+// `redis_stream_length_mismatch` at flush time.
 func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	userKey, ok := parseStreamMetaKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamKey, "meta key: %q", key)
 	}
-	if len(value) != redisStreamMetaSize && len(value) != redisStreamMetaInlineTTLSize {
+	if len(value) != redisStreamMetaSize &&
+		len(value) != redisStreamMetaInlineTTLSize &&
+		len(value) != redisStreamMetaTrimCursorSize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamMeta,
-			"length %d not in {%d,%d}", len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize)
+			"length %d not in {%d,%d,%d}",
+			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, redisStreamMetaTrimCursorSize)
 	}
 	rawLen := binary.BigEndian.Uint64(value[0:8])
 	if rawLen > math.MaxInt64 {
@@ -134,7 +143,7 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	st.lastMs = binary.BigEndian.Uint64(value[8:16])
 	st.lastSeq = binary.BigEndian.Uint64(value[16:24])
 	st.metaSeen = true
-	if len(value) == redisStreamMetaInlineTTLSize {
+	if len(value) == redisStreamMetaInlineTTLSize || len(value) == redisStreamMetaTrimCursorSize {
 		expireAtMs := binary.BigEndian.Uint64(value[24:32])
 		st.expireAtMs = expireAtMs
 		st.hasTTL = expireAtMs != 0

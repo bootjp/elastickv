@@ -4297,7 +4297,7 @@ func (c *luaScriptContext) streamDeltaCommitElems(
 	}
 
 	trimCount := int(st.baseTrim)
-	trimElems, err := c.server.buildXTrimHeadElems(ctx, keyBytes, c.startTS, trimCount)
+	trimElems, trimmedThrough, err := c.server.buildXTrimHeadElems(ctx, keyBytes, c.startTS, trimCount, st.baseMeta)
 	if err != nil {
 		return nil, err
 	}
@@ -4323,6 +4323,9 @@ func (c *luaScriptContext) streamDeltaCommitElems(
 	}
 	meta := st.meta
 	meta.ExpireAt = ttlMillis(ttl)
+	if trimmedThrough.ok {
+		meta.TrimmedMs, meta.TrimmedSeq = trimmedThrough.ms, trimmedThrough.seq
+	}
 	metaBytes, err := store.MarshalStreamMeta(meta)
 	if err != nil {
 		return nil, errors.WithStack(err)

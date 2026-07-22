@@ -16,6 +16,7 @@ type luaStreamCountingStore struct {
 	store.MVCCStore
 	entryPrefix  []byte
 	entryScans   []int
+	entryStarts  [][]byte
 	entryPuts    int
 	entryDeletes int
 }
@@ -55,6 +56,7 @@ func (s *luaStreamCountingStore) ScanAt(
 ) ([]*store.KVPair, error) {
 	if bytes.HasPrefix(start, s.entryPrefix) {
 		s.entryScans = append(s.entryScans, limit)
+		s.entryStarts = append(s.entryStarts, bytes.Clone(start))
 	}
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
@@ -75,6 +77,7 @@ func (s *luaStreamCountingStore) DeleteAt(ctx context.Context, key []byte, commi
 
 func (s *luaStreamCountingStore) reset() {
 	s.entryScans = nil
+	s.entryStarts = nil
 	s.entryPuts = 0
 	s.entryDeletes = 0
 }
@@ -168,6 +171,8 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 128, "130-0", "field", "b")
 	require.True(t, found)
 	require.Equal(t, int64(128), meta.Length)
 	require.Equal(t, uint64(130), meta.LastMs)
+	require.Equal(t, uint64(2), meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
 }
 
 func TestLuaStreamXAddMaxLenZeroKeepsLastIDWithoutRows(t *testing.T) {
@@ -193,6 +198,41 @@ return next
 	require.True(t, found)
 	require.Zero(t, meta.Length)
 	require.Equal(t, string(conn.bulk), formatStreamID(meta.LastMs, meta.LastSeq))
+	require.Equal(t, uint64(2), meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
+}
+
+func TestLuaStreamXAddMaxLenUsesTrimCursorForNextHeadScan(t *testing.T) {
+	key := []byte("lua:stream:trim-cursor")
+	server, base, counting := newLuaStreamDeltaTestServer(t, key)
+	seedLuaWideStream(t, base, key, 4, 0)
+
+	conn := &recordingConn{}
+	server.runLuaScript(conn, `return redis.call("XADD", KEYS[1], "MAXLEN", 4, "5-0", "field", "a")`, [][]byte{
+		[]byte("1"), key,
+	})
+	require.Empty(t, conn.err)
+	meta, found, err := server.loadStreamMetaAt(context.Background(), key, server.readTS())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(1), meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
+
+	counting.reset()
+	second := &recordingConn{}
+	server.runLuaScript(second, `return redis.call("XADD", KEYS[1], "MAXLEN", 4, "6-0", "field", "b")`, [][]byte{
+		[]byte("1"), key,
+	})
+	require.Empty(t, second.err)
+	require.Equal(t, []int{1}, counting.entryScans)
+	require.Len(t, counting.entryStarts, 1)
+	require.Equal(t, store.StreamEntryKey(key, 1, 1), counting.entryStarts[0])
+
+	meta, found, err = server.loadStreamMetaAt(context.Background(), key, server.readTS())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(2), meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
 }
 
 func TestTrimLuaStreamHeadMaxLenZeroAtStorageCapRemovesPendingAppend(t *testing.T) {
@@ -431,7 +471,7 @@ func TestLuaStreamXAddRetryDoesNotDuplicateEntries(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, int64(2), meta.Length)
-	entries, err := server.scanStreamEntriesAt(context.Background(), key, server.readTS(), meta.Length)
+	entries, err := server.scanStreamEntriesAt(context.Background(), key, server.readTS(), meta)
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 }
@@ -454,7 +494,7 @@ func TestLuaStreamXAddAmbiguousWireConflictFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, int64(2), meta.Length)
-	entries, err := server.scanStreamEntriesAt(context.Background(), key, server.readTS(), meta.Length)
+	entries, err := server.scanStreamEntriesAt(context.Background(), key, server.readTS(), meta)
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 }
