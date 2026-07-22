@@ -11,7 +11,7 @@ import (
 
 const (
 	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 4
+	defaultElasticKVPoolSize = 16
 	defaultDialTimeout       = 5 * time.Second
 	defaultReadTimeout       = 3 * time.Second
 	defaultWriteTimeout      = 3 * time.Second

@@ -57,7 +57,7 @@ const (
 	// producer-before-consumer ordering settle; a bounded no-effect window keeps
 	// BZPOP load from turning into a long retry backlog.
 	blockingReplayInitialDelay        = 250 * time.Millisecond
-	blockingReplayNoEffectRetryWindow = 500 * time.Millisecond
+	blockingReplayNoEffectRetryWindow = 100 * time.Millisecond
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
