@@ -119,6 +119,7 @@ type S3Server struct {
 	blobLocalStores      S3BlobLocalStoreResolver
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
+	blobBackfiller       *S3BlobBackfiller
 }
 
 type s3BucketMeta struct {
@@ -193,6 +194,10 @@ func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
 	var responseErr *s3ResponseError
 	if errors.As(err, &responseErr) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
+		return
+	}
+	if isS3ServiceUnavailable(err) {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", "", "")
 		return
 	}
 	writeS3InternalError(w, err)
@@ -402,12 +407,22 @@ func (s *S3Server) Run() error {
 }
 
 func (s *S3Server) Stop() {
+	if s != nil && s.blobBackfiller != nil {
+		s.blobBackfiller.Stop()
+	}
 	if s != nil && s.blobCluster != nil {
 		_ = s.blobCluster.Close()
 	}
 	if s != nil && s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
 	}
+}
+
+func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
+	if s == nil || s.blobBackfiller == nil {
+		return nil
+	}
+	return s.blobBackfiller.Start(ctx, s)
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
@@ -1229,7 +1244,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 		},
 	}); err != nil {
-		writeS3InternalError(w, err)
+		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}
 	writeS3XML(w, http.StatusOK, s3InitiateMultipartUploadResult{
@@ -2567,11 +2582,15 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isS3ServiceUnavailable(err) {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)
+}
+
+func isS3ServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 var errUnsupportedCannedAcl = errors.New("unsupported canned ACL")

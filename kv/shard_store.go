@@ -2427,6 +2427,25 @@ func (s *ShardStore) LocalStoreForKey(key []byte) (store.MVCCStore, bool) {
 	return g.Store, true
 }
 
+// LocalStores returns every process-local shard store in stable group order.
+// It is used by node-local auxiliary maintenance that must recover state after
+// snapshot restore without leader routing.
+func (s *ShardStore) LocalStores() []store.MVCCStore {
+	groupIDs := make([]uint64, 0, len(s.groups))
+	for groupID := range s.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	sort.Slice(groupIDs, func(i, j int) bool { return groupIDs[i] < groupIDs[j] })
+	stores := make([]store.MVCCStore, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		group := s.groups[groupID]
+		if group != nil && group.Store != nil {
+			stores = append(stores, group.Store)
+		}
+	}
+	return stores
+}
+
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64) ([]byte, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
