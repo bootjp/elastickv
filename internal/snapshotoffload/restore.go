@@ -21,6 +21,12 @@ type RestoreOptions struct {
 	Peers       []etcdraftengine.Peer
 }
 
+const (
+	maxManifestBytes      = 1 << 20
+	restoreTempDirMode    = 0o755
+	restoreTempDirPattern = ".snapshot-offload-restore-*"
+)
+
 func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest, error) {
 	if store == nil {
 		return Manifest{}, errors.Wrap(ErrInvalidOptions, "object store is required")
@@ -30,11 +36,11 @@ func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest,
 		return Manifest{}, errors.Wrap(err, "get snapshot manifest")
 	}
 	defer func() { _ = body.Close() }()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, contextReader{ctx: ctx, reader: body}); err != nil {
-		return Manifest{}, errors.WithStack(err)
+	data, err := readLimitedManifest(ctx, body)
+	if err != nil {
+		return Manifest{}, err
 	}
-	manifest, err := DecodeManifest(buf.Bytes())
+	manifest, err := DecodeManifest(data)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -55,9 +61,12 @@ func RestorePhysicalSnapshot(ctx context.Context, opts RestoreOptions) (*etcdraf
 	if err := validateManifest(manifest); err != nil {
 		return nil, err
 	}
-	downloadDir, err := os.MkdirTemp(filepath.Dir(filepath.Clean(opts.DataDir)), ".snapshot-offload-restore-*")
+	if err := ensureRestoreDestinationAbsent(opts.DataDir); err != nil {
+		return nil, err
+	}
+	downloadDir, err := prepareRestoreDownloadDir(opts.DataDir)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	defer func() { _ = os.RemoveAll(downloadDir) }()
 	payloadPath := filepath.Join(downloadDir, "payload.fsm")
@@ -76,6 +85,66 @@ func RestorePhysicalSnapshot(ctx context.Context, opts RestoreOptions) (*etcdraf
 		return nil, errors.Wrap(err, "prepare physical snapshot restore")
 	}
 	return result, nil
+}
+
+func readLimitedManifest(ctx context.Context, body io.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	limited := io.LimitReader(contextReader{ctx: ctx, reader: body}, maxManifestBytes+1)
+	if _, err := io.Copy(&buf, limited); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if buf.Len() > maxManifestBytes {
+		return nil, errors.Wrapf(ErrInvalidOptions, "manifest exceeds %d bytes", maxManifestBytes)
+	}
+	return buf.Bytes(), nil
+}
+
+func ensureRestoreDestinationAbsent(dataDir string) error {
+	cleaned := filepath.Clean(dataDir)
+	if _, err := os.Stat(cleaned); err == nil {
+		return errors.Wrapf(etcdraftengine.ErrExternalSnapshotRestoreExists, "destination exists: %s", cleaned)
+	} else if !os.IsNotExist(err) {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func prepareRestoreDownloadDir(dataDir string) (string, error) {
+	parent := filepath.Dir(filepath.Clean(dataDir))
+	if err := os.MkdirAll(parent, restoreTempDirMode); err != nil {
+		return "", errors.WithStack(err)
+	}
+	if err := cleanupRestoreDownloadDirs(parent); err != nil {
+		return "", err
+	}
+	downloadDir, err := os.MkdirTemp(parent, restoreTempDirPattern)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return downloadDir, nil
+}
+
+func cleanupRestoreDownloadDirs(parent string) error {
+	matches, err := filepath.Glob(filepath.Join(parent, restoreTempDirPattern))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for _, match := range matches {
+		info, err := os.Lstat(match)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return errors.WithStack(err)
+		}
+		if !info.IsDir() {
+			continue
+		}
+		if err := os.RemoveAll(match); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 func validateRestoreOptions(opts RestoreOptions) error {
@@ -123,7 +192,10 @@ func downloadVerifiedPayload(ctx context.Context, store ObjectStore, manifest Ma
 }
 
 func validatePayloadInfo(manifest Manifest, info ObjectInfo) error {
-	if info.Size != manifest.Payload.Bytes || info.SHA256 != manifest.Payload.SHA256 {
+	if info.Size != manifest.Payload.Bytes {
+		return errors.Wrapf(ErrIntegrity, "payload head mismatch for %s", manifest.Payload.Key)
+	}
+	if info.SHA256 != "" && info.SHA256 != manifest.Payload.SHA256 {
 		return errors.Wrapf(ErrIntegrity, "payload head mismatch for %s", manifest.Payload.Key)
 	}
 	return nil

@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Proposed — M0 implemented; M1 object-store-neutral substrate partial
+Status: Partial — M0 implemented; M1 object-store-neutral substrate partial
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -162,7 +162,7 @@ permissions below the configured prefix.
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
 | M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
 
-The filename and header remain `proposed` until M1-M3 complete the central
+The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
 rename this file to `2026_07_19_implemented_physical_snapshot_object_offload.md`,
 change the header status, update every reference, and verify with `rg` that the

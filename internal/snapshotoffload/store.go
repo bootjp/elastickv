@@ -26,8 +26,10 @@ type PutOptions struct {
 }
 
 type ObjectInfo struct {
-	Key    string
-	Size   int64
+	Key  string
+	Size int64
+	// SHA256 is optional for metadata-only Head/Get paths; PutObject returns it
+	// when the writer verified the committed content.
 	SHA256 string
 }
 
@@ -108,13 +110,30 @@ func (s *LocalStore) pathForKey(key string) (string, error) {
 		return "", errors.Wrap(ErrInvalidOptions, "object store is required")
 	}
 	normalized := normalizeObjectKey(key)
-	if normalized == "" || normalized == "." || strings.HasPrefix(normalized, "../") {
+	if normalized == "" || normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object key %q", key)
 	}
 	return filepath.Join(s.root, filepath.FromSlash(normalized)), nil
 }
 
 func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, error) {
+	stat, err := os.Stat(objectPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
+		}
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	if !stat.Mode().IsRegular() {
+		return ObjectInfo{}, errors.Wrapf(ErrInvalidOptions, "object %s is not a regular file", key)
+	}
+	return ObjectInfo{
+		Key:  normalizeObjectKey(key),
+		Size: stat.Size(),
+	}, nil
+}
+
+func (s *LocalStore) hashedObjectInfoForPath(key, objectPath string) (ObjectInfo, error) {
 	file, err := os.Open(objectPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -196,7 +215,7 @@ func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected O
 }
 
 func (s *LocalStore) verifyExistingObject(key, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
-	info, err := s.objectInfoForPath(key, finalPath)
+	info, err := s.hashedObjectInfoForPath(key, finalPath)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -243,6 +262,29 @@ func (r contextReader) Read(p []byte) (int, error) {
 	}
 	if r.ctx != nil {
 		if ctxErr := r.ctx.Err(); ctxErr != nil {
+			return n, errors.WithStack(ctxErr)
+		}
+	}
+	return n, nil
+}
+
+type contextWriter struct {
+	ctx    context.Context
+	writer io.Writer
+}
+
+func (w contextWriter) Write(p []byte) (int, error) {
+	if w.ctx != nil {
+		if err := w.ctx.Err(); err != nil {
+			return 0, errors.WithStack(err)
+		}
+	}
+	n, err := w.writer.Write(p)
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	if w.ctx != nil {
+		if ctxErr := w.ctx.Err(); ctxErr != nil {
 			return n, errors.WithStack(ctxErr)
 		}
 	}

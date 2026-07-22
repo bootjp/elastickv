@@ -3,6 +3,7 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1opaque-physical-snapshot-payload")
-	sourceDataDir := seedPhysicalSnapshot(t, root, "source", payload, 42, 7, []etcdraftengine.Peer{
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 42, 7, []etcdraftengine.Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002"},
 	})
@@ -78,7 +79,7 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-before-corruption")
-	sourceDataDir := seedPhysicalSnapshot(t, root, "source", payload, 10, 3, singlePeer())
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 10, 3, singlePeer())
 	store := newTestLocalStore(t, filepath.Join(root, "objects"))
 	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
 		Store:         store,
@@ -90,7 +91,7 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 	require.NoError(t, err)
 	payloadPath, err := store.pathForKey(manifest.Payload.Key)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(payloadPath, []byte("corrupt"), 0o600))
+	require.NoError(t, os.WriteFile(payloadPath, bytes.Repeat([]byte("x"), len(payload)), 0o600))
 
 	restoreDataDir := filepath.Join(root, "restored")
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
@@ -108,7 +109,7 @@ func TestPublishRejectsExistingPayloadMismatchBeforeManifest(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-with-known-sha")
-	sourceDataDir := seedPhysicalSnapshot(t, root, "source", payload, 11, 4, singlePeer())
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 11, 4, singlePeer())
 	store := newTestLocalStore(t, filepath.Join(root, "objects"))
 	payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
 	require.NoError(t, err)
@@ -134,19 +135,219 @@ func TestPublishRejectsExistingPayloadMismatchBeforeManifest(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestPublishRejectsExistingManifestMismatch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-with-conflicting-manifest")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 15, 8, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	key, err := manifestKey("cluster-a", 1, 15, 8)
+	require.NoError(t, err)
+	bad := []byte(`{"schema_version":1}`)
+	_, err = store.PutObject(ctx, key, bytes.NewReader(bad), PutOptions{
+		Size:        int64(len(bad)),
+		SHA256:      hexSHA256Bytes(bad),
+		ContentType: "application/json",
+	})
+	require.NoError(t, err)
+
+	_, err = PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+		CreatedAt:     time.Unix(200, 0).UTC(),
+	})
+	require.ErrorIs(t, err, ErrIntegrity)
+}
+
+func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-reused-by-retry")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 16, 9, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	opts := PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+		CreatedAt:     time.Unix(300, 0).UTC(),
+	}
+
+	first, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	second, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	require.Equal(t, first.ManifestKey, second.ManifestKey)
+	require.Equal(t, first.Payload.Key, second.Payload.Key)
+}
+
+func TestLoadManifestRejectsStaleSelfHash(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-for-stale-manifest-hash")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 12, 5, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	})
+	require.NoError(t, err)
+	manifestPath, err := store.pathForKey(manifest.ManifestKey)
+	require.NoError(t, err)
+	raw, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(raw, &body))
+	body["snapshot_index"] = float64(99)
+	tampered, err := json.MarshalIndent(body, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, append(tampered, '\n'), 0o600))
+
+	_, err = LoadManifest(ctx, store, manifest.ManifestKey)
+	require.ErrorIs(t, err, ErrIntegrity)
+}
+
+func TestLoadManifestRejectsOversizedBody(t *testing.T) {
+	ctx := context.Background()
+	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
+	key := "cluster-a/v1/groups/1/snapshots/oversized.json"
+	body := bytes.Repeat([]byte("x"), maxManifestBytes+1)
+	_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:        int64(len(body)),
+		SHA256:      hexSHA256Bytes(body),
+		ContentType: "application/json",
+	})
+	require.NoError(t, err)
+
+	_, err = LoadManifest(ctx, store, key)
+	require.ErrorIs(t, err, ErrInvalidOptions)
+}
+
+func TestLocalStoreRejectsParentDirectoryKeys(t *testing.T) {
+	ctx := context.Background()
+	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
+	emptySHA := hexSHA256Bytes(nil)
+
+	_, err := store.PutObject(ctx, "..", bytes.NewReader(nil), PutOptions{SHA256: emptySHA})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	_, err = store.PutObject(ctx, "a/../..", bytes.NewReader(nil), PutOptions{SHA256: emptySHA})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+}
+
+func TestLocalStoreHeadObjectUsesStatMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
+	body := []byte("metadata-only-head")
+	key := "cluster-a/v1/payloads/test.fsm"
+	putInfo, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:        int64(len(body)),
+		SHA256:      hexSHA256Bytes(body),
+		ContentType: "application/octet-stream",
+	})
+	require.NoError(t, err)
+	require.Equal(t, hexSHA256Bytes(body), putInfo.SHA256)
+
+	headInfo, ok, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(len(body)), headInfo.Size)
+	require.Empty(t, headInfo.SHA256)
+
+	reader, getInfo, err := store.GetObject(ctx, key)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reader.Close()) }()
+	require.Equal(t, int64(len(body)), getInfo.Size)
+	require.Empty(t, getInfo.SHA256)
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+}
+
+func TestPublishHonorsCancelledContextWhileSpooling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-cancelled-before-spool")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 13, 6, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	_, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-before-existing-destination")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 14, 7, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	})
+	require.NoError(t, err)
+	payloadPath, err := store.pathForKey(manifest.Payload.Key)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(payloadPath, []byte("corrupt"), 0o600))
+	restoreDataDir := filepath.Join(root, "restored")
+	require.NoError(t, os.Mkdir(restoreDataDir, 0o755))
+
+	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
+		Store:       store,
+		ManifestKey: manifest.ManifestKey,
+		DataDir:     restoreDataDir,
+		Peers:       singlePeer(),
+	})
+	require.ErrorIs(t, err, etcdraftengine.ErrExternalSnapshotRestoreExists)
+}
+
+func TestPrepareRestoreDownloadDirCreatesParentAndCleansStaleDirs(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "missing-parent", "restored")
+
+	downloadDir, err := prepareRestoreDownloadDir(dataDir)
+	require.NoError(t, err)
+	require.DirExists(t, filepath.Dir(dataDir))
+	require.Contains(t, downloadDir, filepath.Dir(dataDir))
+	require.NoError(t, os.RemoveAll(downloadDir))
+
+	staleDir := filepath.Join(filepath.Dir(dataDir), ".snapshot-offload-restore-stale")
+	require.NoError(t, os.MkdirAll(staleDir, 0o755))
+	downloadDir, err = prepareRestoreDownloadDir(dataDir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, os.RemoveAll(downloadDir)) }()
+	_, err = os.Stat(staleDir)
+	require.True(t, os.IsNotExist(err))
+}
+
 func seedPhysicalSnapshot(
 	t *testing.T,
 	root string,
-	name string,
 	payload []byte,
 	index uint64,
 	term uint64,
 	peers []etcdraftengine.Peer,
 ) string {
 	t.Helper()
-	input := filepath.Join(root, name+".fsm")
+	input := filepath.Join(root, "source.fsm")
 	require.NoError(t, os.WriteFile(input, payload, 0o600))
-	dataDir := filepath.Join(root, name+"-raft")
+	dataDir := filepath.Join(root, "source-raft")
 	_, err := etcdraftengine.PreparePhysicalSnapshotRestore(etcdraftengine.PhysicalSnapshotRestoreOptions{
 		InputFSMPath: input,
 		DataDir:      dataDir,

@@ -75,6 +75,9 @@ func DecodeManifest(data []byte) (Manifest, error) {
 	if err := validateManifest(manifest); err != nil {
 		return Manifest{}, err
 	}
+	if err := verifyManifestSelfHash(manifest); err != nil {
+		return Manifest{}, err
+	}
 	return manifest, nil
 }
 
@@ -96,6 +99,20 @@ func validateManifest(manifest Manifest) error {
 		return errors.Wrap(ErrInvalidOptions, "payload sha256 must be 64 lowercase hex characters")
 	case manifest.ManifestKey == "":
 		return errors.Wrap(ErrInvalidOptions, "manifest key is required")
+	}
+	return nil
+}
+
+func verifyManifestSelfHash(manifest Manifest) error {
+	if !isSHA256Hex(manifest.ManifestSHA256) {
+		return errors.Wrap(ErrInvalidOptions, "manifest sha256 must be 64 lowercase hex characters")
+	}
+	_, sum, err := manifest.MarshalCanonical()
+	if err != nil {
+		return err
+	}
+	if sum != manifest.ManifestSHA256 {
+		return errors.Wrapf(ErrIntegrity, "manifest sha256 %s, expected %s", manifest.ManifestSHA256, sum)
 	}
 	return nil
 }

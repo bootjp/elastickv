@@ -112,12 +112,23 @@ func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest) err
 	if err != nil {
 		return err
 	}
-	if _, err := store.PutObject(ctx, manifest.ManifestKey, bytes.NewReader(data), PutOptions{
+	objectSHA := hexSHA256Bytes(data)
+	if exists, err := verifyExistingStoreObject(ctx, store, manifest.ManifestKey, int64(len(data)), objectSHA); err != nil {
+		return errors.Wrap(err, "verify existing snapshot manifest")
+	} else if exists {
+		manifest.ManifestSHA256 = manifestSHA
+		return nil
+	}
+	info, err := store.PutObject(ctx, manifest.ManifestKey, bytes.NewReader(data), PutOptions{
 		Size:        int64(len(data)),
-		SHA256:      hexSHA256Bytes(data),
+		SHA256:      objectSHA,
 		ContentType: "application/json",
-	}); err != nil {
+	})
+	if err != nil {
 		return errors.Wrap(err, "put snapshot manifest")
+	}
+	if info.Size != int64(len(data)) || (info.SHA256 != "" && info.SHA256 != objectSHA) {
+		return errors.Wrapf(ErrIntegrity, "manifest object %s remote integrity mismatch", manifest.ManifestKey)
 	}
 	manifest.ManifestSHA256 = manifestSHA
 	return nil
@@ -147,7 +158,10 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 		}
 	}()
 	hash := sha256.New()
-	n, err := export.WriteTo(io.MultiWriter(tmp, hash))
+	n, err := export.WriteTo(contextWriter{
+		ctx:    ctx,
+		writer: io.MultiWriter(tmp, hash),
+	})
 	if err != nil {
 		return nil, "", n, errors.Wrap(err, "spool persisted snapshot export")
 	}
@@ -165,13 +179,10 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 }
 
 func putPayload(ctx context.Context, store ObjectStore, key string, file *os.File, size int64, sha string) error {
-	if info, ok, err := store.HeadObject(ctx, key); err != nil {
-		return errors.Wrap(err, "head snapshot payload")
-	} else if ok {
-		if info.Size == size && info.SHA256 == sha {
-			return nil
-		}
-		return errors.Wrapf(ErrIntegrity, "payload object %s already exists with different content", key)
+	if exists, err := verifyExistingStoreObject(ctx, store, key, size, sha); err != nil {
+		return errors.Wrap(err, "verify existing snapshot payload")
+	} else if exists {
+		return nil
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return errors.WithStack(err)
@@ -184,10 +195,51 @@ func putPayload(ctx context.Context, store ObjectStore, key string, file *os.Fil
 	if err != nil {
 		return errors.Wrap(err, "put snapshot payload")
 	}
-	if info.Size != size || info.SHA256 != sha {
+	if info.Size != size || (info.SHA256 != "" && info.SHA256 != sha) {
 		return errors.Wrapf(ErrIntegrity, "payload object %s remote integrity mismatch", key)
 	}
 	return nil
+}
+
+func verifyExistingStoreObject(ctx context.Context, store ObjectStore, key string, size int64, sha string) (bool, error) {
+	info, ok, err := store.HeadObject(ctx, key)
+	if err != nil {
+		return false, errors.Wrap(err, "head existing object")
+	}
+	if !ok {
+		return false, nil
+	}
+	if info.Size != size {
+		return true, errors.Wrapf(ErrIntegrity, "object %s already exists with different size", key)
+	}
+	if info.SHA256 != "" {
+		if info.SHA256 == sha {
+			return true, nil
+		}
+		return true, errors.Wrapf(ErrIntegrity, "object %s already exists with different sha256", key)
+	}
+	gotSize, gotSHA, err := hashExistingStoreObject(ctx, store, key)
+	if err != nil {
+		return true, err
+	}
+	if gotSize == size && gotSHA == sha {
+		return true, nil
+	}
+	return true, errors.Wrapf(ErrIntegrity, "object %s already exists with different content", key)
+}
+
+func hashExistingStoreObject(ctx context.Context, store ObjectStore, key string) (int64, string, error) {
+	body, _, err := store.GetObject(ctx, key)
+	if err != nil {
+		return 0, "", errors.Wrap(err, "get existing object")
+	}
+	defer func() { _ = body.Close() }()
+	sum := sha256.New()
+	n, err := io.Copy(sum, contextReader{ctx: ctx, reader: body})
+	if err != nil {
+		return 0, "", errors.WithStack(err)
+	}
+	return n, hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 func stringsTrim(v string) string {
