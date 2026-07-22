@@ -710,6 +710,77 @@ func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
 	assert.Equal(t, 2, secondary.CallCount())
 }
 
+func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(int64(0), nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 30 * time.Millisecond},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	d.Close()
+
+	assert.Greater(t, secondary.CallCount(), 1)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
+}
+
+func TestDualWriter_BlockingReplayDoesNotConsumeWriteWorkers(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(int64(1), nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                                 ModeDualWrite,
+			SecondaryTimeout:                     time.Second,
+			SecondaryWriteConcurrency:            1,
+			SecondaryBlockingReplayConcurrency:   1,
+			SecondaryWriteQueueCapacity:          1,
+			SecondaryBlockingReplayQueueCapacity: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	blocker := make(chan struct{})
+	started := make(chan struct{})
+	d.goWrite(func(context.Context) {
+		close(started)
+		<-blocker
+	})
+	<-started
+
+	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return secondary.CallCount() == 1 },
+		time.Second, 10*time.Millisecond)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncWorkersActive.WithLabelValues(asyncQueueWrite)), 0.001)
+
+	close(blocker)
+	d.Close()
+}
+
 func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",

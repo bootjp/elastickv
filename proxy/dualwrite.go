@@ -29,6 +29,10 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
+	// maxBlockingReplayGoroutines isolates mutating blocking command replays
+	// from normal secondary writes. Blocking replays may wait for the secondary
+	// to observe a producer write and must not occupy producer write workers.
+	maxBlockingReplayGoroutines = 64
 	// Async queues absorb short bursts without allowing an unavailable or slow
 	// secondary to build an unbounded replay backlog.
 	minAsyncQueueCapacity       = 64
@@ -105,13 +109,16 @@ type DualWriter struct {
 	sentry    *SentryReporter
 	logger    *slog.Logger
 
-	writeSem         chan struct{} // bounds concurrent secondary write goroutines
-	shadowSem        chan struct{} // bounds concurrent shadow read goroutines
-	scriptSem        chan struct{} // bounds concurrent secondary Lua-script write goroutines
-	writeQueue       chan asyncTask
-	scriptQueue      chan asyncTask
-	writeQueueSlots  chan struct{}
-	scriptQueueSlots chan struct{}
+	writeSem                 chan struct{} // bounds concurrent secondary write goroutines
+	shadowSem                chan struct{} // bounds concurrent shadow read goroutines
+	scriptSem                chan struct{} // bounds concurrent secondary Lua-script write goroutines
+	blockingReplaySem        chan struct{} // bounds secondary mutating blocking replays
+	writeQueue               chan asyncTask
+	scriptQueue              chan asyncTask
+	blockingReplayQueue      chan asyncTask
+	writeQueueSlots          chan struct{}
+	scriptQueueSlots         chan struct{}
+	blockingReplayQueueSlots chan struct{}
 
 	dispatchWG    sync.WaitGroup
 	workerWG      sync.WaitGroup
@@ -136,22 +143,25 @@ type DualWriter struct {
 // NewDualWriter creates a DualWriter with the given backends.
 func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMetrics, sentryReporter *SentryReporter, logger *slog.Logger) *DualWriter {
 	d := &DualWriter{
-		primary:          primary,
-		secondary:        secondary,
-		cfg:              cfg,
-		metrics:          metrics,
-		sentry:           sentryReporter,
-		logger:           logger,
-		writeSem:         make(chan struct{}, secondaryWriteConcurrency(cfg)),
-		shadowSem:        make(chan struct{}, maxShadowGoroutines),
-		scriptSem:        make(chan struct{}, secondaryScriptConcurrency(cfg)),
-		writeQueue:       make(chan asyncTask, secondaryWriteQueueCapacity(cfg)),
-		scriptQueue:      make(chan asyncTask, secondaryScriptQueueCapacity(cfg)),
-		writeQueueSlots:  make(chan struct{}, secondaryWriteQueueCapacity(cfg)),
-		scriptQueueSlots: make(chan struct{}, secondaryScriptQueueCapacity(cfg)),
-		closeDone:        make(chan struct{}),
-		poolStatsStop:    make(chan struct{}),
-		scripts:          make(map[string]string),
+		primary:                  primary,
+		secondary:                secondary,
+		cfg:                      cfg,
+		metrics:                  metrics,
+		sentry:                   sentryReporter,
+		logger:                   logger,
+		writeSem:                 make(chan struct{}, secondaryWriteConcurrency(cfg)),
+		shadowSem:                make(chan struct{}, maxShadowGoroutines),
+		scriptSem:                make(chan struct{}, secondaryScriptConcurrency(cfg)),
+		blockingReplaySem:        make(chan struct{}, secondaryBlockingReplayConcurrency(cfg)),
+		writeQueue:               make(chan asyncTask, secondaryWriteQueueCapacity(cfg)),
+		scriptQueue:              make(chan asyncTask, secondaryScriptQueueCapacity(cfg)),
+		blockingReplayQueue:      make(chan asyncTask, secondaryBlockingReplayQueueCapacity(cfg)),
+		writeQueueSlots:          make(chan struct{}, secondaryWriteQueueCapacity(cfg)),
+		scriptQueueSlots:         make(chan struct{}, secondaryScriptQueueCapacity(cfg)),
+		blockingReplayQueueSlots: make(chan struct{}, secondaryBlockingReplayQueueCapacity(cfg)),
+		closeDone:                make(chan struct{}),
+		poolStatsStop:            make(chan struct{}),
+		scripts:                  make(map[string]string),
 	}
 
 	if cfg.Mode == ModeDualWriteShadow || cfg.Mode == ModeElasticKVPrimary {
@@ -167,11 +177,14 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 	d.startBackendPoolSampler()
 	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueWrite).Set(float64(cap(d.writeQueueSlots)))
 	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueScript).Set(float64(cap(d.scriptQueueSlots)))
+	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueBlocking).Set(float64(cap(d.blockingReplayQueueSlots)))
 	d.logger.Info("secondary async scheduler configured",
 		"write_concurrency", cap(d.writeSem),
 		"script_concurrency", cap(d.scriptSem),
+		"blocking_replay_concurrency", cap(d.blockingReplaySem),
 		"write_queue_capacity", cap(d.writeQueueSlots),
 		"script_queue_capacity", cap(d.scriptQueueSlots),
+		"blocking_replay_queue_capacity", cap(d.blockingReplayQueueSlots),
 		"timeout", cfg.SecondaryTimeout)
 
 	return d
@@ -189,12 +202,23 @@ func secondaryScriptConcurrency(cfg ProxyConfig) int {
 	return concurrency
 }
 
+func secondaryBlockingReplayConcurrency(cfg ProxyConfig) int {
+	return configuredConcurrencyOrDefault(cfg.SecondaryBlockingReplayConcurrency, maxBlockingReplayGoroutines)
+}
+
 func secondaryWriteQueueCapacity(cfg ProxyConfig) int {
 	return configuredQueueCapacityOrDefault(cfg.SecondaryWriteQueueCapacity, secondaryWriteConcurrency(cfg))
 }
 
 func secondaryScriptQueueCapacity(cfg ProxyConfig) int {
 	return configuredQueueCapacityOrDefault(cfg.SecondaryScriptQueueCapacity, secondaryScriptConcurrency(cfg))
+}
+
+func secondaryBlockingReplayQueueCapacity(cfg ProxyConfig) int {
+	return configuredQueueCapacityOrDefault(
+		cfg.SecondaryBlockingReplayQueueCapacity,
+		secondaryBlockingReplayConcurrency(cfg),
+	)
 }
 
 func configuredQueueCapacityOrDefault(configured, concurrency int) int {
@@ -234,6 +258,7 @@ func (d *DualWriter) Close() {
 	if d.hasSecondaryWrite() {
 		close(d.writeQueue)
 		close(d.scriptQueue)
+		close(d.blockingReplayQueue)
 	}
 	close(d.poolStatsStop)
 	d.mu.Unlock()
@@ -330,9 +355,9 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 
 	if d.hasSecondaryWrite() {
 		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
-			d.goWrite(func(ctx context.Context) { d.writeSecondaryPositiveInt(ctx, replayCmd, replayArgs) })
+			d.goBlockingReplay(func(ctx context.Context) { d.writeSecondaryPositiveInt(ctx, replayCmd, replayArgs) })
 		} else if shouldReplayBlockingToSecondary(cmd) {
-			d.goWrite(func(ctx context.Context) {
+			d.goBlockingReplay(func(ctx context.Context) {
 				sCtx, cancel := context.WithTimeout(ctx, time.Second)
 				defer cancel()
 				d.secondary.Do(sCtx, iArgs...)
@@ -425,8 +450,10 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 		if attempt >= retryLimit {
 			break
 		}
-		d.logger.Debug("retrying secondary write",
-			"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if shouldLogSecondaryRetry(sErr) {
+			d.logger.Debug("retrying secondary write",
+				"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		}
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
@@ -453,29 +480,26 @@ func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string,
 		var resp any
 		result := d.secondary.Do(sCtx, iArgs...)
 		resp, sErr = result.Result()
-		if sErr == nil {
-			if n, ok := redisInteger(resp); ok && n > 0 {
-				elapsed := time.Since(start)
-				d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
-				d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
-				return
-			}
-			sErr = errSecondaryReplayNoEffect
+		if ok, err := positiveIntReplayResult(resp, sErr); ok {
+			elapsed := time.Since(start)
+			d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
+			d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+			return
+		} else {
+			sErr = err
 		}
 
-		retryReason, retryLimit := secondaryRetryReasonAndLimit(cmd, sErr)
-		if errors.Is(sErr, errSecondaryReplayNoEffect) {
-			retryReason = "no_effect"
-			retryLimit = maxNoEffectReplayRetries
-		}
+		retryReason, retryLimit := secondaryPositiveIntRetryReasonAndLimit(cmd, sErr)
 		if retryReason == "" {
 			break
 		}
 		if attempt >= retryLimit {
 			break
 		}
-		d.logger.Debug("retrying secondary write",
-			"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if shouldLogSecondaryRetry(sErr) {
+			d.logger.Debug("retrying secondary write",
+				"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		}
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
@@ -484,7 +508,32 @@ func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string,
 
 	elapsed := time.Since(start)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
+	if errors.Is(sErr, errSecondaryReplayNoEffect) {
+		d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "miss").Inc()
+		return
+	}
 	d.recordSecondaryWriteFailure(cmd, iArgs, elapsed, attempt+1, false, sErr)
+}
+
+func positiveIntReplayResult(resp any, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	if n, ok := redisInteger(resp); ok && n > 0 {
+		return true, nil
+	}
+	return false, errSecondaryReplayNoEffect
+}
+
+func secondaryPositiveIntRetryReasonAndLimit(cmd string, err error) (string, int) {
+	if errors.Is(err, errSecondaryReplayNoEffect) {
+		return "no_effect", maxNoEffectReplayRetries
+	}
+	return secondaryRetryReasonAndLimit(cmd, err)
+}
+
+func shouldLogSecondaryRetry(err error) bool {
+	return !errors.Is(err, errSecondaryReplayNoEffect)
 }
 
 func redisInteger(resp any) (int64, bool) {
@@ -663,6 +712,12 @@ func (d *DualWriter) goWrite(fn func(context.Context)) {
 // It uses a smaller class limit while also consuming the shared write limit.
 func (d *DualWriter) goScript(fn func(context.Context)) {
 	d.enqueueAsync(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, fn)
+}
+
+// goBlockingReplay queues fn for bounded secondary replay of mutating blocking
+// commands without consuming the normal secondary write workers.
+func (d *DualWriter) goBlockingReplay(fn func(context.Context)) {
+	d.enqueueAsync(d.blockingReplayQueue, d.blockingReplayQueueSlots, asyncQueueBlocking, fn)
 }
 
 // goShadow launches fn in a bounded shadow-read goroutine.

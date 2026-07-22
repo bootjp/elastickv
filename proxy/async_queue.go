@@ -6,11 +6,12 @@ import (
 )
 
 const (
-	asyncDispatcherCount = 2
+	asyncDispatcherCount = 3
 
-	asyncQueueWrite  = "write"
-	asyncQueueScript = "script"
-	asyncQueueShadow = "shadow"
+	asyncQueueWrite    = "write"
+	asyncQueueScript   = "script"
+	asyncQueueBlocking = "blocking"
+	asyncQueueShadow   = "shadow"
 
 	asyncDropQueueFull = "queue_full"
 	asyncDropExpired   = "expired"
@@ -26,6 +27,7 @@ func (d *DualWriter) startAsyncDispatchers() {
 	d.dispatchWG.Add(asyncDispatcherCount)
 	go d.dispatchAsyncQueue(d.writeQueue, d.writeQueueSlots, asyncQueueWrite, d.writeSem)
 	go d.dispatchAsyncQueue(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, d.scriptSem, d.writeSem)
+	go d.dispatchAsyncQueue(d.blockingReplayQueue, d.blockingReplayQueueSlots, asyncQueueBlocking, d.blockingReplaySem)
 }
 
 func (d *DualWriter) enqueueAsync(queue chan asyncTask, slots chan struct{}, queueName string, fn func(context.Context)) {
