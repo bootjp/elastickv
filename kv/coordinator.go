@@ -42,7 +42,8 @@ const dispatchLeaderRetryInterval = 25 * time.Millisecond
 const hlcPhysicalWindowMs int64 = 30_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
-// Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
+// Keep the renewal interval and proposal timeout below the physical window;
+// this provides timing margin but cannot prevent expiry after repeated failures.
 const hlcRenewalInterval = 2 * time.Second
 
 // hlcRenewalProposalTimeout bounds one renewal proposal independently from the
@@ -838,9 +839,9 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 // physical ceiling to the Raft cluster while this node is the leader.
 //
 // The ceiling is set to now + hlcPhysicalWindowMs and is renewed every
-// hlcRenewalInterval. Because the window remains ahead of any real timestamp,
-// a new leader will never issue timestamps that overlap with the previous
-// leader's window.
+// hlcRenewalInterval. While renewals keep succeeding, the committed ceiling and
+// NextFenced fail-closed check prevent timestamp issuance after the safe window
+// has expired.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/redislimits"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
@@ -1334,7 +1335,7 @@ func TestDefaultBackendOptions(t *testing.T) {
 
 func TestDefaultElasticKVBackendOptions(t *testing.T) {
 	opts := DefaultElasticKVBackendOptions()
-	assert.Equal(t, 64, opts.PoolSize)
+	assert.Equal(t, redislimits.DefaultElasticKVRedisConnections, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
 	assert.Equal(t, 3*time.Second, opts.WriteTimeout)

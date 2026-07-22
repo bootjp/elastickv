@@ -3,6 +3,7 @@ package adapter
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/redislimits"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,7 +17,7 @@ func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
 
 	require.NotNil(t, server.peerLimiter)
 	require.Equal(t, defaultRedisPerPeerConnectionCap, server.peerLimiter.limit)
-	require.Equal(t, 64, server.peerLimiter.limit)
+	require.Equal(t, redislimits.DefaultElasticKVRedisConnections, server.peerLimiter.limit)
 }
 
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {

@@ -27,30 +27,139 @@ func (s *bzpopminRecordingStore) ScanAt(ctx context.Context, start []byte, end [
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func TestRedis_BZPopMinCandidateUsesScoreIndex(t *testing.T) {
+func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	key := []byte("zset-score-index-pop")
 	readTS := uint64(10)
-	base := store.NewMVCCStore()
-	require.NoError(t, base.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 2}), readTS, 0))
-	require.NoError(t, base.PutAt(ctx, store.ZSetMemberKey(key, []byte("later")), store.MarshalZSetScore(2), readTS, 0))
-	require.NoError(t, base.PutAt(ctx, store.ZSetScoreKey(key, 2, []byte("later")), []byte{}, readTS, 0))
-	require.NoError(t, base.PutAt(ctx, store.ZSetMemberKey(key, []byte("first")), store.MarshalZSetScore(1), readTS, 0))
-	require.NoError(t, base.PutAt(ctx, store.ZSetScoreKey(key, 1, []byte("first")), []byte{}, readTS, 0))
 
-	rec := &bzpopminRecordingStore{MVCCStore: base}
-	server := &RedisServer{store: rec}
-	candidate, err := server.bzpopminCandidateAt(ctx, key, readTS)
+	for _, tc := range []struct {
+		name       string
+		seed       func(t *testing.T, st store.MVCCStore, key []byte)
+		wantMember string
+		wantScore  float64
+		wantWide   bool
+		wantLast   bool
+		wantScans  []int
+	}{
+		{
+			name: "wide score index",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "later", Score: 2},
+					{Member: "first", Score: 1},
+				})
+			},
+			wantMember: "first",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{bzpopminScoreScanLimit},
+		},
+		{
+			name: "single score entry",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "only", Score: 3},
+				})
+			},
+			wantMember: "only",
+			wantScore:  3,
+			wantWide:   true,
+			wantLast:   true,
+			wantScans:  []int{bzpopminScoreScanLimit},
+		},
+		{
+			name: "member only fallback",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "later", Score: 2},
+					{Member: "first", Score: 1},
+				})
+			},
+			wantMember: "first",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+		},
+		{
+			name: "legacy blob fallback",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedLegacyZSetForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "later", Score: 2},
+					{Member: "first", Score: 1},
+				})
+			},
+			wantMember: "first",
+			wantScore:  1,
+			wantWide:   false,
+			wantLast:   false,
+			wantScans:  []int{bzpopminScoreScanLimit, 1},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			key := []byte("zset-bzpopmin-" + tc.name)
+			base := store.NewMVCCStore()
+			tc.seed(t, base, key)
+			rec := &bzpopminRecordingStore{MVCCStore: base}
+			server := &RedisServer{store: rec}
+
+			candidate, err := server.bzpopminCandidateAt(ctx, key, readTS)
+			require.NoError(t, err)
+			require.NotNil(t, candidate)
+			require.Equal(t, tc.wantWide, candidate.isWide)
+			require.Equal(t, tc.wantLast, candidate.isLast)
+			require.Equal(t, tc.wantMember, candidate.entry.Member)
+			require.InDelta(t, tc.wantScore, candidate.entry.Score, 1e-9)
+			require.Len(t, rec.scans, len(tc.wantScans))
+			for i, wantLimit := range tc.wantScans {
+				require.Equal(t, wantLimit, rec.scans[i].limit)
+			}
+			require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[0].start)
+		})
+	}
+}
+
+func seedZSetMemberRowsForBZPopMinTest(
+	t *testing.T,
+	st store.MVCCStore,
+	key []byte,
+	commitTS uint64,
+	entries []redisZSetEntry,
+) {
+	t.Helper()
+	ctx := context.Background()
+	for _, entry := range entries {
+		require.NoError(t, st.PutAt(
+			ctx,
+			store.ZSetMemberKey(key, []byte(entry.Member)),
+			store.MarshalZSetScore(entry.Score),
+			commitTS,
+			0,
+		))
+	}
+	require.NoError(t, st.PutAt(
+		ctx,
+		store.ZSetMetaKey(key),
+		store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(entries))}),
+		commitTS,
+		0,
+	))
+}
+
+func seedLegacyZSetForBZPopMinTest(
+	t *testing.T,
+	st store.MVCCStore,
+	key []byte,
+	commitTS uint64,
+	entries []redisZSetEntry,
+) {
+	t.Helper()
+	ctx := context.Background()
+	raw, err := marshalZSetValue(redisZSetValue{Entries: entries})
 	require.NoError(t, err)
-	require.NotNil(t, candidate)
-	require.True(t, candidate.isWide)
-	require.False(t, candidate.isLast)
-	require.Equal(t, "first", candidate.entry.Member)
-	require.InDelta(t, 1.0, candidate.entry.Score, 1e-9)
-	require.Len(t, rec.scans, 1)
-	require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[0].start)
-	require.Equal(t, 2, rec.scans[0].limit)
+	require.NoError(t, st.PutAt(ctx, redisZSetKey(key), raw, commitTS, 0))
 }
 
 // TestRedis_BZPopMinWakesOnZAdd verifies the event-driven wake path:

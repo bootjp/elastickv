@@ -34,7 +34,10 @@ type bzpopminCandidate struct {
 	isLast    bool
 }
 
-const zsetOpsPerEntry = 2
+const (
+	zsetOpsPerEntry        = 2
+	bzpopminScoreScanLimit = 2
+)
 
 // buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
 // !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no
@@ -1167,7 +1170,7 @@ func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readT
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
-	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, 2, readTS) //nolint:mnd // first entry plus last-entry sentinel
+	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}

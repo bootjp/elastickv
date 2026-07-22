@@ -361,6 +361,12 @@ func TestShardedCoordinator_RenewHLCLeases_UsesProposalTimeoutBeyondCadence(t *t
 	}
 }
 
+func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
+	t.Parallel()
+	window := time.Duration(hlcPhysicalWindowMs) * time.Millisecond
+	require.Less(t, hlcRenewalInterval+hlcRenewalProposalTimeout, window)
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)

@@ -6,11 +6,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/bootjp/elastickv/internal/redislimits"
 )
 
 const (
 	redisPerPeerLimitEnv             = "ELASTICKV_REDIS_PER_PEER_CONNECTIONS"
-	defaultRedisPerPeerConnectionCap = 64
+	defaultRedisPerPeerConnectionCap = redislimits.DefaultElasticKVRedisConnections
 	redisPeerLimitError              = "ERR max connections per client exceeded"
 	unknownRedisPeer                 = "unknown"
 )

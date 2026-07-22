@@ -84,12 +84,13 @@ Breakage points:
 references anywhere in `kv/`, `distribution/`, or
 `internal/raftengine/etcd/`. Everything is single-region etcd/raft.
 
-HLC is `kv/hlc.go` + `kv/coordinator.go`: physical ceiling is
-Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 30 s`,
-renewed every `hlcRenewalInterval = 2 s` from the **default-group
-leader only** (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced`
-fails closed with `ErrCeilingExpired` once `wall_now >= ceiling`.
-Wall clock is `time.Now().UnixMilli()` — assumes NTP-synced hosts.
+HLC is `kv/hlc.go` + `kv/coordinator.go` +
+`kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
+`ProposeHLCLease`, `hlcPhysicalWindowMs = 30 s`, renewed every
+`hlcRenewalInterval = 2 s` by each led shard group
+(`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
+with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
+`time.Now().UnixMilli()` — assumes NTP-synced hosts.
 
 Raft engine (`internal/raftengine/etcd/engine.go`):
 `defaultTickInterval = 10 ms`, `defaultHeartbeatTick = 10` (100 ms),
@@ -98,11 +99,11 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 
 Multi-region blockers:
 
-- HLC ceiling is **single-point** — default-group leader proposes
-  every 2 s; cross-region default-group leadership means every
-  shard's persistence-grade ts depends on a cross-WAN propose. 1 s
-  WAN RTT is now less likely to expire the 30 s window immediately,
-  but every renewal still depends on cross-WAN quorum progress.
+- HLC ceiling renewal is **per Raft group** — each shard group leader
+  proposes every 2 s, so cross-region leadership for that group makes
+  its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
+  RTT is now less likely to expire the 30 s window immediately, but
+  every renewal still depends on that group's cross-WAN quorum progress.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
 - Cross-shard txns are blocked (`ErrCrossShardTransactionNotSupported`),
