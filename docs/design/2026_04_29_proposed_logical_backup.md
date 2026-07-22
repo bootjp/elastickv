@@ -13,7 +13,7 @@ given dump.
 
 | Phase | Doc | Scope |
 |-------|-----|-------|
-| **Phase 0** | [`2026_04_29_proposed_snapshot_logical_decoder.md`](./2026_04_29_proposed_snapshot_logical_decoder.md) | Offline `.fsm` ↔ logical-format directory tree converter. No live cluster, no admin RPCs, no FSM/Raft changes. **Owns the format definition.** Sufficient for single-shard clusters, one-time exports off elastickv, and any use case where the latest available snapshot is a good-enough recovery point. |
+| **Phase 0** | [`2026_04_29_implemented_snapshot_logical_decoder.md`](./2026_04_29_implemented_snapshot_logical_decoder.md) | Offline `.fsm` ↔ logical-format directory tree converter. No live cluster, no admin RPCs, no FSM/Raft changes. **Owns the format definition.** Sufficient for single-shard clusters, one-time exports off elastickv, and any use case where the latest available snapshot is a good-enough recovery point. |
 | **Phase 1 (this doc)** | This file | Live, running-cluster extraction with cluster-wide point-in-time consistency across multiple Raft groups. Adds `BeginBackup` / `RenewBackup` / `EndBackup` admin RPCs, replicated `BackupPin` / `Extend` / `Release` Raft FSM commands, version-gated rolling-upgrade safety, expected-keys baseline. Required only when cross-shard PIT consistency or "snapshot now" cadence is needed. |
 
 The format details (per-adapter directory layout, filename encoding,

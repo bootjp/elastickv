@@ -1,6 +1,6 @@
 # Hotspot Shard Split — Milestone 2: Migration Plane
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-06-11
 
@@ -20,6 +20,14 @@ M1 landed the control plane:
 Composed-1 cross-group commit guard (PR #927) and the routeKey normalization fix (PR #932) close the apply-time hazards that an unsafe M2 cutover would trip. M2 builds on top of both.
 
 M2 does **not** ship hotspot detection or auto-split scheduling (M3).
+
+Implementation status (updated 2026-07-23): the durable SplitJob
+catalog substrate has landed in `distribution/split_job_catalog.go`
+and `proto/distribution.proto`, with codec/list/history tests in
+`distribution/split_job_catalog_test.go`. The `StartSplitMigration`
+RPC, migrator state machine, source/target export/import, fencing,
+cutover, promotion, cleanup, and capability gate remain open, so the
+document is partial rather than implemented.
 
 ## 2. Goals and Non-Goals
 
@@ -1231,17 +1239,17 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 
 Phased into reviewable PRs, each lands behind its own doc-or-test gate:
 
-| PR | Scope | Tests |
+| PR | Scope | Tests / status |
 |---|---|---|
 | M2-PR0 | Prepare-time `commit_ts` plumbing behind the PR7 cluster capability gate: decoder/helpers understand both legacy and new lock values; while the gate is closed, normal PREPARE/COMMIT remains byte-compatible with M1 and writes neither lock `commit_ts` fields nor per-key `!txn|ok|` markers; once the gate is open, the coordinator allocates/fences `commit_ts` before PREPARE, prepare request and txn metadata carry it to every participant, `handlePrepare` writes the same value into each `txnLock`, the migration write tracker records that value at prepare admission, and COMMIT reuses it while writing length-prefixed per-key `!txn|ok|` success markers for every committed participant. Keep decoder backward-compat for existing lock values without the field (zero → migrator fallback to direct commit-record lookup / pending drain). | `kv/txn_codec_test.go` round-trip + backward-compat case; `kv/txn_prepare_commit_ts_test.go` covers gate-closed mixed-cluster traffic emitting legacy locks/no `!txn|ok|`, then gate-open coordinator → prepare request/meta → `handlePrepare` → tracker path + per-key success marker; red controls for codec-only, commit-time allocation, primary-only commit proof, and writing PR0 side effects before the gate opens |
-| M2-PR1 | SplitJob codec + reserved-key layout + catalog read/write helpers | catalog_test |
+| M2-PR1 | SplitJob codec + reserved-key layout + catalog read/write helpers | Implemented in `distribution/split_job_catalog.go` and `distribution/split_job_catalog_test.go` |
 | M2-PR2 | `proto/distribution.proto` + `proto/internal.proto` regen (`MVCCVersion.expire_at`, bracket/batch identity, scan-budget fields); wire fields plumbed but unused | proto regen; build |
 | M2-PR3 | `store/MVCCStore.ExportVersions` raw committed-version export + `ImportVersions` with idempotency, tombstone/`expire_at` preservation, target-local full-HLC floor persistence, durable RouteDescriptor v2 codec/dual decoder, and descriptor `min_write_ts_exclusive` plumbing, no migrator wiring | store unit incl. tombstone/TTL + HLC-floor restore cases + property; `distribution/catalog_test.go` v1/v2 route descriptor codec matrix |
 | M2-PR4 | `distribution/migrator.go` state machine + export bracket planner, including list delta/claim, Redis wide-column brackets, concrete-only SQS/S3 brackets, txn success marker routing, drain-only txn locks, and matching `routeKey()` decoder coverage — same-group target (no-op data move) to lock the state shape | migrator unit + `migrator_export_plan_test` |
 | M2-PR5 | Coordinator + FSM FENCE rejection (`ErrRouteWriteFenced`) with point and `DEL_PREFIX` range-footprint checks + route-faithful txn-lock drain (§3.2a.0a) + same-group `SplitRange` overlap rejection while a SplitJob is live | fsm + coordinator unit + `migrator_lock_drain_test` + `catalog_test` overlap red controls |
 | M2-PR6 | Cross-group end-to-end: ExportRangeVersions / ImportVersions server-side handlers + migrator BACKFILL/DELTA_COPY + raw-candidate staged/live merge read path in both scan directions and `LatestCommitTS` + §7.2.2e source-side cutover read-fence arm with every-current-source-voter ACK, membership-epoch re-ACK, catalog-version waiter, route-key-normalized scan ownership checks, and server-stamped RawKV read versions | integration incl. delete/TTL DELTA_COPY, Redis list/hash/set/zset/stream migration, HLC restart/fence-floor cases + `kv/fsm_cutover_read_fence_test.go` |
 | M2-PR7 | Target-local `PromotionState` + background promoter + ordered default-group promotion-complete CAS retaining `min_write_ts_exclusive` + source/target cleanup before DONE history move; readiness guard accepts matching cleared descriptors while retained; `AbandonSplitJob` with durable `ABANDONING` cleanup witness + CLEANUP GC + Jepsen split workload | `kv/fsm_promote_staged_test.go` raw hidden-version/LatestCommitTS merge + jepsen suite |
-| M2-PR8 | Rename `*_proposed_*` → `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 |  |
+| M2-PR8 | Rename `*_proposed_*` -> `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 | Partial rename complete; implemented rename remains gated on PR7 |
 
 Each PR follows the five-lens self-review and is gated by its tests + `make lint`.
 
@@ -1281,9 +1289,9 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 
 ## 14. Lifecycle
 
-This document begins as `*_proposed_*`. Per CLAUDE.md:
+This document began as `*_proposed_*` and is now `*_partial_*` because
+M2-PR1's SplitJob catalog substrate has landed. Per `docs/design/README.md`:
 
-- Rename to `*_partial_*` after M2-PR1 lands; track per-PR landing under §11.
 - Rename to `*_implemented_*` after M2-PR7 ships and the parent partial doc's M2 row is checked off.
 
 `git mv` is used so history follows.
