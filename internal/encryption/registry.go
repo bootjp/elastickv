@@ -97,8 +97,8 @@ func IsRegistryKey(key []byte) bool {
 
 // DecodeRegistryKey parses a registry-row key back into its
 // (dek_id, uint16 node_id) tuple. Returns ErrRegistryKeyMalformed
-// when the key does not start with WriterRegistryPrefix or has the
-// wrong length. The decoder does NOT range-check the parsed
+// when the key does not match the exact writer-registry key shape.
+// The decoder does NOT range-check the parsed
 // dek_id against ReservedKeyID — that is the caller's policy.
 func DecodeRegistryKey(key []byte) (dekID uint32, nodeID16 uint16, err error) {
 	if !IsRegistryKey(key) {
