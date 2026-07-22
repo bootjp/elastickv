@@ -1337,7 +1337,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// in handlerCtx, so it would cancel-on-call too — but routing
 		// through isXReadIterCtxError silently translates that into an
 		// empty iteration and the loop would otherwise wait at
-		// redisBlockWaitFallback cadence until the deadline.
+		// the configured block fallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
@@ -1397,7 +1397,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 			conn.WriteNull()
 			return
 		}
-		waitForBlockedCommandUpdate(handlerCtx, w, deadline)
+		waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)
 	}
 }
 

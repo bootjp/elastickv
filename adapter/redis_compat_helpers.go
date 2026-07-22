@@ -388,7 +388,7 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 // appeared between iterations is invisible to this fast path; the
 // blocking command's fallback-timer wake (which uses the slow
 // keyTypeAtExpect) is the safety net that detects it within
-// ~redisBlockWaitFallback.
+// roughly one configured block fallback interval.
 //
 // Compared to keyTypeAtExpect on the empty-key case
 // (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19

@@ -146,7 +146,7 @@ func TestRedis_BZPopMinRejectsInitialWrongType(t *testing.T) {
 // non-existent key and a wrongType encoding (e.g. SET) is written
 // to that key during the BLOCK window, the next fallback-timer
 // wake must run the full check and surface WRONGTYPE within
-// ~redisBlockWaitFallback. A pure signal-driven path
+// roughly one configured block fallback interval. A pure signal-driven path
 // would miss this because SET / HSET / etc. do not fire
 // zsetWaiters.Signal.
 //
@@ -216,8 +216,8 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 // instead of returning WRONGTYPE.
 //
 // The fix maintains a lastFullCheck wall time inside bzpopminWaitLoop
-// and demotes `fast` back to false when more than redisBlockWaitFallback
-// has elapsed since the last full check, restoring the #666 ceiling.
+// and demotes `fast` back to false when more than the configured fallback
+// interval has elapsed since the last full check, restoring the #666 ceiling.
 func TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad(t *testing.T) {
 	t.Parallel()
 	// This test drives the in-process waiter registry directly, so a
