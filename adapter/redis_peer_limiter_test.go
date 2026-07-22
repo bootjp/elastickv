@@ -10,6 +10,23 @@ const (
 	testPeerLimit = 2
 )
 
+func TestDefaultRedisPeerLimiterUsesNoisyClientBoundedDefault(t *testing.T) {
+	t.Setenv(redisPerPeerLimitEnv, "")
+
+	limiter := newDefaultRedisPeerLimiter()
+	require.NotNil(t, limiter)
+	require.Equal(t, 8, limiter.limit)
+	require.Equal(t, defaultRedisPerPeerConnectionCap, limiter.limit)
+}
+
+func TestDefaultRedisPeerLimiterCanRaiseProxyDeploymentCap(t *testing.T) {
+	t.Setenv(redisPerPeerLimitEnv, "64")
+
+	limiter := newDefaultRedisPeerLimiter()
+	require.NotNil(t, limiter)
+	require.Equal(t, 64, limiter.limit)
+}
+
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
 	c1 := &remoteCommandRecorder{remote: "192.168.0.64:10001"}

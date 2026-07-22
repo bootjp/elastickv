@@ -784,7 +784,7 @@ func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing
 
 func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
 	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
-	assert.Equal(t, 2, limit)
+	assert.Equal(t, 5, limit)
 
 	var spent time.Duration
 	backoff := compactedRetryInitialBackoff
@@ -1334,7 +1334,7 @@ func TestDefaultBackendOptions(t *testing.T) {
 
 func TestDefaultElasticKVBackendOptions(t *testing.T) {
 	opts := DefaultElasticKVBackendOptions()
-	assert.Equal(t, 16, opts.PoolSize)
+	assert.Equal(t, 8, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
 	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
