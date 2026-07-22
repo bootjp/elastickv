@@ -61,15 +61,18 @@ func (d *DualWriter) enqueueAsync(queue chan asyncTask, slots chan struct{}, que
 func (d *DualWriter) dispatchAsyncQueue(queue <-chan asyncTask, slots chan struct{}, queueName string, sems ...chan struct{}) {
 	defer d.dispatchWG.Done()
 	for task := range queue {
+		if task.isExpired() {
+			d.finishAsyncQueueWait(task, slots, queueName)
+			d.recordAsyncDrop(queueName, asyncDropExpired, cap(slots), len(slots))
+			continue
+		}
+
 		for _, sem := range sems {
 			sem <- struct{}{}
 		}
 
-		<-slots
-		d.metrics.AsyncQueueDepth.WithLabelValues(queueName).Dec()
-		queueDelay := time.Since(task.enqueuedAt)
-		d.metrics.AsyncQueueDelay.WithLabelValues(queueName).Observe(queueDelay.Seconds())
-		if !task.deadline.IsZero() && !time.Now().Before(task.deadline) {
+		d.finishAsyncQueueWait(task, slots, queueName)
+		if task.isExpired() {
 			d.releaseAsyncSemaphores(sems)
 			d.recordAsyncDrop(queueName, asyncDropExpired, cap(slots), len(slots))
 			continue
@@ -93,6 +96,17 @@ func (d *DualWriter) dispatchAsyncQueue(queue <-chan asyncTask, slots chan struc
 			task.fn(ctx)
 		}(task)
 	}
+}
+
+func (d *DualWriter) finishAsyncQueueWait(task asyncTask, slots chan struct{}, queueName string) {
+	<-slots
+	d.metrics.AsyncQueueDepth.WithLabelValues(queueName).Dec()
+	queueDelay := time.Since(task.enqueuedAt)
+	d.metrics.AsyncQueueDelay.WithLabelValues(queueName).Observe(queueDelay.Seconds())
+}
+
+func (t asyncTask) isExpired() bool {
+	return !t.deadline.IsZero() && !time.Now().Before(t.deadline)
 }
 
 func (d *DualWriter) releaseAsyncSemaphores(sems []chan struct{}) {

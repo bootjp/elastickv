@@ -744,7 +744,7 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 	assert.NoError(t, err)
 	d.Close()
 
-	assert.Greater(t, secondary.CallCount(), 9)
+	assert.Equal(t, noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)+1, secondary.CallCount())
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(
 		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
@@ -1145,6 +1145,47 @@ func TestDualWriter_QueuedWorkExpiresBeforeBackendDispatch(t *testing.T) {
 	assert.False(t, ran.Load())
 	assert.InDelta(t, 1, testutil.ToFloat64(
 		metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueScript, asyncDropExpired)), 0.001)
+}
+
+func TestDualWriter_ExpiredQueuedWorkDoesNotWaitForSemaphore(t *testing.T) {
+	metrics := newTestMetrics()
+	d := &DualWriter{
+		metrics: metrics,
+		logger:  testLogger,
+	}
+	queue := make(chan asyncTask, 1)
+	slots := make(chan struct{}, 1)
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{}
+
+	now := time.Now()
+	slots <- struct{}{}
+	metrics.AsyncQueueDepth.WithLabelValues(asyncQueueWrite).Inc()
+	queue <- asyncTask{
+		enqueuedAt: now.Add(-time.Second),
+		deadline:   now.Add(-time.Millisecond),
+		fn: func(context.Context) {
+			t.Fatal("expired task must not run")
+		},
+	}
+	close(queue)
+
+	d.dispatchWG.Add(1)
+	done := make(chan struct{})
+	go func() {
+		d.dispatchAsyncQueue(queue, slots, asyncQueueWrite, sem)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expired task waited for an unavailable semaphore")
+	}
+
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncQueueDepth.WithLabelValues(asyncQueueWrite)), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueWrite, asyncDropExpired)), 0.001)
 }
 
 // TestDualWriter_Close_NoWaitGroupRace verifies that concurrent calls to
