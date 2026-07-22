@@ -120,9 +120,9 @@ const (
 	// blocking-command wait loops when no in-process write signal arrives.
 	// Signals cover normal XADD / ZADD / ZINCRBY wakeups immediately; this
 	// interval only bounds missed-signal, wrong-type, and BLOCK-deadline checks.
-	// Keep it below common sub-second BLOCK budgets while reducing idle
-	// fallback scans versus the previous 100ms cadence.
-	defaultRedisBlockWaitFallback = 250 * time.Millisecond
+	// Keep normal producer wakeups event-driven while reducing idle fallback scans
+	// from blocked consumers waiting on empty collections.
+	defaultRedisBlockWaitFallback = time.Second
 	redisFlushLegacyTimeout       = 10 * time.Minute
 	redisRelayPublishTimeout      = 2 * time.Second
 	redisTraceArgLimit            = 6
