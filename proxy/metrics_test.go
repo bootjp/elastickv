@@ -135,3 +135,35 @@ func TestObserveBackendPoolMetrics(t *testing.T) {
 	assert.InDelta(t, 0.15, testutil.ToFloat64(
 		metrics.BackendPoolWaitDuration.WithLabelValues("elastickv")), 0.001)
 }
+
+func TestDualWriterSamplesBackendPoolsOnStart(t *testing.T) {
+	metrics := newTestMetrics()
+	primary := &poolStatsMockBackend{
+		mockBackend: newMockBackend("redis"),
+		stats: BackendPoolStats{
+			Limit:           16,
+			TotalConns:      12,
+			PendingRequests: 5,
+		},
+	}
+	secondary := &poolStatsMockBackend{
+		mockBackend: newMockBackend("elastickv"),
+		stats: BackendPoolStats{
+			Limit:           32,
+			TotalConns:      20,
+			PendingRequests: 7,
+		},
+	}
+
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+	defer d.Close()
+
+	assert.InDelta(t, 16, testutil.ToFloat64(metrics.BackendPoolLimit.WithLabelValues("redis")), 0.001)
+	assert.InDelta(t, 12, testutil.ToFloat64(
+		metrics.BackendPoolConnections.WithLabelValues("redis", "total")), 0.001)
+	assert.InDelta(t, 5, testutil.ToFloat64(metrics.BackendPoolPending.WithLabelValues("redis")), 0.001)
+	assert.InDelta(t, 32, testutil.ToFloat64(metrics.BackendPoolLimit.WithLabelValues("elastickv")), 0.001)
+	assert.InDelta(t, 20, testutil.ToFloat64(
+		metrics.BackendPoolConnections.WithLabelValues("elastickv", "total")), 0.001)
+	assert.InDelta(t, 7, testutil.ToFloat64(metrics.BackendPoolPending.WithLabelValues("elastickv")), 0.001)
+}

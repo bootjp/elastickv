@@ -63,6 +63,8 @@ const (
 	// asyncDropLogInterval keeps the secondary-drop warning useful without
 	// emitting one log line per dropped fire-and-forget write under load.
 	asyncDropLogInterval = 5 * time.Second
+
+	backendPoolSampleInterval = time.Second
 )
 
 // readTSCompactedMarker is the substring produced by
@@ -104,14 +106,16 @@ type DualWriter struct {
 	writeQueueSlots  chan struct{}
 	scriptQueueSlots chan struct{}
 
-	dispatchWG sync.WaitGroup
-	workerWG   sync.WaitGroup
-	shadowWG   sync.WaitGroup
-	mu         sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
-	closed     bool
-	closeDone  chan struct{}
-	scriptMu   sync.RWMutex
-	scripts    map[string]string
+	dispatchWG    sync.WaitGroup
+	workerWG      sync.WaitGroup
+	shadowWG      sync.WaitGroup
+	poolStatsWG   sync.WaitGroup
+	mu            sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
+	closed        bool
+	closeDone     chan struct{}
+	poolStatsStop chan struct{}
+	scriptMu      sync.RWMutex
+	scripts       map[string]string
 	// scriptOrder tracks insertion order for FIFO eviction of the bounded script cache.
 	scriptOrder []string
 	asyncDropMu sync.Mutex
@@ -139,6 +143,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		writeQueueSlots:  make(chan struct{}, secondaryWriteQueueCapacity(cfg)),
 		scriptQueueSlots: make(chan struct{}, secondaryScriptQueueCapacity(cfg)),
 		closeDone:        make(chan struct{}),
+		poolStatsStop:    make(chan struct{}),
 		scripts:          make(map[string]string),
 	}
 
@@ -152,6 +157,7 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 	if d.hasSecondaryWrite() {
 		d.startAsyncDispatchers()
 	}
+	d.startBackendPoolSampler()
 	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueWrite).Set(float64(cap(d.writeQueueSlots)))
 	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueScript).Set(float64(cap(d.scriptQueueSlots)))
 	d.logger.Info("secondary async scheduler configured",
@@ -222,6 +228,7 @@ func (d *DualWriter) Close() {
 		close(d.writeQueue)
 		close(d.scriptQueue)
 	}
+	close(d.poolStatsStop)
 	d.mu.Unlock()
 
 	// Dispatchers are the only goroutines that add to workerWG. Waiting for
@@ -230,6 +237,7 @@ func (d *DualWriter) Close() {
 	d.dispatchWG.Wait()
 	d.workerWG.Wait()
 	d.shadowWG.Wait()
+	d.poolStatsWG.Wait()
 	close(d.closeDone)
 }
 
@@ -241,7 +249,6 @@ func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any,
 	start := time.Now()
 	result := d.primary.Do(ctx, iArgs...)
 	resp, err := result.Result()
-	d.metrics.observeBackendPool(d.primary)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -268,7 +275,6 @@ func (d *DualWriter) Read(ctx context.Context, cmd string, args [][]byte) (any, 
 	start := time.Now()
 	result := d.primary.Do(ctx, iArgs...)
 	resp, err := result.Result()
-	d.metrics.observeBackendPool(d.primary)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -306,7 +312,6 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 		result = d.primary.Do(ctx, iArgs...)
 	}
 	resp, err := result.Result()
-	d.metrics.observeBackendPool(d.primary)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -335,7 +340,6 @@ func (d *DualWriter) Admin(ctx context.Context, cmd string, args [][]byte) (any,
 	start := time.Now()
 	result := d.primary.Do(ctx, iArgs...)
 	resp, err := result.Result()
-	d.metrics.observeBackendPool(d.primary)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -354,7 +358,6 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	start := time.Now()
 	result := d.primary.Do(ctx, iArgs...)
 	resp, err := result.Result()
-	d.metrics.observeBackendPool(d.primary)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.primary.Name()).Observe(time.Since(start).Seconds())
 
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -383,7 +386,6 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 // predicate isReadTSCompactedError matches the exact substring coming back
 // from gRPC.
 func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []any) {
-	defer d.metrics.observeBackendPool(d.secondary)
 	start := time.Now()
 
 	backoff := compactedRetryInitialBackoff
@@ -431,7 +433,6 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 }
 
 func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) {
-	defer d.metrics.observeBackendPool(d.secondary)
 	start := time.Now()
 
 	backoff := compactedRetryInitialBackoff
@@ -601,6 +602,54 @@ func (d *DualWriter) goShadow(fn func()) {
 // goAsync queues fn with the write class (for txn replay).
 func (d *DualWriter) goAsync(fn func(context.Context)) {
 	d.goWrite(fn)
+}
+
+func (d *DualWriter) startBackendPoolSampler() {
+	backends := backendPoolSampleBackends(d.primary, d.secondary)
+	if len(backends) == 0 {
+		return
+	}
+	d.sampleBackendPools(backends)
+	d.poolStatsWG.Add(1)
+	go func() {
+		defer d.poolStatsWG.Done()
+		ticker := time.NewTicker(backendPoolSampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				d.sampleBackendPools(backends)
+			case <-d.poolStatsStop:
+				return
+			}
+		}
+	}()
+}
+
+func (d *DualWriter) sampleBackendPools(backends []Backend) {
+	for _, backend := range backends {
+		d.metrics.observeBackendPool(backend)
+	}
+}
+
+func backendPoolSampleBackends(backends ...Backend) []Backend {
+	seen := make(map[string]struct{}, len(backends))
+	out := make([]Backend, 0, len(backends))
+	for _, backend := range backends {
+		if backend == nil {
+			continue
+		}
+		if _, ok := backend.(backendPoolStatsProvider); !ok {
+			continue
+		}
+		name := backend.Name()
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, backend)
+	}
+	return out
 }
 
 // goShadowWithSem launches a shadow read without entering the write queues.
