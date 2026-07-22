@@ -636,10 +636,84 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, primary.args)
 }
 
-func TestDualWriter_Blocking_ReplaysMutatingBlockingCommand(t *testing.T) {
+func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
+	for _, tc := range []struct {
+		cmd string
+	}{
+		{cmd: "BZPOPMIN"},
+		{cmd: "BZPOPMAX"},
+	} {
+		t.Run(tc.cmd, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{
+				name:        "primary",
+				returnValue: []any{"queue", "job-1", "12.5"},
+			}
+			secondary := newMockBackend("secondary")
+			secondary.doFunc = makeCmd(int64(1), nil)
+
+			metrics := newTestMetrics()
+			d := NewDualWriter(
+				primary,
+				secondary,
+				ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+				metrics,
+				newTestSentry(),
+				testLogger,
+			)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, [][]byte{[]byte(tc.cmd), []byte("queue"), []byte("5")})
+			assert.NoError(t, err)
+			assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
+			d.Close()
+
+			assert.Equal(t, 1, secondary.CallCount())
+			secondary.mu.Lock()
+			got := append([]any(nil), secondary.calls[0]...)
+			secondary.mu.Unlock()
+			assert.Equal(t, []any{"ZREM", "queue", "job-1"}, got)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+	var attempts atomic.Int32
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		cmd := redis.NewCmd(ctx, args...)
+		if attempts.Add(1) == 1 {
+			cmd.SetVal(int64(0))
+			return cmd
+		}
+		cmd.SetVal(int64(1))
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	d.Close()
+
+	assert.Equal(t, int32(2), attempts.Load())
+	assert.Equal(t, 2, secondary.CallCount())
+}
+
+func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"stream-result"},
 	}
 	secondary := newMockBackend("secondary")
 
@@ -653,16 +727,20 @@ func TestDualWriter_Blocking_ReplaysMutatingBlockingCommand(t *testing.T) {
 		testLogger,
 	)
 
-	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	args := [][]byte{
+		[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("c"),
+		[]byte("BLOCK"), []byte("1000"), []byte("STREAMS"), []byte("jobs"), []byte(">"),
+	}
+	resp, err := d.Blocking(context.Background(), "XREADGROUP", args)
 	assert.NoError(t, err)
-	assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
+	assert.Equal(t, []any{"stream-result"}, resp)
 	d.Close()
 
 	assert.Equal(t, 1, secondary.CallCount())
 	secondary.mu.Lock()
 	got := append([]any(nil), secondary.calls[0]...)
 	secondary.mu.Unlock()
-	assert.Equal(t, []any{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")}, got)
+	assert.Equal(t, bytesArgsToInterfaces(args), got)
 }
 
 func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {

@@ -46,6 +46,11 @@ const (
 	// transient admission failures into backpressure without hiding a sustained
 	// overload.
 	maxServerOverloadedRetries = 8
+	// maxNoEffectReplayRetries bounds deterministic replay retries when the
+	// secondary has not observed the producer write yet. With the shared retry
+	// backoff capped at 100ms this covers normal queue reordering without
+	// allowing an unbounded worker leak if the producer write never lands.
+	maxNoEffectReplayRetries = 256
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
@@ -73,6 +78,8 @@ const (
 // because both layers erase the typed error.
 const readTSCompactedMarker = "read timestamp has been compacted"
 const serverOverloadedMarker = "BUSY server overloaded"
+
+var errSecondaryReplayNoEffect = errors.New("secondary replay produced no effect")
 
 func isReadTSCompactedError(err error) bool {
 	if err == nil {
@@ -321,12 +328,16 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
-	if d.hasSecondaryWrite() && shouldReplayBlockingToSecondary(cmd) {
-		d.goWrite(func(ctx context.Context) {
-			sCtx, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-			d.secondary.Do(sCtx, iArgs...)
-		})
+	if d.hasSecondaryWrite() {
+		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
+			d.goWrite(func(ctx context.Context) { d.writeSecondaryPositiveInt(ctx, replayCmd, replayArgs) })
+		} else if shouldReplayBlockingToSecondary(cmd) {
+			d.goWrite(func(ctx context.Context) {
+				sCtx, cancel := context.WithTimeout(ctx, time.Second)
+				defer cancel()
+				d.secondary.Do(sCtx, iArgs...)
+			})
+		}
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -430,6 +441,66 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 		return
 	}
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+}
+
+func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string, iArgs []any) {
+	start := time.Now()
+
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	var attempt int
+	for ; ; attempt++ {
+		var resp any
+		result := d.secondary.Do(sCtx, iArgs...)
+		resp, sErr = result.Result()
+		if sErr == nil {
+			if n, ok := redisInteger(resp); ok && n > 0 {
+				elapsed := time.Since(start)
+				d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
+				d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
+				return
+			}
+			sErr = errSecondaryReplayNoEffect
+		}
+
+		retryReason, retryLimit := secondaryRetryReasonAndLimit(cmd, sErr)
+		if errors.Is(sErr, errSecondaryReplayNoEffect) {
+			retryReason = "no_effect"
+			retryLimit = maxNoEffectReplayRetries
+		}
+		if retryReason == "" {
+			break
+		}
+		if attempt >= retryLimit {
+			break
+		}
+		d.logger.Debug("retrying secondary write",
+			"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if !waitCompactedRetryBackoff(sCtx, backoff) {
+			break
+		}
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+
+	elapsed := time.Since(start)
+	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
+	d.recordSecondaryWriteFailure(cmd, iArgs, elapsed, attempt+1, false, sErr)
+}
+
+func redisInteger(resp any) (int64, bool) {
+	switch v := resp.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint64:
+		if v > uint64(1<<63-1) {
+			return 0, false
+		}
+		return int64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) {
