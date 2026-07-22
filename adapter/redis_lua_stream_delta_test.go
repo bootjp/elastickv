@@ -202,6 +202,62 @@ return next
 	require.Zero(t, meta.TrimmedSeq)
 }
 
+func TestLuaStreamXTrimMaxLenZeroKeepsEmptyStreamMetadata(t *testing.T) {
+	key := []byte("lua:stream:xtrim-empty")
+	server, base, counting := newLuaStreamDeltaTestServer(t, key)
+	expireAt := time.Now().Add(time.Hour)
+	lastMs := safeUnixMilliToUint64(time.Now().Add(24 * time.Hour).UnixMilli())
+	entry := newRedisStreamEntry(formatStreamID(lastMs, 0), []string{"field", "old"})
+	rawEntry, err := marshalStreamEntry(entry)
+	require.NoError(t, err)
+	require.NoError(t, base.PutAt(context.Background(), store.StreamEntryKey(key, lastMs, 0), rawEntry, 1, 0))
+	rawMeta, err := store.MarshalStreamMeta(store.StreamMeta{
+		Length:   1,
+		LastMs:   lastMs,
+		ExpireAt: redisExpireAtMillis(expireAt),
+	})
+	require.NoError(t, err)
+	require.NoError(t, base.PutAt(context.Background(), store.StreamMetaKey(key), rawMeta, 1, 0))
+	counting.reset()
+
+	trim := &recordingConn{}
+	server.runLuaScript(trim, `return redis.call("XTRIM", KEYS[1], "MAXLEN", 0)`, [][]byte{
+		[]byte("1"), key,
+	})
+	require.Empty(t, trim.err)
+	require.Equal(t, int64(1), trim.int)
+	require.Equal(t, []int{1}, counting.entryScans)
+	require.Zero(t, counting.entryPuts)
+	require.Equal(t, 1, counting.entryDeletes)
+
+	readTS := server.readTS()
+	meta, found, err := server.loadStreamMetaAt(context.Background(), key, readTS)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Zero(t, meta.Length)
+	require.Equal(t, lastMs, meta.LastMs)
+	require.Equal(t, lastMs, meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
+	require.WithinDuration(t, expireAt, *redisTimeFromMillis(meta.ExpireAt), 3*time.Second)
+	typ, err := server.keyTypeAt(context.Background(), key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisTypeStream, typ)
+
+	next := &recordingConn{}
+	server.runLuaScript(next, `return redis.call("XADD", KEYS[1], "*", "field", "new")`, [][]byte{
+		[]byte("1"), key,
+	})
+	require.Empty(t, next.err)
+	require.Greater(t, compareRedisStreamID(string(next.bulk), formatStreamID(lastMs, 0)), 0)
+	meta, found, err = server.loadStreamMetaAt(context.Background(), key, server.readTS())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), meta.Length)
+	require.Equal(t, lastMs, meta.TrimmedMs)
+	require.Zero(t, meta.TrimmedSeq)
+	require.WithinDuration(t, expireAt, *redisTimeFromMillis(meta.ExpireAt), 3*time.Second)
+}
+
 func TestLuaStreamXAddMaxLenUsesTrimCursorForNextHeadScan(t *testing.T) {
 	key := []byte("lua:stream:trim-cursor")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)

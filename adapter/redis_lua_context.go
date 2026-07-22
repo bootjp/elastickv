@@ -3490,21 +3490,7 @@ func (c *luaScriptContext) cmdXTrim(args []string) (luaReply, error) {
 		return luaIntReply(0), nil
 	}
 	removed := st.meta.Length - int64(maxLen)
-	if maxLen == 0 {
-		st.value.Entries = nil
-		st.exists = false
-		c.deleted[string(key)] = true
-		c.everDeleted[string(key)] = true
-		c.clearTTL(key)
-		st.materialized = true
-		st.requiresFullRewrite = true
-		st.baseMeta = store.StreamMeta{}
-		st.meta = store.StreamMeta{}
-		st.baseTrim = 0
-		st.appended = nil
-	} else {
-		removed = trimLuaStreamHead(st, removed)
-	}
+	removed = trimLuaStreamHead(st, removed)
 	st.loaded = true
 	st.dirty = true
 	c.markTouched(key)
