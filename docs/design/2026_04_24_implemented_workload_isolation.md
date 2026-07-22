@@ -376,7 +376,7 @@ one check per accept, not per command.
 
 ### Recommended v1 shape
 
-**Per-peer-IP connection cap, default `N=64`, env-configurable,
+**Per-peer-IP connection cap, default `N=8`, env-configurable,
 enforced at accept.** On reject, accept the TCP connection, write a
 `-ERR max connections per client exceeded` RESP error, then close —
 so the client sees a protocol-level message instead of a bare
