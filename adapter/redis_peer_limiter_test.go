@@ -10,6 +10,15 @@ const (
 	testPeerLimit = 2
 )
 
+func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
+	t.Setenv(redisPerPeerLimitEnv, "")
+	server := NewRedisServer(nil, "", nil, nil, nil, nil)
+
+	require.NotNil(t, server.peerLimiter)
+	require.Equal(t, defaultRedisPerPeerConnectionCap, server.peerLimiter.limit)
+	require.Equal(t, 64, server.peerLimiter.limit)
+}
+
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
 	c1 := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
@@ -95,7 +104,7 @@ func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
 	}{
 		{name: "low cap", limit: 2, wantNormal: 1, wantBlocking: 1},
 		{name: "four cap", limit: 4, wantNormal: 2, wantBlocking: 2},
-		{name: "default cap", limit: 8, wantNormal: 4, wantBlocking: 4},
+		{name: "small cap", limit: 8, wantNormal: 4, wantBlocking: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(tc.limit))

@@ -333,6 +333,34 @@ func TestShardedCoordinator_RenewHLCLeases_SlowGroupDoesNotBlockPeers(t *testing
 	requireRenewalDone(t, done)
 }
 
+func TestShardedCoordinator_RenewHLCLeases_UsesProposalTimeoutBeyondCadence(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	deadlineRemaining := make(chan time.Duration, 1)
+	eng1.proposeCtxHook = func(ctx context.Context) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadlineRemaining <- 0
+			return
+		}
+		deadlineRemaining <- time.Until(deadline)
+	}
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	select {
+	case remaining := <-deadlineRemaining:
+		require.Greater(t, remaining, hlcRenewalInterval,
+			"renewal proposals need a timeout longer than the cadence under load")
+		require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for captured renewal deadline")
+	}
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)

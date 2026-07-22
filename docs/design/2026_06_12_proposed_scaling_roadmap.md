@@ -85,8 +85,8 @@ references anywhere in `kv/`, `distribution/`, or
 `internal/raftengine/etcd/`. Everything is single-region etcd/raft.
 
 HLC is `kv/hlc.go` + `kv/coordinator.go`: physical ceiling is
-Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 3 s`,
-renewed every `hlcRenewalInterval = 1 s` from the **default-group
+Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 30 s`,
+renewed every `hlcRenewalInterval = 2 s` from the **default-group
 leader only** (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced`
 fails closed with `ErrCeilingExpired` once `wall_now >= ceiling`.
 Wall clock is `time.Now().UnixMilli()` — assumes NTP-synced hosts.
@@ -99,9 +99,10 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 Multi-region blockers:
 
 - HLC ceiling is **single-point** — default-group leader proposes
-  every 1 s; cross-region default-group leadership means every
+  every 2 s; cross-region default-group leadership means every
   shard's persistence-grade ts depends on a cross-WAN propose. 1 s
-  WAN RTT + 1 s renewal interval ≈ no margin against the 3 s window.
+  WAN RTT is now less likely to expire the 30 s window immediately,
+  but every renewal still depends on cross-WAN quorum progress.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
 - Cross-shard txns are blocked (`ErrCrossShardTransactionNotSupported`),
@@ -316,10 +317,10 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
   service.** Operationally heavy (needs reliable atomic-clock
   reference per DC); rejected as v1.
 - **Option C — Stretched single ceiling with relaxed window.**
-  Increase `hlcPhysicalWindowMs` to 30 s; renewal still cross-WAN
-  but the failure mode is "slow ts allocation," not "no ts
-  allocation." Useful as a fallback when option A is partially
-  shipped.
+  `hlcPhysicalWindowMs = 30 s` is now the local-resilience baseline.
+  It reduces accidental ceiling expiry under load, but renewal still
+  depends on the default group's quorum and is not a complete
+  cross-region design by itself.
 
 V1 = option A. Carries the existing M2 hotspot-split monotone-merge
 contract over the region boundary.

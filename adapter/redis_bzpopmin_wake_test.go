@@ -1,14 +1,57 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
+
+type bzpopminScanRecord struct {
+	start []byte
+	limit int
+}
+
+type bzpopminRecordingStore struct {
+	store.MVCCStore
+	scans []bzpopminScanRecord
+}
+
+func (s *bzpopminRecordingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.scans = append(s.scans, bzpopminScanRecord{start: bytes.Clone(start), limit: limit})
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func TestRedis_BZPopMinCandidateUsesScoreIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	key := []byte("zset-score-index-pop")
+	readTS := uint64(10)
+	base := store.NewMVCCStore()
+	require.NoError(t, base.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 2}), readTS, 0))
+	require.NoError(t, base.PutAt(ctx, store.ZSetMemberKey(key, []byte("later")), store.MarshalZSetScore(2), readTS, 0))
+	require.NoError(t, base.PutAt(ctx, store.ZSetScoreKey(key, 2, []byte("later")), []byte{}, readTS, 0))
+	require.NoError(t, base.PutAt(ctx, store.ZSetMemberKey(key, []byte("first")), store.MarshalZSetScore(1), readTS, 0))
+	require.NoError(t, base.PutAt(ctx, store.ZSetScoreKey(key, 1, []byte("first")), []byte{}, readTS, 0))
+
+	rec := &bzpopminRecordingStore{MVCCStore: base}
+	server := &RedisServer{store: rec}
+	candidate, err := server.bzpopminCandidateAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.NotNil(t, candidate)
+	require.True(t, candidate.isWide)
+	require.False(t, candidate.isLast)
+	require.Equal(t, "first", candidate.entry.Member)
+	require.InDelta(t, 1.0, candidate.entry.Score, 1e-9)
+	require.Len(t, rec.scans, 1)
+	require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[0].start)
+	require.Equal(t, 2, rec.scans[0].limit)
+}
 
 // TestRedis_BZPopMinWakesOnZAdd verifies the event-driven wake path:
 // an in-process ZADD on the leader's redis adapter must wake a

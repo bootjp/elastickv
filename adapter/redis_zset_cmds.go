@@ -27,6 +27,13 @@ type bzpopminResult struct {
 	entry redisZSetEntry
 }
 
+type bzpopminCandidate struct {
+	entry     redisZSetEntry
+	remaining []redisZSetEntry
+	isWide    bool
+	isLast    bool
+}
+
 const zsetOpsPerEntry = 2
 
 // buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
@@ -1128,44 +1135,115 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(ctx, key, readTS)
+		candidate, err := r.bzpopminCandidateAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		if len(value.Entries) == 0 {
+		if candidate == nil {
 			result = nil
 			return nil
 		}
-		popped := value.Entries[0]
-		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-
-		// Detect wide-column storage.
-		memberPrefix := store.ZSetMemberScanPrefix(key)
-		memberEnd := store.PrefixScanEnd(memberPrefix)
-		probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
-		if probeErr != nil {
-			return cockerrors.WithStack(probeErr)
-		}
-		isWide := len(probeKVs) > 0
-
-		if err := r.persistBZPopMinResult(ctx, key, readTS, popped, remaining, isWide); err != nil {
+		if err := r.persistBZPopMinResult(ctx, key, readTS, candidate); err != nil {
 			return err
 		}
-		result = &bzpopminResult{key: key, entry: popped}
+		result = &bzpopminResult{key: key, entry: candidate.entry}
 		return nil
 	})
 	return result, err
 }
 
-func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, popped redisZSetEntry, remaining []redisZSetEntry, isWide bool) error {
-	if len(remaining) == 0 {
+func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	candidate, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
+	if err != nil || candidate != nil {
+		return candidate, err
+	}
+	candidate, err = r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
+	if err != nil || candidate != nil {
+		return candidate, err
+	}
+	return r.bzpopminLegacyCandidateAt(ctx, key, readTS)
+}
+
+func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	scorePrefix := store.ZSetScoreScanPrefix(key)
+	scoreEnd := store.PrefixScanEnd(scorePrefix)
+	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, 2, readTS) //nolint:mnd // first entry plus last-entry sentinel
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	for _, kv := range scoreKVs {
+		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
+		if !ok {
+			continue
+		}
+		return &bzpopminCandidate{
+			entry:  redisZSetEntry{Member: string(member), Score: score},
+			isWide: true,
+			isLast: len(scoreKVs) == 1,
+		}, nil
+	}
+	return nil, nil
+}
+
+func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberEnd := store.PrefixScanEnd(memberPrefix)
+	memberKVs, err := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	if len(memberKVs) > 0 {
+		value, loadErr := r.loadZSetMembersAt(ctx, key, readTS)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if len(value.Entries) == 0 {
+			return nil, nil
+		}
+		return &bzpopminCandidate{
+			entry:     value.Entries[0],
+			remaining: append([]redisZSetEntry(nil), value.Entries[1:]...),
+			isWide:    true,
+			isLast:    len(value.Entries) == 1,
+		}, nil
+	}
+	return nil, nil
+}
+
+func (r *RedisServer) bzpopminLegacyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
+			return nil, nil
+		}
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(value.Entries) == 0 {
+		return nil, nil
+	}
+	return &bzpopminCandidate{
+		entry:     value.Entries[0],
+		remaining: append([]redisZSetEntry(nil), value.Entries[1:]...),
+		isLast:    len(value.Entries) == 1,
+	}, nil
+}
+
+func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, candidate *bzpopminCandidate) error {
+	if candidate == nil {
+		return nil
+	}
+	if candidate.isLast {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
-	if isWide {
+	if candidate.isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
 		startTS := normalizeStartTS(readTS)
 		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistBZPopMinResult: allocate commitTS")
@@ -1174,8 +1252,8 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
 		elems := []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
-			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
+			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(candidate.entry.Member))},
+			{Op: kv.Del, Key: store.ZSetScoreKey(key, candidate.entry.Score, []byte(candidate.entry.Member))},
 			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
 			redisTxnWideZSetFenceElem(key),
 		}
@@ -1189,7 +1267,7 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		return cockerrors.WithStack(dispatchErr)
 	}
 	// Legacy blob: write back all remaining entries.
-	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
+	payload, err := marshalZSetValue(redisZSetValue{Entries: candidate.remaining})
 	if err != nil {
 		return err
 	}

@@ -14,7 +14,7 @@ Elastickv is an experimental project undertaking the challenge of creating a dis
 - **DynamoDB Compatibility Scope**: `CreateTable`/`DeleteTable`/`DescribeTable`/`ListTables`/`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems` are implemented.
 - **S3 Compatibility Scope**: `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket`, `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, and `ListObjectsV2` (path-style) are implemented. AWS Signature Version 4 authentication with static credentials is supported. The server exposes an S3-compatible HTTP endpoint via `--s3Address`.
 - **Basic Consistency Behaviors**: Write-after-read checks, leader redirection/forwarding paths, and OCC conflict detection for transactional writes are covered by tests.
-- **Hybrid Logical Clock (HLC)**: Transactions are ordered by a 64-bit HLC split into an upper 48-bit physical component (Unix milliseconds) and a lower 16-bit logical counter. The logical half advances in memory with atomic CAS on every `Next()` call — no Raft round-trip per timestamp — so timestamp issuance stays in the nanosecond range. The physical half is bounded by a leader-lease style ceiling: the leader periodically commits a lease entry (`hlcRenewalInterval ≈ 1s`, window `hlcPhysicalWindowMs = 3s`) so that a newly elected leader inherits a safe lower bound and never issues timestamps overlapping the previous leader's window, without blocking per-request on consensus. See `docs/architecture_overview.md` §4 for details.
+- **Hybrid Logical Clock (HLC)**: Transactions are ordered by a 64-bit HLC split into an upper 48-bit physical component (Unix milliseconds) and a lower 16-bit logical counter. The logical half advances in memory with atomic CAS on every `Next()` call — no Raft round-trip per timestamp — so timestamp issuance stays in the nanosecond range. The physical half is bounded by a leader-lease style ceiling: the leader periodically commits a lease entry (`hlcRenewalInterval ≈ 2s`, window `hlcPhysicalWindowMs = 30s`) so that a newly elected leader inherits a safe lower bound and never issues timestamps overlapping the previous leader's window, without blocking per-request on consensus. See `docs/architecture_overview.md` §4 for details.
 
 ## Planned Features
 - **Dynamic Node Scaling**: Automatic node/range scaling based on load is not yet implemented (current sharding operations are configuration/manual driven).
@@ -202,9 +202,10 @@ docker run --rm \
   -listen :6479 \
   -primary redis.internal:6379 \
   -secondary elastickv.internal:6380 \
-  -elastickv-pool-size 4 \
-  -secondary-write-concurrency 2 \
-  -secondary-script-concurrency 1 \
+  -elastickv-pool-size 64 \
+  -secondary-write-concurrency 32 \
+  -secondary-script-concurrency 16 \
+  -secondary-blocking-replay-concurrency 32 \
   -mode dual-write
 ```
 

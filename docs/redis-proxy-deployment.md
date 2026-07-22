@@ -35,11 +35,13 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
-| `-elastickv-pool-size` | `4` | ElasticKV backend connection pool size |
+| `-elastickv-pool-size` | `64` | ElasticKV backend connection pool size; keep this at or below `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` on the cluster |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
 | `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives half of the shared write limit, minimum `1` |
+| `-secondary-blocking-replay-concurrency` | `0` | Mutating blocking-command replay limit. `0` uses the remaining secondary backend pool capacity after normal writes, capped at `64` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-script-queue-size` | `0` | Bounded queue for secondary Lua-script writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
+| `-secondary-blocking-replay-queue-size` | `0` | Bounded queue for mutating blocking-command replays. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
 | `-secondary-timeout` | `5s` | End-to-end secondary write deadline, including queue wait |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
@@ -94,9 +96,10 @@ docker run --rm \
   -primary redis.internal:6379 \
   -primary-password "${REDIS_PASSWORD}" \
   -secondary elastickv.internal:6380 \
-  -elastickv-pool-size 4 \
-  -secondary-write-concurrency 2 \
-  -secondary-script-concurrency 1 \
+  -elastickv-pool-size 64 \
+  -secondary-write-concurrency 32 \
+  -secondary-script-concurrency 16 \
+  -secondary-blocking-replay-concurrency 32 \
   -mode dual-write-shadow \
   -secondary-timeout 5s \
   -shadow-timeout 3s \
@@ -118,9 +121,10 @@ services:
       - -listen=:6479
       - -primary=redis:6379
       - -secondary=elastickv:6380
-      - -elastickv-pool-size=4
-      - -secondary-write-concurrency=2
-      - -secondary-script-concurrency=1
+      - -elastickv-pool-size=64
+      - -secondary-write-concurrency=32
+      - -secondary-script-concurrency=16
+      - -secondary-blocking-replay-concurrency=32
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
@@ -213,7 +217,7 @@ Override backend wiring via env vars before `docker compose up`:
 ```bash
 REDIS_PROXY_PRIMARY=redis.prod.internal:6379 \
 REDIS_PROXY_SECONDARY=elastickv-1.prod.internal:6380,elastickv-2.prod.internal:6380,elastickv-3.prod.internal:6380 \
-REDIS_PROXY_ELASTICKV_POOL_SIZE=4 \
+REDIS_PROXY_ELASTICKV_POOL_SIZE=64 \
 REDIS_PROXY_MODE=dual-write-shadow \
   docker compose -f docker-compose.ha.yml up -d
 ```
@@ -370,7 +374,7 @@ Available at `/metrics` on the address specified by `-metrics`.
 | `proxy_divergences_total` | Counter | Shadow read mismatches (labels: command, kind) |
 | `proxy_migration_gap_total` | Counter | Expected mismatches from incomplete migration (labels: command) |
 | `proxy_async_drops_total` | Counter | Async operations dropped due to backpressure |
-| `proxy_async_drops_by_queue_total{queue,reason}` | Counter | Drops split by `write`/`script`/`shadow` and `queue_full`/`expired` |
+| `proxy_async_drops_by_queue_total{queue,reason}` | Counter | Drops split by `write`/`script`/`blocking`/`shadow` and `queue_full`/`expired` |
 | `proxy_async_queue_depth{queue}` | Gauge | Async operations waiting for worker capacity |
 | `proxy_async_queue_capacity{queue}` | Gauge | Configured queue capacity |
 | `proxy_async_queue_delay_seconds{queue}` | Histogram | Time spent waiting for worker capacity |
@@ -414,11 +418,12 @@ groups:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Redis connection pool size | 128 | Default go-redis pool size for Redis |
-| ElasticKV connection pool size | 4 | Default per-leader pool; keep within the server per-peer connection limit |
+| ElasticKV connection pool size | 64 | Default per-leader pool; keep within `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
 | Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
+| Async blocking replay concurrency cap | 64 | Command-derived maximum for mutating blocking-command replays after normal writes reserve pool capacity |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |
 | PubSub compare window | 2s | Message matching window |
 | PubSub sweep interval | 500ms | Expired message scan interval |
@@ -437,9 +442,9 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ## Troubleshooting
 
 ### Secondary writes are falling behind
-- Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
+- Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` by queue before increasing concurrency. A sustained `blocking` queue means BZPOP/XREAD replay work is lagging behind normal writes.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
-- Increase the ElasticKV pool only together with `ELASTICKV_REDIS_PER_PEER_CONNECTIONS`; keep `-secondary-write-concurrency` at or below the pool size.
+- Increase the ElasticKV pool only together with `ELASTICKV_REDIS_PER_PEER_CONNECTIONS`; keep `-secondary-write-concurrency + -secondary-blocking-replay-concurrency` at or below the pool size.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count
