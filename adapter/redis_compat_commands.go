@@ -17,10 +17,11 @@ const (
 	// Signal (Lua flush, follower-applied entries — both addressed by
 	// the FSM ApplyObserver tracked in
 	// docs/design/2026_04_26_implemented_fsm_apply_observer.md).
-	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
-	// busy-poll, while bounding stale-poll latency to a value clients
-	// already tolerate from network round-trips.
-	redisBlockWaitFallback = 100 * time.Millisecond
+	// Most wakeups should come from the waiter signal path; the fallback is
+	// only a safety net for missed signals, wrong-type detection, and the
+	// BLOCK deadline. Keep it coarse enough that many idle blocking commands
+	// do not turn into a constant stream of full key-type scans.
+	redisBlockWaitFallback = time.Second
 	redisKeywordCount      = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set

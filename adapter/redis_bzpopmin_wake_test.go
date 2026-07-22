@@ -146,7 +146,7 @@ func TestRedis_BZPopMinRejectsInitialWrongType(t *testing.T) {
 // non-existent key and a wrongType encoding (e.g. SET) is written
 // to that key during the BLOCK window, the next fallback-timer
 // wake must run the full check and surface WRONGTYPE within
-// ~redisBlockWaitFallback (100 ms). A pure signal-driven path
+// ~redisBlockWaitFallback. A pure signal-driven path
 // would miss this because SET / HSET / etc. do not fire
 // zsetWaiters.Signal.
 //
@@ -176,7 +176,7 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 
 	// Let the reader enter the wait loop and exhaust its first
 	// (full) iteration on a missing key. Then SET a string at the
-	// same key. The next fallback-timer wake (~100 ms after the
+	// same key. The next fallback-timer wake after the
 	// previous one) must run the full check and surface WRONGTYPE.
 	time.Sleep(50 * time.Millisecond)
 	require.NoError(t, rdbWriter.Set(ctx, "bzpop-mid-wrongtype", "I am a string", 0).Err())
@@ -197,7 +197,7 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 // The fast-path optimisation skips the wrongType slow probe on
 // signal-driven wakes. If `fast` is set directly from
 // waitForBlockedCommandUpdate's return value, sustained ZADD/ZINCRBY
-// signals can keep `fast=true` indefinitely — the 100 ms fallback
+// signals can keep `fast=true` indefinitely — the fallback
 // timer never fires because waiterC is constantly refilled. A
 // mid-block wrongType write on one of the registered keys then goes
 // undetected for the entire BLOCK window.
@@ -263,9 +263,8 @@ func TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad(t *testing.T) {
 	}()
 
 	// Let the reader complete several signal-driven wakes before we
-	// introduce the wrongType. 200 ms is well above the 100 ms
-	// fallback budget; with the fix in place a forced full check
-	// has run during this window.
+	// introduce the wrongType after the reader has settled into the
+	// signal-driven fast path.
 	time.Sleep(200 * time.Millisecond)
 
 	require.NoError(t, rdbWriter.Set(context.Background(), "bzpop-press-cold",
@@ -296,7 +295,7 @@ func TestRedis_BZPopMinTimesOutOnEmptyKey(t *testing.T) {
 	ctx := context.Background()
 
 	// 250 ms BLOCK on a key that never receives a write. The fallback
-	// timer (100 ms) fires twice, then the deadline branch writes
+	// timer is capped by the remaining BLOCK budget, then the deadline branch writes
 	// nil. Total budget: redisDispatchTimeout caps each iter; we
 	// expect ~250 ms total wall time and a redis.Nil reply.
 	zwk, err := rdb.BZPopMin(ctx, 250*time.Millisecond, "zset-empty").Result()

@@ -1247,7 +1247,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	// undetected for the entire BLOCK window. Demoting `fast` back
 	// to false after redisBlockWaitFallback elapses since the last
 	// full check restores the #666 ceiling: WRONGTYPE on any
-	// registered key surfaces within ~one fallback interval (100 ms)
+	// registered key surfaces within ~one fallback interval
 	// regardless of signal rate. See
 	// TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad for the
 	// regression scenario.
