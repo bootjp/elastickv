@@ -389,16 +389,14 @@ func (b *LeaderAwareRedisBackend) currentClient() *redis.Client {
 	return b.clients[b.leader]
 }
 
-// Do forwards a single command to the current leader. An explicit not-leader
-// reply is safe to retry because the rejected command was not applied. A
-// transport failure is ambiguous, so it only triggers discovery for the next
-// command and is returned without replaying the write.
+// Do forwards a single command to the current leader. NOTLEADER refreshes the
+// cached leader for the next command, but the current command is not replayed:
+// leadership-loss errors can be returned after an operation has already applied.
 func (b *LeaderAwareRedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	cmd := b.doOnce(ctx, args...)
 	switch {
-	case isElasticKVNotLeaderError(cmd.Err()) && allowNotLeaderRetry(args):
+	case isElasticKVNotLeaderError(cmd.Err()):
 		b.RefreshLeaderNow(ctx)
-		return b.doOnce(ctx, args...)
 	case isLeaderRefreshTransportError(cmd.Err()):
 		b.TriggerRefresh()
 	}
@@ -419,9 +417,8 @@ func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redi
 func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
 	cmd := b.doWithTimeoutOnce(ctx, timeout, args...)
 	switch {
-	case isElasticKVNotLeaderError(cmd.Err()) && allowNotLeaderRetry(args):
+	case isElasticKVNotLeaderError(cmd.Err()):
 		b.RefreshLeaderNow(ctx)
-		return b.doWithTimeoutOnce(ctx, timeout, args...)
 	case isLeaderRefreshTransportError(cmd.Err()):
 		b.TriggerRefresh()
 	}
@@ -453,8 +450,8 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 	if err != nil {
 		var redisErr redis.Error
 		if errors.As(err, &redisErr) || errors.Is(err, redis.Nil) {
-			for i, result := range results {
-				if isElasticKVNotLeaderError(result.Err()) && allowNotLeaderRetry(pipelineArgsAt(cmds, i)) {
+			for _, result := range results {
+				if isElasticKVNotLeaderError(result.Err()) {
 					b.TriggerRefresh()
 					break
 				}
@@ -467,35 +464,6 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil
-}
-
-func allowNotLeaderRetry(args []any) bool {
-	name, ok := redisCommandName(args)
-	if !ok {
-		return true
-	}
-	return !isRedisScriptCommandName(name)
-}
-
-func pipelineArgsAt(cmds [][]any, i int) []any {
-	if i < 0 || i >= len(cmds) {
-		return nil
-	}
-	return cmds[i]
-}
-
-func redisCommandName(args []any) (string, bool) {
-	if len(args) == 0 {
-		return "", false
-	}
-	switch v := args[0].(type) {
-	case string:
-		return strings.ToUpper(v), true
-	case []byte:
-		return strings.ToUpper(string(v)), true
-	default:
-		return "", false
-	}
 }
 
 func isRedisScriptCommandName(name string) bool {

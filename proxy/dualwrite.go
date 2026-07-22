@@ -407,7 +407,7 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 				_, sErr = result.Result()
 			}
 		}
-		retryReason, retryLimit := secondaryRetryReasonAndLimit(sErr)
+		retryReason, retryLimit := secondaryRetryReasonAndLimit(cmd, sErr)
 		if retryReason == "" {
 			break
 		}
@@ -572,11 +572,11 @@ func nextCompactedRetryBackoff(current time.Duration) time.Duration {
 	return next
 }
 
-func secondaryRetryReasonAndLimit(err error) (string, int) {
+func secondaryRetryReasonAndLimit(cmd string, err error) (string, int) {
 	switch {
 	case isReadTSCompactedError(err):
 		return "compacted_snapshot", maxCompactedRetries
-	case isServerOverloadedError(err):
+	case isServerOverloadedError(err) && !isRedisScriptCommandName(cmd):
 		return "server_overloaded", maxServerOverloadedRetries
 	default:
 		return "", 0

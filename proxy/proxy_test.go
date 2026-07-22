@@ -1166,7 +1166,7 @@ func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T
 		"a persistent compacted error must still be reported as a secondary write error")
 }
 
-func TestDualWriter_writeSecondary_RetriesServerOverloaded(t *testing.T) {
+func TestDualWriter_writeSecondary_RetriesServerOverloadedNonScript(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -1187,14 +1187,14 @@ func TestDualWriter_writeSecondary_RetriesServerOverloaded(t *testing.T) {
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
 
-	d.writeSecondary(context.Background(), "EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+	d.writeSecondary(context.Background(), "SET", []any{[]byte("SET"), []byte("k"), []byte("v")})
 
 	assert.Equal(t, 4, calls, "secondary must retry transient admission failures")
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a retried server-overloaded response must not count as a secondary write error")
 }
 
-func TestDualWriter_writeSecondary_ServerOverloadedRetriesAreBounded(t *testing.T) {
+func TestDualWriter_writeSecondary_ServerOverloadedNonScriptRetriesAreBounded(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -1204,12 +1204,30 @@ func TestDualWriter_writeSecondary_ServerOverloadedRetriesAreBounded(t *testing.
 	metrics := newTestMetrics()
 	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 2 * time.Second}, metrics, newTestSentry(), testLogger)
 
-	d.writeSecondary(context.Background(), "EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+	d.writeSecondary(context.Background(), "SET", []any{[]byte("SET"), []byte("k"), []byte("v")})
 
 	assert.Equal(t, maxServerOverloadedRetries+1, secondary.CallCount(),
 		"secondary must stop after maxServerOverloadedRetries+1 attempts")
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
 		"a persistent server-overloaded response must still be reported as a secondary write error")
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.SecondaryWriteErrorsByReason.WithLabelValues("SET", "busy")), 0.001)
+}
+
+func TestDualWriter_writeSecondary_DoesNotRetryScriptReturnedServerOverloaded(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(nil, testRedisErr(serverOverloadedMarker))
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondary(context.Background(), "EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+
+	assert.Equal(t, 1, secondary.CallCount(), "script-returned BUSY is ambiguous and must not be replayed")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(
 		metrics.SecondaryWriteErrorsByReason.WithLabelValues("EVALSHA", "busy")), 0.001)
 }

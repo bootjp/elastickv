@@ -250,7 +250,7 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
 }
 
-func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
+func TestLeaderAwareRedisBackend_NotLeaderRefreshesWithoutReplay(t *testing.T) {
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 	nodeA.SetLeader(nodeA.addr)
@@ -272,10 +272,40 @@ func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
 	nodeB.SetLeader(nodeB.addr)
 
 	res := backend.Do(context.Background(), "SET", "k", "v")
-	require.NoError(t, res.Err())
+	require.Error(t, res.Err())
+	require.Contains(t, res.Err().Error(), "NOTLEADER")
 	require.Equal(t, nodeB.addr, backend.CurrentLeader())
 	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt must be rejected by the former leader")
-	require.Equal(t, int64(1), nodeB.commands.Load(), "safe retry must reach the refreshed leader")
+	require.Equal(t, int64(0), nodeB.commands.Load(), "ambiguous writes must not be replayed")
+}
+
+func TestLeaderAwareRedisBackend_ScriptNotLeaderRefreshesWithoutReplay(t *testing.T) {
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
+	nodeA.SetLeader(nodeA.addr)
+	nodeB.SetLeader(nodeA.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{nodeA.addr, nodeB.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == nodeA.addr
+	}, 2*time.Second, 10*time.Millisecond)
+
+	nodeA.SetLeader(nodeB.addr)
+	nodeB.SetLeader(nodeB.addr)
+
+	res := backend.Do(context.Background(), "EVALSHA", "deadbeef", "0")
+	require.Error(t, res.Err())
+	require.Contains(t, res.Err().Error(), "NOTLEADER")
+	require.Equal(t, nodeB.addr, backend.CurrentLeader())
+	require.Equal(t, int64(1), nodeA.commands.Load(), "script reaches the stale leader once")
+	require.Equal(t, int64(0), nodeB.commands.Load(), "script must not be replayed after refresh")
 }
 
 func TestLeaderAwareRedisBackend_DoesNotRetryScriptNotLeaderRedisError(t *testing.T) {
