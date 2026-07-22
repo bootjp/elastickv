@@ -185,6 +185,70 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 	require.Equal(t, first.Payload.Key, second.Payload.Key)
 }
 
+func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-retry-with-implicit-created-at")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 17, 10, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	opts := PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	}
+
+	first, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	time.Sleep(time.Millisecond)
+	second, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	require.Equal(t, first.ManifestKey, second.ManifestKey)
+	require.Equal(t, first.ManifestSHA256, second.ManifestSHA256)
+	require.Equal(t, first.CreatedAt, second.CreatedAt)
+}
+
+func TestPublishRejectsGroupZeroWithoutSourceClusterBeforePayload(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-invalid-group-zero")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 18, 11, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	_, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:   store,
+		DataDir: sourceDataDir,
+		Prefix:  "cluster-a",
+		GroupID: 0,
+	})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+
+	payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
+	require.NoError(t, err)
+	_, ok, err := store.HeadObject(ctx, payloadKey)
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestPublishUsesDataDirLocalSpoolByDefault(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-spooled-near-data-dir")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 19, 12, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	_, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	})
+	require.NoError(t, err)
+	require.DirExists(t, filepath.Join(filepath.Dir(sourceDataDir), ".snapshot-offload-spool"))
+}
+
 func TestLoadManifestRejectsStaleSelfHash(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -317,7 +381,7 @@ func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T)
 	require.ErrorIs(t, err, etcdraftengine.ErrExternalSnapshotRestoreExists)
 }
 
-func TestPrepareRestoreDownloadDirCreatesParentAndCleansStaleDirs(t *testing.T) {
+func TestPrepareRestoreDownloadDirCreatesParentAndCleansOnlyStaleDirs(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "missing-parent", "restored")
 
@@ -327,11 +391,18 @@ func TestPrepareRestoreDownloadDirCreatesParentAndCleansStaleDirs(t *testing.T) 
 	require.Contains(t, downloadDir, filepath.Dir(dataDir))
 	require.NoError(t, os.RemoveAll(downloadDir))
 
-	staleDir := filepath.Join(filepath.Dir(dataDir), ".snapshot-offload-restore-stale")
+	parent := filepath.Dir(dataDir)
+	activeDir := filepath.Join(parent, ".snapshot-offload-restore-active")
+	require.NoError(t, os.MkdirAll(activeDir, 0o755))
+	staleDir := filepath.Join(parent, ".snapshot-offload-restore-stale")
 	require.NoError(t, os.MkdirAll(staleDir, 0o755))
+	oldTime := time.Now().Add(-restoreTempDirStaleAfter - time.Hour)
+	require.NoError(t, os.Chtimes(staleDir, oldTime, oldTime))
 	downloadDir, err = prepareRestoreDownloadDir(dataDir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, os.RemoveAll(downloadDir)) }()
+	require.DirExists(t, activeDir)
+	require.NoError(t, os.RemoveAll(activeDir))
 	_, err = os.Stat(staleDir)
 	require.True(t, os.IsNotExist(err))
 }

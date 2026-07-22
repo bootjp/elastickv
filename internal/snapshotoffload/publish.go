@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ type PublishOptions struct {
 	SourceCluster string
 	BinaryVersion string
 	CreatedAt     time.Time
+	SpoolDir      string
 }
 
 func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
@@ -35,7 +38,7 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	defer func() { _ = export.Close() }()
 
 	metadata := export.Metadata()
-	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export)
+	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export, publishSpoolDir(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +60,10 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err != nil {
 		return nil, err
 	}
-	if err := putManifest(ctx, opts.Store, manifest); err != nil {
+	if err := validateManifest(*manifest); err != nil {
+		return nil, err
+	}
+	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero()); err != nil {
 		return nil, err
 	}
 	return manifest, nil
@@ -107,16 +113,18 @@ func buildManifest(
 	}, nil
 }
 
-func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest) error {
+func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reuseExistingCreatedAt bool) error {
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
 	}
 	objectSHA := hexSHA256Bytes(data)
-	if exists, err := verifyExistingStoreObject(ctx, store, manifest.ManifestKey, int64(len(data)), objectSHA); err != nil {
-		return errors.Wrap(err, "verify existing snapshot manifest")
+	if exists, err := verifyExistingManifest(ctx, store, manifest, int64(len(data)), objectSHA, reuseExistingCreatedAt); err != nil {
+		return err
 	} else if exists {
-		manifest.ManifestSHA256 = manifestSHA
+		if manifest.ManifestSHA256 == "" {
+			manifest.ManifestSHA256 = manifestSHA
+		}
 		return nil
 	}
 	info, err := store.PutObject(ctx, manifest.ManifestKey, bytes.NewReader(data), PutOptions{
@@ -134,19 +142,85 @@ func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest) err
 	return nil
 }
 
+func verifyExistingManifest(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	size int64,
+	sha string,
+	reuseExistingCreatedAt bool,
+) (bool, error) {
+	info, ok, err := store.HeadObject(ctx, manifest.ManifestKey)
+	if err != nil {
+		return false, errors.Wrap(err, "head existing snapshot manifest")
+	}
+	if !ok {
+		return false, nil
+	}
+	if matches, err := existingStoreObjectMatches(ctx, store, manifest.ManifestKey, info, size, sha); err != nil {
+		return true, errors.Wrap(err, "verify existing snapshot manifest")
+	} else if matches {
+		return true, nil
+	}
+	if !reuseExistingCreatedAt {
+		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
+	}
+	existing, err := LoadManifest(ctx, store, manifest.ManifestKey)
+	if err != nil {
+		return true, errors.Wrap(err, "load existing snapshot manifest")
+	}
+	if !sameManifestExceptCreation(existing, *manifest) {
+		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
+	}
+	*manifest = existing
+	return true, nil
+}
+
+func existingStoreObjectMatches(ctx context.Context, store ObjectStore, key string, info ObjectInfo, size int64, sha string) (bool, error) {
+	if info.Size != size {
+		return false, nil
+	}
+	if info.SHA256 != "" {
+		return info.SHA256 == sha, nil
+	}
+	gotSize, gotSHA, err := hashExistingStoreObject(ctx, store, key)
+	if err != nil {
+		return false, err
+	}
+	return gotSize == size && gotSHA == sha, nil
+}
+
+func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {
+	candidate.CreatedAt = existing.CreatedAt
+	candidate.ManifestSHA256 = existing.ManifestSHA256
+	return reflect.DeepEqual(existing, candidate)
+}
+
 func validatePublishOptions(opts PublishOptions) error {
 	switch {
 	case opts.Store == nil:
 		return errors.Wrap(ErrInvalidOptions, "object store is required")
 	case stringsTrim(opts.DataDir) == "":
 		return errors.Wrap(ErrInvalidOptions, "data dir is required")
+	case opts.GroupID == 0 && stringsTrim(opts.SourceCluster) == "":
+		return errors.Wrap(ErrInvalidOptions, "source cluster is required for group 0 manifests")
 	default:
 		return nil
 	}
 }
 
-func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotExport) (*os.File, string, int64, error) {
-	tmp, err := os.CreateTemp("", "elastickv-snapshot-offload-*.fsm")
+func publishSpoolDir(opts PublishOptions) string {
+	if stringsTrim(opts.SpoolDir) != "" {
+		return filepath.Clean(opts.SpoolDir)
+	}
+	return filepath.Join(filepath.Dir(filepath.Clean(opts.DataDir)), ".snapshot-offload-spool")
+}
+
+func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotExport, spoolDir string) (*os.File, string, int64, error) {
+	if err := os.MkdirAll(spoolDir, localStoreDirPerm); err != nil {
+		return nil, "", 0, errors.WithStack(err)
+	}
+	tmp, err := os.CreateTemp(spoolDir, "elastickv-snapshot-offload-*.fsm")
 	if err != nil {
 		return nil, "", 0, errors.WithStack(err)
 	}

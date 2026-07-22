@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/cockroachdb/errors"
@@ -22,9 +23,10 @@ type RestoreOptions struct {
 }
 
 const (
-	maxManifestBytes      = 1 << 20
-	restoreTempDirMode    = 0o755
-	restoreTempDirPattern = ".snapshot-offload-restore-*"
+	maxManifestBytes         = 1 << 20
+	restoreTempDirMode       = 0o755
+	restoreTempDirPattern    = ".snapshot-offload-restore-*"
+	restoreTempDirStaleAfter = 7 * 24 * time.Hour
 )
 
 func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest, error) {
@@ -129,6 +131,7 @@ func cleanupRestoreDownloadDirs(parent string) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	staleBefore := time.Now().Add(-restoreTempDirStaleAfter)
 	for _, match := range matches {
 		info, err := os.Lstat(match)
 		if err != nil {
@@ -138,6 +141,9 @@ func cleanupRestoreDownloadDirs(parent string) error {
 			return errors.WithStack(err)
 		}
 		if !info.IsDir() {
+			continue
+		}
+		if info.ModTime().After(staleBefore) {
 			continue
 		}
 		if err := os.RemoveAll(match); err != nil {
