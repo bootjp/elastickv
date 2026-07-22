@@ -54,10 +54,10 @@ const (
 	// Blocking ZPOP replays trail the producer write path and must not occupy
 	// their dedicated workers for the full secondary timeout when the producer
 	// write is delayed or dropped. A short initial delay lets the common
-	// producer-before-consumer ordering settle; a small no-effect cap keeps
+	// producer-before-consumer ordering settle; a bounded no-effect window keeps
 	// BZPOP load from turning into a long retry backlog.
-	blockingReplayInitialDelay       = 250 * time.Millisecond
-	maxBlockingReplayNoEffectRetries = 8
+	blockingReplayInitialDelay        = 250 * time.Millisecond
+	blockingReplayNoEffectRetryWindow = 2 * time.Second
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
@@ -364,9 +364,9 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
 			d.goBlockingReplay(func(ctx context.Context) {
 				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
-					initialDelay:       blockingReplayInitialDelay,
-					noEffectRetryLimit: maxBlockingReplayNoEffectRetries,
-					deadlineAsMiss:     true,
+					initialDelay:        blockingReplayInitialDelay,
+					noEffectRetryWindow: blockingReplayNoEffectRetryWindow,
+					deadlineAsMiss:      true,
 				})
 			})
 		} else if shouldReplayBlockingToSecondary(cmd) {
@@ -484,9 +484,9 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 }
 
 type positiveIntReplayOptions struct {
-	initialDelay       time.Duration
-	noEffectRetryLimit int
-	deadlineAsMiss     bool
+	initialDelay        time.Duration
+	noEffectRetryWindow time.Duration
+	deadlineAsMiss      bool
 }
 
 func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, cmd string, iArgs []any, opts positiveIntReplayOptions) {
@@ -494,6 +494,7 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 	if !d.waitPositiveIntReplayInitialDelay(sCtx, cmd, start, opts.initialDelay) {
 		return
 	}
+	noEffectRetryLimit := noEffectReplayRetryLimit(sCtx, opts.noEffectRetryWindow)
 
 	backoff := compactedRetryInitialBackoff
 	var sErr error
@@ -511,7 +512,7 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 			sErr = err
 		}
 
-		retryReason, retryLimit := secondaryPositiveIntRetryReasonAndLimit(cmd, sErr, opts.noEffectRetryLimit)
+		retryReason, retryLimit := secondaryPositiveIntRetryReasonAndLimit(cmd, sErr, noEffectRetryLimit)
 		if retryReason == "" {
 			break
 		}
@@ -538,6 +539,7 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 }
 
 func (d *DualWriter) waitPositiveIntReplayInitialDelay(ctx context.Context, cmd string, start time.Time, delay time.Duration) bool {
+	delay = positiveIntReplayInitialDelay(ctx, delay)
 	if delay <= 0 {
 		return true
 	}
@@ -548,6 +550,21 @@ func (d *DualWriter) waitPositiveIntReplayInitialDelay(ctx context.Context, cmd 
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "miss").Inc()
 	return false
+}
+
+func positiveIntReplayInitialDelay(ctx context.Context, requested time.Duration) time.Duration {
+	if requested <= 0 {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return requested
+	}
+	remaining := time.Until(deadline)
+	if remaining <= requested+compactedRetryInitialBackoff {
+		return 0
+	}
+	return requested
 }
 
 func positiveIntReplayResult(resp any, err error) (bool, error) {
@@ -568,6 +585,38 @@ func secondaryPositiveIntRetryReasonAndLimit(cmd string, err error, noEffectRetr
 		return "no_effect", noEffectRetryLimit
 	}
 	return secondaryRetryReasonAndLimit(cmd, err)
+}
+
+func noEffectReplayRetryLimit(ctx context.Context, maxWindow time.Duration) int {
+	window := positiveIntReplayRetryWindow(ctx, maxWindow)
+	if window <= 0 {
+		return 0
+	}
+	limit := 0
+	for spent, backoff := time.Duration(0), compactedRetryInitialBackoff; spent+backoff <= window; {
+		limit++
+		spent += backoff
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+	return limit
+}
+
+func positiveIntReplayRetryWindow(ctx context.Context, maxWindow time.Duration) time.Duration {
+	if maxWindow <= 0 {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return maxWindow
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < maxWindow {
+		return remaining
+	}
+	return maxWindow
 }
 
 func positiveIntReplayMiss(ctx context.Context, opts positiveIntReplayOptions, err error) bool {

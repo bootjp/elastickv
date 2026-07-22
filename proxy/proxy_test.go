@@ -744,7 +744,39 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 	assert.NoError(t, err)
 	d.Close()
 
-	assert.Equal(t, maxBlockingReplayNoEffectRetries+1, secondary.CallCount())
+	assert.Greater(t, secondary.CallCount(), 9)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
+}
+
+func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(int64(0), nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   30 * time.Millisecond,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	d.Close()
+
+	assert.GreaterOrEqual(t, secondary.CallCount(), 1)
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(
 		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
