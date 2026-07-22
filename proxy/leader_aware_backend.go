@@ -396,7 +396,7 @@ func (b *LeaderAwareRedisBackend) currentClient() *redis.Client {
 func (b *LeaderAwareRedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	cmd := b.doOnce(ctx, args...)
 	switch {
-	case isElasticKVNotLeaderError(cmd.Err()):
+	case isElasticKVNotLeaderError(cmd.Err()) && allowNotLeaderRetry(args):
 		b.RefreshLeaderNow(ctx)
 		return b.doOnce(ctx, args...)
 	case isLeaderRefreshTransportError(cmd.Err()):
@@ -419,7 +419,7 @@ func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redi
 func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
 	cmd := b.doWithTimeoutOnce(ctx, timeout, args...)
 	switch {
-	case isElasticKVNotLeaderError(cmd.Err()):
+	case isElasticKVNotLeaderError(cmd.Err()) && allowNotLeaderRetry(args):
 		b.RefreshLeaderNow(ctx)
 		return b.doWithTimeoutOnce(ctx, timeout, args...)
 	case isLeaderRefreshTransportError(cmd.Err()):
@@ -453,8 +453,8 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 	if err != nil {
 		var redisErr redis.Error
 		if errors.As(err, &redisErr) || errors.Is(err, redis.Nil) {
-			for _, result := range results {
-				if isElasticKVNotLeaderError(result.Err()) {
+			for i, result := range results {
+				if isElasticKVNotLeaderError(result.Err()) && allowNotLeaderRetry(pipelineArgsAt(cmds, i)) {
 					b.TriggerRefresh()
 					break
 				}
@@ -467,6 +467,44 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil
+}
+
+func allowNotLeaderRetry(args []any) bool {
+	name, ok := redisCommandName(args)
+	if !ok {
+		return true
+	}
+	return !isRedisScriptCommandName(name)
+}
+
+func pipelineArgsAt(cmds [][]any, i int) []any {
+	if i < 0 || i >= len(cmds) {
+		return nil
+	}
+	return cmds[i]
+}
+
+func redisCommandName(args []any) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	switch v := args[0].(type) {
+	case string:
+		return strings.ToUpper(v), true
+	case []byte:
+		return strings.ToUpper(string(v)), true
+	default:
+		return "", false
+	}
+}
+
+func isRedisScriptCommandName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO", "FCALL", "FCALL_RO", "FUNCTION", "SCRIPT":
+		return true
+	default:
+		return false
+	}
 }
 
 func isElasticKVNotLeaderError(err error) bool {

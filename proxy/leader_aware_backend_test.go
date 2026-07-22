@@ -65,6 +65,7 @@ type fakeElasticKVNode struct {
 	leaderAddr atomic.Pointer[string]
 	commands   atomic.Int64
 	infoCalls  atomic.Int64
+	scriptErr  atomic.Bool
 	infoGateMu sync.RWMutex
 	infoGate   <-chan struct{}
 }
@@ -90,6 +91,10 @@ func (n *fakeElasticKVNode) Leader() string {
 		return *p
 	}
 	return ""
+}
+
+func (n *fakeElasticKVNode) SetScriptNotLeaderError(enabled bool) {
+	n.scriptErr.Store(enabled)
 }
 
 func (n *fakeElasticKVNode) SetInfoGate(gate <-chan struct{}) {
@@ -145,14 +150,22 @@ func (n *fakeElasticKVNode) handleConn(conn net.Conn) {
 			)
 			_, _ = fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(body), body)
 		default:
-			n.commands.Add(1)
-			if leader := n.Leader(); leader != "" && leader != n.addr {
-				_, _ = conn.Write([]byte("-NOTLEADER etcd raft engine is not leader\r\n"))
-				continue
-			}
-			_, _ = conn.Write([]byte("+OK\r\n"))
+			n.writeCommandResponse(conn, cmd)
 		}
 	}
+}
+
+func (n *fakeElasticKVNode) writeCommandResponse(conn net.Conn, cmd string) {
+	n.commands.Add(1)
+	if leader := n.Leader(); leader != "" && leader != n.addr {
+		_, _ = conn.Write([]byte("-NOTLEADER etcd raft engine is not leader\r\n"))
+		return
+	}
+	if n.scriptErr.Load() && isRedisScriptCommandName(cmd) {
+		_, _ = conn.Write([]byte("-NOTLEADER user script\r\n"))
+		return
+	}
+	_, _ = conn.Write([]byte("+OK\r\n"))
 }
 
 // readRESPArray reads a single RESP array of bulk strings from rd.
@@ -263,6 +276,30 @@ func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
 	require.Equal(t, nodeB.addr, backend.CurrentLeader())
 	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt must be rejected by the former leader")
 	require.Equal(t, int64(1), nodeB.commands.Load(), "safe retry must reach the refreshed leader")
+}
+
+func TestLeaderAwareRedisBackend_DoesNotRetryScriptNotLeaderRedisError(t *testing.T) {
+	node := newFakeElasticKVNode(t)
+	node.SetLeader(node.addr)
+	node.SetScriptNotLeaderError(true)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{node.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == node.addr
+	}, 2*time.Second, 10*time.Millisecond)
+
+	res := backend.Do(context.Background(), "EVAL", "redis.call('SET', KEYS[1], ARGV[1]); return {err='NOTLEADER user script'}", "1", "k", "v")
+
+	require.Error(t, res.Err())
+	assert.Contains(t, res.Err().Error(), "NOTLEADER user script")
+	assert.Equal(t, int64(1), node.commands.Load(), "script errors must not be retried because the script may already have mutated state")
 }
 
 func TestLeaderAwareRedisBackend_CoalescesConcurrentRefreshes(t *testing.T) {

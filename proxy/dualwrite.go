@@ -430,6 +430,73 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
 }
 
+func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) {
+	defer d.metrics.observeBackendPool(d.secondary)
+	start := time.Now()
+
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	var attempt int
+	for ; ; attempt++ {
+		results, pErr := d.secondary.Pipeline(sCtx, cmds)
+		sErr = secondaryPipelineError(results, pErr)
+		retryReason, retryLimit := secondaryPipelineRetryReasonAndLimit(sErr)
+		if retryReason == "" {
+			break
+		}
+		if attempt >= retryLimit {
+			break
+		}
+		d.logger.Debug("retrying secondary txn replay",
+			"reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if !waitCompactedRetryBackoff(sCtx, backoff) {
+			break
+		}
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+
+	elapsed := time.Since(start)
+	d.metrics.CommandDuration.WithLabelValues(cmdExec, d.secondary.Name()).Observe(elapsed.Seconds())
+
+	if sErr != nil && !errors.Is(sErr, redis.Nil) {
+		d.recordSecondaryWriteFailure(cmdExec, pipelineCommandNames(cmds), elapsed, attempt+1, false, sErr)
+		return
+	}
+	d.metrics.CommandTotal.WithLabelValues(cmdExec, d.secondary.Name(), "ok").Inc()
+}
+
+func secondaryPipelineError(results []*redis.Cmd, err error) error {
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		return errors.New("empty transaction response")
+	}
+	err = results[len(results)-1].Err()
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("transaction exec: %w", err)
+}
+
+func secondaryPipelineRetryReasonAndLimit(err error) (string, int) {
+	if isServerOverloadedError(err) {
+		return "server_overloaded", maxServerOverloadedRetries
+	}
+	return "", 0
+}
+
+func pipelineCommandNames(cmds [][]any) []any {
+	names := make([]any, 0, len(cmds))
+	for _, args := range cmds {
+		if len(args) == 0 {
+			continue
+		}
+		names = append(names, args[0])
+	}
+	return names
+}
+
 // recordSecondaryWriteFailure updates metrics, reports to Sentry, and emits a
 // structured warning with enough context to diagnose EVALSHA timeouts.
 func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapsed time.Duration, attempts int, usedNOSCRIPTFallback bool, sErr error) {

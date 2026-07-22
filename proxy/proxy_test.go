@@ -24,10 +24,11 @@ var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 // --- Mock Backend ---
 
 type mockBackend struct {
-	name   string
-	doFunc func(ctx context.Context, args ...any) *redis.Cmd
-	mu     sync.Mutex
-	calls  [][]any
+	name         string
+	doFunc       func(ctx context.Context, args ...any) *redis.Cmd
+	pipelineFunc func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error)
+	mu           sync.Mutex
+	calls        [][]any
 }
 
 func newMockBackend(name string) *mockBackend {
@@ -47,6 +48,9 @@ func (b *mockBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 }
 
 func (b *mockBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	if b.pipelineFunc != nil {
+		return b.pipelineFunc(ctx, cmds)
+	}
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {
 		results[i] = b.Do(ctx, args...)
@@ -1210,6 +1214,78 @@ func TestDualWriter_writeSecondary_ServerOverloadedRetriesAreBounded(t *testing.
 		metrics.SecondaryWriteErrorsByReason.WithLabelValues("EVALSHA", "busy")), 0.001)
 }
 
+func TestDualWriter_writeSecondaryPipeline_RetriesServerOverloadedExec(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	overloadedErr := testRedisErr(serverOverloadedMarker)
+	secondary := newMockBackend("secondary")
+	var calls int
+	secondary.pipelineFunc = func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+		calls++
+		var execErr error
+		if calls < 4 {
+			execErr = overloadedErr
+		}
+		return pipelineResults(ctx, cmds, execErr), nil
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondaryPipeline(context.Background(), [][]any{{"MULTI"}, {"EVALSHA", "deadbeef", "0"}, {"EXEC"}})
+
+	assert.Equal(t, 4, calls, "secondary transaction replay must retry transient admission failures")
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a retried server-overloaded EXEC must not count as a secondary write error")
+}
+
+func TestDualWriter_writeSecondaryPipeline_ServerOverloadedRetriesAreBounded(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	overloadedErr := testRedisErr(serverOverloadedMarker)
+	secondary := newMockBackend("secondary")
+	var calls int
+	secondary.pipelineFunc = func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+		calls++
+		return pipelineResults(ctx, cmds, overloadedErr), nil
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: 2 * time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondaryPipeline(context.Background(), [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}})
+
+	assert.Equal(t, maxServerOverloadedRetries+1, calls,
+		"secondary transaction replay must stop after maxServerOverloadedRetries+1 attempts")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001,
+		"a persistent server-overloaded EXEC must still be reported as a secondary write error")
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.SecondaryWriteErrorsByReason.WithLabelValues("EXEC", "busy")), 0.001)
+}
+
+func TestDualWriter_writeSecondaryPipeline_DoesNotRetryCompactedExec(t *testing.T) {
+	primary := newMockBackend("primary")
+	primary.doFunc = makeCmd("OK", nil)
+
+	compactedErr := testRedisErr("rpc error: code = FailedPrecondition desc = read timestamp has been compacted")
+	secondary := newMockBackend("secondary")
+	var calls int
+	secondary.pipelineFunc = func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+		calls++
+		return pipelineResults(ctx, cmds, compactedErr), nil
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(primary, secondary, ProxyConfig{Mode: ModeDualWrite, SecondaryTimeout: time.Second}, metrics, newTestSentry(), testLogger)
+
+	d.writeSecondaryPipeline(context.Background(), [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}})
+
+	assert.Equal(t, 1, calls, "transaction replay must not retry errors that may occur after partial execution")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
+}
+
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {
 	// After the EVAL fallback resolves a NOSCRIPT, a compacted-retry must
 	// re-send the resolved EVAL form directly — never the known-missing
@@ -1327,6 +1403,20 @@ type testRedisErr string
 
 func (e testRedisErr) Error() string { return string(e) }
 func (e testRedisErr) RedisError()   {}
+
+func pipelineResults(ctx context.Context, cmds [][]any, execErr error) []*redis.Cmd {
+	results := make([]*redis.Cmd, len(cmds))
+	for i, args := range cmds {
+		cmd := redis.NewCmd(ctx, args...)
+		if i == len(cmds)-1 && execErr != nil {
+			cmd.SetErr(execErr)
+		} else {
+			cmd.SetVal("OK")
+		}
+		results[i] = cmd
+	}
+	return results
+}
 
 type mockRespWriter struct {
 	writes []any

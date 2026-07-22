@@ -471,12 +471,7 @@ func (s *pubsubSession) execTxn() {
 
 	if s.proxy.dual.hasSecondaryWrite() {
 		s.proxy.dual.goAsync(func(ctx context.Context) {
-			_, pErr := s.proxy.dual.Secondary().Pipeline(ctx, cmds)
-			s.proxy.metrics.observeBackendPool(s.proxy.dual.Secondary())
-			if pErr != nil {
-				s.proxy.logger.Warn("secondary txn replay failed", "err", pErr)
-				s.proxy.metrics.SecondaryWriteErrors.Inc()
-			}
+			s.proxy.dual.writeSecondaryPipeline(ctx, cmds)
 		})
 	}
 }
