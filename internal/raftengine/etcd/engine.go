@@ -3365,7 +3365,9 @@ func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
 	if index == 0 {
 		return
 	}
-	e.snapshotMu.Lock()
+	if !e.snapshotMu.TryLock() {
+		return
+	}
 	defer e.snapshotMu.Unlock()
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
 }
