@@ -3773,8 +3773,8 @@ func (c *luaScriptContext) listCommitPlan(ctx context.Context, key string, commi
 		elems, err := c.listCommitElems(ctx, key, commitTS)
 		return luaCommitPlan{elems: elems}, err
 	}
-	elems, err := c.listDeltaCommitElems(key, st, commitTS)
-	return luaCommitPlan{preserveExisting: true, elems: elems}, err
+	elems, err := c.listDeltaCommitElems(ctx, key, st, commitTS)
+	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: luaListMetaRewritten(elems, []byte(key)), elems: elems}, err
 }
 
 func (c *luaScriptContext) listCommitElems(ctx context.Context, key string, _ uint64) ([]*kv.Elem[kv.OP], error) {
@@ -3812,7 +3812,7 @@ func (c *luaScriptContext) listCommitElems(ctx context.Context, key string, _ ui
 	return elems, nil
 }
 
-func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+func (c *luaScriptContext) listDeltaCommitElems(ctx context.Context, key string, st *luaListState, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
 	if !st.exists || st.currentLen() == 0 {
 		return nil, nil
 	}
@@ -3829,34 +3829,110 @@ func (c *luaScriptContext) listDeltaCommitElems(key string, st *luaListState, co
 
 	// Emit Delta keys for any appended values and trims instead of writing base meta.
 	// Trims are counted separately as negative deltas.
-	var seqInTxn uint32
+	keyBytes := []byte(key)
+	elems, err = c.appendListDeltaMetaElems(ctx, elems, keyBytes, luaListMetaDeltas(st), commitTS)
+	if err != nil {
+		return nil, err
+	}
+	if len(elems) != 0 {
+		elems = append(elems, redisTxnWideListFenceElem(keyBytes))
+	}
+	return elems, nil
+}
+
+func luaListMetaDeltas(st *luaListState) []store.ListMetaDelta {
+	deltas := make([]store.ListMetaDelta, 0, redisPairWidth)
 	if len(st.rightValues) > 0 || st.rightTrim > 0 {
-		rightDelta := store.MarshalListMetaDelta(store.ListMetaDelta{
+		deltas = append(deltas, store.ListMetaDelta{
 			HeadDelta: 0,
 			LenDelta:  int64(len(st.rightValues)) - st.rightTrim,
 		})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.ListMetaDeltaKey([]byte(key), commitTS, seqInTxn),
-			Value: rightDelta,
-		})
-		seqInTxn++
 	}
 	if len(st.leftValues) > 0 || st.leftTrim > 0 {
-		leftDelta := store.MarshalListMetaDelta(store.ListMetaDelta{
+		deltas = append(deltas, store.ListMetaDelta{
 			HeadDelta: -int64(len(st.leftValues)) + st.leftTrim,
 			LenDelta:  int64(len(st.leftValues)) - st.leftTrim,
 		})
+	}
+	return deltas
+}
+
+func (c *luaScriptContext) appendListDeltaMetaElems(
+	ctx context.Context, elems []*kv.Elem[kv.OP], key []byte, deltas []store.ListMetaDelta, commitTS uint64,
+) ([]*kv.Elem[kv.OP], error) {
+	compactElems, compacted, err := c.listInlineMetaCompactionElems(ctx, key, deltas)
+	if err != nil {
+		return nil, err
+	}
+	if compacted {
+		elems = append(elems, compactElems...)
+		return elems, nil
+	}
+	for seqInTxn, delta := range deltas {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
-			Key:   store.ListMetaDeltaKey([]byte(key), commitTS, seqInTxn),
-			Value: leftDelta,
+			Key:   store.ListMetaDeltaKey(key, commitTS, uint32(seqInTxn)), //nolint:gosec // len(deltas) is bounded by redisPairWidth.
+			Value: store.MarshalListMetaDelta(delta),
 		})
 	}
-	if len(elems) != 0 {
-		elems = append(elems, redisTxnWideListFenceElem([]byte(key)))
-	}
 	return elems, nil
+}
+
+func (c *luaScriptContext) listInlineMetaCompactionElems(ctx context.Context, key []byte, deltas []store.ListMetaDelta) ([]*kv.Elem[kv.OP], bool, error) {
+	if len(deltas) == 0 {
+		return nil, false, nil
+	}
+	var additional store.ListMetaDelta
+	for _, delta := range deltas {
+		additional.HeadDelta += delta.HeadDelta
+		additional.LenDelta += delta.LenDelta
+	}
+	elems, compacted, err := c.server.listInlineMetaCompactionElems(ctx, key, c.startTS, additional, len(deltas))
+	if err != nil || !compacted {
+		return elems, compacted, err
+	}
+	return c.listMetaElemsWithFinalTTL(ctx, key, elems)
+}
+
+func (c *luaScriptContext) listMetaElemsWithFinalTTL(ctx context.Context, key []byte, elems []*kv.Elem[kv.OP]) ([]*kv.Elem[kv.OP], bool, error) {
+	ttl, err := c.finalTTL(ctx, key)
+	if err != nil {
+		return nil, false, err
+	}
+	expireAt := ttlMillis(ttl)
+	metaKey := store.ListMetaKey(key)
+	out := make([]*kv.Elem[kv.OP], 0, len(elems))
+	for _, elem := range elems {
+		if elem.Op == kv.Put && string(elem.Key) == string(metaKey) {
+			meta, err := store.UnmarshalListMeta(elem.Value)
+			if err != nil {
+				return nil, false, errors.WithStack(err)
+			}
+			meta.ExpireAt = expireAt
+			metaBytes, err := store.MarshalListMeta(meta)
+			if err != nil {
+				return nil, false, errors.WithStack(err)
+			}
+			out = append(out, &kv.Elem[kv.OP]{
+				Op:    elem.Op,
+				Key:   elem.Key,
+				Value: metaBytes,
+			})
+			continue
+		}
+		out = append(out, elem)
+	}
+	return out, true, nil
+}
+
+func luaListMetaRewritten(elems []*kv.Elem[kv.OP], key []byte) bool {
+	metaKey := store.ListMetaKey(key)
+	for _, elem := range elems {
+		if string(elem.Key) == string(metaKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateListDeltaRanges(st *luaListState) (int64, int64, error) {
