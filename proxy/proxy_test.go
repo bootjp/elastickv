@@ -732,7 +732,7 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 		secondary,
 		ProxyConfig{
 			Mode:                               ModeDualWrite,
-			SecondaryTimeout:                   30 * time.Millisecond,
+			SecondaryTimeout:                   2 * time.Second,
 			SecondaryBlockingReplayConcurrency: 1,
 		},
 		metrics,
@@ -744,7 +744,7 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 	assert.NoError(t, err)
 	d.Close()
 
-	assert.Greater(t, secondary.CallCount(), 1)
+	assert.Equal(t, maxBlockingReplayNoEffectRetries+1, secondary.CallCount())
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(
 		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)

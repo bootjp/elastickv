@@ -31,8 +31,9 @@ const (
 	maxScriptWriteGoroutines = 64
 	// maxBlockingReplayGoroutines isolates mutating blocking command replays
 	// from normal secondary writes. Blocking replays may wait for the secondary
-	// to observe a producer write and must not occupy producer write workers.
-	maxBlockingReplayGoroutines = 64
+	// to observe a producer write, and they hit the secondary's heavy-command
+	// limiter, so keep the default well below the normal write limit.
+	maxBlockingReplayGoroutines = 8
 	// Async queues absorb short bursts without allowing an unavailable or slow
 	// secondary to build an unbounded replay backlog.
 	minAsyncQueueCapacity       = 64
@@ -50,11 +51,13 @@ const (
 	// transient admission failures into backpressure without hiding a sustained
 	// overload.
 	maxServerOverloadedRetries = 8
-	// maxNoEffectReplayRetries bounds deterministic replay retries when the
-	// secondary has not observed the producer write yet. With the shared retry
-	// backoff capped at 100ms this covers normal queue reordering without
-	// allowing an unbounded worker leak if the producer write never lands.
-	maxNoEffectReplayRetries = 256
+	// Blocking ZPOP replays trail the producer write path and must not occupy
+	// their dedicated workers for the full secondary timeout when the producer
+	// write is delayed or dropped. A short initial delay lets the common
+	// producer-before-consumer ordering settle; a small no-effect cap keeps
+	// BZPOP load from turning into a long retry backlog.
+	blockingReplayInitialDelay       = 250 * time.Millisecond
+	maxBlockingReplayNoEffectRetries = 8
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
@@ -359,7 +362,13 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 
 	if d.hasSecondaryWrite() {
 		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
-			d.goBlockingReplay(func(ctx context.Context) { d.writeSecondaryPositiveInt(ctx, replayCmd, replayArgs) })
+			d.goBlockingReplay(func(ctx context.Context) {
+				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
+					initialDelay:       blockingReplayInitialDelay,
+					noEffectRetryLimit: maxBlockingReplayNoEffectRetries,
+					deadlineAsMiss:     true,
+				})
+			})
 		} else if shouldReplayBlockingToSecondary(cmd) {
 			d.goBlockingReplay(func(ctx context.Context) {
 				sCtx, cancel := context.WithTimeout(ctx, time.Second)
@@ -474,8 +483,17 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
 }
 
-func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string, iArgs []any) {
+type positiveIntReplayOptions struct {
+	initialDelay       time.Duration
+	noEffectRetryLimit int
+	deadlineAsMiss     bool
+}
+
+func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, cmd string, iArgs []any, opts positiveIntReplayOptions) {
 	start := time.Now()
+	if !d.waitPositiveIntReplayInitialDelay(sCtx, cmd, start, opts.initialDelay) {
+		return
+	}
 
 	backoff := compactedRetryInitialBackoff
 	var sErr error
@@ -493,7 +511,7 @@ func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string,
 			sErr = err
 		}
 
-		retryReason, retryLimit := secondaryPositiveIntRetryReasonAndLimit(cmd, sErr)
+		retryReason, retryLimit := secondaryPositiveIntRetryReasonAndLimit(cmd, sErr, opts.noEffectRetryLimit)
 		if retryReason == "" {
 			break
 		}
@@ -512,11 +530,24 @@ func (d *DualWriter) writeSecondaryPositiveInt(sCtx context.Context, cmd string,
 
 	elapsed := time.Since(start)
 	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
-	if errors.Is(sErr, errSecondaryReplayNoEffect) {
+	if positiveIntReplayMiss(sCtx, opts, sErr) {
 		d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "miss").Inc()
 		return
 	}
 	d.recordSecondaryWriteFailure(cmd, iArgs, elapsed, attempt+1, false, sErr)
+}
+
+func (d *DualWriter) waitPositiveIntReplayInitialDelay(ctx context.Context, cmd string, start time.Time, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	if waitSecondaryReplayDelay(ctx, delay) {
+		return true
+	}
+	elapsed := time.Since(start)
+	d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
+	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "miss").Inc()
+	return false
 }
 
 func positiveIntReplayResult(resp any, err error) (bool, error) {
@@ -529,11 +560,30 @@ func positiveIntReplayResult(resp any, err error) (bool, error) {
 	return false, errSecondaryReplayNoEffect
 }
 
-func secondaryPositiveIntRetryReasonAndLimit(cmd string, err error) (string, int) {
+func secondaryPositiveIntRetryReasonAndLimit(cmd string, err error, noEffectRetryLimit int) (string, int) {
 	if errors.Is(err, errSecondaryReplayNoEffect) {
-		return "no_effect", maxNoEffectReplayRetries
+		if noEffectRetryLimit <= 0 {
+			return "", 0
+		}
+		return "no_effect", noEffectRetryLimit
 	}
 	return secondaryRetryReasonAndLimit(cmd, err)
+}
+
+func positiveIntReplayMiss(ctx context.Context, opts positiveIntReplayOptions, err error) bool {
+	return errors.Is(err, errSecondaryReplayNoEffect) || opts.deadlineAsMiss && ctx.Err() != nil
+}
+
+func waitSecondaryReplayDelay(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func shouldLogSecondaryRetry(err error) bool {
