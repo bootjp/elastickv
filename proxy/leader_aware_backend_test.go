@@ -553,6 +553,51 @@ func TestLeaderAwareRedisBackend_EvictsOldestNonProtectedClient(t *testing.T) {
 	assert.Contains(t, addrs, seed.addr, "seed must never be evicted")
 }
 
+func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testing.T) {
+	aliveLeader := newFakeElasticKVNode(t)
+	aliveLeader.SetLeader(aliveLeader.addr)
+	gate := make(chan struct{})
+	aliveLeader.SetInfoGate(gate)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{"127.0.0.1:1", aliveLeader.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 200*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Empty(t, backend.CurrentLeader(), "initial commands must not target the first seed before discovery")
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done <- backend.Do(ctx, "SET", "k", "v").Err()
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("command returned before leader discovery completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(gate)
+	var err error
+	require.Eventually(t, func() bool {
+		select {
+		case err = <-done:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), aliveLeader.commands.Load(), "initial command must reach the discovered leader")
+	require.Equal(t, aliveLeader.addr, backend.CurrentLeader())
+}
+
 func TestLeaderAwareRedisBackend_FallsBackToSeedOnProbeFailure(t *testing.T) {
 	// Seed 1 is unreachable; seed 2 is alive and reports itself as leader.
 	aliveLeader := newFakeElasticKVNode(t)
