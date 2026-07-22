@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,6 +65,8 @@ type fakeElasticKVNode struct {
 	leaderAddr atomic.Pointer[string]
 	commands   atomic.Int64
 	infoCalls  atomic.Int64
+	infoGateMu sync.RWMutex
+	infoGate   <-chan struct{}
 }
 
 func newFakeElasticKVNode(t *testing.T) *fakeElasticKVNode {
@@ -87,6 +90,21 @@ func (n *fakeElasticKVNode) Leader() string {
 		return *p
 	}
 	return ""
+}
+
+func (n *fakeElasticKVNode) SetInfoGate(gate <-chan struct{}) {
+	n.infoGateMu.Lock()
+	n.infoGate = gate
+	n.infoGateMu.Unlock()
+}
+
+func (n *fakeElasticKVNode) waitInfoGate() {
+	n.infoGateMu.RLock()
+	gate := n.infoGate
+	n.infoGateMu.RUnlock()
+	if gate != nil {
+		<-gate
+	}
 }
 
 func (n *fakeElasticKVNode) serve() {
@@ -120,6 +138,7 @@ func (n *fakeElasticKVNode) handleConn(conn net.Conn) {
 			_, _ = conn.Write([]byte("+OK\r\n"))
 		case "INFO":
 			n.infoCalls.Add(1)
+			n.waitInfoGate()
 			body := fmt.Sprintf(
 				"# Replication\r\nrole:slave\r\nraft_leader_redis:%s\r\n",
 				n.Leader(),
@@ -127,6 +146,10 @@ func (n *fakeElasticKVNode) handleConn(conn net.Conn) {
 			_, _ = fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(body), body)
 		default:
 			n.commands.Add(1)
+			if leader := n.Leader(); leader != "" && leader != n.addr {
+				_, _ = conn.Write([]byte("-NOTLEADER etcd raft engine is not leader\r\n"))
+				continue
+			}
 			_, _ = conn.Write([]byte("+OK\r\n"))
 		}
 	}
@@ -213,6 +236,165 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.Equal(t, beforeA, nodeA.commands.Load(), "command must not reach former leader A")
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
 }
+
+func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
+	nodeA := newFakeElasticKVNode(t)
+	nodeB := newFakeElasticKVNode(t)
+	nodeA.SetLeader(nodeA.addr)
+	nodeB.SetLeader(nodeA.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{nodeA.addr, nodeB.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == nodeA.addr
+	}, 2*time.Second, 10*time.Millisecond)
+
+	nodeA.SetLeader(nodeB.addr)
+	nodeB.SetLeader(nodeB.addr)
+
+	res := backend.Do(context.Background(), "SET", "k", "v")
+	require.NoError(t, res.Err())
+	require.Equal(t, nodeB.addr, backend.CurrentLeader())
+	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt must be rejected by the former leader")
+	require.Equal(t, int64(1), nodeB.commands.Load(), "safe retry must reach the refreshed leader")
+}
+
+func TestLeaderAwareRedisBackend_CoalescesConcurrentRefreshes(t *testing.T) {
+	node := newFakeElasticKVNode(t)
+	node.SetLeader(node.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{node.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, time.Second,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == node.addr && node.infoCalls.Load() > 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	gate := make(chan struct{})
+	node.SetInfoGate(gate)
+	before := node.infoCalls.Load()
+
+	ownerDone := make(chan struct{})
+	go func() {
+		backend.RefreshLeaderNow(context.Background())
+		close(ownerDone)
+	}()
+	require.Eventually(t, func() bool {
+		return node.infoCalls.Load() == before+1
+	}, time.Second, 10*time.Millisecond)
+
+	const callers = 32
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			backend.RefreshLeaderNow(ctx)
+		}()
+	}
+	waitersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitersDone)
+	}()
+	select {
+	case <-waitersDone:
+	case <-time.After(time.Second):
+		close(gate)
+		<-ownerDone
+		t.Fatal("refresh waiters did not respect their contexts")
+	}
+
+	assert.Equal(t, before+1, node.infoCalls.Load())
+	close(gate)
+	<-ownerDone
+	assert.Equal(t, before+1, node.infoCalls.Load())
+}
+
+func TestLeaderAwareRedisBackend_RefreshOutlivesCallerDeadline(t *testing.T) {
+	node := newFakeElasticKVNode(t)
+	node.SetLeader(node.addr)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{node.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, time.Second,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+	require.Eventually(t, func() bool {
+		return backend.CurrentLeader() == node.addr && node.infoCalls.Load() > 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	gate := make(chan struct{})
+	node.SetInfoGate(gate)
+	before := node.infoCalls.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	backend.RefreshLeaderNow(ctx)
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	require.Equal(t, before+1, node.infoCalls.Load())
+
+	close(gate)
+	require.Eventually(t, func() bool {
+		backend.refreshMu.Lock()
+		defer backend.refreshMu.Unlock()
+		return backend.refreshDone == nil
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, before+1, node.infoCalls.Load(), "caller cancellation must not start a replacement probe")
+}
+
+func TestLeaderRefreshTransportErrorClassification(t *testing.T) {
+	require.True(t, isLeaderRefreshTransportError(io.EOF))
+	require.True(t, isLeaderRefreshTransportError(&net.OpError{Op: "read", Err: errors.New("connection reset by peer")}))
+	require.False(t, isLeaderRefreshTransportError(context.Canceled))
+	require.False(t, isLeaderRefreshTransportError(context.DeadlineExceeded))
+	require.False(t, isLeaderRefreshTransportError(errors.New("write conflict")))
+}
+
+func TestElasticKVNotLeaderErrorClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "canonical redis code", err: redisError("NOTLEADER leader not found"), want: true},
+		{name: "bare canonical code", err: errors.New("NOTLEADER"), want: true},
+		{name: "internal sentinel text", err: errors.New("raft engine: not leader"), want: true},
+		{name: "grpc wrapped text", err: errors.New("rpc error: code = Unknown desc = leader not found"), want: true},
+		{name: "unrelated error", err: errors.New("write conflict"), want: false},
+		{name: "redis user error containing phrase", err: redisError("ERR script says raft engine: not leader"), want: false},
+		{name: "redis user error with bare phrase", err: redisError("leader not found"), want: false},
+		{name: "free form suffix", err: errors.New("key value says leader not found"), want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isElasticKVNotLeaderError(tc.err))
+		})
+	}
+}
+
+type redisError string
+
+func (e redisError) Error() string { return string(e) }
+func (redisError) RedisError()     {}
 
 func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {
 	// Regression guard: Close() must not race concurrent Do() callers —
