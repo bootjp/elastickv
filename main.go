@@ -2676,9 +2676,7 @@ func startRaftServers(
 			internalTimestampOptions(coordinate)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
-		if adminServer != nil {
-			pb.RegisterAdminServer(gs, adminServer)
-		}
+		registerAdminServerIfPresent(gs, adminServer)
 		// full_node_id MUST be per-node-stable, not per-shard.
 		// rt.spec.id is the Raft group id which every replica of
 		// the same group shares; using it as full_node_id makes
@@ -2695,6 +2693,10 @@ func startRaftServers(
 		// Proposer + LeaderView for the cutover marker, while
 		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
 		// path for normal admin entries.
+		writerRegistry, err := encryptionAdminWriterRegistry(*encryptionSidecarPath, rt.store, rt.spec.id)
+		if err != nil {
+			return err
+		}
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
@@ -2702,6 +2704,7 @@ func startRaftServers(
 			enableMutators,
 			rt.engine,
 			encryptionCapabilityFanout,
+			writerRegistry,
 			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
@@ -2753,6 +2756,13 @@ func startRaftServers(
 		})
 	}
 	return nil
+}
+
+func registerAdminServerIfPresent(gs grpc.ServiceRegistrar, adminServer *adapter.AdminServer) {
+	if adminServer == nil {
+		return
+	}
+	pb.RegisterAdminServer(gs, adminServer)
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {

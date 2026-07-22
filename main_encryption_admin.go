@@ -2,8 +2,10 @@ package main
 
 import (
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
@@ -76,6 +78,17 @@ type encryptionAdminEngine interface {
 	raftengine.LeaderView
 }
 
+func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, groupID uint64) (encryption.WriterRegistryStore, error) {
+	if sidecarPath == "" {
+		return nil, nil
+	}
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to construct encryption admin writer registry for group %d", groupID)
+	}
+	return reg, nil
+}
+
 // registerEncryptionAdminServer constructs and registers an
 // EncryptionAdminServer on the supplied gRPC server. The function
 // is intentionally per-shard: the §7.1 Phase-0 GetCapability
@@ -131,12 +144,15 @@ type encryptionAdminEngine interface {
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, extraOpts ...adapter.EncryptionAdminServerOption) {
+func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, extraOpts ...adapter.EncryptionAdminServerOption) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if sidecarPath != "" {
 		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(sidecarPath))
+	}
+	if writerRegistry != nil {
+		opts = append(opts, adapter.WithEncryptionAdminWriterRegistry(writerRegistry))
 	}
 	if enableMutators && engine != nil {
 		opts = append(opts,

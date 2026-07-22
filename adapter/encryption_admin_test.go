@@ -159,6 +159,37 @@ func TestEncryptionAdmin_GetSidecarState_ShipsWrappedDEKs(t *testing.T) {
 	assertSidecarWrappedDEKs(t, got)
 }
 
+func TestEncryptionAdmin_GetSidecarState_ProjectsLocalWriterRegistry(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		RaftAppliedIndex: 1,
+		Active:           encryption.ActiveKeys{Storage: 10, Raft: 11},
+		Keys: map[string]encryption.SidecarKey{
+			"10": {Purpose: "storage", Wrapped: []byte("storage")},
+			"11": {Purpose: "raft", Wrapped: []byte("raft")},
+			"12": {Purpose: "storage", Wrapped: []byte("unregistered")},
+		},
+	})
+	reg := newTestWriterRegistryStore()
+	reg.seed(t, 10, callerFullNodeID, 3)
+	reg.seed(t, 11, callerFullNodeID, 7)
+
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminFullNodeID(callerFullNodeID),
+		WithEncryptionAdminWriterRegistry(reg),
+	)
+	got, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	if err != nil {
+		t.Fatalf("GetSidecarState: %v", err)
+	}
+	want := map[uint32]uint32{10: 3, 11: 7}
+	if !mapsEqual(got.WriterRegistryForCaller, want) {
+		t.Errorf("WriterRegistryForCaller=%v, want %v", got.WriterRegistryForCaller, want)
+	}
+}
+
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {
 	t.Helper()
 	if got.ActiveStorageId != 1 || got.ActiveRaftId != 2 {
@@ -184,10 +215,10 @@ func assertSidecarWrappedDEKs(t *testing.T, got *pb.SidecarStateReport) {
 		t.Errorf("wrapped[2]=%q, want %q", got.WrappedDeksById[2], "wrapped-2")
 	}
 	if got.WriterRegistryForCaller == nil {
-		t.Errorf("WriterRegistryForCaller=nil, want empty non-nil map (PR-A contract)")
+		t.Errorf("WriterRegistryForCaller=nil, want empty non-nil map when no writer registry is wired")
 	}
 	if len(got.WriterRegistryForCaller) != 0 {
-		t.Errorf("WriterRegistryForCaller=%v, want empty in PR-A", got.WriterRegistryForCaller)
+		t.Errorf("WriterRegistryForCaller=%v, want empty when no writer registry is wired", got.WriterRegistryForCaller)
 	}
 }
 
@@ -245,14 +276,89 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 	if string(got.WrappedDeksById[3]) != "ws" || string(got.WrappedDeksById[4]) != "wr" {
 		t.Errorf("wrapped=%v, want id3=ws id4=wr", got.WrappedDeksById)
 	}
-	// Mirror the GetSidecarState contract: non-nil empty map until
-	// Stage 7 wires the writer registry. Locks in the §5.5 promise
-	// so a future change to the field cannot silently degrade to nil.
+	// Mirror the GetSidecarState contract: a server without a
+	// wired writer registry still returns a non-nil empty map so
+	// callers can distinguish "no projection rows" from nil.
 	if got.WriterRegistryForCaller == nil {
-		t.Errorf("WriterRegistryForCaller=nil, want empty non-nil map (PR-A contract)")
+		t.Errorf("WriterRegistryForCaller=nil, want empty non-nil map when no writer registry is wired")
 	}
 	if len(got.WriterRegistryForCaller) != 0 {
-		t.Errorf("WriterRegistryForCaller=%v, want empty in PR-A", got.WriterRegistryForCaller)
+		t.Errorf("WriterRegistryForCaller=%v, want empty when no writer registry is wired", got.WriterRegistryForCaller)
+	}
+}
+
+func TestEncryptionAdmin_ResyncSidecar_ProjectsCallerWriterRegistry(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xDEAD_BEEF_0000_8888
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		RaftAppliedIndex: 17,
+		Active:           encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	reg := newTestWriterRegistryStore()
+	reg.seed(t, 3, callerFullNodeID, 21)
+	reg.seed(t, 4, callerFullNodeID, 22)
+
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminWriterRegistry(reg),
+	)
+	got, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: callerFullNodeID})
+	if err != nil {
+		t.Fatalf("ResyncSidecar: %v", err)
+	}
+	want := map[uint32]uint32{3: 21, 4: 22}
+	if !mapsEqual(got.WriterRegistryForCaller, want) {
+		t.Errorf("WriterRegistryForCaller=%v, want %v", got.WriterRegistryForCaller, want)
+	}
+}
+
+func TestEncryptionAdmin_ResyncSidecar_RejectsMissingCallerID(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminWriterRegistry(newTestWriterRegistryStore()),
+	)
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
+	if got, want := status.Code(err), codes.InvalidArgument; got != want {
+		t.Errorf("status=%v, want %v (err=%v)", got, want, err)
+	}
+}
+
+func TestEncryptionAdmin_ResyncSidecar_RejectsWriterRegistryCollision(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0x0000_0000_0000_ABCD
+	const collidingFullNodeID uint64 = 0x9999_9999_9999_ABCD
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	reg := newTestWriterRegistryStore()
+	reg.seedAtNodeID16(t, 3, encryption.NodeID16(callerFullNodeID), collidingFullNodeID, 9)
+
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminWriterRegistry(reg),
+	)
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: callerFullNodeID})
+	if got, want := status.Code(err), codes.Internal; got != want {
+		t.Errorf("status=%v, want %v (err=%v)", got, want, err)
 	}
 }
 
@@ -316,6 +422,57 @@ func validRegisterEncryptionWriterRequest() *pb.RegisterEncryptionWriterRequest 
 			{FullNodeId: 11, LocalEpoch: 7},
 		},
 	}
+}
+
+type testWriterRegistryStore struct {
+	rows map[string][]byte
+}
+
+func newTestWriterRegistryStore() *testWriterRegistryStore {
+	return &testWriterRegistryStore{rows: map[string][]byte{}}
+}
+
+func (s *testWriterRegistryStore) GetRegistryRow(key []byte) ([]byte, bool, error) {
+	value, ok := s.rows[string(key)]
+	if !ok {
+		return nil, false, nil
+	}
+	out := append([]byte(nil), value...)
+	return out, true, nil
+}
+
+func (s *testWriterRegistryStore) SetRegistryRow(key []byte, value []byte) error {
+	s.rows[string(key)] = append([]byte(nil), value...)
+	return nil
+}
+
+func (s *testWriterRegistryStore) seed(t *testing.T, dekID uint32, fullNodeID uint64, lastSeen uint16) {
+	t.Helper()
+	s.seedAtNodeID16(t, dekID, encryption.NodeID16(fullNodeID), fullNodeID, lastSeen)
+}
+
+func (s *testWriterRegistryStore) seedAtNodeID16(t *testing.T, dekID uint32, nodeID16 uint16, storedFullNodeID uint64, lastSeen uint16) {
+	t.Helper()
+	value := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID:          storedFullNodeID,
+		FirstSeenLocalEpoch: 1,
+		LastSeenLocalEpoch:  lastSeen,
+	})
+	if err := s.SetRegistryRow(encryption.RegistryKey(dekID, nodeID16), value); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+}
+
+func mapsEqual[K comparable, V comparable](left, right map[K]V) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftVal := range left {
+		if rightVal, ok := right[key]; !ok || rightVal != leftVal {
+			return false
+		}
+	}
+	return true
 }
 
 // TestEncryptionAdmin_Validate_RejectsProposerWithoutLeaderView
