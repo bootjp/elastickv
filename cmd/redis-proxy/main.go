@@ -38,6 +38,8 @@ func run() error {
 	elasticKVPoolSize := proxy.DefaultElasticKVBackendOptions().PoolSize
 	secondaryWriteConcurrency := 0
 	secondaryScriptConcurrency := 0
+	secondaryWriteQueueSize := 0
+	secondaryScriptQueueSize := 0
 
 	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "Proxy listen address")
 	flag.StringVar(&cfg.PrimaryAddr, "primary", cfg.PrimaryAddr, "Primary (Redis) address")
@@ -48,8 +50,10 @@ func run() error {
 	flag.StringVar(&cfg.SecondaryPassword, "secondary-password", cfg.SecondaryPassword, "Secondary Redis password")
 	flag.IntVar(&primaryPoolSize, "primary-pool-size", primaryPoolSize, "Primary Redis backend connection pool size")
 	flag.IntVar(&elasticKVPoolSize, "elastickv-pool-size", elasticKVPoolSize, "ElasticKV backend connection pool size")
-	flag.IntVar(&secondaryWriteConcurrency, "secondary-write-concurrency", secondaryWriteConcurrency, "Maximum concurrent asynchronous secondary writes (0 = half of secondary backend pool size)")
-	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes (0 = half of secondary write concurrency)")
+	flag.IntVar(&secondaryWriteConcurrency, "secondary-write-concurrency", secondaryWriteConcurrency, "Maximum concurrent asynchronous secondary writes including scripts (0 = half of secondary backend pool size)")
+	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes within the write limit (0 = half of secondary write concurrency)")
+	flag.IntVar(&secondaryWriteQueueSize, "secondary-write-queue-size", secondaryWriteQueueSize, "Maximum queued asynchronous secondary writes (0 = derived from write concurrency)")
+	flag.IntVar(&secondaryScriptQueueSize, "secondary-script-queue-size", secondaryScriptQueueSize, "Maximum queued asynchronous secondary Lua-script writes (0 = derived from script concurrency)")
 	flag.StringVar(&modeStr, "mode", "dual-write", "Proxy mode: redis-only, dual-write, dual-write-shadow, elastickv-primary, elastickv-only")
 	flag.DurationVar(&cfg.SecondaryTimeout, "secondary-timeout", cfg.SecondaryTimeout, "Secondary write timeout")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", cfg.ShadowTimeout, "Shadow read timeout")
@@ -59,18 +63,23 @@ func run() error {
 	flag.StringVar(&cfg.MetricsAddr, "metrics", cfg.MetricsAddr, "Prometheus metrics address")
 	flag.Parse()
 
-	mode, err := parseRuntimeOptions(modeStr, primaryPoolSize, elasticKVPoolSize, secondaryWriteConcurrency, secondaryScriptConcurrency)
-	if err != nil {
-		return err
-	}
-	cfg.Mode = mode
-	cfg.SecondaryWriteConcurrency, cfg.SecondaryScriptConcurrency = deriveSecondaryConcurrency(
-		mode,
+	mode, resolvedWriteConcurrency, resolvedScriptConcurrency, err := resolveRuntimeOptions(
+		modeStr,
 		primaryPoolSize,
 		elasticKVPoolSize,
 		secondaryWriteConcurrency,
 		secondaryScriptConcurrency,
+		secondaryWriteQueueSize,
+		secondaryScriptQueueSize,
 	)
+	if err != nil {
+		return err
+	}
+	cfg.Mode = mode
+	cfg.SecondaryWriteConcurrency = resolvedWriteConcurrency
+	cfg.SecondaryScriptConcurrency = resolvedScriptConcurrency
+	cfg.SecondaryWriteQueueCapacity = secondaryWriteQueueSize
+	cfg.SecondaryScriptQueueCapacity = secondaryScriptQueueSize
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -149,7 +158,49 @@ func run() error {
 	return nil
 }
 
-func parseRuntimeOptions(modeStr string, primaryPoolSize, elasticKVPoolSize, secondaryWriteConcurrency, secondaryScriptConcurrency int) (proxy.ProxyMode, error) {
+func resolveRuntimeOptions(
+	modeStr string,
+	primaryPoolSize, elasticKVPoolSize int,
+	secondaryWriteConcurrency, secondaryScriptConcurrency int,
+	secondaryWriteQueueSize, secondaryScriptQueueSize int,
+) (proxy.ProxyMode, int, int, error) {
+	mode, err := parseRuntimeOptions(
+		modeStr,
+		primaryPoolSize,
+		elasticKVPoolSize,
+		secondaryWriteConcurrency,
+		secondaryScriptConcurrency,
+		secondaryWriteQueueSize,
+		secondaryScriptQueueSize,
+	)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	writeConcurrency, scriptConcurrency := deriveSecondaryConcurrency(
+		mode,
+		primaryPoolSize,
+		elasticKVPoolSize,
+		secondaryWriteConcurrency,
+		secondaryScriptConcurrency,
+	)
+	if err := validateSecondaryConcurrency(
+		mode,
+		primaryPoolSize,
+		elasticKVPoolSize,
+		writeConcurrency,
+		scriptConcurrency,
+	); err != nil {
+		return 0, 0, 0, err
+	}
+	return mode, writeConcurrency, scriptConcurrency, nil
+}
+
+func parseRuntimeOptions(
+	modeStr string,
+	primaryPoolSize, elasticKVPoolSize int,
+	secondaryWriteConcurrency, secondaryScriptConcurrency int,
+	secondaryWriteQueueSize, secondaryScriptQueueSize int,
+) (proxy.ProxyMode, error) {
 	mode, ok := proxy.ParseProxyMode(modeStr)
 	if !ok {
 		return 0, fmt.Errorf("unknown mode: %s", modeStr)
@@ -166,7 +217,27 @@ func parseRuntimeOptions(modeStr string, primaryPoolSize, elasticKVPoolSize, sec
 	if secondaryScriptConcurrency < 0 {
 		return 0, fmt.Errorf("secondary-script-concurrency must be non-negative: %d", secondaryScriptConcurrency)
 	}
+	if secondaryWriteQueueSize < 0 {
+		return 0, fmt.Errorf("secondary-write-queue-size must be non-negative: %d", secondaryWriteQueueSize)
+	}
+	if secondaryScriptQueueSize < 0 {
+		return 0, fmt.Errorf("secondary-script-queue-size must be non-negative: %d", secondaryScriptQueueSize)
+	}
 	return mode, nil
+}
+
+func validateSecondaryConcurrency(mode proxy.ProxyMode, primaryPoolSize, elasticKVPoolSize, writeConcurrency, scriptConcurrency int) error {
+	if mode == proxy.ModeRedisOnly || mode == proxy.ModeElasticKVOnly {
+		return nil
+	}
+	poolSize := secondaryBackendPoolSize(mode, primaryPoolSize, elasticKVPoolSize)
+	if writeConcurrency > poolSize {
+		return fmt.Errorf("secondary-write-concurrency %d exceeds secondary backend pool size %d", writeConcurrency, poolSize)
+	}
+	if scriptConcurrency > writeConcurrency {
+		return fmt.Errorf("secondary-script-concurrency %d exceeds secondary-write-concurrency %d", scriptConcurrency, writeConcurrency)
+	}
+	return nil
 }
 
 func deriveSecondaryConcurrency(mode proxy.ProxyMode, primaryPoolSize, elasticKVPoolSize, writeConcurrency, scriptConcurrency int) (int, int) {

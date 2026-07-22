@@ -432,14 +432,8 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 
 	// Async replay to secondary (bounded)
 	if p.dual.hasSecondaryWrite() {
-		p.dual.goAsync(func() {
-			sCtx, cancel := context.WithTimeout(context.Background(), p.cfg.SecondaryTimeout)
-			defer cancel()
-			_, pErr := p.dual.Secondary().Pipeline(sCtx, cmds)
-			if pErr != nil {
-				p.logger.Warn("secondary txn replay failed", "err", pErr)
-				p.metrics.SecondaryWriteErrors.Inc()
-			}
+		p.dual.goAsync(func(ctx context.Context) {
+			p.dual.writeSecondaryPipeline(ctx, cmds)
 		})
 	}
 }

@@ -29,12 +29,23 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
+	// Async queues absorb short bursts without allowing an unavailable or slow
+	// secondary to build an unbounded replay backlog.
+	minAsyncQueueCapacity       = 64
+	maxAsyncQueueCapacity       = 8192
+	asyncQueueConcurrencyFactor = 64
 
 	// maxCompactedRetries caps retries when the secondary returns
 	// "read timestamp has been compacted". Each attempt re-sends the command so
 	// the secondary re-selects a fresh read snapshot; a small bound is enough
 	// because the compaction waterline advances slowly relative to SecondaryTimeout.
 	maxCompactedRetries = 3
+	// maxServerOverloadedRetries caps retries when ElasticKV rejects a secondary
+	// replay before execution because the heavy-command worker pool is full.
+	// Retrying holds the proxy's secondary budget, so a bounded loop turns
+	// transient admission failures into backpressure without hiding a sustained
+	// overload.
+	maxServerOverloadedRetries = 8
 	// compactedRetryInitialBackoff is the first delay before retrying a secondary
 	// command that failed with a compacted-read error.
 	compactedRetryInitialBackoff = 10 * time.Millisecond
@@ -52,6 +63,8 @@ const (
 	// asyncDropLogInterval keeps the secondary-drop warning useful without
 	// emitting one log line per dropped fire-and-forget write under load.
 	asyncDropLogInterval = 5 * time.Second
+
+	backendPoolSampleInterval = time.Second
 )
 
 // readTSCompactedMarker is the substring produced by
@@ -59,12 +72,20 @@ const (
 // FailedPrecondition) and Lua PCall. Matching on substring is necessary
 // because both layers erase the typed error.
 const readTSCompactedMarker = "read timestamp has been compacted"
+const serverOverloadedMarker = "BUSY server overloaded"
 
 func isReadTSCompactedError(err error) bool {
 	if err == nil {
 		return false
 	}
 	return strings.Contains(err.Error(), readTSCompactedMarker)
+}
+
+func isServerOverloadedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), serverOverloadedMarker)
 }
 
 // DualWriter routes commands to primary and secondary backends based on mode.
@@ -77,15 +98,24 @@ type DualWriter struct {
 	sentry    *SentryReporter
 	logger    *slog.Logger
 
-	writeSem  chan struct{} // bounds concurrent secondary write goroutines
-	shadowSem chan struct{} // bounds concurrent shadow read goroutines
-	scriptSem chan struct{} // bounds concurrent secondary Lua-script write goroutines
+	writeSem         chan struct{} // bounds concurrent secondary write goroutines
+	shadowSem        chan struct{} // bounds concurrent shadow read goroutines
+	scriptSem        chan struct{} // bounds concurrent secondary Lua-script write goroutines
+	writeQueue       chan asyncTask
+	scriptQueue      chan asyncTask
+	writeQueueSlots  chan struct{}
+	scriptQueueSlots chan struct{}
 
-	wg       sync.WaitGroup
-	mu       sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
-	closed   bool
-	scriptMu sync.RWMutex
-	scripts  map[string]string
+	dispatchWG    sync.WaitGroup
+	workerWG      sync.WaitGroup
+	shadowWG      sync.WaitGroup
+	poolStatsWG   sync.WaitGroup
+	mu            sync.Mutex // protects closed; held briefly to make wg.Add atomic with close check
+	closed        bool
+	closeDone     chan struct{}
+	poolStatsStop chan struct{}
+	scriptMu      sync.RWMutex
+	scripts       map[string]string
 	// scriptOrder tracks insertion order for FIFO eviction of the bounded script cache.
 	scriptOrder []string
 	asyncDropMu sync.Mutex
@@ -99,16 +129,22 @@ type DualWriter struct {
 // NewDualWriter creates a DualWriter with the given backends.
 func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMetrics, sentryReporter *SentryReporter, logger *slog.Logger) *DualWriter {
 	d := &DualWriter{
-		primary:   primary,
-		secondary: secondary,
-		cfg:       cfg,
-		metrics:   metrics,
-		sentry:    sentryReporter,
-		logger:    logger,
-		writeSem:  make(chan struct{}, secondaryWriteConcurrency(cfg)),
-		shadowSem: make(chan struct{}, maxShadowGoroutines),
-		scriptSem: make(chan struct{}, secondaryScriptConcurrency(cfg)),
-		scripts:   make(map[string]string),
+		primary:          primary,
+		secondary:        secondary,
+		cfg:              cfg,
+		metrics:          metrics,
+		sentry:           sentryReporter,
+		logger:           logger,
+		writeSem:         make(chan struct{}, secondaryWriteConcurrency(cfg)),
+		shadowSem:        make(chan struct{}, maxShadowGoroutines),
+		scriptSem:        make(chan struct{}, secondaryScriptConcurrency(cfg)),
+		writeQueue:       make(chan asyncTask, secondaryWriteQueueCapacity(cfg)),
+		scriptQueue:      make(chan asyncTask, secondaryScriptQueueCapacity(cfg)),
+		writeQueueSlots:  make(chan struct{}, secondaryWriteQueueCapacity(cfg)),
+		scriptQueueSlots: make(chan struct{}, secondaryScriptQueueCapacity(cfg)),
+		closeDone:        make(chan struct{}),
+		poolStatsStop:    make(chan struct{}),
+		scripts:          make(map[string]string),
 	}
 
 	if cfg.Mode == ModeDualWriteShadow || cfg.Mode == ModeElasticKVPrimary {
@@ -118,6 +154,18 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		shadowBackend := secondary
 		d.shadow = NewShadowReader(shadowBackend, metrics, sentryReporter, logger, cfg.ShadowTimeout)
 	}
+	if d.hasSecondaryWrite() {
+		d.startAsyncDispatchers()
+	}
+	d.startBackendPoolSampler()
+	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueWrite).Set(float64(cap(d.writeQueueSlots)))
+	d.metrics.AsyncQueueCapacity.WithLabelValues(asyncQueueScript).Set(float64(cap(d.scriptQueueSlots)))
+	d.logger.Info("secondary async scheduler configured",
+		"write_concurrency", cap(d.writeSem),
+		"script_concurrency", cap(d.scriptSem),
+		"write_queue_capacity", cap(d.writeQueueSlots),
+		"script_queue_capacity", cap(d.scriptQueueSlots),
+		"timeout", cfg.SecondaryTimeout)
 
 	return d
 }
@@ -127,7 +175,33 @@ func secondaryWriteConcurrency(cfg ProxyConfig) int {
 }
 
 func secondaryScriptConcurrency(cfg ProxyConfig) int {
-	return configuredConcurrencyOrDefault(cfg.SecondaryScriptConcurrency, maxScriptWriteGoroutines)
+	concurrency := configuredConcurrencyOrDefault(cfg.SecondaryScriptConcurrency, maxScriptWriteGoroutines)
+	if writeConcurrency := secondaryWriteConcurrency(cfg); concurrency > writeConcurrency {
+		return writeConcurrency
+	}
+	return concurrency
+}
+
+func secondaryWriteQueueCapacity(cfg ProxyConfig) int {
+	return configuredQueueCapacityOrDefault(cfg.SecondaryWriteQueueCapacity, secondaryWriteConcurrency(cfg))
+}
+
+func secondaryScriptQueueCapacity(cfg ProxyConfig) int {
+	return configuredQueueCapacityOrDefault(cfg.SecondaryScriptQueueCapacity, secondaryScriptConcurrency(cfg))
+}
+
+func configuredQueueCapacityOrDefault(configured, concurrency int) int {
+	if configured > 0 {
+		return configured
+	}
+	capacity := concurrency * asyncQueueConcurrencyFactor
+	if capacity < minAsyncQueueCapacity {
+		return minAsyncQueueCapacity
+	}
+	if capacity > maxAsyncQueueCapacity {
+		return maxAsyncQueueCapacity
+	}
+	return capacity
 }
 
 func configuredConcurrencyOrDefault(configured, fallback int) int {
@@ -140,12 +214,31 @@ func configuredConcurrencyOrDefault(configured, fallback int) int {
 // Close waits for all in-flight async goroutines to finish.
 // Should be called during graceful shutdown.
 func (d *DualWriter) Close() {
-	// Set closed under the mutex so that no concurrent goAsyncWithSem call
-	// can slip a wg.Add(1) in after wg.Wait() starts (which would panic).
+	// Set closed under the mutex so no producer can enqueue after the queue
+	// channels are closed.
 	d.mu.Lock()
+	if d.closed {
+		closeDone := d.closeDone
+		d.mu.Unlock()
+		<-closeDone
+		return
+	}
 	d.closed = true
+	if d.hasSecondaryWrite() {
+		close(d.writeQueue)
+		close(d.scriptQueue)
+	}
+	close(d.poolStatsStop)
 	d.mu.Unlock()
-	d.wg.Wait()
+
+	// Dispatchers are the only goroutines that add to workerWG. Waiting for
+	// them first prevents WaitGroup Add/Wait races while still draining work
+	// accepted before shutdown.
+	d.dispatchWG.Wait()
+	d.workerWG.Wait()
+	d.shadowWG.Wait()
+	d.poolStatsWG.Wait()
+	close(d.closeDone)
 }
 
 // Write sends a write command to the primary synchronously, then to the secondary asynchronously.
@@ -168,7 +261,7 @@ func (d *DualWriter) Write(ctx context.Context, cmd string, args [][]byte) (any,
 
 	// Secondary: async fire-and-forget (bounded)
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() { d.writeSecondary(cmd, iArgs) })
+		d.goWrite(func(ctx context.Context) { d.writeSecondary(ctx, cmd, iArgs) })
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -229,8 +322,8 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 
 	// Warmup: send to secondary with short timeout (fire-and-forget, bounded)
 	if d.hasSecondaryWrite() {
-		d.goWrite(func() {
-			sCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		d.goWrite(func(ctx context.Context) {
+			sCtx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
 			d.secondary.Do(sCtx, iArgs...)
 		})
@@ -275,7 +368,7 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 	d.rememberScript(cmd, args)
 
 	if d.hasSecondaryWrite() {
-		d.goScript(func() { d.writeSecondary(cmd, iArgs) })
+		d.goScript(func(ctx context.Context) { d.writeSecondary(ctx, cmd, iArgs) })
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
@@ -292,10 +385,7 @@ func (d *DualWriter) Script(ctx context.Context, cmd string, args [][]byte) (any
 // original message to Sentry and the structured log, and so the retry
 // predicate isReadTSCompactedError matches the exact substring coming back
 // from gRPC.
-func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
-	sCtx, cancel := context.WithTimeout(context.Background(), d.cfg.SecondaryTimeout)
-	defer cancel()
-
+func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []any) {
 	start := time.Now()
 
 	backoff := compactedRetryInitialBackoff
@@ -317,14 +407,15 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 				_, sErr = result.Result()
 			}
 		}
-		if !isReadTSCompactedError(sErr) {
+		retryReason, retryLimit := secondaryRetryReasonAndLimit(cmd, sErr)
+		if retryReason == "" {
 			break
 		}
-		if attempt >= maxCompactedRetries {
+		if attempt >= retryLimit {
 			break
 		}
-		d.logger.Debug("retrying secondary write on compacted snapshot",
-			"cmd", cmd, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		d.logger.Debug("retrying secondary write",
+			"cmd", cmd, "reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
 		if !waitCompactedRetryBackoff(sCtx, backoff) {
 			break
 		}
@@ -341,6 +432,72 @@ func (d *DualWriter) writeSecondary(cmd string, iArgs []any) {
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.secondary.Name(), "ok").Inc()
 }
 
+func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) {
+	start := time.Now()
+
+	backoff := compactedRetryInitialBackoff
+	var sErr error
+	var attempt int
+	for ; ; attempt++ {
+		results, pErr := d.secondary.Pipeline(sCtx, cmds)
+		sErr = secondaryPipelineError(results, pErr)
+		retryReason, retryLimit := secondaryPipelineRetryReasonAndLimit(sErr)
+		if retryReason == "" {
+			break
+		}
+		if attempt >= retryLimit {
+			break
+		}
+		d.logger.Debug("retrying secondary txn replay",
+			"reason", retryReason, "attempt", attempt+1, "backoff", backoff, "err", sErr)
+		if !waitCompactedRetryBackoff(sCtx, backoff) {
+			break
+		}
+		backoff = nextCompactedRetryBackoff(backoff)
+	}
+
+	elapsed := time.Since(start)
+	d.metrics.CommandDuration.WithLabelValues(cmdExec, d.secondary.Name()).Observe(elapsed.Seconds())
+
+	if sErr != nil && !errors.Is(sErr, redis.Nil) {
+		d.recordSecondaryWriteFailure(cmdExec, pipelineCommandNames(cmds), elapsed, attempt+1, false, sErr)
+		return
+	}
+	d.metrics.CommandTotal.WithLabelValues(cmdExec, d.secondary.Name(), "ok").Inc()
+}
+
+func secondaryPipelineError(results []*redis.Cmd, err error) error {
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		return errors.New("empty transaction response")
+	}
+	err = results[len(results)-1].Err()
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("transaction exec: %w", err)
+}
+
+func secondaryPipelineRetryReasonAndLimit(err error) (string, int) {
+	if isServerOverloadedError(err) {
+		return "server_overloaded", maxServerOverloadedRetries
+	}
+	return "", 0
+}
+
+func pipelineCommandNames(cmds [][]any) []any {
+	names := make([]any, 0, len(cmds))
+	for _, args := range cmds {
+		if len(args) == 0 {
+			continue
+		}
+		names = append(names, args[0])
+	}
+	return names
+}
+
 // recordSecondaryWriteFailure updates metrics, reports to Sentry, and emits a
 // structured warning with enough context to diagnose EVALSHA timeouts.
 func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapsed time.Duration, attempts int, usedNOSCRIPTFallback bool, sErr error) {
@@ -353,7 +510,7 @@ func (d *DualWriter) recordSecondaryWriteFailure(cmd string, iArgs []any, elapse
 		d.sentry.CaptureException(sErr, "secondary_write_failure", argsToBytes(iArgs))
 	}
 	warnArgs := []any{"cmd", cmd, "err", sErr, "elapsed", elapsed, "attempts", attempts}
-	if (cmd == "EVALSHA" || cmd == "EVALSHA_RO") && len(iArgs) > 1 {
+	if (cmd == cmdEvalSHA || cmd == cmdEvalSHARO) && len(iArgs) > 1 {
 		switch v := iArgs[1].(type) {
 		case []byte:
 			warnArgs = append(warnArgs, "sha", string(v))
@@ -415,31 +572,88 @@ func nextCompactedRetryBackoff(current time.Duration) time.Duration {
 	return next
 }
 
-// goWrite launches fn in a bounded write goroutine.
-func (d *DualWriter) goWrite(fn func()) {
-	d.goAsyncWithSem(d.writeSem, fn)
+func secondaryRetryReasonAndLimit(cmd string, err error) (string, int) {
+	switch {
+	case isReadTSCompactedError(err):
+		return "compacted_snapshot", maxCompactedRetries
+	case isServerOverloadedError(err) && !isRedisScriptCommandName(cmd):
+		return "server_overloaded", maxServerOverloadedRetries
+	default:
+		return "", 0
+	}
+}
+
+// goWrite queues fn for bounded secondary execution.
+func (d *DualWriter) goWrite(fn func(context.Context)) {
+	d.enqueueAsync(d.writeQueue, d.writeQueueSlots, asyncQueueWrite, fn)
 }
 
 // goScript launches fn in a bounded Lua-script write goroutine.
-// It uses a smaller semaphore than goWrite to cap the number of concurrent
-// EVAL/EVALSHA secondary writes. When the cap is reached the write is dropped.
-func (d *DualWriter) goScript(fn func()) {
-	d.goAsyncWithSem(d.scriptSem, fn)
+// It uses a smaller class limit while also consuming the shared write limit.
+func (d *DualWriter) goScript(fn func(context.Context)) {
+	d.enqueueAsync(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, fn)
 }
 
 // goShadow launches fn in a bounded shadow-read goroutine.
 func (d *DualWriter) goShadow(fn func()) {
-	d.goAsyncWithSem(d.shadowSem, fn)
+	d.goShadowWithSem(fn)
 }
 
-// goAsync launches fn using the write semaphore (for backward compat with txn replay).
-func (d *DualWriter) goAsync(fn func()) {
+// goAsync queues fn with the write class (for txn replay).
+func (d *DualWriter) goAsync(fn func(context.Context)) {
 	d.goWrite(fn)
 }
 
-// goAsyncWithSem launches fn in a bounded goroutine using the given semaphore.
-// If the DualWriter is closing or the semaphore is full, the work is dropped.
-func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
+func (d *DualWriter) startBackendPoolSampler() {
+	backends := backendPoolSampleBackends(d.primary, d.secondary)
+	if len(backends) == 0 {
+		return
+	}
+	d.sampleBackendPools(backends)
+	d.poolStatsWG.Add(1)
+	go func() {
+		defer d.poolStatsWG.Done()
+		ticker := time.NewTicker(backendPoolSampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				d.sampleBackendPools(backends)
+			case <-d.poolStatsStop:
+				return
+			}
+		}
+	}()
+}
+
+func (d *DualWriter) sampleBackendPools(backends []Backend) {
+	for _, backend := range backends {
+		d.metrics.observeBackendPool(backend)
+	}
+}
+
+func backendPoolSampleBackends(backends ...Backend) []Backend {
+	seen := make(map[string]struct{}, len(backends))
+	out := make([]Backend, 0, len(backends))
+	for _, backend := range backends {
+		if backend == nil {
+			continue
+		}
+		if _, ok := backend.(backendPoolStatsProvider); !ok {
+			continue
+		}
+		name := backend.Name()
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, backend)
+	}
+	return out
+}
+
+// goShadowWithSem launches a shadow read without entering the write queues.
+func (d *DualWriter) goShadowWithSem(fn func()) {
 	// Hold mu while checking closed and calling wg.Add so that Close() cannot
 	// start wg.Wait() between the closed-check and the wg.Add(1) call.
 	d.mu.Lock()
@@ -448,24 +662,29 @@ func (d *DualWriter) goAsyncWithSem(sem chan struct{}, fn func()) {
 		return
 	}
 	select {
-	case sem <- struct{}{}:
-		d.wg.Add(1)
+	case d.shadowSem <- struct{}{}:
+		d.shadowWG.Add(1)
 		d.mu.Unlock()
 		go func() {
 			defer func() {
-				<-sem
-				d.wg.Done()
+				<-d.shadowSem
+				d.shadowWG.Done()
 			}()
 			fn()
 		}()
 	default:
 		d.mu.Unlock()
-		d.metrics.AsyncDrops.Inc()
-		d.logAsyncDrop()
+		d.recordAsyncDrop(asyncQueueShadow, asyncDropQueueFull, cap(d.shadowSem), len(d.shadowSem))
 	}
 }
 
-func (d *DualWriter) logAsyncDrop() {
+func (d *DualWriter) recordAsyncDrop(queue, reason string, capacity, depth int) {
+	d.metrics.AsyncDrops.Inc()
+	d.metrics.AsyncDropsByQueue.WithLabelValues(queue, reason).Inc()
+	d.logAsyncDrop(queue, reason, capacity, depth)
+}
+
+func (d *DualWriter) logAsyncDrop(queue, reason string, capacity, depth int) {
 	nowNano := time.Now().UnixNano()
 
 	nextLog := atomic.LoadInt64(&d.nextAsyncDropLog)
@@ -487,10 +706,12 @@ func (d *DualWriter) logAsyncDrop() {
 	atomic.StoreInt64(&d.nextAsyncDropLog, time.Now().Add(asyncDropLogInterval).UnixNano())
 
 	if suppressed > 0 {
-		d.logger.Warn("async goroutine limit reached, dropping secondary operation", "suppressed", suppressed)
+		d.logger.Warn("async operation dropped", "queue", queue, "reason", reason,
+			"capacity", capacity, "depth", depth, "suppressed", suppressed)
 		return
 	}
-	d.logger.Warn("async goroutine limit reached, dropping secondary operation")
+	d.logger.Warn("async operation dropped", "queue", queue, "reason", reason,
+		"capacity", capacity, "depth", depth)
 }
 
 func (d *DualWriter) hasSecondaryWrite() bool {
@@ -554,6 +775,7 @@ var secondaryWriteErrorPatterns = []struct {
 	reason string
 }{
 	{"retry limit exceeded", "retry_limit"},
+	{serverOverloadedMarker, "busy"},
 	{"write conflict", "write_conflict"},
 	{"deadline exceeded", "deadline_exceeded"},
 	{"not leader", "not_leader"},

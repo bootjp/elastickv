@@ -60,18 +60,24 @@ type ProxyConfig struct {
 	SecondaryPassword string
 	Mode              ProxyMode
 	SecondaryTimeout  time.Duration
-	// SecondaryWriteConcurrency limits concurrent asynchronous secondary writes.
-	// Zero keeps the package default.
+	// SecondaryWriteConcurrency limits all concurrent asynchronous secondary
+	// writes, including Lua scripts. Zero keeps the package default.
 	SecondaryWriteConcurrency int
 	// SecondaryScriptConcurrency limits concurrent asynchronous secondary Lua
-	// script writes. Zero keeps the package default.
+	// script writes within SecondaryWriteConcurrency. Zero keeps the package default.
 	SecondaryScriptConcurrency int
-	ShadowTimeout              time.Duration
-	SentryDSN                  string
-	SentryEnv                  string
-	SentrySampleRate           float64
-	MetricsAddr                string
-	PubSubCompareWindow        time.Duration
+	// SecondaryWriteQueueCapacity bounds queued non-script secondary writes.
+	// Zero derives a capacity from SecondaryWriteConcurrency.
+	SecondaryWriteQueueCapacity int
+	// SecondaryScriptQueueCapacity bounds queued secondary Lua script writes.
+	// Zero derives a capacity from SecondaryScriptConcurrency.
+	SecondaryScriptQueueCapacity int
+	ShadowTimeout                time.Duration
+	SentryDSN                    string
+	SentryEnv                    string
+	SentrySampleRate             float64
+	MetricsAddr                  string
+	PubSubCompareWindow          time.Duration
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.
