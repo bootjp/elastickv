@@ -177,7 +177,7 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 	// Let the reader enter the wait loop and exhaust its first
 	// (full) iteration on a missing key. Then SET a string at the
 	// same key. The next fallback-timer wake after the
-	// previous one) must run the full check and surface WRONGTYPE.
+	// previous one must run the full check and surface WRONGTYPE.
 	time.Sleep(50 * time.Millisecond)
 	require.NoError(t, rdbWriter.Set(ctx, "bzpop-mid-wrongtype", "I am a string", 0).Err())
 
