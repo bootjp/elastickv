@@ -115,14 +115,21 @@ const (
 )
 
 const (
-	redisDispatchTimeout     = 10 * time.Second
-	redisFlushLegacyTimeout  = 10 * time.Minute
-	redisRelayPublishTimeout = 2 * time.Second
-	redisTraceArgLimit       = 6
-	redisTraceArgMaxLen      = 96
-	redisTraceArgEllipsis    = "..."
-	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
-	redisTraceRedactAfter    = 1 // redact arguments after key (command name already stripped by caller)
+	redisDispatchTimeout = 10 * time.Second
+	// defaultRedisBlockWaitFallback is the safety-net poll interval for
+	// blocking-command wait loops when no in-process write signal arrives.
+	// Signals cover normal XADD / ZADD / ZINCRBY wakeups immediately; this
+	// interval only bounds missed-signal, wrong-type, and BLOCK-deadline checks.
+	// Keep it below common sub-second BLOCK budgets while reducing idle
+	// fallback scans versus the previous 100ms cadence.
+	defaultRedisBlockWaitFallback = 250 * time.Millisecond
+	redisFlushLegacyTimeout       = 10 * time.Minute
+	redisRelayPublishTimeout      = 2 * time.Second
+	redisTraceArgLimit            = 6
+	redisTraceArgMaxLen           = 96
+	redisTraceArgEllipsis         = "..."
+	redisTraceArgTrimLen          = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
+	redisTraceRedactAfter         = 1 // redact arguments after key (command name already stripped by caller)
 
 	// listPopDeltaOverhead is the number of extra elements reserved in a list
 	// pop elem slice beyond the per-position claim keys and per-item del keys:
@@ -166,6 +173,9 @@ type RedisServer struct {
 	heavyCommandLimiter *redisHeavyCommandLimiter
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
+	// blockWaitFallback is the safety-net polling interval used by blocking
+	// Redis commands when no waiter signal arrives.
+	blockWaitFallback time.Duration
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -327,6 +337,18 @@ func WithRedisHeavyCommandSlots(n int) RedisServerOption {
 func WithRedisPerPeerConnectionLimit(n int) RedisServerOption {
 	return func(r *RedisServer) {
 		r.peerLimiter = newRedisPeerLimiter(n)
+	}
+}
+
+// WithRedisBlockWaitFallback overrides the safety-net polling interval for
+// blocking Redis commands. Production should normally use the default and rely
+// on waiter signals for immediate wakeups; tests use a shorter interval to keep
+// package runtime bounded.
+func WithRedisBlockWaitFallback(d time.Duration) RedisServerOption {
+	return func(r *RedisServer) {
+		if d > 0 {
+			r.blockWaitFallback = d
+		}
 	}
 }
 
@@ -517,6 +539,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
 		peerLimiter:         newDefaultRedisPeerLimiter(),
+		blockWaitFallback:   defaultRedisBlockWaitFallback,
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).

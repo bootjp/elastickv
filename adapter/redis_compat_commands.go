@@ -1,27 +1,11 @@
 package adapter
 
-import (
-	"time"
-)
-
 const (
 	redisPairWidth      = 2
 	redisTripletWidth   = 3
 	pubsubPatternArgMin = 3
 	pubsubFirstChannel  = 2
-	// redisBlockWaitFallback is the safety-net poll interval that fires
-	// in blocking-command wait loops (XREAD BLOCK, BZPOPMIN — and the
-	// future BLPOP / BRPOP / BLMOVE) when no in-process write signal
-	// arrives. The signal path covers all in-process XADD / ZADD /
-	// ZINCRBY on the same node; the fallback covers paths that bypass
-	// Signal (Lua flush, follower-applied entries — both addressed by
-	// the FSM ApplyObserver tracked in
-	// docs/design/2026_04_26_implemented_fsm_apply_observer.md).
-	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
-	// busy-poll, while bounding stale-poll latency to a value clients
-	// already tolerate from network round-trips.
-	redisBlockWaitFallback = 100 * time.Millisecond
-	redisKeywordCount      = "COUNT"
+	redisKeywordCount   = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set
 	// wide-column mutation slice beyond the per-member elements: one for the
