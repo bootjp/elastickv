@@ -11,7 +11,7 @@ import (
 
 const (
 	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 8
+	defaultElasticKVPoolSize = 4
 	defaultDialTimeout       = 5 * time.Second
 	defaultReadTimeout       = 3 * time.Second
 	defaultWriteTimeout      = 3 * time.Second
@@ -73,8 +73,8 @@ func DefaultBackendOptions() BackendOptions {
 
 // DefaultElasticKVBackendOptions returns defaults for proxy backends that
 // connect to ElasticKV's Redis adapter. Keep the default within ElasticKV's
-// server-side per-peer cap so mixed-version proxy rollouts do not exceed older
-// servers; operators can still raise this together with
+// server-side per-peer cap while leaving room for dedicated Pub/Sub and
+// blocking-command sockets. Operators can still raise this together with
 // ELASTICKV_REDIS_PER_PEER_CONNECTIONS after the cluster is configured for it.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
