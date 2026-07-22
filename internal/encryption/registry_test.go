@@ -75,6 +75,36 @@ func TestRegistryDEKPrefix(t *testing.T) {
 	}
 }
 
+func TestIsRegistryKey(t *testing.T) {
+	t.Parallel()
+	valid := encryption.RegistryKey(0xfeedbeef, 0xcafe)
+	wrongPrefix := append([]byte{}, valid...)
+	wrongPrefix[1] = 'x'
+	missingSep := append([]byte{}, valid...)
+	missingSep[len(encryption.WriterRegistryPrefix)+4] = 'X'
+	prefixUserKey := append([]byte{}, encryption.WriterRegistryPrefix...)
+	prefixUserKey = append(prefixUserKey, []byte("tenant-visible-key")...)
+	cases := []struct {
+		name string
+		key  []byte
+		want bool
+	}{
+		{"valid", valid, true},
+		{"empty", nil, false},
+		{"wrong length", append([]byte{}, valid[:len(valid)-1]...), false},
+		{"wrong prefix same length", wrongPrefix, false},
+		{"missing separator", missingSep, false},
+		{"user key with registry prefix remains data", prefixUserKey, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := encryption.IsRegistryKey(tc.key); got != tc.want {
+				t.Fatalf("IsRegistryKey() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDecodeRegistryKey_RejectsMalformed(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
