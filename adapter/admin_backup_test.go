@@ -122,6 +122,7 @@ type backupTestStore struct {
 	pairCloseErr error
 	captureErr   error
 	validateErr  error
+	valueKeys    [][]byte
 }
 
 func (s *backupTestStore) ValidateBackupSnapshotAt(context.Context, kv.BackupRouteSnapshot, uint64, int) error {
@@ -154,15 +155,40 @@ func (s *backupTestStore) NewBackupKeyScannerAtSnapshot(_ kv.BackupRouteSnapshot
 }
 
 func (s *backupTestStore) NewBackupScannerAtSnapshot(_ kv.BackupRouteSnapshot, ts uint64, _ int) kv.BackupScanner {
+	return s.newBackupScannerAtSnapshot(ts, nil)
+}
+
+func (s *backupTestStore) NewFilteredBackupScannerAtSnapshot(
+	_ kv.BackupRouteSnapshot,
+	ts uint64,
+	_ int,
+	keyFilter kv.BackupKeyFilter,
+) kv.BackupScanner {
+	return s.newBackupScannerAtSnapshot(ts, keyFilter)
+}
+
+func (s *backupTestStore) newBackupScannerAtSnapshot(ts uint64, keyFilter kv.BackupKeyFilter) kv.BackupScanner {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.readTS = append(s.readTS, ts)
 	pairs := make([]*kvstore.KVPair, 0, len(s.keys))
+	var filterErr error
 	for _, key := range s.keys {
+		if keyFilter != nil {
+			selected, err := keyFilter(key)
+			if err != nil {
+				filterErr = err
+				break
+			}
+			if !selected {
+				continue
+			}
+		}
+		s.valueKeys = append(s.valueKeys, append([]byte(nil), key...))
 		pairs = append(pairs, &kvstore.KVPair{Key: append([]byte(nil), key...), Value: []byte("value")})
 	}
 	closeErr := s.pairCloseErr
-	s.mu.Unlock()
-	return &backupPairScanner{pairs: pairs, closeErr: closeErr}
+	return &backupPairScanner{pairs: pairs, err: filterErr, closeErr: closeErr}
 }
 
 type backupSliceScanner struct {
@@ -205,11 +231,17 @@ func (s *backupSliceScanner) Close() error { return s.closeErr }
 type backupPairScanner struct {
 	pairs    []*kvstore.KVPair
 	index    int
+	err      error
 	closeErr error
 }
 
 func (s *backupPairScanner) Next(ctx context.Context) (*kvstore.KVPair, bool, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if s.err != nil {
+		err := s.err
+		s.err = nil
 		return nil, false, err
 	}
 	if s.index >= len(s.pairs) {
@@ -464,6 +496,7 @@ func TestStreamBackupUsesPinTimestampAndScopeFilter(t *testing.T) {
 	require.Len(t, stream.got, 1)
 	require.Equal(t, redisKey, stream.got[0].GetKey())
 	require.Equal(t, uint64(42), store.readTS[len(store.readTS)-1])
+	require.Equal(t, [][]byte{redisKey}, store.valueKeys)
 }
 
 func TestStreamBackupPreservesContextStatusAndReportsCloseErrors(t *testing.T) {
@@ -560,6 +593,28 @@ func TestStreamBackupHonorsRenewedSessionDeadline(t *testing.T) {
 	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, stream)
 	require.NoError(t, err)
 	require.Len(t, stream.got, 2)
+}
+
+func TestRenewBackupFailsWhenSessionEndsDuringRenew(t *testing.T) {
+	t.Parallel()
+	store := &backupTestStore{keys: [][]byte{[]byte(logicalbackup.RedisStringPrefix + "key")}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	tok, err := srv.decodeBackupToken(begin.GetPinToken())
+	require.NoError(t, err)
+
+	proposer.onPropose = func(subtype byte, _ uint64) {
+		if subtype == backupSubtypePin {
+			srv.forgetBackupSession(tok.pinID)
+		}
+	}
+	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, proposer.subtypes(), backupSubtypeRelease)
+	require.Contains(t, proposer.subtypes(), backupSubtypeUnreserve)
 }
 
 func TestStreamBackupFailsClosedWithoutPinnedRouteSnapshot(t *testing.T) {

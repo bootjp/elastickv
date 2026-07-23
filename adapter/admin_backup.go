@@ -62,6 +62,15 @@ type BackupStore interface {
 	NewBackupScannerAtSnapshot(snapshot kv.BackupRouteSnapshot, ts uint64, pageSize int) kv.BackupScanner
 }
 
+type filteredBackupScanStore interface {
+	NewFilteredBackupScannerAtSnapshot(
+		snapshot kv.BackupRouteSnapshot,
+		ts uint64,
+		pageSize int,
+		keyFilter kv.BackupKeyFilter,
+	) kv.BackupScanner
+}
+
 type BackupPinLimiter interface {
 	PinWithDeadline(pinID kv.BackupPinID, readTS uint64, deadline time.Time) error
 	ReleaseBackupPin(pinID kv.BackupPinID)
@@ -431,12 +440,24 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 		s.forgetBackupSession(tok.pinID)
 		return nil, err
 	}
+	return s.finishRenewBackup(groups, tok, ttl, deadline)
+}
+
+func (s *AdminServer) finishRenewBackup(
+	groups []backupGroup,
+	tok backupToken,
+	ttl time.Duration,
+	deadline time.Time,
+) (*pb.RenewBackupResponse, error) {
 	tok.deadline = deadline
+	if !s.extendBackupSession(tok) {
+		s.compensateBackupRelease(groups[0], groups, tok.pinID)
+		return nil, status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	}
 	encodedToken, err := s.encodeBackupToken(tok)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode renewed backup token: %v", err)
 	}
-	s.extendBackupSession(tok)
 	return &pb.RenewBackupResponse{
 		TtlMsEffective: uint64(ttl / time.Millisecond), //nolint:gosec // validated positive.
 		PinToken:       encodedToken,
@@ -528,7 +549,7 @@ func (s *AdminServer) StreamBackup(
 	if err != nil {
 		return err
 	}
-	scanner := s.backupStore.NewBackupScannerAtSnapshot(routes, tok.readTS, s.backupConfig.scanPageSize)
+	scanner := s.newBackupStreamScanner(routes, tok.readTS, selected)
 	if scanner == nil {
 		return status.Errorf(codes.Unavailable, "%s", "backup scanner is nil")
 	}
@@ -542,6 +563,21 @@ func (s *AdminServer) StreamBackup(
 		return status.Errorf(codes.Internal, "close backup scanner: %v", err)
 	}
 	return nil
+}
+
+func (s *AdminServer) newBackupStreamScanner(
+	routes kv.BackupRouteSnapshot,
+	readTS uint64,
+	selected map[logicalbackup.Scope]bool,
+) kv.BackupScanner {
+	if len(selected) > 0 {
+		if filtered, ok := s.backupStore.(filteredBackupScanStore); ok {
+			return filtered.NewFilteredBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize, func(key []byte) (bool, error) {
+				return backupKeySelected(key, selected)
+			})
+		}
+	}
+	return s.backupStore.NewBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
 }
 
 func streamBackupRecords(
@@ -581,7 +617,11 @@ func backupRecordSelected(pair *store.KVPair, selected map[logicalbackup.Scope]b
 	if pair == nil {
 		return false, status.Errorf(codes.Internal, "%s", "backup scanner returned a nil record")
 	}
-	scope, scoped, err := logicalbackup.ScopeForKey(pair.Key)
+	return backupKeySelected(pair.Key, selected)
+}
+
+func backupKeySelected(key []byte, selected map[logicalbackup.Scope]bool) (bool, error) {
+	scope, scoped, err := logicalbackup.ScopeForKey(key)
 	if err != nil {
 		return false, status.Errorf(codes.FailedPrecondition, "classify backup key: %v", err)
 	}
@@ -1074,17 +1114,18 @@ func (s *AdminServer) requireLiveBackupSession(tok backupToken) error {
 	return nil
 }
 
-func (s *AdminServer) extendBackupSession(tok backupToken) {
+func (s *AdminServer) extendBackupSession(tok backupToken) bool {
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
 	session, ok := s.backupSessions[tok.pinID]
 	if !ok || session.readTS != tok.readTS {
-		return
+		return false
 	}
 	if tok.deadline.After(session.deadline) {
 		session.deadline = tok.deadline
 		s.backupSessions[tok.pinID] = session
 	}
+	return true
 }
 
 func (s *AdminServer) forgetBackupSession(pinID kv.BackupPinID) {

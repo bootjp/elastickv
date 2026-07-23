@@ -19,6 +19,10 @@ type BackupScanner interface {
 	Close() error
 }
 
+// BackupKeyFilter decides whether a key should be materialized by a value
+// scanner. It runs after route ownership filtering but before reading values.
+type BackupKeyFilter func(key []byte) (bool, error)
+
 // BackupKeyScanner is the count-only counterpart to BackupScanner. It pages
 // through the same captured route set without materializing values.
 type BackupKeyScanner interface {
@@ -47,6 +51,7 @@ type backupScanner struct {
 	cursor        []byte
 	page          []*store.KVPair
 	index         int
+	keyFilter     BackupKeyFilter
 	closed        bool
 	exhausted     bool
 }
@@ -169,6 +174,18 @@ func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *Shar
 
 // NewBackupScannerAtSnapshot creates a value scanner from a captured route view.
 func NewBackupScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupScanner {
+	return NewFilteredBackupScannerAtSnapshot(st, snapshot, ts, pageSize, nil)
+}
+
+// NewFilteredBackupScannerAtSnapshot creates a value scanner that skips
+// filtered-out keys before materializing values.
+func NewFilteredBackupScannerAtSnapshot(
+	st *ShardStore,
+	snapshot BackupRouteSnapshot,
+	ts uint64,
+	pageSize int,
+	keyFilter BackupKeyFilter,
+) BackupScanner {
 	if pageSize <= 0 {
 		pageSize = defaultBackupScanPageSize
 	}
@@ -181,6 +198,7 @@ func NewBackupScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot, ts
 		end:           snapshot.end,
 		ts:            ts,
 		pageSize:      pageSize,
+		keyFilter:     keyFilter,
 	}
 }
 
@@ -190,6 +208,15 @@ func (s *ShardStore) NewBackupScanner(start []byte, end []byte, ts uint64, pageS
 
 func (s *ShardStore) NewBackupScannerAtSnapshot(snapshot BackupRouteSnapshot, ts uint64, pageSize int) BackupScanner {
 	return NewBackupScannerAtSnapshot(s, snapshot, ts, pageSize)
+}
+
+func (s *ShardStore) NewFilteredBackupScannerAtSnapshot(
+	snapshot BackupRouteSnapshot,
+	ts uint64,
+	pageSize int,
+	keyFilter BackupKeyFilter,
+) BackupScanner {
+	return NewFilteredBackupScannerAtSnapshot(s, snapshot, ts, pageSize, keyFilter)
 }
 
 func NewBackupKeyScanner(st *ShardStore, start []byte, end []byte, ts uint64, pageSize int) BackupKeyScanner {
@@ -323,21 +350,14 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	}
 	s.page = s.page[:0]
 	for _, item := range keys {
-		route, ok, err := s.materializeRouteForKey(item)
+		kvp, ok, err := s.materializeBackupKey(ctx, item)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			continue
 		}
-		val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
-		if errors.Is(err, store.ErrKeyNotFound) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		s.page = append(s.page, &store.KVPair{Key: bytes.Clone(item.key), Value: bytes.Clone(val)})
+		s.page = append(s.page, kvp)
 	}
 	s.index = 0
 	if len(keys) == 0 {
@@ -351,6 +371,33 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 	}
 	s.cursor = nextScanCursor(last)
 	return nil
+}
+
+func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedScanKey) (*store.KVPair, bool, error) {
+	if s.keyFilter != nil {
+		selected, err := s.keyFilter(item.key)
+		if err != nil {
+			return nil, false, err
+		}
+		if !selected {
+			return nil, false, nil
+		}
+	}
+	route, ok, err := s.materializeRouteForKey(item)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &store.KVPair{Key: bytes.Clone(item.key), Value: bytes.Clone(val)}, true, nil
 }
 
 func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution.Route, bool, error) {
