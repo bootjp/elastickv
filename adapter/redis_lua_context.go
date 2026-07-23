@@ -260,7 +260,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, server.coordinator, server.readTS(), "redis lua: begin read timestamp")
+	readTimestamp, err := server.beginTxnReadTimestamp(ctx, "redis lua: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

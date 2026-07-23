@@ -646,7 +646,8 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 				{Op: kv.Put, Key: s3keys.BucketGenerationKey(bucket), Value: encodeS3Generation(nextGeneration)},
 			},
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), req)
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req)
 		return errors.WithStack(err)
 	})
 	if err != nil {

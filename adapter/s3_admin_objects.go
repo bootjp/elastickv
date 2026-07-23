@@ -347,7 +347,8 @@ func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string,
 		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
 		return nil, 0, errors.WithStack(err)
 	}
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,

@@ -2,6 +2,9 @@ package adapter
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +85,69 @@ func TestS3BeginTxnReadTimestampPhaseDNormalizesEmptySnapshotSentinel(t *testing
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), readTimestamp.Timestamp())
 	require.Zero(t, allocator.count, "an empty S3 snapshot must not allocate ahead of Raft apply")
+}
+
+func TestS3CreateBucketPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	req := httptest.NewRequest(http.MethodPut, "/voucher-bucket", nil)
+	rec := httptest.NewRecorder()
+	server.createBucket(rec, req, "voucher-bucket")
+
+	require.Equalf(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, 1, coord.vouchCalls, "create bucket must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
+func TestS3AdminCreateBucketPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	_, err := server.AdminCreateBucket(context.Background(), fullAdminBucketsPrincipal(), "admin-voucher-bucket", s3AclPrivate)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, coord.vouchCalls, "admin create bucket must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
+func TestS3AdminPutObjectPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	const generation = uint64(1)
+	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{
+		BucketName:   "admin-voucher-bucket",
+		Generation:   generation,
+		CreatedAtHLC: 1,
+		Region:       s3DefaultRegion,
+		Owner:        "AKIA_FULL",
+		Acl:          s3AclPrivate,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, s3keys.BucketMetaKey("admin-voucher-bucket"), bucketMeta, 1, 0))
+
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	err = server.AdminPutObject(ctx, fullAdminBucketsPrincipal(), "admin-voucher-bucket", "key.txt", strings.NewReader(""), "text/plain")
+
+	require.NoError(t, err)
+	require.Equal(t, 1, coord.vouchCalls, "admin put object must carry the applied-read voucher into final dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
 }
 
 // TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling verifies that
