@@ -31,6 +31,11 @@ service RaftAdmin {
   rpc TransferLeadership(RaftAdminTransferLeadershipRequest) returns (RaftAdminTransferLeadershipResponse) {}
 }
 
+service S3BlobFetch {
+  rpc FetchChunkBlob(FetchChunkBlobRequest) returns (stream FetchChunkBlobResponse) {}
+  rpc PushChunkBlob(stream PushChunkBlobRequest) returns (PushChunkBlobResponse) {}
+}
+
 message RawPutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -190,6 +195,9 @@ enum RaftAdminState {
 message RaftAdminStatusRequest {}
 
 message RaftAdminStatusResponse {
+  reserved 12, 13;
+  reserved "configuration_index", "pending_conf_change";
+
   RaftAdminState state = 1;
   string leader_id = 2;
   string leader_address = 3;
@@ -265,6 +273,26 @@ message RaftAdminTransferLeadershipRequest {
 message TransferTarget {
   string target_id = 1;
   string target_address = 2;
+}
+
+message FetchChunkBlobRequest {
+  bytes content_sha256 = 1;
+}
+
+message FetchChunkBlobResponse {
+  bytes payload = 1;
+  bool eof = 2;
+}
+
+message PushChunkBlobRequest {
+  bytes content_sha256 = 1;
+  bytes payload = 2;
+  bool eof = 3;
+  uint64 commit_ts = 4;
+}
+
+message PushChunkBlobResponse {
+  bool durable = 1;
 }
 
 message RaftAdminTransferLeadershipResponse {}

@@ -20,7 +20,13 @@ const (
 	txnReadChunkSize        = 4096
 )
 
-const txnLockFlagPrimary byte = 0x01
+const (
+	txnLockFlagPrimary  byte = 0x01
+	txnLockFlagCommitTS byte = 0x02
+	txnLockKnownFlags        = txnLockFlagPrimary | txnLockFlagCommitTS
+)
+
+const txnLockPrimaryOffset = 1 + uint64FieldSize + uint64FieldSize + 1 + uint64FieldSize
 
 const (
 	txnMetaFlagLockTTL      byte = 0x01
@@ -225,11 +231,15 @@ type txnLock struct {
 	TTLExpireAt  uint64
 	PrimaryKey   []byte
 	IsPrimaryKey bool
+	CommitTS     uint64
 }
 
 func encodeTxnLock(l txnLock) []byte {
-	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey
+	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey + optional fields
 	size := 1 + uint64FieldSize + uint64FieldSize + 1 + uint64FieldSize + len(l.PrimaryKey)
+	if l.CommitTS != 0 {
+		size += uint64FieldSize
+	}
 	b := make([]byte, size)
 	b[0] = txnLockVersion
 	binary.BigEndian.PutUint64(b[1:], l.StartTS)
@@ -238,9 +248,16 @@ func encodeTxnLock(l txnLock) []byte {
 	if l.IsPrimaryKey {
 		flags |= txnLockFlagPrimary
 	}
+	if l.CommitTS != 0 {
+		flags |= txnLockFlagCommitTS
+	}
 	b[17] = flags
 	binary.BigEndian.PutUint64(b[18:], uint64(len(l.PrimaryKey)))
-	copy(b[26:], l.PrimaryKey)
+	copy(b[txnLockPrimaryOffset:], l.PrimaryKey)
+	offset := txnLockPrimaryOffset + len(l.PrimaryKey)
+	if flags&txnLockFlagCommitTS != 0 {
+		binary.BigEndian.PutUint64(b[offset:], l.CommitTS)
+	}
 	return b
 }
 
@@ -252,32 +269,58 @@ func decodeTxnLock(b []byte) (txnLock, error) {
 		return txnLock{}, errors.WithStack(errors.Newf("txn lock: unsupported version %d", b[0]))
 	}
 	r := bytes.NewReader(b[1:])
-	var startTS uint64
-	var ttlExpireAt uint64
-	if err := binary.Read(r, binary.BigEndian, &startTS); err != nil {
-		return txnLock{}, errors.WithStack(err)
-	}
-	if err := binary.Read(r, binary.BigEndian, &ttlExpireAt); err != nil {
-		return txnLock{}, errors.WithStack(err)
-	}
-	flags, err := r.ReadByte()
-	if err != nil {
-		return txnLock{}, errors.WithStack(err)
-	}
-	var primaryLen uint64
-	if err := binary.Read(r, binary.BigEndian, &primaryLen); err != nil {
-		return txnLock{}, errors.WithStack(err)
-	}
-	primaryKey, err := readTxnField(r, primaryLen, "txn lock: primary key truncated")
+	lock, flags, err := decodeTxnLockRequired(r)
 	if err != nil {
 		return txnLock{}, err
 	}
-	return txnLock{
+	return decodeTxnLockOptional(lock, flags, r)
+}
+
+func decodeTxnLockRequired(r *bytes.Reader) (txnLock, byte, error) {
+	startTS, err := readTxnUint64(r, "txn lock: start ts truncated")
+	if err != nil {
+		return txnLock{}, 0, err
+	}
+	ttlExpireAt, err := readTxnUint64(r, "txn lock: ttl expire at truncated")
+	if err != nil {
+		return txnLock{}, 0, err
+	}
+	flags, err := r.ReadByte()
+	if err != nil {
+		return txnLock{}, 0, errors.WithStack(err)
+	}
+	if flags&^txnLockKnownFlags != 0 {
+		return txnLock{}, 0, errors.WithStack(errors.Newf("txn lock: unsupported flags 0x%02x", flags))
+	}
+	primaryLen, err := readTxnUint64(r, "txn lock: primary key length truncated")
+	if err != nil {
+		return txnLock{}, 0, err
+	}
+	primaryKey, err := readTxnField(r, primaryLen, "txn lock: primary key truncated")
+	if err != nil {
+		return txnLock{}, 0, err
+	}
+	lock := txnLock{
 		StartTS:      startTS,
 		TTLExpireAt:  ttlExpireAt,
 		PrimaryKey:   primaryKey,
 		IsPrimaryKey: (flags & txnLockFlagPrimary) != 0,
-	}, nil
+	}
+	return lock, flags, nil
+}
+
+func decodeTxnLockOptional(lock txnLock, flags byte, r *bytes.Reader) (txnLock, error) {
+	if flags&txnLockFlagCommitTS != 0 {
+		commitTS, rerr := readTxnUint64(r, "txn lock: commit ts truncated")
+		if rerr != nil {
+			return txnLock{}, rerr
+		}
+		lock.CommitTS = commitTS
+	}
+	if r.Len() != 0 {
+		return txnLock{}, errors.WithStack(errors.Newf("txn lock: unexpected trailing bytes %d", r.Len()))
+	}
+	return lock, nil
 }
 
 type txnIntent struct {

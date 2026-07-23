@@ -16,6 +16,8 @@
 (def ^:private pid-file "/var/run/elastickv.pid")
 (def ^:private server-bin (str bin-dir "/elastickv"))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
+(def ^:private split-bin (str bin-dir "/elastickv-split"))
+(def ^:private list-routes-bin (str bin-dir "/elastickv-list-routes"))
 
 (def ^:private build-dir
   ;; local (control node) directory for built binaries
@@ -38,7 +40,9 @@
                      "GOPATH" "/home/vagrant/go"
                      "GOCACHE" "/home/vagrant/.cache/go-build"})]
     (doseq [[out-cmd args] [["elastickv" ["go" "build" "-o" (str build-dir "/elastickv") "./cmd/server"]]
-                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]]]
+                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]
+                            ["elastickv-split" ["go" "build" "-o" (str build-dir "/elastickv-split") "./cmd/elastickv-split"]]
+                            ["elastickv-list-routes" ["go" "build" "-o" (str build-dir "/elastickv-list-routes") "./cmd/elastickv-list-routes"]]]]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
           (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
@@ -58,7 +62,7 @@
   (c/on node
     (c/su
       (c/exec :mkdir :-p bin-dir)
-      (doseq [bin ["elastickv" "raftadmin"]]
+      (doseq [bin ["elastickv" "raftadmin" "elastickv-split" "elastickv-list-routes"]]
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
@@ -104,7 +108,7 @@
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -137,11 +141,16 @@
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
                bootstrap? (conj "--raftBootstrap"))
+        effective-server-env (cond-> (or server-env {})
+                               migration-enabled
+                               (merge {"ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE" "true"
+                                       "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE" "true"
+                                       "ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE" "true"}))
         daemon-opts (cond-> {:chdir bin-dir
                              :logfile log-file
                              :pidfile pid-file
                              :background? true}
-                      (seq server-env) (assoc :env server-env))]
+                      (seq effective-server-env) (assoc :env effective-server-env))]
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)

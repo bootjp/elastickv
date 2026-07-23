@@ -1,11 +1,13 @@
 # Hotspot Shard Split — Milestone 2: Migration Plane
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-06-11
 
 Parent: [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md).
 M1 (control plane) is as-built in [2026_02_18_implemented_hotspot_split_milestone1_pr.md](2026_02_18_implemented_hotspot_split_milestone1_pr.md).
+
+Current implementation status: implemented. The M2 stack provides the durable SplitJob catalog, versioned route descriptors, resumable range export/import, staged/live visibility, source write and read fences, current-voter readiness and cleanup barriers, constant-time route cutover, incremental target promotion, bounded source/target cleanup, terminal `DONE` history, and the deterministic cross-group Jepsen workload. PR #1096 completed the production runner and lifecycle wiring. Automatic hotspot detection and split scheduling remain M3 scope; the broader route-shuffle and fault campaign remains M4 scope.
 
 ## 1. Background
 
@@ -1241,7 +1243,7 @@ Phased into reviewable PRs, each lands behind its own doc-or-test gate:
 | M2-PR5 | Coordinator + FSM FENCE rejection (`ErrRouteWriteFenced`) with point and `DEL_PREFIX` range-footprint checks + route-faithful txn-lock drain (§3.2a.0a) + same-group `SplitRange` overlap rejection while a SplitJob is live | fsm + coordinator unit + `migrator_lock_drain_test` + `catalog_test` overlap red controls |
 | M2-PR6 | Cross-group end-to-end: ExportRangeVersions / ImportVersions server-side handlers + migrator BACKFILL/DELTA_COPY + raw-candidate staged/live merge read path in both scan directions and `LatestCommitTS` + §7.2.2e source-side cutover read-fence arm with every-current-source-voter ACK, membership-epoch re-ACK, catalog-version waiter, route-key-normalized scan ownership checks, and server-stamped RawKV read versions | integration incl. delete/TTL DELTA_COPY, Redis list/hash/set/zset/stream migration, HLC restart/fence-floor cases + `kv/fsm_cutover_read_fence_test.go` |
 | M2-PR7 | Target-local `PromotionState` + background promoter + ordered default-group promotion-complete CAS retaining `min_write_ts_exclusive` + source/target cleanup before DONE history move; readiness guard accepts matching cleared descriptors while retained; `AbandonSplitJob` with durable `ABANDONING` cleanup witness + CLEANUP GC + Jepsen split workload | `kv/fsm_promote_staged_test.go` raw hidden-version/LatestCommitTS merge + jepsen suite |
-| M2-PR8 | Rename `*_proposed_*` → `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 |  |
+| M2-PR8 | Rename `*_proposed_*` → `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 | Completed after the runner, voter barriers, cleanup lifecycle, route publication, and Jepsen workload landed in PR #1096. |
 
 Each PR follows the five-lens self-review and is gated by its tests + `make lint`.
 
@@ -1281,9 +1283,12 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 
 ## 14. Lifecycle
 
-This document begins as `*_proposed_*`. Per CLAUDE.md:
+This document is `*_implemented_*` because the M2 cross-group migration plane is complete as a central subsystem. The production runner now resumes durable jobs across leadership changes, drives every phase through `CLEANUP`, waits for current source and target voter proofs, publishes the target route, removes bounded migration state, and moves the job to `DONE` history. The deterministic Jepsen split workload exercises the cross-group operation alongside leader-kill and partition fault packages.
 
-- Rename to `*_partial_*` after M2-PR1 lands; track per-PR landing under §11.
-- Rename to `*_implemented_*` after M2-PR7 ships and the parent partial doc's M2 row is checked off.
+The remaining work is intentionally outside M2's central scope:
+
+- M3 owns automatic hotspot detection, target selection, and split scheduling.
+- M4 owns the broader route-shuffle nemesis matrix and production-scale fault campaigns.
+- Reverse migration after CUTOVER and concurrent migration jobs remain future extensions.
 
 `git mv` is used so history follows.

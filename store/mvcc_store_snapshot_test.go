@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,7 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	defer snap.Close()
 
 	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotLegacyVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
 
 	// Mutate source after snapshot so restore must reflect snapshot point-in-time.
 	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
@@ -36,6 +38,62 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	v, err = dst.GetAt(ctx, []byte("k2"), 30)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), v)
+}
+
+func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+
+	stale := TargetStagedReadinessState{
+		JobID:                  8,
+		RouteStart:             []byte("old"),
+		RouteEnd:               []byte("oldz"),
+		ExpectedCutoverVersion: 1,
+		MigrationJobID:         8,
+		MinWriteTSExclusive:    80,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, stale))
+
+	snapState := TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 12,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, snapState))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+		JobID:                  77,
+		RouteStart:             []byte("dst-only"),
+		RouteEnd:               []byte("dst-z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         77,
+		MinWriteTSExclusive:    700,
+		Armed:                  true,
+	}))
+
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	states, err := dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{stale, snapState}, states)
+
+	states[0].RouteStart[0] = 'x'
+	states, err = dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), states[0].RouteStart)
 }
 
 func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {

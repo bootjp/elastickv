@@ -293,6 +293,14 @@ Add RPCs:
 2. Job phases: BACKFILL/FENCE/DELTA/CUTOVER
 3. Manual split with target-group relocation
 
+Status: implemented. The production runner advances durable cross-group jobs
+through BACKFILL, FENCE, DELTA_COPY, CUTOVER, CLEANUP, and `DONE`; current-voter
+readiness and cleanup barriers protect leadership changes; and the deterministic
+Jepsen workload covers the split alongside leader-kill and partition packages.
+The completed M2 contract is recorded in
+[`2026_06_11_implemented_hotspot_split_milestone2_migration.md`](2026_06_11_implemented_hotspot_split_milestone2_migration.md)
+and its final runner/lifecycle slice landed in PR #1096.
+
 ### Milestone 3: Automation
 
 1. Access aggregation

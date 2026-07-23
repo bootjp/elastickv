@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -15,6 +16,18 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	// MigrationImportOpcodeEnv enables the internal staged import opcode after
+	// every voter is running a compatible build.
+	MigrationImportOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE"
+	// MigrationPromoteOpcodeEnv enables the internal staged promotion opcode
+	// after every voter is running a compatible build.
+	MigrationPromoteOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE"
+	// MigrationCleanupOpcodeEnv enables the internal migration cleanup opcode
+	// after every voter is running a compatible build.
+	MigrationCleanupOpcodeEnv = "ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE"
 )
 
 type InternalOption func(*Internal)
@@ -49,9 +62,21 @@ func WithInternalMigrationPromoteGate(gate func(context.Context) error) Internal
 	}
 }
 
+func WithInternalMigrationCleanupGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationCleanupGate = gate
+	}
+}
+
 func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
 	return func(i *Internal) {
 		i.routeEngine = engine
+	}
+}
+
+func WithInternalActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) InternalOption {
+	return func(i *Internal) {
+		i.readTracker = tracker
 	}
 }
 
@@ -70,6 +95,7 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 		relay:                relay,
 		migrationImportGate:  defaultMigrationImportGate,
 		migrationPromoteGate: defaultMigrationPromoteGate,
+		migrationCleanupGate: defaultMigrationCleanupGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -87,7 +113,9 @@ type Internal struct {
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
+	migrationCleanupGate    func(context.Context) error
 	routeEngine             *distribution.Engine
+	readTracker             *kv.ActiveTimestampTracker
 	migrationExportGroupID  uint64
 	migrationExportResolver kv.PartitionResolver
 
@@ -135,6 +163,179 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	if req == nil || req.GetJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration probe job_id is required"))
+	}
+	return i.probeMigrationStateKind(ctx, req)
+}
+
+func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	switch req.GetKind() {
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED:
+		return i.probeMigrationControl(ctx, req)
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED:
+		return i.probeMigrationRoute(req, true), nil
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED:
+		return i.probeMigrationRoute(req, false), nil
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED:
+		return &pb.ProbeMigrationStateResponse{
+			Ready: time.Now().UnixMilli() >= req.GetReadDrainNotBeforeMs() &&
+				(i.readTracker == nil || i.readTracker.Oldest() == 0),
+			CatalogVersion: i.migrationCatalogVersion(),
+		}, nil
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED:
+		return i.probeMigrationMetadataCleared(ctx, req.GetJobId())
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED:
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration probe kind is required"))
+	default:
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "unknown migration probe kind"))
+	}
+}
+
+func (i *Internal) IssueMigrationTimestamp(ctx context.Context, _ *pb.IssueMigrationTimestampRequest) (*pb.IssueMigrationTimestampResponse, error) {
+	if err := i.verifyInternalLeaderApplied(ctx); err != nil {
+		return nil, err
+	}
+	if i.store == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration timestamp store is not configured"))
+	}
+	lastCommitTS := i.store.LastCommitTS()
+	ts, err := i.nextTimestampAfter(ctx, lastCommitTS, "issue migration timestamp")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.IssueMigrationTimestampResponse{Timestamp: ts, LastCommitTs: lastCommitTS}, nil
+}
+
+func (i *Internal) probeMigrationControl(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	reader, ok := i.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration readiness reader is not configured"))
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, state := range states {
+		if state.JobID != req.GetJobId() {
+			continue
+		}
+		ready := migrationControlMatches(state, req)
+		return &pb.ProbeMigrationStateResponse{Ready: ready, CatalogVersion: i.migrationCatalogVersion(), MinAdmittedTs: state.MinAdmittedTS}, nil
+	}
+	return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+}
+
+func migrationControlMatches(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
+	return state.Armed &&
+		bytes.Equal(state.RouteStart, req.GetRouteStart()) &&
+		bytes.Equal(state.RouteEnd, normalizeOptionalEnd(req.GetRouteEnd())) &&
+		state.ExpectedCutoverVersion == req.GetExpectedCatalogVersion() &&
+		state.MigrationJobID == req.GetMigrationJobId() &&
+		state.MinWriteTSExclusive == req.GetMinWriteTsExclusive() &&
+		state.SourceWriteFence == req.GetSourceWriteFence() &&
+		state.SourceReadFence == req.GetSourceReadFence() &&
+		state.TrackWrites == req.GetTrackWrites() &&
+		state.RetentionPinTS == req.GetRetentionPinTs()
+}
+
+func (i *Internal) probeMigrationRoute(req *pb.ProbeMigrationStateRequest, requireCleared bool) *pb.ProbeMigrationStateResponse {
+	version := i.migrationCatalogVersion()
+	if i.routeEngine == nil || version < req.GetExpectedCatalogVersion() {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: version}
+	}
+	route, found := i.routeEngine.GetRoute(req.GetRouteStart())
+	ready := found && route.GroupID == req.GetExpectedGroupId() &&
+		bytes.Equal(route.Start, req.GetRouteStart()) &&
+		bytes.Equal(route.End, normalizeOptionalEnd(req.GetRouteEnd()))
+	if requireCleared {
+		ready = ready && !route.StagedVisibilityActive && route.MigrationJobID == 0 &&
+			route.MinWriteTSExclusive == req.GetMinWriteTsExclusive()
+	}
+	return &pb.ProbeMigrationStateResponse{Ready: ready, CatalogVersion: version}
+}
+
+func (i *Internal) probeMigrationMetadataCleared(ctx context.Context, jobID uint64) (*pb.ProbeMigrationStateResponse, error) {
+	present, err := i.migrationReadinessMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	present, err = i.migrationPromotionMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	present, err = i.migrationImportMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: i.migrationCatalogVersion()}, nil
+}
+
+func (i *Internal) migrationReadinessMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	readiness, ok := i.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return false, errors.WithStack(status.Error(codes.FailedPrecondition, "migration readiness reader is not configured"))
+	}
+	states, err := readiness.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	for _, state := range states {
+		if state.JobID == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (i *Internal) migrationPromotionMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	promotion, ok := i.store.(store.MigrationPromotionStateReader)
+	if !ok {
+		return false, nil
+	}
+	_, found, err := promotion.MigrationPromotionState(ctx, jobID)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return found, nil
+}
+
+func (i *Internal) migrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	importMetadata, ok := i.store.(store.MigrationImportMetadataReader)
+	if !ok {
+		return false, nil
+	}
+	present, err := importMetadata.MigrationImportMetadataPresent(ctx, jobID)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return present, nil
+}
+
+func (i *Internal) migrationCatalogVersion() uint64 {
+	if i.routeEngine == nil {
+		return 0
+	}
+	return i.routeEngine.Version()
+}
+
+func normalizeOptionalEnd(end []byte) []byte {
+	if len(end) == 0 {
+		return nil
+	}
+	return end
 }
 
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
@@ -286,11 +487,136 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	}, nil
 }
 
+func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
+	if err := validateTargetStagedReadinessRequest(req); err != nil {
+		return nil, err
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.TargetStagedReadinessResponse{MinAdmittedTs: i.migrationMinAdmittedTS(ctx, req.GetJobId())}, nil
+}
+
+func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigrationRequest) (*pb.CleanupMigrationResponse, error) {
+	if err := validateCleanupMigrationRequest(req); err != nil {
+		return nil, err
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.verifyMigrationCleanupEnabled(ctx); err != nil {
+		return nil, err
+	}
+	result, err := i.proposeMigrationCleanup(ctx, req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.CleanupMigrationResponse{
+		NextCursor:   result.NextCursor,
+		Done:         result.Done,
+		DeletedRows:  result.DeletedRows,
+		DeletedBytes: result.DeletedBytes,
+		ScannedBytes: result.ScannedBytes,
+	}, nil
+}
+
+func validateCleanupMigrationRequest(req *pb.CleanupMigrationRequest) error {
+	switch {
+	case req == nil:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup request is nil"))
+	case req.GetJobId() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup job_id is required"))
+	case req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS &&
+		req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup mode is invalid"))
+	case req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS && req.GetKeyFamily() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup key_family is required"))
+	}
+	return nil
+}
+
+func (i *Internal) migrationMinAdmittedTS(ctx context.Context, jobID uint64) uint64 {
+	reader, ok := i.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return 0
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return 0
+	}
+	for _, state := range states {
+		if state.JobID == jobID {
+			return state.MinAdmittedTS
+		}
+	}
+	return 0
+}
+
+func validateTargetStagedReadinessRequest(req *pb.TargetStagedReadinessRequest) error {
+	switch {
+	case req == nil:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness request is nil"))
+	case req.GetJobId() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness job_id is required"))
+	case req.GetMigrationJobId() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness migration_job_id is required"))
+	case req.GetArmed() && req.GetMinWriteTsExclusive() == 0:
+		return errors.WithStack(status.Error(codes.InvalidArgument, "target staged readiness min_write_ts_exclusive is required when armed"))
+	}
+	return validateSourceMigrationControlRequest(req)
+}
+
+func validateSourceMigrationControlRequest(req *pb.TargetStagedReadinessRequest) error {
+	if req.GetSourceReadFence() && !req.GetSourceWriteFence() {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "source read fence requires source write fence"))
+	}
+	if (req.GetSourceWriteFence() || req.GetSourceReadFence()) && req.GetRetentionPinTs() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "source migration control retention_pin_ts is required"))
+	}
+	return nil
+}
+
+func (i *Internal) ProbeMigrationLocks(ctx context.Context, req *pb.ProbeMigrationLocksRequest) (*pb.ProbeMigrationLocksResponse, error) {
+	if req == nil || len(req.GetRouteStart()) == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration lock probe route_start is required"))
+	}
+	if i.store == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration lock probe store is not configured"))
+	}
+	if err := i.verifyInternalLeaderApplied(ctx); err != nil {
+		return nil, err
+	}
+	locks, err := kv.PendingTxnLocksInRoute(ctx, i.store, req.GetRouteStart(), req.GetRouteEnd(), ^uint64(0), int(req.GetLimit()))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &pb.ProbeMigrationLocksResponse{PendingCount: uint32(len(locks))}, nil //nolint:gosec // result is bounded by uint32 wire limit
+}
+
 func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
 	if i.migrationPromoteGate == nil {
 		return nil
 	}
 	if err := i.migrationPromoteGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (i *Internal) verifyMigrationCleanupEnabled(ctx context.Context) error {
+	if i.migrationCleanupGate == nil {
+		return nil
+	}
+	if err := i.migrationCleanupGate(ctx); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -315,7 +641,7 @@ func defaultMigrationImportGate(context.Context) error {
 }
 
 func migrationImportOpcodeEnabledFromEnv() bool {
-	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE")
+	return MigrationImportOpcodeEnabledFromEnv()
 }
 
 func defaultMigrationPromoteGate(context.Context) error {
@@ -325,8 +651,33 @@ func defaultMigrationPromoteGate(context.Context) error {
 	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
 }
 
+func defaultMigrationCleanupGate(context.Context) error {
+	if MigrationCleanupOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup opcode is disabled; enable after every voter is running a build that supports migration cleanup"))
+}
+
 func migrationPromoteOpcodeEnabledFromEnv() bool {
-	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE")
+	return MigrationPromoteOpcodeEnabledFromEnv()
+}
+
+// MigrationImportOpcodeEnabledFromEnv reports whether the staged import opcode
+// is enabled for this process.
+func MigrationImportOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationImportOpcodeEnv)
+}
+
+// MigrationPromoteOpcodeEnabledFromEnv reports whether the staged promotion
+// opcode is enabled for this process.
+func MigrationPromoteOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationPromoteOpcodeEnv)
+}
+
+// MigrationCleanupOpcodeEnabledFromEnv reports whether the migration cleanup
+// opcode is enabled for this process.
+func MigrationCleanupOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled(MigrationCleanupOpcodeEnv)
 }
 
 func envFlagEnabled(name string) bool {
@@ -408,6 +759,51 @@ func (i *Internal) proposeMigrationPromote(ctx context.Context, req *pb.PromoteS
 	default:
 		return store.PromoteVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration promote apply response type %T", resp))
 	}
+}
+
+func (i *Internal) proposeMigrationCleanup(ctx context.Context, req *pb.CleanupMigrationRequest) (store.CleanupVersionsResult, error) {
+	cmd, err := kv.MarshalMigrationCleanupCommand(req)
+	if err != nil {
+		return store.CleanupVersionsResult{}, errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "migration cleanup")
+	if err != nil {
+		return store.CleanupVersionsResult{}, errors.WithStack(err)
+	}
+	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA && resp == nil {
+		return store.CleanupVersionsResult{Done: true}, nil
+	}
+	switch resp := resp.(type) {
+	case store.CleanupVersionsResult:
+		return resp, nil
+	case *store.CleanupVersionsResult:
+		if resp == nil {
+			return store.CleanupVersionsResult{}, errors.New("migration cleanup apply returned nil result")
+		}
+		return *resp, nil
+	case error:
+		return store.CleanupVersionsResult{}, errors.WithStack(resp)
+	default:
+		return store.CleanupVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration cleanup apply response type %T", resp))
+	}
+}
+
+func (i *Internal) proposeTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) error {
+	cmd, err := kv.MarshalTargetStagedReadinessCommand(req)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "target staged readiness")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if resp == nil {
+		return nil
+	}
+	if err, ok := resp.(error); ok {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(errors.Newf("unexpected target readiness apply response type %T", resp))
 }
 
 func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, label string) (any, error) {
