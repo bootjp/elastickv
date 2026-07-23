@@ -117,6 +117,10 @@ func (c keyVizLabeledCoordinator) LeaseReadAllGroups(ctx context.Context) error 
 	return errors.WithStack(err)
 }
 
+func (c keyVizLabeledCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
+	return LeaseReadAllGroupsTimestampThrough(c.inner, ctx)
+}
+
 func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	if gr, ok := c.inner.(GroupRoutableCoordinator); ok {
 		return gr.EngineGroupIDForKey(key)

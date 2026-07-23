@@ -62,7 +62,7 @@ type ShardGroup struct {
 	proposer raftengine.Proposer
 	// leaderRead forwards a read barrier to this group's current leader when
 	// the local replica is a follower. It is installed with the LeaderProxy.
-	leaderRead func(context.Context) (uint64, error)
+	leaderRead func(context.Context) (leaseReadResult, error)
 	// leaderReadToken authenticates follower-to-leader lease-read RPCs. Admin
 	// service setup publishes it once before the public listeners are opened.
 	leaderReadToken atomic.Pointer[string]
@@ -1818,16 +1818,28 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 // but correctness does not depend on it because every configured group must
 // succeed.
 func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	_, err := c.LeaseReadAllGroupsTimestamp(ctx)
+	return err
+}
+
+// LeaseReadAllGroupsTimestamp fences every data-group leader and returns the
+// maximum commit timestamp observed after those barriers.
+func (c *ShardedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
 	groups, err := c.allShardGroups()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	var maxCommitTS uint64
 	for _, g := range groups {
-		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
-			return errors.WithStack(err)
+		result, err := groupLeaseReadResult(ctx, g, c.leaseObserver)
+		if err != nil {
+			return 0, errors.WithStack(err)
+		}
+		if result.lastCommitTS > maxCommitTS {
+			maxCommitTS = result.lastCommitTS
 		}
 	}
-	return nil
+	return maxCommitTS, nil
 }
 
 func (c *ShardedCoordinator) allShardGroups() ([]*ShardGroup, error) {
@@ -1881,17 +1893,35 @@ func shouldForwardGroupLeaseRead(g *ShardGroup, engine raftengine.Engine) bool {
 	return g != nil && g.leaderRead != nil && engine != nil && engine.State() != raftengine.StateLeader
 }
 
-func handleGroupLeaseReadError(ctx context.Context, g *ShardGroup, err error) (uint64, error) {
+type leaseReadResult struct {
+	appliedIndex uint64
+	lastCommitTS uint64
+}
+
+func localLeaseReadResult(g *ShardGroup, appliedIndex uint64) leaseReadResult {
+	result := leaseReadResult{appliedIndex: appliedIndex}
+	if g != nil && g.Store != nil {
+		result.lastCommitTS = g.Store.LastCommitTS()
+	}
+	return result
+}
+
+func handleGroupLeaseReadError(ctx context.Context, g *ShardGroup, err error) (leaseReadResult, error) {
 	if g != nil && isLeadershipLossError(err) {
 		g.lease.invalidate()
 	}
 	if g != nil && g.leaderRead != nil && isTransientLeaderError(err) {
 		return g.leaderRead(ctx)
 	}
-	return 0, err
+	return leaseReadResult{}, err
 }
 
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
+	result, err := groupLeaseReadResult(ctx, g, observer)
+	return result.appliedIndex, err
+}
+
+func groupLeaseReadResult(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (leaseReadResult, error) {
 	engine := engineForGroup(g)
 	if shouldForwardGroupLeaseRead(g, engine) {
 		observeLeaseRead(observer, false)
@@ -1903,12 +1933,14 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	// guard preserves engineForGroup's nil-safety since g.lp would panic
 	// on a nil receiver.
 	if g == nil || g.lp == nil {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	lp := g.lp
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	// Single monoclock.Now() sample so primary/secondary/extension
 	// all see the same monotonic-raw instant. Clock-skew safety
@@ -1917,12 +1949,12 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	expectedGen := g.lease.generation()
 	if g.lease.valid(now) && state == raftengine.StateLeader {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
@@ -1930,7 +1962,7 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 		return handleGroupLeaseReadError(ctx, g, err)
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
-	return idx, nil
+	return localLeaseReadResult(g, idx), nil
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

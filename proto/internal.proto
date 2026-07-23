@@ -91,6 +91,7 @@ message ForwardLeaseReadRequest {}
 
 message ForwardLeaseReadResponse {
   uint64 applied_index = 1;
+  uint64 last_commit_ts = 2;
 }
 
 message RelayPublishRequest {

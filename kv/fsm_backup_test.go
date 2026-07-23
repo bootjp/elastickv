@@ -189,6 +189,16 @@ func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
 	}
 }
 
+func TestBackupTimestampFloorKeyRejectsRawMutation(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+	resp := applyBackupTestRequest(t, fsm, &pb.Request{Ts: 10, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: bytes.Clone(backupTimestampFloorKey), Value: make([]byte, backupTimestampFloorValueSize),
+	}}})
+	err, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
 func TestApplyBackupAllowsResolutionOfPrePinTransaction(t *testing.T) {
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 	primary := []byte("primary")

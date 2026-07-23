@@ -24,6 +24,12 @@ func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
 	}
 }
 
+func WithInternalLastCommitTimestamp(reader func() uint64) InternalOption {
+	return func(i *Internal) {
+		i.lastCommitTimestamp = reader
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -38,12 +44,13 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	adminProposer      raftengine.Proposer
-	relay              *RedisPubSubRelay
+	leader              raftengine.LeaderView
+	transactionManager  kv.Transactional
+	clock               *kv.HLC
+	tsAllocator         kv.TimestampAllocator
+	adminProposer       raftengine.Proposer
+	lastCommitTimestamp func() uint64
+	relay               *RedisPubSubRelay
 
 	pb.UnimplementedInternalServer
 }
@@ -119,7 +126,11 @@ func (i *Internal) ForwardLeaseRead(
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &pb.ForwardLeaseReadResponse{AppliedIndex: index}, nil
+	lastCommitTS := uint64(0)
+	if i.lastCommitTimestamp != nil {
+		lastCommitTS = i.lastCommitTimestamp()
+	}
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS}, nil
 }
 
 func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {

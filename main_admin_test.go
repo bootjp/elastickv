@@ -79,17 +79,23 @@ type backupFenceOrderCoordinator struct {
 
 type backupFenceTSOCoordinator struct {
 	stubStartupCoordinator
-	min        uint64
-	nextAfter  uint64
-	barriers   atomic.Int32
-	barrierErr error
-	nextErr    error
-	afterErr   error
+	min            uint64
+	nextAfter      uint64
+	barriers       atomic.Int32
+	barrierErr     error
+	nextErr        error
+	afterErr       error
+	leaderCommitTS uint64
 }
 
 func (c *backupFenceTSOCoordinator) LeaseReadAllGroups(context.Context) error {
 	c.barriers.Add(1)
 	return c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroupsTimestamp(context.Context) (uint64, error) {
+	c.barriers.Add(1)
+	return c.leaderCommitTS, c.barrierErr
 }
 
 func (c *backupFenceTSOCoordinator) Next(context.Context) (uint64, error) {
@@ -134,7 +140,7 @@ func TestAdminBackupReadFenceAllocatesTimestampAfterBarrier(t *testing.T) {
 
 func TestAdminBackupReadFenceUsesCoordinatorTimestampAllocator(t *testing.T) {
 	t.Parallel()
-	coordinate := &backupFenceTSOCoordinator{nextAfter: 9_000}
+	coordinate := &backupFenceTSOCoordinator{nextAfter: 9_000, leaderCommitTS: 8_000}
 	groupStore := store.NewMVCCStore()
 	require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), 7_000, 0))
 	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
@@ -145,7 +151,7 @@ func TestAdminBackupReadFenceUsesCoordinatorTimestampAllocator(t *testing.T) {
 	readTS, err := fence(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, uint64(9_000), readTS)
-	require.Equal(t, uint64(7_000), coordinate.min)
+	require.Equal(t, uint64(8_000), coordinate.min)
 	require.Equal(t, int32(1), coordinate.barriers.Load())
 }
 

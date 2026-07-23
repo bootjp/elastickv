@@ -225,36 +225,36 @@ func (p *LeaderProxy) forward(parentCtx context.Context, reqs []*pb.Request) (*T
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
 }
 
-func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (uint64, error) {
+func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {
 	deadline := time.Now().Add(leaderProxyRetryBudget)
 	ctx, cancel := context.WithDeadline(callerCtx, deadline)
 	defer cancel()
 	var lastErr error
 	for time.Now().Before(deadline) {
-		index, err := p.forwardLeaseReadOnce(ctx)
+		result, err := p.forwardLeaseReadOnce(ctx)
 		if err == nil {
-			return index, nil
+			return result, nil
 		}
 		lastErr = err
 		if !isTransientLeaderError(err) {
-			return 0, err
+			return leaseReadResult{}, err
 		}
 		waitLeaderProxyBackoff(ctx, leaderProxyRetryInterval, deadline)
 	}
 	if lastErr == nil {
 		lastErr = ErrLeaderNotFound
 	}
-	return 0, errors.WithStack(lastErr)
+	return leaseReadResult{}, errors.WithStack(lastErr)
 }
 
-func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (uint64, error) {
+func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (leaseReadResult, error) {
 	addr := leaderAddrFromEngine(p.engine)
 	if addr == "" {
-		return 0, errors.WithStack(ErrLeaderNotFound)
+		return leaseReadResult{}, errors.WithStack(ErrLeaderNotFound)
 	}
 	conn, err := p.connCache.ConnFor(addr)
 	if err != nil {
-		return 0, err
+		return leaseReadResult{}, err
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
@@ -263,9 +263,9 @@ func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (uint64, e
 	}
 	resp, err := pb.NewInternalClient(conn).ForwardLeaseRead(ctx, &pb.ForwardLeaseReadRequest{})
 	if err != nil {
-		return 0, errors.WithStack(err)
+		return leaseReadResult{}, errors.WithStack(err)
 	}
-	return resp.GetAppliedIndex(), nil
+	return leaseReadResult{appliedIndex: resp.GetAppliedIndex(), lastCommitTS: resp.GetLastCommitTs()}, nil
 }
 
 var _ Transactional = (*LeaderProxy)(nil)

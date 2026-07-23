@@ -33,10 +33,10 @@ var ErrScopeKeyMalformed = errors.New("backup: malformed scoped key")
 // Internal control-plane keys and derivable indexes return (_, false, nil).
 func ScopeForKey(key []byte) (Scope, bool, error) {
 	switch {
-	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBGSIPrefix):
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBItemPrefix, DDBGSIPrefix):
 		return scopeForDDBKey(key)
 	case hasAnyBackupPrefix(key,
-		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix,
+		S3BucketMetaPrefix, S3ObjectManifestPrefix,
 		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3GCUploadPrefix, S3RoutePrefix,
 	):
 		return scopeForS3Key(key)
@@ -56,8 +56,6 @@ func scopeForDDBKey(key []byte) (Scope, bool, error) {
 	switch {
 	case bytes.HasPrefix(key, []byte(DDBTableMetaPrefix)):
 		return ddbScopeFromDirectSegment(key, DDBTableMetaPrefix)
-	case bytes.HasPrefix(key, []byte(DDBTableGenPrefix)):
-		return ddbScopeFromDirectSegment(key, DDBTableGenPrefix)
 	case bytes.HasPrefix(key, []byte(DDBItemPrefix)):
 		encoded, _, err := parseDDBItemKey(key)
 		if err != nil {
@@ -75,10 +73,6 @@ func scopeForS3Key(key []byte) (Scope, bool, error) {
 	switch {
 	case bytes.HasPrefix(key, []byte(S3BucketMetaPrefix)):
 		bucket, ok := s3keys.ParseBucketMetaKey(key)
-		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3BucketGenPrefix)):
-		metaKey := append([]byte(S3BucketMetaPrefix), key[len(S3BucketGenPrefix):]...)
-		bucket, ok := s3keys.ParseBucketMetaKey(metaKey)
 		return parsedS3Scope(bucket, ok, key)
 	case bytes.HasPrefix(key, []byte(S3ObjectManifestPrefix)):
 		bucket, _, _, ok := s3keys.ParseObjectManifestKey(key)

@@ -37,6 +37,7 @@ const (
 	defaultLiveBackupScanPageSize         = 1024
 	defaultLiveBackupRenewAttempts        = 3
 	defaultLiveBackupRenewBackoff         = 500 * time.Millisecond
+	backupAppliedPollInterval             = 10 * time.Millisecond
 )
 
 var (
@@ -55,6 +56,7 @@ type BackupPeerProbe func(context.Context, string) (BackupPeerVersion, error)
 
 type BackupStore interface {
 	CaptureBackupRouteSnapshotAt(context.Context, uint64) (kv.BackupRouteSnapshot, error)
+	ValidateBackupSnapshotAt(context.Context, kv.BackupRouteSnapshot, uint64, int) error
 	NewBackupKeyScannerAtSnapshot(snapshot kv.BackupRouteSnapshot, ts uint64, pageSize int) kv.BackupKeyScanner
 	NewBackupScannerAtSnapshot(snapshot kv.BackupRouteSnapshot, ts uint64, pageSize int) kv.BackupScanner
 }
@@ -252,12 +254,9 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	if err := s.checkBackupSnapshotHeadroom(groups); err != nil {
 		return preparedBackup{}, err
 	}
-	readTS, err := s.backupReadFence(ctx)
+	readTS, err := s.prepareBackupReadTimestamp(ctx)
 	if err != nil {
-		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "backup read fence failed: %v", err)
-	}
-	if readTS == 0 || readTS == ^uint64(0) {
-		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "%s", "backup read fence returned an invalid timestamp")
+		return preparedBackup{}, err
 	}
 	pinID, err := newBackupPinID()
 	if err != nil {
@@ -269,6 +268,39 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	if err != nil {
 		return preparedBackup{}, err
 	}
+	routes, err := s.captureBackupRoutesAfterPin(ctx, groups, controlGroup, pinID, commits, readTS)
+	if err != nil {
+		return preparedBackup{}, err
+	}
+	return preparedBackup{
+		groups: groups, commits: commits, controlGroup: controlGroup,
+		pinID: pinID, readTS: readTS, ttl: ttl, routes: routes,
+	}, nil
+}
+
+func (s *AdminServer) prepareBackupReadTimestamp(ctx context.Context) (uint64, error) {
+	readTS, err := s.backupReadFence(ctx)
+	if err != nil {
+		return 0, status.Errorf(codes.FailedPrecondition, "backup read fence failed: %v", err)
+	}
+	if readTS == 0 || readTS == ^uint64(0) {
+		return 0, status.Errorf(codes.FailedPrecondition, "%s", "backup read fence returned an invalid timestamp")
+	}
+	return readTS, nil
+}
+
+func (s *AdminServer) captureBackupRoutesAfterPin(
+	ctx context.Context,
+	groups []backupGroup,
+	controlGroup backupGroup,
+	pinID kv.BackupPinID,
+	commits map[uint64]uint64,
+	readTS uint64,
+) (kv.BackupRouteSnapshot, error) {
+	if err := waitBackupGroupsApplied(ctx, groups, commits); err != nil {
+		s.compensateBackupRelease(controlGroup, groups, pinID)
+		return kv.BackupRouteSnapshot{}, status.Errorf(codes.FailedPrecondition, "wait for local backup pin apply: %v", err)
+	}
 	// Capture catalog ownership only after every data group has applied the
 	// pin's timestamp floor. A preallocated catalog write at or below readTS
 	// either lands before this point and is visible here, or is rejected by the
@@ -276,12 +308,9 @@ func (s *AdminServer) prepareBackup(ctx context.Context, ttl time.Duration) (pre
 	routes, err := s.backupStore.CaptureBackupRouteSnapshotAt(ctx, readTS)
 	if err != nil {
 		s.compensateBackupRelease(controlGroup, groups, pinID)
-		return preparedBackup{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
+		return kv.BackupRouteSnapshot{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
 	}
-	return preparedBackup{
-		groups: groups, commits: commits, controlGroup: controlGroup,
-		pinID: pinID, readTS: readTS, ttl: ttl, routes: routes,
-	}, nil
+	return routes, nil
 }
 
 func (s *AdminServer) pinBackupGroups(
@@ -320,7 +349,17 @@ func (s *AdminServer) buildExpectedBackupBaseline(
 			ctx, stopRenew, prepared.groups, prepared.pinID, prepared.readTS, prepared.ttl,
 		)
 	}()
-	counts, appliedAtCount, scanErr := s.scanBackupScopeCounts(ctx, prepared.routes, prepared.readTS, prepared.groups)
+	validateErr := s.backupStore.ValidateBackupSnapshotAt(
+		ctx, prepared.routes, prepared.readTS, s.backupConfig.scanPageSize,
+	)
+	var counts map[logicalbackup.Scope]uint64
+	var appliedAtCount uint64
+	var scanErr error
+	if validateErr != nil {
+		scanErr = errors.Wrap(validateErr, "validate backup transaction locks")
+	} else {
+		counts, appliedAtCount, scanErr = s.scanBackupScopeCounts(ctx, prepared.routes, prepared.readTS, prepared.groups)
+	}
 	close(stopRenew)
 	renewErr := <-renewDone
 	if scanErr != nil {
@@ -330,6 +369,32 @@ func (s *AdminServer) buildExpectedBackupBaseline(
 		return nil, 0, status.Errorf(codes.Unavailable, "renew backup pin while building baseline: %v", renewErr)
 	}
 	return counts, appliedAtCount, nil
+}
+
+func waitBackupGroupsApplied(ctx context.Context, groups []backupGroup, commits map[uint64]uint64) error {
+	for {
+		pending := false
+		for _, group := range groups {
+			target := commits[group.id]
+			if group.reader == nil || target == 0 {
+				return errors.Wrapf(ErrBackupUnavailable, "raft group %d has no local apply target", group.id)
+			}
+			if group.reader.Status().AppliedIndex < target {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return nil
+		}
+		timer := time.NewTimer(backupAppliedPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.WithStack(ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupRequest) (*pb.RenewBackupResponse, error) {

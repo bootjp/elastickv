@@ -526,12 +526,14 @@ func run() error {
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
 	sampler := buildKeyVizSampler()
+	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
+	shardStore.WithPartitionResolver(sqsPartitionResolver)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
-		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+		WithPartitionResolver(sqsPartitionResolver)
 	if err := configureCoordinatorTSO(coordinate); err != nil {
 		return err
 	}
@@ -2243,6 +2245,7 @@ type startupGatedCoordinator struct {
 var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.AllGroupsLeaseTimestampCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
@@ -2312,6 +2315,10 @@ func (c startupGatedCoordinator) LeaseReadForKey(ctx context.Context, key []byte
 
 func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
 	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
+	return kv.LeaseReadAllGroupsTimestampThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
 
 func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
@@ -2490,10 +2497,14 @@ func adminBackupReadFence(coordinate kv.Coordinator, shardStore *kv.ShardStore) 
 	}
 	return func(ctx context.Context) (uint64, error) {
 		clock := coordinate.Clock()
-		if err := kv.LeaseReadAllGroupsThrough(coordinate, ctx); err != nil {
+		leaderCommitTS, err := kv.LeaseReadAllGroupsTimestampThrough(coordinate, ctx)
+		if err != nil {
 			return 0, errors.Wrap(err, "backup: fence raft groups")
 		}
 		lastCommitTS := shardStore.LastCommitTS()
+		if leaderCommitTS > lastCommitTS {
+			lastCommitTS = leaderCommitTS
+		}
 		clock.Observe(lastCommitTS)
 		readTS, err := allocateBackupReadTimestamp(ctx, coordinate, lastCommitTS)
 		if err != nil {
@@ -2764,7 +2775,7 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups))
+		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id])
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2849,10 +2860,14 @@ func internalServerOptions(
 	coordinate kv.Coordinator,
 	adminServer *adapter.AdminServer,
 	proposer raftengine.Proposer,
+	group *kv.ShardGroup,
 ) []adapter.InternalOption {
 	opts := internalTimestampOptions(coordinate)
 	if adminServer != nil {
-		return append(opts, adapter.WithInternalAdminProposer(proposer))
+		opts = append(opts, adapter.WithInternalAdminProposer(proposer))
+	}
+	if group != nil && group.Store != nil {
+		opts = append(opts, adapter.WithInternalLastCommitTimestamp(group.Store.LastCommitTS))
 	}
 	return opts
 }

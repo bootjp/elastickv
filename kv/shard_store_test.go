@@ -726,6 +726,29 @@ func TestCaptureBackupRouteSnapshotAtReadsRowsFromCatalogOwner(t *testing.T) {
 	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
 }
 
+func TestValidateBackupSnapshotAtRejectsPreparedInsert(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		st, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	primary := []byte("insert-only")
+	prepare := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+		})},
+		{Op: pb.Op_PUT, Key: primary, Value: []byte("pending")},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, prepare))
+
+	engine := distribution.NewEngineWithDefaultRoute()
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: st}})
+	snapshot := shards.CaptureBackupRouteSnapshot(nil, nil)
+	err := shards.ValidateBackupSnapshotAt(ctx, snapshot, 50, 16)
+	require.ErrorIs(t, err, ErrTxnLocked)
+}
+
 func TestBackupScannerMaterializesFromCapturedRoute(t *testing.T) {
 	t.Parallel()
 
@@ -831,6 +854,82 @@ func TestBackupScannersPreferCapturedOwnerForDuplicateKey(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, []byte("a"), pair.Key)
 	require.Equal(t, []byte("captured-owner"), pair.Value)
+}
+
+func TestBackupScannerKeepsPartitionResolvedOwnerForSQSKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups).
+		WithPartitionResolver(&fakePartitionResolver{
+			routes:           map[string]uint64{string(key): 2},
+			recognisedPrefix: []byte("!sqs|msg|data|p|"),
+		})
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-engine-owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("partition-owner"), 2, 0))
+	routes := []distribution.Route{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	}
+
+	keyScanner := &backupKeyScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer keyScanner.Close()
+	gotKey, ok, err := keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, gotKey)
+	_, ok, err = keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	valueScanner := &backupScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer valueScanner.Close()
+	pair, ok, err := valueScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, pair.Key)
+	require.Equal(t, []byte("partition-owner"), pair.Value)
+}
+
+func TestBackupScannerFailsClosedOnUnresolvedPartitionedSQSKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("!sqs|msg|data|p|orders|partition-9|msg-9")
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups).
+		WithPartitionResolver(&fakePartitionResolver{
+			routes:           map[string]uint64{},
+			recognisedPrefix: []byte("!sqs|msg|data|p|"),
+		})
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("unresolved"), 1, 0))
+	scanner := &backupScanner{
+		store: st,
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1},
+		},
+		clampToRoutes: false,
+		cursor:        []byte(""),
+		ts:            ^uint64(0),
+		pageSize:      1,
+	}
+	defer scanner.Close()
+
+	_, _, err := scanner.Next(ctx)
+	require.ErrorIs(t, err, ErrInvalidRequest)
 }
 
 func TestBackupScannerPreservesFullRoutingAfterListKeyCursor(t *testing.T) {

@@ -581,6 +581,7 @@ func (*ForwardLeaseReadRequest) Descriptor() ([]byte, []int) {
 type ForwardLeaseReadResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AppliedIndex  uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LastCommitTs  uint64                 `protobuf:"varint,2,opt,name=last_commit_ts,json=lastCommitTs,proto3" json:"last_commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -618,6 +619,13 @@ func (*ForwardLeaseReadResponse) Descriptor() ([]byte, []int) {
 func (x *ForwardLeaseReadResponse) GetAppliedIndex() uint64 {
 	if x != nil {
 		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *ForwardLeaseReadResponse) GetLastCommitTs() uint64 {
+	if x != nil {
+		return x.LastCommitTs
 	}
 	return 0
 }
@@ -748,9 +756,10 @@ const file_internal_proto_rawDesc = "" +
 	"\apayload\x18\x01 \x01(\fR\apayload\"A\n" +
 	"\x1cForwardAdminProposalResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\"\x19\n" +
-	"\x17ForwardLeaseReadRequest\"?\n" +
+	"\x17ForwardLeaseReadRequest\"e\n" +
 	"\x18ForwardLeaseReadResponse\x12#\n" +
-	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\"I\n" +
+	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\x12$\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +

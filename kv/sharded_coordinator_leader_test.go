@@ -31,7 +31,7 @@ func (s *leaseReadForwardServer) ForwardLeaseRead(
 	s.mu.Lock()
 	s.authorization = append([]string(nil), md.Get("authorization")...)
 	s.mu.Unlock()
-	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44}, nil
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44, LastCommitTs: 91}, nil
 }
 
 func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
@@ -76,9 +76,11 @@ func TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	s1 := store.NewMVCCStore()
+	require.NoError(t, s1.PutAt(context.Background(), []byte("a"), []byte("one"), 70, 0))
 	r1, stop1 := newSingleRaft(t, "lrag-g1", NewKvFSMWithHLC(s1, NewHLC()))
 	t.Cleanup(stop1)
 	s2 := store.NewMVCCStore()
+	require.NoError(t, s2.PutAt(context.Background(), []byte("z"), []byte("two"), 90, 0))
 	r2, stop2 := newSingleRaft(t, "lrag-g2", NewKvFSMWithHLC(s2, NewHLC()))
 	t.Cleanup(stop2)
 
@@ -88,7 +90,9 @@ func TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
 
-	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
+	maxCommitTS, err := coord.LeaseReadAllGroupsTimestamp(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(90), maxCommitTS)
 }
 
 func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *testing.T) {
@@ -115,7 +119,9 @@ func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *t
 	group.Txn = proxy
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: group}, 1, NewHLC(), nil)
 
-	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))
+	maxCommitTS, err := coord.LeaseReadAllGroupsTimestamp(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(91), maxCommitTS)
 	require.Equal(t, int32(1), service.calls.Load())
 	service.mu.Lock()
 	require.Equal(t, []string{"Bearer admin-secret"}, service.authorization)

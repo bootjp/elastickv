@@ -184,6 +184,9 @@ enum RaftAdminState {
 message RaftAdminStatusRequest {}
 
 message RaftAdminStatusResponse {
+  reserved 12, 13;
+  reserved "configuration_index", "pending_conf_change";
+
   RaftAdminState state = 1;
   string leader_id = 2;
   string leader_address = 3;

@@ -31,10 +31,12 @@ func TestInternalForwardLeaseReadUsesLeaderBarrier(t *testing.T) {
 		internalAdminLeaderView{state: raftengine.StateLeader, readIndex: 23},
 		nil,
 		nil,
+		WithInternalLastCommitTimestamp(func() uint64 { return 37 }),
 	)
 	resp, err := internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})
 	require.NoError(t, err)
 	require.Equal(t, uint64(23), resp.GetAppliedIndex())
+	require.Equal(t, uint64(37), resp.GetLastCommitTs())
 
 	internal.leader = internalAdminLeaderView{state: raftengine.StateFollower}
 	_, err = internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})

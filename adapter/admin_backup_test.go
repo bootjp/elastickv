@@ -121,6 +121,11 @@ type backupTestStore struct {
 	keyCloseErr  error
 	pairCloseErr error
 	captureErr   error
+	validateErr  error
+}
+
+func (s *backupTestStore) ValidateBackupSnapshotAt(context.Context, kv.BackupRouteSnapshot, uint64, int) error {
+	return s.validateErr
 }
 
 func (s *backupTestStore) CaptureBackupRouteSnapshotAt(_ context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
@@ -360,6 +365,34 @@ func TestBeginBackupCapturesRouteSnapshotAfterReadFence(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(2), stage.Load())
 	require.Equal(t, []uint64{42}, store.capturedTS)
+}
+
+func TestBeginBackupWaitsForLocalPinApplyBeforeCatalogCapture(t *testing.T) {
+	store := &backupTestStore{}
+	group := &backupTestGroup{status: raftengine.Status{}, every: 10_000}
+	proposer := newBackupTestProposer()
+	proposer.onPropose = func(subtype byte) {
+		if subtype != backupSubtypePin {
+			return
+		}
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			group.setApplied(2)
+		}()
+	}
+	store.onCapture = func() {
+		require.GreaterOrEqual(t, group.Status().AppliedIndex, uint64(2))
+	}
+	srv := newBackupControlTestServer(
+		t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: proposer},
+		nil,
+		WithAdminBackupConfig(AdminBackupConfig{BeginDeadline: time.Second}),
+	)
+
+	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
 }
 
 func TestBeginBackupCompensatesWhenPinnedRouteCaptureFails(t *testing.T) {

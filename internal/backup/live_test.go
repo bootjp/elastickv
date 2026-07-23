@@ -24,6 +24,8 @@ func TestScopeForKey(t *testing.T) {
 		{name: "sqs sequence", key: []byte(SQSQueueSeqPrefix + enc("jobs")), want: Scope{Adapter: "sqs", Name: "jobs"}, scoped: true},
 		{name: "redis", key: []byte(RedisStringPrefix + "key"), want: Scope{Adapter: "redis", Name: "db_0"}, scoped: true},
 		{name: "ddb derived gsi", key: []byte(DDBGSIPrefix + "ignored"), scoped: false},
+		{name: "dynamodb generation counter", key: []byte(DDBTableGenPrefix + enc("deleted")), scoped: false},
+		{name: "s3 generation counter", key: []byte(S3BucketGenPrefix + "deleted"), scoped: false},
 		{name: "transaction", key: []byte("!txn|lock|ignored"), scoped: false},
 	}
 	for _, tc := range cases {
