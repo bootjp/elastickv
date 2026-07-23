@@ -496,7 +496,7 @@ func (b *LeaderAwareRedisBackend) DoWithReadTimeout(ctx context.Context, timeout
 }
 
 func (b *LeaderAwareRedisBackend) doWithReadTimeoutOnce(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	cli := b.currentClient()
+	cli := b.currentClientOrRefresh(ctx)
 	if cli == nil {
 		cmd := redis.NewCmd(ctx, args...)
 		cmd.SetErr(ErrNoLeaderBackend)
