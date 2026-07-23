@@ -1200,7 +1200,7 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
-	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreIndexScanLimit(metaLen, metaExists), readTS)
+	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
@@ -1245,16 +1245,6 @@ func zsetScoresEqual(left, right float64) bool {
 		return true
 	}
 	return math.Float64bits(left) == math.Float64bits(right)
-}
-
-func bzpopminScoreIndexScanLimit(metaLen int64, metaExists bool) int {
-	if !metaExists || metaLen <= 0 {
-		return bzpopminScoreScanLimit
-	}
-	if metaLen >= int64(maxWideScanLimit) {
-		return maxWideScanLimit
-	}
-	return int(metaLen) + 1
 }
 
 func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {

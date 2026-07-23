@@ -53,7 +53,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
 		},
 		{
 			name: "score tie falls back to member ordering",
@@ -67,7 +67,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "single score entry",
@@ -102,7 +102,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "mixed partial score index keeps indexed candidate non-last",
@@ -124,7 +124,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "member only fallback",
@@ -138,7 +138,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "truncated meta still falls back to member rows",

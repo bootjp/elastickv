@@ -170,6 +170,30 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 		"HLC renewal should resume after startup rotation blocker clears")
 }
 
+func TestCoordinate_RenewHLCLeaseAsync_OverlapsSlowProposal(t *testing.T) {
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	eng.proposeHook = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	c.renewHLCLeaseAsync(context.Background())
+	<-entered
+	c.renewHLCLeaseAsync(context.Background())
+	<-entered
+
+	require.Equal(t, int32(2), eng.proposeCalls.Load(),
+		"a slow renewal proposal must not monopolize newer ceiling proposals")
+	close(release)
+	require.Eventually(t, func() bool {
+		return c.lease.valid(monoclock.Now())
+	}, time.Second, 10*time.Millisecond,
+		"overlapped renewal goroutines should finish and warm the lease")
+}
+
 // TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the
 // sharded renewal path warms the target group's lease on a successful
 // propose, so LeaseReadForKey on a key owned by that group serves from the
@@ -427,14 +451,13 @@ func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
 	require.Less(t, uint64(hlcPhysicalWindowMs), defaultTxnLockTTLms)
 }
 
-func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
+func TestShardedCoordinator_RenewHLCLeases_OverlapsInFlightGroup(t *testing.T) {
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
-	entered := make(chan struct{})
+	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
-	var enteredOnce sync.Once
 	eng1.proposeHook = func() {
-		enteredOnce.Do(func() { close(entered) })
+		entered <- struct{}{}
 		<-release
 	}
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
@@ -442,25 +465,30 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	first := coord.renewHLCLeases(context.Background())
 	<-entered
 	require.Eventually(t, func() bool {
-		return eng2.proposeCalls.Load() == 1 && !hlcRenewalInFlight(coord, 2)
+		return eng2.proposeCalls.Load() == 1
 	}, time.Second, 10*time.Millisecond,
 		"precondition: the first round must fully finish for the non-blocked group")
 
 	second := coord.renewHLCLeases(context.Background())
-	requireRenewalDone(t, second)
+	<-entered
 
-	require.Equal(t, int32(1), eng1.proposeCalls.Load(),
-		"an in-flight group must not receive a second concurrent renewal proposal")
+	require.Eventually(t, func() bool {
+		return eng1.proposeCalls.Load() == 2 && eng2.proposeCalls.Load() == 2
+	}, time.Second, 10*time.Millisecond,
+		"the next renewal round should launch for both the slow group and its peer")
+	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
+		"a slow in-flight group still needs a fresher renewal proposal on the next tick")
 	require.Equal(t, int32(2), eng2.proposeCalls.Load(),
 		"other led groups must still renew while one group is in flight")
 
 	close(release)
 	requireRenewalDone(t, first)
+	requireRenewalDone(t, second)
 
 	third := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, third)
-	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
-		"the group must be eligible for renewal after the in-flight proposal finishes")
+	require.Equal(t, int32(3), eng1.proposeCalls.Load(),
+		"the group remains eligible for later renewal after overlapping proposals finish")
 }
 
 func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testing.T) {
@@ -480,13 +508,6 @@ func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testi
 	require.Equal(t, int32(0), eng1.proposeCalls.Load())
 	require.True(t, coord.groups[0].lease.valid(monoclock.Now()),
 		"a synchronous timestamp renewal must warm the timestamp group's lease")
-}
-
-func hlcRenewalInFlight(coord *ShardedCoordinator, gid uint64) bool {
-	coord.hlcRenewalMu.Lock()
-	defer coord.hlcRenewalMu.Unlock()
-	_, ok := coord.hlcRenewalInFlight[gid]
-	return ok
 }
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {

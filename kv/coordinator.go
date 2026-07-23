@@ -868,10 +868,13 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
-	// Use a Timer rather than a Ticker so the next renewal is scheduled
-	// relative to the completion of the previous one. This prevents a burst
-	// of back-to-back proposals if ProposeHLCLease stalls (e.g. waiting for
-	// Raft quorum during a slow leader election).
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Schedule relative to proposal launch, not completion. A renewal proposal
+	// may legitimately take longer than hlcRenewalInterval under load; letting
+	// the next tick launch a fresher ceiling keeps logical counter headroom
+	// available while the older proposal is still bounded by its own timeout.
 	timer := time.NewTimer(hlcRenewalInterval)
 	defer timer.Stop()
 	for {
@@ -882,22 +885,27 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 				continue
 			}
 			if c.IsLeaderAcceptingWrites() {
-				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
-				err := c.ProposeHLCLease(pctx, ceilingMs)
-				cancel()
-				if err != nil {
-					c.log.WarnContext(ctx, "hlc lease renewal failed",
-						slog.Int64("ceiling_ms", ceilingMs),
-						slog.Any("err", err),
-					)
-				}
+				c.renewHLCLeaseAsync(ctx)
 			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (c *Coordinate) renewHLCLeaseAsync(ctx context.Context) {
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	go func() {
+		pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
+		defer cancel()
+		if err := c.ProposeHLCLease(pctx, ceilingMs); err != nil {
+			c.log.WarnContext(ctx, "hlc lease renewal failed",
+				slog.Int64("ceiling_ms", ceilingMs),
+				slog.Any("err", err),
+			)
+		}
+	}()
 }
 
 func (c *Coordinate) IsLeaderForKey(_ []byte) bool {

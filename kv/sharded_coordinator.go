@@ -409,10 +409,6 @@ type ShardedCoordinator struct {
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
 	hlcRecoveryMu     sync.Mutex
-	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
-	// another background HLC lease proposal for the same group on the next tick.
-	hlcRenewalMu       sync.Mutex
-	hlcRenewalInFlight map[uint64]struct{}
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -2370,8 +2366,10 @@ func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
 }
 
 // renewHLCLeases starts one renewal proposal for every shard group this node
-// currently leads. It does not wait for those proposals before returning; the
-// returned channel closes when the launched proposals finish and exists for
+// currently leads. It does not suppress a group that still has an older renewal
+// proposal in flight: HLC lease entries apply monotonically, so overlapping
+// proposals are safe, and each proposal's context bounds the maximum overlap.
+// The returned channel closes when the launched proposals finish and exists for
 // tests/diagnostics only.
 func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
@@ -2386,13 +2384,9 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		if !shardGroupAcceptingWrites(group) {
 			continue
 		}
-		if !c.startHLCLeaseRenewal(gid) {
-			continue
-		}
 		wg.Add(1)
 		go func(gid uint64, group *ShardGroup) {
 			defer wg.Done()
-			defer c.finishHLCLeaseRenewal(gid)
 			pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
 			defer cancel()
 			c.renewHLCLease(pctx, gid, group)
@@ -2403,25 +2397,6 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		close(done)
 	}()
 	return done
-}
-
-func (c *ShardedCoordinator) startHLCLeaseRenewal(gid uint64) bool {
-	c.hlcRenewalMu.Lock()
-	defer c.hlcRenewalMu.Unlock()
-	if c.hlcRenewalInFlight == nil {
-		c.hlcRenewalInFlight = make(map[uint64]struct{})
-	}
-	if _, ok := c.hlcRenewalInFlight[gid]; ok {
-		return false
-	}
-	c.hlcRenewalInFlight[gid] = struct{}{}
-	return true
-}
-
-func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
-	c.hlcRenewalMu.Lock()
-	defer c.hlcRenewalMu.Unlock()
-	delete(c.hlcRenewalInFlight, gid)
 }
 
 // renewHLCLease proposes a fresh physical ceiling on one shard
