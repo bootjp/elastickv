@@ -499,8 +499,9 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
-	require.Zero(t, coordinator.lastRequestedCommitTS)
+	require.NotZero(t, coordinator.lastRequestedCommitTS)
 	require.NotZero(t, coordinator.lastCommitTS)
+	require.Equal(t, coordinator.lastRequestedCommitTS, coordinator.lastCommitTS)
 	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
 
 	snapshot, err := catalog.Snapshot(ctx)
@@ -513,6 +514,14 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
 	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
 	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	changes, err := catalog.ChangesSince(ctx, saved.Version, 1)
+	require.NoError(t, err)
+	require.Len(t, changes.Deltas, 1)
+	require.Len(t, changes.Deltas[0].Mutations, 3)
+	require.Equal(t, distribution.CatalogMutationDelete, changes.Deltas[0].Mutations[0].Op)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[1].Route.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[2].Route.SplitAtHLC)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {

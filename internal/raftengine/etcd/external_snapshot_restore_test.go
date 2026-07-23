@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -68,6 +69,54 @@ func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001", Suffrage: SuffrageVoter},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002", Suffrage: SuffrageVoter},
 	}, peers)
+}
+
+func TestPrepareExternalSnapshotRestoreHonorsCanceledContext(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "encoded.fsm")
+	require.NoError(t, os.WriteFile(input, []byte("payload"), 0o600))
+	dataDir := filepath.Join(root, "raft")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := PrepareExternalSnapshotRestore(ExternalSnapshotRestoreOptions{
+		Context:      ctx,
+		InputFSMPath: input,
+		DataDir:      dataDir,
+		Index:        1,
+		Term:         1,
+		Peers:        []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}},
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	_, statErr := os.Stat(dataDir)
+	require.True(t, os.IsNotExist(statErr))
+	_, statErr = os.Stat(dataDir + ".restore-prep")
+	require.True(t, os.IsNotExist(statErr))
+}
+
+func TestPrepareExternalSnapshotRestoreCleansTempWhenContextCanceledAfterPayload(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "raft")
+	ctx, cancel := context.WithCancel(context.Background())
+	opts, err := normalizeExternalSnapshotRestoreOptions(ExternalSnapshotRestoreOptions{
+		Context:      ctx,
+		InputFSMPath: filepath.Join(root, "encoded.fsm"),
+		DataDir:      dataDir,
+		Index:        1,
+		Term:         1,
+		Peers:        []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}},
+	})
+	require.NoError(t, err)
+
+	_, err = prepareExternalSnapshotRestore(opts, func(context.Context, string, string, uint64, uint64) (uint32, int64, string, error) {
+		cancel()
+		return 1, 0, hex.EncodeToString(sha256.New().Sum(nil)), nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	_, statErr := os.Stat(dataDir)
+	require.True(t, os.IsNotExist(statErr))
+	_, statErr = os.Stat(dataDir + ".restore-prep")
+	require.True(t, os.IsNotExist(statErr))
 }
 
 func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {

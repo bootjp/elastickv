@@ -294,6 +294,64 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 		"the non-default group lease must be warmed by all-group renewal")
 }
 
+func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+	got, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.NotZero(t, got)
+}
+
+func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		failFirst  bool
+		failSecond bool
+	}{
+		{name: "first fails then second advances", failFirst: true},
+		{name: "first advances then second fails", failSecond: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clock := NewHLC()
+			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+			eng1 := newShardedLeaseEngine(100)
+			eng2 := newShardedLeaseEngine(200)
+			eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			if tc.failFirst {
+				eng1.proposeErr = errors.New("group 1 unavailable")
+			}
+			if tc.failSecond {
+				eng2.proposeErr = errors.New("group 2 unavailable")
+			}
+			coord := mustShardedLeaseCoord(t, eng1, eng2)
+			coord.clock = clock
+
+			require.NoError(t, coord.RecoverHLCLease(context.Background()))
+			require.Equal(t, int32(1), eng1.proposeCalls.Load())
+			require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+			got, err := clock.NextFenced()
+			require.NoError(t, err)
+			require.NotZero(t, got)
+		})
+	}
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
