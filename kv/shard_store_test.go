@@ -304,6 +304,36 @@ func TestShardStoreWritePathsRejectRouteWriteTimestampFloor(t *testing.T) {
 	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, []byte("raft-at-prefix-fresh"), nil, 11, 4))
 }
 
+func TestShardStoreDeletePrefixChecksRedisLogicalRouteFloors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte(store.HashFieldPrefix), nil, 100), store.ErrWriteConflict)
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte("!lst|"), nil, 100), store.ErrWriteConflict)
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte("!redis|hash|"), nil, 100), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("alpha")), nil, 100))
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("zulu")), nil, 100), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("zulu")), nil, 101))
+}
+
 func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	t.Parallel()
 
@@ -347,6 +377,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	fake.mu.Lock()
 	require.Equal(t, uint64(100), fake.lastGetReq.GetReadRouteVersion())
 	require.Equal(t, uint64(100), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(1), fake.lastLatestReq.GetGroupId())
 	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
 	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
 	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
@@ -1088,7 +1119,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.NoError(t, g.Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -1103,7 +1134,7 @@ func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
 	require.NoError(t, g.Store.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, nil, nil, 2, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, nil, nil, 2, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
 }
@@ -1756,6 +1787,56 @@ func TestShardStoreRedisWideColumnReadsLegacyRawRoute(t *testing.T) {
 	value, err = st.GetAt(ctx, key, 9)
 	require.NoError(t, err)
 	require.Equal(t, []byte("future"), value)
+}
+
+func TestShardStoreRedisWideColumnScanRefillsAfterLogicalTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	userKey := []byte("zulu")
+	a := store.HashFieldKey(userKey, []byte("a"))
+	b := store.HashFieldKey(userKey, []byte("b"))
+	c := store.HashFieldKey(userKey, []byte("c"))
+	d := store.HashFieldKey(userKey, []byte("d"))
+	for _, item := range []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: a, value: []byte("legacy-a")},
+		{key: b, value: []byte("legacy-b")},
+		{key: c, value: []byte("legacy-c")},
+		{key: d, value: []byte("legacy-d")},
+	} {
+		require.NoError(t, groups[1].Store.PutAt(ctx, item.key, item.value, 5, 0))
+	}
+	require.NoError(t, st.DeleteAt(ctx, a, 7))
+	require.NoError(t, st.DeleteAt(ctx, b, 7))
+
+	prefix := store.HashFieldScanPrefix(userKey)
+	kvs, err := st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, c, kvs[0].Key)
+	require.Equal(t, []byte("legacy-c"), kvs[0].Value)
+	require.Equal(t, d, kvs[1].Key)
+	require.Equal(t, []byte("legacy-d"), kvs[1].Value)
+
+	keys, err := st.ScanKeysAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{c, d}, keys)
 }
 
 func TestShardStoreReverseRedisWideColumnScanPrefersLogicalRoute(t *testing.T) {

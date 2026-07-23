@@ -71,6 +71,7 @@ message RawDeleteResponse {
 message RawLatestCommitTSRequest {
   bytes key = 1;
   uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
+  uint64 group_id = 3; // optional explicit Raft group for route-specific probes
 }
 
 message RawLatestCommitTSResponse {

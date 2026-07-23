@@ -260,6 +260,8 @@ type recordingRawReadFenceStore struct {
 	routeVersion             uint64
 	getReadRouteVersion      uint64
 	latestReadRouteVersion   uint64
+	latestGroupID            uint64
+	latestGroupReadVersion   uint64
 	scanReadRouteVersion     uint64
 	scanReadRouteStart       []byte
 	scanReadRouteEnd         []byte
@@ -309,6 +311,12 @@ func (s *recordingRawReadFenceStore) LatestCommitTSWithReadFence(_ context.Conte
 	return 10, true, nil
 }
 
+func (s *recordingRawReadFenceStore) LatestCommitTSGroupWithReadFence(_ context.Context, _ []byte, groupID uint64, readRouteVersion uint64) (uint64, bool, error) {
+	s.latestGroupID = groupID
+	s.latestGroupReadVersion = readRouteVersion
+	return 11, true, nil
+}
+
 func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	s.scanReadRouteVersion = readRouteVersion
 	s.scanReadRouteStart = cloneTestBytes(routeStart)
@@ -353,6 +361,22 @@ func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(55), st.getReadRouteVersion)
 	require.Equal(t, uint64(55), st.latestReadRouteVersion)
 	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+}
+
+func TestGRPCServer_RawLatestCommitTS_UsesExplicitGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), GroupId: 42, ReadRouteVersion: 98})
+	require.NoError(t, err)
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(11), resp.GetTs())
+	require.Equal(t, uint64(42), st.latestGroupID)
+	require.Equal(t, uint64(98), st.latestGroupReadVersion)
+	require.Zero(t, st.latestReadRouteVersion)
 }
 
 func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {

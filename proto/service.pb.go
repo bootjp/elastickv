@@ -408,6 +408,7 @@ type RawLatestCommitTSRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	ReadRouteVersion uint64                 `protobuf:"varint,2,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	GroupId          uint64                 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for route-specific probes
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -452,6 +453,13 @@ func (x *RawLatestCommitTSRequest) GetKey() []byte {
 func (x *RawLatestCommitTSRequest) GetReadRouteVersion() uint64 {
 	if x != nil {
 		return x.ReadRouteVersion
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
 	}
 	return 0
 }
@@ -2555,10 +2563,11 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"Z\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"u\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
-	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\"C\n" +
+	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
+	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\"C\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
 	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xde\x02\n" +

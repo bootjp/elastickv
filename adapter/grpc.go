@@ -42,6 +42,10 @@ type rawReadFenceCommitTSReader interface {
 	LatestCommitTSWithReadFence(ctx context.Context, key []byte, readRouteVersion uint64) (uint64, bool, error)
 }
 
+type rawGroupCommitTSReader interface {
+	LatestCommitTSGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, readRouteVersion uint64) (uint64, bool, error)
+}
+
 type rawReadFenceScanner interface {
 	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
 }
@@ -172,8 +176,15 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	var ts uint64
 	var exists bool
 	var err error
-	if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
-		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, r.readRouteVersion(req.GetReadRouteVersion()))
+	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
+	if groupID := req.GetGroupId(); groupID != 0 {
+		groupReader, ok := r.store.(rawGroupCommitTSReader)
+		if !ok {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp for an explicit group requires a group-aware store"))
+		}
+		ts, exists, err = groupReader.LatestCommitTSGroupWithReadFence(ctx, key, groupID, readRouteVersion)
+	} else if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
+		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
 	} else if req.GetReadRouteVersion() != 0 {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp with read fence requires a read-fence-aware store"))
 	} else {
