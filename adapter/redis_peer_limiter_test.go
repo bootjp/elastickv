@@ -103,7 +103,7 @@ func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
 	}{
 		{name: "low cap", limit: 2, wantNormal: 1, wantBlocking: 1},
 		{name: "four cap", limit: 4, wantNormal: 2, wantBlocking: 2},
-		{name: "legacy cap", limit: 8, wantNormal: defaultRedisLeaderClientPoolSize, wantBlocking: defaultRedisBlockingLeaderClientPoolSize},
+		{name: "legacy cap", limit: 8, wantNormal: 4, wantBlocking: 4},
 		{name: "default cap", limit: defaultRedisPerPeerConnectionCap, wantNormal: defaultRedisLeaderClientPoolSize, wantBlocking: defaultRedisBlockingLeaderClientPoolSize},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

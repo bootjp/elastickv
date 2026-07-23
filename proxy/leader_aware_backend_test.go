@@ -613,6 +613,12 @@ func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testin
 			aliveLeader := newFakeElasticKVNode(t)
 			aliveLeader.SetLeader(aliveLeader.addr)
 			gate := make(chan struct{})
+			var releaseGate sync.Once
+			defer func() {
+				releaseGate.Do(func() {
+					close(gate)
+				})
+			}()
 			aliveLeader.SetInfoGate(gate)
 
 			backend := NewLeaderAwareRedisBackendWithInterval(
@@ -640,7 +646,9 @@ func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testin
 			}
 			require.Equal(t, int64(0), aliveLeader.commands.Load(), "operation must not run before discovery completes")
 
-			close(gate)
+			releaseGate.Do(func() {
+				close(gate)
+			})
 			var err error
 			require.Eventually(t, func() bool {
 				select {
