@@ -890,6 +890,14 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 	require.NoError(t, src.PutAt(ctx, []byte("key1"), []byte("val1-updated"), 20, 0))
 	require.NoError(t, src.DeleteAt(ctx, []byte("key2"), 15))
 	require.NoError(t, src.PutWithTTLAt(ctx, []byte("key3"), []byte("val3"), 30, 9999))
+	_, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("streaming-metadata"),
+		Versions:  []MVCCVersion{{Key: []byte("imported"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
 
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
@@ -925,6 +933,22 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 	val, err = dst.GetAt(ctx, []byte("key3"), 30)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("val3"), val)
+
+	val, err = dst.GetAt(ctx, []byte("imported"), 50)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(50), floor)
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("different"),
+	})
+	require.NoError(t, err)
+	assert.True(t, res.Duplicate)
+	assert.Equal(t, []byte("streaming-metadata"), res.AckedCursor)
 
 	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
 }

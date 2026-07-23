@@ -2537,7 +2537,7 @@ func (s *S3Server) nextTxnCommitTS(ctx context.Context, startTS uint64) (uint64,
 }
 
 func isRetryableS3MutationErr(err error) bool {
-	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrRouteWriteFenced)
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || isRouteWriteFencedError(err)
 }
 
 func waitS3RetryBackoff(ctx context.Context, delay time.Duration) bool {

@@ -665,22 +665,28 @@ func writePebbleUint64(db *pebble.DB, key []byte, value uint64, opts *pebble.Wri
 	return errors.WithStack(db.Set(key, buf[:], opts))
 }
 
-// writeTempDBMetadata writes lastCommitTS and minRetainedTS atomically in a
-// single synced batch so that both values are either fully durable or fully
-// absent after a crash.  This is critical for restore paths that swap a
-// temporary Pebble directory into place: losing lastCommitTS could allow
-// future commits to reuse timestamps, violating monotonic ordering.
-func writeTempDBMetadata(db *pebble.DB, lastCommitTS, minRetainedTS uint64) error {
+// writeTempDBMetadata writes restore metadata atomically in a single synced
+// batch so every field is either fully durable or fully absent after a crash.
+// This is critical for restore paths that swap a temporary Pebble directory
+// into place: losing lastCommitTS could allow future commits to reuse
+// timestamps, violating monotonic ordering.
+func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error {
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 
 	var buf [timestampSize]byte
-	binary.LittleEndian.PutUint64(buf[:], lastCommitTS)
+	binary.LittleEndian.PutUint64(buf[:], meta.lastCommitTS)
 	if err := batch.Set(metaLastCommitTSBytes, buf[:], nil); err != nil {
 		return errors.WithStack(err)
 	}
-	binary.LittleEndian.PutUint64(buf[:], minRetainedTS)
+	binary.LittleEndian.PutUint64(buf[:], meta.minRetainedTS)
 	if err := batch.Set(metaMinRetainedTSBytes, buf[:], nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationAckMetaKeyBytes, encodeMigrationImportAcks(meta.migrationAcks), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(meta.migrationHLCFloors), nil); err != nil {
 		return errors.WithStack(err)
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
@@ -3351,22 +3357,35 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, error) {
-	expectedChecksum, err := readMVCCSnapshotHeader(r)
+type streamingMVCCRestoreMetadata struct {
+	lastCommitTS       uint64
+	minRetainedTS      uint64
+	migrationAcks      map[migrationAckID]migrationImportAck
+	migrationHLCFloors map[uint64]uint64
+}
+
+func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
+	version, expectedChecksum, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
-	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
+	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
-		return nil, nil, 0, 0, 0, err
+		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
-	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, nil
+	meta := streamingMVCCRestoreMetadata{
+		lastCommitTS:       lastCommitTS,
+		minRetainedTS:      minRetainedTS,
+		migrationAcks:      migrationAcks,
+		migrationHLCFloors: migrationHLCFloors,
+	}
+	return body, hash, expectedChecksum, meta, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, lastCommitTS uint64, minRetainedTS uint64) (string, error) {
+func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, meta streamingMVCCRestoreMetadata) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
@@ -3394,7 +3413,7 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 		cleanupTmp()
 		return "", errors.WithStack(ErrInvalidChecksum)
 	}
-	if err := writeTempDBMetadata(tmpDB, lastCommitTS, minRetainedTS); err != nil {
+	if err := writeTempDBMetadata(tmpDB, meta); err != nil {
 		cleanupTmp()
 		return "", err
 	}
@@ -3406,12 +3425,12 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 }
 
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, err := readStreamingMVCCRestoreHeader(r)
+	body, hash, expectedChecksum, meta, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta)
 	if err != nil {
 		return err
 	}

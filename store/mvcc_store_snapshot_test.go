@@ -99,6 +99,58 @@ func TestMVCCStore_RestoreClearsMigrationMetadata(t *testing.T) {
 	require.Equal(t, []byte("fresh"), res.AckedCursor)
 }
 
+func TestMVCCStore_SnapshotRestorePreservesMigrationMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+	res, err := st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("snap-cursor"),
+		Versions:  []MVCCVersion{{Key: []byte("imported"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, uint64(50), res.MaxImportedTS)
+
+	snap, err := st.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  2,
+		Cursor:    []byte("post-snapshot-cursor"),
+		Versions:  []MVCCVersion{{Key: []byte("post-snapshot"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, st.Restore(bytes.NewReader(raw)))
+	floor, err := st.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+
+	_, err = st.GetAt(ctx, []byte("post-snapshot"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	res, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("ignored"),
+		Versions:  []MVCCVersion{{Key: []byte("duplicate"), CommitTS: 70, Value: []byte("v70")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("snap-cursor"), res.AckedCursor)
+	_, err = st.GetAt(ctx, []byte("duplicate"), 70)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
 func TestMVCCStore_ApplyMutations_WriteConflict(t *testing.T) {
 	t.Parallel()
 
