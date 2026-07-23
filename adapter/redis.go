@@ -116,6 +116,10 @@ const (
 
 const (
 	redisDispatchTimeout = 10 * time.Second
+	// redisLuaDispatchTimeout gives EVAL/EVALSHA enough room for migration
+	// scripts that expand into thousands of Redis calls while keeping regular
+	// commands on the tighter dispatch deadline.
+	redisLuaDispatchTimeout = 30 * time.Second
 	// defaultRedisBlockWaitFallback is the safety-net poll interval for
 	// blocking-command wait loops when no in-process write signal arrives.
 	// Signals cover normal XADD / ZADD / ZINCRBY wakeups immediately; this

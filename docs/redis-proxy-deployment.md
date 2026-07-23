@@ -35,15 +35,15 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
-| `-elastickv-pool-size` | `128` | ElasticKV backend connection pool size |
+| `-elastickv-pool-size` | `192` | ElasticKV backend connection pool size |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
-| `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives half of the shared write limit, minimum `1` |
-| `-secondary-blocking-replay-concurrency` | `0` | Mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `20` |
+| `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives one thirty-second of the shared write limit, capped at `2`, minimum `1` |
+| `-secondary-blocking-replay-concurrency` | `0` | Mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `32` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-script-queue-size` | `0` | Bounded queue for secondary Lua-script writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-blocking-replay-queue-size` | `0` | Bounded queue for mutating blocking-command replays. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
-| `-secondary-timeout` | `5s` | End-to-end secondary write deadline, including queue wait |
+| `-secondary-timeout` | `30s` | End-to-end secondary write deadline, including queue wait |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
 | `-sentry-dsn` | (empty) | Sentry DSN (empty = disabled) |
 | `-sentry-env` | (empty) | Sentry environment name |
@@ -96,11 +96,11 @@ docker run --rm \
   -primary redis.internal:6379 \
   -primary-password "${REDIS_PASSWORD}" \
   -secondary elastickv.internal:6380 \
-  -elastickv-pool-size 128 \
-  -secondary-write-concurrency 64 \
-  -secondary-script-concurrency 32 \
+  -elastickv-pool-size 192 \
+  -secondary-write-concurrency 96 \
+  -secondary-script-concurrency 2 \
   -mode dual-write-shadow \
-  -secondary-timeout 5s \
+  -secondary-timeout 30s \
   -shadow-timeout 3s \
   -sentry-dsn "${SENTRY_DSN}" \
   -sentry-env production \
@@ -120,9 +120,9 @@ services:
       - -listen=:6479
       - -primary=redis:6379
       - -secondary=elastickv:6380
-      - -elastickv-pool-size=128
-      - -secondary-write-concurrency=64
-      - -secondary-script-concurrency=32
+      - -elastickv-pool-size=192
+      - -secondary-write-concurrency=96
+      - -secondary-script-concurrency=2
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
@@ -215,7 +215,7 @@ Override backend wiring via env vars before `docker compose up`:
 ```bash
 REDIS_PROXY_PRIMARY=redis.prod.internal:6379 \
 REDIS_PROXY_SECONDARY=elastickv-1.prod.internal:6380,elastickv-2.prod.internal:6380,elastickv-3.prod.internal:6380 \
-REDIS_PROXY_ELASTICKV_POOL_SIZE=128 \
+REDIS_PROXY_ELASTICKV_POOL_SIZE=192 \
 REDIS_PROXY_MODE=dual-write-shadow \
   docker compose -f docker-compose.ha.yml up -d
 ```
@@ -416,8 +416,8 @@ groups:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Redis connection pool size | 128 | Default go-redis pool size for Redis |
-| ElasticKV connection pool size | 128 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
-| ElasticKV Redis per-peer connection cap | 384 | Default server-side cap: two proxy replicas at pool `128`, plus dedicated PubSub/shadow PubSub headroom |
+| ElasticKV connection pool size | 192 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
+| ElasticKV Redis per-peer connection cap | 512 | Default server-side cap: two proxy replicas at pool `192`, plus dedicated PubSub/shadow PubSub headroom |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
@@ -442,7 +442,8 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ### Secondary writes are falling behind
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
-- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `384`. Keep `-secondary-write-concurrency` at or below the pool size.
+- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
+- If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low and profile ElasticKV before raising it.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count

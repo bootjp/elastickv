@@ -33,7 +33,7 @@ const (
 	// from normal secondary writes. Blocking replays may wait for the secondary
 	// to observe a producer write, and they hit the secondary's heavy-command
 	// limiter, so keep the default well below the normal write limit.
-	maxBlockingReplayGoroutines = 20
+	maxBlockingReplayGoroutines = 32
 	// Async queues absorb short bursts without allowing an unavailable or slow
 	// secondary to build an unbounded replay backlog.
 	minAsyncQueueCapacity       = 64

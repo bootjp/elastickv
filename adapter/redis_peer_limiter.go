@@ -10,7 +10,7 @@ import (
 
 const (
 	redisPerPeerLimitEnv              = "ELASTICKV_REDIS_PER_PEER_CONNECTIONS"
-	defaultRedisProxyPoolPeerCap      = 128
+	defaultRedisProxyPoolPeerCap      = 192
 	defaultRedisProxyReplicasPerPeer  = 2
 	defaultRedisDedicatedPeerHeadroom = 128
 	defaultRedisPerPeerConnectionCap  = defaultRedisProxyPoolPeerCap*defaultRedisProxyReplicasPerPeer + defaultRedisDedicatedPeerHeadroom

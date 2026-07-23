@@ -183,6 +183,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "localhost:6379", cfg.PrimaryAddr)
 	assert.Equal(t, "localhost:6380", cfg.SecondaryAddr)
 	assert.Equal(t, ModeDualWrite, cfg.Mode)
+	assert.Equal(t, 30*time.Second, cfg.SecondaryTimeout)
 }
 
 // ========== compare.go tests ==========
@@ -1334,7 +1335,7 @@ func TestDefaultBackendOptions(t *testing.T) {
 
 func TestDefaultElasticKVBackendOptions(t *testing.T) {
 	opts := DefaultElasticKVBackendOptions()
-	assert.Equal(t, 128, opts.PoolSize)
+	assert.Equal(t, 192, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
 	assert.Equal(t, 3*time.Second, opts.WriteTimeout)

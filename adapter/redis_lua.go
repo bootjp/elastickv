@@ -115,7 +115,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisLuaDispatchTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -833,7 +833,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 		stringArgs[i] = string(arg)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), redisLuaDispatchTimeout)
 	defer cancel()
 
 	var reply luaReply

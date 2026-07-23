@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	sentryFlushTimeout          = 2 * time.Second
-	metricsShutdownTimeout      = 5 * time.Second
-	secondaryConcurrencyDivisor = 2
+	sentryFlushTimeout                = 2 * time.Second
+	metricsShutdownTimeout            = 5 * time.Second
+	secondaryWriteConcurrencyDivisor  = 2
+	secondaryScriptConcurrencyDivisor = 32
+	secondaryScriptConcurrencyCap     = 2
 )
 
 func main() {
@@ -53,7 +55,7 @@ func run() error {
 	flag.IntVar(&primaryPoolSize, "primary-pool-size", primaryPoolSize, "Primary Redis backend connection pool size")
 	flag.IntVar(&elasticKVPoolSize, "elastickv-pool-size", elasticKVPoolSize, "ElasticKV backend connection pool size")
 	flag.IntVar(&secondaryWriteConcurrency, "secondary-write-concurrency", secondaryWriteConcurrency, "Maximum concurrent asynchronous secondary writes including scripts (0 = half of secondary backend pool size)")
-	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes within the write limit (0 = half of secondary write concurrency)")
+	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes within the write limit (0 = secondary write concurrency / 32, capped at 2)")
 	flag.IntVar(&secondaryBlockingReplayConcurrency, "secondary-blocking-replay-concurrency", secondaryBlockingReplayConcurrency, "Maximum concurrent asynchronous secondary mutating blocking-command replays (0 = capped remaining secondary backend pool capacity after writes)")
 	flag.IntVar(&secondaryWriteQueueSize, "secondary-write-queue-size", secondaryWriteQueueSize, "Maximum queued asynchronous secondary writes (0 = derived from write concurrency)")
 	flag.IntVar(&secondaryScriptQueueSize, "secondary-script-queue-size", secondaryScriptQueueSize, "Maximum queued asynchronous secondary Lua-script writes (0 = derived from script concurrency)")
@@ -283,11 +285,15 @@ func secondaryBackendPoolSize(mode proxy.ProxyMode, primaryPoolSize, elasticKVPo
 }
 
 func defaultSecondaryWriteConcurrency(poolSize int) int {
-	return atLeastOne(poolSize / secondaryConcurrencyDivisor)
+	return atLeastOne(poolSize / secondaryWriteConcurrencyDivisor)
 }
 
 func defaultSecondaryScriptConcurrency(writeConcurrency int) int {
-	return atLeastOne(writeConcurrency / secondaryConcurrencyDivisor)
+	concurrency := atLeastOne(writeConcurrency / secondaryScriptConcurrencyDivisor)
+	if concurrency > secondaryScriptConcurrencyCap {
+		return secondaryScriptConcurrencyCap
+	}
+	return concurrency
 }
 
 func defaultSecondaryBlockingReplayConcurrency(poolSize, writeConcurrency int) int {

@@ -3,7 +3,7 @@ package proxy
 import "time"
 
 const (
-	defaultSecondaryTimeout    = 5 * time.Second
+	defaultSecondaryTimeout    = 30 * time.Second
 	defaultShadowTimeout       = 3 * time.Second
 	defaultPubSubCompareWindow = 2 * time.Second
 	defaultPubSubSweepInterval = 500 * time.Millisecond

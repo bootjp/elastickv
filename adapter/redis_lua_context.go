@@ -3534,7 +3534,7 @@ func (c *luaScriptContext) commit() error {
 	}
 	sort.Strings(keys)
 
-	ctx, cancel := context.WithTimeout(c.scriptCtx(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(c.scriptCtx(), redisLuaDispatchTimeout)
 	defer cancel()
 
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.

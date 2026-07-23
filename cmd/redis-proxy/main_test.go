@@ -74,8 +74,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       64,
 			wantWriteConcurrency:    32,
-			wantScriptConcurrency:   16,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   1,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "shadow mode derives from ElasticKV pool",
@@ -83,7 +83,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       8,
 			wantWriteConcurrency:    4,
-			wantScriptConcurrency:   2,
+			wantScriptConcurrency:   1,
 			wantBlockingConcurrency: 4,
 		},
 		{
@@ -92,8 +92,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       4,
 			wantWriteConcurrency:    64,
-			wantScriptConcurrency:   32,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   2,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "large remaining pool caps blocking replay",
@@ -102,8 +102,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       144,
 			writeConcurrency:        80,
 			wantWriteConcurrency:    80,
-			wantScriptConcurrency:   40,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   2,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "explicit write keeps derived script",
@@ -112,7 +112,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       8,
 			writeConcurrency:        5,
 			wantWriteConcurrency:    5,
-			wantScriptConcurrency:   2,
+			wantScriptConcurrency:   1,
 			wantBlockingConcurrency: 3,
 		},
 		{
@@ -166,10 +166,10 @@ func TestDeriveSecondaryConcurrencyFromDefaultElasticKVPool(t *testing.T) {
 		0,
 	)
 
-	require.Equal(t, 128, poolSize)
-	require.Equal(t, 64, writeConcurrency)
-	require.Equal(t, 32, scriptConcurrency)
-	require.Equal(t, 20, blockingConcurrency)
+	require.Equal(t, 192, poolSize)
+	require.Equal(t, 96, writeConcurrency)
+	require.Equal(t, 2, scriptConcurrency)
+	require.Equal(t, 32, blockingConcurrency)
 	require.NoError(t, validateSecondaryConcurrency(
 		proxy.ModeDualWrite,
 		proxy.DefaultBackendOptions().PoolSize,
