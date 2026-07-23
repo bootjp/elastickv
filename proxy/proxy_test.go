@@ -531,13 +531,17 @@ func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
 }
 
 type timeoutCapturingBackend struct {
-	name        string
-	timeout     time.Duration
-	args        []any
-	doCalls     int
-	doWithCalls int
-	returnValue any
-	returnErr   error
+	name              string
+	timeout           time.Duration
+	pipelineTimeout   time.Duration
+	args              []any
+	pipelineCmds      [][]any
+	doCalls           int
+	doWithCalls       int
+	pipelineCalls     int
+	pipelineWithCalls int
+	returnValue       any
+	returnErr         error
 }
 
 func (b *timeoutCapturingBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
@@ -566,6 +570,8 @@ func (b *timeoutCapturingBackend) DoWithTimeout(ctx context.Context, timeout tim
 }
 
 func (b *timeoutCapturingBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	b.pipelineCalls++
+	b.pipelineCmds = clonePipelineArgs(cmds)
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {
 		results[i] = b.Do(ctx, args...)
@@ -573,8 +579,33 @@ func (b *timeoutCapturingBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 	return results, nil
 }
 
+func (b *timeoutCapturingBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	b.pipelineWithCalls++
+	b.pipelineTimeout = timeout
+	b.pipelineCmds = clonePipelineArgs(cmds)
+	results := make([]*redis.Cmd, len(cmds))
+	for i, args := range cmds {
+		cmd := redis.NewCmd(ctx, args...)
+		if b.returnErr != nil && i == len(cmds)-1 {
+			cmd.SetErr(b.returnErr)
+		} else {
+			cmd.SetVal(b.returnValue)
+		}
+		results[i] = cmd
+	}
+	return results, nil
+}
+
 func (b *timeoutCapturingBackend) Close() error { return nil }
 func (b *timeoutCapturingBackend) Name() string { return b.name }
+
+func clonePipelineArgs(cmds [][]any) [][]any {
+	out := make([][]any, len(cmds))
+	for i, args := range cmds {
+		out[i] = append([]any(nil), args...)
+	}
+	return out
+}
 
 func TestBlockingCommandTimeout(t *testing.T) {
 	tests := []struct {
@@ -951,7 +982,7 @@ func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {
 func TestDualWriter_Blocking_DoesNotReplayWhenBlockingReplayDisabled(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
-		returnValue: []any{"queue", "job-1", "12.5"},
+		returnValue: []any{"stream-result"},
 	}
 	secondary := newMockBackend("secondary")
 
@@ -965,13 +996,48 @@ func TestDualWriter_Blocking_DoesNotReplayWhenBlockingReplayDisabled(t *testing.
 		testLogger,
 	)
 
+	args := [][]byte{
+		[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("c"),
+		[]byte("BLOCK"), []byte("1000"), []byte("STREAMS"), []byte("jobs"), []byte(">"),
+	}
+	resp, err := d.Blocking(context.Background(), "XREADGROUP", args)
+	assert.NoError(t, err)
+	assert.Equal(t, []any{"stream-result"}, resp)
+	d.Close()
+
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+}
+
+func TestDualWriter_BlockingTranslatedReplayUsesWriteQueueWhenBlockingReplayDisabled(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(int64(1), nil)
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                      ModeDualWrite,
+			SecondaryTimeout:          time.Second,
+			SecondaryWriteConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
 	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
 	assert.NoError(t, err)
 	assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
 	d.Close()
 
-	assert.Equal(t, 0, secondary.CallCount())
-	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.Equal(t, 1, secondary.CallCount())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueBlocking, asyncDropQueueFull)), 0.001)
 }
 
 func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {
@@ -1232,6 +1298,90 @@ func TestDualWriter_ScriptQueueUsesScriptTimeout(t *testing.T) {
 		metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueScript, asyncDropExpired)), 0.001)
 }
 
+func TestDualWriter_SecondaryUsesPerCommandSocketTimeouts(t *testing.T) {
+	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		secondary,
+		ProxyConfig{
+			Mode:                   ModeDualWrite,
+			SecondaryTimeout:       30 * time.Second,
+			SecondaryScriptTimeout: 5 * time.Minute,
+		},
+		newTestMetrics(),
+		newTestSentry(),
+		testLogger,
+	)
+
+	d.writeSecondary(context.Background(), "SET", []any{[]byte("SET"), []byte("k"), []byte("v")})
+	assert.Equal(t, 1, secondary.doWithCalls)
+	assert.Equal(t, 30*time.Second, secondary.timeout)
+
+	d.writeSecondary(context.Background(), "EVALSHA", []any{[]byte("EVALSHA"), []byte("deadbeef"), []byte("0")})
+	assert.Equal(t, 2, secondary.doWithCalls)
+	assert.Equal(t, 5*time.Minute, secondary.timeout)
+}
+
+func TestDualWriter_TxnReplayWithScriptUsesScriptQueueAndTimeout(t *testing.T) {
+	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		secondary,
+		ProxyConfig{
+			Mode:                         ModeDualWrite,
+			SecondaryTimeout:             30 * time.Second,
+			SecondaryScriptTimeout:       5 * time.Minute,
+			SecondaryWriteConcurrency:    1,
+			SecondaryScriptConcurrency:   1,
+			SecondaryWriteQueueCapacity:  1,
+			SecondaryScriptQueueCapacity: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	cmds := [][]any{{"MULTI"}, {"EVALSHA", "deadbeef", "0"}, {"EXEC"}}
+	d.goTxnReplay(cmds, func(ctx context.Context) {
+		d.writeSecondaryPipeline(ctx, cmds)
+	})
+	d.Close()
+
+	assert.Equal(t, 1, secondary.pipelineWithCalls)
+	assert.Equal(t, 5*time.Minute, secondary.pipelineTimeout)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueScript, asyncDropQueueFull)), 0.001)
+}
+
+func TestDualWriter_TxnReplayWithoutScriptUsesWriteQueueAndTimeout(t *testing.T) {
+	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		secondary,
+		ProxyConfig{
+			Mode:                         ModeDualWrite,
+			SecondaryTimeout:             30 * time.Second,
+			SecondaryScriptTimeout:       5 * time.Minute,
+			SecondaryWriteConcurrency:    1,
+			SecondaryScriptConcurrency:   1,
+			SecondaryWriteQueueCapacity:  1,
+			SecondaryScriptQueueCapacity: 1,
+		},
+		newTestMetrics(),
+		newTestSentry(),
+		testLogger,
+	)
+
+	cmds := [][]any{{"MULTI"}, {"SET", "k", "v"}, {"EXEC"}}
+	d.goTxnReplay(cmds, func(ctx context.Context) {
+		d.writeSecondaryPipeline(ctx, cmds)
+	})
+	d.Close()
+
+	assert.Equal(t, 1, secondary.pipelineWithCalls)
+	assert.Equal(t, 30*time.Second, secondary.pipelineTimeout)
+}
+
 func TestDualWriter_ExpiredQueuedWorkDoesNotWaitForSemaphore(t *testing.T) {
 	metrics := newTestMetrics()
 	d := &DualWriter{
@@ -1421,7 +1571,7 @@ func TestDefaultElasticKVBackendOptions(t *testing.T) {
 	opts := DefaultElasticKVBackendOptions()
 	assert.Equal(t, 192, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
-	assert.Equal(t, defaultSecondaryScriptTimeout+blockingReadGrace, opts.ReadTimeout)
+	assert.Equal(t, 3*time.Second, opts.ReadTimeout)
 	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
 }
 

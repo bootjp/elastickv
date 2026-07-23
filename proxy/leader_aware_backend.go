@@ -437,9 +437,21 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 
 // Pipeline forwards a batch to the current leader.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, 0, cmds)
+}
+
+// PipelineWithTimeout forwards a batch with a per-call socket timeout override.
+func (b *LeaderAwareRedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, effectiveBlockingReadTimeout(timeout), cmds)
+}
+
+func (b *LeaderAwareRedisBackend) pipeline(ctx context.Context, readTimeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
 	cli := b.currentClient()
 	if cli == nil {
 		return nil, ErrNoLeaderBackend
+	}
+	if readTimeout > 0 {
+		cli = cli.WithTimeout(readTimeout)
 	}
 	pipe := cli.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))

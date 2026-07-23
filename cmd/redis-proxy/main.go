@@ -62,7 +62,7 @@ func run() error {
 	flag.IntVar(&secondaryBlockingReplayQueueSize, "secondary-blocking-replay-queue-size", secondaryBlockingReplayQueueSize, "Maximum queued asynchronous secondary mutating blocking-command replays (0 = derived from blocking replay concurrency)")
 	flag.StringVar(&modeStr, "mode", "dual-write", "Proxy mode: redis-only, dual-write, dual-write-shadow, elastickv-primary, elastickv-only")
 	flag.DurationVar(&cfg.SecondaryTimeout, "secondary-timeout", cfg.SecondaryTimeout, "Secondary write timeout")
-	flag.DurationVar(&cfg.SecondaryScriptTimeout, "secondary-script-timeout", cfg.SecondaryScriptTimeout, "Secondary Lua-script write timeout (0 = secondary-timeout)")
+	flag.DurationVar(&cfg.SecondaryScriptTimeout, "secondary-script-timeout", cfg.SecondaryScriptTimeout, "Secondary Lua-script write timeout for Redis or ElasticKV replay, including transaction scripts (0 = secondary-timeout)")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", cfg.ShadowTimeout, "Shadow read timeout")
 	flag.StringVar(&cfg.SentryDSN, "sentry-dsn", cfg.SentryDSN, "Sentry DSN (empty = disabled)")
 	flag.StringVar(&cfg.SentryEnv, "sentry-env", cfg.SentryEnv, "Sentry environment")

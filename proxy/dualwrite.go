@@ -444,7 +444,7 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 	var usedNOSCRIPTFallback bool
 	args := iArgs
 	for ; ; attempt++ {
-		result := d.secondary.Do(sCtx, args...)
+		result := d.secondaryDo(sCtx, cmd, args)
 		_, sErr = result.Result()
 		if isNoScriptError(sErr) {
 			// After a successful NOSCRIPT→EVAL resolution, retries reuse the
@@ -453,7 +453,7 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
 				usedNOSCRIPTFallback = true
 				args = fallbackArgs
-				result = d.secondary.Do(sCtx, args...)
+				result = d.secondaryDo(sCtx, cmd, args)
 				_, sErr = result.Result()
 			}
 		}
@@ -502,7 +502,7 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 	var attempt int
 	for ; ; attempt++ {
 		var resp any
-		result := d.secondary.Do(sCtx, iArgs...)
+		result := d.secondaryDo(sCtx, cmd, iArgs)
 		resp, sErr = result.Result()
 		if ok, err := positiveIntReplayResult(resp, sErr); ok {
 			elapsed := time.Since(start)
@@ -671,7 +671,7 @@ func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) 
 	var sErr error
 	var attempt int
 	for ; ; attempt++ {
-		results, pErr := d.secondary.Pipeline(sCtx, cmds)
+		results, pErr := d.secondaryPipeline(sCtx, cmds)
 		sErr = secondaryPipelineError(results, pErr)
 		retryReason, retryLimit := secondaryPipelineRetryReasonAndLimit(sErr)
 		if retryReason == "" {
@@ -836,9 +836,6 @@ func (d *DualWriter) goBlockingReplay(fn func(context.Context)) {
 }
 
 func (d *DualWriter) goTranslatedBlockingReplay(fn func(context.Context)) {
-	if cap(d.blockingReplaySem) == 0 {
-		return
-	}
 	d.goWrite(fn)
 }
 
@@ -847,9 +844,17 @@ func (d *DualWriter) goShadow(fn func()) {
 	d.goShadowWithSem(fn)
 }
 
-// goAsync queues fn with the write class (for txn replay).
+// goAsync queues fn with the write class (for txn replay without scripts).
 func (d *DualWriter) goAsync(fn func(context.Context)) {
 	d.goWrite(fn)
+}
+
+func (d *DualWriter) goTxnReplay(cmds [][]any, fn func(context.Context)) {
+	if pipelineContainsScript(cmds) {
+		d.goScript(fn)
+		return
+	}
+	d.goAsync(fn)
 }
 
 func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
@@ -857,6 +862,71 @@ func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
 		return cfg.SecondaryScriptTimeout
 	}
 	return cfg.SecondaryTimeout
+}
+
+func (d *DualWriter) secondaryDo(ctx context.Context, cmd string, args []any) *redis.Cmd {
+	timeout := d.secondaryCommandReadTimeout(cmd)
+	if timeout > 0 {
+		if backend, ok := d.secondary.(blockingTimeoutBackend); ok {
+			return backend.DoWithTimeout(ctx, timeout, args...)
+		}
+	}
+	return d.secondary.Do(ctx, args...)
+}
+
+func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	timeout := d.secondaryPipelineReadTimeout(cmds)
+	if timeout > 0 {
+		if backend, ok := d.secondary.(pipelineTimeoutBackend); ok {
+			results, err := backend.PipelineWithTimeout(ctx, timeout, cmds)
+			if err != nil {
+				return results, fmt.Errorf("secondary pipeline with timeout: %w", err)
+			}
+			return results, nil
+		}
+	}
+	results, err := d.secondary.Pipeline(ctx, cmds)
+	if err != nil {
+		return results, fmt.Errorf("secondary pipeline: %w", err)
+	}
+	return results, nil
+}
+
+func (d *DualWriter) secondaryCommandReadTimeout(cmd string) time.Duration {
+	if isRedisScriptCommandName(cmd) {
+		return secondaryScriptTimeout(d.cfg)
+	}
+	return d.cfg.SecondaryTimeout
+}
+
+func (d *DualWriter) secondaryPipelineReadTimeout(cmds [][]any) time.Duration {
+	if pipelineContainsScript(cmds) {
+		return secondaryScriptTimeout(d.cfg)
+	}
+	return d.cfg.SecondaryTimeout
+}
+
+func pipelineContainsScript(cmds [][]any) bool {
+	for _, args := range cmds {
+		if len(args) == 0 {
+			continue
+		}
+		if isRedisScriptCommandName(redisCommandName(args[0])) {
+			return true
+		}
+	}
+	return false
+}
+
+func redisCommandName(arg any) string {
+	switch v := arg.(type) {
+	case []byte:
+		return string(v)
+	case string:
+		return v
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func (d *DualWriter) startBackendPoolSampler() {

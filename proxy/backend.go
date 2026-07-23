@@ -10,14 +10,13 @@ import (
 )
 
 const (
-	defaultPoolSize             = 128
-	defaultElasticKVPoolSize    = 192
-	defaultDialTimeout          = 5 * time.Second
-	defaultReadTimeout          = 3 * time.Second
-	blockingReadGrace           = 10 * time.Second
-	defaultElasticKVReadTimeout = defaultSecondaryScriptTimeout + blockingReadGrace
-	defaultWriteTimeout         = 3 * time.Second
-	respProtocolV2              = 2
+	defaultPoolSize          = 128
+	defaultElasticKVPoolSize = 192
+	defaultDialTimeout       = 5 * time.Second
+	defaultReadTimeout       = 3 * time.Second
+	blockingReadGrace        = 10 * time.Second
+	defaultWriteTimeout      = 3 * time.Second
+	respProtocolV2           = 2
 )
 
 // Backend abstracts a Redis-protocol endpoint (real Redis or ElasticKV).
@@ -73,17 +72,14 @@ func DefaultBackendOptions() BackendOptions {
 }
 
 // DefaultElasticKVBackendOptions returns defaults for proxy backends that
-// connect to ElasticKV's Redis adapter. Production dual-write deployments
-// should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS sized for
-// every proxy replica that may share one client IP, plus dedicated PubSub and
-// shadow PubSub connections outside this command pool. Lower the proxy pool
-// instead for clusters that keep the server-side per-peer cap below the default.
-// The read timeout intentionally exceeds the proxy's script replay timeout so
-// per-operation contexts, not socket deadlines, decide script cancellation.
+// connect to ElasticKV's Redis adapter. Production dual-write deployments should
+// run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS sized for every
+// proxy replica that may share one client IP, plus dedicated PubSub and shadow
+// PubSub connections outside this command pool. Lower the proxy pool instead
+// for clusters that keep the server-side per-peer cap below the default.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize
-	opts.ReadTimeout = defaultElasticKVReadTimeout
 	return opts
 }
 
@@ -140,7 +136,17 @@ func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
 }
 
 func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
-	pipe := b.client.Pipeline()
+	return b.pipeline(ctx, b.client, cmds)
+}
+
+// PipelineWithTimeout executes a pipeline using a per-call socket timeout
+// override for async replay classes whose deadline exceeds the backend default.
+func (b *RedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)), cmds)
+}
+
+func (b *RedisBackend) pipeline(ctx context.Context, client *redis.Client, cmds [][]any) ([]*redis.Cmd, error) {
+	pipe := client.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {
 		results[i] = pipe.Do(ctx, args...)

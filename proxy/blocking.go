@@ -16,6 +16,10 @@ type blockingTimeoutBackend interface {
 	DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd
 }
 
+type pipelineTimeoutBackend interface {
+	PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error)
+}
+
 func blockingCommandTimeout(cmd string, args [][]byte) time.Duration {
 	switch strings.ToUpper(cmd) {
 	case "BLPOP", "BRPOP", "BRPOPLPUSH", "BLMOVE", "BZPOPMIN", "BZPOPMAX":

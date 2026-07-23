@@ -68,7 +68,7 @@ func newHLCMetrics(registerer prometheus.Registerer) *HLCMetrics {
 		}),
 		wallSkewSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "elastickv_hlc_wall_skew_seconds",
-			Help: "wall_now - physicalCeiling, in seconds. Negative is healthy (ceiling is in the future); zero or positive means NextFenced is at-or-past the rejection boundary. Alert on > -5 to catch renewal stalls before the HLC-4 (iii) fence trips.",
+			Help: "wall_now - physicalCeiling, in seconds. Negative is healthy after physicalCeiling > 0; pre-bootstrap physicalCeiling == 0 is held at 0. Alert on wallSkewSeconds > -5 and physicalCeilingSeconds > 0 to catch renewal stalls before the HLC-4 (iii) fence trips.",
 		}),
 		nextFencedRejectionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "elastickv_hlc_next_fenced_rejections_total",
