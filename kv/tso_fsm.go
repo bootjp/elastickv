@@ -3,6 +3,7 @@ package kv
 import (
 	"encoding/binary"
 	"io"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -18,7 +19,8 @@ var _ raftengine.VolatileEntryClassifier = (*TSOStateMachine)(nil)
 // group. It tracks only the Raft-agreed HLC physical ceiling; no KV state,
 // route catalog, or sidecar state is attached to group 0.
 type TSOStateMachine struct {
-	hlc *HLC
+	hlc       *HLC
+	ceilingMs atomic.Int64
 }
 
 // NewTSOStateMachine constructs the dedicated TSO FSM over the shared HLC.
@@ -38,14 +40,12 @@ func (f *TSOStateMachine) applyHLCLease(data []byte) any {
 		return errors.Newf("tso fsm: hlc lease: expected %d bytes, got %d", hlcLeasePayloadLen, len(data)) //nolint:wrapcheck // creating new error, nothing to wrap
 	}
 	ceilingMs := int64(binary.BigEndian.Uint64(data)) //nolint:gosec // value is a Unix ms timestamp encoded as uint64; fits in int64 for valid deployments.
-	if f.hlc != nil && ceilingMs > 0 {
-		f.hlc.SetPhysicalCeiling(ceilingMs)
-	}
+	f.applyTSOCeiling(ceilingMs)
 	return nil
 }
 
 func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
-	return &tsoSnapshot{ceilingMs: hlcCeilingFromHLC(f.hlc)}, nil
+	return &tsoSnapshot{ceilingMs: f.committedCeiling()}, nil
 }
 
 func (f *TSOStateMachine) Restore(r io.Reader) error {
@@ -62,10 +62,39 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 		return errors.New("tso fsm: restore snapshot: trailing bytes") //nolint:wrapcheck // creating new error, nothing to wrap
 	}
 	ceilingMs := int64(binary.BigEndian.Uint64(buf[:])) //nolint:gosec // value was written from an int64 Unix ms ceiling.
-	if f.hlc != nil && ceilingMs > 0 {
-		f.hlc.SetPhysicalCeiling(ceilingMs)
-	}
+	f.applyTSOCeiling(ceilingMs)
 	return nil
+}
+
+func (f *TSOStateMachine) applyTSOCeiling(ceilingMs int64) {
+	if ceilingMs <= 0 {
+		return
+	}
+	f.advanceCommittedCeiling(ceilingMs)
+	if f.hlc != nil {
+		f.hlc.SetPhysicalCeiling(ceilingMs)
+		f.hlc.Observe(tsoCeilingMaxTimestamp(ceilingMs))
+	}
+}
+
+func (f *TSOStateMachine) advanceCommittedCeiling(ceilingMs int64) {
+	for {
+		prev := f.ceilingMs.Load()
+		if ceilingMs <= prev {
+			return
+		}
+		if f.ceilingMs.CompareAndSwap(prev, ceilingMs) {
+			return
+		}
+	}
+}
+
+func (f *TSOStateMachine) committedCeiling() int64 {
+	return f.ceilingMs.Load()
+}
+
+func tsoCeilingMaxTimestamp(ceilingMs int64) uint64 {
+	return (uint64(ceilingMs) << hlcLogicalBits) | hlcLogicalMask //nolint:gosec // ceilingMs is validated positive before conversion.
 }
 
 // IsVolatileOnlyPayload classifies HLC lease entries for the cold-start replay
