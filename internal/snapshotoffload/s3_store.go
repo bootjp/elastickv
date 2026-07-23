@@ -27,7 +27,7 @@ const (
 	s3DefaultMultipartPart    = int64(64 * 1024 * 1024)
 	s3MaxMultipartPart        = int64(5 * 1024 * 1024 * 1024)
 	s3MaxMultipartParts       = int64(10_000)
-	s3MaxObjectBytes          = s3MaxMultipartPart * s3MaxMultipartParts
+	s3MaxObjectBytes          = int64(5 * 1024 * 1024 * 1024 * 1024)
 	s3MultipartAbortTimeout   = 30 * time.Second
 )
 
@@ -488,10 +488,14 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, Obj
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(normalized),
-	})
+	}
+	if !s.disableChecksumHeaders {
+		input.ChecksumMode = types.ChecksumModeEnabled
+	}
+	out, err := s.client.GetObject(ctx, input)
 	if err != nil {
 		if isS3NotFound(err) {
 			return nil, ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", normalized)
@@ -526,10 +530,14 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (ObjectInfo, bool,
 	if err != nil {
 		return ObjectInfo{}, false, err
 	}
-	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+	input := &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(normalized),
-	})
+	}
+	if !s.disableChecksumHeaders {
+		input.ChecksumMode = types.ChecksumModeEnabled
+	}
+	out, err := s.client.HeadObject(ctx, input)
 	if err != nil {
 		if isS3NotFound(err) {
 			return ObjectInfo{}, false, nil

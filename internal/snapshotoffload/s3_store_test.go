@@ -72,11 +72,13 @@ func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int64(len(body)), head.Size)
 	require.Equal(t, sha, head.SHA256)
+	require.Equal(t, types.ChecksumModeEnabled, fake.lastHeadObjectChecksumMode())
 
 	reader, gotInfo, err := store.GetObject(ctx, "snapshots/body.fsm")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, reader.Close()) }()
 	require.Equal(t, sha, gotInfo.SHA256)
+	require.Equal(t, types.ChecksumModeEnabled, fake.lastGetObjectChecksumMode())
 	gotBody, err := io.ReadAll(reader)
 	require.NoError(t, err)
 	require.Equal(t, body, gotBody)
@@ -286,10 +288,35 @@ func TestS3ObjectSHA256RejectsMetadataFullObjectChecksumMismatch(t *testing.T) {
 	require.ErrorIs(t, err, ErrIntegrity)
 }
 
-func TestMultipartPartSizeAllowsS3PartCapacity(t *testing.T) {
+func TestS3StoreHeadAndGetRequestChecksumModeForFullObjectValidation(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store := newTestS3Store(t, fake)
+	key := "snapshots/checksum-mismatch.fsm"
+	metadataSHA := hexSHA256Bytes([]byte("metadata-body"))
+	fullObjectChecksum, err := sha256HexToBase64(hexSHA256Bytes([]byte("full-object-body")))
+	require.NoError(t, err)
+	fake.putRawObject("backup-bucket", key, []byte("body"), map[string]string{
+		s3MetadataSHA256: metadataSHA,
+	}, aws.String(fullObjectChecksum), types.ChecksumTypeFullObject)
+
+	_, ok, err := store.HeadObject(ctx, key)
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.False(t, ok)
+	require.Equal(t, types.ChecksumModeEnabled, fake.lastHeadObjectChecksumMode())
+
+	body, _, err := store.GetObject(ctx, key)
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.Nil(t, body)
+	require.Equal(t, types.ChecksumModeEnabled, fake.lastGetObjectChecksumMode())
+}
+
+func TestMultipartPartSizeCapsAtS3ObjectLimit(t *testing.T) {
 	partSize, err := multipartPartSize(s3MaxObjectBytes, s3DefaultMultipartPart)
 	require.NoError(t, err)
-	require.Equal(t, s3MaxMultipartPart, partSize)
+	expectedPartSize := max(s3DefaultMultipartPart, (s3MaxObjectBytes+s3MaxMultipartParts-1)/s3MaxMultipartParts)
+	require.Equal(t, expectedPartSize, partSize)
+	require.LessOrEqual(t, partSize, s3MaxMultipartPart)
 
 	_, err = multipartPartSize(s3MaxObjectBytes+1, s3DefaultMultipartPart)
 	require.ErrorIs(t, err, ErrInvalidOptions)
@@ -339,6 +366,8 @@ type fakeS3Client struct {
 	lastMultipartCreate  types.ChecksumAlgorithm
 	lastUploadPart       types.ChecksumAlgorithm
 	lastUploadPartSHA    *string
+	lastHeadChecksumMode types.ChecksumMode
+	lastGetChecksumMode  types.ChecksumMode
 	completedChecksums   int
 	attempts             int
 	gets                 int
@@ -463,6 +492,7 @@ func (c *fakeS3Client) PutObject(_ context.Context, input *s3.PutObjectInput, _ 
 func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.lastHeadChecksumMode = input.ChecksumMode
 	obj, ok := c.objects[fakeS3ClientKey(input.Bucket, input.Key)]
 	if !ok {
 		return nil, &types.NotFound{}
@@ -471,11 +501,12 @@ func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, 
 	for k, v := range obj.metadata {
 		metadata[k] = v
 	}
+	checksum, checksumType := fakeS3ChecksumForMode(input.ChecksumMode, obj)
 	return &s3.HeadObjectOutput{
 		ContentLength:        aws.Int64(int64(len(obj.body))),
 		Metadata:             metadata,
-		ChecksumSHA256:       obj.checksum,
-		ChecksumType:         obj.checksumType,
+		ChecksumSHA256:       checksum,
+		ChecksumType:         checksumType,
 		ServerSideEncryption: obj.serverSideEncryption,
 		SSEKMSKeyId:          obj.kmsKeyID,
 	}, nil
@@ -485,6 +516,7 @@ func (c *fakeS3Client) GetObject(_ context.Context, input *s3.GetObjectInput, _ 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gets++
+	c.lastGetChecksumMode = input.ChecksumMode
 	obj, ok := c.objects[fakeS3ClientKey(input.Bucket, input.Key)]
 	if !ok {
 		return nil, &types.NotFound{}
@@ -493,12 +525,13 @@ func (c *fakeS3Client) GetObject(_ context.Context, input *s3.GetObjectInput, _ 
 	for k, v := range obj.metadata {
 		metadata[k] = v
 	}
+	checksum, checksumType := fakeS3ChecksumForMode(input.ChecksumMode, obj)
 	return &s3.GetObjectOutput{
 		Body:                 io.NopCloser(bytes.NewReader(obj.body)),
 		ContentLength:        aws.Int64(int64(len(obj.body))),
 		Metadata:             metadata,
-		ChecksumSHA256:       obj.checksum,
-		ChecksumType:         obj.checksumType,
+		ChecksumSHA256:       checksum,
+		ChecksumType:         checksumType,
 		ServerSideEncryption: obj.serverSideEncryption,
 		SSEKMSKeyId:          obj.kmsKeyID,
 	}, nil
@@ -623,6 +656,18 @@ func (c *fakeS3Client) lastUploadPartSHA256() *string {
 	return cloneStringPtr(c.lastUploadPartSHA)
 }
 
+func (c *fakeS3Client) lastHeadObjectChecksumMode() types.ChecksumMode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastHeadChecksumMode
+}
+
+func (c *fakeS3Client) lastGetObjectChecksumMode() types.ChecksumMode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastGetChecksumMode
+}
+
 func (c *fakeS3Client) completedPartChecksums() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -672,6 +717,13 @@ func s3ChecksumTypeForSHA(checksum *string) types.ChecksumType {
 		return ""
 	}
 	return types.ChecksumTypeFullObject
+}
+
+func fakeS3ChecksumForMode(mode types.ChecksumMode, obj fakeS3Object) (*string, types.ChecksumType) {
+	if mode != types.ChecksumModeEnabled {
+		return nil, ""
+	}
+	return obj.checksum, obj.checksumType
 }
 
 func fakeS3ClientKey(bucket *string, key *string) string {
