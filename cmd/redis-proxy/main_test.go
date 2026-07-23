@@ -168,7 +168,7 @@ func TestDeriveSecondaryConcurrencyFromDefaultElasticKVPool(t *testing.T) {
 
 	require.Equal(t, 192, poolSize)
 	require.Equal(t, 96, writeConcurrency)
-	require.Equal(t, 2, scriptConcurrency)
+	require.Equal(t, 3, scriptConcurrency)
 	require.Equal(t, 32, blockingConcurrency)
 	require.NoError(t, validateSecondaryConcurrency(
 		proxy.ModeDualWrite,

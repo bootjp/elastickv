@@ -204,7 +204,7 @@ docker run --rm \
   -secondary elastickv.internal:6380 \
   -elastickv-pool-size 192 \
   -secondary-write-concurrency 96 \
-  -secondary-script-concurrency 2 \
+  -secondary-script-concurrency 3 \
   -mode dual-write
 ```
 

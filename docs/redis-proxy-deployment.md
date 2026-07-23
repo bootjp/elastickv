@@ -37,7 +37,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
 | `-elastickv-pool-size` | `192` | ElasticKV backend connection pool size |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
-| `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives one thirty-second of the shared write limit, capped at `2`, minimum `1` |
+| `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives one thirty-second of the shared write limit, capped at `3`, minimum `1` |
 | `-secondary-blocking-replay-concurrency` | `0` | Mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `32` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-script-queue-size` | `0` | Bounded queue for secondary Lua-script writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
@@ -99,7 +99,7 @@ docker run --rm \
   -secondary elastickv.internal:6380 \
   -elastickv-pool-size 192 \
   -secondary-write-concurrency 96 \
-  -secondary-script-concurrency 2 \
+  -secondary-script-concurrency 3 \
   -mode dual-write-shadow \
   -secondary-timeout 30s \
   -secondary-script-timeout 5m \
@@ -124,7 +124,7 @@ services:
       - -secondary=elastickv:6380
       - -elastickv-pool-size=192
       - -secondary-write-concurrency=96
-      - -secondary-script-concurrency=2
+      - -secondary-script-concurrency=3
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
