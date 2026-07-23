@@ -3658,18 +3658,27 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		return luaKeyPlan{}, err
 	}
 
-	startType, err := c.server.keyTypeAt(ctx, []byte(key), c.startTS)
+	keyBytes := []byte(key)
+	rawStartType, err := c.server.rawKeyTypeAt(ctx, keyBytes, c.startTS)
+	if err != nil {
+		return luaKeyPlan{}, err
+	}
+	startType, err := c.server.applyTTLFilter(ctx, keyBytes, c.startTS, rawStartType)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
 	var deleteElems []*kv.Elem[kv.OP]
-	readKeys := luaWideFenceReadKeysForPlan([]byte(key), finalType, startType, valuePlan.preserveExisting)
+	readKeys := luaWideFenceReadKeysForPlan(keyBytes, finalType, startType, valuePlan.preserveExisting)
 	if !valuePlan.preserveExisting {
-		deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, []byte(key), c.startTS)
+		if c.everDeleted[key] && rawStartType != redisTypeNone {
+			deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, keyBytes, c.startTS)
+		} else {
+			deleteElems, _, err = c.server.deleteLogicalKeyElemsForType(ctx, keyBytes, c.startTS, rawStartType)
+		}
 		if err != nil {
 			return luaKeyPlan{}, err
 		}
-		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems([]byte(key))...)
+		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems(keyBytes)...)
 	}
 
 	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems))
