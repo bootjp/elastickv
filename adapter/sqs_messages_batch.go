@@ -181,7 +181,11 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	entries []sqsSendMessageBatchEntryInput,
 	identities []sqsSendIdentity,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs send message batch: begin read timestamp")
+	if err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, nil, false, errors.WithStack(err)
@@ -367,12 +371,16 @@ func (s *SQSServer) runFifoSendWithRetry(
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := s.nextTxnReadTS(ctx)
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs fifo send: begin read timestamp")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		meta, dedupID, delay, err := s.resolveFreshFifoSnapshot(ctx, queueName, in, readTS)
 		if err != nil {
 			return nil, err
 		}
-		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
+		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTimestamp)
 		if err != nil {
 			return nil, err
 		}

@@ -174,8 +174,9 @@ func (s *SQSServer) sendFifoMessage(
 	in sqsSendMessageInput,
 	dedupID string,
 	delay int64,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 ) (map[string]string, bool, error) {
+	readTS := readTimestamp.Timestamp()
 	// HT-FIFO: hash the MessageGroupId once at the entry point so
 	// every key built in this transaction (data, vis, byage, dedup,
 	// group-lock, sequence) lands in the same partition. partitionFor
@@ -248,7 +249,8 @@ func (s *SQSServer) sendFifoMessage(
 			{Op: kv.Put, Key: seqKey, Value: []byte(strconv.FormatUint(nextSeq, 10))},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, true, nil
 		}

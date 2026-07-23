@@ -21,12 +21,11 @@ func (d *DynamoDBServer) ensureLegacyTableMigrationLocked(ctx context.Context, t
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
-		schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
+		readTimestamp, schema, migrationRequired, err := d.legacyMigrationSnapshot(ctx, tableName)
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		if !exists || !schema.needsLegacyKeyMigration() {
+		if !migrationRequired {
 			return nil
 		}
 		// Admin read-only callers (AdminScanTable) must not trigger
@@ -39,7 +38,7 @@ func (d *DynamoDBServer) ensureLegacyTableMigrationLocked(ctx context.Context, t
 				"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
 		}
 		if !schema.usesOrderedKeyEncoding() {
-			err = d.startLegacyTableKeyMigration(ctx, schema, readTS)
+			err = d.startLegacyTableKeyMigration(ctx, schema, readTimestamp)
 		} else {
 			err = d.migrateLegacyTableGeneration(ctx, schema)
 		}
@@ -57,14 +56,30 @@ func (d *DynamoDBServer) ensureLegacyTableMigrationLocked(ctx context.Context, t
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "legacy table migration retry attempts exhausted")
 }
 
+func (d *DynamoDBServer) legacyMigrationSnapshot(
+	ctx context.Context,
+	tableName string,
+) (kv.ReadTimestamp, *dynamoTableSchema, bool, error) {
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-table migration: begin read timestamp")
+	if err != nil {
+		return kv.ReadTimestamp{}, nil, false, errors.WithStack(err)
+	}
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTimestamp.Timestamp())
+	if err != nil {
+		return kv.ReadTimestamp{}, nil, false, errors.WithStack(err)
+	}
+	return readTimestamp, schema, exists && schema.needsLegacyKeyMigration(), nil
+}
+
 func (d *DynamoDBServer) startLegacyTableKeyMigration(
 	ctx context.Context,
 	schema *dynamoTableSchema,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 ) error {
 	if schema == nil || schema.usesOrderedKeyEncoding() {
 		return nil
 	}
+	readTS := readTimestamp.Timestamp()
 	nextGeneration, err := d.nextTableGenerationAt(ctx, schema.TableName, readTS)
 	if err != nil {
 		return err
@@ -151,7 +166,11 @@ func (d *DynamoDBServer) migrateLegacyItem(
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-item migration: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		req, done, err := d.buildLegacyMigrationRequest(ctx, targetSchema, sourceSchema, targetKey, sourceKey, readTS)
 		if err != nil {
 			return err
@@ -292,7 +311,11 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	readTS := d.nextTxnReadTS()
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb finalize migration: begin read timestamp")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	req := &kv.OperationGroup[kv.OP]{
 		IsTxn:   true,
 		StartTS: readTS,

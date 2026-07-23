@@ -1577,7 +1577,7 @@ func (t *txnContext) commit() error {
 		CommitTS: prepared.commitTS,
 		ReadKeys: prepared.readKeys,
 	}
-	if _, err := t.server.coordinator.Dispatch(prepared.ctx, group); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(prepared.ctx, t.server.coordinator, group); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -2379,13 +2379,18 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		startTS := r.txnStartTS()
+		readTimestamp, err := r.beginTxnReadTimestamp(dispatchCtx, "redis exec: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		attemptCtx := readTimestamp.WithDispatchVoucher(dispatchCtx)
+		startTS := readTimestamp.Timestamp()
 		readPin := r.pinReadTS(startTS)
 		defer readPin.Release()
 
 		txn := &txnContext{
 			server:                r,
-			ctx:                   dispatchCtx,
+			ctx:                   attemptCtx,
 			working:               map[string]*txnValue{},
 			replacers:             map[string]*stringReplacement{},
 			listStates:            map[string]*listTxnState{},
@@ -2412,7 +2417,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 			nextResults = append(nextResults, res)
 		}
 
-		if err := txn.validateReadSet(dispatchCtx); err != nil {
+		if err := txn.validateReadSet(attemptCtx); err != nil {
 			return err
 		}
 		if err := txn.commit(); err != nil {
@@ -2446,11 +2451,12 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 // results are only returned when reuse actually represents the
 // outcome of attempt 1's intent.
 type reusableExecTxn struct {
-	elems    []*kv.Elem[kv.OP]
-	startTS  uint64
-	commitTS uint64
-	readKeys [][]byte
-	results  []redisResult
+	elems         []*kv.Elem[kv.OP]
+	startTS       uint64
+	commitTS      uint64
+	readKeys      [][]byte
+	results       []redisResult
+	readTimestamp kv.ReadTimestamp
 }
 
 // dispatchExecReuse runs one iteration of the option-2 reuse path for
@@ -2468,6 +2474,7 @@ type reusableExecTxn struct {
 // is the current length" question; the client-visible result IS the
 // cached results array.
 func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableExecTxn) (results []redisResult, drop bool, err error) {
+	ctx = pending.readTimestamp.WithDispatchVoucher(ctx)
 	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
 	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
 	// at tla/hlc/MCHLC_gap.cfg). Clock().Next() bypasses the ceiling and
@@ -2478,7 +2485,7 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	if allocErr != nil {
 		return nil, false, errors.WithStack(allocErr)
 	}
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	_, dispErr := kv.DispatchWithReadTimestamp(ctx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
 		StartTS:      pending.startTS,
 		CommitTS:     commitTS,
@@ -2593,7 +2600,12 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 // from runTransactionWithDedup to keep that loop under the cyclop
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
-	startTS := r.txnStartTS()
+	readTimestamp, err := r.beginTxnReadTimestamp(dispatchCtx, "redis exec: begin read timestamp")
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	dispatchCtx = readTimestamp.WithDispatchVoucher(dispatchCtx)
+	startTS := readTimestamp.Timestamp()
 	readPin := r.pinReadTS(startTS)
 	defer readPin.Release()
 
@@ -2647,7 +2659,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		CommitTS: prepared.commitTS,
 		ReadKeys: prepared.readKeys,
 	}
-	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
+	if _, dispErr := kv.DispatchWithReadTimestamp(prepared.ctx, r.coordinator, group); dispErr != nil {
 		// Preserve the exact attempt for a forwarded conflict only after
 		// restoring its typed form. runTransactionWithDedup can then reuse this
 		// write set instead of replaying the EXEC body from a new snapshot.
@@ -2660,11 +2672,12 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		// escape to the client are out of scope for this loop.
 		if isRetryableRedisTxnErr(dispErr) {
 			return nil, &reusableExecTxn{
-				elems:    prepared.elems,
-				startTS:  txn.startTS,
-				commitTS: prepared.commitTS,
-				readKeys: prepared.readKeys,
-				results:  nextResults,
+				elems:         prepared.elems,
+				startTS:       txn.startTS,
+				commitTS:      prepared.commitTS,
+				readKeys:      prepared.readKeys,
+				results:       nextResults,
+				readTimestamp: readTimestamp,
 			}, errors.WithStack(dispErr)
 		}
 		return nil, nil, errors.WithStack(dispErr)
@@ -2708,6 +2721,19 @@ func (r *RedisServer) txnStartTS() uint64 {
 		return 1
 	}
 	return maxTS
+}
+
+func (r *RedisServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, r.txnStartTS(), label)
+	return readTimestamp, errors.WithStack(err)
+}
+
+func (r *RedisServer) beginTxnStartTS(ctx context.Context, label string) (uint64, error) {
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, label)
+	if err != nil {
+		return 0, err
+	}
+	return readTimestamp.Timestamp(), nil
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {

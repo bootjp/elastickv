@@ -5,6 +5,7 @@ option go_package = "github.com/bootjp/elastickv/proto";
 service Distribution {
   rpc GetRoute (GetRouteRequest) returns (GetRouteResponse) {}
   rpc GetTimestamp (GetTimestampRequest) returns (GetTimestampResponse) {}
+  rpc ValidateTimestamp (ValidateTimestampRequest) returns (ValidateTimestampResponse) {}
   rpc ListRoutes (ListRoutesRequest) returns (ListRoutesResponse) {}
   rpc SplitRange (SplitRangeRequest) returns (SplitRangeResponse) {}
 }
@@ -32,6 +33,9 @@ message GetTimestampRequest {
   // issuance. Once committed, shadow clients return TSO timestamps instead of
   // legacy HLC candidates, so a rolling cutover cannot reintroduce them.
   bool activate_cutover = 3;
+  // ActivatePhaseD closes the legacy compatibility window after every member
+  // understands the M7 FSM entry. It requires ActivateCutover and is one-way.
+  bool activate_phase_d = 4;
 }
 
 message GetTimestampResponse {
@@ -48,6 +52,21 @@ message GetTimestampResponse {
   // CutoverActive reports the durable group-0 cutover marker after applying
   // this request. Shadow nodes switch to the returned TSO timestamp when true.
   bool cutover_active = 5;
+  // PhaseDActive reports that legacy per-shard issuance has been retired.
+  bool phase_d_active = 6;
+  // PhaseDFloor is the allocation floor captured by the Phase-D marker.
+  uint64 phase_d_floor = 7;
+}
+
+message ValidateTimestampRequest {
+  uint64 timestamp = 1;
+}
+
+message ValidateTimestampResponse {
+  bool valid = 1;
+  bool phase_d_active = 2;
+  uint64 phase_d_floor = 3;
+  uint64 allocation_floor = 4;
 }
 
 enum RouteState {

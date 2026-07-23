@@ -600,7 +600,10 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 }
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis zadd: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	base, err := r.prepareZSetWriteBase(ctx, key, readTS, len(pairs))
 	if err != nil {
 		return 0, err
@@ -722,7 +725,10 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis zincrby: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	base, err := r.prepareZSetWriteBase(ctx, key, readTS, 0)
 	if err != nil {
 		return 0, err
@@ -1016,7 +1022,10 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis zrem: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
 		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
 		if err != nil {
 			return err
@@ -1065,21 +1074,17 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		readTS, err := r.beginTxnStartTS(ctx, "redis zremrangebyrank: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
+		value, exists, err := r.zsetMutationValueAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
-		if typ == redisTypeNone {
+		if !exists {
 			removed = 0
 			return nil
-		}
-		if typ != redisTypeZSet {
-			return wrongTypeError()
-		}
-		value, _, err := r.loadZSetAt(ctx, cmd.Args[1], readTS)
-		if err != nil {
-			return err
 		}
 		s, e := normalizeRankRange(start, stop, len(value.Entries))
 		if e < s {
@@ -1098,6 +1103,25 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
+func (r *RedisServer) zsetMutationValueAt(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+) (redisZSetValue, bool, error) {
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
+		return redisZSetValue{}, false, err
+	}
+	if typ == redisTypeNone {
+		return redisZSetValue{}, false, nil
+	}
+	if typ != redisTypeZSet {
+		return redisZSetValue{}, false, wrongTypeError()
+	}
+	value, _, err := r.loadZSetAt(ctx, key, readTS)
+	return value, true, err
+}
+
 // tryBZPopMinWithMode runs one BZPOPMIN attempt against key. The
 // fast flag selects keyTypeAtExpectFast (no slow-path fallback, no
 // wrongType detection) when true; the caller MUST guarantee that the
@@ -1110,16 +1134,19 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 	defer cancel()
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		var typ redisValueType
-		var err error
-		if fast {
-			typ, err = r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
-		} else {
-			typ, err = r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
-		}
+		readTS, err := r.beginTxnStartTS(ctx, "redis bzpopmin: begin read timestamp")
 		if err != nil {
-			return err
+			return cockerrors.WithStack(err)
+		}
+		var typ redisValueType
+		var typeErr error
+		if fast {
+			typ, typeErr = r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+		} else {
+			typ, typeErr = r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+		}
+		if typeErr != nil {
+			return typeErr
 		}
 		if typ == redisTypeNone {
 			result = nil

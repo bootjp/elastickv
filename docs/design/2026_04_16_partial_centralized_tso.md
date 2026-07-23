@@ -1,13 +1,13 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1-M6 are implemented, including the dedicated group-0
+- Status: Partial — M1-M7 are implemented, including the dedicated group-0
   FSM, leader-routed durable windows, strict term bootstrap, serialized shadow
-  migration, and the one-way rolling cutover marker. M7 legacy cleanup and
-  cross-shard SSI timestamp validation remain open; runtime config reload and
-  production latency/alerting work also remain open.
+  migration, one-way rolling cutover, durable Phase-D retirement, and
+  cross-shard SSI timestamp validation. Runtime config reload and production
+  latency/alerting work remain open.
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-18
+- Updated: 2026-07-19
 
 ---
 
@@ -98,14 +98,50 @@ Implemented:
     issuance. The marker uses a versioned TSO envelope with the same legacy
     fail-closed prefix as allocation-floor entries and a distinct magic, so an
     old or misrouted data FSM halts while encryption bytes cannot activate it.
+15. `--tsoPhaseDEnabled` commits a second one-way group-0 marker after cutover.
+    The marker captures the maximum pre-Phase-D timestamp floor. Its state and
+    floor are persisted in the V4 TSO snapshot. Before the marker applies, the
+    FSM continues writing V3 snapshots so older followers can install them
+    during the rolling upgrade. Malformed ordering or a changed replay floor
+    halts the TSO FSM fail-closed. The marker has its own versioned TSO envelope
+    with the same legacy fail-closed prefix, so old or misrouted data FSMs halt
+    and no reserved encryption byte can activate Phase D.
+16. Once Phase D is durable, data groups no longer receive HLC ceiling renewal,
+    coordinator legacy HLC issuance is rejected, and shadow mode bypasses
+    legacy candidate generation/comparison. Group 0 remains renewed while it
+    is needed for the dedicated allocator's physical-ceiling fence.
+17. Cross-shard transactions with a caller-supplied `StartTS` are accepted only
+    when the group-0 leader verifies `phase_d_floor < StartTS <=
+    allocation_floor`. The upper bound is a committed TSO reservation floor and
+    the lower bound excludes every legacy or pre-Phase-D value. Follower-local
+    state is never authoritative for this check.
+18. Adapter read-modify-write paths call `BeginReadTimestampThrough` before the
+    first read and pass an applied store/catalog watermark, never a freshly
+    allocated clock value. If Phase D is required but not yet locally active,
+    the read boundary first forces the marker and its post-marker allocation
+    window to commit, then discards that allocation. The adapter still uses the
+    exact applied watermark for every read and `StartTS`. When that watermark
+    predates the Phase-D floor, the read boundary registers a bounded,
+    process-local capability that identifies the audited applied snapshot. The
+    adapter binds that capability to the logical operation and reserves exactly
+    one one-use coordinator voucher immediately before each dispatch that
+    shares the snapshot. Unvouched external `StartTS` values remain subject to
+    group-0 validation and values at/below the floor fail closed. A zero,
+    latest-sentinel, unavailable activation, or otherwise unprovable watermark
+    also fails closed. Retries reload and revalidate the applied watermark;
+    retries that intentionally reuse an exact OCC write set reserve a fresh use
+    without widening the capability to another timestamp. Coordinator
+    decorators forward both the allocator provider and voucher operation so
+    startup and keyviz wrappers cannot silently fall back to an unvalidated
+    value.
+19. `BatchAllocator` validates cached candidates once Phase D is required. A
+    candidate at/below the Phase-D floor invalidates the entire local window and
+    forces a refill above the marker before any timestamp is returned.
 
 Remaining:
 
-1. M7 Phase-D removal of per-shard renewal/legacy issuance after the migration
-   compatibility window closes.
-2. Cross-shard SSI read-timestamp validation through the dedicated TSO.
-3. Runtime config reload for the mode switch; current flags are startup-only.
-4. Production benchmark, divergence metrics, and alert thresholds.
+1. Runtime config reload for the mode switch; current flags are startup-only.
+2. Production benchmark, divergence metrics, and alert thresholds.
 
 ### 1.1 Original Limitation
 
@@ -123,10 +159,10 @@ Node B: not in defaultGroup → ceiling never updated ❌
          → may collide with the previous leader's committed window
 ```
 
-M1 fixes that per-node renewal gap by proposing to every group this node
-currently leads. **Global timestamp monotonicity is still not guaranteed when
-different coordinators on different nodes allocate timestamps for cross-group
-work**; that is the dedicated TSO / single-oracle work left open by M2-M7.
+M1 fixed that per-node renewal gap by proposing to every group this node
+currently leads. It did not by itself guarantee global timestamp monotonicity
+when different coordinators allocated timestamps for cross-group work; M2-M7
+add the dedicated TSO and retire that distributed issuance path.
 
 ### 1.2 Near-Term Workaround
 
@@ -727,9 +763,40 @@ approach enables a live cutover.
 
 ### 7.4 Phase D — Legacy Cleanup
 
-- Remove per-shard ceiling proposals.
-- Remove `legacyHLC` from `ShardedCoordinator`.
-- Remove the shadow comparison code.
+- Roll every member to a binary that understands the Phase-D entry and
+  `ValidateTimestamp` RPC. Run all members on the dedicated TSO path before
+  enabling `--tsoPhaseDEnabled`; an older member would correctly halt on the
+  unknown control entry, so mixed-version activation is prohibited.
+- The first allocation with `--tsoPhaseDEnabled` commits cutover (if needed),
+  then the Phase-D marker and its pre-Phase-D floor, then a new allocation
+  window strictly above that floor. The switch is one-way and survives restart
+  through the TSO V4 snapshot.
+- `ShardedCoordinator` dynamically stops data-group ceiling proposals and
+  fails closed instead of issuing from its legacy HLC. It continues group-0
+  renewal only. Shadow mode observes durable cutover and directly uses the
+  dedicated allocator without generating or comparing a legacy candidate.
+- Every adapter read-modify-write attempt obtains its transaction snapshot
+  from an applied store/catalog watermark before reading. If Phase D is required
+  but not yet active locally, the read boundary first commits the marker and a
+  post-marker allocation window, then discards the allocated value; it is never
+  substituted for data-group apply progress. The same applied watermark is used
+  for direct MVCC reads, active-snapshot pinning, and `OperationGroup.StartTS`;
+  a retry reloads and revalidates the watermark and repeats all reads. An applied
+  watermark at/below the Phase-D floor is admitted only through a bounded,
+  process-local capability registered by that audited read boundary. Every
+  dispatch sharing the snapshot reserves and consumes its own one-use voucher;
+  the capability is timestamp-bound and cannot authorize another value.
+  Arbitrary or repeated unvouched caller values at/below the floor still fail
+  closed at group 0. Pre-Phase-D deployments retain the prior
+  committed-watermark behavior.
+- After Phase D, the coordinator asks the current group-0 leader to validate a
+  caller-supplied cross-shard `StartTS` before allocating `CommitTS` or proposing
+  to any data group. The allocator's configured `PhaseDRequired` state activates
+  this check before the local group-0 replica has applied the marker. Values
+  at/below the marker floor, beyond the committed TSO allocation floor, zero
+  values, inactive Phase-D state, missing validation support, and unavailable
+  leadership all fail closed. Existing single-shard caller-supplied `StartTS`
+  remains compatible because it does not establish a cross-shard SSI snapshot.
 
 ### 7.5 Monotonicity Invariant Across Phases
 
@@ -757,7 +824,7 @@ its first window above the strict maximum committed data timestamp.
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped | Preserve the default-group `LocalTSOAllocator` compatibility bridge when group 0 is absent; route coordinator-owned timestamp call sites through the allocator abstraction. | Medium |
 | M6 — shipped | Run the dedicated group-0 FSM, fence each new TSO leader term above all authoritative data-group commit floors, redirect follower requests to the TSO leader over gRPC, synchronously serialize fail-closed shadow issuance, and commit the one-way rolling cutover marker before production windows. | Low |
-| M7 — open | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
+| M7 — shipped | Commit the durable Phase-D floor marker, preserve V3 snapshots until activation, retire data-shard HLC renewal and legacy/shadow issuance after cutover, activate before read validation while preserving exact applied snapshots through timestamp-bound per-dispatch vouchers, invalidate pre-Phase-D batch windows, and validate unvouched caller-supplied cross-shard SSI timestamps at the group-0 leader from activation onward. | Low |
 
 ---
 

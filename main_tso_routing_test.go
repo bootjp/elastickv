@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )
@@ -52,6 +53,41 @@ func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T)
 	require.NotZero(t, ts)
 	require.Equal(t, uint64(2), engine.proposals.Load(), "cutover marker must commit before the first window")
 	require.True(t, fsm.CutoverActive())
+}
+
+func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T) {
+	setTSOModeFlags(t, true, false)
+	*tsoPhaseDEnabled = true
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+	decorated := kv.WithKeyVizLabel(startupGatedCoordinator{inner: coord}, keyviz.LabelRedis)
+
+	readTS, err := kv.BeginReadTimestampThrough(context.Background(), decorated, 42, "test decorated phase D")
+	require.NoError(t, err)
+	require.NotZero(t, readTS.Timestamp())
+	require.True(t, fsm.CutoverActive())
+	require.True(t, fsm.PhaseDActive())
+	require.Equal(t, uint64(3), engine.proposals.Load(),
+		"cutover and phase-D markers must commit before the timestamp window")
+}
+
+func TestConfigureCoordinatorTSOPhaseDRequiresCutoverMode(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+	*tsoPhaseDEnabled = true
+	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
+
+	_, err := configureCoordinatorTSO(coord, nil)
+	require.ErrorContains(t, err, "requires --tsoEnabled")
 }
 
 func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
@@ -156,7 +192,7 @@ func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainT
 	group := &kv.ShardGroup{Engine: engine, TSOState: fsm}
 	allocator, err := kv.NewRaftTSOAllocator(group, clock, kv.WithTSOCutoverFloorProvider(mainTSOFloorProvider{}))
 	require.NoError(t, err)
-	_, err = allocator.ReserveBatchAfter(context.Background(), 1, 0, true)
+	_, err = allocator.ReserveBatchAfter(context.Background(), 1, 0, true, false)
 	require.NoError(t, err)
 	require.True(t, fsm.CutoverActive())
 	engine.proposals.Store(0)
@@ -167,13 +203,16 @@ func setTSOModeFlags(t *testing.T, enabled, shadow bool) {
 	t.Helper()
 	oldEnabled := *tsoEnabled
 	oldShadow := *tsoShadowEnabled
+	oldPhaseD := *tsoPhaseDEnabled
 	oldBatchSize := *tsoBatchSize
 	*tsoEnabled = enabled
 	*tsoShadowEnabled = shadow
+	*tsoPhaseDEnabled = false
 	*tsoBatchSize = 8
 	t.Cleanup(func() {
 		*tsoEnabled = oldEnabled
 		*tsoShadowEnabled = oldShadow
+		*tsoPhaseDEnabled = oldPhaseD
 		*tsoBatchSize = oldBatchSize
 	})
 }

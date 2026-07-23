@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,6 +173,36 @@ func TestRaftTSOAllocatorDropsCommittedWindowAfterTermChange(t *testing.T) {
 	require.Greater(t, next, leakedFloor)
 }
 
+func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	var changeTerm sync.Once
+	engine.afterPropose = func(payload []byte) {
+		if bytes.HasPrefix(payload, []byte(tsoPhaseDEnvelope)) {
+			changeTerm.Do(func() { engine.setTerm(2) })
+		}
+	}
+	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	require.NoError(t, err)
+
+	_, err = alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
+	require.ErrorIs(t, err, ErrTSONotLeader)
+	require.True(t, fsm.PhaseDActive())
+	require.Zero(t, fsm.AllocationFloor())
+
+	payloads := engine.proposedPayloads()
+	require.Len(t, payloads, 2)
+	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
+	require.Equal(t, marshalTSOPhaseD(0), payloads[1])
+}
+
 func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
@@ -185,13 +216,105 @@ func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
 	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
 	require.NoError(t, err)
 
-	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true)
+	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, false)
 	require.NoError(t, err)
 	require.True(t, reservation.CutoverActive)
 	payloads := engine.proposedPayloads()
 	require.Len(t, payloads, 2)
 	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
 	require.True(t, bytes.HasPrefix(payloads[1], []byte(tsoAllocationFloorEnvelope)))
+}
+
+func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	require.NoError(t, err)
+
+	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
+	require.NoError(t, err)
+	require.True(t, reservation.CutoverActive)
+	require.True(t, reservation.PhaseDActive)
+	require.Equal(t, reservation.PreviousAllocationFloor, reservation.PhaseDFloor)
+	require.Greater(t, reservation.Base, reservation.PhaseDFloor)
+
+	payloads := engine.proposedPayloads()
+	require.Len(t, payloads, 3)
+	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
+	require.Equal(t, marshalTSOPhaseD(reservation.PreviousAllocationFloor), payloads[1])
+	require.True(t, bytes.HasPrefix(payloads[2], []byte(tsoAllocationFloorEnvelope)))
+
+	end := reservation.Base + positiveIntToUint64(reservation.Count) - 1
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), reservation.Base))
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), end))
+	err = alloc.ValidateDurableTimestamp(context.Background(), reservation.PhaseDFloor)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), end+1), ErrTSOTimestampInvalid)
+}
+
+func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTerm(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	provider := &recordingTSOFloorProvider{}
+	alloc, err := NewRaftTSOAllocator(
+		&ShardGroup{Engine: engine, TSOState: fsm},
+		clock,
+		WithTSOCutoverFloorProvider(provider),
+	)
+	require.NoError(t, err)
+
+	_, err = alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, provider.callCount())
+
+	laterDataFloor := fsm.AllocationFloor() + 1_000
+	provider.setFloor(laterDataFloor)
+	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
+	require.NoError(t, err)
+	require.Equal(t, 2, provider.callCount(), "Phase-D activation must resample the data commit floor even within an initialized term")
+	require.Equal(t, laterDataFloor, reservation.PreviousAllocationFloor)
+	require.Equal(t, laterDataFloor, reservation.PhaseDFloor)
+	require.Greater(t, reservation.Base, laterDataFloor)
+}
+
+func TestRaftTSOAllocatorFencesAboveRestoredPhaseDFloor(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	phaseDFloor := uint64(time.Now().Add(30*time.Minute).UnixMilli()) << hlcLogicalBits //nolint:gosec // future test HLC.
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(phaseDFloor)))
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	require.NoError(t, err)
+
+	reservation, err := alloc.ReserveBatchAfter(context.Background(), 1, 0, false, false)
+	require.NoError(t, err)
+	require.Equal(t, phaseDFloor, reservation.PreviousAllocationFloor)
+	require.Greater(t, reservation.Base, phaseDFloor)
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), reservation.Base))
+	err = alloc.ValidateDurableTimestamp(context.Background(), phaseDFloor)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.ErrorIs(t, err, ErrTSOTimestampPrePhaseD)
 }
 
 func TestLeaderRoutedTSOAllocatorReResolvesAfterStaleLeader(t *testing.T) {
@@ -203,11 +326,12 @@ func TestLeaderRoutedTSOAllocatorReResolvesAfterStaleLeader(t *testing.T) {
 	alloc.retryInterval = time.Millisecond
 
 	var addresses []string
-	alloc.remoteRequest = func(_ context.Context, addr string, n int, min uint64, activate bool) (TSOReservation, error) {
+	alloc.remoteRequest = func(_ context.Context, addr string, n int, min uint64, activate, activatePhaseD bool) (TSOReservation, error) {
 		addresses = append(addresses, addr)
 		require.Equal(t, testTSOBatchSize, n)
 		require.Equal(t, uint64(testTSOInitialBase), min)
 		require.False(t, activate)
+		require.False(t, activatePhaseD)
 		if addr == "old" {
 			engine.setLeaderAddress("new")
 			return TSOReservation{}, status.Error(codes.FailedPrecondition, "tso: not leader")
@@ -226,7 +350,7 @@ func TestLeaderRoutedTSOAllocatorUsesLocalLeader(t *testing.T) {
 	engine := &recordingTSOEngine{state: raftengine.StateLeader, leader: raftengine.LeaderInfo{Address: "self"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
 	require.NoError(t, err)
-	alloc.remoteRequest = func(context.Context, string, int, uint64, bool) (TSOReservation, error) {
+	alloc.remoteRequest = func(context.Context, string, int, uint64, bool, bool) (TSOReservation, error) {
 		t.Fatal("local TSO leader must not call remote RPC")
 		return TSOReservation{}, nil
 	}
@@ -251,7 +375,7 @@ func TestLeaderRoutedTSOAllocatorRejectsRemoteWindowAtMinimum(t *testing.T) {
 	engine := &recordingTSOEngine{state: raftengine.StateFollower, leader: raftengine.LeaderInfo{Address: "leader"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
 	require.NoError(t, err)
-	alloc.remoteRequest = func(context.Context, string, int, uint64, bool) (TSOReservation, error) {
+	alloc.remoteRequest = func(context.Context, string, int, uint64, bool, bool) (TSOReservation, error) {
 		return TSOReservation{Base: testTSOInitialBase, Count: testTSOBatchSize}, nil
 	}
 
@@ -268,7 +392,7 @@ func TestLeaderRoutedTSOAllocatorPreservesDeadlineAfterTransientErrors(t *testin
 	alloc.retryInterval = time.Millisecond
 
 	var attempts int
-	alloc.remoteRequest = func(context.Context, string, int, uint64, bool) (TSOReservation, error) {
+	alloc.remoteRequest = func(context.Context, string, int, uint64, bool, bool) (TSOReservation, error) {
 		attempts++
 		return TSOReservation{}, status.Error(codes.Unavailable, "leader restarting")
 	}
@@ -277,6 +401,29 @@ func TestLeaderRoutedTSOAllocatorPreservesDeadlineAfterTransientErrors(t *testin
 	_, err = alloc.NextBatch(ctx, testTSOBatchSize)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Greater(t, attempts, 1)
+}
+
+func TestLeaderRoutedTSOAllocatorRetriesValidationAfterLocalLeadershipLoss(t *testing.T) {
+	local := &leadershipLosingValidationTSO{fakeTSOAllocator: &fakeTSOAllocator{leader: true}}
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateFollower,
+		leader: raftengine.LeaderInfo{Address: "new-leader"},
+	}
+	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
+	require.NoError(t, err)
+	alloc.retryBudget = time.Second
+	alloc.retryInterval = time.Millisecond
+	var remoteCalls atomic.Uint64
+	alloc.remoteValidate = func(_ context.Context, addr string, timestamp uint64) error {
+		remoteCalls.Add(1)
+		require.Equal(t, "new-leader", addr)
+		require.Equal(t, uint64(42), timestamp)
+		return nil
+	}
+
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), 42))
+	require.Equal(t, uint64(1), local.validateCalls.Load())
+	require.Equal(t, uint64(1), remoteCalls.Load())
 }
 
 func TestShadowTimestampAllocatorReturnsLegacyAndAdvancesTSO(t *testing.T) {
@@ -353,6 +500,26 @@ func TestShadowTimestampAllocatorReturnsTSOAfterDurableCutover(t *testing.T) {
 	require.Greater(t, issued, legacyCandidate)
 }
 
+func TestShadowTimestampAllocatorBypassesLegacyAfterObservedCutover(t *testing.T) {
+	legacy := NewHLC()
+	fsm := NewTSOStateMachine(NewHLC())
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	dedicated := &dedicatedShadowAllocator{next: testTSOInitialBase}
+	alloc, err := NewShadowTimestampAllocator(
+		legacy,
+		dedicated,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithTSOShadowCutoverState(fsm),
+	)
+	require.NoError(t, err)
+
+	issued, err := alloc.NextAfter(context.Background(), testTSOInitialBase-1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(testTSOInitialBase), issued)
+	require.Zero(t, legacy.Current(), "post-cutover issuance must not sample legacy HLC")
+	require.Zero(t, dedicated.shadowCalls, "post-cutover issuance must not run shadow comparison")
+}
+
 func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
 	tsoClock := NewHLC()
 	tsoClock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
@@ -402,6 +569,20 @@ type recordingShadowReservationAllocator struct {
 	cutover      bool
 }
 
+type dedicatedShadowAllocator struct {
+	next        uint64
+	shadowCalls int
+}
+
+func (a *dedicatedShadowAllocator) Next(context.Context) (uint64, error) {
+	return a.next, nil
+}
+
+func (a *dedicatedShadowAllocator) ValidateShadowTimestamp(context.Context, uint64) (TSOReservation, error) {
+	a.shadowCalls++
+	return TSOReservation{}, errors.New("shadow comparison must not run after cutover")
+}
+
 func (a *recordingShadowReservationAllocator) ValidateShadowTimestamp(_ context.Context, min uint64) (TSOReservation, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -449,6 +630,17 @@ type recordingTSOEngine struct {
 	apply        func([]byte) error
 	afterPropose func([]byte)
 	term         uint64
+}
+
+type leadershipLosingValidationTSO struct {
+	*fakeTSOAllocator
+	validateCalls atomic.Uint64
+}
+
+func (a *leadershipLosingValidationTSO) ValidateDurableTimestamp(context.Context, uint64) error {
+	a.validateCalls.Add(1)
+	a.leader = false
+	return errors.WithStack(ErrTSONotLeader)
 }
 
 func (e *recordingTSOEngine) Propose(_ context.Context, payload []byte) (*raftengine.ProposalResult, error) {
@@ -593,4 +785,10 @@ func (p *recordingTSOFloorProvider) callCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.calls
+}
+
+func (p *recordingTSOFloorProvider) setFloor(floor uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.floor = floor
 }

@@ -231,11 +231,11 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) (string, error) {
-	id, readTS, elems, err := r.prepareXAdd(ctx, key, req)
+	id, readTimestamp, elems, err := r.prepareXAdd(ctx, key, req)
 	if err != nil {
 		return "", err
 	}
-	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+	return id, r.dispatchAndSignalStreamWithReadTimestamp(ctx, true, readTimestamp, elems, key)
 }
 
 // prepareXAdd fixes one XADD attempt's stream ID and exact write set at a
@@ -246,35 +246,39 @@ func (r *RedisServer) prepareXAdd(
 	ctx context.Context,
 	key []byte,
 	req xaddRequest,
-) (string, uint64, []*kv.Elem[kv.OP], error) {
-	readTS := r.readTS()
+) (string, kv.ReadTimestamp, []*kv.Elem[kv.OP], error) {
+	readTimestamp, err := r.xaddReadTimestamp(ctx, key)
+	if err != nil {
+		return "", kv.ReadTimestamp{}, nil, err
+	}
+	readTS := readTimestamp.Timestamp()
 	typ, err := r.streamTypeForXAdd(ctx, key, readTS)
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 
 	legacyCleanup, meta, metaFound, err := r.streamWriteBase(ctx, key, readTS)
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 	legacyCleanup, meta, metaFound, err = r.streamCleanupForExpiredRecreate(
 		ctx, key, readTS, typ, legacyCleanup, meta, metaFound)
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 
 	id, parsedID, err := resolveXAddID(meta, metaFound, req.id)
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 
 	if err := xaddEnforceMaxWideColumn(key, meta.Length, req.maxLen); err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 
 	entryValue, err := marshalStreamEntry(newRedisStreamEntry(id, req.fields))
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 
 	// Capacity hint covers: stream cleanup Dels + one entry Put + one meta
@@ -293,7 +297,7 @@ func (r *RedisServer) prepareXAdd(
 
 	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1)
 	if err != nil {
-		return "", 0, nil, err
+		return "", kv.ReadTimestamp{}, nil, err
 	}
 	elems = append(elems, trim...)
 	elems = appendMaxLenZeroSelfDel(elems, req.maxLen, key, parsedID)
@@ -305,11 +309,11 @@ func (r *RedisServer) prepareXAdd(
 		ExpireAt: meta.ExpireAt,
 	})
 	if err != nil {
-		return "", 0, nil, cockerrors.WithStack(err)
+		return "", kv.ReadTimestamp{}, nil, cockerrors.WithStack(err)
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
-	return id, readTS, elems, nil
+	return id, readTimestamp, elems, nil
 }
 
 // reusableXAdd captures the exact ID and write set from an XADD attempt. A
@@ -317,11 +321,12 @@ func (r *RedisServer) prepareXAdd(
 // already landed instead of resolving "*" against newer stream metadata and
 // appending a duplicate entry.
 type reusableXAdd struct {
-	elems    []*kv.Elem[kv.OP]
-	startTS  uint64
-	commitTS uint64
-	probeKey []byte
-	id       string
+	elems         []*kv.Elem[kv.OP]
+	readTimestamp kv.ReadTimestamp
+	startTS       uint64
+	commitTS      uint64
+	probeKey      []byte
+	id            string
 }
 
 // xaddTxnWithDedup retries XADD only through exact write-set reuse. This is the
@@ -362,16 +367,18 @@ func (r *RedisServer) firstXAddAttempt(
 	key []byte,
 	req xaddRequest,
 ) (string, *reusableXAdd, error) {
-	id, readTS, elems, err := r.prepareXAdd(ctx, key, req)
+	id, readTimestamp, elems, err := r.prepareXAdd(ctx, key, req)
 	if err != nil {
 		return "", nil, err
 	}
+	readTS := readTimestamp.Timestamp()
 	startTS := normalizeStartTS(readTS)
 	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "redis xadd first-attempt: allocate commitTS")
 	if err != nil {
 		return "", nil, cockerrors.WithStack(err)
 	}
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	attemptCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, dispErr := kv.DispatchWithReadTimestamp(attemptCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -389,11 +396,12 @@ func (r *RedisServer) firstXAddAttempt(
 		return "", nil, cockerrors.WithStack(dispErr)
 	}
 	return "", &reusableXAdd{
-		elems:    elems,
-		startTS:  startTS,
-		commitTS: commitTS,
-		probeKey: kv.PrimaryKeyForElems(elems),
-		id:       id,
+		elems:         elems,
+		readTimestamp: readTimestamp,
+		startTS:       startTS,
+		commitTS:      commitTS,
+		probeKey:      kv.PrimaryKeyForElems(elems),
+		id:            id,
 	}, cockerrors.WithStack(dispErr)
 }
 
@@ -410,7 +418,8 @@ func (r *RedisServer) dispatchXAddReuse(
 	if allocErr != nil {
 		return "", false, cockerrors.WithStack(allocErr)
 	}
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	attemptCtx := pending.readTimestamp.WithDispatchVoucher(ctx)
+	_, dispErr := kv.DispatchWithReadTimestamp(attemptCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
 		StartTS:      pending.startTS,
 		CommitTS:     commitTS,
@@ -472,22 +481,40 @@ func (r *RedisServer) streamCleanupForExpiredRecreate(
 	return cleanup, store.StreamMeta{}, false, nil
 }
 
-// dispatchAndSignalStream dispatches the elems through the coordinator
-// and, on success, wakes any XREAD BLOCK waiter on the same node.
-// dispatchElems blocks until the FSM applies locally, so by the time
-// Signal fires the new entries are visible at the readTS the woken
-// waiter will pick on its next iteration. Pulled out of xaddTxn so the
-// parent function stays under the cyclop budget — the signal step
-// would otherwise add an extra branch on the dispatch error path.
-func (r *RedisServer) dispatchAndSignalStream(
+func (r *RedisServer) xaddReadTimestamp(ctx context.Context, key []byte) (kv.ReadTimestamp, error) {
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis xadd: begin read timestamp")
+	if err != nil {
+		return kv.ReadTimestamp{}, cockerrors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+	if err != nil {
+		return kv.ReadTimestamp{}, err
+	}
+	if typ != redisTypeNone && typ != redisTypeStream {
+		return kv.ReadTimestamp{}, wrongTypeError()
+	}
+	return readTimestamp, nil
+}
+
+func (r *RedisServer) dispatchAndSignalStreamWithReadTimestamp(
 	ctx context.Context,
 	isTxn bool,
-	startTS uint64,
+	readTimestamp kv.ReadTimestamp,
 	elems []*kv.Elem[kv.OP],
 	streamKey []byte,
 ) error {
-	if err := r.dispatchElems(ctx, isTxn, startTS, elems); err != nil {
-		return err
+	if len(elems) == 0 {
+		return nil
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   isTxn,
+		StartTS: normalizeStartTS(readTimestamp.Timestamp()),
+		Elems:   elems,
+	})
+	if err != nil {
+		return cockerrors.WithStack(err)
 	}
 	r.streamWaiters.Signal(streamKey)
 	return nil
@@ -811,7 +838,10 @@ func (r *RedisServer) flushLegacyCleanupOnTrimNoOp(
 }
 
 func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int, error) {
-	readTS := r.readTS()
+	readTS, err := r.beginTxnStartTS(ctx, "redis xtrim: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
 	proceed, err := r.streamTypeForWrite(ctx, key, readTS)
 	if err != nil || !proceed {
 		return 0, err

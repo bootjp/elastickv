@@ -364,7 +364,8 @@ const (
 	// surfaces unchanged so the client (or a wrapping retry harness in
 	// the adapter) sees the failure rather than the coordinator spinning
 	// on a persistent route shift.
-	composed1RetryAttempts = 1
+	composed1RetryAttempts         = 1
+	maxAppliedReadTimestampVouches = 4096
 )
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
@@ -384,6 +385,14 @@ type ShardedCoordinator struct {
 	// behavior where any locally-led shard group can issue TSO timestamps.
 	timestampGroup           uint64
 	timestampGroupConfigured bool
+	// tsoCutoverState is consensus-owned group-0 migration state. Phase D uses
+	// it to retire data-shard HLC renewal and reject legacy cross-shard startTS.
+	tsoCutoverState interface {
+		CutoverActive() bool
+		PhaseDActive() bool
+	}
+	appliedReadVoucherMu sync.Mutex
+	appliedReadVouchers  map[appliedReadVoucherKey]uint64
 	// allShardGroupIDs, when configured, is the explicit set of data groups
 	// that whole-keyspace operations must visit. It lets callers keep
 	// non-data groups (for example a reserved timestamp group) in c.groups
@@ -422,6 +431,11 @@ type ShardedCoordinator struct {
 	// commits. nil when encryption is off / no registration is pending
 	// (the common case — ungated). See RegistrationGate.
 	registrationGate *RegistrationGate
+}
+
+type appliedReadVoucherKey struct {
+	timestamp uint64
+	ref       AppliedReadTimestampVoucherRef
 }
 
 // RegistrationGate carries the Stage 7a §4.1 registration-before-
@@ -467,6 +481,82 @@ func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *Sharded
 	return c
 }
 
+// TimestampAllocator exposes the configured allocator to coordinator
+// decorators without widening the Coordinator interface.
+func (c *ShardedCoordinator) TimestampAllocator() TimestampAllocator {
+	if c == nil {
+		return nil
+	}
+	return c.tsAllocator
+}
+
+// VouchAppliedReadTimestamp records one use of an audited adapter watermark.
+// The bounded map prevents abandoned requests from growing process memory.
+func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return errors.WithStack(ErrTSOTimestampInvalid)
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	if c.appliedReadVouchers == nil {
+		c.appliedReadVouchers = make(map[appliedReadVoucherKey]uint64)
+	}
+	if uses, ok := c.appliedReadVouchers[key]; ok {
+		c.appliedReadVouchers[key] = uses + 1
+		return nil
+	}
+	if len(c.appliedReadVouchers) >= maxAppliedReadTimestampVouches {
+		return errors.WithStack(ErrTSOReadVoucherLimit)
+	}
+	c.appliedReadVouchers[key] = 1
+	return nil
+}
+
+// RevokeAppliedReadTimestamp removes one prepared voucher that did not reach
+// ShardedCoordinator dispatch validation, for example because an outer
+// coordinator decorator rejected the dispatch first.
+func (c *ShardedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+		return
+	}
+	c.appliedReadVouchers[key] = uses - 1
+}
+
+func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
+	if c == nil {
+		return false
+	}
+	ref, ok := appliedReadTimestampVoucherRefFromContext(ctx, timestamp)
+	if !ok {
+		return false
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return false
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+	} else {
+		c.appliedReadVouchers[key] = uses - 1
+	}
+	return true
+}
+
 // WithTimestampGroup pins timestamp issuance leadership to one Raft group.
 // Callers should only enable this once a data-shard leader can redirect
 // timestamp allocation to that group; otherwise data leaders would stop being
@@ -474,6 +564,17 @@ func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *Sharded
 func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
 	c.timestampGroup = groupID
 	c.timestampGroupConfigured = true
+	return c
+}
+
+// WithTSOCutoverState wires the durable group-0 migration state. The state is
+// read dynamically so a marker applied after startup changes renewal and
+// validation behavior without a process-local mode race.
+func (c *ShardedCoordinator) WithTSOCutoverState(state interface {
+	CutoverActive() bool
+	PhaseDActive() bool
+}) *ShardedCoordinator {
+	c.tsoCutoverState = state
 	return c
 }
 
@@ -888,7 +989,17 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion, reqs.KeyVizLabel)
+		resp, err := c.dispatchTxn(
+			ctx,
+			reqs.StartTS,
+			reqs.CommitTS,
+			reqs.PrevCommitTS,
+			reqs.Elems,
+			reqs.ReadKeys,
+			reqs.ObservedRouteVersion,
+			reqs.KeyVizLabel,
+			callerSuppliedStartTS,
+		)
 		if err == nil {
 			return resp, nil
 		}
@@ -1117,7 +1228,17 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, label keyviz.Label) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(
+	ctx context.Context,
+	startTS uint64,
+	commitTS uint64,
+	prevCommitTS uint64,
+	elems []*Elem[OP],
+	readKeys [][]byte,
+	observedRouteVersion uint64,
+	label keyviz.Label,
+	callerSuppliedStartTS bool,
+) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -1129,16 +1250,17 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if len(primaryKey) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
+	singleShard := len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0])
+	if err := c.validateCallerSuppliedTxnStart(ctx, startTS, singleShard, callerSuppliedStartTS); err != nil {
+		return nil, err
+	}
 
-	commitTS, err = c.resolveTxnCommitTS(ctx, startTS, commitTS)
+	commitTS, err = c.prepareTxnCommitTimestamp(ctx, startTS, commitTS, elems)
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
-		return nil, err
-	}
 
-	if len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0]) {
+	if singleShard {
 		// Fast path: all mutations and read keys are in a single shard.
 		// Use the one-phase path without allocating a grouped-read-keys map.
 		// If any read key belongs to a different shard the 2PC path is required
@@ -1152,9 +1274,47 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion)
 }
 
+func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context, startTS uint64, singleShard, callerSupplied bool) error {
+	if !callerSupplied {
+		return nil
+	}
+	if c.consumeAppliedReadTimestampVoucher(ctx, startTS) || singleShard {
+		return nil
+	}
+	return c.validateCrossShardReadTimestamp(ctx, startTS)
+}
+
+func (c *ShardedCoordinator) prepareTxnCommitTimestamp(ctx context.Context, startTS, commitTS uint64, elems []*Elem[OP]) (uint64, error) {
+	resolved, err := c.resolveTxnCommitTS(ctx, startTS, commitTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateElemCommitTSPatches(elems, resolved); err != nil {
+		return 0, err
+	}
+	return resolved, nil
+}
+
+func (c *ShardedCoordinator) validateCrossShardReadTimestamp(
+	ctx context.Context,
+	startTS uint64,
+) error {
+	validator, _, required, err := phaseDTimestampValidator(c.tsAllocator)
+	if err != nil {
+		return errors.Wrap(err, "cross-shard read timestamp validator is unavailable")
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(ctx, startTS); err != nil {
+		return errors.Wrap(err, "validate cross-shard read/start timestamp")
+	}
+	return nil
+}
+
 // dispatchMultiShardTxn runs the 2PC path. Extracted from dispatchTxn to keep
-// that function under the cyclop budget after the prevCommitTS reject (codex
-// P2 round-10) was added; the multi-shard branch already carries five linear
+// that function under the cyclop budget after the prevCommitTS reject was
+// added; the multi-shard branch already carries five linear
 // error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
 // commitSecondaries) that pushed the parent over the 10-edge limit.
 func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
@@ -1506,6 +1666,10 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
 		}
 		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+	}
+	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		return 0, errors.Wrap(ErrTSOAllocatorRequired,
+			"legacy HLC issuance is disabled by durable TSO phase D")
 	}
 	if c.clock == nil {
 		return 0, errors.Wrap(ErrTSOClockNil, label)
@@ -2276,10 +2440,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for gid, group := range c.groups {
-		if group == nil || group.Engine == nil {
-			continue
-		}
-		if group.Engine.State() != raftengine.StateLeader {
+		if !c.shouldRenewHLCGroup(gid, group) {
 			continue
 		}
 		if !c.startHLCLeaseRenewal(gid) {
@@ -2299,6 +2460,14 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		close(done)
 	}()
 	return done
+}
+
+func (c *ShardedCoordinator) shouldRenewHLCGroup(gid uint64, group *ShardGroup) bool {
+	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() &&
+		(!c.timestampGroupConfigured || gid != c.timestampGroup) {
+		return false
+	}
+	return group != nil && group.Engine != nil && group.Engine.State() == raftengine.StateLeader
 }
 
 func (c *ShardedCoordinator) startHLCLeaseRenewal(gid uint64) bool {

@@ -154,7 +154,10 @@ func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byt
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
 	var result redisSetExecution
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
+		readTS, err := r.beginTxnStartTS(ctx, "redis set string: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
 		state, err := r.loadRedisSetState(ctx, key, readTS, opts.returnOld)
 		if err != nil {
 			return err
@@ -519,7 +522,11 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 	err := r.retryRedisWrite(ctx, func() error {
 		elems := []*kv.Elem[kv.OP]{}
 		nextRemoved := 0
-		readTS := r.readTS()
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis del: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		for _, key := range keys {
 			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 			if err != nil {
@@ -530,7 +537,7 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 			}
 			elems = append(elems, keyElems...)
 		}
-		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		if err := r.dispatchReadTimestampElems(ctx, true, readTimestamp, elems); err != nil {
 			return err
 		}
 		removed = nextRemoved

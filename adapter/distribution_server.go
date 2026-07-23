@@ -147,18 +147,15 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 	if err != nil {
 		return nil, err
 	}
-	activateCutover := req != nil && req.GetActivateCutover()
+	activateCutover, activatePhaseD, err := timestampActivationValues(req)
+	if err != nil {
+		return nil, err
+	}
 	if s.timestampAllocator == nil {
-		if count != 1 || minTimestamp != 0 || activateCutover {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "dedicated TSO allocator is not configured"))
-		}
-		if s.engine == nil {
-			return nil, errors.WithStack(status.Error(codes.Unavailable, "distribution engine is not configured"))
-		}
-		return &pb.GetTimestampResponse{Timestamp: s.engine.NextTimestamp()}, nil
+		return s.legacyTimestampResponse(count, minTimestamp, activateCutover, activatePhaseD)
 	}
 
-	reservation, err := s.allocateTimestampReservation(ctx, count, minTimestamp, activateCutover)
+	reservation, err := s.allocateTimestampReservation(ctx, count, minTimestamp, activateCutover, activatePhaseD)
 	if err != nil {
 		return nil, timestampRPCError(err)
 	}
@@ -171,7 +168,63 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 		Count:                   uint32(count), //nolint:gosec // count is bounded by MaxTSOBatchSize.
 		PreviousAllocationFloor: reservation.PreviousAllocationFloor,
 		CutoverActive:           reservation.CutoverActive,
+		PhaseDActive:            reservation.PhaseDActive,
+		PhaseDFloor:             reservation.PhaseDFloor,
 	}, nil
+}
+
+func timestampActivationValues(req *pb.GetTimestampRequest) (bool, bool, error) {
+	activateCutover := req != nil && req.GetActivateCutover()
+	activatePhaseD := req != nil && req.GetActivatePhaseD()
+	if activatePhaseD && !activateCutover {
+		return false, false, errors.WithStack(status.Error(codes.InvalidArgument,
+			"phase D activation requires cutover activation"))
+	}
+	return activateCutover, activatePhaseD, nil
+}
+
+func (s *DistributionServer) legacyTimestampResponse(
+	count int,
+	minTimestamp uint64,
+	activateCutover bool,
+	activatePhaseD bool,
+) (*pb.GetTimestampResponse, error) {
+	if count != 1 || minTimestamp != 0 || activateCutover || activatePhaseD {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "dedicated TSO allocator is not configured"))
+	}
+	if s.engine == nil {
+		return nil, errors.WithStack(status.Error(codes.Unavailable, "distribution engine is not configured"))
+	}
+	return &pb.GetTimestampResponse{Timestamp: s.engine.NextTimestamp()}, nil
+}
+
+// ValidateTimestamp verifies a read/start timestamp against the durable M7
+// allocation range. The local allocator performs the group-0 leader fence;
+// followers reject so clients re-resolve rather than validating stale state.
+func (s *DistributionServer) ValidateTimestamp(
+	ctx context.Context,
+	req *pb.ValidateTimestampRequest,
+) (*pb.ValidateTimestampResponse, error) {
+	if req == nil || req.GetTimestamp() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "timestamp is required"))
+	}
+	validator, ok := s.timestampAllocator.(kv.DurableTimestampValidator)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition,
+			"dedicated TSO timestamp validation is not configured"))
+	}
+	if err := validator.ValidateDurableTimestamp(ctx, req.GetTimestamp()); err != nil {
+		return nil, timestampRPCError(err)
+	}
+	resp := &pb.ValidateTimestampResponse{Valid: true, PhaseDActive: true}
+	if state, ok := s.timestampAllocator.(interface {
+		PhaseDFloor() uint64
+		AllocationFloor() uint64
+	}); ok {
+		resp.PhaseDFloor = state.PhaseDFloor()
+		resp.AllocationFloor = state.AllocationFloor()
+	}
+	return resp, nil
 }
 
 func (s *DistributionServer) allocateTimestampReservation(
@@ -179,14 +232,15 @@ func (s *DistributionServer) allocateTimestampReservation(
 	count int,
 	minTimestamp uint64,
 	activateCutover bool,
+	activatePhaseD bool,
 ) (kv.TSOReservation, error) {
 	if allocator, ok := s.timestampAllocator.(kv.TSOReservationAllocator); ok {
-		reservation, err := allocator.ReserveBatchAfter(ctx, count, minTimestamp, activateCutover)
+		reservation, err := allocator.ReserveBatchAfter(ctx, count, minTimestamp, activateCutover, activatePhaseD)
 		return reservation, errors.Wrap(err, "reserve dedicated TSO window")
 	}
 	reservation := kv.TSOReservation{Count: count}
 	switch {
-	case activateCutover:
+	case activateCutover || activatePhaseD:
 		return reservation, errors.WithStack(status.Error(codes.FailedPrecondition,
 			"TSO allocator does not support durable cutover"))
 	case minTimestamp > 0:
@@ -251,6 +305,12 @@ func timestampRPCError(err error) error {
 		return errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
 	case errors.Is(err, kv.ErrTSONotLeader), errors.Is(err, kv.ErrLeaderNotFound):
 		return errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+	case errors.Is(err, kv.ErrTSOTimestampPrePhaseD):
+		return errors.WithStack(status.Error(codes.OutOfRange, err.Error()))
+	case errors.Is(err, kv.ErrTSOTimestampInvalid):
+		return errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
+	case errors.Is(err, kv.ErrTSOPhaseDInactive):
+		return errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
 	default:
 		return errors.WithStack(status.Error(codes.Unavailable, err.Error()))
 	}
@@ -280,7 +340,16 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	snapshot, err := s.loadCatalogSnapshot(ctx)
+	readTimestamp, err := kv.BeginReadTimestampThrough(
+		ctx,
+		s.coordinator,
+		s.catalog.LatestCommitTS(),
+		"distribution split range: begin read timestamp",
+	)
+	if err != nil {
+		return nil, grpcStatusErrorf(codes.Internal, "begin catalog split snapshot: %v", err)
+	}
+	snapshot, err := s.loadCatalogSnapshotAt(ctx, readTimestamp.Timestamp())
 	if err != nil {
 		return nil, err
 	}
@@ -290,15 +359,8 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	parent, found := findRouteByID(snapshot.Routes, req.GetRouteId())
-	if !found {
-		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
-	}
-
-	rawSplitKey := req.GetSplitKey()
-	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
-	if err := validateSplitKey(parent, splitKey); err != nil {
-		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
+	parent, splitKey, err := s.prepareSplitRange(snapshot.Routes, req)
+	if err != nil {
 		return nil, err
 	}
 
@@ -308,7 +370,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	}
 	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, 0)
 
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, readTimestamp, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +387,20 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		Left:           toProtoRouteDescriptor(savedLeft),
 		Right:          toProtoRouteDescriptor(savedRight),
 	}, nil
+}
+
+func (s *DistributionServer) prepareSplitRange(routes []distribution.RouteDescriptor, req *pb.SplitRangeRequest) (distribution.RouteDescriptor, []byte, error) {
+	parent, found := findRouteByID(routes, req.GetRouteId())
+	if !found {
+		return distribution.RouteDescriptor{}, nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
+	}
+	rawSplitKey := req.GetSplitKey()
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(rawSplitKey)))
+	if err := validateSplitKey(parent, splitKey); err != nil {
+		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
+		return distribution.RouteDescriptor{}, nil, err
+	}
+	return parent, splitKey, nil
 }
 
 func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
@@ -372,7 +448,7 @@ func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
 
 func (s *DistributionServer) saveSplitResultViaCoordinator(
 	ctx context.Context,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
@@ -391,10 +467,11 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
-	resp, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	resp, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		Elems:   ops,
 		IsTxn:   true,
-		StartTS: readTS,
+		StartTS: readTimestamp.Timestamp(),
 	})
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
@@ -473,6 +550,17 @@ func (s *DistributionServer) loadCatalogSnapshot(ctx context.Context) (distribut
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
 	}
 	snapshot, err := s.catalog.Snapshot(ctx)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "load route catalog: %v", err)
+	}
+	return snapshot, nil
+}
+
+func (s *DistributionServer) loadCatalogSnapshotAt(ctx context.Context, readTS uint64) (distribution.CatalogSnapshot, error) {
+	if s.catalog == nil {
+		return distribution.CatalogSnapshot{}, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	snapshot, err := s.catalog.SnapshotAt(ctx, readTS)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "load route catalog: %v", err)
 	}

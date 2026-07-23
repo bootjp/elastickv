@@ -47,23 +47,17 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var v []byte
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAt(ctx, key, readTS)
+		readTS, err := r.beginTxnStartTS(ctx, "redis getdel: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
+		raw, exists, err := r.getdelValueAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		if typ == redisTypeNone {
+		if !exists {
 			v = nil
 			return nil
-		}
-		if typ != redisTypeString {
-			return wrongTypeError()
-		}
-		raw, _, err := r.readRedisStringAt(key, readTS)
-		if err != nil {
-			// Key may have expired or been deleted between type check and read.
-			v = nil
-			return nil //nolint:nilerr // treat not-found/expired as nil value
 		}
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
@@ -84,6 +78,25 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteBulk(v)
+}
+
+func (r *RedisServer) getdelValueAt(ctx context.Context, key []byte, readTS uint64) ([]byte, bool, error) {
+	typ, err := r.keyTypeAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if typ == redisTypeNone {
+		return nil, false, nil
+	}
+	if typ != redisTypeString {
+		return nil, false, wrongTypeError()
+	}
+	raw, _, err := r.readRedisStringAt(key, readTS)
+	if err != nil {
+		// Key may have expired or been deleted between type check and read.
+		return nil, false, nil //nolint:nilerr // treat not-found/expired as nil value
+	}
+	return raw, true, nil
 }
 
 // SETNX key value — set if not exists, returns 1 on success, 0 on failure
@@ -185,9 +198,12 @@ func parseExpireTTL(raw []byte) (int64, error) {
 	return ttl, nil
 }
 
-func (r *RedisServer) prepareExpire(key []byte, nxOnly bool) (uint64, bool, error) {
-	readTS := r.readTS()
-	exists, err := r.logicalExistsAt(context.Background(), key, readTS)
+func (r *RedisServer) prepareExpire(ctx context.Context, key []byte, nxOnly bool) (uint64, bool, error) {
+	readTS, err := r.beginTxnStartTS(ctx, "redis expire: begin read timestamp")
+	if err != nil {
+		return 0, false, cockerrors.WithStack(err)
+	}
+	exists, err := r.logicalExistsAt(ctx, key, readTS)
 	if err != nil {
 		return 0, false, err
 	}
@@ -199,7 +215,7 @@ func (r *RedisServer) prepareExpire(key []byte, nxOnly bool) (uint64, bool, erro
 		return readTS, true, nil
 	}
 
-	currentTTL, err := r.ttlAt(context.Background(), key, readTS)
+	currentTTL, err := r.ttlAt(ctx, key, readTS)
 	if err != nil {
 		return 0, false, err
 	}
@@ -253,7 +269,7 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 // then re-invokes doSetExpire with a fresh readTS, providing OCC safety without
 // an explicit mutex. Leadership is verified by coordinator.Dispatch itself.
 func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, expireAt time.Time, nxOnly bool) (int, error) {
-	readTS, eligible, err := r.prepareExpire(key, nxOnly)
+	readTS, eligible, err := r.prepareExpire(ctx, key, nxOnly)
 	if err != nil {
 		return 0, err
 	}

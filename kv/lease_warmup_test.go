@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -292,6 +293,33 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 	require.Equal(t, uint64(200), idx)
 	require.Equal(t, int32(0), eng2.linearizableCalls.Load(),
 		"the non-default group lease must be warmed by all-group renewal")
+}
+
+func TestShardedCoordinator_RenewHLCLeases_PhaseDOnlyRenewsTimestampGroup(t *testing.T) {
+	t.Parallel()
+	eng0 := newShardedLeaseEngine(50)
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	distEngine := distribution.NewEngine()
+	distEngine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	distEngine.UpdateRoute([]byte("m"), nil, 2)
+	phaseD := NewTSOStateMachine(NewHLC())
+	require.Nil(t, phaseD.Apply(marshalTSOCutover()))
+	require.Nil(t, phaseD.Apply(marshalTSOPhaseD(0)))
+	coord := NewShardedCoordinator(distEngine, map[uint64]*ShardGroup{
+		0: {Engine: eng0},
+		1: {Engine: eng1},
+		2: {Engine: eng2},
+	}, 1, NewHLC(), nil).
+		WithTimestampGroup(0).
+		WithTSOCutoverState(phaseD)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	require.Equal(t, int32(1), eng0.proposeCalls.Load())
+	require.Equal(t, int32(0), eng1.proposeCalls.Load())
+	require.Equal(t, int32(0), eng2.proposeCalls.Load())
 }
 
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {

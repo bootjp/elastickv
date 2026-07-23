@@ -10,21 +10,24 @@ import (
 )
 
 type s3PutObjectState struct {
-	startTS  uint64
-	meta     *s3BucketMeta
-	headKey  []byte
-	previous *s3ObjectManifest
-	uploadID string
-	readPin  *kv.ActiveTimestampToken
+	startTS       uint64
+	readTimestamp kv.ReadTimestamp
+	meta          *s3BucketMeta
+	headKey       []byte
+	previous      *s3ObjectManifest
+	uploadID      string
+	readPin       *kv.ActiveTimestampToken
 }
 
 func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request, bucket, objectKey string) (*s3PutObjectState, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 put object: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	state := &s3PutObjectState{startTS: startTS, readPin: s.pinReadTS(readTS)}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
+	state := &s3PutObjectState{startTS: startTS, readTimestamp: readTimestamp, readPin: s.pinReadTS(readTS)}
 	prepared := false
 	defer func() {
 		if !prepared {
@@ -109,7 +112,8 @@ func (s *S3Server) commitS3PutObject(ctx context.Context, request *http.Request,
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := state.readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  state.startTS,
 		CommitTS: commitTS,

@@ -28,9 +28,13 @@ const (
 	// tsoCutoverEnvelope uses the same legacy fail-closed prefix but a distinct
 	// magic, so an encryption entry cannot become a one-way TSO state change.
 	tsoCutoverEnvelope = "\x07TSOC\x01"
-	tsoSnapshotV1Len   = hlcLeasePayloadLen
-	tsoSnapshotV2Len   = hlcLeasePayloadLen * 2
-	tsoSnapshotV3Len   = tsoSnapshotV2Len + 1
+	// tsoPhaseDEnvelope retains the rolling-upgrade halt prefix and gives the
+	// irreversible Phase-D marker its own exact wire identity.
+	tsoPhaseDEnvelope = "\x07TSOD\x01"
+	tsoSnapshotV1Len  = hlcLeasePayloadLen
+	tsoSnapshotV2Len  = hlcLeasePayloadLen * 2
+	tsoSnapshotV3Len  = tsoSnapshotV2Len + 1
+	tsoSnapshotV4Len  = tsoSnapshotV3Len + 1 + hlcLeasePayloadLen
 )
 
 // TSOStateMachine is the minimal state machine for the dedicated timestamp
@@ -43,6 +47,8 @@ type TSOStateMachine struct {
 	ceilingMs       atomic.Int64
 	allocationFloor atomic.Uint64
 	cutoverActive   atomic.Bool
+	phaseDActive    atomic.Bool
+	phaseDFloor     atomic.Uint64
 }
 
 func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
@@ -60,6 +66,8 @@ func (f *TSOStateMachine) Apply(data []byte) any {
 		return f.applyAllocationFloorEntry(data)
 	case bytes.Equal(data, []byte(tsoCutoverEnvelope)):
 		return f.applyCutoverEntry(data)
+	case bytes.HasPrefix(data, []byte(tsoPhaseDEnvelope)):
+		return f.applyPhaseDEntry(data)
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return rejectLegacyTSOEncryptionEntry(data)
 	default:
@@ -134,6 +142,33 @@ func (f *TSOStateMachine) applyCutoverEntry(data []byte) any {
 	return nil
 }
 
+func (f *TSOStateMachine) applyPhaseDEntry(data []byte) any {
+	expectedLen := len(tsoPhaseDEnvelope) + hlcLeasePayloadLen
+	if len(data) != expectedLen {
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"expected TSO phase-D entry length %d, got %d", expectedLen, len(data)))
+	}
+	if f == nil {
+		return nil
+	}
+	if !f.cutoverActive.Load() {
+		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry,
+			"TSO phase-D marker requires the durable cutover marker"))
+	}
+	floor := binary.BigEndian.Uint64(data[len(tsoPhaseDEnvelope):])
+	if f.phaseDActive.Load() && f.phaseDFloor.Load() != floor {
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"TSO phase-D floor changed from %d to %d", f.phaseDFloor.Load(), floor))
+	}
+	if !f.phaseDActive.Load() && floor < f.allocationFloor.Load() {
+		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"TSO phase-D floor %d is below allocation floor %d", floor, f.allocationFloor.Load()))
+	}
+	f.phaseDFloor.Store(floor)
+	f.phaseDActive.Store(true)
+	return nil
+}
+
 // AllocationFloor returns the highest timestamp window end applied by the
 // dedicated TSO group. It is consensus-owned state, unlike HLC.Current().
 func (f *TSOStateMachine) AllocationFloor() uint64 {
@@ -150,19 +185,42 @@ func (f *TSOStateMachine) CutoverActive() bool {
 	return f != nil && f.cutoverActive.Load()
 }
 
+// PhaseDActive reports whether the compatibility window has been durably
+// closed. Once active, data-shard HLC renewal and caller-supplied cross-shard
+// timestamps may no longer use legacy issuance semantics.
+func (f *TSOStateMachine) PhaseDActive() bool {
+	return f != nil && f.phaseDActive.Load()
+}
+
+// PhaseDFloor is the highest allocation floor that existed when Phase D was
+// activated. Only timestamps reserved strictly above it are valid M7 durable
+// read/start allocations.
+func (f *TSOStateMachine) PhaseDFloor() uint64 {
+	if f == nil {
+		return 0
+	}
+	return f.phaseDFloor.Load()
+}
+
 func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 	var ceilingMs int64
 	var allocationFloor uint64
 	var cutoverActive bool
+	var phaseDActive bool
+	var phaseDFloor uint64
 	if f != nil {
 		ceilingMs = f.ceilingMs.Load()
 		allocationFloor = f.allocationFloor.Load()
 		cutoverActive = f.cutoverActive.Load()
+		phaseDActive = f.phaseDActive.Load()
+		phaseDFloor = f.phaseDFloor.Load()
 	}
 	return &tsoFSMSnapshot{
 		ceilingMs:       ceilingMs,
 		allocationFloor: allocationFloor,
 		cutoverActive:   cutoverActive,
+		phaseDActive:    phaseDActive,
+		phaseDFloor:     phaseDFloor,
 	}, nil
 }
 
@@ -174,12 +232,12 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	if legacy, err := restoreLegacyKVFSMSnapshot(f, br); legacy || err != nil {
 		return err
 	}
-	ceilingMs, allocationFloor, cutoverActive, err := readTSOSnapshotState(br)
+	ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, err := readTSOSnapshotState(br)
 	if err != nil {
 		return err
 	}
 	if f != nil {
-		f.restoreSnapshotState(ceilingMs, allocationFloor, cutoverActive)
+		f.restoreSnapshotState(ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor)
 	}
 	return nil
 }
@@ -191,28 +249,30 @@ func tsoSnapshotReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
 }
 
-func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, bool, error) {
-	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV3Len+1))
+func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, bool, bool, uint64, error) {
+	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV4Len+1))
 	if err != nil {
-		return 0, 0, false, errors.Wrap(err, "restore tso fsm snapshot")
+		return 0, 0, false, false, 0, errors.Wrap(err, "restore tso fsm snapshot")
 	}
-	ceilingMs, allocationFloor, cutoverActive, legacySnapshot, err := decodeTSOSnapshotPayload(payload)
+	ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, legacySnapshot, err := decodeTSOSnapshotPayload(payload)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, false, 0, err
 	}
 	if ceilingMs < 0 {
-		return 0, 0, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+		return 0, 0, false, false, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
 	}
 	if legacySnapshot && ceilingMs > 0 {
 		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
 	}
-	return ceilingMs, allocationFloor, cutoverActive, nil
+	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, nil
 }
 
-func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, error) {
+func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, uint64, bool, error) {
 	var ceilingMs int64
 	var allocationFloor uint64
 	var cutoverActive bool
+	var phaseDActive bool
+	var phaseDFloor uint64
 	var legacySnapshot bool
 	switch len(payload) {
 	case tsoSnapshotV1Len:
@@ -227,17 +287,46 @@ func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, error)
 		var err error
 		cutoverActive, err = decodeTSOCutoverByte(payload[tsoSnapshotV2Len])
 		if err != nil {
-			return 0, 0, false, false, err
+			return 0, 0, false, false, 0, false, err
 		}
+	case tsoSnapshotV4Len:
+		return decodeTSOSnapshotV4(payload)
 	default:
-		return 0, 0, false, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
-			"tso fsm snapshot: expected %d, %d, or %d bytes, got %d",
-			tsoSnapshotV1Len, tsoSnapshotV2Len, tsoSnapshotV3Len, len(payload))
+		return 0, 0, false, false, 0, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: expected %d, %d, %d, or %d bytes, got %d",
+			tsoSnapshotV1Len, tsoSnapshotV2Len, tsoSnapshotV3Len, tsoSnapshotV4Len, len(payload))
 	}
-	return ceilingMs, allocationFloor, cutoverActive, legacySnapshot, nil
+	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, legacySnapshot, nil
+}
+
+func decodeTSOSnapshotV4(payload []byte) (int64, uint64, bool, bool, uint64, bool, error) {
+	ceilingMs := int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
+	allocationFloor := binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len])
+	cutoverActive, err := decodeTSOCutoverByte(payload[tsoSnapshotV2Len])
+	if err != nil {
+		return 0, 0, false, false, 0, false, err
+	}
+	phaseDActive, err := decodeTSOBooleanByte("phase-D", payload[tsoSnapshotV3Len])
+	if err != nil {
+		return 0, 0, false, false, 0, false, err
+	}
+	phaseDFloor := binary.BigEndian.Uint64(payload[tsoSnapshotV3Len+1:])
+	if phaseDActive && !cutoverActive {
+		return 0, 0, false, false, 0, false, errors.Wrap(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: phase-D active without cutover")
+	}
+	if !phaseDActive && phaseDFloor != 0 {
+		return 0, 0, false, false, 0, false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: inactive phase-D has floor %d", phaseDFloor)
+	}
+	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, false, nil
 }
 
 func decodeTSOCutoverByte(value byte) (bool, error) {
+	return decodeTSOBooleanByte("cutover", value)
+}
+
+func decodeTSOBooleanByte(name string, value byte) (bool, error) {
 	switch value {
 	case 0:
 		return false, nil
@@ -245,7 +334,7 @@ func decodeTSOCutoverByte(value byte) (bool, error) {
 		return true, nil
 	default:
 		return false, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
-			"tso fsm snapshot: invalid cutover byte %d", value)
+			"tso fsm snapshot: invalid %s byte %d", name, value)
 	}
 }
 
@@ -272,7 +361,7 @@ func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, err
 	if f == nil || ceilingMs == 0 {
 		return true, nil
 	}
-	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs), false)
+	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs), false, false, 0)
 	return true, nil
 }
 
@@ -302,7 +391,9 @@ func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
 	}
 	return len(payload) == hlcLeaseEntryLen && payload[0] == raftEncodeHLCLease ||
 		len(payload) == len(tsoAllocationFloorEnvelope)+hlcLeasePayloadLen &&
-			bytes.HasPrefix(payload, []byte(tsoAllocationFloorEnvelope))
+			bytes.HasPrefix(payload, []byte(tsoAllocationFloorEnvelope)) ||
+		len(payload) == len(tsoPhaseDEnvelope)+hlcLeasePayloadLen &&
+			bytes.HasPrefix(payload, []byte(tsoPhaseDEnvelope))
 }
 
 func (f *TSOStateMachine) applyLeaseCeiling(ceilingMs int64) {
@@ -325,7 +416,13 @@ func (f *TSOStateMachine) applyAllocationFloor(floor uint64) {
 	}
 }
 
-func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor uint64, cutoverActive bool) {
+func (f *TSOStateMachine) restoreSnapshotState(
+	ceilingMs int64,
+	allocationFloor uint64,
+	cutoverActive bool,
+	phaseDActive bool,
+	phaseDFloor uint64,
+) {
 	if f == nil {
 		return
 	}
@@ -337,6 +434,10 @@ func (f *TSOStateMachine) restoreSnapshotState(ceilingMs int64, allocationFloor 
 	}
 	if cutoverActive {
 		f.cutoverActive.Store(true)
+	}
+	if phaseDActive {
+		f.phaseDFloor.Store(phaseDFloor)
+		f.phaseDActive.Store(true)
 	}
 	if f.hlc != nil {
 		if currentCeiling := f.ceilingMs.Load(); currentCeiling > 0 {
@@ -387,10 +488,19 @@ func marshalTSOCutover() []byte {
 	return []byte(tsoCutoverEnvelope)
 }
 
+func marshalTSOPhaseD(floor uint64) []byte {
+	out := make([]byte, len(tsoPhaseDEnvelope)+hlcLeasePayloadLen)
+	copy(out, tsoPhaseDEnvelope)
+	binary.BigEndian.PutUint64(out[len(tsoPhaseDEnvelope):], floor)
+	return out
+}
+
 type tsoFSMSnapshot struct {
 	ceilingMs       int64
 	allocationFloor uint64
 	cutoverActive   bool
+	phaseDActive    bool
+	phaseDFloor     uint64
 }
 
 func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
@@ -400,18 +510,30 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 	var ceilingMs int64
 	var allocationFloor uint64
 	var cutoverActive bool
+	var phaseDActive bool
+	var phaseDFloor uint64
 	if s != nil {
 		ceilingMs = s.ceilingMs
 		allocationFloor = s.allocationFloor
 		cutoverActive = s.cutoverActive
+		phaseDActive = s.phaseDActive
+		phaseDFloor = s.phaseDFloor
 	}
-	var buf [tsoSnapshotV3Len]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp.
+	snapshotLen := tsoSnapshotV3Len
+	if phaseDActive {
+		snapshotLen = tsoSnapshotV4Len
+	}
+	buf := make([]byte, snapshotLen)
+	binary.BigEndian.PutUint64(buf, uint64(ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp.
 	binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
 	if cutoverActive {
 		buf[tsoSnapshotV2Len] = 1
 	}
-	n, err := w.Write(buf[:])
+	if phaseDActive {
+		buf[tsoSnapshotV3Len] = 1
+		binary.BigEndian.PutUint64(buf[tsoSnapshotV3Len+1:], phaseDFloor)
+	}
+	n, err := w.Write(buf)
 	if err != nil {
 		return int64(n), errors.Wrap(err, "write tso fsm snapshot")
 	}
