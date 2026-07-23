@@ -369,6 +369,30 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	require.FileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
 }
 
+func TestPrepareFSMSnapshotWriteRejectsFooterOnlyRestorablePair(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	crc100, _ := writeFSMFileForTest(t, fsmSnapDir, 100, []byte("valid previous snapshot"))
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc100)
+
+	tokenCRC := crc32.Checksum([]byte("valid newer snapshot"), crc32cTable)
+	f, err := os.Create(fsmSnapPath(fsmSnapDir, 200))
+	require.NoError(t, err)
+	_, err = f.Write([]byte("corrupted newer snapshot"))
+	require.NoError(t, err)
+	require.NoError(t, binary.Write(f, binary.BigEndian, tokenCRC))
+	require.NoError(t, f.Close())
+	createTokenSnapFileWithTerm(t, snapDir, 1, 200, tokenCRC)
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 300))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
+}
+
 func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
