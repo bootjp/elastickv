@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -196,6 +198,46 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	require.Empty(t, internalTimestampOptions(legacy))
 }
 
+func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
+	t.Parallel()
+
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	*tsoModeFile = path
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
+
+	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
+	opts := internalTimestampOptions(gated)
+	require.Len(t, opts, 1)
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeShadow))
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeCutover))
+
+	txn := &mainForwardTxn{}
+	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+	resp, err := internal.Forward(context.Background(), &pb.ForwardRequest{Requests: reqs})
+	require.NoError(t, err)
+	require.True(t, resp.GetSuccess())
+	require.Len(t, txn.requests, 1)
+	require.Greater(t, txn.requests[0].GetTs(), uint64(1),
+		"timestamp 1 would mean the long-lived Internal server lost the runtime allocator and used its nil-clock fallback")
+}
+
 func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
 	setTSOModeFlags(t, false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
@@ -289,6 +331,19 @@ type mainTimestampAllocator struct {
 
 func (a *mainTimestampAllocator) Next(context.Context) (uint64, error) {
 	return a.next, nil
+}
+
+type mainForwardTxn struct {
+	requests []*pb.Request
+}
+
+func (t *mainForwardTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
+	t.requests = reqs
+	return &kv.TransactionResponse{CommitIndex: 1}, nil
+}
+
+func (t *mainForwardTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
 }
 
 func (mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {

@@ -48,6 +48,14 @@ type TimestampAllocatorProvider interface {
 	TimestampAllocator() TimestampAllocator
 }
 
+// ConfiguredTimestampAllocatorProvider lets coordinator decorators expose the
+// configured allocator without resolving runtime-mode wrappers. Long-lived
+// services use this to keep a DynamicTimestampAllocator reference while the
+// active mode is still legacy.
+type ConfiguredTimestampAllocatorProvider interface {
+	ConfiguredTimestampAllocator() TimestampAllocator
+}
+
 type TimestampAfterAllocator interface {
 	NextAfter(ctx context.Context, min uint64) (uint64, error)
 }
@@ -231,6 +239,10 @@ func TimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
 // that must keep a DynamicTimestampAllocator reference across later mode-file
 // reloads while still falling back to HLC when that allocator reports legacy.
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(ConfiguredTimestampAllocatorProvider); ok {
+		alloc := provider.ConfiguredTimestampAllocator()
+		return alloc, alloc != nil
+	}
 	if provider, ok := coord.(TimestampAllocatorProvider); ok {
 		alloc := provider.TimestampAllocator()
 		return alloc, alloc != nil

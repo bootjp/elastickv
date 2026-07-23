@@ -60,6 +60,26 @@ func TestDynamicTimestampAllocatorPreservesLegacyFallbackUntilActivated(t *testi
 	require.Equal(t, legacyTS+100, dedicatedTS)
 }
 
+func TestConfiguredTimestampAllocatorThroughPrefersConfiguredProvider(t *testing.T) {
+	t.Parallel()
+
+	active := &phaseDTestAllocator{next: 10}
+	configured := NewDynamicTimestampAllocator(nil)
+	provider := configuredAllocatorTestProvider{
+		Coordinator: NewShardedCoordinator(distribution.NewEngine(), nil, 1, NewHLC(), nil),
+		active:      active,
+		configured:  configured,
+	}
+
+	got, ok := TimestampAllocatorThrough(provider)
+	require.True(t, ok)
+	require.Same(t, active, got)
+
+	got, ok = ConfiguredTimestampAllocatorThrough(provider)
+	require.True(t, ok)
+	require.Same(t, configured, got)
+}
+
 func TestDynamicTimestampAllocatorRejectsValidationWithoutAllocator(t *testing.T) {
 	t.Parallel()
 	dynamic := NewDynamicTimestampAllocator(nil)
@@ -347,6 +367,20 @@ func (o *recordingRuntimeTSOObserver) ObserveTSODurableState(cutoverActive, phas
 type runtimeTSOState struct {
 	cutover atomic.Bool
 	phaseD  atomic.Bool
+}
+
+type configuredAllocatorTestProvider struct {
+	Coordinator
+	active     TimestampAllocator
+	configured TimestampAllocator
+}
+
+func (p configuredAllocatorTestProvider) TimestampAllocator() TimestampAllocator {
+	return p.active
+}
+
+func (p configuredAllocatorTestProvider) ConfiguredTimestampAllocator() TimestampAllocator {
+	return p.configured
 }
 
 func (s *runtimeTSOState) CutoverActive() bool { return s.cutover.Load() }

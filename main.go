@@ -2417,6 +2417,7 @@ var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
+var _ kv.ConfiguredTimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucher = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -2459,6 +2460,11 @@ func (c startupGatedCoordinator) Clock() *kv.HLC {
 }
 
 func (c startupGatedCoordinator) TimestampAllocator() kv.TimestampAllocator {
+	alloc, _ := kv.TimestampAllocatorThrough(c.inner)
+	return alloc
+}
+
+func (c startupGatedCoordinator) ConfiguredTimestampAllocator() kv.TimestampAllocator {
 	alloc, _ := kv.ConfiguredTimestampAllocatorThrough(c.inner)
 	return alloc
 }
