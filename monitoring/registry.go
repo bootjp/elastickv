@@ -29,6 +29,8 @@ type Registry struct {
 	hlcObserver   *HLCObserver
 	coldStart     *ColdStartMetrics
 	coldStartObs  *ColdStartObserver
+	tso           *TSOMetrics
+	tsoObserver   *TSOObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -59,6 +61,8 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.hlcObserver = newHLCObserver(r.hlc)
 	r.coldStart = newColdStartMetrics(registerer)
 	r.coldStartObs = newColdStartObserver(r.coldStart)
+	r.tso = newTSOMetrics(registerer)
+	r.tsoObserver = newTSOObserver(r.tso)
 	return r
 }
 
@@ -278,4 +282,13 @@ func (r *Registry) HLCObserver() *HLCObserver {
 		return nil
 	}
 	return r.hlcObserver
+}
+
+// TSOObserver returns the shared runtime TSO observer. The kv package consumes
+// it through its narrow observer interface, keeping Prometheus ownership here.
+func (r *Registry) TSOObserver() *TSOObserver {
+	if r == nil {
+		return nil
+	}
+	return r.tsoObserver
 }

@@ -1012,11 +1012,11 @@ func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, m
 	if min == ^uint64(0) {
 		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
 	}
-	if c.tsAllocator != nil {
+	if allocator, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		if min > 0 {
-			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
+			return nextTimestampAfterFromAllocator(ctx, allocator, min, label)
 		}
-		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+		return nextTimestampFromAllocator(ctx, allocator, label)
 	}
 	if c.clock == nil {
 		return 0, errors.Wrap(ErrTSOClockNil, label)

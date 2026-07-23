@@ -3,14 +3,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -139,7 +143,6 @@ func TestConfigureCoordinatorTSORestoresDurableCutoverWithoutFlags(t *testing.T)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.serverAllocator)
 	require.NotNil(t, wiring.routedAllocator)
-	require.Nil(t, wiring.shadowAllocator)
 	require.True(t, coord.IsTimestampLeader())
 	require.True(t, fsm.CutoverActive())
 
@@ -158,7 +161,8 @@ func TestConfigureCoordinatorTSODurableCutoverOverridesShadowFlag(t *testing.T) 
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.routedAllocator)
-	require.Nil(t, wiring.shadowAllocator, "durable cutover cannot return to legacy shadow issuance")
+	require.Equal(t, kv.TSOModeCutover, wiring.runtimeController.CurrentMode(),
+		"durable cutover cannot return to legacy shadow issuance")
 	require.True(t, coord.IsTimestampLeader())
 	require.True(t, fsm.CutoverActive())
 
@@ -179,8 +183,96 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	require.Same(t, allocator, got)
 	require.Len(t, internalTimestampOptions(gated), 1)
 
+	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
+	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
+	runtimeGated := startupGatedCoordinator{inner: runtimeCoord, gate: &startupPublicKVGate{}}
+	got, ok = kv.TimestampAllocatorThrough(runtimeGated)
+	require.False(t, ok)
+	require.Nil(t, got)
+	configured, ok := kv.ConfiguredTimestampAllocatorThrough(runtimeGated)
+	require.True(t, ok)
+	require.Same(t, runtimeAllocator, configured)
+	require.Len(t, internalTimestampOptions(runtimeGated), 1)
+
 	legacy := startupGatedCoordinator{inner: newMainTSOCoordinator(kv.NewHLC(), nil)}
 	require.Empty(t, internalTimestampOptions(legacy))
+}
+
+func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
+	t.Parallel()
+
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	*tsoModeFile = path
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
+
+	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
+	opts := internalTimestampOptions(gated)
+	require.Len(t, opts, 1)
+
+	txn := &mainForwardTxn{}
+	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)
+
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeShadow))
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeCutover))
+
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+	resp, err := internal.Forward(context.Background(), &pb.ForwardRequest{Requests: reqs})
+	require.NoError(t, err)
+	require.True(t, resp.GetSuccess())
+	require.Len(t, txn.requests, 1)
+	require.Greater(t, txn.requests[0].GetTs(), uint64(1),
+		"timestamp 1 would mean the long-lived Internal server lost the runtime allocator and used its nil-clock fallback")
+}
+
+func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("shadow\n"), 0o600))
+	*tsoModeFile = path
+	*tsoModeReloadInterval = time.Millisecond
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+	require.NotNil(t, wiring.runtimeController)
+	require.Equal(t, kv.TSOModeShadow, wiring.runtimeController.CurrentMode())
+	_, configured := kv.TimestampAllocatorThrough(coord)
+	require.True(t, configured)
+}
+
+func TestConfigureCoordinatorTSOModeFileRequiresDedicatedGroup(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	*tsoModeFile = path
+	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
+
+	_, err := configureCoordinatorTSO(coord, nil)
+	require.ErrorIs(t, err, kv.ErrTSOGroupRequired)
 }
 
 func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainTSOEngine, map[uint64]*kv.ShardGroup) {
@@ -205,15 +297,21 @@ func setTSOModeFlags(t *testing.T, enabled, shadow bool) {
 	oldShadow := *tsoShadowEnabled
 	oldPhaseD := *tsoPhaseDEnabled
 	oldBatchSize := *tsoBatchSize
+	oldModeFile := *tsoModeFile
+	oldReloadInterval := *tsoModeReloadInterval
 	*tsoEnabled = enabled
 	*tsoShadowEnabled = shadow
 	*tsoPhaseDEnabled = false
 	*tsoBatchSize = 8
+	*tsoModeFile = ""
+	*tsoModeReloadInterval = defaultTSOReload
 	t.Cleanup(func() {
 		*tsoEnabled = oldEnabled
 		*tsoShadowEnabled = oldShadow
 		*tsoPhaseDEnabled = oldPhaseD
 		*tsoBatchSize = oldBatchSize
+		*tsoModeFile = oldModeFile
+		*tsoModeReloadInterval = oldReloadInterval
 	})
 }
 
@@ -235,6 +333,19 @@ type mainTimestampAllocator struct {
 
 func (a *mainTimestampAllocator) Next(context.Context) (uint64, error) {
 	return a.next, nil
+}
+
+type mainForwardTxn struct {
+	requests []*pb.Request
+}
+
+func (t *mainForwardTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
+	t.requests = reqs
+	return &kv.TransactionResponse{CommitIndex: 1}, nil
+}
+
+func (t *mainForwardTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
 }
 
 func (mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {

@@ -29,35 +29,40 @@ TLA_LIB      := ../lib
 
 .PHONY: tla-check tla-tools
 
-tla-tools: $(TLA_JAR)
-
-$(TLA_JAR):
+tla-tools:
 	@mkdir -p $(dir $(TLA_JAR))
-	@echo "Downloading tla2tools.jar $(TLA_VERSION)..."
-	@curl -fsSL -o $(TLA_JAR).tmp $(TLA_URL)
-	@# Prefer sha256sum (GNU coreutils, universal on Linux); fall back to
-	@# shasum -a 256 (default on macOS).  Either yields the same hex
-	@# digest in the first whitespace-delimited field.
-	@if command -v sha256sum >/dev/null 2>&1; then \
-		actual=$$(sha256sum $(TLA_JAR).tmp | awk '{print $$1}'); \
-	elif command -v shasum >/dev/null 2>&1; then \
-		actual=$$(shasum -a 256 $(TLA_JAR).tmp | awk '{print $$1}'); \
-	else \
-		echo "ERROR: neither sha256sum nor shasum is available."; \
-		rm -f $(TLA_JAR).tmp; \
-		exit 1; \
+	@set -eu; \
+	sha256_file() { \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			sha256sum "$$1" | awk '{print $$1}'; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			shasum -a 256 "$$1" | awk '{print $$1}'; \
+		else \
+			echo "ERROR: neither sha256sum nor shasum is available." >&2; \
+			return 1; \
+		fi; \
+	}; \
+	actual=""; \
+	if [ -f "$(TLA_JAR)" ]; then actual=$$(sha256_file "$(TLA_JAR)"); fi; \
+	if [ "$$actual" = "$(TLA_SHA256)" ]; then \
+		echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"; \
+		exit 0; \
 	fi; \
+	echo "Downloading tla2tools.jar $(TLA_VERSION)..."; \
+	trap 'rm -f "$(TLA_JAR).tmp"' EXIT HUP INT TERM; \
+	curl -fsSL -o "$(TLA_JAR).tmp" "$(TLA_URL)"; \
+	actual=$$(sha256_file "$(TLA_JAR).tmp"); \
 	if [ "$$actual" != "$(TLA_SHA256)" ]; then \
 		echo "ERROR: tla2tools.jar SHA-256 mismatch."; \
 		echo "  expected: $(TLA_SHA256)"; \
 		echo "  actual:   $$actual"; \
-		rm -f $(TLA_JAR).tmp; \
 		exit 1; \
-	fi
-	@mv $(TLA_JAR).tmp $(TLA_JAR)
-	@echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"
+	fi; \
+	mv "$(TLA_JAR).tmp" "$(TLA_JAR)"; \
+	trap - EXIT HUP INT TERM; \
+	echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"
 
-tla-check: $(TLA_JAR)
+tla-check: tla-tools
 	@# Per-module orchestration lives in scripts/tla-check.sh so adding
 	@# M3..M5 only needs an entry in that script's TLA_MODULES array
 	@# and a `case` line for the gap-invariant string.  The script does

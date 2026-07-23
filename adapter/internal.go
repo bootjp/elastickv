@@ -101,11 +101,17 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
 	if i.tsAllocator != nil {
 		ts, err := i.tsAllocator.Next(ctx)
-		if err != nil {
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
 			return 0, errors.Wrap(err, label)
 		}
-		return ts, nil
 	}
+	return i.nextLegacyTimestamp(label)
+}
+
+func (i *Internal) nextLegacyTimestamp(label string) (uint64, error) {
 	if i.clock == nil {
 		return 1, nil
 	}
@@ -121,15 +127,23 @@ func (i *Internal) nextTimestampAfter(ctx context.Context, min uint64, label str
 		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
 	}
 	if i.tsAllocator != nil {
-		return i.nextTimestampAfterFromAllocator(ctx, min, label)
+		ts, err := i.nextTimestampAfterFromAllocator(ctx, min, label)
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
+			return 0, err
+		}
 	}
+	return i.nextLegacyTimestampAfter(min, label)
+}
+
+func (i *Internal) nextLegacyTimestampAfter(min uint64, label string) (uint64, error) {
 	if i.clock == nil {
 		return min + 1, nil
 	}
-	if i.clock != nil {
-		i.clock.Observe(min)
-	}
-	ts, err := i.nextTimestamp(ctx, label)
+	i.clock.Observe(min)
+	ts, err := i.nextLegacyTimestamp(label)
 	if err != nil {
 		return 0, err
 	}

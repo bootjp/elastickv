@@ -48,6 +48,14 @@ type TimestampAllocatorProvider interface {
 	TimestampAllocator() TimestampAllocator
 }
 
+// ConfiguredTimestampAllocatorProvider lets coordinator decorators expose the
+// configured allocator without resolving runtime-mode wrappers. Long-lived
+// services use this to keep a DynamicTimestampAllocator reference while the
+// active mode is still legacy.
+type ConfiguredTimestampAllocatorProvider interface {
+	ConfiguredTimestampAllocator() TimestampAllocator
+}
+
 type TimestampAfterAllocator interface {
 	NextAfter(ctx context.Context, min uint64) (uint64, error)
 }
@@ -199,28 +207,76 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 	return nextTimestampAfterObserved(ctx, coord, clock, startTS, label)
 }
 
-// TimestampAllocatorThrough returns the allocator configured behind a
-// coordinator or coordinator decorator.
+// TimestampAllocatorThrough returns the currently active allocator behind a
+// coordinator or coordinator decorator. A runtime allocator in legacy mode is
+// intentionally hidden so normal write paths use the coordinator HLC fallback.
 func TimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(TimestampAllocatorProvider); ok {
+		return resolveTimestampAllocator(provider.TimestampAllocator())
+	}
+	switch c := coord.(type) {
+	case *Coordinate:
+		if c != nil {
+			return resolveTimestampAllocator(c.tsAllocator)
+		}
+		return nil, false
+	case *ShardedCoordinator:
+		if c != nil {
+			return resolveTimestampAllocator(c.tsAllocator)
+		}
+		return nil, false
+	default:
+		alloc, ok := coord.(TimestampAllocator)
+		if !ok {
+			return nil, false
+		}
+		return resolveTimestampAllocator(alloc)
+	}
+}
+
+// ConfiguredTimestampAllocatorThrough returns the configured allocator without
+// resolving runtime-mode decorators. It is used by long-lived internal servers
+// that must keep a DynamicTimestampAllocator reference across later mode-file
+// reloads while still falling back to HLC when that allocator reports legacy.
+func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(ConfiguredTimestampAllocatorProvider); ok {
+		alloc := provider.ConfiguredTimestampAllocator()
+		return alloc, alloc != nil
+	}
 	if provider, ok := coord.(TimestampAllocatorProvider); ok {
 		alloc := provider.TimestampAllocator()
 		return alloc, alloc != nil
 	}
 	switch c := coord.(type) {
 	case *Coordinate:
-		if c != nil && c.tsAllocator != nil {
-			return c.tsAllocator, true
+		if c == nil || c.tsAllocator == nil {
+			return nil, false
 		}
-		return nil, false
+		return c.tsAllocator, true
 	case *ShardedCoordinator:
-		if c != nil && c.tsAllocator != nil {
-			return c.tsAllocator, true
+		if c == nil || c.tsAllocator == nil {
+			return nil, false
 		}
-		return nil, false
+		return c.tsAllocator, true
 	default:
 		alloc, ok := coord.(TimestampAllocator)
 		return alloc, ok
 	}
+}
+
+type currentTimestampAllocatorProvider interface {
+	currentTimestampAllocator() TimestampAllocator
+}
+
+func resolveTimestampAllocator(alloc TimestampAllocator) (TimestampAllocator, bool) {
+	for range 4 {
+		provider, ok := alloc.(currentTimestampAllocatorProvider)
+		if !ok {
+			return alloc, alloc != nil
+		}
+		alloc = provider.currentTimestampAllocator()
+	}
+	return alloc, alloc != nil
 }
 
 func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {

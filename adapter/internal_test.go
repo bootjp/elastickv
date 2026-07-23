@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,6 +83,35 @@ func TestFillForwardedTxnCommitTS_AssignsCommitTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, startTS+1, meta.CommitTS)
 	require.Equal(t, meta.CommitTS, commitTS)
+}
+
+func TestFillForwardedTxnCommitTS_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	startTS := uint64(10)
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte(kv.TxnMetaPrefix),
+					Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 0}),
+				},
+			},
+		},
+	}
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS)
+	require.NoError(t, err)
+	require.Greater(t, commitTS, startTS)
 }
 
 func TestFillForwardedTxnCommitTS_PreservesExistingCommitTS(t *testing.T) {
@@ -175,6 +206,21 @@ func TestFillForwardedTxnCommitTS_StampsCommitTSValueOffset(t *testing.T) {
 	require.Zero(t, reqs[0].Mutations[1].CommitTsValueOffset)
 }
 
+func TestStampRawTimestamps_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	reqs := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}}
+
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.NotZero(t, reqs[0].Ts)
+}
+
 func TestFillForwardedTxnCommitTS_PrepareAllowsAlreadyStampedOffsets(t *testing.T) {
 	t.Parallel()
 
@@ -240,4 +286,10 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, meta.CommitTS, uint64(9))
 	require.Equal(t, meta.CommitTS, commitTS)
+}
+
+type internalLegacyRuntimeAllocator struct{}
+
+func (internalLegacyRuntimeAllocator) Next(context.Context) (uint64, error) {
+	return 0, errors.WithStack(kv.ErrTSOAllocatorRequired)
 }
