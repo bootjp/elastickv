@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -294,6 +295,64 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 		"the non-default group lease must be warmed by all-group renewal")
 }
 
+func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+	got, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.NotZero(t, got)
+}
+
+func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		failFirst  bool
+		failSecond bool
+	}{
+		{name: "first fails then second advances", failFirst: true},
+		{name: "first advances then second fails", failSecond: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clock := NewHLC()
+			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+			eng1 := newShardedLeaseEngine(100)
+			eng2 := newShardedLeaseEngine(200)
+			eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			if tc.failFirst {
+				eng1.proposeErr = errors.New("group 1 unavailable")
+			}
+			if tc.failSecond {
+				eng2.proposeErr = errors.New("group 2 unavailable")
+			}
+			coord := mustShardedLeaseCoord(t, eng1, eng2)
+			coord.clock = clock
+
+			require.NoError(t, coord.RecoverHLCLease(context.Background()))
+			require.Equal(t, int32(1), eng1.proposeCalls.Load())
+			require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+			got, err := clock.NextFenced()
+			require.NoError(t, err)
+			require.NotZero(t, got)
+		})
+	}
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
@@ -367,6 +426,25 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	requireRenewalDone(t, third)
 	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
 		"the group must be eligible for renewal after the in-flight proposal finishes")
+}
+
+func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testing.T) {
+	t.Parallel()
+	eng0 := newShardedLeaseEngine(300)
+	eng1 := newShardedLeaseEngine(100)
+	distEngine := distribution.NewEngine()
+	distEngine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(distEngine, map[uint64]*ShardGroup{
+		0: {Engine: eng0},
+		1: {Engine: eng1},
+	}, 1, NewHLC(), nil).WithTimestampGroup(0)
+
+	err := coord.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng0.proposeCalls.Load())
+	require.Equal(t, int32(0), eng1.proposeCalls.Load())
+	require.True(t, coord.groups[0].lease.valid(monoclock.Now()),
+		"a synchronous timestamp renewal must warm the timestamp group's lease")
 }
 
 func hlcRenewalInFlight(coord *ShardedCoordinator, gid uint64) bool {

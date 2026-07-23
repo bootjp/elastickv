@@ -72,6 +72,9 @@ message CapabilityReport {
 // SidecarStateReport is the §5.5 compaction-fallback RPC. Served on
 // every node but the cutover-recovery flow only consults the
 // leader's response. wrapped_deks_by_id covers every unretired DEK.
+// Because this request is Empty, writer_registry_for_caller is the
+// server's local-node projection; caller-specific follower repair
+// uses ResyncSidecarRequest.caller_full_node_id.
 message SidecarStateReport {
   map<uint32, bytes>  wrapped_deks_by_id           = 1;
   uint32              active_storage_id            = 2;
@@ -159,9 +162,9 @@ message ResyncSidecarResponse {
   // (dek_id, last_seen_local_epoch) for the calling node so the
   // follower can re-derive its §4.1 local_epoch monotonically.
   // Values MUST be <= 0xFFFF and the decode site MUST enforce
-  // that bound. Empty until Stage 7 wires the registry; the
-  // §5.5 recovery flow tolerates an empty map because a node
-  // recovering before any DEK exists has nothing to re-derive.
+  // that bound. Missing rows are omitted; an empty map means the
+  // leader has no recorded local_epoch for this caller under the
+  // returned DEKs.
   map<uint32, uint32> writer_registry_for_caller = 5;
 }
 

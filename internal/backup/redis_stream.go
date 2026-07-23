@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	cockroachdberr "github.com/cockroachdb/errors"
 	gproto "google.golang.org/protobuf/proto"
 )
@@ -23,6 +24,7 @@ import (
 // adapter/redis_storage_codec.go:
 //   - !stream|meta|<userKeyLen(4)><userKey>
 //     → BE Length(8) || LastMs(8) || LastSeq(8) [|| ExpireAtMs(8)]
+//     [|| TrimmedMs(8) || TrimmedSeq(8)]
 //   - !stream|entry|<userKeyLen(4)><userKey><ms(8)><seq(8)>
 //     → magic-prefixed pb.RedisStreamEntry protobuf with fields
 //     {id string, fields []string} where Fields is the
@@ -111,18 +113,22 @@ type redisStreamState struct {
 
 // HandleStreamMeta processes one !stream|meta|<userKey> record.
 // Value layout: Length(8) || LastMs(8) || LastSeq(8), optionally followed
-// by inline ExpireAtMs(8). The encoder uses the meta's last_ms / last_seq
-// verbatim in the JSONL _meta terminator so a restorer can replay them into
-// the same XADD '*' monotonicity window. Length mismatches against the
-// observed entry count surface as `redis_stream_length_mismatch` at flush time.
+// by inline ExpireAtMs(8), and optionally by a live-side trim cursor. The
+// encoder uses the meta's last_ms / last_seq verbatim in the JSONL _meta
+// terminator so a restorer can replay them into the same XADD '*' monotonicity
+// window. Length mismatches against the observed entry count surface as
+// `redis_stream_length_mismatch` at flush time.
 func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	userKey, ok := parseStreamMetaKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamKey, "meta key: %q", key)
 	}
-	if len(value) != redisStreamMetaSize && len(value) != redisStreamMetaInlineTTLSize {
+	if len(value) != redisStreamMetaSize &&
+		len(value) != redisStreamMetaInlineTTLSize &&
+		len(value) != store.StreamMetaTrimBinarySize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamMeta,
-			"length %d not in {%d,%d}", len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize)
+			"length %d not in {%d,%d,%d}",
+			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, store.StreamMetaTrimBinarySize)
 	}
 	rawLen := binary.BigEndian.Uint64(value[0:8])
 	if rawLen > math.MaxInt64 {
@@ -134,7 +140,9 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	st.lastMs = binary.BigEndian.Uint64(value[8:16])
 	st.lastSeq = binary.BigEndian.Uint64(value[16:24])
 	st.metaSeen = true
-	if len(value) == redisStreamMetaInlineTTLSize {
+	// The trim-cursor shape is store.StreamMetaTrimBinarySize; backup accepts
+	// it for compatibility but omits TrimmedMs/TrimmedSeq from logical JSONL.
+	if len(value) == redisStreamMetaInlineTTLSize || len(value) == store.StreamMetaTrimBinarySize {
 		expireAtMs := binary.BigEndian.Uint64(value[24:32])
 		st.expireAtMs = expireAtMs
 		st.hasTTL = expireAtMs != 0

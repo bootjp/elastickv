@@ -114,15 +114,30 @@ const (
 	minKeyedArgs        = 2
 )
 
+const cmdElasticKVZRemFast = "ELASTICKV.ZREMFAST"
+
 const (
-	redisDispatchTimeout     = 10 * time.Second
-	redisFlushLegacyTimeout  = 10 * time.Minute
-	redisRelayPublishTimeout = 2 * time.Second
-	redisTraceArgLimit       = 6
-	redisTraceArgMaxLen      = 96
-	redisTraceArgEllipsis    = "..."
-	redisTraceArgTrimLen     = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
-	redisTraceRedactAfter    = 1 // redact arguments after key (command name already stripped by caller)
+	redisDispatchTimeout = 30 * time.Second
+	// redisLuaDispatchTimeout gives EVAL/EVALSHA enough room for migration
+	// scripts that expand into thousands of Redis calls. Regular commands stay
+	// on redisDispatchTimeout so non-script heavy paths cannot hold worker slots
+	// for the full script replay budget.
+	redisLuaDispatchTimeout = 5 * time.Minute
+	// defaultRedisBlockWaitFallback is the safety-net poll interval for
+	// blocking-command wait loops when no in-process write signal arrives.
+	// Signals cover normal XADD / ZADD / ZINCRBY wakeups immediately; this
+	// interval only bounds missed-signal, wrong-type, and BLOCK-deadline checks.
+	// Keep normal producer wakeups event-driven while reducing idle fallback scans
+	// from blocked consumers waiting on empty collections.
+	defaultRedisBlockWaitFallback = time.Second
+	redisFinalTypeCheckTimeout    = 100 * time.Millisecond
+	redisFlushLegacyTimeout       = 10 * time.Minute
+	redisRelayPublishTimeout      = 2 * time.Second
+	redisTraceArgLimit            = 6
+	redisTraceArgMaxLen           = 96
+	redisTraceArgEllipsis         = "..."
+	redisTraceArgTrimLen          = redisTraceArgMaxLen - len(redisTraceArgEllipsis)
+	redisTraceRedactAfter         = 1 // redact arguments after key (command name already stripped by caller)
 
 	// listPopDeltaOverhead is the number of extra elements reserved in a list
 	// pop elem slice beyond the per-position claim keys and per-item del keys:
@@ -166,6 +181,9 @@ type RedisServer struct {
 	heavyCommandLimiter *redisHeavyCommandLimiter
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
+	// blockWaitFallback is the safety-net polling interval used by blocking
+	// Redis commands when no waiter signal arrives.
+	blockWaitFallback time.Duration
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -330,6 +348,18 @@ func WithRedisPerPeerConnectionLimit(n int) RedisServerOption {
 	}
 }
 
+// WithRedisBlockWaitFallback overrides the safety-net polling interval for
+// blocking Redis commands. Production should normally use the default and rely
+// on waiter signals for immediate wakeups; tests use a shorter interval to keep
+// package runtime bounded.
+func WithRedisBlockWaitFallback(d time.Duration) RedisServerOption {
+	return func(r *RedisServer) {
+		if d > 0 {
+			r.blockWaitFallback = d
+		}
+	}
+}
+
 // luaFastPathCmdZRangeByScore is the shared label for ZRANGEBYSCORE
 // and ZREVRANGEBYSCORE fast-path outcomes. Both directions take the
 // same branch through zsetRangeByScoreFast so sharing one label
@@ -391,6 +421,7 @@ func isTransientLeaderRedisError(err error) bool {
 	if errors.Is(err, ErrLeaderNotFound) ||
 		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, kv.ErrLeaderProxyCircuitOpen) ||
 		errors.Is(err, raftengine.ErrNotLeader) ||
 		errors.Is(err, raftengine.ErrLeadershipLost) ||
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
@@ -412,15 +443,16 @@ func isTransientLeaderRedisError(err error) bool {
 }
 
 // redisLeaderErrorPhrases mirrors kv.leaderErrorPhrases (the kv
-// package keeps it unexported). Any new transient-leader phrase the
-// kv layer treats as retryable should also flip a NOTLEADER prefix
-// on the Redis wire so Carmine's with-exceptions catches it; keep
-// in lockstep.
+// package keeps it unexported) and adds adapter-visible availability
+// sentinels such as the leader-proxy circuit. The circuit is deliberately
+// not coordinator-retryable, but Redis clients still need NOTLEADER so they
+// can retry without treating it as a command failure.
 var redisLeaderErrorPhrases = []string{
 	"not leader",
 	"leader not found",
 	"leadership lost",
 	"leadership transfer in progress",
+	"leader proxy circuit open",
 }
 
 // hasTransientLeaderSuffix is the suffix-match fallback for
@@ -515,6 +547,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
 		peerLimiter:         newDefaultRedisPeerLimiter(),
+		blockWaitFallback:   defaultRedisBlockWaitFallback,
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).

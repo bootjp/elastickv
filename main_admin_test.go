@@ -26,13 +26,14 @@ import (
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	proto "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", false, "", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
@@ -48,7 +49,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, adapter.NodeIdentity{}, nil); err == nil {
+	if _, _, err := configureAdminService(tokPath, true, "", false, adapter.NodeIdentity{}, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -57,25 +58,80 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	tokPath := filepath.Join(dir, "t")
+	peerPath := filepath.Join(dir, "peer")
 	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, true, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	// Expect one unary + one stream interceptor for the admin-token gate.
-	if len(icept.unary) != 1 || len(icept.stream) != 1 {
-		t.Fatalf("expected 1 unary + 1 stream interceptor, got %d + %d", len(icept.unary), len(icept.stream))
+	if len(icept.unary) != 2 || len(icept.stream) != 2 {
+		t.Fatalf("expected separate admin and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
+	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if !overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("enabled authenticated configuration should advertise S3 blob offload")
+	}
+}
+
+func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	adminPath := filepath.Join(dir, "admin")
+	peerPath := filepath.Join(dir, "peer")
+	for _, path := range []string{adminPath, peerPath} {
+		if err := os.WriteFile(path, []byte("same-secret\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := configureAdminService(adminPath, false, peerPath, true, adapter.NodeIdentity{}, nil); err == nil {
+		t.Fatal("expected shared admin and peer token to be rejected")
+	}
+}
+
+func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "t")
+	peerPath := filepath.Join(dir, "peer")
+	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	if err != nil {
+		t.Fatalf("configureAdminService: %v", err)
+	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("rollback mode must retain authenticated blob reads")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("disabled rollout flag must remove S3 blob offload capability")
 	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", true, "", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
@@ -84,6 +140,16 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	}
 	if !icept.empty() {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
+	}
+	if icept.s3BlobFetchEnabled {
+		t.Fatal("insecure admin mode must not expose S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &proto.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("insecure admin mode must not advertise S3 blob offload capability")
 	}
 }
 
@@ -370,13 +436,14 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 // bridge maps transient leader-churn errors from the kv coordinator
 // (which AdminCreateTable/AdminDeleteTable can return after their
 // initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
-// rather than the generic 500 fallthrough. Codex P2 on PR #634.
+// rather than the generic 500 fallthrough. P2 review on PR #634.
 func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	cases := []struct {
 		name string
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -394,7 +461,7 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 }
 
 // TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
-// the false-positive class Codex P2 flagged: a message that
+// the false-positive class P2 review flagged: a message that
 // happens to contain a leader phrase NOT at the suffix must NOT
 // be classified as leader-churn. Switching from strings.Contains
 // to strings.HasSuffix is what makes this test pass.
@@ -428,8 +495,8 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 }
 
 // TestTranslateAdminItemsError_LeaderChurn is the items-tier
-// counterpart of TestTranslateAdminTablesError_LeaderChurn — Codex
-// P2 on PR #813 flagged that translateAdminItemsError did not
+// counterpart of TestTranslateAdminTablesError_LeaderChurn — P2
+// review on PR #813 flagged that translateAdminItemsError did not
 // classify transient leader-churn errors as 503/retryable, so an
 // election mid-AdminPutItem / AdminGetItem would 500 instead of
 // surfacing through the SPA's retry path.
@@ -439,6 +506,7 @@ func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -496,6 +564,7 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},

@@ -2415,6 +2415,37 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 	return g, ok
 }
 
+// LocalStoreForKey returns this process's store for the key's owning group
+// without a leader fence or network proxy. It is reserved for node-local
+// auxiliary state such as content-addressed S3 chunk blobs; replicated state
+// must continue through the normal ShardStore or Coordinator paths.
+func (s *ShardStore) LocalStoreForKey(key []byte) (store.MVCCStore, bool) {
+	g, ok := s.groupForKey(key)
+	if !ok || g == nil || g.Store == nil {
+		return nil, false
+	}
+	return g.Store, true
+}
+
+// LocalStores returns every process-local shard store in stable group order.
+// It is used by node-local auxiliary maintenance that must recover state after
+// snapshot restore without leader routing.
+func (s *ShardStore) LocalStores() []store.MVCCStore {
+	groupIDs := make([]uint64, 0, len(s.groups))
+	for groupID := range s.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	sort.Slice(groupIDs, func(i, j int) bool { return groupIDs[i] < groupIDs[j] })
+	stores := make([]store.MVCCStore, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		group := s.groups[groupID]
+		if group != nil && group.Store != nil {
+			stores = append(stores, group.Store)
+		}
+	}
+	return stores
+}
+
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64) ([]byte, error) {
 	engine := engineForGroup(g)
 	if engine == nil {

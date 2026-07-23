@@ -66,7 +66,7 @@ func isRedisHeavyCommand(name string) bool {
 		cmdXRead, cmdXRange, cmdXRevRange,
 		cmdZCount, cmdZPopMin,
 		cmdZRange, cmdZRangeByScore, cmdZRevRange, cmdZRevRangeByScore,
-		cmdZRem, cmdZRemRangeByRank, cmdZRemRangeByScore,
+		cmdZRem, cmdElasticKVZRemFast, cmdZRemRangeByRank, cmdZRemRangeByScore,
 		cmdBZPopMin:
 		return true
 	default:

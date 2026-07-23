@@ -104,7 +104,7 @@ func TestHLCObserver_NilSourceIsNoop(t *testing.T) {
 // skew gauge stays at 0 when PhysicalCeiling() == 0 (pre-bootstrap,
 // before the first HLC lease lands).  Without this guard the
 // observer would publish wallSkewSeconds ≈ 1.75e9 (~55 years) and
-// trip the recommended `wallSkewSeconds > -0.5` alert on every cold
+// trip the recommended `wallSkewSeconds > -5` alert on every cold
 // start until the first lease propagates.  Regression for the medium
 // finding on PR #879.
 func TestHLCObserveOnce_PreBootstrapHoldsSkewAtZero(t *testing.T) {

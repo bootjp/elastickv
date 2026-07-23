@@ -161,8 +161,14 @@ func (r *raceFireRotateStartupController) State() raftengine.State {
 }
 
 type stubStartupCoordinator struct {
-	dispatches atomic.Int32
-	clock      *kv.HLC
+	dispatches   atomic.Int32
+	nextCalls    atomic.Int32
+	nextAfter    atomic.Int32
+	recoverCalls atomic.Int32
+	clock        *kv.HLC
+	nextErr      error
+	nextAfterErr error
+	recoverErr   error
 }
 
 func (s *stubStartupCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -189,6 +195,21 @@ func (s *stubStartupCoordinator) Clock() *kv.HLC {
 		s.clock = kv.NewHLC()
 	}
 	return s.clock
+}
+
+func (s *stubStartupCoordinator) Next(context.Context) (uint64, error) {
+	s.nextCalls.Add(1)
+	return 101, s.nextErr
+}
+
+func (s *stubStartupCoordinator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	s.nextAfter.Add(1)
+	return min + 1, s.nextAfterErr
+}
+
+func (s *stubStartupCoordinator) RecoverHLCLease(context.Context) error {
+	s.recoverCalls.Add(1)
+	return s.recoverErr
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderWaitRuns(t *testing.T) {
@@ -432,6 +453,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
 		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
 		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+		pb.S3BlobFetch_PushChunkBlob_FullMethodName,
 	}
 
 	for _, method := range blockedMethods {
@@ -503,6 +525,42 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 	}
 }
 
+func TestStartupPublicKVGate_BlocksMutatorStreamsUntilReady(t *testing.T) {
+	t.Parallel()
+	gate := &startupPublicKVGate{}
+
+	handlerCalled := false
+	handler := func(interface{}, grpc.ServerStream) error {
+		handlerCalled = true
+		return nil
+	}
+	err := gate.streamInterceptor(
+		nil,
+		nil,
+		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
+		handler,
+	)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("PushChunkBlob before ready err=%v, want Unavailable", err)
+	}
+	if handlerCalled {
+		t.Fatal("stream handler ran before startup gate opened")
+	}
+
+	gate.markReady()
+	if err := gate.streamInterceptor(
+		nil,
+		nil,
+		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
+		handler,
+	); err != nil {
+		t.Fatalf("PushChunkBlob after ready err=%v", err)
+	}
+	if !handlerCalled {
+		t.Fatal("stream handler did not run after startup gate opened")
+	}
+}
+
 func TestStartupPublicKVGate_BlocksAfterReadyWhenStartupRotationPending(t *testing.T) {
 	t.Parallel()
 	blocked := true
@@ -565,6 +623,40 @@ func TestStartupGatedCoordinator_BlocksAdapterDispatchDuringAsyncRotation(t *tes
 	}
 }
 
+func TestStartupGatedCoordinator_ForwardsTimestampCapabilities(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("recover failed")
+	inner := &stubStartupCoordinator{clock: kv.NewHLC(), recoverErr: sentinel}
+	coord := startupGatedCoordinator{
+		inner: inner,
+		gate:  &startupPublicKVGate{blockMutator: func() bool { return true }},
+	}
+
+	ts, err := coord.Next(context.Background())
+	if err != nil || ts != 101 {
+		t.Fatalf("Next() = (%d, %v), want (101, nil)", ts, err)
+	}
+	next, err := coord.NextAfter(context.Background(), 200)
+	if err != nil || next != 201 {
+		t.Fatalf("NextAfter() = (%d, %v), want (201, nil)", next, err)
+	}
+	if err := coord.RecoverHLCLease(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("RecoverHLCLease() err=%v, want sentinel", err)
+	}
+	if got := inner.nextCalls.Load(); got != 1 {
+		t.Fatalf("inner Next calls=%d, want 1", got)
+	}
+	if got := inner.nextAfter.Load(); got != 1 {
+		t.Fatalf("inner NextAfter calls=%d, want 1", got)
+	}
+	if got := inner.recoverCalls.Load(); got != 1 {
+		t.Fatalf("inner RecoverHLCLease calls=%d, want 1", got)
+	}
+	if got := inner.dispatches.Load(); got != 0 {
+		t.Fatalf("timestamp capability forwarding called Dispatch %d times, want 0", got)
+	}
+}
+
 func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListeners(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -587,6 +679,9 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 		s3Address:       heldS3.Addr().String(),
 		s3PathStyleOnly: true,
 		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
+		coordinate: startupGatedCoordinator{
+			inner: &stubStartupCoordinator{clock: kv.NewHLC()},
+		},
 	}
 	if err := runner.prepareAdminForwardServers(); err != nil {
 		t.Fatalf("prepareAdminForwardServers: %v", err)

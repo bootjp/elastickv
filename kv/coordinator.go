@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -35,15 +36,24 @@ const dispatchLeaderRetryBudget = 5 * time.Second
 const dispatchLeaderRetryInterval = 25 * time.Millisecond
 
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
-// physical ceiling extends ahead of the current wall clock. Modelled after
-// TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
-// renews before the window expires. A new leader inherits the committed ceiling
-// so it never issues timestamps that collide with the previous leader's window.
-const hlcPhysicalWindowMs int64 = 3_000
+// physical ceiling extends ahead of the current wall clock. The leader commits
+// ceiling = now + window, and renews before the window expires. A new leader
+// inherits the committed ceiling so it never issues timestamps that collide with
+// the previous leader's window. Keep this comfortably above the renewal proposal
+// timeout so a renewal that spends a few seconds queued in Raft still lands with
+// a future ceiling.
+const hlcPhysicalWindowMs int64 = 10_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
 // Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
 const hlcRenewalInterval = 1 * time.Second
+
+// hlcRenewalProposalTimeout bounds a single HLC lease-renewal proposal. This is
+// intentionally longer than hlcRenewalInterval: under write-heavy Redis proxy
+// traffic, a renewal can sit behind normal Raft proposals for more than one
+// second, and timing it out there causes avoidable fail-closed timestamp
+// refusals.
+const hlcRenewalProposalTimeout = dispatchLeaderRetryBudget
 
 // CoordinatorOption is a functional option for Coordinate constructors.
 type CoordinatorOption func(*Coordinate)
@@ -216,6 +226,7 @@ type Coordinate struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	hlcRecoveryMu     sync.Mutex
 	// deregisterLeaseCb removes the leader-loss callback registered
 	// against engine at construction. Long-lived Coordinates don't
 	// need to call it (the engine will be closed after them), but
@@ -321,6 +332,24 @@ type GroupRoutableCoordinator interface {
 	// EngineGroupIDForKey returns the owning group ID, or 0 when the
 	// key cannot be routed.
 	EngineGroupIDForKey(key []byte) uint64
+}
+
+// RaftMember describes one member of the Raft group that owns a key. The
+// adapter layer uses this read-only view for peer-local side channels whose
+// payloads deliberately do not enter the Raft log.
+type RaftMember struct {
+	NodeID   string
+	Address  string
+	Suffrage string
+}
+
+// RaftMembershipCoordinator is the optional capability implemented by
+// coordinators that can expose both cluster-wide and per-key Raft membership.
+// It does not establish a read fence; callers must use it only for peer
+// discovery and keep correctness decisions behind their own quorum checks.
+type RaftMembershipCoordinator interface {
+	RaftMembers(ctx context.Context) ([]RaftMember, error)
+	RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error)
 }
 
 // LeaseReadGroupKey returns a representative key per distinct owning
@@ -795,6 +824,27 @@ func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error
 	return nil
 }
 
+func (c *Coordinate) RecoverHLCLease(ctx context.Context) error {
+	if c == nil || c.clock == nil {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	c.hlcRecoveryMu.Lock()
+	defer c.hlcRecoveryMu.Unlock()
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	if !c.IsLeaderAcceptingWrites() {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+		return errors.WithStack(errHLCLeaseRecoveryBlocked)
+	}
+	rctx, cancel := hlcRecoveryContext(ctx)
+	defer cancel()
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	return errors.Wrap(c.ProposeHLCLease(rctx, ceilingMs), "recover hlc lease")
+}
+
 // extendLeaseAfterRenewal warms the read lease after a successful HLC
 // ceiling propose. It is the renewal-path counterpart of
 // refreshLeaseAfterDispatch's success branch: the propose was a
@@ -814,10 +864,11 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new
 // physical ceiling to the Raft cluster while this node is the leader.
 //
-// The ceiling is set to now + hlcPhysicalWindowMs (3 s) and is renewed every
+// The ceiling is set to now + hlcPhysicalWindowMs (10 s) and is renewed every
 // hlcRenewalInterval (1 s), mirroring TiDB's TSO window strategy. Because the
-// window is always at least 2 s ahead of any real timestamp, a new leader will
-// never issue timestamps that overlap with the previous leader's window.
+// window is always well ahead of any real timestamp during healthy renewal, a
+// new leader will never issue timestamps that overlap with the previous
+// leader's window.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
@@ -1008,11 +1059,7 @@ func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, m
 	if min > 0 {
 		c.clock.Observe(min)
 	}
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	return nextFencedWithRecovery(ctx, c.clock, c, label)
 }
 
 // Next makes Coordinate usable as a TimestampAllocator for adapter helpers.

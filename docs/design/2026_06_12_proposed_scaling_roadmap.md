@@ -112,10 +112,14 @@ Multi-region blockers:
 
 ### 2.3 Storage tier (Pebble)
 
-`store/lsm_store.go`: per-shard `pebble.Open`, default block cache
-`defaultPebbleCacheBytes = 256 MiB` **per store** (not shared).
-WAL sync via `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on
-FSM apply; `nosync` opt-in).
+`store/lsm_store.go`: per-shard `pebble.Open`, process-wide shared block cache
+sized to 25% of the node's hard memory capacity by default and shared by all
+stores in the process. Linux uses the minimum positive cgroup limit found from
+the process leaf through every ancestor, bounded by physical RAM. `GOMEMLIMIT`
+is not used as a total RSS budget because the Pebble cache is off-heap.
+`ELASTICKV_PEBBLE_CACHE_PERCENT` changes the hard-capacity fraction;
+`ELASTICKV_PEBBLE_CACHE_MB` is the absolute-capacity override. WAL sync via
+`ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM apply; `nosync` opt-in).
 
 `store/mvcc_store.go`: encoded as `UserKey ++ 0x00 ++ inverted_TS`,
 `maxSnapshotVersionCount = 1 M`, `maxSnapshotValueSize = 256 MiB`.
@@ -139,8 +143,9 @@ Storage breakage at 1–10 TB/shard:
   is tens of minutes.
 - Pebble L0CompactionThreshold / LBaseMaxBytes / compaction
   concurrency are defaults; write-heavy shards hit stall thresholds.
-  256 MiB block cache per shard × N shards/node = N × 256 MiB
-  resident memory (shared-cache TODO not landed).
+  Shared block cache M1 has landed, so resident block-cache memory is capped per
+  process rather than N × 256 MiB. Shared memtable / compaction concurrency
+  budgeting and per-group cache fairness remain open.
 - MVCC retention 30 min + per-key 1 M version cap means a key
   written ≥ 555/s for 30 min trips the cap; compactor runs every
   5 min so read tail latency spikes during accumulation.
@@ -347,7 +352,7 @@ control-plane (`*_proposed_*` doc TBD).**
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
 - M2 depends on the M2 hotspot-split migration contract
-  (`2026_06_11_proposed_hotspot_split_milestone2_migration.md`)
+  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
   being implemented so the monotone-merge primitive exists.
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
@@ -367,7 +372,8 @@ control-plane (`*_proposed_*` doc TBD).**
 
 ### 5.2 Design — milestones
 
-**M1 — SST ingest snapshot transfer (`*_proposed_*` doc TBD).**
+**M1 — SST ingest snapshot transfer
+([focused design](2026_07_19_implemented_pebble_sst_ingest_snapshot_transfer.md)).**
 - Replace `pebbleSnapshot.WriteTo`'s full-iter stream with
   **Pebble SST-level snapshot transfer**: leader takes a
   Pebble snapshot, copies the live SSTs (+ memtable flush) as
@@ -376,11 +382,12 @@ control-plane (`*_proposed_*` doc TBD).**
   work.
 - Streamed in parallel across the leader's outgoing transport.
 
-**M2 — Shared block cache + per-shard tuning (`*_proposed_*` doc
+**M2 — Shared block-cache follow-ups + per-shard tuning (`*_proposed_*` doc
 TBD).**
-- Land the existing shared-cache TODO: one `pebble.Cache` per node
-  shared across all shards' stores, sized as a per-node config
-  fraction of available RAM (default 25%).
+- M1 shared block cache has landed: one `pebble.Cache` per process is shared
+  across all shards' stores, defaults to 25% of the node's effective memory
+  budget, and supports percentage or absolute-MiB operator overrides.
+- Add shared memtable / compaction concurrency budgets across stores.
 - Surface `L0CompactionThreshold`, `LBaseMaxBytes`,
   `MaxConcurrentCompactions` as per-shard config so a write-heavy
   shard can be tuned without touching the cluster default.
@@ -404,8 +411,8 @@ TBD).**
   rows) so they do not pile up in L0 between compactor runs —
   reuses the existing TTL helper path.
 
-**M4 — Disaster-recovery snapshot offload (`*_proposed_*` doc
-TBD).**
+**M4 — Disaster-recovery snapshot offload
+([`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md)).**
 - Periodic per-shard Pebble snapshot uploaded to an S3-compatible
   bucket (the S3 adapter already speaks the protocol).
 - Restore is `s3 fetch → pebble.Ingest`; combined with M1's
@@ -541,7 +548,7 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
-`2026_06_11_proposed_hotspot_split_milestone2_migration.md`) is the
+`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits

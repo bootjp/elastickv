@@ -3,10 +3,11 @@ package proxy
 import "time"
 
 const (
-	defaultSecondaryTimeout    = 5 * time.Second
-	defaultShadowTimeout       = 3 * time.Second
-	defaultPubSubCompareWindow = 2 * time.Second
-	defaultPubSubSweepInterval = 500 * time.Millisecond
+	defaultSecondaryTimeout       = 30 * time.Second
+	defaultSecondaryScriptTimeout = 5 * time.Minute
+	defaultShadowTimeout          = 3 * time.Second
+	defaultPubSubCompareWindow    = 2 * time.Second
+	defaultPubSubSweepInterval    = 500 * time.Millisecond
 )
 
 // ProxyMode controls which backends receive reads and writes.
@@ -60,31 +61,48 @@ type ProxyConfig struct {
 	SecondaryPassword string
 	Mode              ProxyMode
 	SecondaryTimeout  time.Duration
-	// SecondaryWriteConcurrency limits concurrent asynchronous secondary writes.
-	// Zero keeps the package default.
+	// SecondaryScriptTimeout bounds queued and running Lua-script secondary
+	// writes. Zero falls back to SecondaryTimeout.
+	SecondaryScriptTimeout time.Duration
+	// SecondaryWriteConcurrency limits all concurrent asynchronous secondary
+	// writes, including Lua scripts. Zero keeps the package default.
 	SecondaryWriteConcurrency int
 	// SecondaryScriptConcurrency limits concurrent asynchronous secondary Lua
-	// script writes. Zero keeps the package default.
+	// script writes within SecondaryWriteConcurrency. Zero keeps the package default.
 	SecondaryScriptConcurrency int
-	ShadowTimeout              time.Duration
-	SentryDSN                  string
-	SentryEnv                  string
-	SentrySampleRate           float64
-	MetricsAddr                string
-	PubSubCompareWindow        time.Duration
+	// SecondaryBlockingReplayConcurrency limits concurrent secondary replays for
+	// mutating blocking commands such as BZPOP. Zero disables blocking replays.
+	SecondaryBlockingReplayConcurrency int
+	// SecondaryWriteQueueCapacity bounds queued non-script secondary writes.
+	// Zero derives a capacity from SecondaryWriteConcurrency.
+	SecondaryWriteQueueCapacity int
+	// SecondaryScriptQueueCapacity bounds queued secondary Lua script writes.
+	// Zero derives a capacity from SecondaryScriptConcurrency.
+	SecondaryScriptQueueCapacity int
+	// SecondaryBlockingReplayQueueCapacity bounds queued secondary blocking
+	// replay work. Zero derives a capacity from SecondaryBlockingReplayConcurrency.
+	SecondaryBlockingReplayQueueCapacity int
+	ShadowTimeout                        time.Duration
+	SentryDSN                            string
+	SentryEnv                            string
+	SentrySampleRate                     float64
+	MetricsAddr                          string
+	PubSubCompareWindow                  time.Duration
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.
 func DefaultConfig() ProxyConfig {
 	return ProxyConfig{
-		ListenAddr:          ":6479",
-		PrimaryAddr:         "localhost:6379",
-		SecondaryAddr:       "localhost:6380",
-		Mode:                ModeDualWrite,
-		SecondaryTimeout:    defaultSecondaryTimeout,
-		ShadowTimeout:       defaultShadowTimeout,
-		SentrySampleRate:    1.0,
-		MetricsAddr:         ":9191",
-		PubSubCompareWindow: defaultPubSubCompareWindow,
+		ListenAddr:                         ":6479",
+		PrimaryAddr:                        "localhost:6379",
+		SecondaryAddr:                      "localhost:6380",
+		Mode:                               ModeDualWrite,
+		SecondaryTimeout:                   defaultSecondaryTimeout,
+		SecondaryScriptTimeout:             defaultSecondaryScriptTimeout,
+		SecondaryBlockingReplayConcurrency: maxBlockingReplayGoroutines,
+		ShadowTimeout:                      defaultShadowTimeout,
+		SentrySampleRate:                   1.0,
+		MetricsAddr:                        ":9191",
+		PubSubCompareWindow:                defaultPubSubCompareWindow,
 	}
 }

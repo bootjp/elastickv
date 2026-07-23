@@ -83,7 +83,7 @@ func cloneColumn(col MatrixColumn) MatrixColumn {
 			rows[i].MemberRoutes = append([]uint64(nil), row.MemberRoutes...)
 		}
 	}
-	return MatrixColumn{At: col.At, Rows: rows}
+	return MatrixColumn{WindowStart: col.WindowStart, At: col.At, Rows: rows}
 }
 
 // snapshotOrdered returns a chronologically ordered (oldest first)

@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -13,14 +15,18 @@ const (
 	// key used by mixed-version PUT admission before writing chunkref metadata.
 	S3BlobOffloadCapabilityName = "feature_s3_blob_offload"
 
-	s3BlobOffloadEnvVar = "ELASTICKV_S3_BLOB_OFFLOAD"
+	s3BlobOffloadEnvVar     = "ELASTICKV_S3_BLOB_OFFLOAD"
+	s3BlobMinReplicasEnvVar = "ELASTICKV_S3_CHUNKBLOB_MIN_REPLICAS"
 
 	s3BlobOffloadModeLegacy  = "legacy"
 	s3BlobOffloadModeOffload = "offload"
 
+	s3BlobMinimumDurableCopies = 2
+
 	s3BlobOffloadReasonFlagDisabled      = "flag_disabled"
 	s3BlobOffloadReasonCapabilityMissing = "capability_missing"
 	s3BlobOffloadReasonDataPathDisabled  = "data_path_disabled"
+	s3BlobOffloadReasonGCNotReady        = "gc_not_ready"
 	s3BlobOffloadReasonEnabled           = "enabled"
 )
 
@@ -46,11 +52,10 @@ type s3BlobOffloadDecision struct {
 	reason string
 }
 
-// S3BlobOffloadLocalCapability reports whether this binary can safely serve the
-// full offloaded S3 chunkref/chunkblob data path. The scaffolding PR keeps this
-// false so future leaders do not mistake these nodes for offload readers.
+// S3BlobOffloadLocalCapability reports whether this binary can serve the M1
+// offloaded PUT/GET path, including durable peer push and proxy-on-miss reads.
 func S3BlobOffloadLocalCapability() bool {
-	return false
+	return true
 }
 
 func WithS3BlobOffloadEnabled(enabled bool) S3ServerOption {
@@ -80,7 +85,73 @@ func WithS3BlobOffloadObserver(observer S3BlobOffloadObserver) S3ServerOption {
 	}
 }
 
-func newS3BlobOffloadEnabledFromEnv() bool {
+func WithS3BlobCluster(cluster S3BlobCluster) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobCluster = cluster
+		server.blobOffloadChecker = cluster
+	}
+}
+
+func WithS3BlobLocalStoreResolver(resolver S3BlobLocalStoreResolver) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobLocalStores = resolver
+	}
+}
+
+func WithS3BlobMinReplicas(minReplicas int) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobMinReplicas = minReplicas
+	}
+}
+
+func WithS3BlobPushBlocked(blocked func() bool) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobPushBlocked = blocked
+	}
+}
+
+func WithS3BlobBackfiller(backfiller *S3BlobBackfiller) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobBackfiller = backfiller
+	}
+}
+
+// S3BlobMinReplicasFromEnv returns zero when the dynamic Raft-quorum default
+// should be used. Explicit values below two are rejected because a leader-only
+// chunkblob is weaker than the legacy Raft data path.
+func S3BlobMinReplicasFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv(s3BlobMinReplicasEnvVar))
+	if raw == "" {
+		return 0, nil
+	}
+	minReplicas, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.Wrap(err, "parse S3 chunkblob minimum replicas")
+	}
+	if minReplicas < s3BlobMinimumDurableCopies {
+		return 0, errors.New("S3 chunkblob minimum replicas must be at least 2")
+	}
+	return minReplicas, nil
+}
+
+// S3BlobOffloadEnabledFromEnv returns the local rollout flag used by both the
+// S3 write path and the Admin capability advertisement.
+func S3BlobOffloadEnabledFromEnv() bool {
 	raw, ok := os.LookupEnv(s3BlobOffloadEnvVar)
 	if !ok {
 		return false
@@ -107,12 +178,20 @@ func (s *S3Server) s3BlobOffloadDecision(ctx context.Context) s3BlobOffloadDecis
 	if !S3BlobOffloadLocalCapability() {
 		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonDataPathDisabled}
 	}
+	// M1 has a complete PUT/GET path, but content-addressed chunkblobs cannot
+	// be enabled operationally until M3 installs reference counting, the grace
+	// queue, and the orphan scanner. M3 sets this readiness only after those
+	// workers are wired into the server lifecycle.
+	if !s.blobOffloadGCReady {
+		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonGCNotReady}
+	}
 	return s3BlobOffloadDecision{mode: s3BlobOffloadModeOffload, reason: s3BlobOffloadReasonEnabled}
 }
 
-func (s *S3Server) observeS3BlobOffloadDecision(ctx context.Context) {
+func (s *S3Server) observeS3BlobOffloadDecision(ctx context.Context) s3BlobOffloadDecision {
 	decision := s.s3BlobOffloadDecision(ctx)
 	if s != nil && s.blobOffloadObserver != nil {
 		s.blobOffloadObserver.ObserveS3BlobOffloadDecision(decision.mode, decision.reason)
 	}
+	return decision
 }

@@ -1,6 +1,6 @@
 # S3 raft blob offload — keep large object payloads out of the Raft log
 
-> **Status: Proposed**
+> **Status: Partial**
 > Author: bootjp
 > Date: 2026-04-25
 >
@@ -13,6 +13,15 @@
 > *aggregate in-flight* memory; this doc removes large blob payloads
 > from the *Raft log itself* so that snapshots and follower catch-up
 > stay bounded as the data set grows.
+
+Implementation status (updated 2026-07-23): the chunkref/chunkblob
+keyspace, local offload decision, PUT/GET helpers, peer blob
+replication/fetch RPCs, follower fetch/backfill helpers, metrics, and
+tests are present in `adapter/s3_blob_*.go`, `internal/s3keys/`, and
+`monitoring/s3.go`. The runtime still fails closed because the M3
+reference-count, grace-queue, orphan-scanner, and GC-readiness wiring
+are not implemented; the M4 legacy `BlobKey` migrator is also still
+open.
 
 ---
 
@@ -142,12 +151,25 @@ client ─► HTTP PUT body
                 fsync-acks have returned (= chunkBlobMinReplicas
                 durable copies including the leader)
              5. queue ChunkRef into pendingBatch
-        ─► flushBatch:
-             coordinator.Dispatch(OperationGroup{
-                 Elems: [ chunkref Puts ... + manifest Put ],
+             6. dispatch each full s3MetaBatchOps chunkref batch
+                through Raft under immutable attempt-versioned keys
+        ─► final flushBatch:
+             coordinator.Dispatch(Transaction{
+                 Elems: [ final partial chunkref batch + manifest Put ],
              })
         ─► HTTP 200 OK once Dispatch acks
 ```
+
+The full chunkref batches in step 6 are staged metadata: readers
+cannot discover them until the final manifest transaction commits,
+so the manifest remains the linearisation point. Attempt-versioned
+multipart keys prevent a retry from overwriting references selected
+by an older committed part descriptor. A failed request schedules
+best-effort deletion of staged chunkrefs by their unique attempt
+prefix; chunkblobs that were already fsynced remain content-addressed
+orphans for the M3 orphan scan in §3.5. Batching at `s3MetaBatchOps`
+keeps every Raft proposal below `MaxSizePerMsg` even for
+multi-terabyte objects.
 
 Step 3 — synchronous chunkblob replication before the chunkref
 commit — is the difference between "Raft-equivalent durability"
@@ -189,7 +211,17 @@ follower that crashes after acking the push but before the chunkref
 commits is fine — the chunkref will be retried by the leader on the
 next attempt because it has not yet entered the Raft log.
 
-**Behaviour during cluster shrink / partial outage.** A controlled
+**M1 safety override.** M1 does not yet include M2's follower-apply
+and backfill worker. It therefore waits for durable acknowledgements
+from **every current Raft member**, including learners, before
+committing a chunkref. This makes each current node's offline logical
+backup self-contained: a backup taken from any member can resolve
+every committed chunkref from its local `chunkblob` keyspace. An
+unreachable current member fails the PUT closed. Once M2 guarantees
+eventual local fetch on apply/backfill, the implementation may adopt
+the quorum policy below without making member-local backups partial.
+
+**Post-M2 behaviour during cluster shrink / partial outage.** A controlled
 decommission (5 → 3 nodes) or a transient partition can leave the
 leader with fewer reachable peers than `(N/2)+1` configured at the
 last membership commit. Blocking PUTs until the configured minimum
@@ -596,15 +628,22 @@ capability-advertising peers exists.
 
 ## 5. Implementation plan
 
-| Milestone | Scope | Risk |
+| Milestone | Scope | Status / Risk |
 |---|---|---|
-| M0 | Spike: prove the chunkref + chunkblob keyspaces under a feature flag with 1 % traffic. Measure local Pebble write amp & blob fetch latency. | Low (observability only). |
-| M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Medium (race ordering, RPC plumbing on the request goroutine). |
-| M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Medium (fanout cost on snapshot apply). |
-| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Medium (correctness of RC under concurrent ops). |
-| M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0–M3 burn in for 30 days in production. | High (long-running batch over live traffic). |
+| M0 | Spike: prove the chunkref + chunkblob keyspaces under a feature flag with 1 % traffic. Measure local Pebble write amp & blob fetch latency. | Implemented. |
+| M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Implemented behind the GC-readiness gate. |
+| M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Partially implemented: fetch/backfill helpers exist; production enablement remains gated by M3. |
+| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Open. |
+| M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Open. |
 
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
+
+Until M3 wires reference counting, the grace queue, and the orphan
+scanner into the server lifecycle, the runtime GC-readiness gate
+remains false. Setting `ELASTICKV_S3_BLOB_OFFLOAD=true` before that
+point still selects the legacy path. This fail-closed gate prevents
+M1 chunkblobs from becoming an unbounded production keyspace while
+preserving explicit test coverage of the M1 data path.
 
 - WAL growth per GiB of S3 PUT < 1 MiB on a one-week soak test.
 - Snapshot transfer for a 100 GiB-cluster follower restart completes

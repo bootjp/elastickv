@@ -151,7 +151,7 @@ var commandTable = map[string]CommandCategory{
 	"XAUTOCLAIM":        CmdWrite,
 	"ZADD":              CmdWrite,
 	"ZINCRBY":           CmdWrite,
-	"ZREM":              CmdWrite,
+	zremReplayCommand:   CmdWrite,
 	"ZREMRANGEBYSCORE":  CmdWrite,
 	"ZREMRANGEBYRANK":   CmdWrite,
 	"ZREMRANGEBYLEX":    CmdWrite,
