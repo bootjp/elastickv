@@ -294,6 +294,26 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 		"the non-default group lease must be warmed by all-group renewal")
 }
 
+func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+	got, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.NotZero(t, got)
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)

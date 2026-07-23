@@ -7,8 +7,16 @@ import (
 )
 
 const (
-	testPeerLimit = 2
+	testPeerLimit                        = 2
+	defaultElasticKVProxyPoolSizeForTest = 64
 )
+
+func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
+	t.Setenv(redisPerPeerLimitEnv, "")
+	limiter := newDefaultRedisPeerLimiter()
+	require.NotNil(t, limiter)
+	require.Equal(t, defaultElasticKVProxyPoolSizeForTest, limiter.limit)
+}
 
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
