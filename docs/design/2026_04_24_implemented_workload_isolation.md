@@ -26,9 +26,11 @@ Implementation status:
   `adapter/redis_peer_limiter.go`, wired through `RedisServer.Run` accept and
   close hooks. Default cap is 64 per peer IP and is configurable via
   `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
-  `WithRedisPerPeerConnectionLimit`. Redis leader-proxy clients use a small
-  explicit go-redis pool below that default cap, and Pub/Sub detached sockets
-  stay counted until their Pub/Sub cleanup path closes.
+  `WithRedisPerPeerConnectionLimit`. The redis-proxy deployment can raise the
+  cap explicitly on ElasticKV nodes before increasing the proxy's ElasticKV
+  pool size. Redis leader-proxy clients use a small explicit go-redis pool
+  below that default cap, and Pub/Sub detached sockets stay counted until their
+  Pub/Sub cleanup path closes.
 - Shipped: Layer 4 stream entry-per-key layout in `store/stream_helpers.go`,
   `adapter/redis_stream_cmds.go`, and `adapter/redis_compat_helpers.go`.
   XREAD now range-scans `!stream|entry|...` after the requested ID instead of

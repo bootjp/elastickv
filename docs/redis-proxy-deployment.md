@@ -418,7 +418,7 @@ groups:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Redis connection pool size | 128 | Default go-redis pool size for Redis |
-| ElasticKV connection pool size | 64 | Default per-leader pool; keep within `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` |
+| ElasticKV connection pool size | 64 | Default per-leader command pool; regular and blocking replay pools share the server per-peer budget, while PubSub uses dedicated sockets outside the pool |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
@@ -444,7 +444,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ### Secondary writes are falling behind
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` by queue before increasing concurrency. A sustained `blocking` queue means BZPOP/XREAD replay work is lagging behind normal writes.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
-- Increase the ElasticKV pool only together with `ELASTICKV_REDIS_PER_PEER_CONNECTIONS`; keep `-secondary-write-concurrency + -secondary-blocking-replay-concurrency` at or below the pool size.
+- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` above `-elastickv-pool-size`; PubSub and shadow PubSub use dedicated connections outside the command pool and detached PubSub sockets may remain counted until cleanup. Keep `-secondary-write-concurrency` at or below the pool size.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count

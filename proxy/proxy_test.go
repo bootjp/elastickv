@@ -814,7 +814,7 @@ func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing
 
 func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
 	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
-	assert.Positive(t, limit)
+	assert.Equal(t, 5, limit)
 
 	var spent time.Duration
 	backoff := compactedRetryInitialBackoff
