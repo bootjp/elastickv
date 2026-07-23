@@ -58,6 +58,20 @@ func (e *followerProxyEngine) Close() error {
 	return nil
 }
 
+func TestShardStoreLocalStoresReturnsLocalShardStoresInStableOrder(t *testing.T) {
+	t.Parallel()
+
+	first := store.NewMVCCStore()
+	second := store.NewMVCCStore()
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		3: {Store: second},
+		1: {Store: first},
+		2: {},
+	})
+
+	require.Equal(t, []store.MVCCStore{first, second}, st.LocalStores())
+}
+
 func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	t.Parallel()
 

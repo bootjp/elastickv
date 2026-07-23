@@ -3289,6 +3289,29 @@ func (s *ShardStore) LocalStoreForKey(key []byte) (store.MVCCStore, bool) {
 	return g.Store, true
 }
 
+// LocalStores returns every local shard store in stable group-ID order. It is
+// reserved for node-local maintenance workers that need to scan auxiliary
+// state present on any local shard, not for replicated reads.
+func (s *ShardStore) LocalStores() []store.MVCCStore {
+	if s == nil {
+		return nil
+	}
+	groupIDs := make([]uint64, 0, len(s.groups))
+	for groupID := range s.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	slices.Sort(groupIDs)
+	stores := make([]store.MVCCStore, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		g := s.groups[groupID]
+		if g == nil || g.Store == nil {
+			continue
+		}
+		stores = append(stores, g.Store)
+	}
+	return stores
+}
+
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
