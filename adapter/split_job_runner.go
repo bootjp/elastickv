@@ -1343,7 +1343,33 @@ func applySplitMigrationControl(
 	if client == nil {
 		return 0, errors.New("split migration control client is nil")
 	}
-	resp, err := client.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
+	resp, err := client.ApplyTargetStagedReadiness(ctx, splitMigrationControlRequest(
+		job,
+		routeEnd,
+		expectedVersion,
+		minWriteTS,
+		sourceWriteFence,
+		sourceReadFence,
+		trackWrites,
+		retentionPinTS,
+	))
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return resp.GetMinAdmittedTs(), nil
+}
+
+func splitMigrationControlRequest(
+	job distribution.SplitJob,
+	routeEnd []byte,
+	expectedVersion uint64,
+	minWriteTS uint64,
+	sourceWriteFence bool,
+	sourceReadFence bool,
+	trackWrites bool,
+	retentionPinTS uint64,
+) *pb.TargetStagedReadinessRequest {
+	return &pb.TargetStagedReadinessRequest{
 		JobId:                  job.JobID,
 		RouteStart:             job.SplitKey,
 		RouteEnd:               routeEnd,
@@ -1355,11 +1381,273 @@ func applySplitMigrationControl(
 		SourceReadFence:        sourceReadFence,
 		RetentionPinTs:         retentionPinTS,
 		TrackWrites:            trackWrites,
-	})
-	if err != nil {
-		return 0, errors.WithStack(err)
 	}
-	return resp.GetMinAdmittedTs(), nil
+}
+
+func probeMigrationControlRequest(req *pb.TargetStagedReadinessRequest) *pb.ProbeMigrationStateRequest {
+	return &pb.ProbeMigrationStateRequest{
+		JobId:                  req.GetJobId(),
+		Kind:                   pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
+		RouteStart:             distribution.CloneBytes(req.GetRouteStart()),
+		RouteEnd:               distribution.CloneBytes(req.GetRouteEnd()),
+		ExpectedCatalogVersion: req.GetExpectedCutoverVersion(),
+		MigrationJobId:         req.GetMigrationJobId(),
+		MinWriteTsExclusive:    req.GetMinWriteTsExclusive(),
+		SourceWriteFence:       req.GetSourceWriteFence(),
+		SourceReadFence:        req.GetSourceReadFence(),
+		TrackWrites:            req.GetTrackWrites(),
+		RetentionPinTs:         req.GetRetentionPinTs(),
+	}
+}
+
+func splitJobCapabilityRegressionRequiresFailClosed(job distribution.SplitJob) bool {
+	return splitJobCapabilityRegressionSourceGuardRequired(job) ||
+		splitJobCapabilityRegressionTargetGuardRequired(job)
+}
+
+func splitJobCapabilityRegressionSourceGuardRequired(job distribution.SplitJob) bool {
+	switch job.Phase {
+	case distribution.SplitJobPhasePlanned:
+		return job.WriteTrackerArmed ||
+			job.SnapshotTS != 0 ||
+			job.SourceRetentionPinTS != 0 ||
+			len(job.FenceAckCursor) != 0
+	case distribution.SplitJobPhaseBackfill,
+		distribution.SplitJobPhaseFence,
+		distribution.SplitJobPhaseDeltaCopy,
+		distribution.SplitJobPhaseCutover:
+		return true
+	case distribution.SplitJobPhaseCleanup:
+		return job.SourceRetentionPinTS != math.MaxUint64
+	case distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoning,
+		distribution.SplitJobPhaseAbandoned:
+		return false
+	}
+	return false
+}
+
+func splitJobCapabilityRegressionTargetGuardRequired(job distribution.SplitJob) bool {
+	switch job.Phase {
+	case distribution.SplitJobPhasePlanned:
+		return job.WriteTrackerArmed ||
+			job.SnapshotTS != 0 ||
+			job.SourceRetentionPinTS != 0 ||
+			len(job.FenceAckCursor) != 0
+	case distribution.SplitJobPhaseBackfill,
+		distribution.SplitJobPhaseFence,
+		distribution.SplitJobPhaseDeltaCopy,
+		distribution.SplitJobPhaseCutover:
+		return true
+	case distribution.SplitJobPhaseCleanup:
+		return !bytes.Equal(job.TargetClearedDescriptorAckCursor, splitCleanupDoneCursor)
+	case distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoning,
+		distribution.SplitJobPhaseAbandoned:
+		return false
+	}
+	return false
+}
+
+type splitJobMigrationControlTargets struct {
+	snapshot      distribution.CatalogSnapshot
+	sourceGroupID uint64
+	routeEnd      []byte
+	source        SplitMigrationClient
+	target        SplitMigrationClient
+}
+
+func (s *DistributionServer) splitJobCapabilityControlTargets(ctx context.Context, job distribution.SplitJob) (splitJobMigrationControlTargets, error) {
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return splitJobMigrationControlTargets{}, err
+	}
+	sourceGroupID, routeEnd, ok := splitJobSourceSibling(snapshot.Routes, job)
+	if !ok {
+		if parent, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
+			sourceGroupID = parent.GroupID
+			routeEnd = distribution.CloneBytes(parent.End)
+			ok = true
+		}
+	}
+	if !ok {
+		return splitJobMigrationControlTargets{}, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
+	}
+	source, target, err := s.splitMigrationClientFactory(ctx, job, sourceGroupID)
+	if err != nil {
+		return splitJobMigrationControlTargets{}, errors.WithStack(err)
+	}
+	if source == nil || target == nil {
+		return splitJobMigrationControlTargets{}, errors.New("split migration source or target client is nil")
+	}
+	return splitJobMigrationControlTargets{
+		snapshot:      snapshot,
+		sourceGroupID: sourceGroupID,
+		routeEnd:      routeEnd,
+		source:        source,
+		target:        target,
+	}, nil
+}
+
+func (s *DistributionServer) ensureSplitJobCapabilityRegressionFailClosed(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	targets, err := s.splitJobCapabilityControlTargets(ctx, job)
+	if err != nil {
+		return false, err
+	}
+	expectedVersion := splitJobCapabilityRegressionExpectedVersion(job, targets.snapshot.Version)
+	minWriteTS := splitJobCapabilityRegressionMinWriteTS(job)
+	retentionPinTS := splitJobCapabilityRegressionRetentionPinTS(job)
+	sourceComplete := true
+	if splitJobCapabilityRegressionSourceGuardRequired(job) {
+		sourceReq := splitMigrationControlRequest(job, targets.routeEnd, expectedVersion, minWriteTS, true, true, true, retentionPinTS)
+		var err error
+		sourceComplete, err = s.applyAndProbeSplitMigrationControl(ctx, targets.sourceGroupID, targets.source, sourceReq)
+		if err != nil {
+			return false, err
+		}
+	}
+	targetComplete := true
+	if splitJobCapabilityRegressionTargetGuardRequired(job) {
+		targetReq := splitMigrationControlRequest(job, targets.routeEnd, expectedVersion, minWriteTS, false, false, false, 0)
+		var err error
+		targetComplete, err = s.applyAndProbeSplitMigrationControl(ctx, job.TargetGroupID, targets.target, targetReq)
+		if err != nil {
+			return false, err
+		}
+	}
+	return sourceComplete && targetComplete, nil
+}
+
+func (s *DistributionServer) restoreSplitJobCapabilityRegressionGuards(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	targets, err := s.splitJobCapabilityControlTargets(ctx, job)
+	if err != nil {
+		return false, err
+	}
+	if splitJobCapabilityRegressionSourceGuardRequired(job) {
+		sourceReq, ok := splitJobNormalSourceControlRequest(job, targets.routeEnd, targets.snapshot.Version)
+		if ok {
+			complete, err := s.applyAndProbeSplitMigrationControl(ctx, targets.sourceGroupID, targets.source, sourceReq)
+			if err != nil || !complete {
+				return complete, err
+			}
+		}
+	}
+	if splitJobCapabilityRegressionTargetGuardRequired(job) {
+		targetReq, ok := splitJobNormalTargetControlRequest(job, targets.routeEnd)
+		if ok {
+			complete, err := s.applyAndProbeSplitMigrationControl(ctx, job.TargetGroupID, targets.target, targetReq)
+			if err != nil || !complete {
+				return complete, err
+			}
+		}
+	}
+	return true, nil
+}
+
+func (s *DistributionServer) applyAndProbeSplitMigrationControl(
+	ctx context.Context,
+	groupID uint64,
+	client SplitMigrationClient,
+	req *pb.TargetStagedReadinessRequest,
+) (bool, error) {
+	if client == nil {
+		return false, errors.New("split migration control client is nil")
+	}
+	if _, err := client.ApplyTargetStagedReadiness(ctx, req); err != nil {
+		return false, errors.WithStack(err)
+	}
+	_, complete, err := s.syncSplitMigrationVoterBarrier(ctx, groupID, nil, client, probeMigrationControlRequest(req))
+	return complete, err
+}
+
+func splitJobCapabilityRegressionExpectedVersion(job distribution.SplitJob, snapshotVersion uint64) uint64 {
+	switch {
+	case job.CutoverVersion != 0:
+		return job.CutoverVersion
+	case job.FenceCatalogVersion != 0:
+		return job.FenceCatalogVersion
+	case snapshotVersion < math.MaxUint64:
+		return snapshotVersion + 1
+	default:
+		return snapshotVersion
+	}
+}
+
+func splitJobCapabilityRegressionMinWriteTS(job distribution.SplitJob) uint64 {
+	switch {
+	case job.FenceTS != 0:
+		return job.FenceTS
+	case job.SnapshotTS != 0:
+		return job.SnapshotTS
+	default:
+		return initialMigrationRetentionPinTS
+	}
+}
+
+func splitJobCapabilityRegressionRetentionPinTS(job distribution.SplitJob) uint64 {
+	if job.SourceRetentionPinTS != 0 && job.SourceRetentionPinTS != math.MaxUint64 {
+		return job.SourceRetentionPinTS
+	}
+	return initialMigrationRetentionPinTS
+}
+
+func splitJobNormalSourceControlRequest(job distribution.SplitJob, routeEnd []byte, snapshotVersion uint64) (*pb.TargetStagedReadinessRequest, bool) {
+	switch job.Phase {
+	case distribution.SplitJobPhasePlanned, distribution.SplitJobPhaseBackfill:
+		return splitMigrationControlRequest(
+			job,
+			routeEnd,
+			splitJobCapabilityRegressionExpectedVersion(job, snapshotVersion),
+			initialMigrationRetentionPinTS,
+			false,
+			false,
+			true,
+			initialMigrationRetentionPinTS,
+		), true
+	case distribution.SplitJobPhaseFence, distribution.SplitJobPhaseDeltaCopy:
+		expectedVersion := job.FenceCatalogVersion
+		if expectedVersion == 0 {
+			expectedVersion = splitJobCapabilityRegressionExpectedVersion(job, snapshotVersion)
+		}
+		return splitMigrationControlRequest(job, routeEnd, expectedVersion, job.SnapshotTS, true, false, true, initialMigrationRetentionPinTS), true
+	case distribution.SplitJobPhaseCutover, distribution.SplitJobPhaseCleanup:
+		if job.FenceTS == 0 || job.CutoverVersion == 0 {
+			return nil, false
+		}
+		return splitMigrationControlRequest(job, routeEnd, job.CutoverVersion, job.FenceTS, true, true, false, initialMigrationRetentionPinTS), true
+	case distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoning,
+		distribution.SplitJobPhaseAbandoned:
+		return nil, false
+	}
+	return nil, false
+}
+
+func splitJobNormalTargetControlRequest(job distribution.SplitJob, routeEnd []byte) (*pb.TargetStagedReadinessRequest, bool) {
+	if job.CutoverVersion == 0 || job.FenceTS == 0 {
+		return nil, false
+	}
+	switch job.Phase {
+	case distribution.SplitJobPhaseCutover, distribution.SplitJobPhaseCleanup:
+		return splitMigrationControlRequest(job, routeEnd, job.CutoverVersion, job.FenceTS, false, false, false, 0), true
+	case distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhasePlanned,
+		distribution.SplitJobPhaseBackfill,
+		distribution.SplitJobPhaseFence,
+		distribution.SplitJobPhaseDeltaCopy,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoning,
+		distribution.SplitJobPhaseAbandoned:
+		return nil, false
+	}
+	return nil, false
 }
 
 func (s *DistributionServer) splitJobSourceRoute(

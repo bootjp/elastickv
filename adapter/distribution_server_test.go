@@ -1291,6 +1291,85 @@ func TestDistributionServerRunSplitJobRunnerOnce_PausesOnCapabilityRegression(t 
 	require.NotZero(t, armed.SnapshotTS)
 }
 
+func TestDistributionServerRunSplitJobRunnerOnce_FailClosesCapabilityRegressionAfterSideEffects(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	require.NoError(t, err)
+	job, err := distribution.InitializeSplitJobPlan(distribution.SplitJob{
+		JobID:         10,
+		SourceRouteID: 1,
+		SplitKey:      []byte("m"),
+		TargetGroupID: 2,
+	}, saved.Routes[0], time.Now().UnixMilli())
+	require.NoError(t, err)
+	job.Phase = distribution.SplitJobPhaseBackfill
+	job.SnapshotTS = 50
+	job.WriteTrackerArmed = true
+	job.SourceRetentionPinTS = initialMigrationRetentionPinTS
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	source := &splitMigrationClientStub{}
+	target := &splitMigrationClientStub{}
+	capabilityErr := errors.New("node capability missing")
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithSplitMigrationCapabilityGate(func(context.Context) error { return capabilityErr }),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return target, nil
+		}),
+		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			return source, target, nil
+		}),
+	)
+
+	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+	regressed, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, regressed.CapabilityRegressed)
+	require.Len(t, source.controls, 1)
+	require.Len(t, target.controls, 1)
+	sourceFailClosed := source.controls[0]
+	require.Equal(t, job.JobID, sourceFailClosed.GetJobId())
+	require.Equal(t, []byte("m"), sourceFailClosed.GetRouteStart())
+	require.Equal(t, []byte("z"), sourceFailClosed.GetRouteEnd())
+	require.True(t, sourceFailClosed.GetSourceWriteFence())
+	require.True(t, sourceFailClosed.GetSourceReadFence())
+	require.True(t, sourceFailClosed.GetTrackWrites())
+	require.Equal(t, uint64(50), sourceFailClosed.GetMinWriteTsExclusive())
+	targetFailClosed := target.controls[0]
+	require.False(t, targetFailClosed.GetSourceWriteFence())
+	require.False(t, targetFailClosed.GetSourceReadFence())
+	require.False(t, targetFailClosed.GetTrackWrites())
+	require.Equal(t, uint64(50), targetFailClosed.GetMinWriteTsExclusive())
+
+	s.migrationCapabilityGate = func(context.Context) error { return nil }
+	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
+	resumed, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, resumed.CapabilityRegressed)
+	require.Len(t, source.controls, 2)
+	sourceRestored := source.controls[1]
+	require.False(t, sourceRestored.GetSourceWriteFence())
+	require.False(t, sourceRestored.GetSourceReadFence())
+	require.True(t, sourceRestored.GetTrackWrites())
+	require.Equal(t, initialMigrationRetentionPinTS, sourceRestored.GetMinWriteTsExclusive())
+	require.Len(t, target.controls, 1)
+}
+
 func TestSplitJobHistoryGCKeysAppliesTTLAndCountBound(t *testing.T) {
 	t.Parallel()
 

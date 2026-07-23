@@ -318,21 +318,58 @@ func (s *DistributionServer) splitJobCapabilityReady(ctx context.Context, job di
 	}
 	gateErr := s.migrationCapabilityGate(ctx)
 	if gateErr != nil {
-		if job.CapabilityRegressed {
-			return false, nil
-		}
-		err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
-			if current.Phase == job.Phase {
-				current.CapabilityRegressed = true
-				current.LastError = "cluster migration capability regressed: " + gateErr.Error()
-				current.UpdatedAtMs = time.Now().UnixMilli()
-			}
-			return current, nil
-		})
-		return false, err
+		return s.handleSplitJobCapabilityRegression(ctx, job, gateErr)
 	}
 	if !job.CapabilityRegressed {
 		return true, nil
+	}
+	return s.clearSplitJobCapabilityRegression(ctx, job)
+}
+
+func (s *DistributionServer) handleSplitJobCapabilityRegression(ctx context.Context, job distribution.SplitJob, cause error) (bool, error) {
+	markedJob, marked, err := s.markSplitJobCapabilityRegressed(ctx, job, cause)
+	if err != nil || !marked {
+		return false, err
+	}
+	if splitJobCapabilityRegressionRequiresFailClosed(markedJob) {
+		closed, err := s.ensureSplitJobCapabilityRegressionFailClosed(ctx, markedJob)
+		if err != nil || !closed {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (s *DistributionServer) markSplitJobCapabilityRegressed(ctx context.Context, job distribution.SplitJob, cause error) (distribution.SplitJob, bool, error) {
+	if job.CapabilityRegressed {
+		return job, true, nil
+	}
+	marked := false
+	err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+		if current.Phase != job.Phase {
+			return current, nil
+		}
+		marked = true
+		if !current.CapabilityRegressed {
+			current.CapabilityRegressed = true
+			current.LastError = "cluster migration capability regressed: " + cause.Error()
+			current.UpdatedAtMs = time.Now().UnixMilli()
+		}
+		return current, nil
+	})
+	if err != nil || !marked {
+		return job, marked, err
+	}
+	job.CapabilityRegressed = true
+	return job, true, nil
+}
+
+func (s *DistributionServer) clearSplitJobCapabilityRegression(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	if splitJobCapabilityRegressionRequiresFailClosed(job) {
+		restored, err := s.restoreSplitJobCapabilityRegressionGuards(ctx, job)
+		if err != nil || !restored {
+			return false, err
+		}
 	}
 	err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == job.Phase && current.CapabilityRegressed {
