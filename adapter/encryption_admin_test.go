@@ -288,6 +288,56 @@ func TestEncryptionAdmin_RegistryProjectionUsesAppliedLinearizableRead(t *testin
 	}
 }
 
+func TestEncryptionAdmin_GetSidecarState_FencesBeforeReadingSidecar(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
+		Keys: map[string]encryption.SidecarKey{
+			"10": {Purpose: "storage", Wrapped: []byte("old-storage")},
+			"11": {Purpose: "raft", Wrapped: []byte("old-raft")},
+		},
+	})
+	reg := newTestWriterRegistryStore()
+	reg.seed(t, 20, callerFullNodeID, 7)
+
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminFullNodeID(callerFullNodeID),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminRegistryLeaderView(stubLeaderView{
+			state: raftengine.StateLeader,
+			linearizableReadFn: func(context.Context) (uint64, error) {
+				if err := encryption.WriteSidecar(path, &encryption.Sidecar{
+					Active: encryption.ActiveKeys{Storage: 20, Raft: 21},
+					Keys: map[string]encryption.SidecarKey{
+						"20": {Purpose: "storage", Wrapped: []byte("new-storage")},
+						"21": {Purpose: "raft", Wrapped: []byte("new-raft")},
+					},
+				}); err != nil {
+					return 0, err
+				}
+				return 99, nil
+			},
+		}),
+		WithEncryptionAdminWriterRegistry(reg),
+	)
+	got, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	if err != nil {
+		t.Fatalf("GetSidecarState: %v", err)
+	}
+	if got.ActiveStorageId != 20 || got.ActiveRaftId != 21 {
+		t.Fatalf("active=(%d,%d), want (20,21) from sidecar after applied fence", got.ActiveStorageId, got.ActiveRaftId)
+	}
+	if string(got.WrappedDeksById[20]) != "new-storage" || string(got.WrappedDeksById[21]) != "new-raft" {
+		t.Fatalf("wrapped=%v, want post-fence DEK set", got.WrappedDeksById)
+	}
+	want := map[uint32]uint32{20: 7}
+	if !mapsEqual(got.WriterRegistryForCaller, want) {
+		t.Fatalf("WriterRegistryForCaller=%v, want %v from post-fence DEK set", got.WriterRegistryForCaller, want)
+	}
+}
+
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {
 	t.Helper()
 	if got.ActiveStorageId != 1 || got.ActiveRaftId != 2 {
@@ -1387,6 +1437,7 @@ type stubLeaderView struct {
 	linearizableReadErr   error
 	linearizableReadIndex uint64
 	linearizableReadCalls *atomic.Int32
+	linearizableReadFn    func(context.Context) (uint64, error)
 }
 
 func (s stubLeaderView) State() raftengine.State       { return s.state }
@@ -1397,9 +1448,12 @@ func (s stubLeaderView) VerifyLeader(context.Context) error {
 	}
 	return s.verifyErr
 }
-func (s stubLeaderView) LinearizableRead(context.Context) (uint64, error) {
+func (s stubLeaderView) LinearizableRead(ctx context.Context) (uint64, error) {
 	if s.linearizableReadCalls != nil {
 		s.linearizableReadCalls.Add(1)
+	}
+	if s.linearizableReadFn != nil {
+		return s.linearizableReadFn(ctx)
 	}
 	return s.linearizableReadIndex, s.linearizableReadErr
 }

@@ -420,14 +420,14 @@ func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
 	}
-	sc, err := encryption.ReadSidecar(s.sidecarPath)
-	if err != nil {
-		return nil, statusFromSidecarErr(err)
-	}
 	if s.writerRegistry != nil && s.fullNodeID != 0 {
 		if err := s.requireRegistryLeader(ctx); err != nil {
 			return nil, err
 		}
+	}
+	sc, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		return nil, statusFromSidecarErr(err)
 	}
 	registryForCaller, err := s.writerRegistryForCaller(sc, s.fullNodeID)
 	if err != nil {
