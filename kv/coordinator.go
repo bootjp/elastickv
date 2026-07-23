@@ -1246,6 +1246,9 @@ func (c *Coordinate) ObserveForwardedRequests(reqs []*pb.Request) {
 			continue
 		}
 		for _, mut := range req.Mutations {
+			if mut == nil || isTxnMetaKey(mut.Key) {
+				continue
+			}
 			c.observeMutation(mut)
 		}
 	}

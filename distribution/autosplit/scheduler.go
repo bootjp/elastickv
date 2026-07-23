@@ -243,12 +243,13 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 }
 
 type tickPreparation struct {
-	snapshot   distribution.CatalogSnapshot
-	routes     []distribution.RouteDescriptor
-	fences     map[uint64]EvidenceFence
-	usedBudget int
-	catalogGap bool
-	result     SchedulerResult
+	snapshot         distribution.CatalogSnapshot
+	routes           []distribution.RouteDescriptor
+	fences           map[uint64]EvidenceFence
+	usedBudget       int
+	catalogGap       bool
+	stopAfterPrepare bool
+	result           SchedulerResult
 }
 
 func (s *Scheduler) ensureLeadership(now time.Time) bool {
@@ -282,15 +283,18 @@ func (s *Scheduler) prepareTick(
 			Leader:         true,
 		},
 	}
-	prep.routes, prep.fences = s.syncCatalogSnapshot(snapshot, now)
 	if runtimeEnabled {
 		var pendingScheduled, pendingFailed int
-		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget = s.finalizePendingCompounds(ctx, snapshot)
+		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget, prep.stopAfterPrepare = s.finalizePendingCompounds(ctx, snapshot)
 		prep.result.CatalogVersion = prep.snapshot.Version
 		prep.result.Scheduled += pendingScheduled
 		prep.result.Failed += pendingFailed
-		prep.routes, prep.fences = s.syncCatalogSnapshot(prep.snapshot, now)
+		if prep.stopAfterPrepare {
+			s.catalogVersion = prep.snapshot.Version
+			return prep, nil
+		}
 	}
+	prep.routes, prep.fences = s.syncCatalogSnapshot(prep.snapshot, now)
 	s.catalogVersion = prep.snapshot.Version
 	return prep, nil
 }
@@ -305,6 +309,9 @@ func (s *Scheduler) syncCatalogSnapshot(
 }
 
 func (s *Scheduler) evaluateTick(now time.Time, prep tickPreparation) Result {
+	if prep.stopAfterPrepare {
+		return Result{}
+	}
 	windows := s.committedWindows(prep.routes, now)
 	s.resetConfidenceForHistoryGaps(prep.routes, windows)
 	if prep.catalogGap {
@@ -342,6 +349,9 @@ func (s *Scheduler) finishTick(
 	runtimeEnabled bool,
 	prep tickPreparation,
 ) SchedulerResult {
+	if prep.stopAfterPrepare {
+		return prep.result
+	}
 	if !runtimeEnabled {
 		prep.result.KillSwitch = true
 		if len(prep.result.Detector.Decisions) > 0 {
@@ -572,9 +582,9 @@ func (s *Scheduler) executePendingCompound(
 func (s *Scheduler) finalizePendingCompounds(
 	ctx context.Context,
 	snapshot distribution.CatalogSnapshot,
-) (distribution.CatalogSnapshot, int, int, int) {
+) (distribution.CatalogSnapshot, int, int, int, bool) {
 	if len(s.pendingCompounds) == 0 {
-		return snapshot, 0, 0, 0
+		return snapshot, 0, 0, 0, false
 	}
 	parentIDs := make([]uint64, 0, len(s.pendingCompounds))
 	for parentID := range s.pendingCompounds {
@@ -618,11 +628,11 @@ func (s *Scheduler) finalizePendingCompounds(
 		if refreshErr != nil {
 			s.cfg.Logger.WarnContext(ctx, "autosplit: refresh after compound finalization failed",
 				slog.Any("err", refreshErr))
-			break
+			return snapshot, scheduled, failed, attempted, true
 		}
 		snapshot = refreshed
 	}
-	return snapshot, scheduled, failed, attempted
+	return snapshot, scheduled, failed, attempted, false
 }
 
 func findActiveRoute(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {

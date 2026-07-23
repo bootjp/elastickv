@@ -35,6 +35,29 @@ func TestEffectiveKeyVizBucketsPerRouteAutoSplitImpliedDefault(t *testing.T) {
 	require.Equal(t, 1, effectiveKeyVizBucketsPerRoute(false, false, keyviz.DefaultKeyBucketsPerRoute, 16))
 }
 
+func TestValidateAutoSplitSamplerConfigAllowsExplicitBucketsWithUnusedInvalidDefault(t *testing.T) {
+	oldAutoSplit := *autoSplit
+	oldExplicit := keyvizKeyBucketsPerRouteExplicit
+	oldKeyBuckets := *keyvizKeyBucketsPerRoute
+	oldDefaultBuckets := *autoSplitDefaultBuckets
+	t.Cleanup(func() {
+		*autoSplit = oldAutoSplit
+		keyvizKeyBucketsPerRouteExplicit = oldExplicit
+		*keyvizKeyBucketsPerRoute = oldKeyBuckets
+		*autoSplitDefaultBuckets = oldDefaultBuckets
+	})
+
+	*autoSplit = true
+	*keyvizKeyBucketsPerRoute = 8
+	*autoSplitDefaultBuckets = keyviz.DefaultKeyBucketsPerRoute
+	keyvizKeyBucketsPerRouteExplicit = true
+	require.NoError(t, validateAutoSplitSamplerConfig(autosplit.DefaultConfig()))
+
+	keyvizKeyBucketsPerRouteExplicit = false
+	*keyvizKeyBucketsPerRoute = keyviz.DefaultKeyBucketsPerRoute
+	require.ErrorContains(t, validateAutoSplitSamplerConfig(autosplit.DefaultConfig()), "--autoSplitDefaultBuckets")
+}
+
 func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *testing.T) {
 	oldAutoSplit := *autoSplit
 	*autoSplit = false

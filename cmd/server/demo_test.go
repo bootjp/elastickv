@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,29 @@ func TestValidateDemoAutoSplitDetectorConfigRejectsNonFiniteValues(t *testing.T)
 			require.Error(t, validateDemoAutoSplitDetectorConfig(cfg))
 		})
 	}
+}
+
+func TestValidateDemoAutoSplitSamplerConfigAllowsExplicitBucketsWithUnusedInvalidDefault(t *testing.T) {
+	oldAutoSplit := *autoSplit
+	oldExplicit := keyvizKeyBucketsPerRouteExplicit
+	oldKeyBuckets := *keyvizKeyBucketsPerRoute
+	oldDefaultBuckets := *autoSplitDefaultBuckets
+	t.Cleanup(func() {
+		*autoSplit = oldAutoSplit
+		keyvizKeyBucketsPerRouteExplicit = oldExplicit
+		*keyvizKeyBucketsPerRoute = oldKeyBuckets
+		*autoSplitDefaultBuckets = oldDefaultBuckets
+	})
+
+	*autoSplit = true
+	*keyvizKeyBucketsPerRoute = 8
+	*autoSplitDefaultBuckets = keyviz.DefaultKeyBucketsPerRoute
+	keyvizKeyBucketsPerRouteExplicit = true
+	require.NoError(t, validateDemoAutoSplitSamplerConfig(autosplit.DefaultConfig()))
+
+	keyvizKeyBucketsPerRouteExplicit = false
+	*keyvizKeyBucketsPerRoute = keyviz.DefaultKeyBucketsPerRoute
+	require.ErrorContains(t, validateDemoAutoSplitSamplerConfig(autosplit.DefaultConfig()), "--autoSplitDefaultBuckets")
 }
 
 func TestDemoSamplerRouteResolverNormalizesInternalKeys(t *testing.T) {

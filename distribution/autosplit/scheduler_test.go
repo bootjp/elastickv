@@ -460,6 +460,64 @@ func TestSchedulerRetriesPendingCompoundWithoutNewSamplerColumn(t *testing.T) {
 	require.Len(t, source.snapshot.Routes, 3)
 }
 
+func TestSchedulerStopsTickAfterCompoundRefreshFailure(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{
+		snapshot: distribution.CatalogSnapshot{
+			Version: 8,
+			Routes: []distribution.RouteDescriptor{
+				testRoute(10, 1, "m", "z"),
+				testRoute(11, 1, "a", "m"),
+			},
+		},
+		failAt: map[int]error{2: errors.New("refresh failed")},
+	}
+	splitter := &fakeSplitter{}
+	splitter.onSuccess = func(req SplitRequest, result SplitResult) {
+		applyFakeSplit(source, req, result)
+	}
+	scheduler := newTestScheduler(source, splitter, []keyviz.MatrixColumn{
+		{
+			At:          now.Add(-2 * time.Minute),
+			WindowStart: now.Add(-3 * time.Minute),
+			Rows: []keyviz.MatrixRow{
+				testRow(10, 1, 0, 2, "m", "n", 60, 0),
+				testRow(10, 1, 1, 2, "n", "z", 60, 0),
+			},
+		},
+		{
+			At:          now.Add(-time.Minute),
+			WindowStart: now.Add(-2 * time.Minute),
+			Rows: []keyviz.MatrixRow{
+				testRow(10, 1, 0, 2, "m", "n", 60, 0),
+				testRow(10, 1, 1, 2, "n", "z", 60, 0),
+			},
+		},
+	}, nil)
+	scheduler.wasLeader = true
+	scheduler.cfg.Detector.MaxSplitsPerCycle = 2
+	registrar := &fakeRegistrar{}
+	scheduler.reconciler = NewRouteReconciler(registrar)
+	scheduler.pendingCompounds[1] = pendingCompound{
+		parentRouteID: 1,
+		intermediate:  testRoute(10, 1, "m", "z"),
+		splitKey:      []byte{'m', 0},
+	}
+
+	result, err := scheduler.Tick(context.Background(), now)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Scheduled)
+	require.Zero(t, result.Failed)
+	require.Empty(t, result.Detector.Decisions)
+	require.Equal(t, uint64(9), result.CatalogVersion)
+	require.Equal(t, uint64(9), scheduler.catalogVersion)
+	require.Len(t, splitter.requests, 1)
+	require.Empty(t, registrar.registered, "must not reconcile the pre-refresh route set after catalog version advances")
+}
+
 func TestSchedulerCatalogTermChangeClearsLeaderLocalState(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)
@@ -645,11 +703,17 @@ func requireFakeSampler(t *testing.T, scheduler *Scheduler) *fakeSampler {
 }
 
 type fakeCatalogSnapshotSource struct {
-	snapshot distribution.CatalogSnapshot
-	err      error
+	snapshot      distribution.CatalogSnapshot
+	err           error
+	snapshotCalls int
+	failAt        map[int]error
 }
 
 func (f *fakeCatalogSnapshotSource) Snapshot(context.Context) (distribution.CatalogSnapshot, error) {
+	f.snapshotCalls++
+	if err := f.failAt[f.snapshotCalls]; err != nil {
+		return distribution.CatalogSnapshot{}, err
+	}
 	if f.err != nil {
 		return distribution.CatalogSnapshot{}, f.err
 	}

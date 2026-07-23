@@ -159,16 +159,24 @@ func validateAutoSplitConfig(cfg autosplit.SchedulerConfig) error {
 }
 
 func validateAutoSplitSamplerConfig(cfg autosplit.Config) error {
-	if *autoSplitDefaultBuckets <= keyviz.DefaultKeyBucketsPerRoute {
-		return errors.New("--autoSplitDefaultBuckets must be greater than 1")
-	}
-	if *autoSplitDefaultBuckets > keyviz.MaxKeyBucketsPerRoute {
-		return errors.Errorf("--autoSplitDefaultBuckets (%d) must be <= %d", *autoSplitDefaultBuckets, keyviz.MaxKeyBucketsPerRoute)
+	if autoSplitUsesDefaultBuckets() {
+		if *autoSplitDefaultBuckets <= keyviz.DefaultKeyBucketsPerRoute {
+			return errors.New("--autoSplitDefaultBuckets must be greater than 1")
+		}
+		if *autoSplitDefaultBuckets > keyviz.MaxKeyBucketsPerRoute {
+			return errors.Errorf("--autoSplitDefaultBuckets (%d) must be <= %d", *autoSplitDefaultBuckets, keyviz.MaxKeyBucketsPerRoute)
+		}
 	}
 	if cfg.MaxRoutes > *keyvizMaxTrackedRoutes {
 		return errors.Errorf("--autoSplitMaxRoutes (%d) must be <= --keyvizMaxTrackedRoutes (%d); raise keyviz capacity or lower the auto-split route cap", cfg.MaxRoutes, *keyvizMaxTrackedRoutes)
 	}
 	return nil
+}
+
+func autoSplitUsesDefaultBuckets() bool {
+	return *autoSplit &&
+		!keyvizKeyBucketsPerRouteExplicit &&
+		*keyvizKeyBucketsPerRoute <= keyviz.DefaultKeyBucketsPerRoute
 }
 
 func validateAutoSplitDetectorConfig(cfg autosplit.Config) error {

@@ -2205,10 +2205,34 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 // path allocation-free. Reads have their own observeReadKey helper
 // (LinearizableReadForKey / LeaseReadForKey).
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation, label keyviz.Label) {
-	if c.sampler == nil {
+	if c == nil || c.sampler == nil || mut == nil {
 		return
 	}
 	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+}
+
+// ObserveForwardedRequests records committed leader-side sampling evidence for
+// writes that entered through a shard follower and were committed via
+// Internal.Forward on this shard leader.
+func (c *ShardedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	if c == nil || c.sampler == nil {
+		return
+	}
+	for _, req := range reqs {
+		if req == nil {
+			continue
+		}
+		for _, mut := range req.Mutations {
+			if mut == nil || isTxnMetaKey(mut.Key) {
+				continue
+			}
+			routeID, _, ok := c.routeAndGroupForKey(mut.Key)
+			if !ok {
+				continue
+			}
+			c.observeMutation(routeID, mut, keyviz.LabelLegacy)
+		}
+	}
 }
 
 // observeRead records a single linearizable / lease read against the

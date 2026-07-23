@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/keyviz"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -265,6 +266,32 @@ func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
 	require.Equal(t, uint64(8), calls[1].routeID)
 	require.Equal(t, normalizedS3Key, calls[1].key)
 	require.NotEqual(t, rawS3Key, calls[1].key)
+}
+
+func TestCoordinateObserveForwardedRequestsSkipsTxnMetadata(t *testing.T) {
+	t.Parallel()
+
+	sampler := &recordingSampler{}
+	var resolverKeys [][]byte
+	c := (&Coordinate{}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
+		resolverKeys = append(resolverKeys, append([]byte(nil), key...))
+		return 7, true
+	})
+
+	c.ObserveForwardedRequests([]*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(TxnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("hot")})},
+			{Op: pb.Op_PUT, Key: []byte("hot"), Value: []byte("value")},
+		},
+	}})
+
+	require.Equal(t, [][]byte{[]byte("hot")}, resolverKeys)
+	calls := sampler.snapshot()
+	require.Len(t, calls, 1)
+	require.Equal(t, uint64(7), calls[0].routeID)
+	require.Equal(t, []byte("hot"), calls[0].key)
 }
 
 func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {
