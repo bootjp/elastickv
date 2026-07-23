@@ -522,10 +522,11 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 	err := r.retryRedisWrite(ctx, func() error {
 		elems := []*kv.Elem[kv.OP]{}
 		nextRemoved := 0
-		readTS, err := r.beginTxnStartTS(ctx, "redis del: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis del: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		for _, key := range keys {
 			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 			if err != nil {
@@ -536,7 +537,7 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 			}
 			elems = append(elems, keyElems...)
 		}
-		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		if err := r.dispatchReadTimestampElems(ctx, true, readTimestamp, elems); err != nil {
 			return err
 		}
 		removed = nextRemoved

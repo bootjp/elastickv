@@ -197,7 +197,12 @@ func (a *RaftTSOAllocator) prepareLeaderTermReservation(
 	activateCutover bool,
 	activatePhaseD bool,
 ) (uint64, error) {
-	termFloor, err := a.termCommitFloor(ctx, term)
+	// The ordinary per-term cache protects all reservations served by this TSO
+	// leader term. Phase-D activation is a one-way cutover boundary, so it must
+	// fence legacy data-group commits that may have landed after this term's
+	// first non-Phase-D reservation.
+	forceFreshFloor := activatePhaseD && !a.state.PhaseDActive()
+	termFloor, err := a.termCommitFloor(ctx, term, forceFreshFloor)
 	if err != nil {
 		return 0, err
 	}
@@ -232,8 +237,8 @@ func (a *RaftTSOAllocator) activateDurableMarkers(
 	return a.commitPhaseD(ctx, engine, previousFloor)
 }
 
-func (a *RaftTSOAllocator) termCommitFloor(ctx context.Context, term uint64) (uint64, error) {
-	if a.initializedTerm == term {
+func (a *RaftTSOAllocator) termCommitFloor(ctx context.Context, term uint64, forceFresh bool) (uint64, error) {
+	if a.initializedTerm == term && !forceFresh {
 		return a.state.AllocationFloor(), nil
 	}
 	floor, err := a.floorProvider.GlobalCommittedTimestampFloor(ctx)

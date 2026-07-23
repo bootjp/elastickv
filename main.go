@@ -2408,6 +2408,12 @@ func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref
 	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
 }
 
+func (c startupGatedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref kv.AppliedReadTimestampVoucherRef) {
+	if revoker, ok := c.inner.(kv.AppliedReadTimestampVoucherRevoker); ok {
+		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+	}
+}
+
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }

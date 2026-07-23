@@ -72,6 +72,13 @@ type AppliedReadTimestampVoucher interface {
 	VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error
 }
 
+// AppliedReadTimestampVoucherRevoker removes an unused voucher registration.
+// Decorators that forward VouchAppliedReadTimestamp should forward revocation
+// too so pre-dispatch gates cannot leak inner-coordinator voucher entries.
+type AppliedReadTimestampVoucherRevoker interface {
+	RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef)
+}
+
 // AppliedReadTimestampVoucherRef is an opaque process-local dispatch
 // capability. Only this package can mint a non-zero ref.
 type AppliedReadTimestampVoucherRef struct {
@@ -148,9 +155,11 @@ func DispatchWithReadTimestamp(
 	if reqs == nil || reqs.StartTS != readTimestamp.timestamp {
 		return nil, errors.WithStack(ErrTSOTimestampInvalid)
 	}
-	if err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp); err != nil {
+	revoke, err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp)
+	if err != nil {
 		return nil, err
 	}
+	defer revoke()
 	resp, err := coord.Dispatch(ctx, reqs)
 	return resp, errors.WithStack(err)
 }
@@ -163,18 +172,25 @@ func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
 	return &appliedReadDispatchVoucher{ref: AppliedReadTimestampVoucherRef{id: id}}
 }
 
-func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) error {
+func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (func(), error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	voucher, ok := coord.(AppliedReadTimestampVoucher)
 	if !ok {
-		return errors.WithStack(ErrTSOProtocolUnsupported)
+		return nil, errors.WithStack(ErrTSOProtocolUnsupported)
 	}
 	if err := voucher.VouchAppliedReadTimestamp(timestamp, v.ref); err != nil {
-		return errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	v.prepared++
-	return nil
+	revoke := func() {}
+	if revoker, ok := coord.(AppliedReadTimestampVoucherRevoker); ok {
+		ref := v.ref
+		revoke = func() {
+			revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+		}
+	}
+	return revoke, nil
 }
 
 type tsoBatchAfterAllocator interface {

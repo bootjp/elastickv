@@ -513,6 +513,27 @@ func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref App
 	return nil
 }
 
+// RevokeAppliedReadTimestamp removes one prepared voucher that did not reach
+// ShardedCoordinator dispatch validation, for example because an outer
+// coordinator decorator rejected the dispatch first.
+func (c *ShardedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+		return
+	}
+	c.appliedReadVouchers[key] = uses - 1
+}
+
 func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
 	if c == nil {
 		return false

@@ -103,6 +103,12 @@ func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64, re
 	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
 }
 
+func (c keyVizLabeledCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if revoker, ok := c.inner.(AppliedReadTimestampVoucherRevoker); ok {
+		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+	}
+}
+
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
 		idx, err := lr.LeaseRead(ctx)

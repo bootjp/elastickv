@@ -240,12 +240,16 @@ type Coordinate struct {
 
 var _ Coordinator = (*Coordinate)(nil)
 var _ AppliedReadTimestampVoucher = (*Coordinate)(nil)
+var _ AppliedReadTimestampVoucherRevoker = (*Coordinate)(nil)
 
 // VouchAppliedReadTimestamp is a no-op for the single-group coordinator. The
 // sharded coordinator consumes vouchers before cross-group StartTS validation.
 func (c *Coordinate) VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error {
 	return nil
 }
+
+// RevokeAppliedReadTimestamp is a no-op for the single-group coordinator.
+func (c *Coordinate) RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) {}
 
 type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)

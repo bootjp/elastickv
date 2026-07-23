@@ -259,6 +259,38 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), end+1), ErrTSOTimestampInvalid)
 }
 
+func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTerm(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	provider := &recordingTSOFloorProvider{}
+	alloc, err := NewRaftTSOAllocator(
+		&ShardGroup{Engine: engine, TSOState: fsm},
+		clock,
+		WithTSOCutoverFloorProvider(provider),
+	)
+	require.NoError(t, err)
+
+	_, err = alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, provider.callCount())
+
+	laterDataFloor := fsm.AllocationFloor() + 1_000
+	provider.setFloor(laterDataFloor)
+	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
+	require.NoError(t, err)
+	require.Equal(t, 2, provider.callCount(), "Phase-D activation must resample the data commit floor even within an initialized term")
+	require.Equal(t, laterDataFloor, reservation.PreviousAllocationFloor)
+	require.Equal(t, laterDataFloor, reservation.PhaseDFloor)
+	require.Greater(t, reservation.Base, laterDataFloor)
+}
+
 func TestRaftTSOAllocatorFencesAboveRestoredPhaseDFloor(t *testing.T) {
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
@@ -753,4 +785,10 @@ func (p *recordingTSOFloorProvider) callCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.calls
+}
+
+func (p *recordingTSOFloorProvider) setFloor(floor uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.floor = floor
 }

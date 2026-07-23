@@ -315,6 +315,34 @@ func TestDispatchWithReadTimestampVouchesEveryBoundDispatch(t *testing.T) {
 	require.Equal(t, uint64(2), alloc.validateCalls.Load())
 }
 
+func TestDispatchWithReadTimestampRevokesVoucherWhenOuterGateRejects(t *testing.T) {
+	t.Parallel()
+	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
+	coord, _, _, _ := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
+	gateErr := errors.New("startup gate rejected dispatch")
+	gated := phaseDGateCoordinator{inner: coord, err: gateErr}
+
+	readTimestamp, err := BeginReadTimestampThrough(context.Background(), gated, 10, "vouch gated applied watermark")
+	require.NoError(t, err)
+	_, err = DispatchWithReadTimestamp(
+		readTimestamp.WithDispatchVoucher(context.Background()),
+		gated,
+		&OperationGroup[OP]{
+			IsTxn:   true,
+			StartTS: readTimestamp.Timestamp(),
+			Elems: []*Elem[OP]{
+				{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+				{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+			},
+		},
+	)
+	require.ErrorIs(t, err, gateErr)
+
+	coord.appliedReadVoucherMu.Lock()
+	defer coord.appliedReadVoucherMu.Unlock()
+	require.Empty(t, coord.appliedReadVouchers)
+}
+
 func TestReadTimestampVoucherBindingShadowsParentCapability(t *testing.T) {
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
 	coord, _, _, alloc := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
@@ -422,6 +450,53 @@ func newPhaseDCrossShardCoordinator(
 		WithTSOAllocator(alloc).
 		WithTSOCutoverState(state)
 	return coord, g1Txn, g2Txn, alloc
+}
+
+type phaseDGateCoordinator struct {
+	inner *ShardedCoordinator
+	err   error
+}
+
+func (c phaseDGateCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
+	return nil, c.err
+}
+
+func (c phaseDGateCoordinator) IsLeader() bool { return c.inner.IsLeader() }
+
+func (c phaseDGateCoordinator) VerifyLeader(ctx context.Context) error {
+	return c.inner.VerifyLeader(ctx)
+}
+
+func (c phaseDGateCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c phaseDGateCoordinator) RaftLeader() string { return c.inner.RaftLeader() }
+
+func (c phaseDGateCoordinator) IsLeaderForKey(key []byte) bool {
+	return c.inner.IsLeaderForKey(key)
+}
+
+func (c phaseDGateCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
+	return c.inner.VerifyLeaderForKey(ctx, key)
+}
+
+func (c phaseDGateCoordinator) RaftLeaderForKey(key []byte) string {
+	return c.inner.RaftLeaderForKey(key)
+}
+
+func (c phaseDGateCoordinator) Clock() *HLC { return c.inner.Clock() }
+
+func (c phaseDGateCoordinator) TimestampAllocator() TimestampAllocator {
+	return c.inner.TimestampAllocator()
+}
+
+func (c phaseDGateCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	return c.inner.VouchAppliedReadTimestamp(timestamp, ref)
+}
+
+func (c phaseDGateCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	c.inner.RevokeAppliedReadTimestamp(timestamp, ref)
 }
 
 func TestShardedCoordinatorDispatchTxn_SingleShardUsesOnePhase(t *testing.T) {
