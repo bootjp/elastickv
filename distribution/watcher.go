@@ -37,22 +37,34 @@ func WithCatalogWatcherLogger(logger *slog.Logger) CatalogWatcherOption {
 	}
 }
 
+// WithCatalogWatcherBatchSize sets the maximum number of deltas applied by one
+// synchronization pass.
+func WithCatalogWatcherBatchSize(batchSize int) CatalogWatcherOption {
+	return func(w *CatalogWatcher) {
+		if batchSize > 0 {
+			w.batchSize = batchSize
+		}
+	}
+}
+
 // CatalogWatcher periodically refreshes Engine from durable catalog snapshots.
 type CatalogWatcher struct {
-	catalog  *CatalogStore
-	engine   *Engine
-	interval time.Duration
-	logger   *slog.Logger
+	catalog   *CatalogStore
+	engine    *Engine
+	interval  time.Duration
+	batchSize int
+	logger    *slog.Logger
 }
 
 // NewCatalogWatcher creates a watcher that polls the durable route catalog and
 // applies newer snapshots to the in-memory engine.
 func NewCatalogWatcher(catalog *CatalogStore, engine *Engine, opts ...CatalogWatcherOption) *CatalogWatcher {
 	w := &CatalogWatcher{
-		catalog:  catalog,
-		engine:   engine,
-		interval: defaultCatalogWatcherInterval,
-		logger:   slog.Default(),
+		catalog:   catalog,
+		engine:    engine,
+		interval:  defaultCatalogWatcherInterval,
+		batchSize: DefaultCatalogDeltaBatchSize,
+		logger:    slog.Default(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -110,29 +122,26 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 		return errors.WithStack(errCatalogWatcherContextRequired)
 	}
 
-	readTS := w.catalog.store.LastCommitTS()
-	catalogVersion, err := w.catalog.versionAt(ctx, readTS)
+	changes, err := w.catalog.ChangesSince(ctx, w.engine.Version(), w.batchSize)
 	if err != nil {
 		return err
 	}
-	if catalogVersion <= w.engine.Version() {
+	if changes.Reset != nil {
+		if err := w.engine.ApplySnapshot(*changes.Reset); err != nil {
+			if errors.Is(err, ErrEngineSnapshotVersionStale) {
+				return nil
+			}
+			return err
+		}
 		return nil
 	}
-
-	routes, err := w.catalog.routesAt(ctx, readTS)
-	if err != nil {
-		return err
-	}
-	snapshot := CatalogSnapshot{
-		Version: catalogVersion,
-		Routes:  routes,
-		ReadTS:  readTS,
-	}
-	if err := w.engine.ApplySnapshot(snapshot); err != nil {
-		if errors.Is(err, ErrEngineSnapshotVersionStale) {
-			return nil
+	for _, delta := range changes.Deltas {
+		if err := w.engine.ApplyDelta(delta); err != nil {
+			if errors.Is(err, ErrEngineSnapshotVersionStale) {
+				continue
+			}
+			return err
 		}
-		return err
 	}
 	return nil
 }
@@ -146,6 +155,9 @@ func (w *CatalogWatcher) validate() error {
 	}
 	if w.interval <= 0 {
 		return errors.WithStack(errCatalogWatcherInvalidInterval)
+	}
+	if w.batchSize <= 0 {
+		return errors.WithStack(ErrCatalogDeltaLimitInvalid)
 	}
 	if w.logger == nil {
 		return errors.WithStack(errCatalogWatcherLoggerRequired)
