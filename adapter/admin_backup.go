@@ -324,7 +324,7 @@ func (s *AdminServer) pinBackupGroups(
 ) (map[uint64]uint64, error) {
 	reserveEntry := kv.EncodeBackupReserveEntry(kv.BackupReserveEntry{PinID: pinID, ReadTS: readTS, Deadline: deadline})
 	if _, _, err := proposeBackupAll(ctx, []backupGroup{controlGroup}, reserveEntry); err != nil {
-		if errors.Is(err, kv.ErrTooManyActiveBackups) {
+		if backupCapacityReservationFull(err) {
 			return nil, status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
 		}
 		return nil, status.Errorf(codes.Unavailable, "reserve backup capacity: %v", err)
@@ -533,7 +533,7 @@ func (s *AdminServer) StreamBackup(
 		return status.Errorf(codes.Unavailable, "%s", "backup scanner is nil")
 	}
 	scanErr := streamBackupRecords(stream, scanner, selected, func() error {
-		return s.requireUnexpiredBackupToken(tok)
+		return s.requireLiveBackupSession(tok)
 	})
 	if err := finishBackupScan(stream.Context(), scanner, scanErr); err != nil {
 		if scanErr != nil {
@@ -847,7 +847,7 @@ func proposeBackupAll(ctx context.Context, groups []backupGroup, entry []byte) (
 		result := <-results
 		if result.err != nil {
 			if firstErr == nil {
-				firstErr = errors.Wrapf(result.err, "raft group %d", result.group.id)
+				firstErr = backupProposalGroupError(result.group.id, result.err)
 			}
 			continue
 		}
@@ -870,6 +870,17 @@ func backupProposalResponseError(result *raftengine.ProposalResult) error {
 	return errors.Wrapf(ErrBackupUnavailable, "unexpected backup apply response %T", result.Response)
 }
 
+func backupProposalGroupError(groupID uint64, err error) error {
+	if status.Code(err) == codes.ResourceExhausted {
+		return status.Errorf(codes.ResourceExhausted, "raft group %d: %v", groupID, err)
+	}
+	return errors.Wrapf(err, "raft group %d", groupID)
+}
+
+func backupCapacityReservationFull(err error) bool {
+	return errors.Is(err, kv.ErrTooManyActiveBackups) || status.Code(err) == codes.ResourceExhausted
+}
+
 func (s *AdminServer) compensateBackupRelease(control backupGroup, groups []backupGroup, pinID kv.BackupPinID) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.backupConfig.beginDeadline)
 	defer cancel()
@@ -881,23 +892,31 @@ func (s *AdminServer) compensateBackupRelease(control backupGroup, groups []back
 	_, _, _ = proposeBackupAll(ctx, []backupGroup{control}, unreserve)
 }
 
-func (s *AdminServer) proposeBackupWithRetry(ctx context.Context, groups []backupGroup, entry []byte) error {
+func (s *AdminServer) proposeBackupWithRetry(
+	ctx context.Context,
+	groups []backupGroup,
+	entry []byte,
+) (map[uint64]uint64, error) {
 	pending := append([]backupGroup(nil), groups...)
+	commits := make(map[uint64]uint64, len(groups))
 	var firstErr error
 	for attempt := 0; attempt < s.backupConfig.renewAttempts && len(pending) > 0; attempt++ {
-		_, committed, err := proposeBackupAll(ctx, pending, entry)
+		attemptCommits, committed, err := proposeBackupAll(ctx, pending, entry)
+		for groupID, index := range attemptCommits {
+			commits[groupID] = index
+		}
 		if err == nil {
-			return nil
+			return commits, nil
 		}
 		firstErr = err
 		pending = remainingBackupGroups(pending, committed)
 		if len(pending) > 0 && attempt+1 < s.backupConfig.renewAttempts {
 			if err := waitBackupRetry(ctx, s.backupConfig.renewBackoff); err != nil {
-				return err
+				return commits, err
 			}
 		}
 	}
-	return firstErr
+	return commits, firstErr
 }
 
 func remainingBackupGroups(pending, committed []backupGroup) []backupGroup {
@@ -937,15 +956,19 @@ func (s *AdminServer) renewBackupGroups(
 	}
 	deadline := s.nowSnapshot().Add(ttl)
 	reserveEntry := kv.EncodeBackupReserveEntry(kv.BackupReserveEntry{PinID: pinID, ReadTS: readTS, Deadline: deadline})
-	if err := s.proposeBackupWithRetry(ctx, groups[:1], reserveEntry); err != nil {
+	if _, err := s.proposeBackupWithRetry(ctx, groups[:1], reserveEntry); err != nil {
 		return time.Time{}, errors.Wrap(err, "capacity reservation")
 	}
 	// Reapply the complete pin rather than only its deadline. This restores a
 	// missing replica-local fence after partial delivery while duplicate Pin
 	// apply preserves the earliest read timestamp and latest deadline.
 	pinEntry := kv.EncodeBackupPinEntry(kv.BackupPinEntry{PinID: pinID, ReadTS: readTS, Deadline: deadline})
-	if err := s.proposeBackupWithRetry(ctx, groups, pinEntry); err != nil {
+	commits, err := s.proposeBackupWithRetry(ctx, groups, pinEntry)
+	if err != nil {
 		return time.Time{}, errors.Wrap(err, "group pins")
+	}
+	if err := waitBackupGroupsApplied(ctx, groups, commits); err != nil {
+		return time.Time{}, errors.Wrap(err, "wait for renewed group pins")
 	}
 	return deadline, nil
 }
@@ -1037,6 +1060,18 @@ func (s *AdminServer) backupRouteSnapshotForToken(tok backupToken) (kv.BackupRou
 		return kv.BackupRouteSnapshot{}, status.Errorf(codes.FailedPrecondition, "%s", "backup route snapshot is unavailable on this endpoint")
 	}
 	return session.routes, nil
+}
+
+func (s *AdminServer) requireLiveBackupSession(tok backupToken) error {
+	now := s.nowSnapshot()
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	s.reapBackupSessionsLocked(now)
+	session, ok := s.backupSessions[tok.pinID]
+	if !ok || session.readTS != tok.readTS {
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	}
+	return nil
 }
 
 func (s *AdminServer) extendBackupSession(tok backupToken) {

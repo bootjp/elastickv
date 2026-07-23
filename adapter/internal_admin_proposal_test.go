@@ -6,8 +6,11 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type internalAdminLeaderView struct {
@@ -87,6 +90,7 @@ func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
 		state     raftengine.State
 		proposer  raftengine.Proposer
 		errTarget error
+		errCode   codes.Code
 		errText   string
 	}{
 		{name: "follower", state: raftengine.StateFollower, errTarget: ErrNotLeader},
@@ -94,6 +98,12 @@ func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
 			name: "apply response", state: raftengine.StateLeader,
 			proposer: &internalAdminProposer{response: stderrors.New("apply failed")},
 			errText:  "apply failed",
+		},
+		{
+			name: "capacity response", state: raftengine.StateLeader,
+			proposer: &internalAdminProposer{response: kv.ErrTooManyActiveBackups},
+			errCode:  codes.ResourceExhausted,
+			errText:  kv.ErrTooManyActiveBackups.Error(),
 		},
 	}
 	for _, tc := range tests {
@@ -108,6 +118,9 @@ func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
 			_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{})
 			if tc.errTarget != nil {
 				require.ErrorIs(t, err, tc.errTarget)
+			}
+			if tc.errCode != codes.OK {
+				require.Equal(t, tc.errCode, status.Code(err))
 			}
 			if tc.errText != "" {
 				require.ErrorContains(t, err, tc.errText)

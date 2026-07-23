@@ -67,7 +67,7 @@ type backupTestProposer struct {
 	failures       map[byte]int
 	transportError map[byte]error
 	responseError  map[byte]error
-	onPropose      func(byte)
+	onPropose      func(byte, uint64)
 }
 
 func newBackupTestProposer() *backupTestProposer {
@@ -95,7 +95,7 @@ func (p *backupTestProposer) ProposeAdmin(ctx context.Context, data []byte) (*ra
 		return nil, p.transportError[subtype]
 	}
 	if p.onPropose != nil {
-		p.onPropose(subtype)
+		p.onPropose(subtype, p.commit)
 	}
 	return &raftengine.ProposalResult{CommitIndex: p.commit, Response: p.responseError[subtype]}, nil
 }
@@ -375,13 +375,13 @@ func TestBeginBackupWaitsForLocalPinApplyBeforeCatalogCapture(t *testing.T) {
 	store := &backupTestStore{}
 	group := &backupTestGroup{status: raftengine.Status{}, every: 10_000}
 	proposer := newBackupTestProposer()
-	proposer.onPropose = func(subtype byte) {
+	proposer.onPropose = func(subtype byte, commit uint64) {
 		if subtype != backupSubtypePin {
 			return
 		}
 		go func() {
 			time.Sleep(25 * time.Millisecond)
-			group.setApplied(2)
+			group.setApplied(commit)
 		}()
 	}
 	store.onCapture = func() {
@@ -524,6 +524,42 @@ func TestStreamBackupStopsWhenTokenExpiresMidStream(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.Contains(t, err.Error(), "expired")
 	require.Len(t, stream.got, 1)
+}
+
+func TestStreamBackupHonorsRenewedSessionDeadline(t *testing.T) {
+	t.Parallel()
+	const ttl = 30 * time.Millisecond
+	nowMS := atomic.Int64{}
+	base := time.Unix(1_000_000, 0)
+	nowMS.Store(base.UnixMilli())
+	store := &backupTestStore{keys: [][]byte{
+		[]byte(logicalbackup.RedisStringPrefix + "a"),
+		[]byte(logicalbackup.RedisStringPrefix + "b"),
+	}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil,
+		WithAdminBackupConfig(AdminBackupConfig{DefaultTTL: ttl, MinTTL: time.Millisecond, MaxTTL: time.Second}),
+	)
+	srv.SetClock(func() time.Time { return time.UnixMilli(nowMS.Load()) })
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+
+	var renewOnce sync.Once
+	stream := &backupTestStream{
+		ctx: context.Background(),
+		onSend: func() {
+			renewOnce.Do(func() {
+				nowMS.Store(base.Add(10 * time.Millisecond).UnixMilli())
+				_, err := srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+				require.NoError(t, err)
+				nowMS.Store(base.Add(ttl + time.Millisecond).UnixMilli())
+			})
+		},
+	}
+	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.got, 2)
 }
 
 func TestStreamBackupFailsClosedWithoutPinnedRouteSnapshot(t *testing.T) {
@@ -688,6 +724,60 @@ func TestRenewBackupRetriesAndRejectsTamperedToken(t *testing.T) {
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
+func TestRenewBackupWaitsForLocalPinApplyBeforePublishing(t *testing.T) {
+	t.Parallel()
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(
+		t,
+		&backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: proposer},
+		nil,
+		WithAdminBackupConfig(AdminBackupConfig{BeginDeadline: time.Second}),
+	)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	group.setApplied(0)
+
+	pinCommit := make(chan uint64, 1)
+	releaseApply := make(chan struct{})
+	proposer.mu.Lock()
+	proposer.onPropose = func(subtype byte, commit uint64) {
+		if subtype != backupSubtypePin {
+			return
+		}
+		pinCommit <- commit
+		go func() {
+			<-releaseApply
+			group.setApplied(commit)
+		}()
+	}
+	proposer.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := srv.RenewBackup(ctx, &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+		done <- err
+	}()
+	var commit uint64
+	select {
+	case commit = <-pinCommit:
+	case <-ctx.Done():
+		require.FailNow(t, "RenewBackup did not propose renewed pin")
+	}
+	select {
+	case err := <-done:
+		require.Failf(t, "RenewBackup returned before local apply", "err=%v", err)
+	default:
+	}
+	close(releaseApply)
+	require.NoError(t, <-done)
+	require.GreaterOrEqual(t, group.Status().AppliedIndex, commit)
+}
+
 func TestBackupTokenDeadlineRotatesAndFailsClosed(t *testing.T) {
 	t.Parallel()
 	const ttl = 30 * time.Millisecond
@@ -744,7 +834,7 @@ func TestRenewBackupReleasesResourcesWhenTokenExpiresDuringRenewal(t *testing.T)
 	decoded, err := srv.decodeBackupToken(begin.GetPinToken())
 	require.NoError(t, err)
 	proposer.mu.Lock()
-	proposer.onPropose = func(subtype byte) {
+	proposer.onPropose = func(subtype byte, _ uint64) {
 		if subtype == backupSubtypePin {
 			nowMS.Store(base.Add(ttl).UnixMilli())
 		}
@@ -797,6 +887,18 @@ func TestBeginBackupMapsCapacityReservationToResourceExhausted(t *testing.T) {
 	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
 	proposer := newBackupTestProposer()
 	proposer.responseError[backupSubtypeReserve] = kv.ErrTooManyActiveBackups
+	srv := newBackupControlTestServer(t, &backupTestStore{}, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
+func TestBeginBackupMapsForwardedCapacityReservationStatusToResourceExhausted(t *testing.T) {
+	t.Parallel()
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	proposer.failures[backupSubtypeReserve] = 1
+	proposer.transportError[backupSubtypeReserve] = status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
 	srv := newBackupControlTestServer(t, &backupTestStore{}, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
 
 	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})

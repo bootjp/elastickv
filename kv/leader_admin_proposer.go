@@ -7,7 +7,9 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type LeaderAdminProposerOption func(*leaderAdminProposer)
@@ -147,7 +149,10 @@ func (p *leaderAdminProposer) forwardAdmin(
 	}
 	resp, err := pb.NewInternalClient(conn).ForwardAdminProposal(ctx, &pb.ForwardAdminProposalRequest{Payload: data})
 	if err != nil {
-		return nil, errors.WithStack(err)
+		if code := status.Code(err); code != codes.Unknown {
+			return nil, status.Errorf(code, "forward admin proposal: %v", err)
+		}
+		return nil, errors.Wrap(err, "forward admin proposal")
 	}
 	return &raftengine.ProposalResult{CommitIndex: resp.GetCommitIndex()}, nil
 }

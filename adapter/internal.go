@@ -8,6 +8,8 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type InternalOption func(*Internal)
@@ -141,6 +143,9 @@ func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) erro
 		return nil
 	}
 	if err, ok := result.Response.(error); ok {
+		if errors.Is(err, kv.ErrTooManyActiveBackups) {
+			return status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
+		}
 		return errors.WithStack(err)
 	}
 	return errors.Errorf("unexpected admin proposal response %T", result.Response)
