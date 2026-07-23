@@ -60,6 +60,34 @@ type ShardGroup struct {
 	// NewLeaderProxyForShardGroup), so the no-wrap default keeps
 	// working.
 	proposer raftengine.Proposer
+	// leaderRead forwards a read barrier to this group's current leader when
+	// the local replica is a follower. It is installed with the LeaderProxy.
+	leaderRead func(context.Context) (leaseReadResult, error)
+	// leaderReadToken authenticates follower-to-leader lease-read RPCs. Admin
+	// service setup publishes it once before the public listeners are opened.
+	leaderReadToken atomic.Pointer[string]
+}
+
+// SetLeaderReadToken configures the bearer token used by forwarded lease-read
+// RPCs. An empty token preserves explicitly configured insecure admin mode.
+func (g *ShardGroup) SetLeaderReadToken(token string) {
+	if token == "" {
+		g.leaderReadToken.Store(nil)
+		return
+	}
+	t := token
+	g.leaderReadToken.Store(&t)
+}
+
+func (g *ShardGroup) forwardedLeaderReadToken() string {
+	if g == nil {
+		return ""
+	}
+	token := g.leaderReadToken.Load()
+	if token == nil {
+		return ""
+	}
+	return *token
 }
 
 // Proposer returns the wrap-aware proposer chain installed by
@@ -207,10 +235,13 @@ func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *Lead
 	// (codex P2 round-1); routing both paths through the same
 	// proposer closes that hole.
 	g.proposer = newDynamicWrappedProposer(g.Engine, &g.raftPayloadWrap)
-	return &LeaderProxy{
+	p := &LeaderProxy{
 		engine: g.Engine,
 		tm:     NewTransactionWithProposer(g.proposer, opts...),
+		group:  g,
 	}
+	g.leaderRead = p.forwardLeaseRead
+	return p
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
@@ -375,6 +406,9 @@ type ShardedCoordinator struct {
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
 	tsAllocator TimestampAllocator
+	// timestampFloor is the highest replicated backup cut observed by this
+	// process. It deduplicates the same cut as each local shard applies its pin.
+	timestampFloor atomic.Uint64
 	// timestampGroup pins IsTimestampLeader to a dedicated Raft group when
 	// timestampGroupConfigured is true. Nil/false preserves the M3 bridge
 	// behavior where any locally-led shard group can issue TSO timestamps.
@@ -461,6 +495,29 @@ func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedC
 func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
 	c.tsAllocator = alloc
 	return c
+}
+
+// ObserveTimestampFloor advances the process clock past a replicated backup
+// cut and invalidates any cached TSO batch that could still contain values at
+// or below it. Claims returned before invalidation remain protected by the
+// FSM's durable backup timestamp floor.
+func (c *ShardedCoordinator) ObserveTimestampFloor(ts uint64) {
+	if c == nil || ts == 0 {
+		return
+	}
+	for {
+		floor := c.timestampFloor.Load()
+		if ts <= floor {
+			return
+		}
+		if c.timestampFloor.CompareAndSwap(floor, ts) {
+			break
+		}
+	}
+	if c.clock != nil {
+		c.clock.Observe(ts)
+	}
+	invalidateTimestampWindow(c.tsAllocator)
 }
 
 // WithTimestampGroup pins timestamp issuance leadership to one Raft group.
@@ -1761,16 +1818,28 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 // but correctness does not depend on it because every configured group must
 // succeed.
 func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	_, err := c.LeaseReadAllGroupsTimestamp(ctx)
+	return err
+}
+
+// LeaseReadAllGroupsTimestamp fences every data-group leader and returns the
+// maximum commit timestamp observed after those barriers.
+func (c *ShardedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
 	groups, err := c.allShardGroups()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	var maxCommitTS uint64
 	for _, g := range groups {
-		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
-			return errors.WithStack(err)
+		result, err := groupLeaseReadResult(ctx, g, c.leaseObserver)
+		if err != nil {
+			return 0, errors.WithStack(err)
+		}
+		if result.lastCommitTS > maxCommitTS {
+			maxCommitTS = result.lastCommitTS
 		}
 	}
-	return nil
+	return maxCommitTS, nil
 }
 
 func (c *ShardedCoordinator) allShardGroups() ([]*ShardGroup, error) {
@@ -1820,20 +1889,58 @@ func observeLeaseRead(observer LeaseReadObserver, hit bool) {
 	}
 }
 
+func shouldForwardGroupLeaseRead(g *ShardGroup, engine raftengine.Engine) bool {
+	return g != nil && g.leaderRead != nil && engine != nil && engine.State() != raftengine.StateLeader
+}
+
+type leaseReadResult struct {
+	appliedIndex uint64
+	lastCommitTS uint64
+}
+
+func localLeaseReadResult(g *ShardGroup, appliedIndex uint64) leaseReadResult {
+	result := leaseReadResult{appliedIndex: appliedIndex}
+	if g != nil && g.Store != nil {
+		result.lastCommitTS = g.Store.LastCommitTS()
+	}
+	return result
+}
+
+func handleGroupLeaseReadError(ctx context.Context, g *ShardGroup, err error) (leaseReadResult, error) {
+	if g != nil && isLeadershipLossError(err) {
+		g.lease.invalidate()
+	}
+	if g != nil && g.leaderRead != nil && isTransientLeaderError(err) {
+		return g.leaderRead(ctx)
+	}
+	return leaseReadResult{}, err
+}
+
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
+	result, err := groupLeaseReadResult(ctx, g, observer)
+	return result.appliedIndex, err
+}
+
+func groupLeaseReadResult(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (leaseReadResult, error) {
 	engine := engineForGroup(g)
+	if shouldForwardGroupLeaseRead(g, engine) {
+		observeLeaseRead(observer, false)
+		return g.leaderRead(ctx)
+	}
 	// g.lp caches the LeaseProvider assertion done once at construction
 	// (NewShardedCoordinator); a nil group or an engine without the
 	// capability falls through to the linearizable slow path. The nil-g
 	// guard preserves engineForGroup's nil-safety since g.lp would panic
 	// on a nil receiver.
 	if g == nil || g.lp == nil {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	lp := g.lp
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	// Single monoclock.Now() sample so primary/secondary/extension
 	// all see the same monotonic-raw instant. Clock-skew safety
@@ -1842,23 +1949,20 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	expectedGen := g.lease.generation()
 	if g.lease.valid(now) && state == raftengine.StateLeader {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		if isLeadershipLossError(err) {
-			g.lease.invalidate()
-		}
-		return 0, err
+		return handleGroupLeaseReadError(ctx, g, err)
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
-	return idx, nil
+	return localLeaseReadResult(g, idx), nil
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {

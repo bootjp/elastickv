@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -98,6 +99,11 @@ type kvFSM struct {
 	// applyObservers are called after successful logical mutations.
 	// They are never mutated after NewKvFSMWithHLC returns.
 	applyObservers []ApplyObserver
+	// backupTimestampFloor is the highest replicated BackupPin read timestamp.
+	// New raw, one-phase, and PREPARE entries at or below this floor were
+	// timestamped before the backup cut and reached apply too late.
+	backupTimestampFloor atomic.Uint64
+	backupFloorLoadErr   error
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -270,6 +276,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 	for _, opt := range opts {
 		opt(f)
 	}
+	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
 	f.snapLatch.log = f.log
 	observeStoreLastCommitTS(hlc, store)
 	return f
@@ -324,6 +331,9 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
+	if f.backupFloorLoadErr != nil {
+		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
+	}
 	if resp, handled := f.applyReservedOpcode(data); handled {
 		return resp
 	}
@@ -481,6 +491,9 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := f.verifyBackupTimestampFloor(r, commitTS); err != nil {
+		return err
+	}
 	if err := f.handleRequest(ctx, r, commitTS); err != nil {
 		return errors.WithStack(err)
 	}
@@ -555,6 +568,9 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
+	if err := f.rejectSnapshotWithActiveBackupPin(); err != nil {
+		return nil, err
+	}
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -600,6 +616,10 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	f.restoredCutover = cutover
 	if err := f.store.Restore(io.NopCloser(br)); err != nil {
 		return errors.WithStack(err)
+	}
+	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
+	if f.backupFloorLoadErr != nil {
+		return errors.Wrap(f.backupFloorLoadErr, "restore backup timestamp floor")
 	}
 	observeStoreLastCommitTS(f.hlc, f.store)
 	return nil
@@ -657,14 +677,14 @@ func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
 }
 
 // IsVolatileOnlyPayload satisfies raftengine.VolatileEntryClassifier.
-// Returns true iff payload is an HLC lease entry (raftEncodeHLCLease
-// tag, 0x02) — those entries only call HLC.SetPhysicalCeiling, which
-// is monotonic and lives purely in memory. After the cold-start skip
-// gate fires, the engine still delivers WAL committed-tail entries
-// past snapshot.Metadata.Index; without this classifier those
-// volatile entries get dropped along with KV/MVCC duplicates. HLC
-// would lose the post-snapshot ceiling raise; backup pins would lose
-// a post-snapshot retention fence.
+// Returns true for HLC lease and backup-pin payloads. HLC leases only call
+// HLC.SetPhysicalCeiling, which is monotonic and lives purely in memory.
+// Backup pins restore volatile retention state and also persist a monotonic
+// timestamp floor; replaying the same floor is idempotent. After the cold-start
+// skip gate fires, the engine still delivers WAL committed-tail entries past
+// snapshot.Metadata.Index; without this classifier those entries get dropped
+// along with KV/MVCC duplicates. HLC would lose the post-snapshot ceiling
+// raise; backup pins would lose a post-snapshot retention fence.
 //
 // Re-applying KV/MVCC entries would re-execute OCC validation against
 // store state that has already moved past commit_ts, surfacing

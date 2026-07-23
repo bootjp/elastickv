@@ -81,6 +81,38 @@ func TestBatchAllocatorInvalidateDropsCachedWindow(t *testing.T) {
 	require.EqualValues(t, 2, tso.calls.Load())
 }
 
+func TestShardedCoordinatorBackupFloorDropsCachedTSOWindow(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	coord := NewShardedCoordinator(
+		distribution.NewEngineWithDefaultRoute(),
+		map[uint64]*ShardGroup{1: {Engine: stubLeaderEngine{}}},
+		1,
+		clock,
+		nil,
+	)
+	local, err := NewLocalTSOAllocator(coord)
+	require.NoError(t, err)
+	batch, err := NewBatchAllocator(local, testTSOBatchSize)
+	require.NoError(t, err)
+	coord.WithTSOAllocator(batch)
+
+	first, err := coord.Next(context.Background())
+	require.NoError(t, err)
+	floor := first + 100
+	coord.ObserveTimestampFloor(floor)
+
+	next, err := coord.Next(context.Background())
+	require.NoError(t, err)
+	require.Greater(t, next, floor)
+
+	coord.ObserveTimestampFloor(floor)
+	afterDuplicateFloor, err := coord.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, next+1, afterDuplicateFloor)
+}
+
 func TestBatchAllocatorNextAfterSkipsCachedSlotsBelowFloor(t *testing.T) {
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)

@@ -23,8 +23,9 @@ const proxyForwardTimeout = 5 * time.Second
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
-	engine *distribution.Engine
-	groups map[uint64]*ShardGroup
+	engine            *distribution.Engine
+	groups            map[uint64]*ShardGroup
+	partitionResolver PartitionResolver
 
 	connCache GRPCConnCache
 }
@@ -40,6 +41,17 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 		engine: engine,
 		groups: groups,
 	}
+}
+
+// WithPartitionResolver installs the same partition-keyspace resolver used by
+// ShardedCoordinator. ShardStore keeps normal byte-range routing for ordinary
+// calls, but backup scanners need the resolver to decide which physical group
+// owns partition-routed keys discovered while scanning every group.
+func (s *ShardStore) WithPartitionResolver(r PartitionResolver) *ShardStore {
+	if s != nil {
+		s.partitionResolver = r
+	}
+	return s
 }
 
 // FilesystemGroupForHome resolves the group that owns one file-home route.

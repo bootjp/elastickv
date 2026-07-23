@@ -19,14 +19,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -41,6 +44,115 @@ func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	if srv != nil || !icept.empty() {
 		t.Fatalf("disabled service should return nil server and empty interceptors; got %v %+v", srv, icept)
 	}
+}
+
+func TestValidateLiveBackupConfig(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, validateLiveBackupConfig(30*time.Minute, time.Hour, 5*time.Second, 1000, 1024, 4))
+	tests := []struct {
+		name                              string
+		defaultTTL, maxTTL, beginDeadline time.Duration
+		headroom                          uint64
+		pageSize, maxPins                 int
+	}{
+		{name: "short default ttl", defaultTTL: time.Second, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "default exceeds max", defaultTTL: 2 * time.Hour, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "zero begin deadline", defaultTTL: time.Minute, maxTTL: time.Hour, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "zero headroom", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, pageSize: 1, maxPins: 1},
+		{name: "zero page", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, maxPins: 1},
+		{name: "zero pins", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validateLiveBackupConfig(
+				tc.defaultTTL, tc.maxTTL, tc.beginDeadline, tc.headroom, tc.pageSize, tc.maxPins,
+			))
+		})
+	}
+}
+
+type backupFenceOrderCoordinator struct {
+	stubStartupCoordinator
+	timestampDuringBarrier uint64
+	onBarrier              func(uint64)
+}
+
+type backupFenceTSOCoordinator struct {
+	stubStartupCoordinator
+	min            uint64
+	nextAfter      uint64
+	barriers       atomic.Int32
+	barrierErr     error
+	nextErr        error
+	afterErr       error
+	leaderCommitTS uint64
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroups(context.Context) error {
+	c.barriers.Add(1)
+	return c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroupsTimestamp(context.Context) (uint64, error) {
+	c.barriers.Add(1)
+	return c.leaderCommitTS, c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) Next(context.Context) (uint64, error) {
+	return c.nextAfter, c.nextErr
+}
+
+func (c *backupFenceTSOCoordinator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	c.min = min
+	return c.nextAfter, c.afterErr
+}
+
+func (c *backupFenceOrderCoordinator) LeaseReadAllGroups(context.Context) error {
+	ts, err := c.Clock().NextFenced()
+	if err != nil {
+		return err
+	}
+	c.timestampDuringBarrier = ts
+	if c.onBarrier != nil {
+		c.onBarrier(ts)
+	}
+	return nil
+}
+
+func TestAdminBackupReadFenceAllocatesTimestampAfterBarrier(t *testing.T) {
+	t.Parallel()
+	coordinate := &backupFenceOrderCoordinator{}
+	groupStore := store.NewMVCCStore()
+	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
+		1: {Store: groupStore},
+	})
+	coordinate.onBarrier = func(ts uint64) {
+		require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), ts, 0))
+	}
+	fence := adminBackupReadFence(coordinate, shardStore)
+	require.NotNil(t, fence)
+
+	readTS, err := fence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, coordinate.timestampDuringBarrier, shardStore.LastCommitTS())
+	require.Greater(t, readTS, coordinate.timestampDuringBarrier)
+}
+
+func TestAdminBackupReadFenceUsesCoordinatorTimestampAllocator(t *testing.T) {
+	t.Parallel()
+	coordinate := &backupFenceTSOCoordinator{nextAfter: 9_000, leaderCommitTS: 8_000}
+	groupStore := store.NewMVCCStore()
+	require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), 7_000, 0))
+	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
+		1: {Store: groupStore},
+	})
+	fence := adminBackupReadFence(coordinate, shardStore)
+
+	readTS, err := fence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(9_000), readTS)
+	require.Equal(t, uint64(8_000), coordinate.min)
+	require.Equal(t, int32(1), coordinate.barriers.Load())
 }
 
 func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {

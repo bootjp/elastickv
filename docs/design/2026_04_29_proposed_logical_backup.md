@@ -995,25 +995,26 @@ dumps with retention pressure.
 
 ### BeginBackup → EndBackup flow
 
-1. **Pick `read_ts`**: `BeginBackup` reads the lease-read timestamp
-   pipeline (`kv/lease_state.go`, see
-   `2026_04_20_implemented_lease_read.md`) and snapshots
-   `applied_index` per Raft group.
-2. **Wait for shards to catch up**: every group is required to report
-   `applied_index ≥ commit_index_at_pin` for the default group's HLC
-   ceiling proposal that produced `read_ts`. `BeginBackup` polls each
-   group's `Status.AppliedIndex` (already exposed via the existing
-   raftengine status interface used by `AdminServer.GetRaftGroups`)
-   with a 500 ms tick and a configurable deadline (default 5 s; surfaced
-   as `--begin-backup-deadline` on the CLI). **This is the binding wait
-   in practice** — a healthy group commits a Raft entry in <100 ms,
-   while a lagging shard recovering from a leader change or restart
-   can take seconds. Operators tuning `--begin-backup-deadline` are
-   adjusting tolerance for shard lag; it does not need to scale with
-   pin-fan-out latency. If any group fails to reach the threshold
-   within the deadline, `BeginBackup` returns `FailedPrecondition`
-   and the producer aborts — the dump is not started until every
-   group can serve `read_ts` consistently.
+1. **Pick `read_ts` after an all-group applied barrier**:
+   `BeginBackup` executes `LeaseReadAllGroups`, reads the maximum
+   applied `LastCommitTS`, and allocates `read_ts` strictly above it
+   through the configured HLC/TSO allocator. The barrier proves the
+   observed store watermark is applied; the replicated floor in step 2
+   closes the separate case where a writer already obtained a lower
+   timestamp but has not reached Raft apply yet.
+2. **Close the timestamp cut on every data group**: every `BackupPin`
+   persists a monotone `backup timestamp floor = read_ts` in the group
+   FSM before baseline or stream scanning. Raw, one-phase, and PREPARE
+   entries that arrive later with `commit_ts <= read_ts` fail closed.
+   COMMIT/ABORT entries for transactions prepared before the pin remain
+   resolvable: the snapshot scanner resolves committed locks and fails
+   `BeginBackup` on a still-pending primary. Applying the pin also
+   observes `read_ts` into the shared HLC. This covers cached TSO batch
+   values as well as HLC values and survives snapshots/restarts.
+   The durable catalog route snapshot is read from the catalog owner
+   group only after every data group has committed this floor, so a
+   delayed catalog write cannot change ownership at or below `read_ts`
+   after route capture.
 3. **Pin `read_ts` cluster-wide**, not just on the node that received
    the RPC. **Per-group `BackupPin` proposals are issued concurrently**
    — one goroutine per group — so a 100-shard cluster does not pay
@@ -1045,7 +1046,7 @@ dumps with retention pressure.
    `BackupScanner.Next(at_ts=read_ts)`.
 5. **Renew on long dumps**: the producer calls
    `RenewBackup(pin_token, ttl_ms)` every `ttl_ms / 3`. The admin
-   server proposes `BackupExtend{pin_id, read_ts, deadline}` on every group
+   server proposes `BackupExtend{pin_id, deadline}` on every group
    recorded in `pin_token`. The `read_ts` is preserved across
    renewals; only the deadline shifts. A multi-hour dump never relies
    on a single 30-minute pin. Renewals are cheap (one Raft entry per
@@ -1077,13 +1078,13 @@ keyspace, not a streaming tail.
 
 ### Cross-shard consistency
 
-Step 2 above is the mechanism. Without it, picking `read_ts` from
-`max(group_commit_ts) + 50 ms` is only a *liveness* assertion: a
-lagging shard might not yet have applied through `read_ts`, and
-`ScanAt(at_ts=read_ts)` on that shard would either block forever or
-return a partial view. The `applied_index` poll-and-wait in
-`BeginBackup` makes the constraint explicit and bounded — every shard
-provably has the data at `read_ts` before any scan begins.
+Steps 1 and 2 are the mechanism. The all-group lease barrier establishes an
+applied starting point, while the replicated timestamp floor prevents an
+already allocated low timestamp from arriving after that point and changing
+the snapshot. Either the write applies before its group pin and is visible to
+the baseline, or it reaches apply after the pin and is rejected. A prepared
+transaction is the deliberate exception: its resolution remains legal, and a
+pending primary makes the baseline fail instead of emitting a partial view.
 
 ## Internal-State Handling
 
@@ -1500,15 +1501,13 @@ written.
     types. Hand-coded fixed-layout binary (matching the HLC lease
     style):
     ```
-    BackupPin     : [envelope:2][pin_id:16][read_ts:8][deadline_ms:8] = 34 bytes
-    BackupExtend  : [envelope:2][pin_id:16][read_ts:8][deadline_ms:8] = 34 bytes
-    BackupRelease : [envelope:2][pin_id:16]                           = 18 bytes
+    BackupPin     : [tag:1][pin_id:16][read_ts:8][deadline_ms:8]   = 33 bytes
+    BackupExtend  : [tag:1][pin_id:16][deadline_ms:8]              = 25 bytes
+    BackupRelease : [tag:1][pin_id:16]                             = 17 bytes
     ```
     `pin_id` is a UUIDv4 generated by the admin server at
     `BeginBackup` time and echoed in every subsequent `BackupExtend`
     / `BackupRelease` so the FSM can target the right tracker entry.
-    `BackupExtend` also carries `read_ts`, allowing committed renewal
-    apply to reconstruct a fence that a replica-local expiry sweep removed.
     Hand-coded binary (vs. proto) keeps the entry small enough to
     stay well within the `MaxSizePerMsg` limit (default 1 MiB,
     `internal/raftengine/etcd/engine.go:55`) and avoids
@@ -1590,7 +1589,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupPinFanOutAllNodes` | A 3-node cluster: `BeginBackup` issued to node A; verify nodes B and C have applied the `BackupPin` Raft entry and their compactors retain MVCC versions at `read_ts`. Compactor on B forced to run mid-dump must not retire pinned versions |
 | `TestBeginBackupPinSurvivesLeaderChange` | After `BeginBackup` on node A, force a leadership change on a group; the new leader still honors the pin (its FSM applied the same entry); subsequent `BackupScanner.Next` calls succeed |
 | `TestBeginBackupGroupUnreachable` | If one group cannot commit `BackupPin` within `--begin-backup-deadline`, `BeginBackup` returns `Unavailable` and proposes `BackupRelease` on every group that did commit; no stranded pins remain |
-| `TestBackupPinFSMCodecRoundTrip` | `BackupPin` / `BackupExtend` / `BackupRelease` byte layouts (34 / 34 / 18 bytes) round-trip through the FSM apply path; unknown tag bytes return `ErrUnknownRequestType` rather than panicking |
+| `TestBackupPinFSMCodecRoundTrip` | `BackupPin` / `BackupExtend` / `BackupRelease` byte layouts (33 / 25 / 17 bytes) round-trip through the FSM apply path; unknown tag bytes return `ErrUnknownRequestType` rather than panicking |
 | `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope expected-keys baseline detects the resulting `ScanAt` shortfall (count below `99% × baseline ± sqrt(baseline)`) and fails the dump with `ErrCompactionDuringDump` rather than emitting a corrupted artifact |
 | `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `SnapshotEvery - (AppliedIndex - LastSnapshotIndex) < --snapshot-headroom-entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path. Verify a freshly-snapshotted cluster (largest remaining headroom) is allowed |
 | `TestExpectedKeysBaselineToleratesTTLExpiry` | Routine TTL expiry between baseline and dump (1% of keys gone) does NOT trigger `ErrCompactionDuringDump`; a 5% drop DOES |

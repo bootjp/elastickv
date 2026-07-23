@@ -296,6 +296,12 @@ type AllGroupsLeaseReadableCoordinator interface {
 	LeaseReadAllGroups(ctx context.Context) error
 }
 
+// AllGroupsLeaseTimestampCoordinator extends the all-group barrier with the
+// greatest commit timestamp applied by any fenced group leader.
+type AllGroupsLeaseTimestampCoordinator interface {
+	LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error)
+}
+
 // LeaseReadAllGroupsThrough establishes the lease freshness bound across
 // every shard group a multi-shard read can touch. When the coordinator owns
 // multiple groups (AllGroupsLeaseReadableCoordinator) it fences all of them;
@@ -309,6 +315,20 @@ func LeaseReadAllGroupsThrough(c Coordinator, ctx context.Context) error {
 	}
 	_, err := LeaseReadThrough(c, ctx)
 	return errors.WithStack(err)
+}
+
+// LeaseReadAllGroupsTimestampThrough returns the greatest leader-side commit
+// timestamp when the coordinator exposes it. Legacy coordinators still execute
+// their all-group barrier and return a zero watermark to their caller.
+func LeaseReadAllGroupsTimestampThrough(c Coordinator, ctx context.Context) (uint64, error) {
+	if ag, ok := c.(AllGroupsLeaseTimestampCoordinator); ok {
+		ts, err := ag.LeaseReadAllGroupsTimestamp(ctx)
+		return ts, errors.WithStack(err)
+	}
+	if err := LeaseReadAllGroupsThrough(c, ctx); err != nil {
+		return 0, err
+	}
+	return 0, nil
 }
 
 // GroupRoutableCoordinator is the optional capability implemented by

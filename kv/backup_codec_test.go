@@ -27,14 +27,13 @@ func TestBackupCodecRoundTrip(t *testing.T) {
 
 	extendWire := EncodeBackupExtendEntry(BackupExtendEntry{
 		PinID:    pinID,
-		ReadTS:   42,
 		Deadline: deadline.Add(time.Second),
 	})
 	require.Len(t, extendWire, backupExtendEntryLen)
 	gotExtend, err := decodeBackupEntry(extendWire)
 	require.NoError(t, err)
 	require.Equal(t, backupSubtypeExtend, gotExtend.subtype)
-	require.Equal(t, BackupExtendEntry{PinID: pinID, ReadTS: 42, Deadline: deadline.Add(time.Second)}, gotExtend.extend)
+	require.Equal(t, BackupExtendEntry{PinID: pinID, Deadline: deadline.Add(time.Second)}, gotExtend.extend)
 
 	releaseWire := EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID})
 	require.Len(t, releaseWire, backupReleaseEntryLen)
@@ -42,6 +41,25 @@ func TestBackupCodecRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, backupSubtypeRelease, gotRelease.subtype)
 	require.Equal(t, BackupReleaseEntry{PinID: pinID}, gotRelease.release)
+}
+
+func TestBackupCodecReserveRoundTrip(t *testing.T) {
+	pinID := backupTrackerTestPinID(4)
+	deadline := time.UnixMilli(9000)
+
+	reserve, err := decodeBackupEntry(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: pinID, ReadTS: 88, Deadline: deadline,
+	}))
+	require.NoError(t, err)
+	require.Equal(t, backupSubtypeReserve, reserve.subtype)
+	require.Equal(t, pinID, reserve.pin.PinID)
+	require.Equal(t, uint64(88), reserve.pin.ReadTS)
+	require.Equal(t, deadline, reserve.pin.Deadline)
+
+	unreserve, err := decodeBackupEntry(EncodeBackupUnreserveEntry(BackupUnreserveEntry{PinID: pinID}))
+	require.NoError(t, err)
+	require.Equal(t, backupSubtypeUnreserve, unreserve.subtype)
+	require.Equal(t, pinID, unreserve.release.PinID)
 }
 
 func TestBackupCodecRejectsMalformedWire(t *testing.T) {
@@ -75,7 +93,6 @@ func TestBackupCodecZeroDeadlineDecodesToZeroTime(t *testing.T) {
 
 	gotExtend, err := decodeBackupEntry(EncodeBackupExtendEntry(BackupExtendEntry{
 		PinID:    pinID,
-		ReadTS:   42,
 		Deadline: time.Time{},
 	}))
 	require.NoError(t, err)

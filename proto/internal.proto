@@ -6,6 +6,8 @@ option go_package = "github.com/bootjp/elastickv/proto";
 service Internal {
   // for internal leader redirect only
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
+  rpc ForwardAdminProposal(ForwardAdminProposalRequest) returns (ForwardAdminProposalResponse) {}
+  rpc ForwardLeaseRead(ForwardLeaseReadRequest) returns (ForwardLeaseReadResponse) {}
   rpc RelayPublish(RelayPublishRequest) returns (RelayPublishResponse) {}
 }
 
@@ -75,6 +77,21 @@ message ForwardResponse {
   bool success = 1;
   uint64 commit_index = 2;
   uint64 commit_ts = 3;
+}
+
+message ForwardAdminProposalRequest {
+  bytes payload = 1;
+}
+
+message ForwardAdminProposalResponse {
+  uint64 commit_index = 1;
+}
+
+message ForwardLeaseReadRequest {}
+
+message ForwardLeaseReadResponse {
+  uint64 applied_index = 1;
+  uint64 last_commit_ts = 2;
 }
 
 message RelayPublishRequest {

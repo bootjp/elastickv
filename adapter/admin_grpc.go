@@ -13,6 +13,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -137,6 +138,18 @@ type AdminServer struct {
 	leaderVersionProbeSeq     atomic.Uint64
 	versionCache              sync.Map
 
+	backupMu              sync.Mutex
+	backupStateMu         sync.Mutex
+	backupStore           BackupStore
+	backupReadFence       BackupReadFence
+	backupPeerProbe       BackupPeerProbe
+	backupLimiter         BackupPinLimiter
+	backupTokenKey        [32]byte
+	backupProtocolVersion uint32
+	backupConfig          backupConfig
+	backupProposers       map[uint64]raftengine.Proposer
+	backupSessions        map[kv.BackupPinID]backupSession
+
 	pb.UnimplementedAdminServer
 }
 
@@ -155,6 +168,9 @@ func NewAdminServer(self NodeIdentity, members []NodeIdentity, opts ...AdminOpti
 		now:                       time.Now,
 		leaderVersionProbeTimeout: defaultAdminLeaderVersionProbeTimeout,
 		leaderVersionCacheTTL:     defaultAdminLeaderVersionCacheTTL,
+		backupConfig:              defaultBackupConfig(),
+		backupProposers:           make(map[uint64]raftengine.Proposer),
+		backupSessions:            make(map[kv.BackupPinID]backupSession),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -521,7 +537,10 @@ func (s *AdminServer) GetNodeVersion(
 	context.Context,
 	*pb.GetNodeVersionRequest,
 ) (*pb.GetNodeVersionResponse, error) {
-	return &pb.GetNodeVersionResponse{NodeVersion: s.nodeVersion}, nil
+	return &pb.GetNodeVersionResponse{
+		NodeVersion:           s.nodeVersion,
+		BackupProtocolVersion: s.backupProtocolVersion,
+	}, nil
 }
 
 func (s *AdminServer) leaderNodeVersion(ctx context.Context, leader raftengine.LeaderInfo, now time.Time, addresses []string) string {
@@ -703,6 +722,12 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
+func adminAuthenticatedMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
+		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
+		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
+}
+
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
 // "authorization: Bearer <token>" metadata against the supplied token. An
 // empty token disables enforcement; callers should pair that mode with a
@@ -736,7 +761,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !adminAuthenticatedMethod(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		if err := check(ctx); err != nil {
@@ -750,7 +775,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if !strings.HasPrefix(info.FullMethod, adminMethodPrefix) {
+		if !adminAuthenticatedMethod(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		if err := check(ss.Context()); err != nil {

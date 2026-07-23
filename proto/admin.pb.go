@@ -1178,12 +1178,13 @@ func (x *BackupShardApplied) GetAppliedIndex() uint64 {
 }
 
 type BackupExpectedKeys struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Adapter       string                 `protobuf:"bytes,1,opt,name=adapter,proto3" json:"adapter,omitempty"`
-	Scope         string                 `protobuf:"bytes,2,opt,name=scope,proto3" json:"scope,omitempty"`
-	KeyCount      uint64                 `protobuf:"varint,3,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	Adapter             string                 `protobuf:"bytes,1,opt,name=adapter,proto3" json:"adapter,omitempty"`
+	Scope               string                 `protobuf:"bytes,2,opt,name=scope,proto3" json:"scope,omitempty"`
+	KeyCount            uint64                 `protobuf:"varint,3,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
+	AppliedIndexAtCount uint64                 `protobuf:"varint,4,opt,name=applied_index_at_count,json=appliedIndexAtCount,proto3" json:"applied_index_at_count,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *BackupExpectedKeys) Reset() {
@@ -1233,6 +1234,13 @@ func (x *BackupExpectedKeys) GetScope() string {
 func (x *BackupExpectedKeys) GetKeyCount() uint64 {
 	if x != nil {
 		return x.KeyCount
+	}
+	return 0
+}
+
+func (x *BackupExpectedKeys) GetAppliedIndexAtCount() uint64 {
+	if x != nil {
+		return x.AppliedIndexAtCount
 	}
 	return 0
 }
@@ -1412,8 +1420,10 @@ func (x *RenewBackupRequest) GetTtlMs() uint64 {
 type RenewBackupResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	TtlMsEffective uint64                 `protobuf:"varint,1,opt,name=ttl_ms_effective,json=ttlMsEffective,proto3" json:"ttl_ms_effective,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Replaces the request token and carries the newly committed hard deadline.
+	PinToken      []byte `protobuf:"bytes,2,opt,name=pin_token,json=pinToken,proto3" json:"pin_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RenewBackupResponse) Reset() {
@@ -1451,6 +1461,13 @@ func (x *RenewBackupResponse) GetTtlMsEffective() uint64 {
 		return x.TtlMsEffective
 	}
 	return 0
+}
+
+func (x *RenewBackupResponse) GetPinToken() []byte {
+	if x != nil {
+		return x.PinToken
+	}
+	return nil
 }
 
 type EndBackupRequest struct {
@@ -1673,6 +1690,112 @@ func (x *ListAdaptersAndScopesResponse) GetScopes() []*BackupScope {
 	return nil
 }
 
+type StreamBackupRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	PinToken []byte                 `protobuf:"bytes,1,opt,name=pin_token,json=pinToken,proto3" json:"pin_token,omitempty"`
+	// Empty means every scope present at read_ts. Otherwise only the exact
+	// adapter/scope pairs are emitted.
+	Scopes        []*BackupScope `protobuf:"bytes,2,rep,name=scopes,proto3" json:"scopes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamBackupRequest) Reset() {
+	*x = StreamBackupRequest{}
+	mi := &file_admin_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamBackupRequest) ProtoMessage() {}
+
+func (x *StreamBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamBackupRequest.ProtoReflect.Descriptor instead.
+func (*StreamBackupRequest) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *StreamBackupRequest) GetPinToken() []byte {
+	if x != nil {
+		return x.PinToken
+	}
+	return nil
+}
+
+func (x *StreamBackupRequest) GetScopes() []*BackupScope {
+	if x != nil {
+		return x.Scopes
+	}
+	return nil
+}
+
+type BackupKV struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupKV) Reset() {
+	*x = BackupKV{}
+	mi := &file_admin_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupKV) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupKV) ProtoMessage() {}
+
+func (x *BackupKV) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupKV.ProtoReflect.Descriptor instead.
+func (*BackupKV) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *BackupKV) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *BackupKV) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
 type GetNodeVersionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1681,7 +1804,7 @@ type GetNodeVersionRequest struct {
 
 func (x *GetNodeVersionRequest) Reset() {
 	*x = GetNodeVersionRequest{}
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1693,7 +1816,7 @@ func (x *GetNodeVersionRequest) String() string {
 func (*GetNodeVersionRequest) ProtoMessage() {}
 
 func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1706,19 +1829,23 @@ func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionRequest.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{26}
+	return file_admin_proto_rawDescGZIP(), []int{28}
 }
 
 type GetNodeVersionResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeVersion   string                 `protobuf:"bytes,1,opt,name=node_version,json=nodeVersion,proto3" json:"node_version,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	NodeVersion string                 `protobuf:"bytes,1,opt,name=node_version,json=nodeVersion,proto3" json:"node_version,omitempty"`
+	// backup_protocol_version is a capability gate, not a release-version
+	// comparison. Zero means the node cannot safely apply live-backup FSM
+	// entries; version 1 supports reservation, pin, renew, release and stream.
+	BackupProtocolVersion uint32 `protobuf:"varint,2,opt,name=backup_protocol_version,json=backupProtocolVersion,proto3" json:"backup_protocol_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *GetNodeVersionResponse) Reset() {
 	*x = GetNodeVersionResponse{}
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1730,7 +1857,7 @@ func (x *GetNodeVersionResponse) String() string {
 func (*GetNodeVersionResponse) ProtoMessage() {}
 
 func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1743,7 +1870,7 @@ func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionResponse.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{27}
+	return file_admin_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *GetNodeVersionResponse) GetNodeVersion() string {
@@ -1751,6 +1878,13 @@ func (x *GetNodeVersionResponse) GetNodeVersion() string {
 		return x.NodeVersion
 	}
 	return ""
+}
+
+func (x *GetNodeVersionResponse) GetBackupProtocolVersion() uint32 {
+	if x != nil {
+		return x.BackupProtocolVersion
+	}
+	return 0
 }
 
 type StreamEventsRequest struct {
@@ -1761,7 +1895,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1773,7 +1907,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1786,7 +1920,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{28}
+	return file_admin_proto_rawDescGZIP(), []int{30}
 }
 
 type StreamEventsEvent struct {
@@ -1802,7 +1936,7 @@ type StreamEventsEvent struct {
 
 func (x *StreamEventsEvent) Reset() {
 	*x = StreamEventsEvent{}
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1814,7 +1948,7 @@ func (x *StreamEventsEvent) String() string {
 func (*StreamEventsEvent) ProtoMessage() {}
 
 func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1827,7 +1961,7 @@ func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsEvent.ProtoReflect.Descriptor instead.
 func (*StreamEventsEvent) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{29}
+	return file_admin_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *StreamEventsEvent) GetEvent() isStreamEventsEvent_Event {
@@ -1883,7 +2017,7 @@ type RouteTransition struct {
 
 func (x *RouteTransition) Reset() {
 	*x = RouteTransition{}
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1895,7 +2029,7 @@ func (x *RouteTransition) String() string {
 func (*RouteTransition) ProtoMessage() {}
 
 func (x *RouteTransition) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1908,7 +2042,7 @@ func (x *RouteTransition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteTransition.ProtoReflect.Descriptor instead.
 func (*RouteTransition) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{30}
+	return file_admin_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RouteTransition) GetParentRouteId() uint64 {
@@ -1950,7 +2084,7 @@ type KeyVizColumn struct {
 
 func (x *KeyVizColumn) Reset() {
 	*x = KeyVizColumn{}
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1962,7 +2096,7 @@ func (x *KeyVizColumn) String() string {
 func (*KeyVizColumn) ProtoMessage() {}
 
 func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1975,7 +2109,7 @@ func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyVizColumn.ProtoReflect.Descriptor instead.
 func (*KeyVizColumn) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{31}
+	return file_admin_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *KeyVizColumn) GetColumnUnixMs() int64 {
@@ -2089,11 +2223,12 @@ const file_admin_proto_rawDesc = "" +
 	"perAdapter\"]\n" +
 	"\x12BackupShardApplied\x12\"\n" +
 	"\rraft_group_id\x18\x01 \x01(\x04R\vraftGroupId\x12#\n" +
-	"\rapplied_index\x18\x02 \x01(\x04R\fappliedIndex\"a\n" +
+	"\rapplied_index\x18\x02 \x01(\x04R\fappliedIndex\"\x96\x01\n" +
 	"\x12BackupExpectedKeys\x12\x18\n" +
 	"\aadapter\x18\x01 \x01(\tR\aadapter\x12\x14\n" +
 	"\x05scope\x18\x02 \x01(\tR\x05scope\x12\x1b\n" +
-	"\tkey_count\x18\x03 \x01(\x04R\bkeyCount\"+\n" +
+	"\tkey_count\x18\x03 \x01(\x04R\bkeyCount\x123\n" +
+	"\x16applied_index_at_count\x18\x04 \x01(\x04R\x13appliedIndexAtCount\"+\n" +
 	"\x12BeginBackupRequest\x12\x15\n" +
 	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\"\xdc\x01\n" +
 	"\x13BeginBackupResponse\x12\x17\n" +
@@ -2104,9 +2239,10 @@ const file_admin_proto_rawDesc = "" +
 	"\rexpected_keys\x18\x05 \x03(\v2\x13.BackupExpectedKeysR\fexpectedKeys\"H\n" +
 	"\x12RenewBackupRequest\x12\x1b\n" +
 	"\tpin_token\x18\x01 \x01(\fR\bpinToken\x12\x15\n" +
-	"\x06ttl_ms\x18\x02 \x01(\x04R\x05ttlMs\"?\n" +
+	"\x06ttl_ms\x18\x02 \x01(\x04R\x05ttlMs\"\\\n" +
 	"\x13RenewBackupResponse\x12(\n" +
-	"\x10ttl_ms_effective\x18\x01 \x01(\x04R\x0ettlMsEffective\"/\n" +
+	"\x10ttl_ms_effective\x18\x01 \x01(\x04R\x0ettlMsEffective\x12\x1b\n" +
+	"\tpin_token\x18\x02 \x01(\fR\bpinToken\"/\n" +
 	"\x10EndBackupRequest\x12\x1b\n" +
 	"\tpin_token\x18\x01 \x01(\fR\bpinToken\"\x13\n" +
 	"\x11EndBackupResponse\";\n" +
@@ -2116,10 +2252,17 @@ const file_admin_proto_rawDesc = "" +
 	"\aadapter\x18\x01 \x01(\tR\aadapter\x12\x14\n" +
 	"\x05scope\x18\x02 \x01(\tR\x05scope\"E\n" +
 	"\x1dListAdaptersAndScopesResponse\x12$\n" +
-	"\x06scopes\x18\x01 \x03(\v2\f.BackupScopeR\x06scopes\"\x17\n" +
-	"\x15GetNodeVersionRequest\";\n" +
+	"\x06scopes\x18\x01 \x03(\v2\f.BackupScopeR\x06scopes\"X\n" +
+	"\x13StreamBackupRequest\x12\x1b\n" +
+	"\tpin_token\x18\x01 \x01(\fR\bpinToken\x12$\n" +
+	"\x06scopes\x18\x02 \x03(\v2\f.BackupScopeR\x06scopes\"2\n" +
+	"\bBackupKV\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"\x17\n" +
+	"\x15GetNodeVersionRequest\"s\n" +
 	"\x16GetNodeVersionResponse\x12!\n" +
-	"\fnode_version\x18\x01 \x01(\tR\vnodeVersion\"\x15\n" +
+	"\fnode_version\x18\x01 \x01(\tR\vnodeVersion\x126\n" +
+	"\x17backup_protocol_version\x18\x02 \x01(\rR\x15backupProtocolVersion\"\x15\n" +
 	"\x13StreamEventsRequest\"\x91\x01\n" +
 	"\x11StreamEventsEvent\x12=\n" +
 	"\x10route_transition\x18\x01 \x01(\v2\x10.RouteTransitionH\x00R\x0frouteTransition\x124\n" +
@@ -2147,7 +2290,7 @@ const file_admin_proto_rawDesc = "" +
 	"\x17SAMPLE_ROLE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18SAMPLE_ROLE_LEADER_WRITE\x10\x01\x12\x1b\n" +
 	"\x17SAMPLE_ROLE_LEADER_READ\x10\x02\x12\x1d\n" +
-	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x032\x80\x06\n" +
+	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x032\xb5\x06\n" +
 	"\x05Admin\x12O\n" +
 	"\x12GetClusterOverview\x12\x1a.GetClusterOverviewRequest\x1a\x1b.GetClusterOverviewResponse\"\x00\x12@\n" +
 	"\rGetRaftGroups\x12\x15.GetRaftGroupsRequest\x1a\x16.GetRaftGroupsResponse\"\x00\x12L\n" +
@@ -2157,7 +2300,8 @@ const file_admin_proto_rawDesc = "" +
 	"\vBeginBackup\x12\x13.BeginBackupRequest\x1a\x14.BeginBackupResponse\"\x00\x12:\n" +
 	"\vRenewBackup\x12\x13.RenewBackupRequest\x1a\x14.RenewBackupResponse\"\x00\x124\n" +
 	"\tEndBackup\x12\x11.EndBackupRequest\x1a\x12.EndBackupResponse\"\x00\x12X\n" +
-	"\x15ListAdaptersAndScopes\x12\x1d.ListAdaptersAndScopesRequest\x1a\x1e.ListAdaptersAndScopesResponse\"\x00\x12C\n" +
+	"\x15ListAdaptersAndScopes\x12\x1d.ListAdaptersAndScopesRequest\x1a\x1e.ListAdaptersAndScopesResponse\"\x00\x123\n" +
+	"\fStreamBackup\x12\x14.StreamBackupRequest\x1a\t.BackupKV\"\x000\x01\x12C\n" +
 	"\x0eGetNodeVersion\x12\x16.GetNodeVersionRequest\x1a\x17.GetNodeVersionResponse\"\x00\x12<\n" +
 	"\fStreamEvents\x12\x14.StreamEventsRequest\x1a\x12.StreamEventsEvent\"\x000\x01B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
@@ -2174,7 +2318,7 @@ func file_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
+var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_admin_proto_goTypes = []any{
 	(KeyVizSeries)(0),                     // 0: KeyVizSeries
 	(SampleRole)(0),                       // 1: SampleRole
@@ -2204,19 +2348,21 @@ var file_admin_proto_goTypes = []any{
 	(*ListAdaptersAndScopesRequest)(nil),  // 25: ListAdaptersAndScopesRequest
 	(*BackupScope)(nil),                   // 26: BackupScope
 	(*ListAdaptersAndScopesResponse)(nil), // 27: ListAdaptersAndScopesResponse
-	(*GetNodeVersionRequest)(nil),         // 28: GetNodeVersionRequest
-	(*GetNodeVersionResponse)(nil),        // 29: GetNodeVersionResponse
-	(*StreamEventsRequest)(nil),           // 30: StreamEventsRequest
-	(*StreamEventsEvent)(nil),             // 31: StreamEventsEvent
-	(*RouteTransition)(nil),               // 32: RouteTransition
-	(*KeyVizColumn)(nil),                  // 33: KeyVizColumn
-	nil,                                   // 34: GetClusterOverviewResponse.CapabilitiesEntry
+	(*StreamBackupRequest)(nil),           // 28: StreamBackupRequest
+	(*BackupKV)(nil),                      // 29: BackupKV
+	(*GetNodeVersionRequest)(nil),         // 30: GetNodeVersionRequest
+	(*GetNodeVersionResponse)(nil),        // 31: GetNodeVersionResponse
+	(*StreamEventsRequest)(nil),           // 32: StreamEventsRequest
+	(*StreamEventsEvent)(nil),             // 33: StreamEventsEvent
+	(*RouteTransition)(nil),               // 34: RouteTransition
+	(*KeyVizColumn)(nil),                  // 35: KeyVizColumn
+	nil,                                   // 36: GetClusterOverviewResponse.CapabilitiesEntry
 }
 var file_admin_proto_depIdxs = []int32{
 	2,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
 	2,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
 	3,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
-	34, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
+	36, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
 	6,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
 	9,  // 5: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
 	1,  // 6: KeyVizRow.sample_roles:type_name -> SampleRole
@@ -2227,37 +2373,40 @@ var file_admin_proto_depIdxs = []int32{
 	17, // 11: BeginBackupResponse.shards:type_name -> BackupShardApplied
 	18, // 12: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
 	26, // 13: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
-	32, // 14: StreamEventsEvent.route_transition:type_name -> RouteTransition
-	33, // 15: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
-	0,  // 16: KeyVizColumn.series:type_name -> KeyVizSeries
-	12, // 17: KeyVizColumn.rows:type_name -> KeyVizRow
-	4,  // 18: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
-	7,  // 19: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
-	10, // 20: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
-	13, // 21: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
-	15, // 22: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
-	19, // 23: Admin.BeginBackup:input_type -> BeginBackupRequest
-	21, // 24: Admin.RenewBackup:input_type -> RenewBackupRequest
-	23, // 25: Admin.EndBackup:input_type -> EndBackupRequest
-	25, // 26: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
-	28, // 27: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
-	30, // 28: Admin.StreamEvents:input_type -> StreamEventsRequest
-	5,  // 29: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
-	8,  // 30: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
-	11, // 31: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
-	14, // 32: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
-	16, // 33: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
-	20, // 34: Admin.BeginBackup:output_type -> BeginBackupResponse
-	22, // 35: Admin.RenewBackup:output_type -> RenewBackupResponse
-	24, // 36: Admin.EndBackup:output_type -> EndBackupResponse
-	27, // 37: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
-	29, // 38: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
-	31, // 39: Admin.StreamEvents:output_type -> StreamEventsEvent
-	29, // [29:40] is the sub-list for method output_type
-	18, // [18:29] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	26, // 14: StreamBackupRequest.scopes:type_name -> BackupScope
+	34, // 15: StreamEventsEvent.route_transition:type_name -> RouteTransition
+	35, // 16: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
+	0,  // 17: KeyVizColumn.series:type_name -> KeyVizSeries
+	12, // 18: KeyVizColumn.rows:type_name -> KeyVizRow
+	4,  // 19: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
+	7,  // 20: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
+	10, // 21: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
+	13, // 22: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
+	15, // 23: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
+	19, // 24: Admin.BeginBackup:input_type -> BeginBackupRequest
+	21, // 25: Admin.RenewBackup:input_type -> RenewBackupRequest
+	23, // 26: Admin.EndBackup:input_type -> EndBackupRequest
+	25, // 27: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
+	28, // 28: Admin.StreamBackup:input_type -> StreamBackupRequest
+	30, // 29: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
+	32, // 30: Admin.StreamEvents:input_type -> StreamEventsRequest
+	5,  // 31: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
+	8,  // 32: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
+	11, // 33: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
+	14, // 34: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
+	16, // 35: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
+	20, // 36: Admin.BeginBackup:output_type -> BeginBackupResponse
+	22, // 37: Admin.RenewBackup:output_type -> RenewBackupResponse
+	24, // 38: Admin.EndBackup:output_type -> EndBackupResponse
+	27, // 39: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
+	29, // 40: Admin.StreamBackup:output_type -> BackupKV
+	31, // 41: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
+	33, // 42: Admin.StreamEvents:output_type -> StreamEventsEvent
+	31, // [31:43] is the sub-list for method output_type
+	19, // [19:31] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_admin_proto_init() }
@@ -2265,7 +2414,7 @@ func file_admin_proto_init() {
 	if File_admin_proto != nil {
 		return
 	}
-	file_admin_proto_msgTypes[29].OneofWrappers = []any{
+	file_admin_proto_msgTypes[31].OneofWrappers = []any{
 		(*StreamEventsEvent_RouteTransition)(nil),
 		(*StreamEventsEvent_KeyvizColumn)(nil),
 	}
@@ -2275,7 +2424,7 @@ func file_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_admin_proto_rawDesc), len(file_admin_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   33,
+			NumMessages:   35,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

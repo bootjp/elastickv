@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	defaultMaxActiveBackupPins = 64
+	defaultMaxActiveBackupPins = 4
 	defaultBackupPinSweepEvery = time.Second
 )
 
@@ -70,16 +70,17 @@ func WithActiveTimestampTrackerLogger(logger *slog.Logger) ActiveTimestampTracke
 // ActiveTimestampTracker tracks in-flight read or transaction timestamps that
 // must remain readable while background compaction is running.
 type ActiveTimestampTracker struct {
-	mu            sync.Mutex
-	nextID        uint64
-	active        map[uint64]uint64
-	backupPins    map[backupPinKey]backupDeadlinePin
-	maxBackupPins int
-	sweepEvery    time.Duration
-	sweepOnce     sync.Once
-	stopCh        chan struct{}
-	closeOnce     sync.Once
-	logger        *slog.Logger
+	mu                  sync.Mutex
+	nextID              uint64
+	active              map[uint64]uint64
+	backupPins          map[backupPinKey]backupDeadlinePin
+	maxBackupPins       int
+	sweepEvery          time.Duration
+	sweepOnce           sync.Once
+	stopCh              chan struct{}
+	closeOnce           sync.Once
+	logger              *slog.Logger
+	backupFloorObserver func(uint64)
 }
 
 // ActiveTimestampToken releases one tracked timestamp when the owning
@@ -107,6 +108,17 @@ func NewActiveTimestampTracker(opts ...ActiveTimestampTrackerOption) *ActiveTime
 	return t
 }
 
+// SetBackupTimestampFloorObserver installs the process-local timestamp-cache
+// invalidation callback invoked after a replicated backup pin is accepted.
+func (t *ActiveTimestampTracker) SetBackupTimestampFloorObserver(observer func(uint64)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.backupFloorObserver = observer
+	t.mu.Unlock()
+}
+
 func (t *ActiveTimestampTracker) Pin(ts uint64) *ActiveTimestampToken {
 	if t == nil || ts == 0 || ts == ^uint64(0) {
 		return &ActiveTimestampToken{}
@@ -130,6 +142,18 @@ func (t *ActiveTimestampTracker) Oldest() uint64 {
 // groupID. Backup pins for other Raft groups do not constrain this group.
 func (t *ActiveTimestampTracker) OldestForGroup(groupID uint64) uint64 {
 	return t.oldestForGroup(groupID, true)
+}
+
+// OldestBackupForGroup returns the oldest live backup pin for groupID,
+// excluding ordinary read pins. FSM snapshot generation uses this to avoid
+// emitting a snapshot that would drop active backup retention state.
+func (t *ActiveTimestampTracker) OldestBackupForGroup(groupID uint64) uint64 {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return oldestBackupTimestamp(t.backupPins, groupID, true, time.Now())
 }
 
 func (t *ActiveTimestampTracker) oldestForGroup(groupID uint64, scoped bool) uint64 {
@@ -206,8 +230,12 @@ func (t *ActiveTimestampTracker) pinWithDeadlineForGroup(pinID BackupPinID, grou
 	t.backupPins[key] = mergeBackupDeadlinePin(
 		t.backupPins[key], backupDeadlinePin{readTS: readTS, deadline: deadline},
 	)
+	observer := t.backupFloorObserver
 	t.startBackupPinSweeperLocked()
 	t.mu.Unlock()
+	if observer != nil {
+		observer(readTS)
+	}
 	t.logExpiredBackupPins(expired)
 	return nil
 }
@@ -231,19 +259,14 @@ func (t *ActiveTimestampTracker) Extend(pinID BackupPinID, deadline time.Time) e
 }
 
 func (t *ActiveTimestampTracker) ExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
-	return t.extendForGroup(pinID, groupID, deadline)
+	return t.extendForGroup(pinID, groupID, deadline, true)
 }
 
-func (t *ActiveTimestampTracker) ApplyExtendForGroup(
-	pinID BackupPinID,
-	groupID uint64,
-	readTS uint64,
-	deadline time.Time,
-) error {
-	return t.pinWithDeadlineForGroup(pinID, groupID, readTS, deadline, false)
+func (t *ActiveTimestampTracker) ApplyExtendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+	return t.extendForGroup(pinID, groupID, deadline, false)
 }
 
-func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time) error {
+func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint64, deadline time.Time, returnMissingExpired bool) error {
 	if t == nil {
 		return nil
 	}
@@ -255,9 +278,12 @@ func (t *ActiveTimestampTracker) extendForGroup(pinID BackupPinID, groupID uint6
 	pin, exists := t.backupPins[key]
 	if !exists {
 		t.mu.Unlock()
+		if !returnMissingExpired {
+			return nil
+		}
 		return errors.WithStack(ErrInvalidBackupPin)
 	}
-	if !pin.deadline.After(time.Now()) {
+	if returnMissingExpired && !pin.deadline.After(time.Now()) {
 		delete(t.backupPins, key)
 		t.mu.Unlock()
 		t.logExpiredBackupPins([]expiredBackupPin{{key: key, ts: pin.readTS}})

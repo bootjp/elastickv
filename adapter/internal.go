@@ -8,6 +8,8 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type InternalOption func(*Internal)
@@ -15,6 +17,18 @@ type InternalOption func(*Internal)
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
+	}
+}
+
+func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.adminProposer = proposer
+	}
+}
+
+func WithInternalLastCommitTimestamp(reader func() uint64) InternalOption {
+	return func(i *Internal) {
+		i.lastCommitTimestamp = reader
 	}
 }
 
@@ -32,11 +46,13 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
+	leader              raftengine.LeaderView
+	transactionManager  kv.Transactional
+	clock               *kv.HLC
+	tsAllocator         kv.TimestampAllocator
+	adminProposer       raftengine.Proposer
+	lastCommitTimestamp func() uint64
+	relay               *RedisPubSubRelay
 
 	pb.UnimplementedInternalServer
 }
@@ -76,6 +92,63 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func (i *Internal) ForwardAdminProposal(
+	ctx context.Context,
+	req *pb.ForwardAdminProposalRequest,
+) (*pb.ForwardAdminProposalResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if i.adminProposer == nil {
+		return nil, errors.New("admin proposer is unavailable")
+	}
+	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := forwardedAdminProposalResponseError(result); err != nil {
+		return nil, err
+	}
+	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
+}
+
+func (i *Internal) ForwardLeaseRead(
+	ctx context.Context,
+	_ *pb.ForwardLeaseReadRequest,
+) (*pb.ForwardLeaseReadResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	index, err := i.leader.LinearizableRead(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	lastCommitTS := uint64(0)
+	if i.lastCommitTimestamp != nil {
+		lastCommitTS = i.lastCommitTimestamp()
+	}
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS}, nil
+}
+
+func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {
+	if result == nil {
+		return errors.New("admin proposal returned nil result")
+	}
+	if result.Response == nil {
+		return nil
+	}
+	if err, ok := result.Response.(error); ok {
+		if errors.Is(err, kv.ErrTooManyActiveBackups) {
+			return status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
+		}
+		return errors.WithStack(err)
+	}
+	return errors.Errorf("unexpected admin proposal response %T", result.Response)
 }
 
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {

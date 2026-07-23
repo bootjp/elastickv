@@ -1,11 +1,24 @@
 package kv
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestActiveTimestampTrackerNotifiesBackupTimestampFloor(t *testing.T) {
+	t.Parallel()
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	var observed atomic.Uint64
+	tracker.SetBackupTimestampFloorObserver(observed.Store)
+
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(
+		backupTrackerTestPinID(1), 7, 42, time.Now().Add(time.Hour),
+	))
+	require.Equal(t, uint64(42), observed.Load())
+}
 
 func TestActiveTimestampTrackerOldest(t *testing.T) {
 	tracker := NewActiveTimestampTracker()
@@ -35,6 +48,19 @@ func TestActiveTimestampTrackerOldestIncludesBackupPins(t *testing.T) {
 
 	tracker.ReleaseBackupPin(pinID)
 	require.Equal(t, uint64(30), tracker.Oldest())
+}
+
+func TestActiveTimestampTrackerOldestBackupForGroupIgnoresReadsAndOtherGroups(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	read := tracker.Pin(5)
+	defer read.Release()
+	deadline := time.Now().Add(time.Hour)
+	require.NoError(t, tracker.PinWithDeadlineForGroup(backupTrackerTestPinID(1), 1, 30, deadline))
+	require.NoError(t, tracker.PinWithDeadlineForGroup(backupTrackerTestPinID(2), 2, 20, deadline))
+
+	require.Equal(t, uint64(30), tracker.OldestBackupForGroup(1))
+	require.Equal(t, uint64(20), tracker.OldestBackupForGroup(2))
+	require.Equal(t, uint64(0), tracker.OldestBackupForGroup(3))
 }
 
 func TestActiveTimestampTrackerBackupPinExpiry(t *testing.T) {
@@ -109,9 +135,7 @@ func TestActiveTimestampTrackerApplyExtendReplaysAfterLocalExpiry(t *testing.T) 
 	now := time.Now()
 
 	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(pinID, 7, 20, now.Add(-time.Millisecond)))
-	tracker.reapExpiredBackupPins(now)
-	require.Equal(t, 0, tracker.ActiveBackupPinCount())
-	require.NoError(t, tracker.ApplyExtendForGroup(pinID, 7, 20, now.Add(time.Hour)))
+	require.NoError(t, tracker.ApplyExtendForGroup(pinID, 7, now.Add(time.Hour)))
 
 	deadline, ok := tracker.BackupPinDeadlineForGroup(pinID, 7)
 	require.True(t, ok)

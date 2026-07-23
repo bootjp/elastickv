@@ -68,14 +68,7 @@ func txnRollbackKey(primaryKey []byte, startTS uint64) []byte {
 }
 
 func isTxnInternalKey(key []byte) bool {
-	if !bytes.HasPrefix(key, txnCommonPrefix) {
-		return false
-	}
-	return bytes.HasPrefix(key, txnLockPrefixBytes) ||
-		bytes.HasPrefix(key, txnIntentPrefixBytes) ||
-		bytes.HasPrefix(key, txnCommitPrefixBytes) ||
-		bytes.HasPrefix(key, txnRollbackPrefixBytes) ||
-		bytes.HasPrefix(key, txnMetaPrefixBytes)
+	return bytes.HasPrefix(key, txnCommonPrefix)
 }
 
 func isTxnMetaKey(key []byte) bool {

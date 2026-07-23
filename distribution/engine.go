@@ -440,6 +440,13 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 	return out, nil
 }
 
+// RoutesFromCatalogSnapshot validates and materializes the immutable route
+// view contained in a durable catalog snapshot. Callers that need ownership
+// as of an MVCC timestamp must use this view instead of the live Engine.
+func RoutesFromCatalogSnapshot(snapshot CatalogSnapshot) ([]Route, error) {
+	return routesFromCatalog(snapshot.Routes)
+}
+
 func validateRouteOrder(routes []Route) error {
 	if len(routes) < minRouteCountForOrderValidation {
 		return nil

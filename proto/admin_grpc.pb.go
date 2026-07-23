@@ -28,6 +28,7 @@ const (
 	Admin_RenewBackup_FullMethodName           = "/Admin/RenewBackup"
 	Admin_EndBackup_FullMethodName             = "/Admin/EndBackup"
 	Admin_ListAdaptersAndScopes_FullMethodName = "/Admin/ListAdaptersAndScopes"
+	Admin_StreamBackup_FullMethodName          = "/Admin/StreamBackup"
 	Admin_GetNodeVersion_FullMethodName        = "/Admin/GetNodeVersion"
 	Admin_StreamEvents_FullMethodName          = "/Admin/StreamEvents"
 )
@@ -36,7 +37,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Admin is the node-side read-only admin gRPC service consumed by
+// Admin is the node-side admin gRPC service consumed by
 // cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
 // metadata unless the node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
@@ -50,6 +51,7 @@ type AdminClient interface {
 	RenewBackup(ctx context.Context, in *RenewBackupRequest, opts ...grpc.CallOption) (*RenewBackupResponse, error)
 	EndBackup(ctx context.Context, in *EndBackupRequest, opts ...grpc.CallOption) (*EndBackupResponse, error)
 	ListAdaptersAndScopes(ctx context.Context, in *ListAdaptersAndScopesRequest, opts ...grpc.CallOption) (*ListAdaptersAndScopesResponse, error)
+	StreamBackup(ctx context.Context, in *StreamBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupKV], error)
 	GetNodeVersion(ctx context.Context, in *GetNodeVersionRequest, opts ...grpc.CallOption) (*GetNodeVersionResponse, error)
 	StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error)
 }
@@ -152,6 +154,25 @@ func (c *adminClient) ListAdaptersAndScopes(ctx context.Context, in *ListAdapter
 	return out, nil
 }
 
+func (c *adminClient) StreamBackup(ctx context.Context, in *StreamBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupKV], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[0], Admin_StreamBackup_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamBackupRequest, BackupKV]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Admin_StreamBackupClient = grpc.ServerStreamingClient[BackupKV]
+
 func (c *adminClient) GetNodeVersion(ctx context.Context, in *GetNodeVersionRequest, opts ...grpc.CallOption) (*GetNodeVersionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetNodeVersionResponse)
@@ -164,7 +185,7 @@ func (c *adminClient) GetNodeVersion(ctx context.Context, in *GetNodeVersionRequ
 
 func (c *adminClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[0], Admin_StreamEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[1], Admin_StreamEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +206,7 @@ type Admin_StreamEventsClient = grpc.ServerStreamingClient[StreamEventsEvent]
 // All implementations must embed UnimplementedAdminServer
 // for forward compatibility.
 //
-// Admin is the node-side read-only admin gRPC service consumed by
+// Admin is the node-side admin gRPC service consumed by
 // cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
 // metadata unless the node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
@@ -199,6 +220,7 @@ type AdminServer interface {
 	RenewBackup(context.Context, *RenewBackupRequest) (*RenewBackupResponse, error)
 	EndBackup(context.Context, *EndBackupRequest) (*EndBackupResponse, error)
 	ListAdaptersAndScopes(context.Context, *ListAdaptersAndScopesRequest) (*ListAdaptersAndScopesResponse, error)
+	StreamBackup(*StreamBackupRequest, grpc.ServerStreamingServer[BackupKV]) error
 	GetNodeVersion(context.Context, *GetNodeVersionRequest) (*GetNodeVersionResponse, error)
 	StreamEvents(*StreamEventsRequest, grpc.ServerStreamingServer[StreamEventsEvent]) error
 	mustEmbedUnimplementedAdminServer()
@@ -237,6 +259,9 @@ func (UnimplementedAdminServer) EndBackup(context.Context, *EndBackupRequest) (*
 }
 func (UnimplementedAdminServer) ListAdaptersAndScopes(context.Context, *ListAdaptersAndScopesRequest) (*ListAdaptersAndScopesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAdaptersAndScopes not implemented")
+}
+func (UnimplementedAdminServer) StreamBackup(*StreamBackupRequest, grpc.ServerStreamingServer[BackupKV]) error {
+	return status.Error(codes.Unimplemented, "method StreamBackup not implemented")
 }
 func (UnimplementedAdminServer) GetNodeVersion(context.Context, *GetNodeVersionRequest) (*GetNodeVersionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNodeVersion not implemented")
@@ -427,6 +452,17 @@ func _Admin_ListAdaptersAndScopes_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Admin_StreamBackup_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamBackupRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AdminServer).StreamBackup(m, &grpc.GenericServerStream[StreamBackupRequest, BackupKV]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Admin_StreamBackupServer = grpc.ServerStreamingServer[BackupKV]
+
 func _Admin_GetNodeVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetNodeVersionRequest)
 	if err := dec(in); err != nil {
@@ -505,6 +541,11 @@ var Admin_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamBackup",
+			Handler:       _Admin_StreamBackup_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "StreamEvents",
 			Handler:       _Admin_StreamEvents_Handler,
