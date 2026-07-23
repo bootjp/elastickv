@@ -194,6 +194,33 @@ func TestLocalTSOAllocatorAcceptsTimestampLeader(t *testing.T) {
 	require.False(t, coord.IsLeader())
 }
 
+func TestLocalTSOAllocatorRenewsExpiredCeilingBeforeIssuing(t *testing.T) {
+	coord := &renewingTSOCoordinator{clock: NewHLC()}
+	coord.leader.Store(true)
+	coord.clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
+	require.NoError(t, err)
+
+	got, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.NotZero(t, got)
+	require.EqualValues(t, 1, coord.proposeCalls.Load())
+	require.Greater(t, coord.clock.PhysicalCeiling(), time.Now().UnixMilli())
+}
+
+func TestLocalTSOAllocatorKeepsFailClosedWhenRenewalFails(t *testing.T) {
+	sentinel := errors.New("renewal rejected")
+	coord := &renewingTSOCoordinator{clock: NewHLC(), proposeErr: sentinel}
+	coord.leader.Store(true)
+	coord.clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
+	require.NoError(t, err)
+
+	_, err = alloc.Next(context.Background())
+	require.ErrorIs(t, err, sentinel)
+	require.EqualValues(t, 1, coord.proposeCalls.Load())
+}
+
 func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
@@ -537,4 +564,28 @@ func (f *fakeTimestampLeaderCoordinator) IsTimestampLeader() bool {
 
 func (f *fakeTimestampLeaderCoordinator) Clock() *HLC {
 	return f.clock
+}
+
+type renewingTSOCoordinator struct {
+	leader       atomic.Bool
+	clock        *HLC
+	proposeErr   error
+	proposeCalls atomic.Uint64
+}
+
+func (f *renewingTSOCoordinator) IsLeader() bool {
+	return f.leader.Load()
+}
+
+func (f *renewingTSOCoordinator) Clock() *HLC {
+	return f.clock
+}
+
+func (f *renewingTSOCoordinator) RecoverHLCLease(context.Context) error {
+	f.proposeCalls.Add(1)
+	if f.proposeErr != nil {
+		return f.proposeErr
+	}
+	f.clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	return nil
 }

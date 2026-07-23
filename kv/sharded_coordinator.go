@@ -2335,6 +2335,40 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
+func (c *ShardedCoordinator) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var firstErr error
+	for _, gid := range c.timestampLeaseRenewalGroupIDs() {
+		group := c.groups[gid]
+		if group == nil || group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "hlc lease renewal group %d", gid)
+			}
+			continue
+		}
+		return nil
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return errors.WithStack(ErrLeaderNotFound)
+}
+
+func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if c.timestampGroupConfigured {
+		return []uint64{c.timestampGroup}
+	}
+	return c.timestampBridgeCandidateGroupIDs()
+}
+
 // renewHLCLeases starts one renewal proposal for every shard group this node
 // currently leads. It does not wait for those proposals before returning; the
 // returned channel closes when the launched proposals finish and exists for
