@@ -2614,7 +2614,7 @@ const file_service_proto_rawDesc = "" +
 	"\bstart_ts\x18\x01 \x01(\x04R\astartTs\",\n" +
 	"\x10RollbackResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x18\n" +
-	"\x16RaftAdminStatusRequest\"\xa2\x03\n" +
+	"\x16RaftAdminStatusRequest\"\xd8\x03\n" +
 	"\x17RaftAdminStatusResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.RaftAdminStateR\x05state\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12%\n" +
@@ -2628,7 +2628,7 @@ const file_service_proto_rawDesc = "" +
 	"fsmPending\x12\x1b\n" +
 	"\tnum_peers\x18\n" +
 	" \x01(\x04R\bnumPeers\x12,\n" +
-	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\"\x1f\n" +
+	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanosJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eR\x13configuration_indexR\x13pending_conf_change\"\x1f\n" +
 	"\x1dRaftAdminConfigurationRequest\"W\n" +
 	"\x0fRaftAdminMember\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
