@@ -374,10 +374,10 @@ func selectLiveBackupScopes(
 	if err != nil {
 		return nil, err
 	}
+	if err := addBaselineLiveBackupScopes(available, adapters, baseline); err != nil {
+		return nil, err
+	}
 	if len(requested) == 0 {
-		if err := addBaselineLiveBackupScopes(available, adapters, baseline); err != nil {
-			return nil, err
-		}
 		return available, nil
 	}
 	return requestedLiveBackupScopes(adapters, requested, available)
@@ -590,16 +590,17 @@ func liveBackupManifest(begin *pb.BeginBackupResponse, token []byte, selected ma
 
 func liveManifestAdapters(enabled AdapterSet, selected map[Scope]struct{}) *Adapters {
 	out := &Adapters{}
-	if enabled.DynamoDB {
+	includeEnabledEmpty := len(selected) == 0
+	if includeEnabledEmpty && enabled.DynamoDB {
 		out.DynamoDB = &Adapter{}
 	}
-	if enabled.S3 {
+	if includeEnabledEmpty && enabled.S3 {
 		out.S3 = &Adapter{}
 	}
-	if enabled.Redis {
+	if includeEnabledEmpty && enabled.Redis {
 		out.Redis = &Adapter{}
 	}
-	if enabled.SQS {
+	if includeEnabledEmpty && enabled.SQS {
 		out.SQS = &Adapter{}
 	}
 	for _, scope := range sortedScopeSet(selected) {
@@ -611,12 +612,24 @@ func liveManifestAdapters(enabled AdapterSet, selected map[Scope]struct{}) *Adap
 func addLiveManifestScope(out *Adapters, scope Scope) {
 	switch scope.Adapter {
 	case adapterDynamoDB:
+		if out.DynamoDB == nil {
+			out.DynamoDB = &Adapter{}
+		}
 		out.DynamoDB.Tables = append(out.DynamoDB.Tables, scope.Name)
 	case adapterS3:
+		if out.S3 == nil {
+			out.S3 = &Adapter{}
+		}
 		out.S3.Buckets = append(out.S3.Buckets, scope.Name)
 	case adapterRedis:
+		if out.Redis == nil {
+			out.Redis = &Adapter{}
+		}
 		addLiveManifestRedisScope(out.Redis, scope.Name)
 	case adapterSQS:
+		if out.SQS == nil {
+			out.SQS = &Adapter{}
+		}
 		out.SQS.Queues = append(out.SQS.Queues, scope.Name)
 	}
 }

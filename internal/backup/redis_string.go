@@ -151,8 +151,10 @@ const (
 // Handle* methods are NOT goroutine-safe; the decoder pipeline is
 // inherently sequential per scope, so a mutex would only add cost.
 type RedisDB struct {
-	outRoot string
-	dbIndex int
+	outRoot   string
+	dbIndex   int
+	countOnly bool
+	finalized bool
 
 	// kindByKey records the Redis type each user key was first seen as.
 	// Populated by HandleString and HandleHLL; consulted by HandleTTL.
@@ -367,6 +369,11 @@ func (r *RedisDB) WithPendingTTLByteCap(capacity int) *RedisDB {
 		capacity = 0
 	}
 	r.pendingTTLBytesCap = capacity
+	return r
+}
+
+func (r *RedisDB) WithCountOnly(on bool) *RedisDB {
+	r.countOnly = on
 	return r
 }
 
@@ -684,7 +691,10 @@ func (r *RedisDB) Finalize() error {
 	// record was dropped, or a `!redis|ttl|` entry written for a
 	// key whose type prefix we don't recognise (a future Redis
 	// type added on the live side without a backup-encoder update).
-	r.orphanTTLCount += len(r.pendingTTL)
+	if !r.finalized {
+		r.orphanTTLCount += len(r.pendingTTL)
+		r.finalized = true
+	}
 	// Codex P2 (PR #790 r13): also warn on pendingTTLOverflow even
 	// when orphanTTLCount is zero. Overflow entries fail-closed at
 	// parkUnknownTTL with ErrPendingTTLBufferFull and never reach
@@ -713,7 +723,7 @@ func (r *RedisDB) Finalize() error {
 // orphan TTLs and meta-less stream records are removed here.
 func (r *RedisDB) RetainedRecordCount() uint64 {
 	count := r.simpleRecordCount + r.ttlRecordCount
-	count = subtractRecordCount(count, nonNegativeRecordCount(r.orphanTTLCount))
+	count = subtractRecordCount(count, r.effectiveOrphanTTLCount())
 	for _, st := range r.hashes {
 		count += boolRecordCount(st.metaSeen) + uint64(len(st.fields))
 	}
@@ -737,6 +747,14 @@ func (r *RedisDB) RetainedRecordCount() uint64 {
 		} else if st.externalTTL {
 			count = subtractRecordCount(count, 1)
 		}
+	}
+	return count
+}
+
+func (r *RedisDB) effectiveOrphanTTLCount() uint64 {
+	count := nonNegativeRecordCount(r.orphanTTLCount)
+	if !r.finalized {
+		count += uint64(len(r.pendingTTL))
 	}
 	return count
 }
@@ -792,6 +810,9 @@ func (r *RedisDB) dbDir() string {
 // that survives `find -name '*.json'` scrutiny.
 func flushWideColumnDir[T any](r *RedisDB, states map[string]T, subdir string, flushOne func(dir, userKey string, st T) error) error {
 	if len(states) == 0 {
+		return nil
+	}
+	if r.countOnly {
 		return nil
 	}
 	dir := filepath.Join(r.dbDir(), subdir)
@@ -927,6 +948,9 @@ func lstatRefuseSymlink(path string) error {
 }
 
 func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
+	if r.countOnly {
+		return nil
+	}
 	encoded := EncodeSegment(userKey)
 	if err := r.recordIfFallback(encoded, userKey); err != nil {
 		return err
@@ -943,6 +967,9 @@ func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 }
 
 func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, expireAtMs uint64) error {
+	if r.countOnly {
+		return nil
+	}
 	if *slot == nil {
 		// Route the parent directory through ensureDir so the
 		// shared assertNoSymlinkAncestors guard fires before we
@@ -988,6 +1015,9 @@ func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, e
 // Idempotent: a duplicate (encoded, original) pair is harmless because
 // LoadKeymap's "last record wins" behaviour leaves the same mapping.
 func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
+	if r.countOnly {
+		return nil
+	}
 	if !IsShaFallback(encoded) {
 		return nil
 	}
@@ -1012,6 +1042,9 @@ func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
 // file is removed so dumps without any non-reversible keys carry no
 // spurious empty file (matches the s3 encoder's keymap policy).
 func (r *RedisDB) closeKeymap() error {
+	if r.countOnly {
+		return nil
+	}
 	if r.keymap == nil {
 		return nil
 	}

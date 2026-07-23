@@ -545,7 +545,7 @@ func (s *AdminServer) StreamBackup(
 	if err != nil {
 		return err
 	}
-	if err := s.requireUnexpiredBackupToken(tok); err != nil {
+	if err := s.requireLiveBackupSession(tok); err != nil {
 		return err
 	}
 	if _, err := s.backupGroupsForToken(tok); err != nil {
@@ -1059,20 +1059,46 @@ func (s *AdminServer) scanBackupScopeCounts(
 	groups []backupGroup,
 	requireLive func() error,
 ) (counts map[logicalbackup.Scope]uint64, applied uint64, retErr error) {
-	scanner := s.backupStore.NewBackupKeyScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
+	scanner := s.backupStore.NewBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
 	if scanner == nil {
-		return nil, 0, errors.New("backup key scanner is nil")
+		return nil, 0, errors.New("backup scanner is nil")
+	}
+	counter, err := logicalbackup.NewLiveScopeCounter(logicalbackup.AllAdapters())
+	if err != nil {
+		_ = scanner.Close()
+		return nil, 0, errors.Wrap(err, "create retained backup baseline counter")
 	}
 	defer func() {
 		retErr = finishBackupScan(ctx, scanner, retErr)
 	}()
-	counts, err := collectBackupScopeCounts(ctx, scanner, requireLive)
-	if err != nil {
+	for {
+		if err := requireBackupScopeScanLive(requireLive); err != nil {
+			return nil, 0, err
+		}
+		pair, ok, err := scanner.Next(ctx)
+		if err != nil {
+			return nil, 0, errors.Wrap(err, "scan backup baseline")
+		}
+		if !ok {
+			break
+		}
+		if pair == nil {
+			return nil, 0, errors.New("backup scanner returned a nil record")
+		}
+		if err := counter.Add(pair.Key, pair.Value); err != nil {
+			return nil, 0, errors.Wrap(err, "count retained backup baseline")
+		}
+	}
+	if err := requireBackupScopeScanLive(requireLive); err != nil {
 		return nil, 0, err
 	}
 	applied, err = currentMinBackupAppliedIndex(groups)
 	if err != nil {
 		return nil, 0, err
+	}
+	counts, err = counter.RetainedCounts()
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "finalize retained backup baseline")
 	}
 	return counts, applied, nil
 }
@@ -1146,11 +1172,15 @@ func (s *AdminServer) requireLiveBackupSession(tok backupToken) error {
 	now := s.nowSnapshot()
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
-	s.reapBackupSessionsLocked(now)
 	session, ok := s.backupSessions[tok.pinID]
 	if !ok || session.readTS != tok.readTS {
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup route snapshot is unavailable on this endpoint")
+	}
+	if session.deadline.IsZero() || !now.Before(session.deadline) {
+		delete(s.backupSessions, tok.pinID)
 		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
 	}
+	s.reapBackupSessionsLocked(now)
 	return nil
 }
 

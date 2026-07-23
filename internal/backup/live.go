@@ -241,14 +241,56 @@ func (d *LiveDecoder) FinalizedScopeCounts(streamed map[Scope]uint64) (map[Scope
 	if d == nil || d.d == nil || !d.finalized {
 		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live decoder is not finalized")
 	}
+	return finalizedScopeCounts(d.d, streamed), nil
+}
+
+// LiveScopeCounter classifies live backup key/value pairs using the same
+// adapter state as the decoder, but in count-only mode. Server-side baseline
+// scans use it so BeginBackup.expected_keys uses the same retained-record
+// denominator that the live producer validates after decoder finalization.
+type LiveScopeCounter struct {
+	d        *dispatcher
+	streamed map[Scope]uint64
+}
+
+func NewLiveScopeCounter(adapters AdapterSet) (*LiveScopeCounter, error) {
+	d, err := newDispatcher(DecodeOptions{Adapters: adapters, countOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	return &LiveScopeCounter{d: d, streamed: make(map[Scope]uint64)}, nil
+}
+
+func (c *LiveScopeCounter) Add(key, value []byte) error {
+	if c == nil || c.d == nil {
+		return errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	scope, scoped, err := ScopeForKey(key)
+	if err != nil {
+		return err
+	}
+	if scoped {
+		c.streamed[scope]++
+	}
+	return c.d.route(key, value)
+}
+
+func (c *LiveScopeCounter) RetainedCounts() (map[Scope]uint64, error) {
+	if c == nil || c.d == nil {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	return finalizedScopeCounts(c.d, c.streamed), nil
+}
+
+func finalizedScopeCounts(d *dispatcher, streamed map[Scope]uint64) map[Scope]uint64 {
 	out := make(map[Scope]uint64, len(streamed))
 	for scope, count := range streamed {
-		if !adapterFinalizesScopeCounts(scope.Adapter) {
+		if count > 0 && !adapterFinalizesScopeCounts(scope.Adapter) {
 			out[scope] = count
 		}
 	}
-	d.d.addFinalizedScopeCounts(out)
-	return out, nil
+	d.addFinalizedScopeCounts(out)
+	return out
 }
 
 func adapterFinalizesScopeCounts(adapter string) bool {
@@ -263,22 +305,30 @@ func adapterFinalizesScopeCounts(adapter string) bool {
 func (d *dispatcher) addFinalizedScopeCounts(out map[Scope]uint64) {
 	if d.ddb != nil {
 		for name, count := range d.ddb.RetainedRecordCounts() {
-			out[Scope{Adapter: adapterDynamoDB, Name: name}] = count
+			addPositiveScopeCount(out, Scope{Adapter: adapterDynamoDB, Name: name}, count)
 		}
 	}
 	if d.s3 != nil {
 		for name, count := range d.s3.RetainedRecordCounts() {
-			out[Scope{Adapter: adapterS3, Name: name}] = count
+			addPositiveScopeCount(out, Scope{Adapter: adapterS3, Name: name}, count)
 		}
 	}
 	if d.redis != nil {
-		out[Scope{Adapter: adapterRedis, Name: "db_0"}] = d.redis.RetainedRecordCount()
+		addPositiveScopeCount(out, Scope{Adapter: adapterRedis, Name: "db_0"}, d.redis.RetainedRecordCount())
 	}
 	if d.sqs != nil {
 		for name, count := range d.sqs.RetainedRecordCounts() {
-			out[Scope{Adapter: adapterSQS, Name: name}] = count
+			addPositiveScopeCount(out, Scope{Adapter: adapterSQS, Name: name}, count)
 		}
 	}
+}
+
+func addPositiveScopeCount(out map[Scope]uint64, scope Scope, count uint64) {
+	if count == 0 {
+		delete(out, scope)
+		return
+	}
+	out[scope] = count
 }
 
 func (s Scope) String() string {

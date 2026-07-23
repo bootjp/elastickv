@@ -139,6 +139,7 @@ type S3Encoder struct {
 	includeIncompleteUploads bool
 	includeOrphans           bool
 	renameCollisions         bool
+	countOnly                bool
 
 	buckets map[string]*s3BucketState
 	warn    func(event string, fields ...any)
@@ -336,6 +337,11 @@ func (s *S3Encoder) WithRenameCollisions(on bool) *S3Encoder {
 	return s
 }
 
+func (s *S3Encoder) WithCountOnly(on bool) *S3Encoder {
+	s.countOnly = on
+	return s
+}
+
 // WithWarnSink wires a structured warning sink.
 func (s *S3Encoder) WithWarnSink(fn func(event string, fields ...any)) *S3Encoder {
 	s.warn = fn
@@ -436,6 +442,11 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	if err != nil {
 		return err
 	}
+	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
+	if s.countOnly {
+		st.chunkPaths[s3ChunkKey{uploadID: uploadID, partNo: partNo, chunkNo: chunkNo, partVersion: partVersion}] = ""
+		return nil
+	}
 	if !st.scratchDirCreated {
 		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 			return errors.WithStack(err)
@@ -446,7 +457,6 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	if err := writeFileAtomic(path, value); err != nil {
 		return err
 	}
-	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
 	st.chunkPaths[s3ChunkKey{uploadID: uploadID, partNo: partNo, chunkNo: chunkNo, partVersion: partVersion}] = path
 	return nil
 }
@@ -488,6 +498,9 @@ func (s *S3Encoder) HandleIncompleteUpload(prefix string, key, value []byte) err
 	bucket, ok := parseUploadFamily(prefix, key)
 	if !ok {
 		return errors.Wrapf(ErrS3MalformedKey, "upload-family key: %q", key)
+	}
+	if s.countOnly {
+		return nil
 	}
 	// Reject dot-segment / empty bucket names BEFORE the
 	// filesystem join — same fix as flushBucket (round 6) but for

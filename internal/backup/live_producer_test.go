@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -363,6 +364,48 @@ func TestRunLiveBackupUnavailableScopeLeavesNoManifest(t *testing.T) {
 	assertLiveBackupHasNoManifest(t, root)
 }
 
+func TestRunLiveBackupAcceptsRequestedBaselineOnlyScope(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	rpc.listed = nil
+	root := filepath.Join(t.TempDir(), "dump")
+	result, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root,
+		Adapters:   AdapterSet{Redis: true},
+		Scopes:     []Scope{{Adapter: adapterRedis, Name: "db_0"}},
+		TTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("RunLiveBackup: %v", err)
+	}
+	if len(result.Scopes) != 1 || result.Scopes[0] != (Scope{Adapter: adapterRedis, Name: "db_0"}) {
+		t.Fatalf("scopes=%+v", result.Scopes)
+	}
+	assertLiveBackupManifest(t, root)
+}
+
+func TestRunLiveBackupScopedManifestOmitsUnselectedAdapters(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	root := filepath.Join(t.TempDir(), "dump")
+	_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root,
+		Adapters:   AllAdapters(),
+		Scopes:     []Scope{{Adapter: adapterRedis, Name: "db_0"}},
+		TTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("RunLiveBackup: %v", err)
+	}
+	manifest := readLiveBackupManifest(t, root)
+	if manifest.Adapters.Redis == nil || len(manifest.Adapters.Redis.Databases) != 1 {
+		t.Fatalf("manifest redis adapters=%+v", manifest.Adapters)
+	}
+	if manifest.Adapters.DynamoDB != nil || manifest.Adapters.S3 != nil || manifest.Adapters.SQS != nil {
+		t.Fatalf("manifest included unselected adapters=%+v", manifest.Adapters)
+	}
+}
+
 func TestCrossAdapterConsistency(t *testing.T) {
 	t.Parallel()
 	rpc, body := crossAdapterLiveBackupRPC(t)
@@ -376,6 +419,113 @@ func TestCrossAdapterConsistency(t *testing.T) {
 		t.Fatalf("RunLiveBackup: %v", err)
 	}
 	assertCrossAdapterLiveBackup(t, root, body, result)
+}
+
+func TestLiveScopeCounterUsesRetainedCounts(t *testing.T) {
+	t.Parallel()
+	schema := &pb.DynamoTableSchema{
+		TableName:            "orders",
+		PrimaryKey:           &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           2,
+	}
+	item := func(id string) *pb.DynamoItem {
+		return &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{"id": sAttr(id)}}
+	}
+	const (
+		bucket   = "photos"
+		object   = "image.jpg"
+		uploadID = "upload-1"
+		queue    = "jobs"
+	)
+	encQueue := base64.RawURLEncoding.EncodeToString([]byte(queue))
+	tests := []struct {
+		name     string
+		adapters AdapterSet
+		records  []*pb.BackupKV
+		want     map[Scope]uint64
+	}{
+		{
+			name:     "S3 stale generation chunks",
+			adapters: AdapterSet{S3: true},
+			records: []*pb.BackupKV{
+				{Key: s3keys.BucketMetaKey(bucket), Value: encodeS3BucketMetaValue(t, map[string]any{
+					"bucket_name": bucket, "generation": 2,
+				})},
+				{Key: s3keys.ObjectManifestKey(bucket, 2, object), Value: encodeS3ManifestValue(t, map[string]any{
+					"upload_id": uploadID, "size_bytes": 1, "parts": []map[string]any{
+						{"part_no": 1, "size_bytes": 1, "chunk_count": 1},
+					},
+				})},
+				{Key: s3keys.BlobKey(bucket, 2, object, uploadID, 1, 0), Value: []byte("x")},
+				{Key: s3keys.ObjectManifestKey(bucket, 1, "old"), Value: encodeS3ManifestValue(t, map[string]any{
+					"upload_id": uploadID, "size_bytes": 1, "parts": []map[string]any{
+						{"part_no": 1, "size_bytes": 1, "chunk_count": 1},
+					},
+				})},
+				{Key: s3keys.BlobKey(bucket, 1, "old", uploadID, 1, 0), Value: []byte("y")},
+			},
+			want: map[Scope]uint64{{Adapter: adapterS3, Name: bucket}: 3},
+		},
+		{
+			name:     "DynamoDB stale generation rows",
+			adapters: AdapterSet{DynamoDB: true},
+			records: []*pb.BackupKV{
+				{Key: EncodeDDBTableMetaKey("orders"), Value: encodeSchemaValue(t, schema)},
+				{Key: EncodeDDBItemKey("orders", 2, "active", ""), Value: encodeItemValue(t, item("active"))},
+				{Key: EncodeDDBItemKey("orders", 1, "stale", ""), Value: encodeItemValue(t, item("stale"))},
+			},
+			want: map[Scope]uint64{{Adapter: adapterDynamoDB, Name: "orders"}: 2},
+		},
+		{
+			name:     "SQS stale generation messages",
+			adapters: AdapterSet{SQS: true},
+			records: []*pb.BackupKV{
+				{Key: EncodeQueueMetaKey(queue), Value: encodeQueueMetaValue(t, map[string]any{
+					"name": queue, "fifo": false, "partition_count": 1, "generation": 2,
+				})},
+				{Key: []byte(SQSQueueGenPrefix + encQueue), Value: []byte("2")},
+				{Key: EncodeMsgDataKey(queue, 2, "live"), Value: encodeMessageValue(t, map[string]any{
+					"message_id": "live", "body": []byte("live"), "send_timestamp_millis": 1, "queue_generation": 2,
+				})},
+				{Key: EncodeMsgDataKey(queue, 1, "stale"), Value: encodeMessageValue(t, map[string]any{
+					"message_id": "stale", "body": []byte("stale"), "send_timestamp_millis": 1, "queue_generation": 1,
+				})},
+			},
+			want: map[Scope]uint64{{Adapter: adapterSQS, Name: queue}: 3},
+		},
+		{
+			name:     "Redis zset legacy row superseded by wide columns",
+			adapters: AdapterSet{Redis: true},
+			records: []*pb.BackupKV{
+				{Key: zsetLegacyBlobKey("rank"), Value: encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{{member: "old", score: 1}})},
+				{Key: zsetMetaKey("rank"), Value: encodeZSetMetaValue(1)},
+				{Key: zsetMemberKey("rank", []byte("new")), Value: encodeZSetScoreValue(2)},
+			},
+			want: map[Scope]uint64{{Adapter: adapterRedis, Name: "db_0"}: 2},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			counter, err := NewLiveScopeCounter(tc.adapters)
+			if err != nil {
+				t.Fatalf("NewLiveScopeCounter: %v", err)
+			}
+			for _, record := range tc.records {
+				if err := counter.Add(record.GetKey(), record.GetValue()); err != nil {
+					t.Fatalf("Add(%q): %v", record.GetKey(), err)
+				}
+			}
+			got, err := counter.RetainedCounts()
+			if err != nil {
+				t.Fatalf("RetainedCounts: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("retained counts=%v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestRunLiveBackupRejectsS3ScopeWithOnlyOrphanRecords(t *testing.T) {

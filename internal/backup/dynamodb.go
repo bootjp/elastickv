@@ -76,7 +76,6 @@ type ddbTableState struct {
 	name       string
 	schema     *pb.DynamoTableSchema
 	itemsByGen map[uint64][]*pb.DynamoItem
-	retained   uint64
 }
 
 func ensureItemsByGen(m map[uint64][]*pb.DynamoItem) map[uint64][]*pb.DynamoItem {
@@ -217,7 +216,8 @@ func (d *DDBEncoder) RetainedRecordCounts() map[string]uint64 {
 	out := make(map[string]uint64, len(d.tables))
 	for _, st := range d.tables {
 		if st.schema != nil {
-			out[st.name] = st.retained
+			emitOrder := ddbGenerationEmitOrder(st.schema.GetGeneration(), st.schema.GetMigratingFromGeneration())
+			out[st.name] = 1 + retainedDDBItemRecords(st.itemsByGen, emitOrder)
 		}
 	}
 	return out
@@ -263,7 +263,6 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	if err := d.writeEffectiveDDBItems(itemsDir, st.name, hashKey, rangeKey, items); err != nil {
 		return err
 	}
-	st.retained = 1 + retainedDDBItemRecords(st.itemsByGen, emitOrder)
 	return nil
 }
 
