@@ -445,7 +445,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
 - Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
-- Successful `BZPOPMIN` / `BZPOPMAX` calls are replayed as `ZREM` on the normal write queue. Timeout/null blocking responses are not replayed because the primary made no mutation.
+- Successful `BZPOPMIN` / `BZPOPMAX` calls are replayed to ElasticKV as an internal fast ZREM variant on the normal write queue. Regular client `ZREM` still keeps Redis wrong-type behavior; stale BZPOP replays avoid wide type scans. Timeout/null blocking responses are not replayed because the primary made no mutation.
 - If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low; use `-secondary-script-timeout` for burst backlog and profile ElasticKV before raising concurrency.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 

@@ -362,7 +362,7 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	if d.hasSecondaryWrite() {
-		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
+		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp, d.secondary); ok {
 			d.goTranslatedBlockingReplay(func(ctx context.Context) {
 				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
 					initialDelay:        blockingReplayInitialDelay,

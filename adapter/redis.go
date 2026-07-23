@@ -114,6 +114,8 @@ const (
 	minKeyedArgs        = 2
 )
 
+const cmdElasticKVZRemFast = "ELASTICKV.ZREMFAST"
+
 const (
 	redisDispatchTimeout = 30 * time.Second
 	// redisLuaDispatchTimeout gives EVAL/EVALSHA enough room for migration

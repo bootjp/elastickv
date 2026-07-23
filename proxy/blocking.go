@@ -10,6 +10,7 @@ import (
 )
 
 const blockingMultiPopMinArgs = 2
+const elasticKVZRemFastCommand = "ELASTICKV.ZREMFAST"
 
 type blockingTimeoutBackend interface {
 	DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd
@@ -60,17 +61,25 @@ func shouldReplayBlockingToSecondary(cmd string, resp any) bool {
 	return !strings.EqualFold(cmd, "XREAD")
 }
 
-func secondaryBlockingReplay(cmd string, resp any) (string, []any, bool) {
+func secondaryBlockingReplay(cmd string, resp any, secondary Backend) (string, []any, bool) {
 	switch strings.ToUpper(cmd) {
 	case "BZPOPMIN", "BZPOPMAX":
 		key, member, ok := zsetPopKeyMember(resp)
 		if !ok {
 			return "", nil, false
 		}
-		return "ZREM", []any{"ZREM", key, member}, true
+		replayCmd := zremReplayCommandForSecondary(secondary)
+		return replayCmd, []any{replayCmd, key, member}, true
 	default:
 		return "", nil, false
 	}
+}
+
+func zremReplayCommandForSecondary(secondary Backend) string {
+	if secondary != nil && strings.EqualFold(secondary.Name(), "elastickv") {
+		return elasticKVZRemFastCommand
+	}
+	return "ZREM"
 }
 
 func zsetPopKeyMember(resp any) (any, any, bool) {

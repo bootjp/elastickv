@@ -640,17 +640,22 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 
 func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
 	for _, tc := range []struct {
-		cmd string
+		name          string
+		cmd           string
+		secondaryName string
+		expectedCmd   string
 	}{
-		{cmd: "BZPOPMIN"},
-		{cmd: "BZPOPMAX"},
+		{name: "generic secondary BZPOPMIN", cmd: "BZPOPMIN", secondaryName: "secondary", expectedCmd: "ZREM"},
+		{name: "generic secondary BZPOPMAX", cmd: "BZPOPMAX", secondaryName: "secondary", expectedCmd: "ZREM"},
+		{name: "elastickv secondary BZPOPMIN", cmd: "BZPOPMIN", secondaryName: "elastickv", expectedCmd: elasticKVZRemFastCommand},
+		{name: "elastickv secondary BZPOPMAX", cmd: "BZPOPMAX", secondaryName: "elastickv", expectedCmd: elasticKVZRemFastCommand},
 	} {
-		t.Run(tc.cmd, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			primary := &timeoutCapturingBackend{
 				name:        "primary",
 				returnValue: []any{"queue", "job-1", "12.5"},
 			}
-			secondary := newMockBackend("secondary")
+			secondary := newMockBackend(tc.secondaryName)
 			secondary.doFunc = makeCmd(int64(1), nil)
 
 			metrics := newTestMetrics()
@@ -676,7 +681,7 @@ func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
 			secondary.mu.Lock()
 			got := append([]any(nil), secondary.calls[0]...)
 			secondary.mu.Unlock()
-			assert.Equal(t, []any{"ZREM", "queue", "job-1"}, got)
+			assert.Equal(t, []any{tc.expectedCmd, "queue", "job-1"}, got)
 		})
 	}
 }
