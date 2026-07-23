@@ -184,6 +184,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "localhost:6380", cfg.SecondaryAddr)
 	assert.Equal(t, ModeDualWrite, cfg.Mode)
 	assert.Equal(t, 30*time.Second, cfg.SecondaryTimeout)
+	assert.Equal(t, 5*time.Minute, cfg.SecondaryScriptTimeout)
 }
 
 // ========== compare.go tests ==========
@@ -1145,6 +1146,47 @@ func TestDualWriter_QueuedWorkExpiresBeforeBackendDispatch(t *testing.T) {
 
 	assert.False(t, ran.Load())
 	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueScript, asyncDropExpired)), 0.001)
+}
+
+func TestDualWriter_ScriptQueueUsesScriptTimeout(t *testing.T) {
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		newMockBackend("secondary"),
+		ProxyConfig{
+			Mode:                         ModeDualWrite,
+			SecondaryTimeout:             30 * time.Millisecond,
+			SecondaryScriptTimeout:       200 * time.Millisecond,
+			SecondaryWriteConcurrency:    1,
+			SecondaryScriptConcurrency:   1,
+			SecondaryScriptQueueCapacity: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	blocker := make(chan struct{})
+	started := make(chan struct{})
+	d.goWrite(func(context.Context) {
+		close(started)
+		<-blocker
+	})
+	<-started
+
+	ran := make(chan struct{})
+	d.goScript(func(context.Context) { close(ran) })
+	time.Sleep(50 * time.Millisecond)
+	close(blocker)
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("script expired before secondary-script-timeout")
+	}
+	d.Close()
+
+	assert.InDelta(t, 0, testutil.ToFloat64(
 		metrics.AsyncDropsByQueue.WithLabelValues(asyncQueueScript, asyncDropExpired)), 0.001)
 }
 

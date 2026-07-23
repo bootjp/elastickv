@@ -44,6 +44,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-blocking-replay-queue-size` | `0` | Bounded queue for mutating blocking-command replays. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
 | `-secondary-timeout` | `30s` | End-to-end secondary write deadline, including queue wait |
+| `-secondary-script-timeout` | `5m` | End-to-end secondary Lua-script write deadline, including queue wait. `0` follows `-secondary-timeout` |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
 | `-sentry-dsn` | (empty) | Sentry DSN (empty = disabled) |
 | `-sentry-env` | (empty) | Sentry environment name |
@@ -101,6 +102,7 @@ docker run --rm \
   -secondary-script-concurrency 2 \
   -mode dual-write-shadow \
   -secondary-timeout 30s \
+  -secondary-script-timeout 5m \
   -shadow-timeout 3s \
   -sentry-dsn "${SENTRY_DSN}" \
   -sentry-env production \
@@ -443,7 +445,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
 - Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
-- If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low and profile ElasticKV before raising it.
+- If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low; use `-secondary-script-timeout` for burst backlog and profile ElasticKV before raising concurrency.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count

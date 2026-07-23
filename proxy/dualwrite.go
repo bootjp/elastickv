@@ -188,7 +188,8 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		"write_queue_capacity", cap(d.writeQueueSlots),
 		"script_queue_capacity", cap(d.scriptQueueSlots),
 		"blocking_replay_queue_capacity", cap(d.blockingReplayQueueSlots),
-		"timeout", cfg.SecondaryTimeout)
+		"timeout", cfg.SecondaryTimeout,
+		"script_timeout", secondaryScriptTimeout(cfg))
 
 	return d
 }
@@ -822,7 +823,7 @@ func (d *DualWriter) goWrite(fn func(context.Context)) {
 // goScript launches fn in a bounded Lua-script write goroutine.
 // It uses a smaller class limit while also consuming the shared write limit.
 func (d *DualWriter) goScript(fn func(context.Context)) {
-	d.enqueueAsync(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, fn)
+	d.enqueueAsyncWithTimeout(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, secondaryScriptTimeout(d.cfg), fn)
 }
 
 // goBlockingReplay queues fn for bounded secondary replay of mutating blocking
@@ -842,6 +843,13 @@ func (d *DualWriter) goShadow(fn func()) {
 // goAsync queues fn with the write class (for txn replay).
 func (d *DualWriter) goAsync(fn func(context.Context)) {
 	d.goWrite(fn)
+}
+
+func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
+	if cfg.SecondaryScriptTimeout > 0 {
+		return cfg.SecondaryScriptTimeout
+	}
+	return cfg.SecondaryTimeout
 }
 
 func (d *DualWriter) startBackendPoolSampler() {
