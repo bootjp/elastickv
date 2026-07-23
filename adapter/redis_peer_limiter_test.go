@@ -106,6 +106,7 @@ func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
 		{name: "low cap", limit: 2, wantNormal: 1, wantBlocking: 1},
 		{name: "four cap", limit: 4, wantNormal: 2, wantBlocking: 2},
 		{name: "small cap", limit: 8, wantNormal: 4, wantBlocking: 4},
+		{name: "raised cap", limit: defaultRedisPerPeerConnectionCap, wantNormal: 4, wantBlocking: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(tc.limit))

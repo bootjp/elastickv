@@ -680,6 +680,35 @@ func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
 	}
 }
 
+func TestDualWriter_Blocking_DoesNotReplayNilResult(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:      "primary",
+		returnErr: redis.Nil,
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   time.Second,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Nil(t, resp)
+	d.Close()
+
+	assert.Equal(t, 0, secondary.CallCount())
+}
+
 func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
