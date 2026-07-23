@@ -179,7 +179,8 @@ func TestSchedulerHistoryGapClearsPriorConfidence(t *testing.T) {
 	afterGap, err := scheduler.Tick(context.Background(), now.Add(5*time.Minute))
 	require.NoError(t, err)
 	require.Empty(t, afterGap.Detector.Decisions)
-	require.Equal(t, 1, scheduler.state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, 0, scheduler.state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, now.Add(5*time.Minute), scheduler.state.RouteStatus(1).LastProcessedAt)
 }
 
 func TestSplitFailureReasonUsesBoundedLabels(t *testing.T) {
@@ -387,7 +388,7 @@ func TestSchedulerExecutesCompoundIsolationBackToBack(t *testing.T) {
 
 func TestSchedulerCompoundUsesNormalizedCommittedBoundary(t *testing.T) {
 	t.Parallel()
-	source := &fakeSnapshotSource{snapshot: distribution.CatalogSnapshot{
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
 		Version: 7,
 		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
 	}}

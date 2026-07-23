@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"math"
 	"testing"
@@ -9,7 +10,9 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestAutoSplitCanonicalFlagsAreRegistered(t *testing.T) {
@@ -30,6 +33,34 @@ func TestEffectiveKeyVizBucketsPerRouteAutoSplitImpliedDefault(t *testing.T) {
 	require.Equal(t, 1, effectiveKeyVizBucketsPerRoute(true, true, keyviz.DefaultKeyBucketsPerRoute, 16))
 	require.Equal(t, 8, effectiveKeyVizBucketsPerRoute(true, false, 8, 16))
 	require.Equal(t, 1, effectiveKeyVizBucketsPerRoute(false, false, keyviz.DefaultKeyBucketsPerRoute, 16))
+}
+
+func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *testing.T) {
+	oldAutoSplit := *autoSplit
+	*autoSplit = false
+	t.Cleanup(func() {
+		*autoSplit = oldAutoSplit
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	_, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte(""),
+		End:     nil,
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	require.NoError(t, err)
+
+	var eg errgroup.Group
+	runtime, err := setupDistributionWatcherAndAutoSplit(ctx, &eg, catalog, distribution.NewEngine(), nil, nil, nil, nil)
+	require.NoError(t, err)
+	require.Nil(t, runtime)
+
+	cancel()
+	require.NoError(t, eg.Wait())
 }
 
 func TestAutoSplitLeaderGateUsesCatalogKeyLeadership(t *testing.T) {

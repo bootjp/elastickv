@@ -547,56 +547,29 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
-		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], cfg.defaultGroup,
-		encWiring, *raftId, *encryptionSidecarPath)
-	if err != nil {
-		cancel()
-		return err
-	}
-	// Seed AFTER setupDistributionCatalog so the sampler picks up the
-	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
-	// setupDistributionCatalog applies a snapshot back into the engine
-	// with durable non-zero RouteIDs; seeding earlier would register
-	// the placeholder zero IDs from buildEngine and Observe would miss
-	// every dispatched mutation.
-	seedKeyVizRoutes(sampler, cfg.engine)
-
-	catalogWatchConns := &kv.GRPCConnCache{}
-	cleanup.Add(func() { _ = catalogWatchConns.Close() })
-	eg.Go(func() error {
-		return runDistributionCatalogStream(runCtx, catalogRuntime, catalogWatchConns, cfg.engine)
+	distStartup, err := startDistributionStartup(distributionStartupInput{
+		ctx:             runCtx,
+		eg:              eg,
+		cancel:          cancel,
+		cleanup:         &cleanup,
+		runtimes:        runtimes,
+		cfg:             cfg,
+		coordinate:      coordinate,
+		defaultGroup:    shardGroups[cfg.defaultGroup],
+		encWiring:       encWiring,
+		raftID:          *raftId,
+		sidecarPath:     *encryptionSidecarPath,
+		sampler:         sampler,
+		readTracker:     readTracker,
+		metricsRegistry: metricsRegistry,
+		clock:           clock,
 	})
-	startKeyVizFlusher(runCtx, eg, sampler)
-	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
-	startMemoryWatchdog(runCtx, eg, cancel)
-	distServer := adapter.NewDistributionServer(
-		cfg.engine,
-		distCatalog,
-		adapter.WithDistributionCoordinator(coordinate),
-		adapter.WithDistributionActiveTimestampTracker(readTracker),
-		adapter.WithCatalogWatchLeaderCheck(func() bool {
-			engine := catalogRuntime.snapshotEngine()
-			return engine != nil && engine.State() == raftengine.StateLeader
-		}),
-		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
-	)
-	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
-		runCtx,
-		eg,
-		distCatalog,
-		cfg.engine,
-		distServer,
-		coordinate,
-		sampler,
-		autosplit.NewPrometheusObserver(metricsRegistry.Registerer()),
-	)
 	if err != nil {
 		return err
 	}
-	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
-	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
+	defaultRuntime := distStartup.defaultRuntime
+	distServer := distStartup.distServer
+	autoSplitRuntime := distStartup.autoSplitRuntime
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -646,6 +619,88 @@ func run() error {
 		return errors.Wrapf(err, "failed to serve")
 	}
 	return nil
+}
+
+type distributionStartupInput struct {
+	ctx             context.Context
+	eg              *errgroup.Group
+	cancel          context.CancelFunc
+	cleanup         *internalutil.CleanupStack
+	runtimes        []*raftGroupRuntime
+	cfg             runtimeConfig
+	coordinate      *kv.ShardedCoordinator
+	defaultGroup    *kv.ShardGroup
+	encWiring       encryptionWriteWiring
+	raftID          string
+	sidecarPath     string
+	sampler         *keyviz.MemSampler
+	readTracker     *kv.ActiveTimestampTracker
+	metricsRegistry *monitoring.Registry
+	clock           *kv.HLC
+}
+
+type distributionStartup struct {
+	defaultRuntime   *raftGroupRuntime
+	distServer       *adapter.DistributionServer
+	autoSplitRuntime adapter.AutoSplitRuntime
+}
+
+func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
+	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
+		in.ctx, in.eg, in.runtimes, in.cfg.engine,
+		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
+		in.encWiring, in.raftID, in.sidecarPath)
+	if err != nil {
+		in.cancel()
+		return distributionStartup{}, err
+	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(in.sampler, in.cfg.engine)
+
+	catalogWatchConns := &kv.GRPCConnCache{}
+	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
+	in.eg.Go(func() error {
+		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
+	})
+	startKeyVizFlusher(in.ctx, in.eg, in.sampler)
+	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
+	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
+	distServer := adapter.NewDistributionServer(
+		in.cfg.engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(in.coordinate),
+		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
+		adapter.WithCatalogWatchLeaderCheck(func() bool {
+			engine := catalogRuntime.snapshotEngine()
+			return engine != nil && engine.State() == raftengine.StateLeader
+		}),
+		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
+	)
+	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
+		in.ctx,
+		in.eg,
+		distCatalog,
+		in.cfg.engine,
+		distServer,
+		in.coordinate,
+		in.sampler,
+		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
+	)
+	if err != nil {
+		return distributionStartup{}, err
+	}
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
+	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
+	return distributionStartup{
+		defaultRuntime:   defaultRuntime,
+		distServer:       distServer,
+		autoSplitRuntime: autoSplitRuntime,
+	}, nil
 }
 
 func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {

@@ -655,6 +655,13 @@ func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *Sharded
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	ownedGroups := map[uint64]*ShardGroup(nil)
+	if groups != nil {
+		ownedGroups = make(map[uint64]*ShardGroup, len(groups))
+		for gid, group := range groups {
+			ownedGroups[gid] = group
+		}
+	}
 	// Construct the coordinator before wrapping the per-shard
 	// Transactionals so each leaseRefreshingTxn can back-reference it
 	// for the §4.1 registration barrier (the gate is installed later
@@ -662,14 +669,14 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	c := &ShardedCoordinator{
 		engine:       engine,
 		router:       router,
-		groups:       groups,
+		groups:       ownedGroups,
 		defaultGroup: defaultGroup,
 		clock:        clock,
 		store:        st,
 		log:          slog.Default(),
 	}
 	var deregisters []func()
-	for gid, g := range groups {
+	for gid, g := range ownedGroups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
 		// per-shard lease. Leave nil transactions unchanged, and skip
 		// if already wrapped so repeat calls don't stack wrappers.
@@ -679,7 +686,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 				// supports repeat construction by not stacking
 				// wrappers): point the existing wrapper at the NEW
 				// coordinator so Commit consults the freshly-installed
-				// registration gate, not a stale one (codex P2).
+				// registration gate, not a stale one.
 				existing.coord = c
 			} else {
 				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}

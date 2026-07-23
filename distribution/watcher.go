@@ -141,35 +141,49 @@ func (w *CatalogWatcher) SyncOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return w.applyCatalogChanges(ctx, changes)
+}
+
+func (w *CatalogWatcher) applyCatalogChanges(ctx context.Context, changes CatalogChangeSet) error {
 	if changes.Reset != nil {
-		if err := w.engine.ApplySnapshot(*changes.Reset); err != nil {
-			if errors.Is(err, ErrEngineSnapshotVersionStale) {
-				return nil
-			}
-			return err
-		}
-		w.notifySnapshotObserver(*changes.Reset)
-		return nil
+		return w.applyCatalogReset(*changes.Reset)
 	}
 	if len(changes.Deltas) == 0 {
 		return w.notifyLatestSnapshotObserver(ctx)
 	}
+	applied, err := w.applyCatalogDeltas(changes.Deltas)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return nil
+	}
+	return w.notifyLatestSnapshotObserver(ctx)
+}
+
+func (w *CatalogWatcher) applyCatalogReset(snapshot CatalogSnapshot) error {
+	if err := w.engine.ApplySnapshot(snapshot); err != nil {
+		if errors.Is(err, ErrEngineSnapshotVersionStale) {
+			return nil
+		}
+		return err
+	}
+	w.notifySnapshotObserver(snapshot)
+	return nil
+}
+
+func (w *CatalogWatcher) applyCatalogDeltas(deltas []CatalogDelta) (bool, error) {
 	applied := false
-	for _, delta := range changes.Deltas {
+	for _, delta := range deltas {
 		if err := w.engine.ApplyDelta(delta); err != nil {
 			if errors.Is(err, ErrEngineSnapshotVersionStale) {
 				continue
 			}
-			return err
+			return false, err
 		}
 		applied = true
 	}
-	if applied {
-		if err := w.notifyLatestSnapshotObserver(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+	return applied, nil
 }
 
 func (w *CatalogWatcher) notifySnapshotObserver(snapshot CatalogSnapshot) {

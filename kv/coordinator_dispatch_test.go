@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -232,13 +233,10 @@ func TestCoordinateSamplerObservesRawTxnAndRead(t *testing.T) {
 func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
 	t.Parallel()
 
-	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
-		Step:             time.Second,
-		HistoryColumns:   4,
-		MaxTrackedRoutes: 8,
-	})
-	require.True(t, sampler.RegisterRoute(7, []byte(""), []byte("m"), 1))
-	require.True(t, sampler.RegisterRoute(8, []byte("m"), nil, 1))
+	sampler := &recordingSampler{}
+	rawS3Key := s3keys.ObjectManifestKey("bucket", 1, "z-object")
+	normalizedS3Key := RouteKey(rawS3Key)
+	var resolverKeys [][]byte
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	c := (&Coordinate{
@@ -246,20 +244,27 @@ func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
 		engine:             stubLeaderEngine{},
 		clock:              clock,
 	}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
-		if bytes.Compare(key, []byte("m")) < 0 {
-			return 7, true
+		resolverKeys = append(resolverKeys, append([]byte(nil), key...))
+		if bytes.Equal(key, normalizedS3Key) {
+			return 8, true
 		}
-		return 8, true
+		return 7, true
 	})
 
 	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
 		{Op: Put, Key: []byte("a"), Value: []byte("left")},
-		{Op: Put, Key: []byte("z"), Value: []byte("right")},
+		{Op: Put, Key: rawS3Key, Value: []byte("right")},
 	}})
 	require.NoError(t, err)
-	sampler.Flush()
-	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 7).Writes)
-	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, 8).Writes)
+
+	require.Equal(t, [][]byte{[]byte("a"), normalizedS3Key}, resolverKeys)
+	calls := sampler.snapshot()
+	require.Len(t, calls, 2)
+	require.Equal(t, uint64(7), calls[0].routeID)
+	require.Equal(t, []byte("a"), calls[0].key)
+	require.Equal(t, uint64(8), calls[1].routeID)
+	require.Equal(t, normalizedS3Key, calls[1].key)
+	require.NotEqual(t, rawS3Key, calls[1].key)
 }
 
 func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {

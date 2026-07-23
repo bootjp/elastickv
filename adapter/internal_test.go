@@ -5,10 +5,39 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
+
+func TestInternalForwardObservesCommittedWrites(t *testing.T) {
+	t.Parallel()
+
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte("hot"),
+			Value: []byte("value"),
+		}},
+	}}
+	txn := &forwardObserverTxn{}
+	var observed []*pb.Request
+	internal := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil, WithInternalForwardWriteObserver(func(reqs []*pb.Request) {
+		observed = reqs
+	}))
+
+	resp, err := internal.Forward(context.Background(), &pb.ForwardRequest{Requests: reqs})
+
+	require.NoError(t, err)
+	require.True(t, resp.Success)
+	require.Equal(t, uint64(9), resp.CommitIndex)
+	require.Len(t, observed, 1)
+	require.Same(t, reqs[0], observed[0])
+	require.Len(t, txn.reqs, 1)
+	require.Same(t, reqs[0], txn.reqs[0])
+	require.Equal(t, uint64(1), reqs[0].Ts)
+}
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {
 	t.Parallel()
@@ -240,4 +269,26 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, meta.CommitTS, uint64(9))
 	require.Equal(t, meta.CommitTS, commitTS)
+}
+
+type forwardObserverLeader struct{}
+
+func (forwardObserverLeader) State() raftengine.State { return raftengine.StateLeader }
+func (forwardObserverLeader) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
+}
+func (forwardObserverLeader) VerifyLeader(context.Context) error               { return nil }
+func (forwardObserverLeader) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
+
+type forwardObserverTxn struct {
+	reqs []*pb.Request
+}
+
+func (t *forwardObserverTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
+	t.reqs = reqs
+	return &kv.TransactionResponse{CommitIndex: 9}, nil
+}
+
+func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
 }

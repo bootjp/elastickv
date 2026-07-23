@@ -495,6 +495,24 @@ func TestRouteCapUsesCycleLocalReservation(t *testing.T) {
 	requireEvent(t, result.Events, 2, SkipReasonRouteCap)
 }
 
+func TestRouteCapUsesFullLiveRouteCountWithLocalSubset(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(525, 0)
+	route := testRoute(1, 1, "a", "z")
+	cfg := testConfig()
+	cfg.MaxRoutes = 2
+
+	result := Evaluate(cfg, NewDetectorState(), Input{
+		Routes:         []distribution.RouteDescriptor{route},
+		Windows:        []ColumnWindow{hotWindow(at)},
+		Now:            at,
+		LiveRouteCount: 2,
+	})
+
+	require.Empty(t, result.Decisions)
+	requireEvent(t, result.Events, 1, SkipReasonRouteCap)
+}
+
 func TestDefaultConfigSetsRouteCap(t *testing.T) {
 	t.Parallel()
 
