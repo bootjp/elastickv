@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
@@ -58,6 +59,35 @@ func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) 
 	require.Equal(t, uint64(2), resp.RaftGroupId)
 }
 
+func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	_, err := catalog.Save(context.Background(), 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+
+	blocked := true
+	s := NewDistributionServer(engine, catalog, WithDistributionReadGate(func() bool { return blocked }))
+
+	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	blocked = false
+	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
+	require.NoError(t, err)
+	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.NoError(t, err)
+}
+
 func TestDistributionServerGetTimestamp_IsMonotonic(t *testing.T) {
 	t.Parallel()
 
@@ -106,10 +136,10 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 			GroupID:                2,
 			State:                  distribution.RouteStateWriteFenced,
 			ParentRouteID:          1,
-			SplitAtHLC:             77,
 			StagedVisibilityActive: true,
 			MigrationJobID:         42,
 			MinWriteTSExclusive:    99,
+			SplitAtHLC:             100,
 		},
 		{
 			RouteID:       1,
@@ -136,10 +166,10 @@ func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	require.Equal(t, uint64(2), resp.Routes[1].RouteId)
 	require.Nil(t, resp.Routes[1].End)
 	require.Equal(t, pb.RouteState_ROUTE_STATE_WRITE_FENCED, resp.Routes[1].State)
-	require.Equal(t, uint64(77), resp.Routes[1].SplitAtHlc)
 	require.True(t, resp.Routes[1].StagedVisibilityActive)
 	require.Equal(t, uint64(42), resp.Routes[1].MigrationJobId)
 	require.Equal(t, uint64(99), resp.Routes[1].MinWriteTsExclusive)
+	require.Equal(t, uint64(100), resp.Routes[1].SplitAtHlc)
 }
 
 func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
@@ -205,6 +235,7 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, []byte("m"), resp.Right.End)
 	require.Equal(t, uint64(1), resp.Right.RaftGroupId)
 	require.Equal(t, uint64(1), resp.Right.ParentRouteId)
+	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
 	require.NotZero(t, resp.Left.SplitAtHlc)
 	require.Equal(t, resp.Left.SplitAtHlc, resp.Right.SplitAtHlc)
 	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
@@ -469,6 +500,138 @@ func TestDistributionServerSplitRange_VersionConflict(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, codes.Aborted, status.Code(err))
 	require.ErrorContains(t, err, errDistributionCatalogConflict.Error())
+}
+
+func TestDistributionServerSplitRange_RejectsLiveSplitJobOverlap(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(ctx, distribution.SplitJob{
+		JobID:         10,
+		SourceRouteID: 1,
+		SplitKey:      []byte("g"),
+		TargetGroupID: 8,
+		Phase:         distribution.SplitJobPhaseBackfill,
+	}))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("c"),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	require.ErrorContains(t, err, distribution.ErrSplitJobOverlap.Error())
+	require.Zero(t, coordinator.dispatchCalls)
+}
+
+func TestDistributionServerSplitRange_AllowsDisjointRouteWhileSplitJobLive(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 3, Start: []byte("a"), End: []byte("g"), GroupID: 1, State: distribution.RouteStateActive, ParentRouteID: 1},
+		{RouteID: 4, Start: []byte("g"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateWriteFenced, ParentRouteID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(ctx, distribution.SplitJob{
+		JobID:         10,
+		SourceRouteID: 1,
+		SplitKey:      []byte("g"),
+		TargetGroupID: 8,
+		Phase:         distribution.SplitJobPhaseFence,
+	}))
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                3,
+		SplitKey:               []byte("c"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), resp.CatalogVersion)
+	require.Equal(t, 1, coordinator.dispatchCalls)
+	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogNextSplitJobIDKey())
+	requireReadKeysContain(t, coordinator.lastReadKeys, distribution.CatalogSplitJobKey(10))
+}
+
+func TestSplitJobReadFenceKeysExcludesTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	readKeys := splitJobReadFenceKeys([]distribution.SplitJob{
+		{
+			JobID: 10,
+			Phase: distribution.SplitJobPhaseBackfill,
+		},
+		{
+			JobID:        11,
+			Phase:        distribution.SplitJobPhaseDone,
+			TerminalAtMs: 1000,
+		},
+		{
+			JobID:        12,
+			Phase:        distribution.SplitJobPhaseAbandoned,
+			TerminalAtMs: 1001,
+		},
+	})
+
+	require.Len(t, readKeys, 2)
+	requireReadKeysContain(t, readKeys, distribution.CatalogNextSplitJobIDKey())
+	requireReadKeysContain(t, readKeys, distribution.CatalogSplitJobKey(10))
+	requireReadKeysNotContain(t, readKeys, distribution.CatalogSplitJobHistoryKey(1000, 11))
+	requireReadKeysNotContain(t, readKeys, distribution.CatalogSplitJobHistoryKey(1001, 12))
+}
+
+func TestDistributionServerSplitRange_ConflictsWhenSplitJobCreatedAfterOverlapScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	coordinator.beforeApply = func(ctx context.Context, _ store.MVCCStore) error {
+		return catalog.CreateSplitJob(ctx, distribution.SplitJob{
+			JobID:         10,
+			SourceRouteID: 1,
+			SplitKey:      []byte("g"),
+			TargetGroupID: 8,
+			Phase:         distribution.SplitJobPhaseBackfill,
+		})
+	}
+	s := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(coordinator))
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("c"),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCatalogConflict.Error())
+	require.Equal(t, 1, coordinator.dispatchCalls)
+
+	snapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, saved.Version, snapshot.Version)
 }
 
 func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing.T) {
@@ -838,6 +1001,8 @@ type distributionCoordinatorStub struct {
 	lastStartTS           uint64
 	lastCommitTS          uint64
 	lastRequestedCommitTS uint64
+	lastReadKeys          [][]byte
+	beforeApply           func(context.Context, store.MVCCStore) error
 	afterDispatch         func(context.Context, store.MVCCStore, uint64) error
 	asyncApplyDone        chan error
 	asyncApplyDelay       time.Duration
@@ -861,6 +1026,8 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 	startTS, commitTS := s.nextTimestamps(reqs.StartTS, reqs.CommitTS)
 	s.lastStartTS = startTS
 	s.lastCommitTS = commitTS
+	readKeys := cloneDistributionReadKeys(reqs.ReadKeys)
+	s.lastReadKeys = readKeys
 
 	if err := kv.ValidateElemCommitTSPatches(reqs.Elems, commitTS); err != nil {
 		return nil, err
@@ -874,14 +1041,14 @@ func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.Ope
 		delay := s.asyncApplyDelay
 		go func() {
 			time.Sleep(delay)
-			err := s.applyDispatch(ctx, mutations, startTS, commitTS)
+			err := s.applyDispatch(ctx, mutations, readKeys, startTS, commitTS)
 			if done != nil {
 				done <- err
 			}
 		}()
 		return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
 	}
-	if err := s.applyDispatch(ctx, mutations, startTS, commitTS); err != nil {
+	if err := s.applyDispatch(ctx, mutations, readKeys, startTS, commitTS); err != nil {
 		return nil, err
 	}
 	return &kv.CoordinateResponse{CommitIndex: commitTS, CommitTS: commitTS}, nil
@@ -918,10 +1085,16 @@ func (s *distributionCoordinatorStub) nextTimestamps(startTS uint64, requestedCo
 func (s *distributionCoordinatorStub) applyDispatch(
 	ctx context.Context,
 	mutations []*store.KVPairMutation,
+	readKeys [][]byte,
 	startTS uint64,
 	commitTS uint64,
 ) error {
-	if err := s.store.ApplyMutations(ctx, mutations, nil, startTS, commitTS); err != nil {
+	if s.beforeApply != nil {
+		if err := s.beforeApply(ctx, s.store); err != nil {
+			return err
+		}
+	}
+	if err := s.store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS); err != nil {
 		return err
 	}
 	if s.afterDispatch != nil {
@@ -930,6 +1103,36 @@ func (s *distributionCoordinatorStub) applyDispatch(
 		}
 	}
 	return nil
+}
+
+func cloneDistributionReadKeys(in [][]byte) [][]byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([][]byte, len(in))
+	for i := range in {
+		out[i] = distribution.CloneBytes(in[i])
+	}
+	return out
+}
+
+func requireReadKeysContain(t *testing.T, readKeys [][]byte, want []byte) {
+	t.Helper()
+	for _, key := range readKeys {
+		if bytes.Equal(key, want) {
+			return
+		}
+	}
+	t.Fatalf("expected read keys to contain %q, got %q", want, readKeys)
+}
+
+func requireReadKeysNotContain(t *testing.T, readKeys [][]byte, want []byte) {
+	t.Helper()
+	for _, key := range readKeys {
+		if bytes.Equal(key, want) {
+			t.Fatalf("expected read keys not to contain %q, got %q", want, readKeys)
+		}
+	}
 }
 
 func coordinatorStubMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {

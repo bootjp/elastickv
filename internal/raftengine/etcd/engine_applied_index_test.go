@@ -60,7 +60,9 @@ func (f *recordingAppliedIndexFSM) SetDurableAppliedIndex(idx uint64) error {
 		f.failNext = false
 		return f.failErr
 	}
-	f.rec.record("bump", idx)
+	if f.rec != nil {
+		f.rec.record("bump", idx)
+	}
 	return nil
 }
 
@@ -236,6 +238,18 @@ func TestProtectReceivedFSMSnapshotWaitsOnSnapshotMuForAlreadyAppliedIndex(t *te
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
+func TestProtectReceivedFSMSnapshotRejectsDuplicateInFlightIndex(t *testing.T) {
+	e := &Engine{}
+
+	require.True(t, e.protectReceivedFSMSnapshot(9))
+	require.False(t, e.protectReceivedFSMSnapshot(9))
+	require.Equal(t, map[uint64]int{9: 1}, e.protectedReceivedFSMSnaps)
+
+	e.unprotectReceivedFSMSnapshot(9)
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.True(t, e.protectReceivedFSMSnapshot(9))
+}
+
 func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{9: 1},
@@ -284,8 +298,29 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsUnprotectsNonSnapshotReady(t *tes
 	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
 }
 
-func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+func TestReleaseIgnoredReceivedFSMSnapshotStepsRemovesIgnoredFSMFile(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("ignored snapshot"))
 	e := &Engine{
+		fsmSnapDir:                fsmSnapDir,
+		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
+		pendingReceivedFSMSnapshotStep: map[uint64]int{
+			10: 1,
+		},
+	}
+
+	e.releaseIgnoredReceivedFSMSnapshotSteps(etcdraft.Ready{})
+
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 10))
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+}
+
+func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("accepted snapshot"))
+	e := &Engine{
+		fsmSnapDir:                fsmSnapDir,
 		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
 		pendingReceivedFSMSnapshotStep: map[uint64]int{
 			10: 1,
@@ -299,6 +334,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 
 	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
 	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 10))
 }
 
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
@@ -366,6 +402,60 @@ func TestPersistCreatedSnapshot_BumpErrorAborts(t *testing.T) {
 	require.Error(t, err, "bump failure MUST be surfaced to caller")
 	require.Empty(t, rec.snapshot(),
 		"failed bump MUST NOT have recorded; SaveSnap MUST NOT have run")
+}
+
+func TestPersistReadyWithSnapshot_BumpsAppliedIndexAfterWALSnapshot(t *testing.T) {
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingAppliedIndexFSM{rec: rec}
+	persist := &recordingPersistStorage{rec: rec}
+	fsmSnapDir := t.TempDir()
+	const index uint64 = 77
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, index, []byte("snapshot-payload"))
+	e := &Engine{
+		storage:    etcdraft.NewMemoryStorage(),
+		fsm:        fsm,
+		persist:    persist,
+		dataDir:    t.TempDir(),
+		fsmSnapDir: fsmSnapDir,
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	snap := appliedIndexTestSnapshot(index, encodeSnapshotToken(index, crc))
+	require.NoError(t, e.persistReadyWithSnapshotLocked(etcdraft.Ready{Snapshot: &snap}))
+
+	require.Equal(t, []orderEvent{
+		{kind: "save", index: index},
+		{kind: "bump", index: index},
+	}, rec.snapshot(),
+		"received snapshot restore MUST publish its applied index only after the raft snapshot is durable")
+	require.Equal(t, index, e.applied)
+}
+
+func TestPersistReadyWithSnapshot_BumpErrorAfterWALSnapshotSurfaces(t *testing.T) {
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingAppliedIndexFSM{rec: rec, failNext: true, failErr: io.ErrShortBuffer}
+	persist := &recordingPersistStorage{rec: rec}
+	fsmSnapDir := t.TempDir()
+	const index uint64 = 78
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, index, []byte("snapshot-payload"))
+	e := &Engine{
+		storage:    etcdraft.NewMemoryStorage(),
+		fsm:        fsm,
+		persist:    persist,
+		dataDir:    t.TempDir(),
+		fsmSnapDir: fsmSnapDir,
+		peers: map[uint64]Peer{
+			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		},
+	}
+
+	snap := appliedIndexTestSnapshot(index, encodeSnapshotToken(index, crc))
+	err := e.persistReadyWithSnapshotLocked(etcdraft.Ready{Snapshot: &snap})
+	require.Error(t, err, "received snapshot bump failure MUST be surfaced")
+	require.Equal(t, []orderEvent{{kind: "save", index: index}}, rec.snapshot(),
+		"received snapshot path must not bump before the WAL snapshot is durable")
 }
 
 // --- Site 2: persistLocalSnapshotPayload (steady-state hot path) ---

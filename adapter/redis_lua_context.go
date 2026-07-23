@@ -194,6 +194,14 @@ type luaPhysicalLimitedScanStore interface {
 
 var errLuaStreamDeltaNeedsFullRewrite = errors.New("lua stream delta requires full rewrite")
 
+type luaExactScanFallbackDecider interface {
+	AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) bool
+}
+
+type luaRoutePinnedScanStore interface {
+	ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error)
+}
+
 type luaCommandHandler func(*luaScriptContext, []string) (luaReply, error)
 type luaRenameHandler func(*luaScriptContext, []byte, []byte) error
 
@@ -1019,7 +1027,10 @@ func (c *luaScriptContext) streamType(key []byte) (redisValueType, error) {
 func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 	k := string(key)
 	if st, ok := c.streams[k]; ok {
-		return st, nil
+		if st.loaded {
+			return st, nil
+		}
+		return c.materializeStreamState(key, st)
 	}
 	st := &luaStreamState{}
 	c.streams[k] = st
@@ -1067,6 +1078,14 @@ func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 	}
 	st.baseMeta = meta
 	st.meta = meta
+	return st, nil
+}
+
+func (c *luaScriptContext) materializeStreamState(key []byte, st *luaStreamState) (*luaStreamState, error) {
+	if err := c.materializeStream(key, st); err != nil {
+		return nil, err
+	}
+	st.loaded = true
 	return st, nil
 }
 
@@ -2324,6 +2343,81 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 	if err != nil {
 		return luaLazyListBoundaryItem{}, false, errors.WithStack(err)
 	}
+	if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+		return item, true, nil
+	}
+	if physicalLimitReached {
+		if !c.allowExactListScanFallback(startKey, endKey, scanLimit, !left) {
+			return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+				"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
+		}
+		return c.scanListItemWindowExact(key, meta, startKey, endKey, left)
+	}
+	if len(kvs) >= scanLimit {
+		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
+			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
+	}
+	return luaLazyListBoundaryItem{}, false, nil
+}
+
+func (c *luaScriptContext) allowExactListScanFallback(startKey, endKey []byte, scanLimit int, reverse bool) bool {
+	decider, ok := c.server.store.(luaExactScanFallbackDecider)
+	if !ok {
+		return true
+	}
+	return decider.AllowExactScanFallbackAfterPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS, reverse)
+}
+
+func (c *luaScriptContext) scanListItemWindowExact(key []byte, meta store.ListMeta, startKey, endKey []byte, left bool) (luaLazyListBoundaryItem, bool, error) {
+	routeStart, routeEnd := luaListRouteScanBounds(key)
+	for {
+		kvs, err := c.scanExactListPage(startKey, endKey, routeStart, routeEnd, left)
+		if err != nil {
+			return luaLazyListBoundaryItem{}, false, err
+		}
+		if len(kvs) == 0 {
+			return luaLazyListBoundaryItem{}, false, nil
+		}
+		if item, ok := luaListBoundaryItemFromKVs(key, meta, kvs); ok {
+			return item, true, nil
+		}
+		if left {
+			startKey = scanStartAfterKey(kvs[0].Key)
+		} else {
+			endKey = append([]byte(nil), kvs[0].Key...)
+		}
+	}
+}
+
+func luaListRouteScanBounds(key []byte) ([]byte, []byte) {
+	return append([]byte(nil), key...), prefixScanEnd(key)
+}
+
+func (c *luaScriptContext) scanExactListPage(startKey, endKey, routeStart, routeEnd []byte, left bool) ([]*store.KVPair, error) {
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if scanner, ok := c.server.store.(luaRoutePinnedScanStore); ok {
+		kvs, err = scanner.ScanAtWithReadFence(c.ctx, startKey, endKey, 1, c.startTS, !left, 0, 0, routeStart, routeEnd)
+	} else if left {
+		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	} else {
+		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return kvs, nil
+}
+
+func scanStartAfterKey(key []byte) []byte {
+	next := make([]byte, len(key)+1)
+	copy(next, key)
+	return next
+}
+
+func luaListBoundaryItemFromKVs(key []byte, meta store.ListMeta, kvs []*store.KVPair) (luaLazyListBoundaryItem, bool) {
 	for _, kvp := range kvs {
 		seq, ok := store.ExtractListItemSeq(kvp.Key, key)
 		if !ok {
@@ -2332,17 +2426,9 @@ func (c *luaScriptContext) scanListItemWindow(key []byte, meta store.ListMeta, s
 		return luaLazyListBoundaryItem{
 			value: string(kvp.Value),
 			index: seq - meta.Head,
-		}, true, nil
+		}, true
 	}
-	if physicalLimitReached {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d physical item rows", string(key), scanLimit)
-	}
-	if len(kvs) >= scanLimit {
-		return luaLazyListBoundaryItem{}, false, errors.Wrapf(ErrCollectionTooLarge,
-			"list %q sparse pop scanned %d non-matching item rows", string(key), scanLimit)
-	}
-	return luaLazyListBoundaryItem{}, false, nil
+	return luaLazyListBoundaryItem{}, false
 }
 
 func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
@@ -3285,6 +3371,10 @@ func (c *luaScriptContext) cmdXAdd(args []string) (luaReply, error) {
 	if err != nil {
 		return luaReply{}, err
 	}
+	return c.cmdXAddMaterialized(parsed)
+}
+
+func (c *luaScriptContext) cmdXAddMaterialized(parsed luaXAddArgs) (luaReply, error) {
 	st, err := c.streamState(parsed.key)
 	if err != nil {
 		return luaReply{}, err
@@ -4186,7 +4276,7 @@ func (c *luaScriptContext) streamCommitPlan(ctx context.Context, key string) (lu
 		elems, err := c.streamCommitElems(ctx, key)
 		return luaCommitPlan{elems: elems, inlineMetaRewritten: true}, err
 	}
-	elems, err := c.streamDeltaCommitElems(ctx, key, st)
+	elems, err := c.streamStateDeltaCommitElems(ctx, key, st)
 	if errors.Is(err, errLuaStreamDeltaNeedsFullRewrite) {
 		if materializeErr := c.materializeStream([]byte(key), st); materializeErr != nil {
 			return luaCommitPlan{}, materializeErr
@@ -4195,6 +4285,62 @@ func (c *luaScriptContext) streamCommitPlan(ctx context.Context, key string) (lu
 		return luaCommitPlan{elems: elems, inlineMetaRewritten: true}, err
 	}
 	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: true, elems: elems}, err
+}
+
+// streamStateDeltaCommitElems emits only newly appended entries, bounded head
+// tombstones, and the authoritative metadata record. Untouched entries remain
+// in place, avoiding an O(stream length) Lua XADD rewrite.
+func (c *luaScriptContext) streamStateDeltaCommitElems(
+	ctx context.Context,
+	key string,
+	st *luaStreamState,
+) ([]*kv.Elem[kv.OP], error) {
+	keyBytes := []byte(key)
+	ttl, err := c.finalTTL(ctx, keyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	trimCount := int(st.baseTrim)
+	trimElems, trimmedThrough, err := c.server.buildXTrimHeadElems(ctx, keyBytes, c.startTS, trimCount, st.baseMeta)
+	if err != nil {
+		return nil, err
+	}
+	if len(trimElems) != trimCount {
+		return nil, errLuaStreamDeltaNeedsFullRewrite
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(trimElems)+len(st.appended)+1)
+	elems = append(elems, trimElems...)
+	for _, entry := range st.appended {
+		parsed, err := parseRedisStreamID(entry.ID)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		entryValue, err := marshalStreamEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.StreamEntryKey(keyBytes, parsed.ms, parsed.seq),
+			Value: entryValue,
+		})
+	}
+	meta := st.meta
+	meta.ExpireAt = ttlMillis(ttl)
+	if trimmedThrough.ok {
+		meta.TrimmedMs, meta.TrimmedSeq = trimmedThrough.ms, trimmedThrough.seq
+	}
+	metaBytes, err := store.MarshalStreamMeta(meta)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.StreamMetaKey(keyBytes),
+		Value: metaBytes,
+	})
+	return elems, nil
 }
 
 // streamCommitElems writes the script's final stream state in the
@@ -4266,62 +4412,6 @@ func marshalLuaStreamEntries(
 	}
 	meta.Length = int64(len(entries))
 	return elems, meta, nil
-}
-
-// streamDeltaCommitElems emits only the newly appended entries, bounded head
-// tombstones, and the authoritative metadata record. Untouched entries remain
-// in place, avoiding the O(stream length) Lua XADD rewrite.
-func (c *luaScriptContext) streamDeltaCommitElems(
-	ctx context.Context,
-	key string,
-	st *luaStreamState,
-) ([]*kv.Elem[kv.OP], error) {
-	keyBytes := []byte(key)
-	ttl, err := c.finalTTL(ctx, keyBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	trimCount := int(st.baseTrim)
-	trimElems, trimmedThrough, err := c.server.buildXTrimHeadElems(ctx, keyBytes, c.startTS, trimCount, st.baseMeta)
-	if err != nil {
-		return nil, err
-	}
-	if len(trimElems) != trimCount {
-		return nil, errLuaStreamDeltaNeedsFullRewrite
-	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(trimElems)+len(st.appended)+1)
-	elems = append(elems, trimElems...)
-	for _, entry := range st.appended {
-		parsed, err := parseRedisStreamID(entry.ID)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		entryValue, err := marshalStreamEntry(entry)
-		if err != nil {
-			return nil, err
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.StreamEntryKey(keyBytes, parsed.ms, parsed.seq),
-			Value: entryValue,
-		})
-	}
-	meta := st.meta
-	meta.ExpireAt = ttlMillis(ttl)
-	if trimmedThrough.ok {
-		meta.TrimmedMs, meta.TrimmedSeq = trimmedThrough.ms, trimmedThrough.seq
-	}
-	metaBytes, err := store.MarshalStreamMeta(meta)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.StreamMetaKey(keyBytes),
-		Value: metaBytes,
-	})
-	return elems, nil
 }
 
 func (c *luaScriptContext) finalType(ctx context.Context, key []byte) (redisValueType, error) {

@@ -47,6 +47,31 @@ func TestExecDedup_LandedPriorAttempt_ReturnsCachedResults(t *testing.T) {
 	require.Equal(t, []byte("v1"), val)
 }
 
+func TestExecDedup_RouteFenceRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.routeFenceAtDispatch = 2
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	queue := []redcon.Command{
+		{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v1")}},
+	}
+	results, err := srv.runTransaction(queue)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "OK", results[0].str)
+	require.Equal(t, 3, coord.dispatches)
+	require.Equal(t, 1, coord.probeNoOps, "route-fenced reuse must not replace the prior landed probe")
+
+	rawVal, err := st.GetAt(ctx, redisStrKey([]byte("k")), snapshotTS(coord.Clock(), st))
+	require.NoError(t, err)
+	val, _, err := decodeRedisStr(rawVal)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+}
+
 // TestExecDedup_PriorAttemptDidNotLand_Applies covers the truncated case for
 // MULTI/EXEC: attempt 1 errored without committing (OCC-style pre-reject),
 // so the probe misses and the reuse applies the same write set at a fresh

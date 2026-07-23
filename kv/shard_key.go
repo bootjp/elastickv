@@ -40,6 +40,17 @@ const (
 	// family (!sqs|queue|meta|, !sqs|msg|vis|, etc.). Used by
 	// sqsRouteKey to dispatch the routing decision.
 	sqsInternalPrefix = "!sqs|"
+
+	sqsQueueMetaPrefix      = "!sqs|queue|meta|"
+	sqsQueueGenPrefix       = "!sqs|queue|gen|"
+	sqsQueueSeqPrefix       = "!sqs|queue|seq|"
+	sqsQueueTombstonePrefix = "!sqs|queue|tombstone|"
+	sqsMsgDataPrefix        = "!sqs|msg|data|"
+	sqsMsgVisPrefix         = "!sqs|msg|vis|"
+	sqsMsgDedupPrefix       = "!sqs|msg|dedup|"
+	sqsMsgGroupPrefix       = "!sqs|msg|group|"
+	sqsMsgByAgePrefix       = "!sqs|msg|byage|"
+	sqsPartitionMarker      = "p|"
 )
 
 var (
@@ -48,23 +59,31 @@ var (
 	dynamoTableGenerationPrefixBytes = []byte(DynamoTableGenerationPrefix)
 	dynamoItemPrefixBytes            = []byte(DynamoItemPrefix)
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
-	sqsRoutePrefixBytes              = []byte(sqsRoutePrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
-	redisWideColumnScanPrefixes      = [][]byte{
-		[]byte(store.HashMetaDeltaPrefix),
-		[]byte(store.HashMetaPrefix),
-		[]byte(store.HashFieldPrefix),
-		[]byte(store.SetMetaDeltaPrefix),
-		[]byte(store.SetMetaPrefix),
-		[]byte(store.SetMemberPrefix),
-		[]byte(store.ZSetMetaDeltaPrefix),
-		[]byte(store.ZSetMetaPrefix),
-		[]byte(store.ZSetMemberPrefix),
-		[]byte(store.ZSetScorePrefix),
+	sqsGlobalRouteKey                = []byte(sqsRoutePrefix + "global")
+	sqsConcreteInternalPrefixBytes   = [][]byte{
+		[]byte(sqsQueueMetaPrefix),
+		[]byte(sqsQueueGenPrefix),
+		[]byte(sqsQueueSeqPrefix),
+		[]byte(sqsQueueTombstonePrefix),
+		[]byte(sqsMsgDataPrefix),
+		[]byte(sqsMsgVisPrefix),
+		[]byte(sqsMsgDedupPrefix),
+		[]byte(sqsMsgGroupPrefix),
+		[]byte(sqsMsgByAgePrefix),
 	}
-	redisListAuxiliaryScanPrefixes = [][]byte{
-		[]byte(store.ListMetaDeltaPrefix),
-		[]byte(store.ListClaimPrefix),
+	routeKeyExtractors = []func([]byte) []byte{
+		redisRouteKey,
+		dynamoRouteKey,
+		sqsRouteKey,
+		s3keys.ExtractRouteKey,
+		fskeys.ExtractRouteKey,
+		listRouteKey,
+		hashRouteKey,
+		setRouteKey,
+		zsetRouteKey,
+		streamRouteKey,
+		store.ExtractListUserKey,
 	}
 )
 
@@ -95,35 +114,19 @@ func routeFilterKey(key []byte) []byte {
 }
 
 func normalizeRouteKey(key []byte) []byte {
-	if user := redisRouteKey(key); user != nil {
-		return user
-	}
-	if user := redisWideColumnRouteKey(key); user != nil {
-		return user
-	}
-	if table := dynamoRouteKey(key); table != nil {
-		return table
-	}
-	if route := sqsRouteKey(key); route != nil {
-		return route
-	}
-	if user := s3keys.ExtractRouteKey(key); user != nil {
-		return user
-	}
-	if user := fskeys.ExtractRouteKey(key); user != nil {
-		return user
-	}
-	if user := store.ExtractListUserKey(key); user != nil {
-		return user
+	for _, extract := range routeKeyExtractors {
+		if user := extract(key); user != nil {
+			return user
+		}
 	}
 	return key
 }
 
 func normalizeRouteFilterKey(key []byte) []byte {
-	if user := redisListAuxiliaryRouteKey(key); user != nil {
+	if user := listRouteKey(key); user != nil {
 		return user
 	}
-	if user := redisStreamRouteKey(key); user != nil {
+	if user := streamRouteKey(key); user != nil {
 		return user
 	}
 	return normalizeRouteKey(key)
@@ -140,17 +143,28 @@ func redisWideColumnLegacyPointRouteKey(key []byte) []byte {
 }
 
 func redisWideColumnRouteKey(key []byte) []byte {
-	if user := redisHashRouteKey(key); user != nil {
+	if user := hashRouteKey(key); user != nil {
 		return user
 	}
-	if user := redisSetRouteKey(key); user != nil {
+	if user := setRouteKey(key); user != nil {
 		return user
 	}
-	return redisZSetRouteKey(key)
+	return zsetRouteKey(key)
 }
 
 func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
-	for _, prefix := range redisWideColumnScanPrefixes {
+	for _, prefix := range [][]byte{
+		[]byte(store.HashMetaDeltaPrefix),
+		[]byte(store.HashMetaPrefix),
+		[]byte(store.HashFieldPrefix),
+		[]byte(store.SetMetaDeltaPrefix),
+		[]byte(store.SetMetaPrefix),
+		[]byte(store.SetMemberPrefix),
+		[]byte(store.ZSetMetaDeltaPrefix),
+		[]byte(store.ZSetMetaPrefix),
+		[]byte(store.ZSetMemberPrefix),
+		[]byte(store.ZSetScorePrefix),
+	} {
 		if !bytes.HasPrefix(key, prefix) {
 			continue
 		}
@@ -162,14 +176,6 @@ func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, u
 		return prefix, user, key[:prefixLen], true, true
 	}
 	return nil, nil, nil, false, false
-}
-
-func redisWideColumnLegacyScanRouteRange(start []byte, end []byte) ([]byte, []byte, bool) {
-	_, _, _, owned, parsed := redisWideColumnScanRouteParts(start)
-	if !owned || !parsed {
-		return nil, nil, false
-	}
-	return start, end, true
 }
 
 func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
@@ -193,7 +199,10 @@ func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte,
 }
 
 func listAuxiliaryScanRouteRange(start []byte, end []byte) (routeStart []byte, exact bool, ok bool) {
-	for _, prefix := range redisListAuxiliaryScanPrefixes {
+	for _, prefix := range [][]byte{
+		[]byte(store.ListMetaDeltaPrefix),
+		[]byte(store.ListClaimPrefix),
+	} {
 		if !bytes.HasPrefix(start, prefix) {
 			continue
 		}
@@ -225,69 +234,6 @@ func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
 		return nil
 	}
 	return rest[:keyLen]
-}
-
-func redisHashRouteKey(key []byte) []byte {
-	switch {
-	case store.IsHashMetaDeltaKey(key):
-		return store.ExtractHashUserKeyFromDelta(key)
-	case store.IsHashMetaKey(key):
-		return store.ExtractHashUserKeyFromMeta(key)
-	case store.IsHashFieldKey(key):
-		return store.ExtractHashUserKeyFromField(key)
-	default:
-		return nil
-	}
-}
-
-func redisSetRouteKey(key []byte) []byte {
-	switch {
-	case store.IsSetMetaDeltaKey(key):
-		return store.ExtractSetUserKeyFromDelta(key)
-	case store.IsSetMetaKey(key):
-		return store.ExtractSetUserKeyFromMeta(key)
-	case store.IsSetMemberKey(key):
-		return store.ExtractSetUserKeyFromMember(key)
-	default:
-		return nil
-	}
-}
-
-func redisZSetRouteKey(key []byte) []byte {
-	switch {
-	case store.IsZSetMetaDeltaKey(key):
-		return store.ExtractZSetUserKeyFromDelta(key)
-	case store.IsZSetMetaKey(key):
-		return store.ExtractZSetUserKeyFromMeta(key)
-	case store.IsZSetMemberKey(key):
-		return store.ExtractZSetUserKeyFromMember(key)
-	case store.IsZSetScoreKey(key):
-		return store.ExtractZSetUserKeyFromScore(key)
-	default:
-		return nil
-	}
-}
-
-func redisListAuxiliaryRouteKey(key []byte) []byte {
-	switch {
-	case store.IsListMetaDeltaKey(key):
-		return store.ExtractListUserKeyFromDelta(key)
-	case store.IsListClaimKey(key):
-		return store.ExtractListUserKeyFromClaim(key)
-	default:
-		return nil
-	}
-}
-
-func redisStreamRouteKey(key []byte) []byte {
-	switch {
-	case store.IsStreamMetaKey(key):
-		return store.ExtractStreamUserKeyFromMeta(key)
-	case store.IsStreamEntryKey(key):
-		return store.ExtractStreamUserKeyFromEntry(key)
-	default:
-		return nil
-	}
 }
 
 func redisRouteKey(key []byte) []byte {
@@ -335,19 +281,86 @@ func dynamoRouteTableKey(tableSegment []byte) []byte {
 	return out
 }
 
-// sqsRouteKey maps any !sqs|... internal key to a stable route key so
-// multi-shard deployments that partition by user-key range still land
-// every SQS mutation on a configured group. Milestone 1 collapses all
-// SQS keys to a single !sqs|route|global route — this keeps the
-// catalog and every queue's message keyspace on the same group, which
-// is the minimum needed for FIFO group-lock semantics (landing later)
-// to work. When per-queue sharding is implemented it will live here.
+func listRouteKey(key []byte) []byte {
+	if userKey := store.ExtractListUserKeyFromDelta(key); userKey != nil {
+		return userKey
+	}
+	if userKey := store.ExtractListUserKeyFromClaim(key); userKey != nil {
+		return userKey
+	}
+	return nil
+}
+
+func hashRouteKey(key []byte) []byte {
+	switch {
+	case store.IsHashMetaDeltaKey(key):
+		return store.ExtractHashUserKeyFromDelta(key)
+	case store.IsHashMetaKey(key):
+		return store.ExtractHashUserKeyFromMeta(key)
+	case store.IsHashFieldKey(key):
+		return store.ExtractHashUserKeyFromField(key)
+	default:
+		return nil
+	}
+}
+
+func setRouteKey(key []byte) []byte {
+	switch {
+	case store.IsSetMetaDeltaKey(key):
+		return store.ExtractSetUserKeyFromDelta(key)
+	case store.IsSetMetaKey(key):
+		return store.ExtractSetUserKeyFromMeta(key)
+	case store.IsSetMemberKey(key):
+		return store.ExtractSetUserKeyFromMember(key)
+	default:
+		return nil
+	}
+}
+
+func zsetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsZSetMetaDeltaKey(key):
+		return store.ExtractZSetUserKeyFromDelta(key)
+	case store.IsZSetMetaKey(key):
+		return store.ExtractZSetUserKeyFromMeta(key)
+	case store.IsZSetMemberKey(key):
+		return store.ExtractZSetUserKeyFromMember(key)
+	case store.IsZSetScoreKey(key):
+		return store.ExtractZSetUserKeyFromScore(key)
+	default:
+		return nil
+	}
+}
+
+func streamRouteKey(key []byte) []byte {
+	switch {
+	case store.IsStreamMetaKey(key):
+		return store.ExtractStreamUserKeyFromMeta(key)
+	case store.IsStreamEntryKey(key):
+		return store.ExtractStreamUserKeyFromEntry(key)
+	default:
+		return nil
+	}
+}
+
+// sqsRouteKey maps concrete persisted !sqs|... storage prefixes to a stable
+// route key. Adapter-looking raw user keys such as !sqs|foo intentionally stay
+// on their raw route and migrate through the user-key bracket.
 func sqsRouteKey(key []byte) []byte {
 	if !bytes.HasPrefix(key, sqsInternalPrefixBytes) {
 		return nil
 	}
-	out := make([]byte, 0, len(sqsRoutePrefixBytes)+len("global"))
-	out = append(out, sqsRoutePrefixBytes...)
-	out = append(out, []byte("global")...)
-	return out
+	if !hasSQSConcreteInternalPrefix(key) {
+		return nil
+	}
+	return sqsGlobalRouteKey
+}
+
+func hasSQSConcreteInternalPrefix(key []byte) bool {
+	for _, prefix := range sqsConcreteInternalPrefixBytes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }

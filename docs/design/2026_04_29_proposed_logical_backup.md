@@ -884,7 +884,7 @@ refuse if: remaining_headroom < --snapshot-headroom-entries
 ```
 
 `SnapshotEvery` is the per-engine snapshot trigger (default
-`defaultSnapshotEvery = 10000` from `internal/raftengine/etcd/engine.go:92`,
+`defaultSnapshotEvery = 100000` from `internal/raftengine/etcd/engine.go:92`,
 overridden via the `ELASTICKV_RAFT_SNAPSHOT_COUNT` env var — there is
 no `--raftSnapshotEvery` CLI flag). The value is currently a private
 field on the etcd `Engine` struct (`internal/raftengine/etcd/engine.go:224`)
@@ -906,9 +906,9 @@ implemented on the etcd backend by returning the
 place, `BeginBackup` reads each group's `SnapshotEvery` rather than
 hardcoding `defaultSnapshotEvery`, so an operator who tuned
 `ELASTICKV_RAFT_SNAPSHOT_COUNT` sees consistent behavior. With
-`SnapshotEvery = 10000` and
-`--snapshot-headroom-entries = 1000` (default; one-tenth of
-SnapshotEvery), the check refuses backups when fewer than 1000 entries
+`SnapshotEvery = 100000` and
+`--snapshot-headroom-entries = 10000` (default; one-tenth of
+SnapshotEvery), the check refuses backups when fewer than 10000 entries
 remain before the next snapshot fires — i.e. when an in-flight backup
 is at risk of triggering the snapshot-installation corner case. A
 freshly-snapshotted cluster has the *largest* remaining headroom and
@@ -1341,7 +1341,7 @@ written.
   `s.groups[id]` map without a typed assertion fallback. Tests
   that mock `AdminGroup` (e.g. `adapter/admin_grpc_test.go`) gain
   one extra method to implement; they can return
-  `defaultSnapshotEvery = 10000` for parity with production.
+  `defaultSnapshotEvery = 100000` for parity with production.
 - Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline`,
   `Extend`, and the per-second sweeper goroutine that reaps expired
   pins and emits the `backup_pin_expired` structured warning.
@@ -1601,7 +1601,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestAdminGRPCConnCacheReuse` | Two consecutive `BeginBackup` calls dialing the same peer share one underlying `*grpc.ClientConn` (verified via the cache size); shutdown of a peer evicts only that entry, not the whole cache; admin cache is independent of `ShardStore.connCache` (no cross-cache eviction) |
 | `TestBeginBackupPropagatesAdminAuthToken` | A cluster booted with `--adminToken` accepts a `BeginBackup` call carrying `authorization: Bearer <token>`; the handler propagates the same metadata via `metadata.NewOutgoingContext` to every `GetNodeVersion` fan-out dial, so peers return their version (not `Unauthenticated`). A `BeginBackup` call without the token is itself rejected before any fan-out happens |
 | `TestVersionCacheRaceUnderLoad` | `go test -race` with 50 concurrent `GetRaftGroups` callers and async `GetNodeVersion` probe goroutines writing the cache simultaneously emits no data-race report; the `sync.Map` choice is enforced by the lack of a separate `versionCacheMu` field on `AdminServer` |
-| `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
+| `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 100000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |

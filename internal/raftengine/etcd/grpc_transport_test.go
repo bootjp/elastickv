@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -122,6 +123,58 @@ func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 	_, err = transport.receiveSnapshotStream(stream)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errSnapshotMetadataDuplicate))
+}
+
+func TestSnapshotSendGateAllowsOnlyOneInFlightSnapshot(t *testing.T) {
+	transport := NewGRPCTransport(nil)
+
+	require.True(t, transport.tryAcquireSnapshotSend())
+	require.False(t, transport.tryAcquireSnapshotSend())
+
+	transport.releaseSnapshotSend()
+	require.True(t, transport.tryAcquireSnapshotSend())
+	transport.releaseSnapshotSend()
+}
+
+func TestReceiveSnapshotStreamRejectsProtectedIndexBeforePayload(t *testing.T) {
+	const index = uint64(127)
+	metadata := raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgSnap),
+		From: uint64Ptr(1),
+		To:   uint64Ptr(2),
+		Snapshot: &raftpb.Snapshot{
+			Metadata: testSnapshotMetadata(index, 1, nil),
+		},
+	}
+	raw, err := proto.Marshal(&metadata)
+	require.NoError(t, err)
+
+	transport := NewGRPCTransport(nil)
+	fsmSnapDir := t.TempDir()
+	transport.SetFSMSnapDir(fsmSnapDir)
+	var protected []uint64
+	transport.SetFSMSnapshotProtection(
+		func(got uint64) bool {
+			protected = append(protected, got)
+			return false
+		},
+		func(uint64) {
+			t.Fatal("stale snapshot rejection must not unprotect an index it did not protect")
+		},
+	)
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: []byte("payload that must not be read"), Final: true},
+		},
+	}
+
+	_, err = transport.receiveSnapshotStream(stream)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errReceivedFSMSnapshotStale))
+	require.Equal(t, []uint64{index}, protected)
+	require.Equal(t, 1, stream.index, "receiver must reject after metadata before reading payload chunks")
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, index))
 }
 
 // TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet pins the
@@ -908,6 +961,30 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 	require.Zero(t, client.sendStreamCalls.Load())
 }
 
+func TestDispatchRegularDropsCachedPeerConnAfterUnaryUnavailable(t *testing.T) {
+	const addr = "host:2"
+	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	client := &testEtcdRaftClient{sendErr: status.Error(codes.Unavailable, "connection refused")}
+	injectClient(t, transport, addr, client)
+
+	err := transport.dispatchRegular(context.Background(), raftpb.Message{
+		Type:   messageTypePtr(raftpb.MsgHeartbeat),
+		From:   uint64Ptr(1),
+		To:     uint64Ptr(2),
+		Term:   uint64Ptr(4),
+		Commit: uint64Ptr(22),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, grpcStatusCode(err))
+
+	transport.mu.RLock()
+	_, cached := transport.clients[addr]
+	transport.mu.RUnlock()
+	require.False(t, cached)
+	require.Equal(t, int32(1), client.sendCalls.Load())
+}
+
 func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
 	t.Setenv(sendStreamEnabledEnvVar, "false")
 	const addr = "host:2"
@@ -1472,10 +1549,13 @@ func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), defaultSnapshotChunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 1)
+	require.Len(t, client.chunks, 2)
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, payload, client.chunks[0].Chunk)
-	require.True(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[0].Chunk)
+	require.False(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[1].Metadata)
+	require.Equal(t, payload, client.chunks[1].Chunk)
+	require.True(t, client.chunks[1].Final)
 }
 
 func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
@@ -1485,10 +1565,13 @@ func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(nil), defaultSnapshotChunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 1)
+	require.Len(t, client.chunks, 2)
 	require.Equal(t, header, client.chunks[0].Metadata)
 	require.Empty(t, client.chunks[0].Chunk)
-	require.True(t, client.chunks[0].Final)
+	require.False(t, client.chunks[0].Final)
+	require.Empty(t, client.chunks[1].Metadata)
+	require.Empty(t, client.chunks[1].Chunk)
+	require.True(t, client.chunks[1].Final)
 }
 
 // testSnapshotSendClient captures chunks sent via sendSnapshotReaderChunks / sendSnapshotChunks.
@@ -1522,12 +1605,16 @@ type testEtcdRaftClient struct {
 	blockSendStreamUntilContext bool
 	sendStreamStarted           chan struct{}
 	releaseSendStream           chan struct{}
+	sendErr                     error
 	sendCalls                   atomic.Int32
 	sendStreamCalls             atomic.Int32
 }
 
 func (c *testEtcdRaftClient) Send(_ context.Context, _ *pb.EtcdRaftMessage, _ ...grpc.CallOption) (*pb.EtcdRaftAck, error) {
 	c.sendCalls.Add(1)
+	if c.sendErr != nil {
+		return nil, c.sendErr
+	}
 	return &pb.EtcdRaftAck{}, nil
 }
 
@@ -1637,19 +1724,23 @@ func TestSendSnapshotReaderChunksMultiChunk(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 3)
+	require.Len(t, client.chunks, 4)
 
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
 	require.Empty(t, client.chunks[1].Metadata)
-	require.Equal(t, []byte("abcd"), client.chunks[1].Chunk)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
 	require.False(t, client.chunks[1].Final)
 
 	require.Empty(t, client.chunks[2].Metadata)
-	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
-	require.True(t, client.chunks[2].Final)
+	require.Equal(t, []byte("abcd"), client.chunks[2].Chunk)
+	require.False(t, client.chunks[2].Final)
+
+	require.Empty(t, client.chunks[3].Metadata)
+	require.Equal(t, []byte("5678"), client.chunks[3].Chunk)
+	require.True(t, client.chunks[3].Final)
 }
 
 func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
@@ -1662,13 +1753,16 @@ func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 2)
+	require.Len(t, client.chunks, 3)
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
-	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
-	require.True(t, client.chunks[1].Final)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
+	require.False(t, client.chunks[1].Final)
+
+	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
+	require.True(t, client.chunks[2].Final)
 }
 
 // TestSendSnapshotReaderChunksTrailingPartialChunk regressions a production
@@ -1691,17 +1785,20 @@ func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
 	err := sendSnapshotReaderChunks(client, header, bytes.NewReader(payload), chunkSize)
 	require.NoError(t, err)
 
-	require.Len(t, client.chunks, 3, "expected two full chunks plus a trailing partial")
+	require.Len(t, client.chunks, 4, "expected metadata, two full chunks, and a trailing partial")
 
 	require.Equal(t, header, client.chunks[0].Metadata)
-	require.Equal(t, []byte("1234"), client.chunks[0].Chunk)
+	require.Empty(t, client.chunks[0].Chunk)
 	require.False(t, client.chunks[0].Final)
 
-	require.Equal(t, []byte("5678"), client.chunks[1].Chunk)
+	require.Equal(t, []byte("1234"), client.chunks[1].Chunk)
 	require.False(t, client.chunks[1].Final)
 
-	require.Equal(t, []byte("X"), client.chunks[2].Chunk)
-	require.True(t, client.chunks[2].Final)
+	require.Equal(t, []byte("5678"), client.chunks[2].Chunk)
+	require.False(t, client.chunks[2].Final)
+
+	require.Equal(t, []byte("X"), client.chunks[3].Chunk)
+	require.True(t, client.chunks[3].Final)
 
 	var delivered []byte
 	for _, c := range client.chunks {

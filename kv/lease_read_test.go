@@ -26,6 +26,7 @@ type fakeLeaseEngine struct {
 	proposeCalls             atomic.Int32
 	proposeHook              func()       // invoked inside Propose before returning (race injection)
 	proposeApply             func([]byte) // invoked after a successful propose (FSM apply simulation)
+	proposeCtxHook           func(context.Context)
 	state                    atomic.Value // stores raftengine.State; default Leader
 	lastQuorumAckMonoNs      atomic.Int64 // 0 = no ack yet. Updated by setQuorumAck().
 	leaderLossCallbacksMu    sync.Mutex
@@ -64,8 +65,11 @@ func (e *fakeLeaseEngine) Status() raftengine.Status {
 func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (e *fakeLeaseEngine) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
+func (e *fakeLeaseEngine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	e.proposeCalls.Add(1)
+	if e.proposeCtxHook != nil {
+		e.proposeCtxHook(ctx)
+	}
 	if e.proposeHook != nil {
 		e.proposeHook()
 	}

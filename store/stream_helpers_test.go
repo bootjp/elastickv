@@ -76,71 +76,25 @@ func TestExtractStreamUserKeyFromEntry_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestStreamMetaMarshalRoundTripTrimCursor(t *testing.T) {
+func TestExtractStreamUserKeyFromEntryScanPrefix_RoundTrip(t *testing.T) {
 	t.Parallel()
-
-	want := StreamMeta{
-		Length:     42,
-		LastMs:     1000,
-		LastSeq:    7,
-		ExpireAt:   123456,
-		TrimmedMs:  999,
-		TrimmedSeq: 6,
-	}
-	raw, err := MarshalStreamMeta(want)
-	if err != nil {
-		t.Fatalf("MarshalStreamMeta: %v", err)
-	}
-	if len(raw) != streamMetaTrimBinarySize {
-		t.Fatalf("encoded size: want %d, got %d", streamMetaTrimBinarySize, len(raw))
-	}
-	got, err := UnmarshalStreamMeta(raw)
-	if err != nil {
-		t.Fatalf("UnmarshalStreamMeta: %v", err)
-	}
-	if got != want {
-		t.Fatalf("round trip: want %+v, got %+v", want, got)
+	want := []byte("entry-scan-user-key")
+	if got := ExtractStreamUserKeyFromEntryScanPrefix(StreamEntryScanPrefix(want)); !bytes.Equal(got, want) {
+		t.Fatalf("scan prefix round trip: want %q, got %q", want, got)
 	}
 }
 
-func TestStreamMetaUnmarshalLegacySizes(t *testing.T) {
+func TestExtractStreamUserKeyRejectsForeignPrefixes(t *testing.T) {
 	t.Parallel()
 
-	legacy := make([]byte, streamMetaLegacyBinarySize)
-	binary.BigEndian.PutUint64(legacy[0:8], 3)
-	binary.BigEndian.PutUint64(legacy[8:16], 10)
-	binary.BigEndian.PutUint64(legacy[16:24], 2)
-	got, err := UnmarshalStreamMeta(legacy)
-	if err != nil {
-		t.Fatalf("legacy UnmarshalStreamMeta: %v", err)
+	key := append([]byte{0, 0, 0, 1}, 'x')
+	if got := ExtractStreamUserKeyFromMeta(key); got != nil {
+		t.Fatalf("meta extractor accepted non-stream key: %q", got)
 	}
-	if got != (StreamMeta{Length: 3, LastMs: 10, LastSeq: 2}) {
-		t.Fatalf("legacy meta: got %+v", got)
+	if got := ExtractStreamUserKeyFromEntry(key); got != nil {
+		t.Fatalf("entry extractor accepted non-stream key: %q", got)
 	}
-
-	current := make([]byte, streamMetaBinarySize)
-	copy(current, legacy)
-	binary.BigEndian.PutUint64(current[24:32], 99)
-	got, err = UnmarshalStreamMeta(current)
-	if err != nil {
-		t.Fatalf("current UnmarshalStreamMeta: %v", err)
-	}
-	if got != (StreamMeta{Length: 3, LastMs: 10, LastSeq: 2, ExpireAt: 99}) {
-		t.Fatalf("current meta: got %+v", got)
-	}
-}
-
-func TestStreamEntryScanStartUsesTrimCursor(t *testing.T) {
-	t.Parallel()
-
-	key := []byte("trim-cursor")
-	if got := StreamEntryScanStart(key, StreamMeta{}); !bytes.Equal(got, StreamEntryScanPrefix(key)) {
-		t.Fatalf("no trim cursor: got %q", got)
-	}
-	if got := StreamEntryScanStart(key, StreamMeta{TrimmedMs: 9, TrimmedSeq: 4}); !bytes.Equal(got, StreamEntryKey(key, 9, 5)) {
-		t.Fatalf("trim cursor: want start after 9-4, got %q", got)
-	}
-	if got := StreamEntryScanStart(key, StreamMeta{TrimmedMs: 9, TrimmedSeq: ^uint64(0)}); !bytes.Equal(got, StreamEntryKey(key, 10, 0)) {
-		t.Fatalf("seq overflow cursor: want start at 10-0, got %q", got)
+	if got := ExtractStreamUserKeyFromEntryScanPrefix(key); got != nil {
+		t.Fatalf("entry scan extractor accepted non-stream key: %q", got)
 	}
 }

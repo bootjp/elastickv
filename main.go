@@ -1859,6 +1859,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		})
 	}
 	publicKVGate := &startupPublicKVGate{}
+	if in.distServer != nil {
+		in.distServer.SetReadGate(publicKVGate.blocked)
+	}
 	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
 	adapterCoordinate := startupGatedCoordinator{
 		inner: in.coordinate,

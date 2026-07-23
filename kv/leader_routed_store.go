@@ -109,9 +109,6 @@ func (s *LeaderRoutedStore) GetAtWithReadFence(ctx context.Context, key []byte, 
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, key)
 	if ok {
-		if readRouteVersion != 0 {
-			return nil, errors.WithStack(store.ErrNotSupported)
-		}
 		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
 		return val, errors.WithStack(err)
 	}
@@ -148,9 +145,6 @@ func (s *LeaderRoutedStore) LatestCommitTSWithReadFence(ctx context.Context, key
 		return 0, false, nil
 	}
 	if s.leaderOKForKey(ctx, key) {
-		if readRouteVersion != 0 {
-			return 0, false, errors.WithStack(store.ErrNotSupported)
-		}
 		ts, exists, err := s.local.LatestCommitTS(ctx, key)
 		return ts, exists, errors.WithStack(err)
 	}
@@ -273,9 +267,6 @@ func (s *LeaderRoutedStore) ScanAtWithReadFence(ctx context.Context, start []byt
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if !ok {
 		return s.proxyRawScanAtWithReadFence(ctx, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
-	}
-	if readRouteVersion != 0 {
-		return nil, errors.WithStack(store.ErrNotSupported)
 	}
 	readTS := max(ts, fenceTS)
 	if routeScanBoundsPresent(routeStart, routeEnd) {
@@ -473,6 +464,20 @@ func (s *LeaderRoutedStore) ReverseScanAt(ctx context.Context, start []byte, end
 
 func (s *LeaderRoutedStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
 	return s.scanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts, true)
+}
+
+func (s *LeaderRoutedStore) AllowExactScanFallbackAfterPhysicalLimit(ctx context.Context, start []byte, _ []byte, visibleLimit, physicalLimit int, _ uint64, _ bool) bool {
+	if s == nil || s.local == nil {
+		return false
+	}
+	if visibleLimit <= 0 || physicalLimit <= 0 {
+		return false
+	}
+	if ok, _ := s.leaderFenceTS(ctx, start); !ok {
+		return false
+	}
+	_, ok := s.local.(physicalLimitedStore)
+	return ok
 }
 
 func (s *LeaderRoutedStore) scanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {
@@ -693,6 +698,35 @@ func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.Compact(ctx, minTS))
+}
+
+func (s *LeaderRoutedStore) ExportVersions(ctx context.Context, opts store.ExportVersionsOptions) (store.ExportVersionsResult, error) {
+	if s == nil || s.local == nil {
+		return store.ExportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	if s.coordinator != nil {
+		if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
+			return store.ExportVersionsResult{}, errors.WithStack(err)
+		}
+	}
+	result, err := s.local.ExportVersions(ctx, opts)
+	return result, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) ImportVersions(ctx context.Context, opts store.ImportVersionsOptions) (store.ImportVersionsResult, error) {
+	if s == nil || s.local == nil {
+		return store.ImportVersionsResult{}, errors.WithStack(store.ErrNotSupported)
+	}
+	result, err := s.local.ImportVersions(ctx, opts)
+	return result, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {
+	if s == nil || s.local == nil {
+		return 0, errors.WithStack(store.ErrNotSupported)
+	}
+	floor, err := s.local.MigrationHLCFloor(ctx, jobID)
+	return floor, errors.WithStack(err)
 }
 
 func (s *LeaderRoutedStore) Snapshot() (store.Snapshot, error) {

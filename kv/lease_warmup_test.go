@@ -169,6 +169,41 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 		"HLC renewal should resume after startup rotation blocker clears")
 }
 
+func TestCoordinate_RunHLCLeaseRenewal_UsesRenewalTimeout(t *testing.T) {
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+	deadline := make(chan time.Duration, 1)
+	eng.proposeCtxHook = func(ctx context.Context) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			deadline <- 0
+			return
+		}
+		deadline <- time.Until(d)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.RunHLCLeaseRenewal(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	select {
+	case got := <-deadline:
+		require.Greater(t, got, hlcRenewalInterval,
+			"HLC renewal proposal deadline must outlive the renewal cadence")
+		require.LessOrEqual(t, got, hlcRenewalTimeout,
+			"HLC renewal proposal deadline must remain bounded")
+	case <-time.After(2 * hlcRenewalInterval):
+		t.Fatal("timed out waiting for HLC renewal proposal")
+	}
+}
+
 // TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the
 // sharded renewal path warms the target group's lease on a successful
 // propose, so LeaseReadForKey on a key owned by that group serves from the
@@ -294,61 +329,32 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 		"the non-default group lease must be warmed by all-group renewal")
 }
 
-func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T) {
+func TestShardedCoordinator_RenewHLCLeases_UsesRenewalTimeout(t *testing.T) {
 	t.Parallel()
-	clock := NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
-	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
-	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	deadline := make(chan time.Duration, 1)
+	eng1.proposeCtxHook = func(ctx context.Context) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			deadline <- 0
+			return
+		}
+		deadline <- time.Until(d)
+	}
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
-	coord.clock = clock
 
-	require.NoError(t, coord.RecoverHLCLease(context.Background()))
-	require.Equal(t, int32(1), eng1.proposeCalls.Load())
-	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
 
-	got, err := clock.NextFenced()
-	require.NoError(t, err)
-	require.NotZero(t, got)
-}
-
-func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name       string
-		failFirst  bool
-		failSecond bool
-	}{
-		{name: "first fails then second advances", failFirst: true},
-		{name: "first advances then second fails", failSecond: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			clock := NewHLC()
-			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
-			eng1 := newShardedLeaseEngine(100)
-			eng2 := newShardedLeaseEngine(200)
-			eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
-			eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
-			if tc.failFirst {
-				eng1.proposeErr = errors.New("group 1 unavailable")
-			}
-			if tc.failSecond {
-				eng2.proposeErr = errors.New("group 2 unavailable")
-			}
-			coord := mustShardedLeaseCoord(t, eng1, eng2)
-			coord.clock = clock
-
-			require.NoError(t, coord.RecoverHLCLease(context.Background()))
-			require.Equal(t, int32(1), eng1.proposeCalls.Load())
-			require.Equal(t, int32(1), eng2.proposeCalls.Load())
-
-			got, err := clock.NextFenced()
-			require.NoError(t, err)
-			require.NotZero(t, got)
-		})
+	select {
+	case got := <-deadline:
+		require.Greater(t, got, hlcRenewalInterval,
+			"HLC renewal proposal deadline must outlive the renewal cadence")
+		require.LessOrEqual(t, got, hlcRenewalTimeout,
+			"HLC renewal proposal deadline must remain bounded")
+	default:
+		t.Fatal("missing HLC renewal proposal deadline sample")
 	}
 }
 

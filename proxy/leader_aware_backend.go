@@ -180,6 +180,13 @@ func (b *LeaderAwareRedisBackend) TriggerRefresh() {
 	}
 }
 
+// RefreshLeaderNow re-probes the cluster before returning. It is used by
+// callers that already observed a not-leader response and need the next retry
+// to use a fresh target instead of waiting for the background loop.
+func (b *LeaderAwareRedisBackend) RefreshLeaderNow(ctx context.Context) {
+	b.refreshLeader(ctx)
+}
+
 // refreshLeader probes INFO replication on the current leader first, then on
 // each seed, and adopts the first advertised leader address. The current
 // leader's Redis address is returned by the leader node itself when it's
@@ -236,12 +243,6 @@ func (b *LeaderAwareRedisBackend) refreshLeaderOnce(ctx context.Context) {
 		b.logger.Warn("leader discovery could not find an advertised leader",
 			"backend", b.name, "candidates", candidates)
 	}
-}
-
-// RefreshLeaderNow synchronously re-probes the cluster. Callers use this only
-// after an explicit not-leader rejection, where retrying is known to be safe.
-func (b *LeaderAwareRedisBackend) RefreshLeaderNow(ctx context.Context) {
-	b.refreshLeader(ctx)
 }
 
 func (b *LeaderAwareRedisBackend) probeLeader(ctx context.Context, addr string) (string, error) {
@@ -414,6 +415,8 @@ func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redi
 }
 
 // DoWithTimeout forwards a blocking command with a per-call socket timeout.
+// Like Do, a not-leader rejection refreshes the cached leader for the next
+// command without replaying the current command.
 func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
 	cmd := b.doWithTimeoutOnce(ctx, timeout, args...)
 	switch {
@@ -435,8 +438,13 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
-// Pipeline forwards a batch to the current leader.
+// Pipeline forwards a batch to the current leader. NOTLEADER refreshes the
+// cached leader for the next command without replaying the current batch.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipelineOnce(ctx, cmds)
+}
+
+func (b *LeaderAwareRedisBackend) pipelineOnce(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	cli := b.currentClient()
 	if cli == nil {
 		return nil, ErrNoLeaderBackend
@@ -452,7 +460,7 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 		if errors.As(err, &redisErr) || errors.Is(err, redis.Nil) {
 			for _, result := range results {
 				if isElasticKVNotLeaderError(result.Err()) {
-					b.TriggerRefresh()
+					b.RefreshLeaderNow(ctx)
 					break
 				}
 			}
@@ -473,35 +481,6 @@ func isRedisScriptCommandName(name string) bool {
 	default:
 		return false
 	}
-}
-
-func isElasticKVNotLeaderError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	msg := strings.TrimSpace(err.Error())
-	upper := strings.ToUpper(msg)
-	if upper == "NOTLEADER" || strings.HasPrefix(upper, "NOTLEADER ") {
-		return true
-	}
-
-	// Redis application errors without the NOTLEADER code are not safe to
-	// replay. Their text may contain a leader phrase supplied by a script or
-	// command, but the command may already have changed state.
-	var redisErr redis.Error
-	if errors.As(err, &redisErr) {
-		return false
-	}
-
-	// Keep a closed set for leadership errors that may reach this backend
-	// before Redis protocol framing (for example through a gRPC wrapper).
-	return msg == "etcd raft engine is not leader" ||
-		msg == "raft engine: not leader" ||
-		msg == "leader not found" ||
-		strings.HasSuffix(msg, "desc = leader not found") ||
-		strings.HasSuffix(msg, "desc = raft engine: not leader") ||
-		strings.HasSuffix(msg, "desc = etcd raft engine is not leader")
 }
 
 func isLeaderRefreshTransportError(err error) bool {

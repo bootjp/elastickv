@@ -266,6 +266,36 @@ func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
 	return 0, false
 }
 
+// RouteOf returns the route that covered key at this snapshot's version.
+func (s RouteHistorySnapshot) RouteOf(key []byte) (Route, bool) {
+	for _, r := range s.routes {
+		if bytes.Compare(key, r.Start) < 0 {
+			break
+		}
+		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
+			continue
+		}
+		return cloneRoute(r), true
+	}
+	return Route{}, false
+}
+
+// IntersectingRoutes returns every route whose range intersects [start, end)
+// in this snapshot. A nil end denotes +infinity.
+func (s RouteHistorySnapshot) IntersectingRoutes(start, end []byte) []Route {
+	out := make([]Route, 0)
+	for _, r := range s.routes {
+		if r.End != nil && bytes.Compare(r.End, start) <= 0 {
+			continue
+		}
+		if end != nil && bytes.Compare(r.Start, end) >= 0 {
+			break
+		}
+		out = append(out, cloneRoute(r))
+	}
+	return out
+}
+
 // Current returns the route catalog snapshot at the engine's current
 // catalogVersion.  Returns (zero, false) when the history ring has
 // not been initialised (bare-struct Engine).  Used by the M3
@@ -486,7 +516,7 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 		}
 		// Route starts at or after scan ends: end != nil && rStart >= end
 		if end != nil && bytes.Compare(r.Start, end) >= 0 {
-			continue
+			break
 		}
 		// Route intersects with scan range
 		result = append(result, Route{
@@ -502,6 +532,20 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 		})
 	}
 	return result, e.catalogVersion
+}
+
+func cloneRoute(r Route) Route {
+	return Route{
+		RouteID:                r.RouteID,
+		Start:                  CloneBytes(r.Start),
+		End:                    CloneBytes(r.End),
+		GroupID:                r.GroupID,
+		State:                  r.State,
+		StagedVisibilityActive: r.StagedVisibilityActive,
+		MigrationJobID:         r.MigrationJobID,
+		MinWriteTSExclusive:    r.MinWriteTSExclusive,
+		Load:                   r.Load,
+	}
 }
 
 func (e *Engine) routeIndex(key []byte) int {
