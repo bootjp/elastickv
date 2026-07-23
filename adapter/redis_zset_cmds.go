@@ -1192,7 +1192,11 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
 	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
 	if err != nil {
-		return nil, false, err
+		if !errors.Is(err, ErrDeltaScanTruncated) {
+			return nil, false, err
+		}
+		metaLen = 0
+		metaExists = false
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)

@@ -127,6 +127,25 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
 		},
 		{
+			name: "truncated meta still falls back to member rows",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "later", Score: 2},
+					{Member: "first", Score: 1},
+				})
+				ctx := context.Background()
+				delta := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 0})
+				for i := uint32(0); i < store.MaxDeltaScanLimit+1; i++ {
+					require.NoError(t, st.PutAt(ctx, store.ZSetMetaDeltaKey(key, readTS, i), delta, readTS, 0))
+				}
+			},
+			wantMember: "first",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
+		},
+		{
 			name: "legacy blob fallback",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				seedLegacyZSetForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
