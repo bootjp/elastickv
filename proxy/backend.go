@@ -10,13 +10,14 @@ import (
 )
 
 const (
-	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 192
-	defaultDialTimeout       = 5 * time.Second
-	defaultReadTimeout       = 3 * time.Second
-	defaultWriteTimeout      = 3 * time.Second
-	blockingReadGrace        = 10 * time.Second
-	respProtocolV2           = 2
+	defaultPoolSize             = 128
+	defaultElasticKVPoolSize    = 192
+	defaultDialTimeout          = 5 * time.Second
+	defaultReadTimeout          = 3 * time.Second
+	defaultElasticKVReadTimeout = 35 * time.Second
+	defaultWriteTimeout         = 3 * time.Second
+	blockingReadGrace           = 10 * time.Second
+	respProtocolV2              = 2
 )
 
 // Backend abstracts a Redis-protocol endpoint (real Redis or ElasticKV).
@@ -81,6 +82,7 @@ func DefaultBackendOptions() BackendOptions {
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize
+	opts.ReadTimeout = defaultElasticKVReadTimeout
 	return opts
 }
 

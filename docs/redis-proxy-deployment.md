@@ -421,7 +421,7 @@ groups:
 | ElasticKV connection pool size | 192 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
 | ElasticKV Redis per-peer connection cap | 512 | Default server-side cap: two proxy replicas at pool `192`, plus dedicated PubSub/shadow PubSub headroom |
 | Dial timeout | 5s | Backend connection timeout |
-| Read timeout | 3s | Backend read timeout |
+| Read timeout | Redis: 3s, ElasticKV: 35s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
 | Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |

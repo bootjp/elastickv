@@ -833,7 +833,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 		stringArgs[i] = string(arg)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisLuaDispatchTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 
 	var reply luaReply
