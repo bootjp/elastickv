@@ -2447,6 +2447,7 @@ func (s *S3Server) beginTxnReadTimestamp(ctx context.Context, readTS uint64, lab
 	if readTS == ^uint64(0) {
 		if alloc, ok := kv.TimestampAllocatorThrough(s.coordinator); ok {
 			if phaseD, phaseDOK := alloc.(kv.TSOPhaseDState); phaseDOK && (phaseD.PhaseDRequired() || phaseD.PhaseDActive()) {
+				readTS = 1
 				readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, readTS, label)
 				return readTimestamp, errors.WithStack(err)
 			}

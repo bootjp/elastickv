@@ -241,7 +241,7 @@ func TestShardedCoordinatorDispatchTxn_PhaseDAcceptsValidatedCallerStartTS(t *te
 	require.Equal(t, uint64(100), g2Txn.requests[0].Ts)
 }
 
-func TestShardedCoordinatorDispatchTxn_PhaseDAcceptsVouchedAppliedWatermarkOnce(t *testing.T) {
+func TestShardedCoordinatorDispatchTxn_PhaseDAcceptsBoundAppliedWatermark(t *testing.T) {
 	t.Parallel()
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
 	coord, g1Txn, g2Txn, alloc := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
@@ -261,15 +261,23 @@ func TestShardedCoordinatorDispatchTxn_PhaseDAcceptsVouchedAppliedWatermarkOnce(
 			},
 		}
 	}
+
 	_, err = coord.Dispatch(context.Background(), request())
+	require.ErrorIs(t, err, ErrTSOTimestampPrePhaseD, "a numeric timestamp without the bound capability must not steal a voucher")
+	require.Equal(t, uint64(2), alloc.validateCalls.Load())
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+
+	ctx := readTS.WithDispatchVoucher(context.Background())
+	_, err = DispatchWithReadTimestamp(ctx, coord, request())
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), alloc.validateCalls.Load(), "voucher must bypass numeric Phase-D validation")
+	require.Equal(t, uint64(2), alloc.validateCalls.Load(), "bound voucher must bypass numeric Phase-D validation")
 	require.Len(t, g1Txn.requests, 2)
 	require.Len(t, g2Txn.requests, 2)
 
 	_, err = coord.Dispatch(context.Background(), request())
 	require.ErrorIs(t, err, ErrTSOTimestampPrePhaseD)
-	require.Equal(t, uint64(2), alloc.validateCalls.Load(), "voucher must be single-use")
+	require.Equal(t, uint64(3), alloc.validateCalls.Load(), "voucher must be bound and single-use")
 }
 
 func TestDispatchWithReadTimestampVouchesEveryBoundDispatch(t *testing.T) {

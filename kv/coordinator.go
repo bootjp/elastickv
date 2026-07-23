@@ -243,7 +243,7 @@ var _ AppliedReadTimestampVoucher = (*Coordinate)(nil)
 
 // VouchAppliedReadTimestamp is a no-op for the single-group coordinator. The
 // sharded coordinator consumes vouchers before cross-group StartTS validation.
-func (c *Coordinate) VouchAppliedReadTimestamp(uint64) error {
+func (c *Coordinate) VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error {
 	return nil
 }
 

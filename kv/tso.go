@@ -69,7 +69,13 @@ type TSOPhaseDState interface {
 // It is a process-local capability used only to distinguish audited adapter
 // snapshots from arbitrary caller-supplied StartTS values during Phase D.
 type AppliedReadTimestampVoucher interface {
-	VouchAppliedReadTimestamp(uint64) error
+	VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error
+}
+
+// AppliedReadTimestampVoucherRef is an opaque process-local dispatch
+// capability. Only this package can mint a non-zero ref.
+type AppliedReadTimestampVoucherRef struct {
+	id uint64
 }
 
 // ReadTimestamp is the adapter-side result of beginning a transaction snapshot.
@@ -86,9 +92,19 @@ func (t ReadTimestamp) Timestamp() uint64 {
 	return t.timestamp
 }
 
+func (t ReadTimestamp) voucherRef() (AppliedReadTimestampVoucherRef, bool) {
+	if t.voucher == nil || t.voucher.ref.id == 0 {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return t.voucher.ref, true
+}
+
+var nextAppliedReadDispatchVoucherID atomic.Uint64
+
 type appliedReadDispatchVoucher struct {
 	mu       sync.Mutex
 	prepared uint64
+	ref      AppliedReadTimestampVoucherRef
 }
 
 type appliedReadDispatchVoucherContextKey struct{}
@@ -100,10 +116,21 @@ func (t ReadTimestamp) WithDispatchVoucher(ctx context.Context) context.Context 
 	return context.WithValue(nonNilTSOContext(ctx), appliedReadDispatchVoucherContextKey{}, t)
 }
 
+func appliedReadTimestampVoucherRefFromContext(ctx context.Context, timestamp uint64) (AppliedReadTimestampVoucherRef, bool) {
+	if ctx == nil {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	readTimestamp, ok := ctx.Value(appliedReadDispatchVoucherContextKey{}).(ReadTimestamp)
+	if !ok || readTimestamp.timestamp != timestamp {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return readTimestamp.voucherRef()
+}
+
 // DispatchWithReadTimestamp dispatches an OCC operation under the applied-read
-// capability bound by ReadTimestamp.WithDispatchVoucher. The first dispatch
-// consumes the voucher reserved by BeginReadTimestampThrough; every subsequent
-// dispatch reserves one additional use immediately before dispatching.
+// capability bound by ReadTimestamp.WithDispatchVoucher. Each dispatch reserves
+// one token tied to that bound capability immediately before dispatching, so a
+// same-valued StartTS from another request cannot consume it.
 func DispatchWithReadTimestamp(
 	ctx context.Context,
 	coord Coordinator,
@@ -128,18 +155,22 @@ func DispatchWithReadTimestamp(
 	return resp, errors.WithStack(err)
 }
 
+func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
+	id := nextAppliedReadDispatchVoucherID.Add(1)
+	if id == 0 {
+		id = nextAppliedReadDispatchVoucherID.Add(1)
+	}
+	return &appliedReadDispatchVoucher{ref: AppliedReadTimestampVoucherRef{id: id}}
+}
+
 func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.prepared == 0 {
-		v.prepared = 1
-		return nil
-	}
 	voucher, ok := coord.(AppliedReadTimestampVoucher)
 	if !ok {
 		return errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	if err := voucher.VouchAppliedReadTimestamp(timestamp); err != nil {
+	if err := voucher.VouchAppliedReadTimestamp(timestamp, v.ref); err != nil {
 		return errors.WithStack(err)
 	}
 	v.prepared++
@@ -261,7 +292,7 @@ func BeginReadTimestampThrough(
 	}
 	readTimestamp := ReadTimestamp{timestamp: legacyTimestamp}
 	if vouched {
-		readTimestamp.voucher = &appliedReadDispatchVoucher{}
+		readTimestamp.voucher = newAppliedReadDispatchVoucher()
 	}
 	return readTimestamp, nil
 }
@@ -296,12 +327,8 @@ func validateAppliedReadTimestamp(
 	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return false, errors.Wrap(err, label)
 	}
-	voucher, ok := coord.(AppliedReadTimestampVoucher)
-	if !ok {
+	if _, ok := coord.(AppliedReadTimestampVoucher); !ok {
 		return false, errors.Wrap(ErrTSOProtocolUnsupported, label+": applied read voucher unavailable")
-	}
-	if err := voucher.VouchAppliedReadTimestamp(timestamp); err != nil {
-		return false, errors.Wrap(err, label)
 	}
 	return true, nil
 }

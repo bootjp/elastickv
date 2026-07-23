@@ -2400,12 +2400,12 @@ func (c startupGatedCoordinator) TimestampAllocator() kv.TimestampAllocator {
 	return alloc
 }
 
-func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
+func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref kv.AppliedReadTimestampVoucherRef) error {
 	voucher, ok := c.inner.(kv.AppliedReadTimestampVoucher)
 	if !ok {
 		return errors.WithStack(kv.ErrTSOProtocolUnsupported)
 	}
-	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp))
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
 }
 
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

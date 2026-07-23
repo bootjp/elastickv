@@ -95,12 +95,12 @@ func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
 	return alloc
 }
 
-func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
+func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
 	voucher, ok := c.inner.(AppliedReadTimestampVoucher)
 	if !ok {
 		return errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp))
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
 }
 
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

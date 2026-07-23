@@ -392,7 +392,7 @@ type ShardedCoordinator struct {
 		PhaseDActive() bool
 	}
 	appliedReadVoucherMu sync.Mutex
-	appliedReadVouchers  map[uint64]uint64
+	appliedReadVouchers  map[appliedReadVoucherKey]uint64
 	// allShardGroupIDs, when configured, is the explicit set of data groups
 	// that whole-keyspace operations must visit. It lets callers keep
 	// non-data groups (for example a reserved timestamp group) in c.groups
@@ -431,6 +431,11 @@ type ShardedCoordinator struct {
 	// commits. nil when encryption is off / no registration is pending
 	// (the common case — ungated). See RegistrationGate.
 	registrationGate *RegistrationGate
+}
+
+type appliedReadVoucherKey struct {
+	timestamp uint64
+	ref       AppliedReadTimestampVoucherRef
 }
 
 // RegistrationGate carries the Stage 7a §4.1 registration-before-
@@ -487,40 +492,46 @@ func (c *ShardedCoordinator) TimestampAllocator() TimestampAllocator {
 
 // VouchAppliedReadTimestamp records one use of an audited adapter watermark.
 // The bounded map prevents abandoned requests from growing process memory.
-func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
-	if c == nil || timestamp == 0 || timestamp == ^uint64(0) {
+func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
 		return errors.WithStack(ErrTSOTimestampInvalid)
 	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
 	c.appliedReadVoucherMu.Lock()
 	defer c.appliedReadVoucherMu.Unlock()
 	if c.appliedReadVouchers == nil {
-		c.appliedReadVouchers = make(map[uint64]uint64)
+		c.appliedReadVouchers = make(map[appliedReadVoucherKey]uint64)
 	}
-	if uses, ok := c.appliedReadVouchers[timestamp]; ok {
-		c.appliedReadVouchers[timestamp] = uses + 1
+	if uses, ok := c.appliedReadVouchers[key]; ok {
+		c.appliedReadVouchers[key] = uses + 1
 		return nil
 	}
 	if len(c.appliedReadVouchers) >= maxAppliedReadTimestampVouches {
 		return errors.WithStack(ErrTSOReadVoucherLimit)
 	}
-	c.appliedReadVouchers[timestamp] = 1
+	c.appliedReadVouchers[key] = 1
 	return nil
 }
 
-func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(timestamp uint64) bool {
+func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
 	if c == nil {
 		return false
 	}
+	ref, ok := appliedReadTimestampVoucherRefFromContext(ctx, timestamp)
+	if !ok {
+		return false
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
 	c.appliedReadVoucherMu.Lock()
 	defer c.appliedReadVoucherMu.Unlock()
-	uses, ok := c.appliedReadVouchers[timestamp]
+	uses, ok := c.appliedReadVouchers[key]
 	if !ok {
 		return false
 	}
 	if uses <= 1 {
-		delete(c.appliedReadVouchers, timestamp)
+		delete(c.appliedReadVouchers, key)
 	} else {
-		c.appliedReadVouchers[timestamp] = uses - 1
+		c.appliedReadVouchers[key] = uses - 1
 	}
 	return true
 }
@@ -1246,7 +1257,7 @@ func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context,
 	if !callerSupplied {
 		return nil
 	}
-	if c.consumeAppliedReadTimestampVoucher(startTS) || singleShard {
+	if c.consumeAppliedReadTimestampVoucher(ctx, startTS) || singleShard {
 		return nil
 	}
 	return c.validateCrossShardReadTimestamp(ctx, startTS)

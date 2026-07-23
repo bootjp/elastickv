@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"encoding/binary"
+	stderrors "errors"
 	"net"
 	"testing"
 	"time"
@@ -1113,6 +1114,10 @@ func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator
 	return s.allocator
 }
 
+func (s *distributionCoordinatorStub) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	return nil
+}
+
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
 	return &distributionCoordinatorStub{
 		store:  st,
@@ -1376,8 +1381,11 @@ func (a *distributionTSOAllocator) ValidateDurableTimestamp(_ context.Context, t
 	if a.err != nil {
 		return a.err
 	}
-	if !a.phaseD || timestamp <= a.phaseDFloor || timestamp > a.base {
+	if !a.phaseD || timestamp == 0 || timestamp > a.base {
 		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.phaseDFloor {
+		return stderrors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
 	}
 	return nil
 }

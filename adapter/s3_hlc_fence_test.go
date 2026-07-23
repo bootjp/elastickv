@@ -70,7 +70,7 @@ func TestS3BeginTxnReadTimestampPhaseDPreservesAppliedWatermark(t *testing.T) {
 	require.Zero(t, allocator.count, "an applied Phase-D read watermark must not allocate ahead of Raft apply")
 }
 
-func TestS3BeginTxnReadTimestampPhaseDRejectsLatestSentinel(t *testing.T) {
+func TestS3BeginTxnReadTimestampPhaseDNormalizesEmptySnapshotSentinel(t *testing.T) {
 	t.Parallel()
 
 	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
@@ -78,9 +78,10 @@ func TestS3BeginTxnReadTimestampPhaseDRejectsLatestSentinel(t *testing.T) {
 	coord.allocator = allocator
 	srv := &S3Server{coordinator: coord}
 
-	_, err := srv.beginTxnReadTimestamp(context.Background(), ^uint64(0), "test")
-	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
-	require.Zero(t, allocator.count, "the latest sentinel must fail closed instead of allocating an unapplied read timestamp")
+	readTimestamp, err := srv.beginTxnReadTimestamp(context.Background(), ^uint64(0), "test")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), readTimestamp.Timestamp())
+	require.Zero(t, allocator.count, "an empty S3 snapshot must not allocate ahead of Raft apply")
 }
 
 // TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling verifies that
