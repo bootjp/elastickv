@@ -259,29 +259,69 @@ func (i *Internal) probeMigrationRoute(req *pb.ProbeMigrationStateRequest, requi
 }
 
 func (i *Internal) probeMigrationMetadataCleared(ctx context.Context, jobID uint64) (*pb.ProbeMigrationStateResponse, error) {
+	present, err := i.migrationReadinessMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	present, err = i.migrationPromotionMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	present, err = i.migrationImportMetadataPresent(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
+	return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: i.migrationCatalogVersion()}, nil
+}
+
+func (i *Internal) migrationReadinessMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
 	readiness, ok := i.store.(store.MigrationTargetReadinessReader)
 	if !ok {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration readiness reader is not configured"))
+		return false, errors.WithStack(status.Error(codes.FailedPrecondition, "migration readiness reader is not configured"))
 	}
 	states, err := readiness.MigrationTargetReadinessStates(ctx)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	for _, state := range states {
 		if state.JobID == jobID {
-			return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+			return true, nil
 		}
 	}
-	if promotion, ok := i.store.(store.MigrationPromotionStateReader); ok {
-		_, found, err := promotion.MigrationPromotionState(ctx, jobID)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		if found {
-			return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
-		}
+	return false, nil
+}
+
+func (i *Internal) migrationPromotionMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	promotion, ok := i.store.(store.MigrationPromotionStateReader)
+	if !ok {
+		return false, nil
 	}
-	return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: i.migrationCatalogVersion()}, nil
+	_, found, err := promotion.MigrationPromotionState(ctx, jobID)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return found, nil
+}
+
+func (i *Internal) migrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	importMetadata, ok := i.store.(store.MigrationImportMetadataReader)
+	if !ok {
+		return false, nil
+	}
+	present, err := importMetadata.MigrationImportMetadataPresent(ctx, jobID)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return present, nil
 }
 
 func (i *Internal) migrationCatalogVersion() uint64 {
@@ -455,9 +495,6 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "target staged readiness proposer is not configured"))
 	}
 	if err := i.verifyInternalLeader(ctx); err != nil {
-		return nil, err
-	}
-	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
 		return nil, err
 	}
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {

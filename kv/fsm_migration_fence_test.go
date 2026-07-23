@@ -326,6 +326,32 @@ func TestFSMDurableSourceFenceRejectsPrefixWrite(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
+func TestFSMDurableSourceFenceRejectsPrefixWriteOnActiveRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("m"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	fsm := newComposed1FSM(t, engine, 1)
+	applySourceMigrationControlToFSM(t, fsm, false)
+	require.NoError(t, fsm.store.PutAt(ctx, []byte("m/key"), []byte("v"), 1, 0))
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("m")}},
+	}, 60)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+
+	got, getErr := fsm.store.GetAt(ctx, []byte("m/key"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
 func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
 	t.Parallel()
 

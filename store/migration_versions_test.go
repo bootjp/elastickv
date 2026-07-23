@@ -957,6 +957,38 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 	})
 }
 
+func TestMigrationImportMetadataPresentClearsWithMigrationState(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		reader, ok := st.(MigrationImportMetadataReader)
+		require.True(t, ok)
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+
+		present, err := reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.False(t, present)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("ack-only"),
+		})
+		require.NoError(t, err)
+		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.True(t, present)
+		present, err = reader.MigrationImportMetadataPresent(ctx, 2)
+		require.NoError(t, err)
+		require.False(t, present)
+
+		require.NoError(t, cleaner.ClearMigrationState(ctx, 1, 0))
+		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.False(t, present)
+	})
+}
+
 func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

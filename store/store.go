@@ -242,6 +242,12 @@ type MigrationTargetReadinessReader interface {
 	MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error)
 }
 
+// MigrationImportMetadataReader reports whether target-local import proof
+// metadata remains for a migration job.
+type MigrationImportMetadataReader interface {
+	MigrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error)
+}
+
 // OpType describes a mutation kind.
 type OpType int
 

@@ -77,7 +77,10 @@ func (f *kvFSM) recordMigrationWrite(ctx context.Context, muts []*pb.Mutation, c
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return recordMigrationWriteInStates(ctx, writer, states, muts, commitTS, f.pendingApplyIdx)
+	// Tracker updates share the Raft entry with the following user mutation.
+	// Leave metaAppliedIndex to the data batch so replay cannot skip a write if
+	// the process stops after only the tracker record is persisted.
+	return recordMigrationWriteInStates(ctx, writer, states, muts, commitTS, 0)
 }
 
 func (f *kvFSM) migrationReadinessStore() (store.MigrationTargetReadinessReader, store.MigrationTargetReadinessWriter, bool) {

@@ -677,3 +677,17 @@ func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, 
 	defer s.mtx.RUnlock()
 	return s.migrationHLCFloors[jobID], nil
 }
+
+func (s *mvccStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.migrationHLCFloors[jobID] != 0 {
+		return true, nil
+	}
+	for id := range s.migrationAcks {
+		if id.jobID == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
+}

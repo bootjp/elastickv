@@ -660,7 +660,7 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
 }
 
-func TestInternalApplyTargetStagedReadinessRejectsWhenOpcodeGateClosed(t *testing.T) {
+func TestInternalApplyTargetStagedReadinessBypassesOpcodeGateForSafetyGuard(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -685,10 +685,23 @@ func TestInternalApplyTargetStagedReadinessRejectsWhenOpcodeGateClosed(t *testin
 		MinWriteTsExclusive:    100,
 		Armed:                  true,
 	})
-	require.Nil(t, resp)
-	require.Error(t, err)
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
-	require.Equal(t, uint64(0), proposer.calls)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(1), proposer.calls)
+
+	reader, ok := st.(store.MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []store.TargetStagedReadinessState{{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobID:         7,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}}, states)
 }
 
 func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {

@@ -102,6 +102,43 @@ func TestInternalProbeMigrationStateUsesLocalFSMAndCatalog(t *testing.T) {
 	require.True(t, metadata.Ready)
 }
 
+func TestInternalProbeMigrationMetadataClearedWaitsForImportMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, nil, nil, nil, WithInternalStore(st))
+	_, err := st.ImportVersions(ctx, store.ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("cursor-1"),
+		Versions: []store.MVCCVersion{{
+			Key:      []byte("m/key"),
+			Value:    []byte("value"),
+			CommitTS: 42,
+		}},
+	})
+	require.NoError(t, err)
+
+	metadata, err := internal.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{
+		JobId: 7,
+		Kind:  pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
+	})
+	require.NoError(t, err)
+	require.False(t, metadata.Ready)
+
+	cleaner, ok := st.(store.MigrationCleaner)
+	require.True(t, ok)
+	require.NoError(t, cleaner.ClearMigrationState(ctx, 7, 0))
+	metadata, err = internal.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{
+		JobId: 7,
+		Kind:  pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
+	})
+	require.NoError(t, err)
+	require.True(t, metadata.Ready)
+}
+
 func TestInternalIssueMigrationTimestampFollowsSourceLastCommit(t *testing.T) {
 	t.Parallel()
 
