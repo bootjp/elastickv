@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +54,13 @@ type LeaderAwareRedisBackend struct {
 	refreshTimeout  time.Duration
 
 	logger *slog.Logger
+	// refreshDone coalesces concurrent command failures into one INFO probe.
+	// Waiters observe the same refresh instead of serially repeating it.
+	refreshMu     sync.Mutex
+	refreshDone   chan struct{}
+	refreshClosed bool
+	refreshCtx    context.Context
+	refreshCancel context.CancelFunc
 
 	mu          sync.RWMutex
 	clients     map[string]*redis.Client
@@ -86,6 +95,7 @@ func NewLeaderAwareRedisBackendWithInterval(seeds []string, name string, opts Ba
 	for _, s := range normalized {
 		seedProtect[s] = struct{}{}
 	}
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
 	b := &LeaderAwareRedisBackend{
 		name:            name,
 		opts:            opts,
@@ -100,6 +110,8 @@ func NewLeaderAwareRedisBackendWithInterval(seeds []string, name string, opts Ba
 		stopCh:          make(chan struct{}),
 		done:            make(chan struct{}),
 		refreshCh:       make(chan struct{}, 1),
+		refreshCtx:      refreshCtx,
+		refreshCancel:   refreshCancel,
 	}
 	for _, addr := range normalized {
 		b.ensureClientLocked(addr)
@@ -127,18 +139,7 @@ func normalizeSeeds(seeds []string) []string {
 
 func (b *LeaderAwareRedisBackend) refreshLoop() {
 	defer close(b.done)
-
-	// Derive a cancellable context from stopCh so that an in-flight INFO
-	// probe is interrupted as soon as Close() is called; otherwise the
-	// refreshTimeout must elapse before the loop can exit.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-b.stopCh
-		cancel()
-	}()
-
-	b.refreshLeader(ctx)
+	b.refreshLeader(b.refreshCtx)
 
 	// Use a NewTimer that is reset after each probe completes rather than a
 	// Ticker so that when a probe takes longer than refreshInterval (e.g. a
@@ -152,7 +153,7 @@ func (b *LeaderAwareRedisBackend) refreshLoop() {
 		case <-b.stopCh:
 			return
 		case <-timer.C:
-			b.refreshLeader(ctx)
+			b.refreshLeader(b.refreshCtx)
 		case <-b.refreshCh:
 			if !timer.Stop() {
 				// Drain the channel if the timer had already fired so the
@@ -162,7 +163,7 @@ func (b *LeaderAwareRedisBackend) refreshLoop() {
 				default:
 				}
 			}
-			b.refreshLeader(ctx)
+			b.refreshLeader(b.refreshCtx)
 		}
 		timer.Reset(b.refreshInterval)
 	}
@@ -191,6 +192,35 @@ func (b *LeaderAwareRedisBackend) RefreshLeaderNow(ctx context.Context) {
 // leader's Redis address is returned by the leader node itself when it's
 // healthy, so this converges in one probe during steady state.
 func (b *LeaderAwareRedisBackend) refreshLeader(ctx context.Context) {
+	b.refreshMu.Lock()
+	if b.refreshClosed {
+		b.refreshMu.Unlock()
+		return
+	}
+	done := b.refreshDone
+	if done == nil {
+		done = make(chan struct{})
+		b.refreshDone = done
+		go b.runLeaderRefresh(done)
+	}
+	b.refreshMu.Unlock()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+func (b *LeaderAwareRedisBackend) runLeaderRefresh(done chan struct{}) {
+	b.refreshLeaderOnce(b.refreshCtx)
+
+	b.refreshMu.Lock()
+	b.refreshDone = nil
+	close(done)
+	b.refreshMu.Unlock()
+}
+
+func (b *LeaderAwareRedisBackend) refreshLeaderOnce(ctx context.Context) {
 	candidates := b.candidateAddrs()
 	for _, addr := range candidates {
 		if ctx.Err() != nil {
@@ -360,16 +390,18 @@ func (b *LeaderAwareRedisBackend) currentClient() *redis.Client {
 	return b.clients[b.leader]
 }
 
-// Do forwards a single command to the current leader. A not-leader Redis reply
-// means the command was rejected before applying, so it is safe to refresh the
-// leader and retry once.
+// Do forwards a single command to the current leader. NOTLEADER refreshes the
+// cached leader for the next command, but the current command is not replayed:
+// leadership-loss errors can be returned after an operation has already applied.
 func (b *LeaderAwareRedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 	cmd := b.doOnce(ctx, args...)
-	if !isNotLeaderError(cmd.Err()) {
-		return cmd
+	switch {
+	case isElasticKVNotLeaderError(cmd.Err()):
+		b.RefreshLeaderNow(ctx)
+	case isLeaderRefreshTransportError(cmd.Err()):
+		b.TriggerRefresh()
 	}
-	b.RefreshLeaderNow(ctx)
-	return b.doOnce(ctx, args...)
+	return cmd
 }
 
 func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redis.Cmd {
@@ -383,14 +415,17 @@ func (b *LeaderAwareRedisBackend) doOnce(ctx context.Context, args ...any) *redi
 }
 
 // DoWithTimeout forwards a blocking command with a per-call socket timeout.
-// Like Do, a not-leader rejection is refreshed and retried once.
+// Like Do, a not-leader rejection refreshes the cached leader for the next
+// command without replaying the current command.
 func (b *LeaderAwareRedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
 	cmd := b.doWithTimeoutOnce(ctx, timeout, args...)
-	if !isNotLeaderError(cmd.Err()) {
-		return cmd
+	switch {
+	case isElasticKVNotLeaderError(cmd.Err()):
+		b.RefreshLeaderNow(ctx)
+	case isLeaderRefreshTransportError(cmd.Err()):
+		b.TriggerRefresh()
 	}
-	b.RefreshLeaderNow(ctx)
-	return b.doWithTimeoutOnce(ctx, timeout, args...)
+	return cmd
 }
 
 func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
@@ -403,15 +438,9 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
-// Pipeline forwards a batch to the current leader. A not-leader Redis reply in
-// any result means the leader rejected the batch before applying it, so retrying
-// once after synchronous discovery is safe.
+// Pipeline forwards a batch to the current leader. NOTLEADER refreshes the
+// cached leader for the next command without replaying the current batch.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
-	results, err := b.pipelineOnce(ctx, cmds)
-	if err != nil || !pipelineHasElasticKVNotLeader(results) {
-		return results, err
-	}
-	b.RefreshLeaderNow(ctx)
 	return b.pipelineOnce(ctx, cmds)
 }
 
@@ -429,20 +458,40 @@ func (b *LeaderAwareRedisBackend) pipelineOnce(ctx context.Context, cmds [][]any
 	if err != nil {
 		var redisErr redis.Error
 		if errors.As(err, &redisErr) || errors.Is(err, redis.Nil) {
+			for _, result := range results {
+				if isElasticKVNotLeaderError(result.Err()) {
+					b.RefreshLeaderNow(ctx)
+					break
+				}
+			}
 			return results, nil
+		}
+		if isLeaderRefreshTransportError(err) {
+			b.TriggerRefresh()
 		}
 		return results, fmt.Errorf("pipeline exec: %w", err)
 	}
 	return results, nil
 }
 
-func pipelineHasElasticKVNotLeader(results []*redis.Cmd) bool {
-	for _, result := range results {
-		if result != nil && isElasticKVNotLeaderError(result.Err()) {
-			return true
-		}
+func isRedisScriptCommandName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO", "FCALL", "FCALL_RO", "FUNCTION", "SCRIPT":
+		return true
+	default:
+		return false
 	}
-	return false
+}
+
+func isLeaderRefreshTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr *net.OpError
+	return errors.As(err, &netErr) && !netErr.Timeout()
 }
 
 // NewPubSub opens a subscribe connection on the current leader.
@@ -457,6 +506,20 @@ func (b *LeaderAwareRedisBackend) NewPubSub(ctx context.Context) *redis.PubSub {
 // Name returns the backend's logical identifier used in metrics.
 func (b *LeaderAwareRedisBackend) Name() string { return b.name }
 
+// PoolStats reports the pool currently serving leader-directed commands.
+// Counters reset when leadership moves to a client pool that has not been used
+// before, so proxy metrics expose them as gauges rather than Prometheus counters.
+func (b *LeaderAwareRedisBackend) PoolStats() BackendPoolStats {
+	b.mu.RLock()
+	cli := b.clients[b.leader]
+	limit := b.opts.PoolSize
+	b.mu.RUnlock()
+	if cli == nil {
+		return BackendPoolStats{Limit: max(limit, 0)}
+	}
+	return redisPoolStatsSnapshot(cli.PoolStats(), limit)
+}
+
 // Close stops the refresh loop and releases every cached client pool.
 // It snapshots the client map under the lock before iterating so concurrent
 // Do/Pipeline calls that race shutdown cannot mutate the map out from under
@@ -470,10 +533,17 @@ func (b *LeaderAwareRedisBackend) Close() error {
 	b.closed = true
 	close(b.stopCh)
 	b.mu.Unlock()
+	b.refreshMu.Lock()
+	b.refreshClosed = true
+	refreshDone := b.refreshDone
+	b.refreshMu.Unlock()
+	b.refreshCancel()
 
-	// Wait for the refresh loop to exit before touching the client map so that
-	// a concurrent probeLeader cannot race with Close on the clients map.
+	// Wait for the loop and any shared in-flight probe before closing clients.
 	<-b.done
+	if refreshDone != nil {
+		<-refreshDone
+	}
 
 	// Snapshot the clients map and swap in an empty replacement under the
 	// lock. After this point, currentClient()/getOrCreateClient see no

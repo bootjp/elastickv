@@ -234,7 +234,7 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 	require.Equal(t, beforeB+1, nodeB.commands.Load(), "command must reach new leader B")
 }
 
-func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
+func TestLeaderAwareRedisBackend_NotLeaderRefreshesWithoutReplay(t *testing.T) {
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 
@@ -258,10 +258,15 @@ func TestLeaderAwareRedisBackend_RetryRefreshesOnNotLeader(t *testing.T) {
 	nodeB.SetLeader(nodeB.addr)
 
 	res := backend.Do(context.Background(), "SET", "k", "v")
-	require.NoError(t, res.Err())
-	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "not-leader retry must synchronously adopt the advertised leader")
+	require.Error(t, res.Err())
+	require.Contains(t, res.Err().Error(), "NOTLEADER")
+	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "not-leader must synchronously adopt the advertised leader")
 	require.Equal(t, int64(1), nodeA.commands.Load(), "first attempt should hit the former leader and be rejected")
-	require.Equal(t, int64(1), nodeB.commands.Load(), "retry should land on the refreshed leader")
+	require.Equal(t, int64(0), nodeB.commands.Load(), "ambiguous writes must not be replayed")
+
+	res = backend.Do(context.Background(), "SET", "k", "v")
+	require.NoError(t, res.Err())
+	require.Equal(t, int64(1), nodeB.commands.Load(), "next command should use the refreshed leader")
 }
 
 func TestLeaderAwareRedisBackend_DoesNotRetryUserNotLeaderError(t *testing.T) {
@@ -288,7 +293,7 @@ func TestLeaderAwareRedisBackend_DoesNotRetryUserNotLeaderError(t *testing.T) {
 	require.Equal(t, int64(1), node.commands.Load(), "user Redis error must not be retried")
 }
 
-func TestLeaderAwareRedisBackend_PipelineRetryRefreshesOnNotLeader(t *testing.T) {
+func TestLeaderAwareRedisBackend_PipelineNotLeaderRefreshesWithoutReplay(t *testing.T) {
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 
@@ -318,11 +323,23 @@ func TestLeaderAwareRedisBackend_PipelineRetryRefreshesOnNotLeader(t *testing.T)
 	})
 	require.NoError(t, err)
 	for _, result := range results {
+		require.Error(t, result.Err())
+		require.Contains(t, result.Err().Error(), "NOTLEADER")
+	}
+	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "pipeline not-leader must synchronously adopt the advertised leader")
+	require.Equal(t, int64(3), nodeA.commands.Load(), "first pipeline attempt should hit the former leader")
+	require.Equal(t, int64(0), nodeB.commands.Load(), "ambiguous pipelines must not be replayed")
+
+	results, err = backend.Pipeline(context.Background(), [][]any{
+		{"MULTI"},
+		{"SET", "k", "v"},
+		{"EXEC"},
+	})
+	require.NoError(t, err)
+	for _, result := range results {
 		require.NoError(t, result.Err())
 	}
-	require.Equal(t, nodeB.addr, backend.CurrentLeader(), "pipeline retry must synchronously adopt the advertised leader")
-	require.Equal(t, int64(3), nodeA.commands.Load(), "first pipeline attempt should hit the former leader")
-	require.Equal(t, int64(3), nodeB.commands.Load(), "retry should replay the whole pipeline on the refreshed leader")
+	require.Equal(t, int64(3), nodeB.commands.Load(), "next pipeline should use the refreshed leader")
 }
 
 func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {

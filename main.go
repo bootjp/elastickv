@@ -288,8 +288,9 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
 const (
-	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
-	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	lockResolverEnabledEnvVar        = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar        = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	redisDeltaCompactorEnabledEnvVar = "ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED"
 )
 
 const bytesPerMiB = 1024 * 1024
@@ -398,6 +399,14 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
+func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator) *adapter.DeltaCompactor {
+	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
+		return adapter.NewDeltaCompactor(shardStore, coordinate)
+	}
+	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
+	return nil
+}
+
 func run() error {
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
@@ -447,6 +456,7 @@ func run() error {
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
+	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -475,6 +485,7 @@ func run() error {
 		*encryptionEnabled,
 		cfg.engine,
 		redisApplyObserver,
+		s3BlobBackfiller,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
@@ -514,10 +525,6 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate); err != nil {
-		return err
-	}
-
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -538,9 +545,10 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distCatalog, err := setupDistributionAndRegistration(
+	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
 		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
+		coordinate, shardGroups[cfg.defaultGroup], cfg.defaultGroup,
+		encWiring, *raftId, *encryptionSidecarPath)
 	if err != nil {
 		cancel()
 		return err
@@ -553,8 +561,15 @@ func run() error {
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
 
+	// The local durable watcher is the 100 ms fallback required when the
+	// best-effort leader stream is unavailable or reconnecting.
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+	})
+	catalogWatchConns := &kv.GRPCConnCache{}
+	cleanup.Add(func() { _ = catalogWatchConns.Close() })
+	eg.Go(func() error {
+		return runDistributionCatalogStream(runCtx, catalogRuntime, catalogWatchConns, cfg.engine)
 	})
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
@@ -564,6 +579,10 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithCatalogWatchLeaderCheck(func() bool {
+			engine := catalogRuntime.snapshotEngine()
+			return engine != nil && engine.State() == raftengine.StateLeader
+		}),
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
@@ -576,7 +595,6 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
 		*encryptionRotateOnStartup,
@@ -599,6 +617,7 @@ func run() error {
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
 		cleanup:                         &cleanup,
+		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -862,6 +881,10 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
+	cfg.s3BlobBackfillConfig, err = adapter.S3BlobBackfillConfigFromEnv()
+	if err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.WithStack(err)
+	}
 
 	bootstrapCfg, err := resolveRaftPeerConfig(
 		*raftId,
@@ -931,15 +954,16 @@ func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
 }
 
 type runtimeConfig struct {
-	groups              []groupSpec
-	defaultGroup        uint64
-	engine              *distribution.Engine
-	leaderRedis         map[string]string
-	leaderS3            map[string]string
-	leaderDynamo        map[string]string
-	leaderSQS           map[string]string
-	sqsFifoPartitionMap map[string]sqsFifoQueueRouting
-	multi               bool
+	groups               []groupSpec
+	defaultGroup         uint64
+	engine               *distribution.Engine
+	leaderRedis          map[string]string
+	leaderS3             map[string]string
+	leaderDynamo         map[string]string
+	leaderSQS            map[string]string
+	sqsFifoPartitionMap  map[string]sqsFifoQueueRouting
+	s3BlobBackfillConfig adapter.S3BlobBackfillConfig
+	multi                bool
 }
 
 func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap, raftSqsMap, sqsFifoPartitionMapRaw string) (runtimeConfig, error) {
@@ -1775,6 +1799,7 @@ type serversInput struct {
 	encWiring          encryptionWriteWiring
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
+	s3BlobBackfiller   *adapter.S3BlobBackfiller
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
@@ -1860,6 +1885,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
 		redisApplyObserver: in.redisApplyObserver,
+		s3BlobBackfiller:   in.s3BlobBackfiller,
 		dynamoAddress:      *dynamoAddr,
 		leaderDynamo:       in.cfg.leaderDynamo,
 		s3Address:          *s3Addr,
@@ -2751,16 +2777,19 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := adapter.NewDeltaCompactor(shardStore, coordinate)
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate)
+	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
-		adapter.WithRedisCompactor(deltaCompactor),
 		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
 		adapter.WithRedisApplyObserver(redisApplyObserver),
-	)
+	}
+	if deltaCompactor != nil {
+		redisOpts = append(redisOpts, adapter.WithRedisCompactor(deltaCompactor))
+	}
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, redisOpts...)
 	// Wire the bounded Lua VM pool into Prometheus. The metrics
 	// (hits/misses/drops/idle/max_idle) are read at scrape time via
 	// CounterFunc / GaugeFunc, so the EVAL hot path stays
@@ -2984,6 +3013,77 @@ func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.Ca
 	return nil
 }
 
+func setupDistributionRuntimeDependencies(
+	runCtx context.Context,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	defaultGroupID uint64,
+	encWiring encryptionWriteWiring,
+	raftID string,
+	sidecarPath string,
+) (*distribution.CatalogStore, *raftGroupRuntime, *raftGroupRuntime, error) {
+	if err := configureCoordinatorTSO(coordinate); err != nil {
+		return nil, nil, nil, err
+	}
+	catalog, err := setupDistributionAndRegistration(
+		runCtx, eg, runtimes, engine, coordinate, defaultGroup, encWiring, raftID, sidecarPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	catalogGroupID, err := distributionCatalogGroupID(engine)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "resolve distribution catalog group runtime")
+	}
+	catalogRuntime := findDefaultGroupRuntime(runtimes, catalogGroupID)
+	if catalogRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"distribution catalog raft group %d runtime is unavailable",
+			catalogGroupID,
+		))
+	}
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	if defaultRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"default raft group %d runtime is unavailable",
+			defaultGroupID,
+		))
+	}
+	return catalog, catalogRuntime, defaultRuntime, nil
+}
+
+func runDistributionCatalogStream(
+	ctx context.Context,
+	runtime *raftGroupRuntime,
+	conns *kv.GRPCConnCache,
+	engine *distribution.Engine,
+) error {
+	watcher := distribution.NewResolvingGRPCCatalogWatcher(
+		func(context.Context) (pb.DistributionClient, error) {
+			raftEngine := runtime.snapshotEngine()
+			if raftEngine == nil {
+				return nil, errors.New("default raft group engine is unavailable")
+			}
+			leader := raftEngine.Leader().Address
+			if leader == "" {
+				return nil, errors.New("default raft group leader is unavailable")
+			}
+			conn, err := conns.ConnFor(leader)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			return pb.NewDistributionClient(conn), nil
+		},
+		engine,
+	)
+	if err := watcher.Run(ctx); err != nil {
+		return errors.Wrap(err, "catalog stream watcher failed")
+	}
+	return nil
+}
+
 func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Group, startupErr error) error {
 	cancel()
 	if err := eg.Wait(); err != nil {
@@ -3013,6 +3113,7 @@ type runtimeServerRunner struct {
 	pubsubRelay                     *adapter.RedisPubSubRelay
 	readTracker                     *kv.ActiveTimestampTracker
 	redisApplyObserver              *adapter.RedisApplyObserver
+	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
@@ -3154,6 +3255,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		blobCluster,
 		r.publicKVGate.blocked,
+		r.s3BlobBackfiller,
 	)
 	if err != nil {
 		if blobCluster != nil {
@@ -3166,7 +3268,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 }
 
 func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
-	if r == nil || strings.TrimSpace(r.s3Address) == "" {
+	if r == nil || !s3BlobNodeEnabled(r.s3Address, *s3BlobPeerTokenFile) {
 		return nil, nil
 	}
 	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
@@ -3297,8 +3399,12 @@ func (r *runtimeServerRunner) startPublicServices() error {
 	r.redisListener = nil
 	runDynamoDBServer(r.ctx, r.eg, r.dynamoServer)
 	r.dynamoListener = nil
-	runS3Server(r.ctx, r.eg, r.s3Server)
-	r.s3Listener = nil
+	if r.s3Listener != nil {
+		runS3Server(r.ctx, r.eg, r.s3Server)
+		r.s3Listener = nil
+	} else {
+		runS3BlobBackfillOnly(r.ctx, r.eg, r.s3Server)
+	}
 	runSQSServer(r.ctx, r.eg, r.sqsServer)
 	r.sqsListener = nil
 	// Plug the SQS adapter into the monitoring registry's depth

@@ -960,6 +960,9 @@ func encodeRouteDescriptorV1ForTest(t *testing.T, route RouteDescriptor) []byte 
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
+	if raw[0] == catalogRouteCodecVersionV1 {
+		return raw
+	}
 	if len(raw) < catalogUint64Bytes+1 {
 		t.Fatalf("encoded route too short: %d", len(raw))
 	}

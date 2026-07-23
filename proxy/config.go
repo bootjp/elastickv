@@ -60,34 +60,47 @@ type ProxyConfig struct {
 	SecondaryPassword string
 	Mode              ProxyMode
 	SecondaryTimeout  time.Duration
-	// SecondaryWriteConcurrency limits concurrent asynchronous secondary writes.
-	// Zero keeps the package default.
+	// SecondaryWriteConcurrency limits all concurrent asynchronous secondary
+	// writes, including Lua scripts. Zero keeps the package default.
 	SecondaryWriteConcurrency int
 	// SecondaryScriptConcurrency limits concurrent asynchronous secondary Lua
-	// script writes. Zero keeps the package default.
+	// script writes within SecondaryWriteConcurrency. Zero keeps the package default.
 	SecondaryScriptConcurrency int
-	ShadowTimeout              time.Duration
-	SentryDSN                  string
-	SentryEnv                  string
-	SentrySampleRate           float64
-	MetricsAddr                string
-	PProfAddr                  string
-	PubSubCompareWindow        time.Duration
-	RedisOnlyRaw               bool
+	// SecondaryBlockingReplayConcurrency limits concurrent secondary replays for
+	// mutating blocking commands such as BZPOP. Zero disables blocking replays.
+	SecondaryBlockingReplayConcurrency int
+	// SecondaryWriteQueueCapacity bounds queued non-script secondary writes.
+	// Zero derives a capacity from SecondaryWriteConcurrency.
+	SecondaryWriteQueueCapacity int
+	// SecondaryScriptQueueCapacity bounds queued secondary Lua script writes.
+	// Zero derives a capacity from SecondaryScriptConcurrency.
+	SecondaryScriptQueueCapacity int
+	// SecondaryBlockingReplayQueueCapacity bounds queued secondary blocking
+	// replay work. Zero derives a capacity from SecondaryBlockingReplayConcurrency.
+	SecondaryBlockingReplayQueueCapacity int
+	ShadowTimeout                        time.Duration
+	SentryDSN                            string
+	SentryEnv                            string
+	SentrySampleRate                     float64
+	MetricsAddr                          string
+	PProfAddr                            string
+	PubSubCompareWindow                  time.Duration
+	RedisOnlyRaw                         bool
 }
 
 // DefaultConfig returns a ProxyConfig with sensible defaults.
 func DefaultConfig() ProxyConfig {
 	return ProxyConfig{
-		ListenAddr:          ":6479",
-		PrimaryAddr:         "localhost:6379",
-		SecondaryAddr:       "localhost:6380",
-		Mode:                ModeDualWrite,
-		SecondaryTimeout:    defaultSecondaryTimeout,
-		ShadowTimeout:       defaultShadowTimeout,
-		SentrySampleRate:    1.0,
-		MetricsAddr:         ":9191",
-		PubSubCompareWindow: defaultPubSubCompareWindow,
-		RedisOnlyRaw:        true,
+		ListenAddr:                         ":6479",
+		PrimaryAddr:                        "localhost:6379",
+		SecondaryAddr:                      "localhost:6380",
+		Mode:                               ModeDualWrite,
+		SecondaryTimeout:                   defaultSecondaryTimeout,
+		SecondaryBlockingReplayConcurrency: maxBlockingReplayGoroutines,
+		ShadowTimeout:                      defaultShadowTimeout,
+		SentrySampleRate:                   1.0,
+		MetricsAddr:                        ":9191",
+		PubSubCompareWindow:                defaultPubSubCompareWindow,
+		RedisOnlyRaw:                       true,
 	}
 }

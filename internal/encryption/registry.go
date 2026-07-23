@@ -78,24 +78,33 @@ func RegistryDEKPrefix(dekID uint32) []byte {
 	return out
 }
 
-// DecodeRegistryKey parses a registry-row key back into its
-// (dek_id, uint16 node_id) tuple. Returns ErrRegistryKeyMalformed
-// when the key does not start with WriterRegistryPrefix or has the
-// wrong length. The decoder does NOT range-check the parsed
-// dek_id against ReservedKeyID — that is the caller's policy.
-func DecodeRegistryKey(key []byte) (dekID uint32, nodeID16 uint16, err error) {
+// IsRegistryKey reports whether key has the exact writer-registry row shape.
+//
+// This is intentionally error-free: raw Pebble scans call it for every scanned
+// key to skip operational rows, so using DecodeRegistryKey there would allocate
+// stack-bearing errors for ordinary user keys.
+func IsRegistryKey(key []byte) bool {
 	if len(key) != len(WriterRegistryPrefix)+registryKeySuffixSize {
-		return 0, 0, errors.Wrapf(ErrRegistryKeyMalformed, "got %d bytes", len(key))
+		return false
 	}
 	for i, b := range WriterRegistryPrefix {
 		if key[i] != b {
-			return 0, 0, errors.WithStack(ErrRegistryKeyMalformed)
+			return false
 		}
 	}
-	body := key[len(WriterRegistryPrefix):]
-	if body[4] != registryKeySep {
-		return 0, 0, errors.WithStack(ErrRegistryKeyMalformed)
+	return key[len(WriterRegistryPrefix)+4] == registryKeySep
+}
+
+// DecodeRegistryKey parses a registry-row key back into its
+// (dek_id, uint16 node_id) tuple. Returns ErrRegistryKeyMalformed
+// when the key does not match the exact writer-registry key shape.
+// The decoder does NOT range-check the parsed
+// dek_id against ReservedKeyID — that is the caller's policy.
+func DecodeRegistryKey(key []byte) (dekID uint32, nodeID16 uint16, err error) {
+	if !IsRegistryKey(key) {
+		return 0, 0, errors.Wrapf(ErrRegistryKeyMalformed, "got %d bytes", len(key))
 	}
+	body := key[len(WriterRegistryPrefix):]
 	dekID = binary.BigEndian.Uint32(body[0:4])
 	nodeID16 = binary.BigEndian.Uint16(body[5:7])
 	return dekID, nodeID16, nil

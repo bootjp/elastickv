@@ -241,6 +241,11 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 }
 
 func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
+	if rawScanCanUseExplicitGroupReverse(req) {
+		if _, ok := r.store.(rawGroupReverseScanner); ok {
+			return r.rawScanExplicitGroupKeysAt(ctx, req, req.GetGroupId(), limit, readTS)
+		}
+	}
 	_, readFenceAware := r.store.(rawReadFenceScanner)
 	if readFenceAware || req.GetRouteBoundsPresent() || req.GetReadRouteVersion() != 0 {
 		return r.rawScanKeysAtWithReadFence(ctx, req, limit, readTS)
@@ -323,6 +328,11 @@ func rawScanErrorResponse(err error) (*pb.RawScanAtResponse, error) {
 }
 
 func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([]*store.KVPair, error) {
+	if rawScanCanUseExplicitGroupReverse(req) {
+		if _, ok := r.store.(rawGroupReverseScanner); ok {
+			return r.rawScanAtExplicitGroup(ctx, req, req.GetGroupId(), limit, readTS)
+		}
+	}
 	if fenceScanner, ok := r.store.(rawReadFenceScanner); ok {
 		if req.GetGroupId() != 0 && req.GetReverse() && !req.GetRouteBoundsPresent() {
 			return nil, errors.WithStack(status.Error(codes.InvalidArgument, "raw scan with explicit group does not support reverse scans"))
@@ -332,6 +342,13 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 		return res, errors.WithStack(err)
 	}
 	return r.rawScanAtWithoutReadFence(ctx, req, limit, readTS)
+}
+
+func rawScanCanUseExplicitGroupReverse(req *pb.RawScanAtRequest) bool {
+	return req.GetGroupId() != 0 &&
+		req.GetReverse() &&
+		!req.GetRouteBoundsPresent() &&
+		req.GetReadRouteVersion() == 0
 }
 
 func (r *GRPCServer) rawScanAtWithoutReadFence(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([]*store.KVPair, error) {

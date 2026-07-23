@@ -274,6 +274,21 @@ type recordingRawReadFenceStore struct {
 	callerSuppliedLatestSeen uint64
 }
 
+type recordingReadFenceGroupStore struct {
+	*recordingRawGroupStore
+
+	readFenceScanCalled bool
+}
+
+func (s *recordingReadFenceGroupStore) ReadRouteVersion() uint64 {
+	return 55
+}
+
+func (s *recordingReadFenceGroupStore) ScanAtWithReadFence(context.Context, []byte, []byte, int, uint64, bool, uint64, uint64, []byte, []byte) ([]*store.KVPair, error) {
+	s.readFenceScanCalled = true
+	return []*store.KVPair{}, nil
+}
+
 func (s *recordingRawReadFenceStore) ReadRouteVersion() uint64 {
 	return s.routeVersion
 }
@@ -712,6 +727,49 @@ func TestGRPCServer_RawScanAt_UsesExplicitGroupForReverse(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanEnd)
 	require.Equal(t, []byte("b"), resp.GetKv()[0].Key)
 	require.Equal(t, []byte("a"), resp.GetKv()[1].Key)
+}
+
+func TestGRPCServer_RawScanAt_ReadFenceAwareStoreUsesExplicitGroupForNonFencedReverse(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		keysOnly bool
+	}{
+		{name: "values"},
+		{name: "keys-only", keysOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &recordingReadFenceGroupStore{
+				recordingRawGroupStore: &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()},
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 9, 0))
+			require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 10, 0))
+			s := NewGRPCServer(st, nil)
+
+			resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+				StartKey: []byte("a"),
+				EndKey:   []byte("z"),
+				Limit:    10,
+				Ts:       10,
+				Reverse:  true,
+				GroupId:  42,
+				KeysOnly: tc.keysOnly,
+			})
+			require.NoError(t, err)
+			require.Len(t, resp.GetKv(), 2)
+			require.Equal(t, []byte("b"), resp.GetKv()[0].GetKey())
+			require.Equal(t, []byte("a"), resp.GetKv()[1].GetKey())
+			require.True(t, st.reverseScan)
+			require.False(t, st.fallbackScan)
+			require.False(t, st.readFenceScanCalled)
+			require.Equal(t, uint64(42), st.scanGroupID)
+		})
+	}
 }
 
 func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {

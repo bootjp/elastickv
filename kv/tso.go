@@ -16,6 +16,9 @@ var (
 	ErrTSOCoordinatorNil    = errors.New("tso: coordinator is required")
 	ErrTSOClockNil          = errors.New("tso: coordinator clock is nil")
 	ErrInvalidTSOBatchSize  = errors.New("tso: invalid batch size")
+
+	errHLCLeaseRecoveryUnavailable = errors.New("hlc lease recovery unavailable")
+	errHLCLeaseRecoveryBlocked     = errors.New("hlc lease recovery blocked")
 )
 
 // TSOAllocator issues globally monotonic timestamps. NextBatch returns the
@@ -42,6 +45,10 @@ type tsoBatchAfterAllocator interface {
 	NextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error)
 }
 
+type hlcLeaseRecoverer interface {
+	RecoverHLCLease(context.Context) error
+}
+
 type timestampIssuer interface {
 	IsTimestampLeader() bool
 }
@@ -66,11 +73,8 @@ func NextTimestampThrough(ctx context.Context, coord Coordinator, label string) 
 	if coord == nil || coord.Clock() == nil {
 		return 1, nil
 	}
-	ts, err := coord.Clock().NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	recoverer, _ := coord.(hlcLeaseRecoverer)
+	return nextFencedWithRecovery(ctx, coord.Clock(), recoverer, label)
 }
 
 // NextTimestampAfterThrough allocates a timestamp strictly greater than
@@ -169,6 +173,67 @@ func nextTimestampAfterFallback(startTS uint64) (uint64, error) {
 	return nextTS, nil
 }
 
+func nextFencedWithRecovery(ctx context.Context, clock *HLC, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	ts, err := clock.NextFenced()
+	if err == nil {
+		return ts, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	ts, err = clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+func nextBatchFencedWithRecovery(ctx context.Context, clock *HLC, n int, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	base, err := clock.NextBatchFenced(n)
+	if err == nil {
+		return base, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	base, err = clock.NextBatchFenced(n)
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return base, nil
+}
+
+func wrapHLCLeaseRecoveryFailure(err, recoverErr error, label string) error {
+	return errors.Join(
+		errors.Wrapf(err, "%s: on-demand HLC lease renewal failed", label),
+		errors.Wrap(recoverErr, "hlc lease recovery"),
+	)
+}
+
+func hlcRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, dispatchLeaderRetryBudget)
+}
+
+func hlcCeilingExpired(clock *HLC) bool {
+	if clock == nil {
+		return false
+	}
+	ceiling := clock.PhysicalCeiling()
+	return ceiling > 0 && time.Now().UnixMilli() >= ceiling
+}
+
 type tsoCoordinator interface {
 	IsLeader() bool
 	Clock() *HLC
@@ -240,8 +305,8 @@ func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint6
 	if min > 0 {
 		clock.Observe(min)
 	}
-	base, err := clock.NextBatchFenced(n)
-	return base, errors.Wrap(err, "tso next batch")
+	recoverer, _ := a.coord.(hlcLeaseRecoverer)
+	return nextBatchFencedWithRecovery(ctx, clock, n, recoverer, "tso next batch")
 }
 
 func (a *LocalTSOAllocator) IsLeader() bool {

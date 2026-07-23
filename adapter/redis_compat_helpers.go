@@ -415,7 +415,7 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 // appeared between iterations is invisible to this fast path; the
 // blocking command's fallback-timer wake (which uses the slow
 // keyTypeAtExpect) is the safety net that detects it within
-// ~redisBlockWaitFallback (100ms).
+// roughly one configured block fallback interval.
 //
 // Compared to keyTypeAtExpect on the empty-key case
 // (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19
@@ -704,7 +704,7 @@ func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint6
 	if !metaFound {
 		return redisStreamValue{}, nil
 	}
-	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta)
 	if err != nil {
 		return redisStreamValue{}, err
 	}
@@ -741,14 +741,14 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 // stream; callers need not distinguish it from a missing stream.
 // When expectedLen > 0 we cap the scan at meta.Length plus slack,
 // matching existing store ScanAt semantics for non-positive limits.
-func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, meta store.StreamMeta) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	limit := scanStreamEntriesLimit(expectedLen)
-	if limit == 0 && expectedLen <= 0 {
+	limit := scanStreamEntriesLimit(meta.Length)
+	if limit == 0 && meta.Length <= 0 {
 		return []redisStreamEntry{}, nil
 	}
-	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

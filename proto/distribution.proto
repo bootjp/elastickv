@@ -7,6 +7,8 @@ service Distribution {
   rpc GetTimestamp (GetTimestampRequest) returns (GetTimestampResponse) {}
   rpc ListRoutes (ListRoutesRequest) returns (ListRoutesResponse) {}
   rpc SplitRange (SplitRangeRequest) returns (SplitRangeResponse) {}
+  rpc GetCatalogCapabilities (CatalogCapabilitiesRequest) returns (CatalogCapabilitiesResponse) {}
+  rpc WatchCatalog (CatalogWatchRequest) returns (stream CatalogWatchEvent) {}
   rpc StartSplitMigration (StartSplitMigrationRequest) returns (StartSplitMigrationResponse) {}
   rpc GetRouteOwnership (GetRouteOwnershipRequest) returns (GetRouteOwnershipResponse) {}
   rpc GetIntersectingRoutes (GetIntersectingRoutesRequest) returns (GetIntersectingRoutesResponse) {}
@@ -146,6 +148,51 @@ message SplitRangeResponse {
   uint64 catalog_version = 1;
   RouteDescriptor left = 2;
   RouteDescriptor right = 3;
+}
+
+message CatalogCapabilitiesRequest {}
+
+message CatalogCapabilitiesResponse {
+  repeated uint32 supported_protocol_versions = 1;
+  uint64 current_version = 2;
+  uint64 oldest_delta_version = 3;
+  uint32 max_batch_size = 4;
+}
+
+message CatalogWatchRequest {
+  uint32 protocol_version = 1;
+  uint64 after_version = 2;
+  uint32 max_batch_size = 3;
+}
+
+enum CatalogDeltaMutationOp {
+  CATALOG_DELTA_MUTATION_OP_UNSPECIFIED = 0;
+  CATALOG_DELTA_MUTATION_OP_UPSERT = 1;
+  CATALOG_DELTA_MUTATION_OP_DELETE = 2;
+}
+
+message CatalogDeltaMutation {
+  CatalogDeltaMutationOp op = 1;
+  uint64 route_id = 2;
+  RouteDescriptor route = 3;
+}
+
+message CatalogDeltaRecord {
+  uint64 previous_version = 1;
+  uint64 version = 2;
+  repeated CatalogDeltaMutation mutations = 3;
+}
+
+message CatalogSnapshotReset {
+  uint64 version = 1;
+  repeated RouteDescriptor routes = 2;
+}
+
+message CatalogWatchEvent {
+  oneof payload {
+    CatalogSnapshotReset snapshot = 1;
+    CatalogDeltaRecord delta = 2;
+  }
 }
 
 message StartSplitMigrationRequest {

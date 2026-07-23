@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -221,6 +222,7 @@ type Coordinate struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	hlcRecoveryMu     sync.Mutex
 	// deregisterLeaseCb removes the leader-loss callback registered
 	// against engine at construction. Long-lived Coordinates don't
 	// need to call it (the engine will be closed after them), but
@@ -818,6 +820,27 @@ func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error
 	return nil
 }
 
+func (c *Coordinate) RecoverHLCLease(ctx context.Context) error {
+	if c == nil || c.clock == nil {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	c.hlcRecoveryMu.Lock()
+	defer c.hlcRecoveryMu.Unlock()
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	if !c.IsLeaderAcceptingWrites() {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+		return errors.WithStack(errHLCLeaseRecoveryBlocked)
+	}
+	rctx, cancel := hlcRecoveryContext(ctx)
+	defer cancel()
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	return errors.Wrap(c.ProposeHLCLease(rctx, ceilingMs), "recover hlc lease")
+}
+
 // extendLeaseAfterRenewal warms the read lease after a successful HLC
 // ceiling propose. It is the renewal-path counterpart of
 // refreshLeaseAfterDispatch's success branch: the propose was a
@@ -1034,11 +1057,7 @@ func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, m
 	if min > 0 {
 		c.clock.Observe(min)
 	}
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	return nextFencedWithRecovery(ctx, c.clock, c, label)
 }
 
 // Next makes Coordinate usable as a TimestampAllocator for adapter helpers.

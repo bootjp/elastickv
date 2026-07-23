@@ -157,6 +157,7 @@ var (
 	errLeadershipTransferNoHealthyTarget   = errors.Mark(errors.New("etcd raft leadership transfer has no healthy target"), raftengine.ErrLeadershipTransferNoHealthyTarget)
 	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
 	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
+	errMembershipConfChangePending         = errors.Mark(errors.New("etcd raft membership change blocked by pending config change"), raftengine.ErrMembershipChangePending)
 	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
 	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
@@ -426,6 +427,8 @@ type Engine struct {
 	snapshotMu                     sync.Mutex
 	protectedReceivedFSMSnaps      map[uint64]int
 	pendingReceivedFSMSnapshotStep map[uint64]int
+	pendingReceivedFSMReleaseIndex atomic.Uint64
+	pendingReceivedFSMReleaseRun   atomic.Bool
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -2145,9 +2148,17 @@ func (e *Engine) handlePromoteLearner(req adminRequest) {
 
 // proposeMembershipChange wraps the encode + storePendingConfig +
 // ProposeConfChange dance shared by AddVoter / AddLearner /
-// PromoteLearner. The caller has already validated the leader and
+// PromoteLearner / RemoveServer. The caller has already validated the leader and
 // prevIndex preconditions in handleAdmin.
 func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	if err := e.reconcilePendingConfChangeFence(); err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	if e.hasPendingConfChange() {
+		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
+		return
+	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}
@@ -2177,24 +2188,7 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
 		return
 	}
-	contextBytes, err := encodeConfChangeContext(req.id, peer)
-	if err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	cc := raftpb.ConfChange{
-		Type:    confChangeTypePtr(raftpb.ConfChangeRemoveNode),
-		NodeId:  uint64Ptr(peer.NodeID),
-		Context: contextBytes,
-	}
-	if err := e.storePendingConfig(req); err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
-		e.cancelPendingConfig(req.id)
-		req.done <- adminResult{err: errors.WithStack(err)}
-	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeRemoveNode, peer)
 }
 
 func (e *Engine) handleTransferLeadership(req adminRequest) {
@@ -2740,12 +2734,15 @@ func (e *Engine) applyReadyEntries(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	if err := e.storage.Append(entries); err != nil {
+		return errors.WithStack(err)
+	}
 	for _, entry := range entries {
 		if entry.GetType() == raftpb.EntryConfChange || entry.GetType() == raftpb.EntryConfChangeV2 {
 			e.markPendingConfChange(entry.GetIndex())
 		}
 	}
-	return errors.WithStack(e.storage.Append(entries))
+	return e.reconcilePendingConfChangeFence()
 }
 
 func (e *Engine) restorePendingConfChangeFenceFromStorage(applied uint64) error {
@@ -3517,9 +3514,46 @@ func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
 	if index == 0 {
 		return
 	}
-	e.snapshotMu.Lock()
+	if !e.snapshotMu.TryLock() {
+		e.scheduleProtectedReceivedFSMSnapshotRelease(index)
+		return
+	}
 	defer e.snapshotMu.Unlock()
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+}
+
+func (e *Engine) scheduleProtectedReceivedFSMSnapshotRelease(index uint64) {
+	for {
+		prev := e.pendingReceivedFSMReleaseIndex.Load()
+		if index <= prev {
+			break
+		}
+		if e.pendingReceivedFSMReleaseIndex.CompareAndSwap(prev, index) {
+			break
+		}
+	}
+	if e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+		go e.drainPendingProtectedReceivedFSMSnapshotRelease()
+	}
+}
+
+func (e *Engine) drainPendingProtectedReceivedFSMSnapshotRelease() {
+	for {
+		index := e.pendingReceivedFSMReleaseIndex.Swap(0)
+		if index != 0 {
+			e.snapshotMu.Lock()
+			e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+			e.snapshotMu.Unlock()
+		}
+
+		e.pendingReceivedFSMReleaseRun.Store(false)
+		if e.pendingReceivedFSMReleaseIndex.Load() == 0 {
+			return
+		}
+		if !e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+			return
+		}
+	}
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) {
@@ -3804,18 +3838,19 @@ func (e *Engine) refreshStatus() {
 	leader := e.leaderInfo(basic.Lead)
 
 	status := raftengine.Status{
-		State:             state,
-		Leader:            leader,
-		Term:              basic.GetTerm(),
-		CommitIndex:       basic.GetCommit(),
-		AppliedIndex:      e.applied,
-		LastLogIndex:      lastLogIndex,
-		LastSnapshotIndex: snapshot.GetMetadata().GetIndex(),
-		FSMPending:        pendingEntries(basic.GetCommit(), e.applied),
-		NumPeers:          numRemoteServers(config.Servers, e.localID),
-		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
-		LeadTransferee:    basic.LeadTransferee,
-		PendingConfChange: e.hasPendingConfChange(),
+		State:              state,
+		Leader:             leader,
+		Term:               basic.GetTerm(),
+		CommitIndex:        basic.GetCommit(),
+		AppliedIndex:       e.applied,
+		LastLogIndex:       lastLogIndex,
+		LastSnapshotIndex:  snapshot.GetMetadata().GetIndex(),
+		FSMPending:         pendingEntries(basic.GetCommit(), e.applied),
+		NumPeers:           numRemoteServers(config.Servers, e.localID),
+		LastContact:        lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
+		ConfigurationIndex: e.currentConfigIndex(),
+		LeadTransferee:     basic.LeadTransferee,
+		PendingConfChange:  e.hasPendingConfChange(),
 	}
 
 	e.mu.Lock()
@@ -4158,6 +4193,64 @@ func (e *Engine) clearPendingConfChange(appliedIndex uint64) {
 
 func (e *Engine) hasPendingConfChange() bool {
 	return e.pendingConfChangeIndex.Load() != 0
+}
+
+// reconcilePendingConfChangeFence drops a volatile fence when a later Ready
+// proves that the proposal at that index was overwritten after leadership
+// loss. A missing index is not enough: the proposal may still live only in
+// raft's unstable log, so the fence remains until storage covers the index.
+func (e *Engine) reconcilePendingConfChangeFence() error {
+	pending := e.pendingConfChangeIndex.Load()
+	if pending == 0 {
+		return nil
+	}
+	if e.storage == nil {
+		return nil
+	}
+	if e.appliedIndex.Load() >= pending {
+		e.clearPendingConfChange(pending)
+		return nil
+	}
+	covered, isConfChange, err := e.persistedPendingConfChange(pending)
+	if err != nil {
+		return err
+	}
+	if !covered {
+		return nil
+	}
+	if !isConfChange {
+		e.pendingConfChangeIndex.CompareAndSwap(pending, 0)
+	}
+	return nil
+}
+
+func (e *Engine) persistedPendingConfChange(index uint64) (bool, bool, error) {
+	firstIndex, err := e.storage.FirstIndex()
+	if err != nil {
+		return false, false, errors.Wrap(err, "reconcile pending conf-change fence: first index")
+	}
+	lastIndex, err := e.storage.LastIndex()
+	if err != nil {
+		return false, false, errors.Wrap(err, "reconcile pending conf-change fence: last index")
+	}
+	if lastIndex < index {
+		return false, false, nil
+	}
+	if index < firstIndex {
+		return true, false, nil
+	}
+	if index == math.MaxUint64 {
+		return false, false, errors.New("reconcile pending conf-change fence: index overflows half-open range")
+	}
+	entries, err := e.storage.Entries(index, index+1, math.MaxUint64)
+	if err != nil {
+		return false, false, errors.Wrapf(err, "reconcile pending conf-change fence: entry %d", index)
+	}
+	if len(entries) != 1 {
+		return false, false, errors.Errorf("reconcile pending conf-change fence: expected one entry at %d, got %d", index, len(entries))
+	}
+	entryType := entries[0].GetType()
+	return true, entryType == raftpb.EntryConfChange || entryType == raftpb.EntryConfChangeV2, nil
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {

@@ -11,7 +11,7 @@ import (
 
 const (
 	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 4
+	defaultElasticKVPoolSize = 64
 	defaultDialTimeout       = 5 * time.Second
 	defaultReadTimeout       = 3 * time.Second
 	defaultWriteTimeout      = 3 * time.Second
@@ -41,6 +41,26 @@ type BackendOptions struct {
 	WriteTimeout time.Duration
 }
 
+// BackendPoolStats is a point-in-time snapshot of a backend's current
+// go-redis connection pool.
+type BackendPoolStats struct {
+	Limit           int
+	Hits            uint32
+	Misses          uint32
+	Timeouts        uint32
+	WaitCount       uint32
+	Unusable        uint32
+	WaitDuration    time.Duration
+	TotalConns      uint32
+	IdleConns       uint32
+	StaleConns      uint32
+	PendingRequests uint32
+}
+
+type backendPoolStatsProvider interface {
+	PoolStats() BackendPoolStats
+}
+
 // DefaultBackendOptions returns reasonable defaults for a proxy backend.
 func DefaultBackendOptions() BackendOptions {
 	return BackendOptions{
@@ -52,9 +72,11 @@ func DefaultBackendOptions() BackendOptions {
 }
 
 // DefaultElasticKVBackendOptions returns defaults for proxy backends that
-// connect to ElasticKV's Redis adapter. ElasticKV limits concurrent Redis
-// connections per peer by default, so keep the pool below that cap unless the
-// operator also raises ELASTICKV_REDIS_PER_PEER_CONNECTIONS on the cluster.
+// connect to ElasticKV's Redis adapter. Production dual-write deployments
+// should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS above this
+// pool size because PubSub and shadow PubSub use dedicated connections outside
+// the go-redis command pool. Lower the proxy pool instead for clusters that
+// keep the server-side per-peer cap below the default.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize
@@ -142,6 +164,29 @@ func (b *RedisBackend) Close() error {
 
 func (b *RedisBackend) Name() string {
 	return b.name
+}
+
+func (b *RedisBackend) PoolStats() BackendPoolStats {
+	return redisPoolStatsSnapshot(b.client.PoolStats(), b.client.Options().PoolSize)
+}
+
+func redisPoolStatsSnapshot(stats *redis.PoolStats, limit int) BackendPoolStats {
+	if stats == nil {
+		return BackendPoolStats{Limit: max(limit, 0)}
+	}
+	return BackendPoolStats{
+		Limit:           max(limit, 0),
+		Hits:            stats.Hits,
+		Misses:          stats.Misses,
+		Timeouts:        stats.Timeouts,
+		WaitCount:       stats.WaitCount,
+		Unusable:        stats.Unusable,
+		WaitDuration:    time.Duration(stats.WaitDurationNs),
+		TotalConns:      stats.TotalConns,
+		IdleConns:       stats.IdleConns,
+		StaleConns:      stats.StaleConns,
+		PendingRequests: stats.PendingRequests,
+	}
 }
 
 // NewPubSub creates a dedicated PubSub connection (not from the pool).

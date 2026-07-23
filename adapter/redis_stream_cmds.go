@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"sort"
 	"strconv"
@@ -291,19 +292,19 @@ func (r *RedisServer) prepareXAdd(
 		Value: entryValue,
 	})
 
-	nextLen, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta.Length+1)
+	nextMeta, trim, err := r.xaddTrimIfNeeded(ctx, key, readTS, req.maxLen, meta)
 	if err != nil {
 		return "", 0, nil, err
 	}
 	elems = append(elems, trim...)
 	elems = appendMaxLenZeroSelfDel(elems, req.maxLen, key, parsedID)
+	if req.maxLen == 0 {
+		nextMeta.TrimmedMs, nextMeta.TrimmedSeq = parsedID.ms, parsedID.seq
+	}
 
-	metaBytes, err := store.MarshalStreamMeta(store.StreamMeta{
-		Length:   nextLen,
-		LastMs:   parsedID.ms,
-		LastSeq:  parsedID.seq,
-		ExpireAt: meta.ExpireAt,
-	})
+	nextMeta.LastMs = parsedID.ms
+	nextMeta.LastSeq = parsedID.seq
+	metaBytes, err := store.MarshalStreamMeta(nextMeta)
 	if err != nil {
 		return "", 0, nil, cockerrors.WithStack(err)
 	}
@@ -563,10 +564,13 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	key []byte,
 	readTS uint64,
 	maxLen int,
-	candidateLen int64,
-) (int64, []*kv.Elem[kv.OP], error) {
+	meta store.StreamMeta,
+) (store.StreamMeta, []*kv.Elem[kv.OP], error) {
+	candidateLen := meta.Length + 1
+	nextMeta := meta
 	if maxLen < 0 || candidateLen <= int64(maxLen) {
-		return candidateLen, nil, nil
+		nextMeta.Length = candidateLen
+		return nextMeta, nil, nil
 	}
 	// int64 arithmetic + clamp at maxWideColumnItems. A single XADD must
 	// not emit more than maxWideColumnItems Del operations: it would risk
@@ -577,15 +581,19 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	// but defends against a corrupted meta.Length feeding the trim path.
 	diff := candidateLen - int64(maxLen)
 	if diff <= 0 {
-		return candidateLen, nil, nil
+		nextMeta.Length = candidateLen
+		return nextMeta, nil, nil
 	}
 	count := maxWideColumnItems
 	if diff <= int64(maxWideColumnItems) {
 		count = int(diff)
 	}
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, count)
+	trim, trimmedThrough, err := r.buildXTrimHeadElems(ctx, key, readTS, count, meta)
 	if err != nil {
-		return 0, nil, err
+		return store.StreamMeta{}, nil, err
+	}
+	if trimmedThrough.ok {
+		nextMeta.TrimmedMs, nextMeta.TrimmedSeq = trimmedThrough.ms, trimmedThrough.seq
 	}
 	// Final length must reflect the trim that actually committed, not
 	// the requested maxLen, so that meta.Length stays consistent with
@@ -595,9 +603,11 @@ func (r *RedisServer) xaddTrimIfNeeded(
 	// caller, so the post-commit length is 0 regardless of what trim
 	// did to the pre-existing rows.
 	if maxLen == 0 {
-		return 0, trim, nil
+		nextMeta.Length = 0
+		return nextMeta, trim, nil
 	}
-	return candidateLen - int64(len(trim)), trim, nil
+	nextMeta.Length = candidateLen - int64(len(trim))
+	return nextMeta, trim, nil
 }
 
 // streamWriteBase prepares a write to a stream. Returns the loaded meta
@@ -683,9 +693,10 @@ func (r *RedisServer) buildXTrimHeadElems(
 	key []byte,
 	readTS uint64,
 	count int,
-) ([]*kv.Elem[kv.OP], error) {
+	meta store.StreamMeta,
+) ([]*kv.Elem[kv.OP], streamTrimCursor, error) {
 	if count <= 0 {
-		return nil, nil
+		return nil, streamTrimCursor{}, nil
 	}
 	// Defense-in-depth cap on the per-trim scan so a caller that asked
 	// for math.MaxInt (corrupted meta upstream) cannot try to materialise
@@ -697,15 +708,35 @@ func (r *RedisServer) buildXTrimHeadElems(
 	}
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	kvs, err := r.store.ScanAt(ctx, prefix, end, count, readTS)
+	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, count, readTS)
 	if err != nil {
-		return nil, cockerrors.WithStack(err)
+		return nil, streamTrimCursor{}, cockerrors.WithStack(err)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(kvs))
+	trimmedThrough := streamTrimCursor{}
 	for _, pair := range kvs {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: append([]byte(nil), pair.Key...)})
+		trimmedThrough = streamTrimCursorFromEntryKey(pair.Key)
 	}
-	return elems, nil
+	return elems, trimmedThrough, nil
+}
+
+type streamTrimCursor struct {
+	ms  uint64
+	seq uint64
+	ok  bool
+}
+
+func streamTrimCursorFromEntryKey(key []byte) streamTrimCursor {
+	if len(key) < store.StreamIDBytes {
+		return streamTrimCursor{}
+	}
+	suffix := key[len(key)-store.StreamIDBytes:]
+	return streamTrimCursor{
+		ms:  binary.BigEndian.Uint64(suffix[0:8]),
+		seq: binary.BigEndian.Uint64(suffix[8:16]),
+		ok:  true,
+	}
 }
 
 func parseXTrimMaxLen(args [][]byte) (int, error) {
@@ -835,7 +866,7 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 	if diff <= int64(maxWideColumnItems) {
 		requestedRemoved = int(diff)
 	}
-	trim, err := r.buildXTrimHeadElems(ctx, key, readTS, requestedRemoved)
+	trim, trimmedThrough, err := r.buildXTrimHeadElems(ctx, key, readTS, requestedRemoved, meta)
 	if err != nil {
 		return 0, err
 	}
@@ -852,6 +883,9 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 	elems = append(elems, legacyCleanup...)
 	elems = append(elems, trim...)
 	meta.Length -= int64(actualRemoved)
+	if trimmedThrough.ok {
+		meta.TrimmedMs, meta.TrimmedSeq = trimmedThrough.ms, trimmedThrough.seq
+	}
 	metaBytes, err := store.MarshalStreamMeta(meta)
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
@@ -1082,14 +1116,14 @@ func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadR
 // whose meta is still missing here cannot have live legacy data from the
 // caller's perspective.
 func (r *RedisServer) readStreamAfter(ctx context.Context, key []byte, readTS uint64, afterID string, count int) ([]redisStreamEntry, error) {
-	_, found, err := r.loadStreamMetaAt(ctx, key, readTS)
+	meta, found, err := r.loadStreamMetaAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
 	if !found {
 		return nil, nil
 	}
-	return r.scanStreamEntriesAfter(ctx, key, readTS, afterID, count)
+	return r.scanStreamEntriesAfter(ctx, key, readTS, meta, afterID, count)
 }
 
 // scanStreamEntriesAfter runs a [strictly-after(afterID), ∞) range scan over
@@ -1103,7 +1137,14 @@ func (r *RedisServer) readStreamAfter(ctx context.Context, key []byte, readTS ui
 // the shorthand "ms" form (no dash), which Redis normalises to "ms-0".
 // Genuinely malformed IDs are rejected immediately so the caller never
 // receives a full-stream result set for invalid input.
-func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, readTS uint64, afterID string, count int) ([]redisStreamEntry, error) {
+func (r *RedisServer) scanStreamEntriesAfter(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	meta store.StreamMeta,
+	afterID string,
+	count int,
+) ([]redisStreamEntry, error) {
 	afterID, ok := normalizeStreamAfterID(afterID)
 	if !ok {
 		return nil, errors.New("ERR Invalid stream ID specified as stream command argument")
@@ -1111,6 +1152,7 @@ func (r *RedisServer) scanStreamEntriesAfter(ctx context.Context, key []byte, re
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	start := streamScanStartForAfter(prefix, afterID)
+	start = laterScanStart(start, store.StreamEntryScanStart(key, meta))
 	limit := count
 	unbounded := limit <= 0
 	if unbounded {
@@ -1233,6 +1275,46 @@ func isXReadIterCtxError(err error) bool {
 	}
 }
 
+func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bool {
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisFinalTypeCheckTimeout)
+	defer cancel()
+	var err error
+	if ok := r.runWithHeavyCommandSlot(func() {
+		err = r.xreadCheckTypes(ctx, req)
+	}); !ok {
+		return false
+	}
+	if err != nil {
+		if isXReadIterCtxError(err) {
+			return false
+		}
+		writeRedisError(conn, err)
+		return true
+	}
+	return false
+}
+
+func (r *RedisServer) xreadCheckTypes(ctx context.Context, req xreadRequest) error {
+	for _, key := range req.keys {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeNone && typ != redisTypeStream {
+			return wrongTypeError()
+		}
+	}
+	return nil
+}
+
+func (r *RedisServer) writeXReadFinalOrNull(conn redcon.Conn, req xreadRequest) {
+	if r.xreadFinalTypeCheck(conn, req) {
+		return
+	}
+	conn.WriteNull()
+}
+
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	req, err := parseXReadRequest(cmd.Args)
 	if err != nil {
@@ -1295,7 +1377,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// in handlerCtx, so it would cancel-on-call too — but routing
 		// through isXReadIterCtxError silently translates that into an
 		// empty iteration and the loop would otherwise wait at
-		// redisBlockWaitFallback cadence until the deadline.
+		// the configured block fallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
@@ -1308,7 +1390,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// return DeadlineExceeded, which we'd then surface as an error.
 		iterTimeout := time.Until(deadline)
 		if iterTimeout <= 0 {
-			conn.WriteNull()
+			r.writeXReadFinalOrNull(conn, req)
 			return
 		}
 		// Cap each iteration at redisDispatchTimeout to avoid holding
@@ -1352,10 +1434,10 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		}
 
 		if !time.Now().Before(deadline) {
-			conn.WriteNull()
+			r.writeXReadFinalOrNull(conn, req)
 			return
 		}
-		waitForBlockedCommandUpdate(handlerCtx, w, deadline)
+		waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)
 	}
 }
 
@@ -1484,13 +1566,13 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 
 	startRaw, endRaw := string(cmd.Args[2]), string(cmd.Args[3])
 
-	_, metaFound, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
+	meta, metaFound, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 	if metaFound {
-		selected, err := r.rangeStreamNewLayout(context.Background(), cmd.Args[1], readTS, startRaw, endRaw, reverse, count)
+		selected, err := r.rangeStreamNewLayout(context.Background(), cmd.Args[1], readTS, meta, startRaw, endRaw, reverse, count)
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -1514,14 +1596,35 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 // binary scan bounds so only the selected entries are unmarshaled.
 func (r *RedisServer) rangeStreamNewLayout(
 	ctx context.Context, key []byte, readTS uint64,
+	meta store.StreamMeta,
 	startRaw, endRaw string, reverse bool, count int,
 ) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
-	scanStart, scanEnd, ok, err := streamScanBounds(prefix, startRaw, endRaw, reverse)
+	kvs, err := r.scanStreamRangeKVs(ctx, key, prefix, meta, readTS, startRaw, endRaw, reverse, count)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
+	entries := make([]redisStreamEntry, 0, len(kvs))
+	for _, pair := range kvs {
+		entry, err := unmarshalStreamEntry(pair.Value)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func (r *RedisServer) scanStreamRangeKVs(
+	ctx context.Context, key, prefix []byte, meta store.StreamMeta, readTS uint64,
+	startRaw, endRaw string, reverse bool, count int,
+) ([]*store.KVPair, error) {
+	scanStart, scanEnd, ok, err := streamScanBounds(prefix, startRaw, endRaw, reverse)
+	if err != nil || !ok {
+		return nil, err
+	}
+	scanStart = laterScanStart(scanStart, store.StreamEntryScanStart(key, meta))
+	if scanEnd != nil && bytes.Compare(scanStart, scanEnd) >= 0 {
 		return nil, nil
 	}
 	limit := count
@@ -1544,15 +1647,14 @@ func (r *RedisServer) rangeStreamNewLayout(
 	if unbounded && len(kvs) > maxWideColumnItems {
 		return nil, cockerrors.Wrapf(ErrCollectionTooLarge, "stream %q exceeds %d entries", key, maxWideColumnItems)
 	}
-	entries := make([]redisStreamEntry, 0, len(kvs))
-	for _, pair := range kvs {
-		entry, err := unmarshalStreamEntry(pair.Value)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
+	return kvs, nil
+}
+
+func laterScanStart(a, b []byte) []byte {
+	if bytes.Compare(a, b) < 0 {
+		return b
 	}
-	return entries, nil
+	return a
 }
 
 // streamScanBounds maps the raw XRANGE / XREVRANGE bounds to half-open

@@ -692,6 +692,15 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan *savePlan) (
 	if err != nil {
 		return nil, err
 	}
+	delta, err := buildCatalogDelta(existingRoutes, plan.routes, plan.nextVersion-1, plan.nextVersion)
+	if err != nil {
+		return nil, err
+	}
+	deltaMutations, err := s.BuildDeltaMutationsAt(ctx, plan.readTS, delta)
+	if err != nil {
+		return nil, err
+	}
+	mutations = append(mutations, deltaMutations...)
 	mutations = append(mutations, &store.KVPairMutation{
 		Op:    store.OpTypePut,
 		Key:   CatalogVersionKey(),

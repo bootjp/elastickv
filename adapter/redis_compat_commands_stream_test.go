@@ -185,6 +185,64 @@ func TestRedis_StreamXReadShortBlockReturnsNullNotError(t *testing.T) {
 	}
 }
 
+func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdbReader := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbReader.Close() }()
+	rdbWriter := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbWriter.Close() }()
+	ctx := context.Background()
+
+	key := "stream-block-wrongtype"
+	_, err := rdbWriter.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.NoError(t, err)
+
+	type readResult struct {
+		streams []redis.XStream
+		err     error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		streams, err := rdbReader.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{key, "$"},
+			Count:   1,
+			Block:   2 * time.Second,
+		}).Result()
+		resultCh <- readResult{streams: streams, err: err}
+	}()
+
+	requireStreamWaiterRegistered(t, nodes[0].redisServer.streamWaiters, key)
+	require.NoError(t, rdbWriter.Set(ctx, key, "now-a-string", 0).Err())
+
+	select {
+	case res := <-resultCh:
+		require.Error(t, res.err)
+		require.Contains(t, res.err.Error(), "WRONGTYPE")
+		require.Empty(t, res.streams)
+	case <-time.After(4 * time.Second):
+		t.Fatal("XREAD BLOCK did not return after wrong-type overwrite")
+	}
+}
+
+func requireStreamWaiterRegistered(t *testing.T, reg *keyWaiterRegistry, key string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		if reg == nil {
+			return false
+		}
+		reg.mu.Lock()
+		defer reg.mu.Unlock()
+		return len(reg.waiters[key]) > 0
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
 // TestRedis_StreamCommandsRejectWrongType locks down the wrongType
 // detection on the stream fast path: keyTypeAtExpect short-circuits to
 // the slow path when the expected (stream) prefixes return empty, so
@@ -975,7 +1033,7 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	// pre-fix this would happily run for the full 5 s after Close()
 	// because iterCtx was rooted in context.Background(). Post-fix the
 	// handlerCtx.Err() guard at the top of each loop iteration kicks
-	// in within ~one redisBlockWaitFallback (100 ms) and we reply null.
+	// in promptly and we reply null.
 	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: "stream-shutdown",
 		ID:     "1-0",

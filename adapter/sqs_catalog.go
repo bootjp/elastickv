@@ -250,7 +250,7 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrPurgeInProgress, rateLimit.Error())
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isSQSServiceUnavailable(err) {
 		writeSQSError(w, http.StatusServiceUnavailable, sqsErrServiceUnavailable, "service unavailable")
 		return
 	}
@@ -262,6 +262,10 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 	// chain) and return a generic 500 body.
 	slog.Error("sqs adapter internal error", "err", err)
 	writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure, "internal error")
+}
+
+func isSQSServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 func writeSQSJSON(w http.ResponseWriter, payload any) {
@@ -940,7 +944,7 @@ func (s *SQSServer) createQueueCore(ctx context.Context, in *sqsCreateQueueInput
 	// here. Idempotent CreateQueue retries on an already-existing
 	// partitioned queue must NOT pay the network poll cost or risk a
 	// transient peer-poll failure flipping a 200-OK retry into a 400
-	// (Codex P1 review on PR #734).
+	// (P1 review on PR #734).
 	if len(in.Tags) > sqsMaxTagsPerQueue {
 		// AWS caps tags per queue at 50. CreateQueue must reject
 		// over-cap tag bundles up front; a silent slice-and-store
@@ -1001,7 +1005,7 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// Runs AFTER the existence check (so idempotent CreateQueue
 	// retries on an already-existing partitioned queue do not pay
 	// the network poll cost or risk a transient peer-poll failure
-	// flipping a 200-OK retry into a 400 — Codex P1 review on PR
+	// flipping a 200-OK retry into a 400 — P1 review on PR
 	// #734) and BEFORE the dispatch (so a rejected create does not
 	// burn an OCC commit).
 	if err := s.validateHTFIFOCapability(ctx, requested); err != nil {

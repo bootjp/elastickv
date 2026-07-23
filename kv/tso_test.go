@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -291,6 +292,81 @@ func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
 	require.EqualValues(t, testTSOInitialBase+6, got)
 }
 
+func TestKeyVizLabeledCoordinatorRecoversExpiredHLCCeiling(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng := &fakeLeaseEngine{
+		applied:      11,
+		leaseDur:     time.Hour,
+		proposeApply: applyHLCLeaseEntryToClock(t, clock),
+	}
+	coord := WithKeyVizLabel(NewCoordinatorWithEngine(nil, eng, WithHLC(clock)), keyviz.LabelRedis)
+
+	got, err := NextTimestampThrough(context.Background(), coord, "redis allocate ts")
+	require.NoError(t, err)
+	require.NotZero(t, got)
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+}
+
+func TestCoordinateTimestampRecoveryKeepsFailClosedWhenRenewalFails(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("propose rejected: no quorum")
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour, proposeErr: sentinel}
+	coord := WithKeyVizLabel(NewCoordinatorWithEngine(nil, eng, WithHLC(clock)), keyviz.LabelRedis)
+
+	_, err := NextTimestampThrough(context.Background(), coord, "redis allocate ts")
+	require.ErrorIs(t, err, ErrCeilingExpired)
+	require.Contains(t, err.Error(), "on-demand HLC lease renewal failed")
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+}
+
+func TestCoordinateTimestampRecoveryPreservesContextErrorWhenRenewalFails(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clock := NewHLC()
+			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+			eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour, proposeErr: tc.err}
+			coord := WithKeyVizLabel(NewCoordinatorWithEngine(nil, eng, WithHLC(clock)), keyviz.LabelRedis)
+
+			_, err := NextTimestampThrough(context.Background(), coord, "redis allocate ts")
+			require.ErrorIs(t, err, ErrCeilingExpired)
+			require.ErrorIs(t, err, tc.err)
+			require.Contains(t, err.Error(), "on-demand HLC lease renewal failed")
+			require.Equal(t, int32(1), eng.proposeCalls.Load())
+		})
+	}
+}
+
+func TestLocalTSOAllocatorRecoversExpiredHLCCeiling(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	coord := &fakeTSOCoordinator{clock: clock}
+	coord.leader.Store(true)
+	coord.recoverHLCLease = func(context.Context) error {
+		clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+		return nil
+	}
+	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
+	require.NoError(t, err)
+
+	got, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.NotZero(t, got)
+	require.EqualValues(t, 1, coord.recoverCalls.Load())
+}
+
 func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
 	t.Parallel()
 
@@ -423,8 +499,10 @@ func (b *blockingTimestampAllocator) Next(ctx context.Context) (uint64, error) {
 }
 
 type fakeTSOCoordinator struct {
-	leader atomic.Bool
-	clock  *HLC
+	leader          atomic.Bool
+	clock           *HLC
+	recoverCalls    atomic.Uint64
+	recoverHLCLease func(context.Context) error
 }
 
 func (f *fakeTSOCoordinator) IsLeader() bool {
@@ -433,6 +511,14 @@ func (f *fakeTSOCoordinator) IsLeader() bool {
 
 func (f *fakeTSOCoordinator) Clock() *HLC {
 	return f.clock
+}
+
+func (f *fakeTSOCoordinator) RecoverHLCLease(ctx context.Context) error {
+	f.recoverCalls.Add(1)
+	if f.recoverHLCLease != nil {
+		return f.recoverHLCLease(ctx)
+	}
+	return errors.WithStack(errHLCLeaseRecoveryUnavailable)
 }
 
 type fakeTimestampLeaderCoordinator struct {

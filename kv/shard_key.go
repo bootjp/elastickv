@@ -103,6 +103,16 @@ func routeKey(key []byte) []byte {
 	return normalizeRouteKey(key)
 }
 
+func routeFilterKey(key []byte) []byte {
+	if key == nil {
+		return nil
+	}
+	if embedded, ok := txnRouteKey(key); ok {
+		return normalizeRouteFilterKey(embedded)
+	}
+	return normalizeRouteFilterKey(key)
+}
+
 func normalizeRouteKey(key []byte) []byte {
 	for _, extract := range routeKeyExtractors {
 		if user := extract(key); user != nil {
@@ -110,6 +120,36 @@ func normalizeRouteKey(key []byte) []byte {
 		}
 	}
 	return key
+}
+
+func normalizeRouteFilterKey(key []byte) []byte {
+	if user := listRouteKey(key); user != nil {
+		return user
+	}
+	if user := streamRouteKey(key); user != nil {
+		return user
+	}
+	return normalizeRouteKey(key)
+}
+
+func redisWideColumnLegacyPointRouteKey(key []byte) []byte {
+	if embedded, ok := txnRouteKey(key); ok {
+		key = embedded
+	}
+	if redisWideColumnRouteKey(key) == nil {
+		return nil
+	}
+	return key
+}
+
+func redisWideColumnRouteKey(key []byte) []byte {
+	if user := hashRouteKey(key); user != nil {
+		return user
+	}
+	if user := setRouteKey(key); user != nil {
+		return user
+	}
+	return zsetRouteKey(key)
 }
 
 func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
@@ -156,6 +196,28 @@ func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte,
 	// ordering cannot be projected to a logical user-key lower bound, so the
 	// remaining namespace must fan out to every logical route.
 	return nil, nil, false, true
+}
+
+func listAuxiliaryScanRouteRange(start []byte, end []byte) (routeStart []byte, exact bool, ok bool) {
+	for _, prefix := range [][]byte{
+		[]byte(store.ListMetaDeltaPrefix),
+		[]byte(store.ListClaimPrefix),
+	} {
+		if !bytes.HasPrefix(start, prefix) {
+			continue
+		}
+		user := wideColumnScanUserKey(start, prefix)
+		if user == nil {
+			return nil, false, true
+		}
+		userPrefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		userPrefix := start[:userPrefixLen]
+		if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+			return user, true, true
+		}
+		return nil, false, true
+	}
+	return nil, false, false
 }
 
 func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
