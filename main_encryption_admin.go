@@ -190,6 +190,9 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 	}
 	if writerRegistry != nil {
 		opts = append(opts, adapter.WithEncryptionAdminWriterRegistry(writerRegistry))
+		if engine != nil {
+			opts = append(opts, adapter.WithEncryptionAdminRegistryLeaderView(engine))
+		}
 	}
 	if enableMutators && engine != nil {
 		opts = append(opts,

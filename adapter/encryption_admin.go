@@ -46,6 +46,12 @@ type EncryptionAdminServer struct {
 	// the raft envelope.
 	postCutoverProposer raftengine.Proposer
 	leaderView          raftengine.LeaderView
+	// registryLeaderView is the leadership oracle for read-repair
+	// responses that include writer-registry projections. Production
+	// wiring points this at the default group even when the gRPC
+	// listener belongs to a non-default group, because registry rows
+	// are default-group control-plane state.
+	registryLeaderView raftengine.LeaderView
 	// capabilityFanout, when wired, runs the §4 Voters ∪ Learners
 	// fan-out before the §7.1 Phase 1 cutover entry is proposed.
 	// A nil value short-circuits EnableStorageEnvelope with
@@ -272,6 +278,20 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 	}
 }
 
+// WithEncryptionAdminRegistryLeaderView registers the leadership
+// oracle used by ResyncSidecar before it reads writer-registry
+// projections. Multi-group production wiring uses the default
+// group leader view here so a non-default group listener cannot
+// serve read-repair data from a stale default-group follower.
+func WithEncryptionAdminRegistryLeaderView(v raftengine.LeaderView) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if v == nil {
+			return
+		}
+		s.registryLeaderView = v
+	}
+}
+
 // WithEncryptionAdminCutoverBarrier wires the §7.1 quiescence
 // barrier controller used by EnableRaftEnvelope. A nil argument is
 // a no-op (the server stays in the cutover-disabled posture);
@@ -316,6 +336,9 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 	}
 	if s.postCutoverProposer == nil {
 		s.postCutoverProposer = s.proposer
+	}
+	if s.registryLeaderView == nil {
+		s.registryLeaderView = s.leaderView
 	}
 	return s
 }
@@ -429,7 +452,7 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // state to a recovering follower and silently overwrite recent
 // rotations.
 func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
-	if err := s.requireLeader(ctx); err != nil {
+	if err := s.requireRegistryLeader(ctx); err != nil {
 		return nil, err
 	}
 	callerFullNodeID := req.GetCallerFullNodeId()
@@ -1908,11 +1931,19 @@ func proposeErrorToStatus(err error, opcode byte) error {
 //     a follower's recovery flow could pull an outdated DEK
 //     set from a stranded leader and miss recent rotations.
 func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
-	if s.leaderView == nil {
+	return requireLeaderView(ctx, s.leaderView)
+}
+
+func (s *EncryptionAdminServer) requireRegistryLeader(ctx context.Context) error {
+	return requireLeaderView(ctx, s.registryLeaderView)
+}
+
+func requireLeaderView(ctx context.Context, leaderView raftengine.LeaderView) error {
+	if leaderView == nil {
 		return nil
 	}
-	if s.leaderView.State() != raftengine.StateLeader {
-		leader := s.leaderView.Leader()
+	if leaderView.State() != raftengine.StateLeader {
+		leader := leaderView.Leader()
 		if leader.ID == "" && leader.Address == "" {
 			return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
 		}
@@ -1920,7 +1951,7 @@ func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 			"encryption: not leader (current leader id=%q address=%q)",
 			leader.ID, leader.Address)
 	}
-	if err := s.leaderView.VerifyLeader(ctx); err != nil {
+	if err := leaderView.VerifyLeader(ctx); err != nil {
 		return verifyLeaderErrorToStatus(err)
 	}
 	return nil
