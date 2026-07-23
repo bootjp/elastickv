@@ -181,12 +181,15 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, extraOpts ...adapter.EncryptionAdminServerOption) {
+func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if sidecarPath != "" {
 		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(sidecarPath))
+	}
+	if latestAppliedIndex != nil {
+		opts = append(opts, adapter.WithEncryptionAdminLatestAppliedIndex(latestAppliedIndex))
 	}
 	if writerRegistry != nil {
 		opts = append(opts, adapter.WithEncryptionAdminWriterRegistry(writerRegistry))

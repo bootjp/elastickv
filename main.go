@@ -2716,7 +2716,7 @@ func startRaftServers(
 			defaultAdmin.engine,
 			encryptionCapabilityFanout,
 			writerRegistry,
-			adapter.WithEncryptionAdminLatestAppliedIndex(defaultAdmin.latestAppliedIndex),
+			defaultAdmin.latestAppliedIndex,
 			adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)
