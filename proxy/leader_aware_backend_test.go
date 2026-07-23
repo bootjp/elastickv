@@ -682,6 +682,33 @@ func TestLeaderAwareRedisBackend_NewPubSubFallsBackToSeedWhenNoLeaderDiscovered(
 	require.Empty(t, backend.CurrentLeader())
 }
 
+func TestLeaderAwareRedisBackend_UnknownLeaderDoesNotProbeOnEveryCommand(t *testing.T) {
+	seed := newFakeElasticKVNode(t)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{seed.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 50*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	require.Eventually(t, func() bool {
+		return seed.infoCalls.Load() > 0
+	}, time.Second, 10*time.Millisecond, "initial background probe should run")
+	require.Empty(t, backend.CurrentLeader())
+	before := seed.infoCalls.Load()
+
+	for i := 0; i < 3; i++ {
+		err := backend.Do(context.Background(), "SET", "k", "v").Err()
+		require.ErrorIs(t, err, ErrNoLeaderBackend)
+	}
+
+	require.Equal(t, before, seed.infoCalls.Load(), "commands must not start a fresh probe inside the refresh interval")
+	require.Equal(t, int64(0), seed.commands.Load(), "commands must not fall back to a seed when leader discovery returned no leader")
+}
+
 func TestLeaderAwareRedisBackend_FallsBackToSeedOnProbeFailure(t *testing.T) {
 	// Seed 1 is unreachable; seed 2 is alive and reports itself as leader.
 	aliveLeader := newFakeElasticKVNode(t)

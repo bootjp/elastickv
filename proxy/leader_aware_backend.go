@@ -59,6 +59,7 @@ type LeaderAwareRedisBackend struct {
 	refreshMu     sync.Mutex
 	refreshDone   chan struct{}
 	refreshClosed bool
+	lastRefreshAt time.Time
 	refreshCtx    context.Context
 	refreshCancel context.CancelFunc
 
@@ -209,6 +210,7 @@ func (b *LeaderAwareRedisBackend) runLeaderRefresh(done chan struct{}) {
 
 	b.refreshMu.Lock()
 	b.refreshDone = nil
+	b.lastRefreshAt = time.Now()
 	close(done)
 	b.refreshMu.Unlock()
 }
@@ -242,6 +244,30 @@ func (b *LeaderAwareRedisBackend) refreshLeaderOnce(ctx context.Context) {
 // after an explicit not-leader rejection, where retrying is known to be safe.
 func (b *LeaderAwareRedisBackend) RefreshLeaderNow(ctx context.Context) {
 	b.refreshLeader(ctx)
+}
+
+func (b *LeaderAwareRedisBackend) refreshLeaderNowIfDue(ctx context.Context) {
+	b.refreshMu.Lock()
+	if b.refreshClosed {
+		b.refreshMu.Unlock()
+		return
+	}
+	done := b.refreshDone
+	if done == nil {
+		if !b.lastRefreshAt.IsZero() && time.Since(b.lastRefreshAt) < b.refreshInterval {
+			b.refreshMu.Unlock()
+			return
+		}
+		done = make(chan struct{})
+		b.refreshDone = done
+		go b.runLeaderRefresh(done)
+	}
+	b.refreshMu.Unlock()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 func (b *LeaderAwareRedisBackend) probeLeader(ctx context.Context, addr string) (string, error) {
@@ -394,7 +420,7 @@ func (b *LeaderAwareRedisBackend) currentClientOrRefresh(ctx context.Context) *r
 	if cli != nil {
 		return cli
 	}
-	b.RefreshLeaderNow(ctx)
+	b.refreshLeaderNowIfDue(ctx)
 	return b.currentClient()
 }
 
