@@ -249,6 +249,41 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 	require.NotEmpty(t, candidate.ManifestSHA256)
 }
 
+func TestDecodeManifestRejectsInvalidConfStateMembership(t *testing.T) {
+	base := testManifestForValidation(t)
+	testCases := []ManifestConfState{
+		{Voters: nil},
+		{Voters: []uint64{0}},
+		{Voters: []uint64{1}, Learners: []uint64{1}},
+		{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, LearnersNext: []uint64{1}},
+		{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, LearnersNext: []uint64{2}},
+		{Voters: []uint64{1}, AutoLeave: true},
+	}
+	for _, confState := range testCases {
+		manifest := base
+		manifest.ConfState = confState
+		raw, _, err := manifest.MarshalCanonical()
+		require.NoError(t, err)
+		_, err = DecodeManifest(raw)
+		require.ErrorIs(t, err, ErrInvalidOptions)
+	}
+}
+
+func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {
+	manifest := testManifestForValidation(t)
+	manifest.ConfState = ManifestConfState{
+		Voters:         []uint64{1, 2},
+		VotersOutgoing: []uint64{1, 3},
+		LearnersNext:   []uint64{3},
+		AutoLeave:      true,
+	}
+	raw, _, err := manifest.MarshalCanonical()
+	require.NoError(t, err)
+	decoded, err := DecodeManifest(raw)
+	require.NoError(t, err)
+	require.Equal(t, manifest.ConfState, decoded.ConfState)
+}
+
 func TestPublishRejectsGroupZeroWithoutSourceClusterBeforePayload(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -528,6 +563,30 @@ func TestPrepareRestoreDownloadDirCreatesParentAndCleansOnlyStaleDirs(t *testing
 	require.NoError(t, os.RemoveAll(activeDir))
 	_, err = os.Stat(staleDir)
 	require.True(t, os.IsNotExist(err))
+}
+
+func testManifestForValidation(t *testing.T) Manifest {
+	t.Helper()
+	payloadSHA := hexSHA256Bytes([]byte("payload"))
+	key, err := manifestKey("cluster-a", 1, 20, 13)
+	require.NoError(t, err)
+	return Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		CreatedAt:     time.Unix(400, 0).UTC(),
+		SourceCluster: "cluster-a",
+		GroupID:       1,
+		SnapshotIndex: 20,
+		SnapshotTerm:  13,
+		ConfState: ManifestConfState{
+			Voters: []uint64{1},
+		},
+		Payload: PayloadDescriptor{
+			Key:    "cluster-a/v1/payloads/test.fsm",
+			Bytes:  int64(len("payload")),
+			SHA256: payloadSHA,
+		},
+		ManifestKey: key,
+	}
 }
 
 func seedPhysicalSnapshot(

@@ -3,6 +3,7 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -156,6 +157,53 @@ func TestS3StoreConflictRejectsExistingObjectWithoutIntegrityMetadataMismatch(t 
 	require.Equal(t, 1, fake.getAttempts())
 }
 
+func TestS3StoreRetriesConditionalRequestConflict(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	fake.conditionalConflicts = 1
+	store := newTestS3Store(t, fake)
+	body := []byte("retry-body")
+	sha := hexSHA256Bytes(body)
+
+	info, err := store.PutObject(ctx, "snapshots/retry.fsm", bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	require.Equal(t, sha, info.SHA256)
+	require.Equal(t, 2, fake.putAttempts())
+}
+
+func TestS3StoreUsesMultipartForLargeObject(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store := newTestS3Store(t, fake)
+	store.multipartThreshold = 4
+	store.multipartPartSize = 3
+	body := []byte("multipart-body")
+	sha := hexSHA256Bytes(body)
+
+	info, err := store.PutObject(ctx, "snapshots/multipart.fsm", bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	require.Equal(t, sha, info.SHA256)
+	require.Equal(t, 1, fake.multipartCompletes)
+	require.Greater(t, fake.uploadedParts, 1)
+}
+
+func TestS3StoreRejectsInvalidKMSConfig(t *testing.T) {
+	_, err := NewS3Store(context.Background(), S3StoreConfig{
+		Client:               newFakeS3Client(),
+		Bucket:               "backup-bucket",
+		ServerSideEncryption: string(types.ServerSideEncryptionAwsKms),
+		SSEKMSKeyID:          "alias/snapshot-key",
+	})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.ErrorContains(t, err, "aliases are not supported")
+}
+
 func TestS3StoreRejectsParentDirectoryKeys(t *testing.T) {
 	ctx := context.Background()
 	store := newTestS3Store(t, newFakeS3Client())
@@ -172,30 +220,51 @@ func TestS3StoreRejectsParentDirectoryKeys(t *testing.T) {
 func newTestS3Store(t *testing.T, client *fakeS3Client) *S3Store {
 	t.Helper()
 	store, err := NewS3Store(context.Background(), S3StoreConfig{
-		Client:         client,
-		Bucket:         "backup-bucket",
-		ForcePathStyle: true,
+		Client:               client,
+		Bucket:               "backup-bucket",
+		ForcePathStyle:       true,
+		ServerSideEncryption: string(types.ServerSideEncryptionAes256),
 	})
 	require.NoError(t, err)
 	return store
 }
 
 type fakeS3Client struct {
-	mu       sync.Mutex
-	objects  map[string]fakeS3Object
-	lastPut  types.ChecksumAlgorithm
-	attempts int
-	gets     int
+	mu                   sync.Mutex
+	objects              map[string]fakeS3Object
+	multipart            map[string]*fakeMultipartUpload
+	lastPut              types.ChecksumAlgorithm
+	attempts             int
+	gets                 int
+	conditionalConflicts int
+	nextUploadID         int
+	uploadedParts        int
+	multipartCompletes   int
 }
 
 type fakeS3Object struct {
-	body     []byte
-	metadata map[string]string
-	checksum *string
+	body                 []byte
+	metadata             map[string]string
+	checksum             *string
+	serverSideEncryption types.ServerSideEncryption
+	kmsKeyID             *string
+}
+
+type fakeMultipartUpload struct {
+	bucket               string
+	key                  string
+	metadata             map[string]string
+	checksum             *string
+	serverSideEncryption types.ServerSideEncryption
+	kmsKeyID             *string
+	parts                map[int32][]byte
 }
 
 func newFakeS3Client() *fakeS3Client {
-	return &fakeS3Client{objects: make(map[string]fakeS3Object)}
+	return &fakeS3Client{
+		objects:   make(map[string]fakeS3Object),
+		multipart: make(map[string]*fakeMultipartUpload),
+	}
 }
 
 func (c *fakeS3Client) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -204,6 +273,10 @@ func (c *fakeS3Client) PutObject(_ context.Context, input *s3.PutObjectInput, _ 
 	defer c.mu.Unlock()
 	c.attempts++
 	c.lastPut = input.ChecksumAlgorithm
+	if c.conditionalConflicts > 0 {
+		c.conditionalConflicts--
+		return nil, &smithy.GenericAPIError{Code: "ConditionalRequestConflict", Message: "retry"}
+	}
 	if _, ok := c.objects[key]; ok && aws.ToString(input.IfNoneMatch) == "*" {
 		return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "exists"}
 	}
@@ -219,9 +292,11 @@ func (c *fakeS3Client) PutObject(_ context.Context, input *s3.PutObjectInput, _ 
 		metadata[k] = v
 	}
 	c.objects[key] = fakeS3Object{
-		body:     append([]byte(nil), body...),
-		metadata: metadata,
-		checksum: input.ChecksumSHA256,
+		body:                 append([]byte(nil), body...),
+		metadata:             metadata,
+		checksum:             input.ChecksumSHA256,
+		serverSideEncryption: input.ServerSideEncryption,
+		kmsKeyID:             input.SSEKMSKeyId,
 	}
 	return &s3.PutObjectOutput{}, nil
 }
@@ -238,9 +313,11 @@ func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, 
 		metadata[k] = v
 	}
 	return &s3.HeadObjectOutput{
-		ContentLength:  aws.Int64(int64(len(obj.body))),
-		Metadata:       metadata,
-		ChecksumSHA256: obj.checksum,
+		ContentLength:        aws.Int64(int64(len(obj.body))),
+		Metadata:             metadata,
+		ChecksumSHA256:       obj.checksum,
+		ServerSideEncryption: obj.serverSideEncryption,
+		SSEKMSKeyId:          obj.kmsKeyID,
 	}, nil
 }
 
@@ -257,11 +334,101 @@ func (c *fakeS3Client) GetObject(_ context.Context, input *s3.GetObjectInput, _ 
 		metadata[k] = v
 	}
 	return &s3.GetObjectOutput{
-		Body:           io.NopCloser(bytes.NewReader(obj.body)),
-		ContentLength:  aws.Int64(int64(len(obj.body))),
-		Metadata:       metadata,
-		ChecksumSHA256: obj.checksum,
+		Body:                 io.NopCloser(bytes.NewReader(obj.body)),
+		ContentLength:        aws.Int64(int64(len(obj.body))),
+		Metadata:             metadata,
+		ChecksumSHA256:       obj.checksum,
+		ServerSideEncryption: obj.serverSideEncryption,
+		SSEKMSKeyId:          obj.kmsKeyID,
 	}, nil
+}
+
+func (c *fakeS3Client) CreateMultipartUpload(
+	_ context.Context,
+	input *s3.CreateMultipartUploadInput,
+	_ ...func(*s3.Options),
+) (*s3.CreateMultipartUploadOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextUploadID++
+	uploadID := fmt.Sprintf("upload-%d", c.nextUploadID)
+	metadata := make(map[string]string, len(input.Metadata))
+	for k, v := range input.Metadata {
+		metadata[k] = v
+	}
+	c.multipart[uploadID] = &fakeMultipartUpload{
+		bucket:               aws.ToString(input.Bucket),
+		key:                  aws.ToString(input.Key),
+		metadata:             metadata,
+		serverSideEncryption: input.ServerSideEncryption,
+		kmsKeyID:             input.SSEKMSKeyId,
+		parts:                make(map[int32][]byte),
+	}
+	return &s3.CreateMultipartUploadOutput{UploadId: aws.String(uploadID)}, nil
+}
+
+func (c *fakeS3Client) UploadPart(
+	_ context.Context,
+	input *s3.UploadPartInput,
+	_ ...func(*s3.Options),
+) (*s3.UploadPartOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	upload := c.multipart[aws.ToString(input.UploadId)]
+	if upload == nil {
+		return nil, &smithy.GenericAPIError{Code: "NoSuchUpload", Message: "missing upload"}
+	}
+	body, err := io.ReadAll(input.Body)
+	if err != nil {
+		return nil, err
+	}
+	upload.parts[aws.ToInt32(input.PartNumber)] = append([]byte(nil), body...)
+	c.uploadedParts++
+	return &s3.UploadPartOutput{ETag: aws.String(fmt.Sprintf("etag-%d", aws.ToInt32(input.PartNumber)))}, nil
+}
+
+func (c *fakeS3Client) CompleteMultipartUpload(
+	_ context.Context,
+	input *s3.CompleteMultipartUploadInput,
+	_ ...func(*s3.Options),
+) (*s3.CompleteMultipartUploadOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	uploadID := aws.ToString(input.UploadId)
+	upload := c.multipart[uploadID]
+	if upload == nil {
+		return nil, &smithy.GenericAPIError{Code: "NoSuchUpload", Message: "missing upload"}
+	}
+	key := upload.bucket + "/" + upload.key
+	if _, ok := c.objects[key]; ok && aws.ToString(input.IfNoneMatch) == "*" {
+		return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "exists"}
+	}
+	var body []byte
+	for _, part := range input.MultipartUpload.Parts {
+		partBody := upload.parts[aws.ToInt32(part.PartNumber)]
+		body = append(body, partBody...)
+	}
+	c.objects[key] = fakeS3Object{
+		body:                 body,
+		metadata:             upload.metadata,
+		checksum:             upload.checksum,
+		serverSideEncryption: upload.serverSideEncryption,
+		kmsKeyID:             upload.kmsKeyID,
+	}
+	c.multipartCompletes++
+	delete(c.multipart, uploadID)
+	return &s3.CompleteMultipartUploadOutput{}, nil
+}
+
+func (c *fakeS3Client) AbortMultipartUpload(
+	_ context.Context,
+	input *s3.AbortMultipartUploadInput,
+	_ ...func(*s3.Options),
+) (*s3.AbortMultipartUploadOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.multipart, aws.ToString(input.UploadId))
+	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
 func (c *fakeS3Client) lastPutChecksumAlgorithm() types.ChecksumAlgorithm {
@@ -290,9 +457,10 @@ func (c *fakeS3Client) putRawObject(bucket string, key string, body []byte, meta
 		clonedMetadata[k] = v
 	}
 	c.objects[bucket+"/"+key] = fakeS3Object{
-		body:     append([]byte(nil), body...),
-		metadata: clonedMetadata,
-		checksum: checksum,
+		body:                 append([]byte(nil), body...),
+		metadata:             clonedMetadata,
+		checksum:             checksum,
+		serverSideEncryption: types.ServerSideEncryptionAes256,
 	}
 }
 
