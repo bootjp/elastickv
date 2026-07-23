@@ -244,18 +244,21 @@ func TestEncryptionAdmin_RegistryProjectionUsesAppliedLinearizableRead(t *testin
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
 	cases := []struct {
-		name string
-		call func(*EncryptionAdminServer) error
+		name             string
+		wantAppliedReads int32
+		call             func(*EncryptionAdminServer) error
 	}{
 		{
-			name: "GetSidecarState",
+			name:             "GetSidecarState",
+			wantAppliedReads: 2,
 			call: func(s *EncryptionAdminServer) error {
 				_, err := s.GetSidecarState(context.Background(), &pb.Empty{})
 				return err
 			},
 		},
 		{
-			name: "ResyncSidecar",
+			name:             "ResyncSidecar",
+			wantAppliedReads: 2,
 			call: func(s *EncryptionAdminServer) error {
 				_, err := s.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: callerFullNodeID})
 				return err
@@ -296,16 +299,45 @@ func TestEncryptionAdmin_RegistryProjectionUsesAppliedLinearizableRead(t *testin
 			if got := verifyCalls.Load(); got != 0 {
 				t.Fatalf("VerifyLeader calls=%d, want 0 for registry projection", got)
 			}
-			if got := linearizableReadCalls.Load(); got != 1 {
-				t.Fatalf("LinearizableRead calls=%d, want 1 for registry projection", got)
+			if got := linearizableReadCalls.Load(); got != tc.wantAppliedReads {
+				t.Fatalf("LinearizableRead calls=%d, want %d for registry projection", got, tc.wantAppliedReads)
 			}
 		})
 	}
 }
 
-func TestEncryptionAdmin_GetSidecarState_FencesBeforeReadingSidecar(t *testing.T) {
+func TestEncryptionAdmin_GetSidecarState_FencesAgainAfterReadingSidecar(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	runEncryptionAdminRegistryProjectionFenceAfterSidecarTest(t, callerFullNodeID,
+		func(s *EncryptionAdminServer) (uint32, uint32, map[uint32][]byte, map[uint32]uint32, error) {
+			got, err := s.GetSidecarState(context.Background(), &pb.Empty{})
+			if got == nil {
+				return 0, 0, nil, nil, err
+			}
+			return got.ActiveStorageId, got.ActiveRaftId, got.WrappedDeksById, got.WriterRegistryForCaller, err
+		})
+}
+
+func TestEncryptionAdmin_ResyncSidecar_FencesAgainAfterReadingSidecar(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	runEncryptionAdminRegistryProjectionFenceAfterSidecarTest(t, callerFullNodeID,
+		func(s *EncryptionAdminServer) (uint32, uint32, map[uint32][]byte, map[uint32]uint32, error) {
+			got, err := s.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: callerFullNodeID})
+			if got == nil {
+				return 0, 0, nil, nil, err
+			}
+			return got.ActiveStorageId, got.ActiveRaftId, got.WrappedDeksById, got.WriterRegistryForCaller, err
+		})
+}
+
+func runEncryptionAdminRegistryProjectionFenceAfterSidecarTest(
+	t *testing.T,
+	callerFullNodeID uint64,
+	call func(*EncryptionAdminServer) (uint32, uint32, map[uint32][]byte, map[uint32]uint32, error),
+) {
+	t.Helper()
 	path := writeSidecarFixture(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
 		Keys: map[string]encryption.SidecarKey{
@@ -314,7 +346,7 @@ func TestEncryptionAdmin_GetSidecarState_FencesBeforeReadingSidecar(t *testing.T
 		},
 	})
 	reg := newTestWriterRegistryStore()
-	reg.seed(t, 20, callerFullNodeID, 7)
+	var appliedReads atomic.Int32
 
 	srv := NewEncryptionAdminServer(
 		WithEncryptionAdminSidecarPath(path),
@@ -323,34 +355,48 @@ func TestEncryptionAdmin_GetSidecarState_FencesBeforeReadingSidecar(t *testing.T
 		WithEncryptionAdminRegistryLeaderView(stubLeaderView{
 			state: raftengine.StateLeader,
 			linearizableReadFn: func(context.Context) (uint64, error) {
-				if err := encryption.WriteSidecar(path, &encryption.Sidecar{
-					Active: encryption.ActiveKeys{Storage: 20, Raft: 21},
-					Keys: map[string]encryption.SidecarKey{
-						"20": {Purpose: "storage", Wrapped: []byte("new-storage")},
-						"21": {Purpose: "raft", Wrapped: []byte("new-raft")},
-					},
-				}); err != nil {
-					return 0, err
+				readNumber := appliedReads.Add(1)
+				if readNumber == 1 {
+					return writeNewSidecarDuringRegistryFence(path)
 				}
-				return 99, nil
+				if readNumber == 2 {
+					reg.seed(t, 20, callerFullNodeID, 7)
+				}
+				return 100, nil
 			},
 		}),
 		WithEncryptionAdminWriterRegistry(reg),
 	)
-	got, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	activeStorageID, activeRaftID, wrapped, registryForCaller, err := call(srv)
 	if err != nil {
-		t.Fatalf("GetSidecarState: %v", err)
+		t.Fatalf("registry projection RPC: %v", err)
 	}
-	if got.ActiveStorageId != 20 || got.ActiveRaftId != 21 {
-		t.Fatalf("active=(%d,%d), want (20,21) from sidecar after applied fence", got.ActiveStorageId, got.ActiveRaftId)
+	if activeStorageID != 20 || activeRaftID != 21 {
+		t.Fatalf("active=(%d,%d), want (20,21) from sidecar selected after first applied fence", activeStorageID, activeRaftID)
 	}
-	if string(got.WrappedDeksById[20]) != "new-storage" || string(got.WrappedDeksById[21]) != "new-raft" {
-		t.Fatalf("wrapped=%v, want post-fence DEK set", got.WrappedDeksById)
+	if string(wrapped[20]) != "new-storage" || string(wrapped[21]) != "new-raft" {
+		t.Fatalf("wrapped=%v, want post-fence DEK set", wrapped)
 	}
 	want := map[uint32]uint32{20: 7}
-	if !mapsEqual(got.WriterRegistryForCaller, want) {
-		t.Fatalf("WriterRegistryForCaller=%v, want %v from post-fence DEK set", got.WriterRegistryForCaller, want)
+	if !mapsEqual(registryForCaller, want) {
+		t.Fatalf("WriterRegistryForCaller=%v, want %v from second post-sidecar fence", registryForCaller, want)
 	}
+	if got := appliedReads.Load(); got != 2 {
+		t.Fatalf("LinearizableRead calls=%d, want 2", got)
+	}
+}
+
+func writeNewSidecarDuringRegistryFence(path string) (uint64, error) {
+	if err := encryption.WriteSidecar(path, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 20, Raft: 21},
+		Keys: map[string]encryption.SidecarKey{
+			"20": {Purpose: "storage", Wrapped: []byte("new-storage")},
+			"21": {Purpose: "raft", Wrapped: []byte("new-raft")},
+		},
+	}); err != nil {
+		return 0, err
+	}
+	return 99, nil
 }
 
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {

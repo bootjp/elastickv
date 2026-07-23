@@ -433,6 +433,16 @@ func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty
 	}
 	registryForCaller := map[uint32]uint32{}
 	if projectRegistryForCaller {
+		// Bootstrap and rotation apply writes keys.json before it
+		// inserts the matching writer-registry rows. Re-fence after
+		// selecting the sidecar snapshot so the projection cannot lag
+		// behind the DEK set returned in this response.
+		projectRegistryForCaller, err = s.canProjectWriterRegistryForCaller(ctx, s.fullNodeID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if projectRegistryForCaller {
 		registryForCaller, err = s.writerRegistryForCaller(sc, s.fullNodeID)
 		if err != nil {
 			return nil, err
@@ -470,9 +480,9 @@ func (s *EncryptionAdminServer) canProjectWriterRegistryForCaller(ctx context.Co
 //
 // Leader-only via requireRegistryLeader, which calls LinearizableRead(ctx)
 // to confirm leadership and wait until the returned ReadIndex has applied
-// locally before registry projections are read. Without that applied fence,
-// a leader could serve stale writer-registry rows immediately after a
-// committed registration or rotation.
+// locally before registry projections are read. The handler also repeats
+// the applied fence after loading keys.json, because bootstrap and rotation
+// apply writes the sidecar before the matching writer-registry rows.
 func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
 	if err := s.requireRegistryLeader(ctx); err != nil {
 		return nil, err
@@ -488,6 +498,9 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 	sc, err := encryption.ReadSidecar(s.sidecarPath)
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
+	}
+	if err := s.requireRegistryLeader(ctx); err != nil {
+		return nil, err
 	}
 	registryForCaller, err := s.writerRegistryForCaller(sc, callerFullNodeID)
 	if err != nil {
