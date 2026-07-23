@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	redisPerPeerLimitEnv             = "ELASTICKV_REDIS_PER_PEER_CONNECTIONS"
-	defaultRedisPerPeerConnectionCap = redislimits.DefaultElasticKVRedisConnections
-	redisPeerLimitError              = "ERR max connections per client exceeded"
-	unknownRedisPeer                 = "unknown"
+	redisPerPeerLimitEnv              = "ELASTICKV_REDIS_PER_PEER_CONNECTIONS"
+	defaultRedisDedicatedPeerHeadroom = redislimits.DefaultElasticKVRedisConnections
+	defaultRedisPerPeerConnectionCap  = redislimits.DefaultElasticKVRedisConnections + defaultRedisDedicatedPeerHeadroom
+	redisPeerLimitError               = "ERR max connections per client exceeded"
+	unknownRedisPeer                  = "unknown"
 )
 
 type redisPeerLimiter struct {

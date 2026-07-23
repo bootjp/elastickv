@@ -53,7 +53,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3},
 		},
 		{
 			name: "single score entry",
@@ -66,7 +66,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  3,
 			wantWide:   true,
 			wantLast:   true,
-			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
 		},
 		{
 			name: "mixed partial score index uses lower member row",
@@ -88,7 +88,29 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+		},
+		{
+			name: "mixed partial score index keeps indexed candidate non-last",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "low-indexed", Score: 1},
+					{Member: "high-unindexed", Score: 5},
+				})
+				ctx := context.Background()
+				require.NoError(t, st.PutAt(
+					ctx,
+					store.ZSetScoreKey(key, 1, []byte("low-indexed")),
+					[]byte{},
+					readTS,
+					0,
+				))
+			},
+			wantMember: "low-indexed",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
 		},
 		{
 			name: "member only fallback",
@@ -102,7 +124,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
 		},
 		{
 			name: "legacy blob fallback",
@@ -116,7 +138,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   false,
 			wantLast:   false,
-			wantScans:  []int{bzpopminScoreScanLimit, 1},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,7 +160,8 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			for i, wantLimit := range tc.wantScans {
 				require.Equal(t, wantLimit, rec.scans[i].limit)
 			}
-			require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[0].start)
+			require.Equal(t, store.ZSetMetaDeltaScanPrefix(key), rec.scans[0].start)
+			require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[1].start)
 		})
 	}
 }

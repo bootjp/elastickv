@@ -1156,9 +1156,12 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 }
 
 func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
-	scoreCandidate, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
+	scoreCandidate, scoreIndexComplete, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
+	}
+	if scoreIndexComplete {
+		return scoreCandidate, nil
 	}
 	memberCandidate, err := r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
 	if err != nil {
@@ -1186,25 +1189,40 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 	return left.Member < right.Member
 }
 
-func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
+	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
-	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
+	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreIndexScanLimit(metaLen, metaExists), readTS)
 	if err != nil {
-		return nil, cockerrors.WithStack(err)
+		return nil, false, cockerrors.WithStack(err)
 	}
 	for _, kv := range scoreKVs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
 		if !ok {
 			continue
 		}
+		scoreIndexComplete := metaExists && metaLen > 0 && int64(len(scoreKVs)) == metaLen
 		return &bzpopminCandidate{
 			entry:  redisZSetEntry{Member: string(member), Score: score},
 			isWide: true,
-			isLast: len(scoreKVs) == 1,
-		}, nil
+			isLast: scoreIndexComplete && metaLen == 1,
+		}, scoreIndexComplete, nil
 	}
-	return nil, nil
+	return nil, metaExists && metaLen == 0, nil
+}
+
+func bzpopminScoreIndexScanLimit(metaLen int64, metaExists bool) int {
+	if !metaExists || metaLen <= 0 {
+		return bzpopminScoreScanLimit
+	}
+	if metaLen >= int64(maxWideScanLimit) {
+		return maxWideScanLimit
+	}
+	return int(metaLen) + 1
 }
 
 func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
