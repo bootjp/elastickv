@@ -72,11 +72,12 @@ func DefaultBackendOptions() BackendOptions {
 }
 
 // DefaultElasticKVBackendOptions returns defaults for proxy backends that
-// connect to ElasticKV's Redis adapter. Production dual-write deployments
-// should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS above this
-// pool size because PubSub and shadow PubSub use dedicated connections outside
-// the go-redis command pool. Lower the proxy pool instead for clusters that
-// keep the server-side per-peer cap below the default.
+// connect to ElasticKV's Redis adapter. The regular command pool and blocking
+// replay pool share ElasticKV's per-peer connection budget. PubSub and shadow
+// PubSub use dedicated sockets outside those pools, and detached sockets may
+// remain counted until cleanup. Run the cluster with
+// ELASTICKV_REDIS_PER_PEER_CONNECTIONS above this pool size before using the
+// default in production, or lower the proxy pool to fit the configured cap.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize
