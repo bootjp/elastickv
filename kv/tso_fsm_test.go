@@ -2,6 +2,8 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
 	"testing"
 	"time"
 
@@ -17,21 +19,44 @@ func TestTSOStateMachineApplyHLCLeaseUpdatesCeiling(t *testing.T) {
 
 	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(ceilingMs)))
 	require.Equal(t, ceilingMs, clock.PhysicalCeiling())
-	require.Equal(t, tsoCeilingMaxTimestamp(ceilingMs), clock.Current())
+	require.Zero(t, clock.Current())
 	require.Equal(t, ceilingMs, fsm.committedCeiling())
 }
 
-func TestTSOStateMachineApplyHLCLeaseExhaustsCommittedCeiling(t *testing.T) {
+func TestTSOStateMachineApplyHLCLeaseKeepsRenewedWindowAllocatable(t *testing.T) {
 	t.Parallel()
 
-	ceilingMs := time.Now().Add(time.Hour).UnixMilli()
+	firstCeilingMs := time.Now().Add(time.Hour).UnixMilli()
+	secondCeilingMs := firstCeilingMs + 100
 	clock := NewHLC()
 	fsm := NewTSOStateMachine(clock)
 
-	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(ceilingMs)))
-	_, err := clock.NextBatchFenced(1)
-	require.ErrorIs(t, err, ErrCeilingExpired)
-	require.Equal(t, uint64(1), clock.NextFencedRejections())
+	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(firstCeilingMs)))
+	first, err := clock.NextBatchFenced(1)
+	require.NoError(t, err)
+	require.EqualValues(t, firstCeilingMs, first>>hlcLogicalBits)
+
+	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(secondCeilingMs)))
+	require.Equal(t, tsoCeilingMaxTimestamp(firstCeilingMs), clock.Current())
+	second, err := clock.NextBatchFenced(1)
+	require.NoError(t, err)
+	require.EqualValues(t, secondCeilingMs, second>>hlcLogicalBits)
+	require.Equal(t, uint64(0), clock.NextFencedRejections())
+}
+
+func TestTSOStateMachineApplyRejectsOutOfRangeHLCLease(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	clock.Observe(123)
+	clock.SetPhysicalCeiling(456)
+	fsm := NewTSOStateMachine(clock)
+
+	resp := fsm.Apply(marshalRawHLCLeaseRenew(uint64(maxHLCPhysicalMillis) + 1))
+	requireApplyError(t, resp)
+	require.Equal(t, uint64(123), clock.Current())
+	require.Equal(t, int64(456), clock.PhysicalCeiling())
+	require.Zero(t, fsm.committedCeiling())
 }
 
 func TestTSOStateMachineApplyIgnoresNonLeasePayload(t *testing.T) {
@@ -77,6 +102,8 @@ func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	require.Equal(t, ceilingMs, restoredClock.PhysicalCeiling())
 	require.Equal(t, tsoCeilingMaxTimestamp(ceilingMs), restoredClock.Current())
 	require.Equal(t, ceilingMs, restored.committedCeiling())
+	_, err = restoredClock.NextBatchFenced(1)
+	require.ErrorIs(t, err, ErrCeilingExpired)
 }
 
 func TestTSOStateMachineSnapshotUsesCommittedCeiling(t *testing.T) {
@@ -119,6 +146,22 @@ func TestTSOStateMachineSnapshotWithNilHLCWritesZero(t *testing.T) {
 	require.Equal(t, make([]byte, 8), buf.Bytes())
 }
 
+func TestTSOStateMachineRestoreRejectsOutOfRangeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	clock.Observe(123)
+	clock.SetPhysicalCeiling(456)
+	fsm := NewTSOStateMachine(clock)
+
+	var buf [tsoSnapshotLen]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(maxHLCPhysicalMillis)+1)
+	require.Error(t, fsm.Restore(bytes.NewReader(buf[:])))
+	require.Equal(t, uint64(123), clock.Current())
+	require.Equal(t, int64(456), clock.PhysicalCeiling())
+	require.Zero(t, fsm.committedCeiling())
+}
+
 func TestTSOStateMachineRestoreRejectsMalformedSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -126,6 +169,15 @@ func TestTSOStateMachineRestoreRejectsMalformedSnapshot(t *testing.T) {
 
 	require.Error(t, fsm.Restore(bytes.NewReader(nil)))
 	require.Error(t, fsm.Restore(bytes.NewReader(make([]byte, 9))))
+}
+
+func TestTSOStateMachineSnapshotWriteWrapsShortWrite(t *testing.T) {
+	t.Parallel()
+
+	snap := &tsoSnapshot{ceilingMs: 1}
+	n, err := snap.WriteTo(shortTSOWriter{})
+	require.EqualValues(t, tsoSnapshotLen-1, n)
+	require.ErrorIs(t, err, io.ErrShortWrite)
 }
 
 func TestTSOStateMachineClassifiesHLCLeaseAsVolatileOnly(t *testing.T) {
@@ -144,4 +196,17 @@ func requireApplyError(t *testing.T, got any) {
 	err, ok := got.(error)
 	require.True(t, ok)
 	require.Error(t, err)
+}
+
+func marshalRawHLCLeaseRenew(raw uint64) []byte {
+	payload := []byte{raftEncodeHLCLease}
+	var buf [hlcLeasePayloadLen]byte
+	binary.BigEndian.PutUint64(buf[:], raw)
+	return append(payload, buf[:]...)
+}
+
+type shortTSOWriter struct{}
+
+func (shortTSOWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
 }

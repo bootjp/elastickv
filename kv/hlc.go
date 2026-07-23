@@ -26,10 +26,12 @@ import (
 // to issue ts before the first RunHLCLeaseRenewal cycle.  Strict
 // bootstrap fencing is a follow-up consideration; the current
 // semantics match the spec wherever the prior-leader hazard is real.
-var ErrCeilingExpired = errors.New("hlc: physical ceiling expired (wall_now >= physicalCeiling); refusing to issue persistence timestamp")
+var ErrCeilingExpired = errors.New("hlc: physical/logical ceiling exhausted; refusing to issue persistence timestamp")
 var ErrInvalidHLCBatchSize = errors.New("hlc: invalid batch size")
 
 const hlcLogicalBits = 16
+const hlcTimestampBits = 64
+const hlcPhysicalBits = hlcTimestampBits - hlcLogicalBits
 const hlcLogicalMask uint64 = (1 << hlcLogicalBits) - 1
 const maxHLCBatchSize = 1 << hlcLogicalBits
 

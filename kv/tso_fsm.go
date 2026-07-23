@@ -10,6 +10,7 @@ import (
 )
 
 const tsoSnapshotLen = 8
+const maxHLCPhysicalMillis = int64((uint64(1) << hlcPhysicalBits) - 1)
 
 var _ raftengine.StateMachine = (*TSOStateMachine)(nil)
 var _ raftengine.Snapshot = (*tsoSnapshot)(nil)
@@ -39,8 +40,11 @@ func (f *TSOStateMachine) applyHLCLease(data []byte) any {
 	if len(data) != hlcLeasePayloadLen {
 		return errors.Newf("tso fsm: hlc lease: expected %d bytes, got %d", hlcLeasePayloadLen, len(data)) //nolint:wrapcheck // creating new error, nothing to wrap
 	}
-	ceilingMs := int64(binary.BigEndian.Uint64(data)) //nolint:gosec // value is a Unix ms timestamp encoded as uint64; fits in int64 for valid deployments.
-	f.applyTSOCeiling(ceilingMs)
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(data))
+	if err != nil {
+		return err
+	}
+	f.applyTSOCeiling(ceilingMs, false)
 	return nil
 }
 
@@ -61,30 +65,49 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	if n != 0 {
 		return errors.New("tso fsm: restore snapshot: trailing bytes") //nolint:wrapcheck // creating new error, nothing to wrap
 	}
-	ceilingMs := int64(binary.BigEndian.Uint64(buf[:])) //nolint:gosec // value was written from an int64 Unix ms ceiling.
-	f.applyTSOCeiling(ceilingMs)
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(buf[:]))
+	if err != nil {
+		return errors.Wrap(err, "tso fsm: restore snapshot")
+	}
+	f.applyTSOCeiling(ceilingMs, true)
 	return nil
 }
 
-func (f *TSOStateMachine) applyTSOCeiling(ceilingMs int64) {
+func decodeTSOCeiling(raw uint64) (int64, error) {
+	if raw > uint64(maxHLCPhysicalMillis) {
+		return 0, errors.Newf("tso fsm: hlc lease: physical ceiling %d exceeds max %d", raw, maxHLCPhysicalMillis) //nolint:wrapcheck // creating new error, nothing to wrap
+	}
+	return int64(raw), nil //nolint:gosec // raw is bounded by maxHLCPhysicalMillis.
+}
+
+func (f *TSOStateMachine) applyTSOCeiling(ceilingMs int64, restore bool) {
 	if ceilingMs <= 0 {
 		return
 	}
-	f.advanceCommittedCeiling(ceilingMs)
+	prevCeiling, advanced := f.advanceCommittedCeiling(ceilingMs)
+	if !advanced && !restore {
+		return
+	}
 	if f.hlc != nil {
-		f.hlc.Observe(tsoCeilingMaxTimestamp(ceilingMs))
+		floorCeiling := prevCeiling
+		if restore {
+			floorCeiling = ceilingMs
+		}
+		if floorCeiling > 0 {
+			f.hlc.Observe(tsoCeilingMaxTimestamp(floorCeiling))
+		}
 		f.hlc.SetPhysicalCeiling(ceilingMs)
 	}
 }
 
-func (f *TSOStateMachine) advanceCommittedCeiling(ceilingMs int64) {
+func (f *TSOStateMachine) advanceCommittedCeiling(ceilingMs int64) (int64, bool) {
 	for {
 		prev := f.ceilingMs.Load()
 		if ceilingMs <= prev {
-			return
+			return prev, false
 		}
 		if f.ceilingMs.CompareAndSwap(prev, ceilingMs) {
-			return
+			return prev, true
 		}
 	}
 }
@@ -115,7 +138,7 @@ func (s *tsoSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return int64(n), errors.WithStack(err)
 	}
 	if n != tsoSnapshotLen {
-		return int64(n), io.ErrShortWrite
+		return int64(n), errors.WithStack(io.ErrShortWrite)
 	}
 	return tsoSnapshotLen, nil
 }
