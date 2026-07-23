@@ -619,7 +619,7 @@ func parseDiscoverFromFlags(raw []string) ([]string, error) {
 }
 
 func discoverBootstrapWriterBatch(ctx context.Context, addrs []string, timeout time.Duration) ([]*pb.WriterRegistryEntry, error) {
-	batch := make([]*pb.WriterRegistryEntry, 0, len(addrs))
+	discovered := make([]*pb.WriterRegistryEntry, 0, len(addrs))
 	for i, addr := range addrs {
 		report, err := getBootstrapCapability(ctx, addr, timeout)
 		if err != nil {
@@ -629,12 +629,40 @@ func discoverBootstrapWriterBatch(ctx context.Context, addrs []string, timeout t
 		if err != nil {
 			return nil, err
 		}
-		batch = append(batch, entry)
+		discovered = append(discovered, entry)
+	}
+	batch, err := deduplicateDiscoveredBootstrapWriters(discovered)
+	if err != nil {
+		return nil, err
 	}
 	if err := validateBootstrapWriterBatch(batch); err != nil {
 		return nil, err
 	}
 	return batch, nil
+}
+
+func deduplicateDiscoveredBootstrapWriters(batch []*pb.WriterRegistryEntry) ([]*pb.WriterRegistryEntry, error) {
+	out := make([]*pb.WriterRegistryEntry, 0, len(batch))
+	seen := make(map[uint64]struct {
+		index      int
+		localEpoch uint32
+	}, len(batch))
+	for i, entry := range batch {
+		fullNodeID := entry.GetFullNodeId()
+		if prev, ok := seen[fullNodeID]; ok {
+			if prev.localEpoch != entry.GetLocalEpoch() {
+				return nil, errors.Errorf("encryption: discovered writer_batch[%d] full_node_id %d reports local_epoch=%d, conflicting with index %d local_epoch=%d",
+					i, fullNodeID, entry.GetLocalEpoch(), prev.index, prev.localEpoch)
+			}
+			continue
+		}
+		seen[fullNodeID] = struct {
+			index      int
+			localEpoch uint32
+		}{index: i, localEpoch: entry.GetLocalEpoch()}
+		out = append(out, entry)
+	}
+	return out, nil
 }
 
 func getBootstrapCapability(ctx context.Context, addr string, timeout time.Duration) (*pb.CapabilityReport, error) {

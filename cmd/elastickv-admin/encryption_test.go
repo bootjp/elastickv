@@ -346,6 +346,100 @@ func TestRunEncryptionBootstrap_DiscoverFromHappyPath(t *testing.T) {
 	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
 }
 
+func TestRunEncryptionBootstrap_DiscoverFromDeduplicatesFullNodeID(t *testing.T) {
+	t.Parallel()
+	leader := &stubMutatorServer{
+		appliedIndex: 117,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+	duplicate := &stubMutatorServer{
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	duplicateAddr := startCustomEncryptionAdminTestServer(t, duplicate)
+	follower := &stubMutatorServer{
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        22,
+			LocalEpoch:        5,
+		},
+	}
+	followerAddr := startCustomEncryptionAdminTestServer(t, follower)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", leaderAddr,
+		"--timeout", "3s",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--discover-from", leaderAddr,
+		"--discover-from", duplicateAddr,
+		"--discover-from", followerAddr,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionBootstrap: %v", err)
+	}
+	if !strings.Contains(buf.String(), "writers=2") {
+		t.Errorf("output missing writers=2 after deduplication, got:\n%s", buf.String())
+	}
+	if len(leader.bootstrapCalls) != 1 {
+		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
+	}
+	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
+}
+
+func TestRunEncryptionBootstrap_DiscoverFromRejectsConflictingDuplicateEpoch(t *testing.T) {
+	t.Parallel()
+	leader := &stubMutatorServer{
+		appliedIndex: 117,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+	conflict := &stubMutatorServer{
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        1,
+		},
+	}
+	conflictAddr := startCustomEncryptionAdminTestServer(t, conflict)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", leaderAddr,
+		"--timeout", "3s",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--discover-from", leaderAddr,
+		"--discover-from", conflictAddr,
+	}, &buf)
+	if err == nil {
+		t.Fatal("runEncryptionBootstrap returned nil, want conflicting duplicate epoch error")
+	}
+	if !strings.Contains(err.Error(), "conflicting") {
+		t.Errorf("error %q does not mention conflicting duplicate epoch", err)
+	}
+	if len(leader.bootstrapCalls) != 0 {
+		t.Errorf("BootstrapEncryption calls=%d, want 0 after conflicting discovery rejection", len(leader.bootstrapCalls))
+	}
+}
+
 func TestRunEncryptionBootstrap_DiscoverFromUsesPerRPCTimeout(t *testing.T) {
 	t.Parallel()
 

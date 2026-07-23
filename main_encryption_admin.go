@@ -101,6 +101,27 @@ func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[ui
 	return encryptionAdminWriterRegistry(sidecarPath, defaultGroup.Store, defaultGroupID)
 }
 
+type encryptionAdminRuntimeOptions struct {
+	engine              encryptionAdminEngine
+	latestAppliedIndex  func() uint64
+	postCutoverProposer raftengine.Proposer
+}
+
+func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	if defaultRuntime == nil || defaultRuntime.engine == nil {
+		if requireDefault {
+			return encryptionAdminRuntimeOptions{}, errors.Errorf("failed to wire encryption admin default group %d: runtime is unavailable", defaultGroupID)
+		}
+		return encryptionAdminRuntimeOptions{}, nil
+	}
+	return encryptionAdminRuntimeOptions{
+		engine:              defaultRuntime.engine,
+		latestAppliedIndex:  appliedIndexForEngine(defaultRuntime.engine),
+		postCutoverProposer: postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+	}, nil
+}
+
 // registerEncryptionAdminServer constructs and registers an
 // EncryptionAdminServer on the supplied gRPC server. The function
 // is intentionally per-shard: the §7.1 Phase-0 GetCapability
@@ -126,7 +147,11 @@ func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[ui
 // short-circuit at the gRPC boundary with FailedPrecondition —
 // identical to the Stage 5D posture. When enableMutators is
 // true, both options are wired and the mutators reach the §6.3
-// applier through the supplied engine. Callers may append a
+// applier through the supplied engine. In multi-group production
+// wiring the supplied engine is the default-group engine for every
+// per-group listener, because writer-registry rows and the sidecar
+// applied-index contract are default-group control-plane state.
+// Callers may append a
 // wrap-aware post-cutover proposer option so non-cutover admin
 // entries wrap after EnableRaftEnvelope while the cutover marker
 // itself remains on the raw engine path.

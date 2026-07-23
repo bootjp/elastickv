@@ -116,6 +116,53 @@ func TestEncryptionAdminDefaultWriterRegistryUsesDefaultGroupStore(t *testing.T)
 	}
 }
 
+func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.T) {
+	t.Parallel()
+
+	defaultEngine := &stubEngineForProposerTest{}
+	otherEngine := &stubEngineForProposerTest{}
+	defaultGroup := &kv.ShardGroup{Engine: defaultEngine}
+	otherGroup := &kv.ShardGroup{Engine: otherEngine}
+	_ = kv.NewLeaderProxyForShardGroup(defaultGroup)
+	_ = kv.NewLeaderProxyForShardGroup(otherGroup)
+
+	got, err := encryptionAdminDefaultRuntimeOptions(
+		[]*raftGroupRuntime{
+			{spec: groupSpec{id: 1}, engine: defaultEngine},
+			{spec: groupSpec{id: 2}, engine: otherEngine},
+		},
+		map[uint64]*kv.ShardGroup{
+			1: defaultGroup,
+			2: otherGroup,
+		},
+		1,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("encryptionAdminDefaultRuntimeOptions: %v", err)
+	}
+	if got.engine != encryptionAdminEngine(defaultEngine) {
+		t.Fatalf("engine=%T, want default group engine", got.engine)
+	}
+	if got.postCutoverProposer != defaultGroup.Proposer() {
+		t.Error("postCutoverProposer did not use the default group's wrap-aware proposer")
+	}
+	if got.postCutoverProposer == otherGroup.Proposer() {
+		t.Error("postCutoverProposer unexpectedly used the non-default group's proposer")
+	}
+}
+
+func TestEncryptionAdminDefaultRuntimeOptionsRequiresDefaultRuntime(t *testing.T) {
+	t.Parallel()
+
+	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, true); err == nil {
+		t.Fatal("missing required default runtime returned nil error")
+	}
+	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, false); err != nil {
+		t.Fatalf("missing optional default runtime returned error: %v", err)
+	}
+}
+
 func newEncryptionAdminRegistryTestStore(t *testing.T, name string) store.MVCCStore {
 	t.Helper()
 	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), name+".db"))

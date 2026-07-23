@@ -2615,6 +2615,28 @@ func registerS3BlobFetchServer(
 	return []string{"S3BlobFetch"}
 }
 
+func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOption {
+	baseOpts := internalutil.GRPCServerOptions()
+	// extraOptsCap reserves slots for the unary + stream admin
+	// interceptor options appended below. Sized as a constant so the
+	// magic-number linter does not complain.
+	const extraOptsCap = 2
+	opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
+	opts = append(opts, baseOpts...)
+	// Collapse all interceptors into a single ChainUnaryInterceptor /
+	// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
+	// (single-interceptor) option added anywhere in this chain cannot
+	// silently overwrite the admin auth gate — gRPC-Go keeps only the
+	// last option of the same type.
+	if len(adminGRPCOpts.unary) > 0 {
+		opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
+	}
+	if len(adminGRPCOpts.stream) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+	}
+	return opts
+}
+
 func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -2636,32 +2658,18 @@ func startRaftServers(
 	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	// extraOptsCap reserves slots for the unary + stream admin interceptor
-	// options appended below. Sized as a constant so the magic-number
-	// linter does not complain.
-	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
 	writerRegistry, err := encryptionAdminDefaultWriterRegistry(*encryptionSidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
 		return err
 	}
+	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimes, shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	if err != nil {
+		return err
+	}
 	for _, rt := range runtimes {
-		baseOpts := internalutil.GRPCServerOptions()
-		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
-		opts = append(opts, baseOpts...)
-		// Collapse all interceptors into a single ChainUnaryInterceptor /
-		// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
-		// (single-interceptor) option added anywhere in this chain cannot
-		// silently overwrite the admin auth gate — gRPC-Go keeps only the
-		// last option of the same type.
-		if len(adminGRPCOpts.unary) > 0 {
-			opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
-		}
-		if len(adminGRPCOpts.stream) > 0 {
-			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
-		}
-		gs := grpc.NewServer(opts...)
+		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
 		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
@@ -2695,20 +2703,21 @@ func startRaftServers(
 		// (etcd.DeriveNodeID), so every node in the cluster reports
 		// a stable, distinct value. Codex r1 P1 on PR #760.
 		// Stage 6B-2 mutator gate is resolved once above the
-		// per-shard loop. Each shard's own engine remains the raw
-		// Proposer + LeaderView for the cutover marker, while
-		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
-		// path for normal admin entries.
+		// per-shard loop. The admin control-plane itself is scoped to
+		// the default group: writer-registry rows are written there,
+		// ResyncSidecar's freshness gate must verify that group's
+		// leader, and all mutating admin RPCs must commit into the
+		// same FSM whose registry GetSidecarState/ResyncSidecar read.
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
 			*encryptionSidecarPath,
 			enableMutators,
-			rt.engine,
+			defaultAdmin.engine,
 			encryptionCapabilityFanout,
 			writerRegistry,
-			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
-			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
+			adapter.WithEncryptionAdminLatestAppliedIndex(defaultAdmin.latestAppliedIndex),
+			adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
