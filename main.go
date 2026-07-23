@@ -525,10 +525,6 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate); err != nil {
-		return err
-	}
-
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -549,9 +545,10 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distCatalog, err := setupDistributionAndRegistration(
+	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
 		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
+		coordinate, shardGroups[cfg.defaultGroup], cfg.defaultGroup,
+		encWiring, *raftId, *encryptionSidecarPath)
 	if err != nil {
 		cancel()
 		return err
@@ -564,8 +561,15 @@ func run() error {
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
 
+	// The local durable watcher is the 100 ms fallback required when the
+	// best-effort leader stream is unavailable or reconnecting.
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+	})
+	catalogWatchConns := &kv.GRPCConnCache{}
+	cleanup.Add(func() { _ = catalogWatchConns.Close() })
+	eg.Go(func() error {
+		return runDistributionCatalogStream(runCtx, catalogRuntime, catalogWatchConns, cfg.engine)
 	})
 	startKeyVizFlusher(runCtx, eg, sampler)
 	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
@@ -575,6 +579,10 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithCatalogWatchLeaderCheck(func() bool {
+			engine := catalogRuntime.snapshotEngine()
+			return engine != nil && engine.State() == raftengine.StateLeader
+		}),
 		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
@@ -587,7 +595,6 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
 		*encryptionRotateOnStartup,
@@ -2999,6 +3006,77 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
 	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
 		return errors.Wrapf(err, "catalog watcher failed")
+	}
+	return nil
+}
+
+func setupDistributionRuntimeDependencies(
+	runCtx context.Context,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	defaultGroupID uint64,
+	encWiring encryptionWriteWiring,
+	raftID string,
+	sidecarPath string,
+) (*distribution.CatalogStore, *raftGroupRuntime, *raftGroupRuntime, error) {
+	if err := configureCoordinatorTSO(coordinate); err != nil {
+		return nil, nil, nil, err
+	}
+	catalog, err := setupDistributionAndRegistration(
+		runCtx, eg, runtimes, engine, coordinate, defaultGroup, encWiring, raftID, sidecarPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	catalogGroupID, err := distributionCatalogGroupID(engine)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "resolve distribution catalog group runtime")
+	}
+	catalogRuntime := findDefaultGroupRuntime(runtimes, catalogGroupID)
+	if catalogRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"distribution catalog raft group %d runtime is unavailable",
+			catalogGroupID,
+		))
+	}
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	if defaultRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"default raft group %d runtime is unavailable",
+			defaultGroupID,
+		))
+	}
+	return catalog, catalogRuntime, defaultRuntime, nil
+}
+
+func runDistributionCatalogStream(
+	ctx context.Context,
+	runtime *raftGroupRuntime,
+	conns *kv.GRPCConnCache,
+	engine *distribution.Engine,
+) error {
+	watcher := distribution.NewResolvingGRPCCatalogWatcher(
+		func(context.Context) (pb.DistributionClient, error) {
+			raftEngine := runtime.snapshotEngine()
+			if raftEngine == nil {
+				return nil, errors.New("default raft group engine is unavailable")
+			}
+			leader := raftEngine.Leader().Address
+			if leader == "" {
+				return nil, errors.New("default raft group leader is unavailable")
+			}
+			conn, err := conns.ConnFor(leader)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			return pb.NewDistributionClient(conn), nil
+		},
+		engine,
+	)
+	if err := watcher.Run(ctx); err != nil {
+		return errors.Wrap(err, "catalog stream watcher failed")
 	}
 	return nil
 }

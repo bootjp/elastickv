@@ -79,9 +79,10 @@ type RouteLoad struct {
 
 // ColumnWindow is a committed keyviz column plus its proven committed duration.
 //
-// keyviz.MatrixColumn does not yet carry WindowStart. Runtime integration can
-// derive Duration from the previous contiguous MatrixColumn.At boundary and pass
-// only committed windows here.
+// Runtime integration passes only committed windows with a proven duration.
+// keyviz.MatrixColumn.WindowStart is authoritative when present; legacy
+// in-memory rows may be accepted only when the previous contiguous column proves
+// the lower boundary.
 type ColumnWindow struct {
 	Column   keyviz.MatrixColumn
 	Duration time.Duration

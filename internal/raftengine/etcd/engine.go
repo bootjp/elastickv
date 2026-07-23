@@ -409,6 +409,8 @@ type Engine struct {
 	snapshotMu                     sync.Mutex
 	protectedReceivedFSMSnaps      map[uint64]int
 	pendingReceivedFSMSnapshotStep map[uint64]int
+	pendingReceivedFSMReleaseIndex atomic.Uint64
+	pendingReceivedFSMReleaseRun   atomic.Bool
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -3365,9 +3367,46 @@ func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
 	if index == 0 {
 		return
 	}
-	e.snapshotMu.Lock()
+	if !e.snapshotMu.TryLock() {
+		e.scheduleProtectedReceivedFSMSnapshotRelease(index)
+		return
+	}
 	defer e.snapshotMu.Unlock()
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+}
+
+func (e *Engine) scheduleProtectedReceivedFSMSnapshotRelease(index uint64) {
+	for {
+		prev := e.pendingReceivedFSMReleaseIndex.Load()
+		if index <= prev {
+			break
+		}
+		if e.pendingReceivedFSMReleaseIndex.CompareAndSwap(prev, index) {
+			break
+		}
+	}
+	if e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+		go e.drainPendingProtectedReceivedFSMSnapshotRelease()
+	}
+}
+
+func (e *Engine) drainPendingProtectedReceivedFSMSnapshotRelease() {
+	for {
+		index := e.pendingReceivedFSMReleaseIndex.Swap(0)
+		if index != 0 {
+			e.snapshotMu.Lock()
+			e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+			e.snapshotMu.Unlock()
+		}
+
+		e.pendingReceivedFSMReleaseRun.Store(false)
+		if e.pendingReceivedFSMReleaseIndex.Load() == 0 {
+			return
+		}
+		if !e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+			return
+		}
+	}
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) {

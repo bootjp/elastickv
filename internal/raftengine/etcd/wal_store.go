@@ -917,7 +917,9 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 const defaultMaxSnapFiles = 3
 
 func buildLocalSnapshot(storage *etcdraft.MemoryStorage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
+	storage.Lock()
 	_, confState, err := storage.InitialState()
+	storage.Unlock()
 	if err != nil {
 		return raftpb.Snapshot{}, errors.WithStack(err)
 	}

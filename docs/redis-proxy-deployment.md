@@ -35,7 +35,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
-| `-elastickv-pool-size` | `64` | ElasticKV backend connection pool size. Keep this at or below `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` on the ElasticKV servers |
+| `-elastickv-pool-size` | `64` | ElasticKV backend command pool size; keep the server-side `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` above this to leave room for dedicated PubSub connections |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
 | `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives half of the shared write limit, minimum `1` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
@@ -414,7 +414,7 @@ groups:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Redis connection pool size | 128 | Default go-redis pool size for Redis |
-| ElasticKV connection pool size | 64 | Default per-leader pool; keep within the server per-peer connection limit |
+| ElasticKV connection pool size | 64 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | 3s | Backend read timeout |
 | Write timeout | 3s | Backend write timeout |
@@ -439,7 +439,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ### Secondary writes are falling behind
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
-- Increase the ElasticKV pool only together with `ELASTICKV_REDIS_PER_PEER_CONNECTIONS`; keep `-secondary-write-concurrency` at or below the pool size.
+- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` above `-elastickv-pool-size`; PubSub and shadow PubSub use dedicated connections outside the command pool. Keep `-secondary-write-concurrency` at or below the pool size.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 
 ### High divergence count
