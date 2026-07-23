@@ -86,7 +86,7 @@ references anywhere in `kv/`, `distribution/`, or
 
 HLC is `kv/hlc.go` + `kv/coordinator.go` +
 `kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
-`ProposeHLCLease`, `hlcPhysicalWindowMs = 30 s`, renewed every
+`ProposeHLCLease`, `hlcPhysicalWindowMs = 20 s`, renewed every
 `hlcRenewalInterval = 2 s` by each led shard group
 (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
 with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
@@ -102,7 +102,7 @@ Multi-region blockers:
 - HLC ceiling renewal is **per Raft group** — each shard group leader
   proposes every 2 s, so cross-region leadership for that group makes
   its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
-  RTT is now less likely to expire the 30 s window immediately, but
+  RTT is now less likely to expire the 20 s window immediately, but
   every renewal still depends on that group's cross-WAN quorum progress.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
@@ -318,7 +318,7 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
   service.** Operationally heavy (needs reliable atomic-clock
   reference per DC); rejected as v1.
 - **Option C — Stretched single ceiling with relaxed window.**
-  `hlcPhysicalWindowMs = 30 s` is now the local-resilience baseline.
+  `hlcPhysicalWindowMs = 20 s` is now the local-resilience baseline.
   It reduces accidental ceiling expiry under load, but renewal still
   depends on the default group's quorum and is not a complete
   cross-region design by itself.

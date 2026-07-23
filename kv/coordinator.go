@@ -40,7 +40,7 @@ const dispatchLeaderRetryInterval = 25 * time.Millisecond
 // ceiling = now + window, and renews before the window expires. A new leader
 // inherits the committed ceiling so it never issues timestamps that collide
 // with the previous leader's window.
-const hlcPhysicalWindowMs int64 = 30_000
+const hlcPhysicalWindowMs int64 = 20_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
 // Keep the renewal interval and proposal timeout below the physical window;

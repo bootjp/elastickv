@@ -56,6 +56,20 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3},
 		},
 		{
+			name: "score tie falls back to member ordering",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "aa", Score: 1},
+					{Member: "a", Score: 1},
+				})
+			},
+			wantMember: "a",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, 3, 1, maxWideScanLimit},
+		},
+		{
 			name: "single score entry",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{

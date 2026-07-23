@@ -199,8 +199,8 @@ cannot check them as state invariants.
     independently reach `ceiling + 1` before a fresh ceiling is
     renewed, the new leader's first `Next()` can tie or undercut the
     old leader's last commit. Bounding inter-node skew to less than
-    one ceiling window (< 30s with the current `hlcPhysicalWindowMs =
-    30000ms`) keeps the window wide enough that the new leader cannot
+    one ceiling window (< 20s with the current `hlcPhysicalWindowMs =
+    20000ms`) keeps the window wide enough that the new leader cannot
     independently reach the overflow value before a renewal applies.
     Should be surfaced in operator docs as a cluster prerequisite.
   - **(ii) Logical-counter handoff.** The 16-bit logical half of the HLC
@@ -270,7 +270,7 @@ cannot check them as state invariants.
     `hlcPhysicalWindowMs` cannot serve any persistence timestamp —
     every client commit is rejected until renewal succeeds. This is
     a CP, not AP, trade-off and operators must size
-    `hlcPhysicalWindowMs` (currently 30s) relative to expected
+    `hlcPhysicalWindowMs` (currently 20s) relative to expected
     partition duration; see §9 risk 7.
 
 ### 5.2 OCC
@@ -676,7 +676,7 @@ does not keep this document in `partial`.
 7. **Fail-closed availability under partition.** HLC-4 precondition
    (iii) makes the ceiling-fence behaviour normative: a leader
    partitioned from the default group's quorum for longer than
-   `hlcPhysicalWindowMs` (currently 30s) cannot serve any persistence
+   `hlcPhysicalWindowMs` (currently 20s) cannot serve any persistence
    timestamp, so client commits are rejected until renewal succeeds.
    This is a CP, not AP, trade-off and is a stricter regime than the
    current implementation (which silently keeps issuing). Mitigation:

@@ -1204,19 +1204,47 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
+	candidate, hasTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
+	if hasTie {
+		return nil, false, nil
+	}
+	if candidate != nil {
+		scoreIndexComplete := metaExists && metaLen > 0 && int64(len(scoreKVs)) == metaLen
+		candidate.isLast = scoreIndexComplete && metaLen == 1
+		return candidate, scoreIndexComplete, nil
+	}
+	return nil, metaExists && metaLen == 0, nil
+}
+
+func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpopminCandidate, bool) {
+	var firstScore float64
+	var candidate *bzpopminCandidate
 	for _, kv := range scoreKVs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
 		if !ok {
 			continue
 		}
-		scoreIndexComplete := metaExists && metaLen > 0 && int64(len(scoreKVs)) == metaLen
-		return &bzpopminCandidate{
-			entry:  redisZSetEntry{Member: string(member), Score: score},
-			isWide: true,
-			isLast: scoreIndexComplete && metaLen == 1,
-		}, scoreIndexComplete, nil
+		if candidate == nil {
+			firstScore = score
+			candidate = &bzpopminCandidate{
+				entry:  redisZSetEntry{Member: string(member), Score: score},
+				isWide: true,
+			}
+			continue
+		}
+		if zsetScoresEqual(firstScore, score) {
+			return nil, true
+		}
+		break
 	}
-	return nil, metaExists && metaLen == 0, nil
+	return candidate, false
+}
+
+func zsetScoresEqual(left, right float64) bool {
+	if left == 0 && right == 0 {
+		return true
+	}
+	return math.Float64bits(left) == math.Float64bits(right)
 }
 
 func bzpopminScoreIndexScanLimit(metaLen int64, metaExists bool) int {

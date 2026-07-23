@@ -424,6 +424,7 @@ func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
 	t.Parallel()
 	window := time.Duration(hlcPhysicalWindowMs) * time.Millisecond
 	require.Less(t, hlcRenewalInterval+hlcRenewalProposalTimeout, window)
+	require.Less(t, uint64(hlcPhysicalWindowMs), defaultTxnLockTTLms)
 }
 
 func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
