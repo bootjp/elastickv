@@ -320,7 +320,7 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
 - **Option C — Stretched single ceiling with relaxed window.**
   `hlcPhysicalWindowMs = 20 s` is now the local-resilience baseline.
   It reduces accidental ceiling expiry under load, but renewal still
-  depends on the default group's quorum and is not a complete
+  depends on each route's shard group quorum and is not a complete
   cross-region design by itself.
 
 V1 = option A. Carries the existing M2 hotspot-split monotone-merge
