@@ -523,6 +523,7 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		Elems:    ops,
 		IsTxn:    true,
 		StartTS:  readTS,
+		CommitTS: commitTS,
 		ReadKeys: readKeys,
 	})
 	if err != nil {
