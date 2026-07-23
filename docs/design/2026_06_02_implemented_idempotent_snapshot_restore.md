@@ -643,7 +643,7 @@ entries individually.
 Round-3 of this doc claimed the resulting full-restore fallback was
 "safe and rare."  Codex correctly pointed out it is neither:
 `RunHLCLeaseRenewal` (`kv/coordinator.go:650`) proposes a lease every
-`hlcRenewalInterval = 1 * time.Second` while the local node is leader,
+`hlcRenewalInterval = 2 * time.Second` while the local node is leader,
 so even an active cluster will routinely accumulate a tail of lease
 entries between any two data writes.  When the next snapshot is
 persisted at index `X`, the gap between the last data-Apply index `Y`
@@ -945,9 +945,9 @@ Each of B2–B3 ships behind tests:
   An idle-cluster integration test runs a 3-node cluster with
   `ELASTICKV_RAFT_SNAPSHOT_COUNT=10` (overriding the default
   `defaultSnapshotEvery = 10000` at `engine.go:93` so the scenario is
-  tractable — at default + `hlcRenewalInterval = 1 s` an idle period
-  would need ≥ 20 000 s).  With the override, the test issues no data
-  writes for `2 × 10 × hlcRenewalInterval = 20 s`, takes a snapshot,
+  tractable — at default + `hlcRenewalInterval = 2 s` an idle period
+  would need ≥ 40 000 s).  With the override, the test issues no data
+  writes for `2 × 10 × hlcRenewalInterval = 40 s`, takes a snapshot,
   restarts a node, and asserts the skip fires — proving the codex
   round-3 P2 scenario is closed end-to-end through the
   `e.persistLocalSnapshotPayload` hook added in round-5.
@@ -1043,7 +1043,7 @@ Codex's round-3 review (P2 at `:438`) pointed out the actual
 production cadence:
 
 - `RunHLCLeaseRenewal` (`kv/coordinator.go:650`) ticks at
-  `hlcRenewalInterval = 1 * time.Second` while the local node is
+  `hlcRenewalInterval = 2 * time.Second` while the local node is
   leader.
 - `applyHLCLease` is memory-only; `metaAppliedIndex` does not advance
   on lease apply.

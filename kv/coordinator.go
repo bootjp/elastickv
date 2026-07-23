@@ -36,15 +36,21 @@ const dispatchLeaderRetryBudget = 5 * time.Second
 const dispatchLeaderRetryInterval = 25 * time.Millisecond
 
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
-// physical ceiling extends ahead of the current wall clock. Modelled after
-// TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
-// renews before the window expires. A new leader inherits the committed ceiling
-// so it never issues timestamps that collide with the previous leader's window.
-const hlcPhysicalWindowMs int64 = 3_000
+// physical ceiling extends ahead of the current wall clock. The leader commits
+// ceiling = now + window, and renews before the window expires. A new leader
+// inherits the committed ceiling so it never issues timestamps that collide
+// with the previous leader's window.
+const hlcPhysicalWindowMs int64 = 20_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
-// Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
-const hlcRenewalInterval = 1 * time.Second
+// Keep the renewal interval and proposal timeout below the physical window;
+// this provides timing margin but cannot prevent expiry after repeated failures.
+const hlcRenewalInterval = 2 * time.Second
+
+// hlcRenewalProposalTimeout bounds one renewal proposal independently from the
+// cadence. Under heavy Redis workloads, a safe quorum-acked renewal may need
+// more than one tick; timing it out at the cadence can let the ceiling expire.
+const hlcRenewalProposalTimeout = 5 * time.Second
 
 // CoordinatorOption is a functional option for Coordinate constructors.
 type CoordinatorOption func(*Coordinate)
@@ -855,17 +861,20 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new
 // physical ceiling to the Raft cluster while this node is the leader.
 //
-// The ceiling is set to now + hlcPhysicalWindowMs (3 s) and is renewed every
-// hlcRenewalInterval (1 s), mirroring TiDB's TSO window strategy. Because the
-// window is always at least 2 s ahead of any real timestamp, a new leader will
-// never issue timestamps that overlap with the previous leader's window.
+// The ceiling is set to now + hlcPhysicalWindowMs and is renewed every
+// hlcRenewalInterval. While renewals keep succeeding, the committed ceiling and
+// NextFenced fail-closed check prevent timestamp issuance after the safe window
+// has expired.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
-	// Use a Timer rather than a Ticker so the next renewal is scheduled
-	// relative to the completion of the previous one. This prevents a burst
-	// of back-to-back proposals if ProposeHLCLease stalls (e.g. waiting for
-	// Raft quorum during a slow leader election).
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Schedule relative to proposal launch, not completion. A renewal proposal
+	// may legitimately take longer than hlcRenewalInterval under load; letting
+	// the next tick launch a fresher ceiling keeps logical counter headroom
+	// available while the older proposal is still bounded by its own timeout.
 	timer := time.NewTimer(hlcRenewalInterval)
 	defer timer.Stop()
 	for {
@@ -876,19 +885,27 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 				continue
 			}
 			if c.IsLeaderAcceptingWrites() {
-				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				if err := c.ProposeHLCLease(ctx, ceilingMs); err != nil {
-					c.log.WarnContext(ctx, "hlc lease renewal failed",
-						slog.Int64("ceiling_ms", ceilingMs),
-						slog.Any("err", err),
-					)
-				}
+				c.renewHLCLeaseAsync(ctx)
 			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (c *Coordinate) renewHLCLeaseAsync(ctx context.Context) {
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	go func() {
+		pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
+		defer cancel()
+		if err := c.ProposeHLCLease(pctx, ceilingMs); err != nil {
+			c.log.WarnContext(ctx, "hlc lease renewal failed",
+				slog.Int64("ceiling_ms", ceilingMs),
+				slog.Any("err", err),
+			)
+		}
+	}()
 }
 
 func (c *Coordinate) IsLeaderForKey(_ []byte) bool {

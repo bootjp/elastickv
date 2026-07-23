@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/redislimits"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
 	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 64
+	defaultElasticKVPoolSize = redislimits.DefaultElasticKVRedisConnections
 	defaultDialTimeout       = 5 * time.Second
 	defaultReadTimeout       = 3 * time.Second
 	defaultWriteTimeout      = 3 * time.Second
