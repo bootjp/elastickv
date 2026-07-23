@@ -225,6 +225,69 @@ func TestEncryptionAdmin_GetSidecarState_UsesRegistryLeaderView(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_RegistryProjectionUsesAppliedLinearizableRead(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	cases := []struct {
+		name string
+		call func(*EncryptionAdminServer) error
+	}{
+		{
+			name: "GetSidecarState",
+			call: func(s *EncryptionAdminServer) error {
+				_, err := s.GetSidecarState(context.Background(), &pb.Empty{})
+				return err
+			},
+		},
+		{
+			name: "ResyncSidecar",
+			call: func(s *EncryptionAdminServer) error {
+				_, err := s.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: callerFullNodeID})
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := writeSidecarFixture(t, &encryption.Sidecar{
+				Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
+				Keys: map[string]encryption.SidecarKey{
+					"10": {Purpose: "storage", Wrapped: []byte("storage")},
+					"11": {Purpose: "raft", Wrapped: []byte("raft")},
+				},
+			})
+			reg := newTestWriterRegistryStore()
+			reg.seed(t, 10, callerFullNodeID, 3)
+			var verifyCalls atomic.Int32
+			var linearizableReadCalls atomic.Int32
+
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminSidecarPath(path),
+				WithEncryptionAdminFullNodeID(callerFullNodeID),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminRegistryLeaderView(stubLeaderView{
+					state:                 raftengine.StateLeader,
+					verifyErr:             errors.New("VerifyLeader must not gate registry projections"),
+					verifyCalls:           &verifyCalls,
+					linearizableReadCalls: &linearizableReadCalls,
+					linearizableReadIndex: 99,
+				}),
+				WithEncryptionAdminWriterRegistry(reg),
+			)
+			if err := tc.call(srv); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got := verifyCalls.Load(); got != 0 {
+				t.Fatalf("VerifyLeader calls=%d, want 0 for registry projection", got)
+			}
+			if got := linearizableReadCalls.Load(); got != 1 {
+				t.Fatalf("LinearizableRead calls=%d, want 1 for registry projection", got)
+			}
+		})
+	}
+}
+
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {
 	t.Helper()
 	if got.ActiveStorageId != 1 || got.ActiveRaftId != 2 {
@@ -1074,9 +1137,9 @@ func TestEncryptionAdmin_RotateDEK_RejectsStaleLeader(t *testing.T) {
 
 // TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader is the
 // read-only path twin of the above. ResyncSidecar has no
-// Propose() to catch leadership loss, so VerifyLeader is the
-// only defence between a follower's recovery flow and a stale
-// leader's outdated sidecar contents.
+// Propose() to catch leadership loss, so LinearizableRead is the
+// applied ReadIndex fence between a follower's recovery flow and a
+// stale leader's outdated sidecar contents.
 func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 	t.Parallel()
 	path := writeSidecarFixture(t, &encryption.Sidecar{
@@ -1089,13 +1152,16 @@ func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 	srv := NewEncryptionAdminServer(
 		WithEncryptionAdminSidecarPath(path),
 		WithEncryptionAdminLeaderView(stubLeaderView{
-			state:     raftengine.StateLeader,
-			verifyErr: errors.New("synthetic quorum loss"),
+			state:               raftengine.StateLeader,
+			linearizableReadErr: errors.New("synthetic quorum loss"),
 		}),
 	)
 	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("ResyncSidecar status=%v, want FailedPrecondition on stale-leader", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "LinearizableRead") {
+		t.Errorf("error %q does not surface the LinearizableRead failure path", err)
 	}
 }
 
@@ -1314,18 +1380,28 @@ func (p *recordingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raf
 // the local node cannot confirm leadership via a quorum
 // ReadIndex round-trip.
 type stubLeaderView struct {
-	state     raftengine.State
-	leader    raftengine.LeaderInfo
-	verifyErr error
+	state                 raftengine.State
+	leader                raftengine.LeaderInfo
+	verifyErr             error
+	verifyCalls           *atomic.Int32
+	linearizableReadErr   error
+	linearizableReadIndex uint64
+	linearizableReadCalls *atomic.Int32
 }
 
 func (s stubLeaderView) State() raftengine.State       { return s.state }
 func (s stubLeaderView) Leader() raftengine.LeaderInfo { return s.leader }
 func (s stubLeaderView) VerifyLeader(context.Context) error {
+	if s.verifyCalls != nil {
+		s.verifyCalls.Add(1)
+	}
 	return s.verifyErr
 }
 func (s stubLeaderView) LinearizableRead(context.Context) (uint64, error) {
-	return 0, nil
+	if s.linearizableReadCalls != nil {
+		s.linearizableReadCalls.Add(1)
+	}
+	return s.linearizableReadIndex, s.linearizableReadErr
 }
 
 // writeSidecarFixture builds a valid keys.json fixture in a tmpdir and

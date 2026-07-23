@@ -450,12 +450,11 @@ func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty
 // sidecar that fell behind a Raft-log compaction window. The RPC is
 // read-only on the server side; no Raft proposal is involved.
 //
-// Leader-only via requireLeader, which calls VerifyLeader(ctx) to
-// confirm leadership through a Raft ReadIndex round-trip. Without
-// the quorum check a partitioned former leader (State() still
-// reports StateLeader pre-step-down) could ship stale wrapped-DEK
-// state to a recovering follower and silently overwrite recent
-// rotations.
+// Leader-only via requireRegistryLeader, which calls LinearizableRead(ctx)
+// to confirm leadership and wait until the returned ReadIndex has applied
+// locally before registry projections are read. Without that applied fence,
+// a leader could serve stale writer-registry rows immediately after a
+// committed registration or rotation.
 func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
 	if err := s.requireRegistryLeader(ctx); err != nil {
 		return nil, err
@@ -1931,35 +1930,53 @@ func proposeErrorToStatus(err error, opcode byte) error {
 //  2. Quorum confirmation: VerifyLeader(ctx) does a ReadIndex
 //     round-trip so a *partitioned former leader* whose
 //     State() still reports StateLeader (the local view has
-//     not stepped down yet) cannot serve mutating RPCs or
-//     ResyncSidecar against stale local state. Without this,
-//     a follower's recovery flow could pull an outdated DEK
-//     set from a stranded leader and miss recent rotations.
+//     not stepped down yet) cannot serve mutating RPCs against
+//     stale local state.
 func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 	return requireLeaderView(ctx, s.leaderView)
 }
 
 func (s *EncryptionAdminServer) requireRegistryLeader(ctx context.Context) error {
-	return requireLeaderView(ctx, s.registryLeaderView)
+	return requireAppliedLeaderView(ctx, s.registryLeaderView)
 }
 
 func requireLeaderView(ctx context.Context, leaderView raftengine.LeaderView) error {
 	if leaderView == nil {
 		return nil
 	}
-	if leaderView.State() != raftengine.StateLeader {
-		leader := leaderView.Leader()
-		if leader.ID == "" && leader.Address == "" {
-			return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
-		}
-		return grpcStatusErrorf(codes.FailedPrecondition,
-			"encryption: not leader (current leader id=%q address=%q)",
-			leader.ID, leader.Address)
+	if err := requireLeaderState(leaderView); err != nil {
+		return err
 	}
 	if err := leaderView.VerifyLeader(ctx); err != nil {
 		return verifyLeaderErrorToStatus(err)
 	}
 	return nil
+}
+
+func requireAppliedLeaderView(ctx context.Context, leaderView raftengine.LeaderView) error {
+	if leaderView == nil {
+		return nil
+	}
+	if err := requireLeaderState(leaderView); err != nil {
+		return err
+	}
+	if _, err := leaderView.LinearizableRead(ctx); err != nil {
+		return linearizableReadErrorToStatus(err)
+	}
+	return nil
+}
+
+func requireLeaderState(leaderView raftengine.LeaderView) error {
+	if leaderView.State() == raftengine.StateLeader {
+		return nil
+	}
+	leader := leaderView.Leader()
+	if leader.ID == "" && leader.Address == "" {
+		return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
+	}
+	return grpcStatusErrorf(codes.FailedPrecondition,
+		"encryption: not leader (current leader id=%q address=%q)",
+		leader.ID, leader.Address)
 }
 
 // verifyLeaderErrorToStatus maps LeaderView.VerifyLeader errors to
@@ -1979,6 +1996,20 @@ func verifyLeaderErrorToStatus(err error) error {
 	default:
 		return grpcStatusErrorf(codes.FailedPrecondition,
 			"encryption: VerifyLeader failed, refusing to act on stale-leader state: %v", err)
+	}
+}
+
+func linearizableReadErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: LinearizableRead canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: LinearizableRead deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: LinearizableRead failed, refusing to read stale registry state: %v", err)
 	}
 }
 
