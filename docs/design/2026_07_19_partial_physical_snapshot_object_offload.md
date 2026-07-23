@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0 implemented; M1 object-store-neutral substrate partial
+Status: Partial — M0/M1 implemented; M2/M3 pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -35,15 +35,20 @@ The M1 object-store-neutral substrate now adds:
 
 - a `snapshotoffload.ObjectStore` interface with a local filesystem
   implementation for deterministic tests and offline drills;
+- an S3-compatible implementation backed by AWS SDK v2, including optional
+  path-style endpoints, SDK credential-chain loading, server-side encryption
+  headers, immutable `If-None-Match: *` writes, SHA-256 metadata, and optional
+  checksum headers;
 - the v1 JSON manifest schema and content-addressed payload key layout;
 - payload-first publish from `OpenPersistedSnapshotExport`, including exact
   byte count and SHA-256 verification before manifest commit;
 - manifest-driven restore that downloads the opaque payload, checks exact
   length and SHA-256, then calls `PreparePhysicalSnapshotRestore` with
   operator-supplied target membership.
+- `cmd/elastickv-snapshot-offload publish` and `restore` for local and
+  S3-backed operator workflows.
 
-The S3-compatible client, operator CLI, runtime scheduler, and retention/GC
-remain pending.
+The runtime scheduler and retention/GC remain pending.
 
 ## 2. Safety boundary
 
@@ -158,7 +163,7 @@ permissions below the configured prefix.
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
-| M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Partial: object-store interface, local implementation, manifest schema, payload-first publish, and verified restore are implemented; S3 client and CLI pending |
+| M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
 | M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
 

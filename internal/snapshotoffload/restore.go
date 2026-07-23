@@ -75,7 +75,11 @@ func RestorePhysicalSnapshot(ctx context.Context, opts RestoreOptions) (*etcdraf
 	if err := downloadVerifiedPayload(ctx, opts.Store, manifest, payloadPath); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	result, err := etcdraftengine.PreparePhysicalSnapshotRestore(etcdraftengine.PhysicalSnapshotRestoreOptions{
+		Context:               ctx,
 		InputFSMPath:          payloadPath,
 		DataDir:               opts.DataDir,
 		Index:                 manifest.SnapshotIndex,

@@ -208,8 +208,12 @@ func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected O
 		}
 		return s.verifyExistingObject(key, finalPath, expected)
 	}
-	if err := syncDir(filepath.Dir(finalPath)); err != nil {
-		return ObjectInfo{}, err
+	finalDir := filepath.Dir(finalPath)
+	if err := syncDir(finalDir); err != nil {
+		if removeErr := os.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.CombineErrors(err, errors.WithStack(removeErr))
+		}
+		return ObjectInfo{}, errors.WithStack(err)
 	}
 	return expected, nil
 }
