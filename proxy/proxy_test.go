@@ -784,6 +784,36 @@ func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing
 		metrics.CommandTotal.WithLabelValues("ZREM", "secondary", "miss")), 0.001)
 }
 
+func TestDualWriter_Blocking_DoesNotReplayNoEffectBZPop(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:      "primary",
+		returnErr: redis.Nil,
+	}
+	secondary := newMockBackend("secondary")
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   time.Second,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("1")})
+	assert.ErrorIs(t, err, redis.Nil)
+	assert.Nil(t, resp)
+	d.Close()
+
+	assert.Equal(t, 0, secondary.CallCount())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncQueueDepth.WithLabelValues(asyncQueueBlocking)), 0.001)
+}
+
 func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
 	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
 	assert.Positive(t, limit)
@@ -799,7 +829,7 @@ func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
 	assert.Greater(t, spent+retryBackoffWithMaxJitter(backoff), blockingReplayNoEffectRetryWindow)
 }
 
-func TestDualWriter_BlockingReplayDoesNotConsumeWriteWorkers(t *testing.T) {
+func TestDualWriter_BlockingTranslatedReplayUsesWriteQueue(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -813,7 +843,7 @@ func TestDualWriter_BlockingReplayDoesNotConsumeWriteWorkers(t *testing.T) {
 		secondary,
 		ProxyConfig{
 			Mode:                                 ModeDualWrite,
-			SecondaryTimeout:                     time.Second,
+			SecondaryTimeout:                     5 * time.Second,
 			SecondaryWriteConcurrency:            1,
 			SecondaryBlockingReplayConcurrency:   1,
 			SecondaryWriteQueueCapacity:          1,
@@ -832,14 +862,21 @@ func TestDualWriter_BlockingReplayDoesNotConsumeWriteWorkers(t *testing.T) {
 	})
 	<-started
 
-	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	resp, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
 	assert.NoError(t, err)
-	assert.Eventually(t, func() bool { return secondary.CallCount() == 1 },
+	assert.Equal(t, []any{"queue", "job-1", "12.5"}, resp)
+	assert.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.AsyncQueueDepth.WithLabelValues(asyncQueueWrite)) == 1
+	},
 		time.Second, 10*time.Millisecond)
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncWorkersActive.WithLabelValues(asyncQueueWrite)), 0.001)
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncWorkersActive.WithLabelValues(asyncQueueBlocking)), 0.001)
+	assert.Equal(t, 0, secondary.CallCount())
 
 	close(blocker)
 	d.Close()
+
+	assert.Equal(t, 1, secondary.CallCount())
 }
 
 func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {

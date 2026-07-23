@@ -29,10 +29,10 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
-	// maxBlockingReplayGoroutines isolates mutating blocking command replays
-	// from normal secondary writes. Blocking replays may wait for the secondary
-	// to observe a producer write, and they hit the secondary's heavy-command
-	// limiter, so keep the default well below the normal write limit.
+	// maxBlockingReplayGoroutines isolates fallback mutating blocking-command
+	// replays from normal secondary writes. BZPOP success replays are translated
+	// to ordinary ZREM writes before they reach the secondary, so they use the
+	// normal write queue instead.
 	maxBlockingReplayGoroutines = 32
 	// Async queues absorb short bursts without allowing an unavailable or slow
 	// secondary to build an unbounded replay backlog.
@@ -363,14 +363,14 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 
 	if d.hasSecondaryWrite() {
 		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
-			d.goBlockingReplay(func(ctx context.Context) {
+			d.goTranslatedBlockingReplay(func(ctx context.Context) {
 				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
 					initialDelay:        blockingReplayInitialDelay,
 					noEffectRetryWindow: blockingReplayNoEffectRetryWindow,
 					deadlineAsMiss:      true,
 				})
 			})
-		} else if shouldReplayBlockingToSecondary(cmd) {
+		} else if shouldReplayBlockingToSecondary(cmd, resp) {
 			d.goBlockingReplay(func(ctx context.Context) {
 				sCtx, cancel := context.WithTimeout(ctx, time.Second)
 				defer cancel()
@@ -833,6 +833,13 @@ func (d *DualWriter) goBlockingReplay(fn func(context.Context)) {
 		return
 	}
 	d.enqueueAsync(d.blockingReplayQueue, d.blockingReplayQueueSlots, asyncQueueBlocking, fn)
+}
+
+func (d *DualWriter) goTranslatedBlockingReplay(fn func(context.Context)) {
+	if cap(d.blockingReplaySem) == 0 {
+		return
+	}
+	d.goWrite(fn)
 }
 
 // goShadow launches fn in a bounded shadow-read goroutine.

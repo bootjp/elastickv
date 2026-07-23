@@ -38,7 +38,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-elastickv-pool-size` | `192` | ElasticKV backend connection pool size |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
 | `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives one thirty-second of the shared write limit, capped at `3`, minimum `1` |
-| `-secondary-blocking-replay-concurrency` | `0` | Mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `32` |
+| `-secondary-blocking-replay-concurrency` | `0` | Fallback mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `32` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-script-queue-size` | `0` | Bounded queue for secondary Lua-script writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-secondary-blocking-replay-queue-size` | `0` | Bounded queue for mutating blocking-command replays. `0` derives `64 * concurrency`, clamped to `64..8192` |
@@ -445,6 +445,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
 - Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
+- Successful `BZPOPMIN` / `BZPOPMAX` calls are replayed as `ZREM` on the normal write queue. Timeout/null blocking responses are not replayed because the primary made no mutation.
 - If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low; use `-secondary-script-timeout` for burst backlog and profile ElasticKV before raising concurrency.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
 

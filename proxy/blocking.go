@@ -53,7 +53,10 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 	return time.Duration(millis) * time.Millisecond
 }
 
-func shouldReplayBlockingToSecondary(cmd string) bool {
+func shouldReplayBlockingToSecondary(cmd string, resp any) bool {
+	if !blockingResponseHasEffect(resp) {
+		return false
+	}
 	return !strings.EqualFold(cmd, "XREAD")
 }
 
@@ -76,4 +79,12 @@ func zsetPopKeyMember(resp any) (any, any, bool) {
 		return nil, nil, false
 	}
 	return arr[0], arr[1], true
+}
+
+func blockingResponseHasEffect(resp any) bool {
+	if resp == nil {
+		return false
+	}
+	arr, ok := resp.([]any)
+	return !ok || len(arr) > 0
 }
