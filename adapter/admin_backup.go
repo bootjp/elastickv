@@ -320,7 +320,7 @@ func (s *AdminServer) captureBackupRoutesAfterPin(
 		s.compensateBackupRelease(controlGroup, groups, pinID)
 		return kv.BackupRouteSnapshot{}, status.Errorf(codes.FailedPrecondition, "capture backup routes at read timestamp: %v", err)
 	}
-	return routes, nil
+	return kv.BackupRouteSnapshotWithScanGroups(routes, backupGroupIDs(groups)), nil
 }
 
 func (s *AdminServer) pinBackupGroups(
@@ -368,7 +368,7 @@ func (s *AdminServer) buildExpectedBackupBaseline(
 	if validateErr != nil {
 		scanErr = errors.Wrap(validateErr, "validate backup transaction locks")
 	} else {
-		counts, appliedAtCount, scanErr = s.scanBackupScopeCounts(ctx, prepared.routes, prepared.readTS, prepared.groups)
+		counts, appliedAtCount, scanErr = s.scanBackupScopeCounts(ctx, prepared.routes, prepared.readTS, prepared.groups, nil)
 	}
 	close(stopRenew)
 	renewErr := <-renewDone
@@ -512,7 +512,9 @@ func (s *AdminServer) ListAdaptersAndScopes(
 	if err != nil {
 		return nil, err
 	}
-	counts, _, err := s.scanBackupScopeCounts(ctx, routes, tok.readTS, groups)
+	counts, _, err := s.scanBackupScopeCounts(ctx, routes, tok.readTS, groups, func() error {
+		return s.requireLiveBackupSession(tok)
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "list backup scopes: %v", err)
 	}
@@ -1047,6 +1049,7 @@ func (s *AdminServer) scanBackupScopeCounts(
 	routes kv.BackupRouteSnapshot,
 	readTS uint64,
 	groups []backupGroup,
+	requireLive func() error,
 ) (counts map[logicalbackup.Scope]uint64, applied uint64, retErr error) {
 	scanner := s.backupStore.NewBackupKeyScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
 	if scanner == nil {
@@ -1055,28 +1058,57 @@ func (s *AdminServer) scanBackupScopeCounts(
 	defer func() {
 		retErr = finishBackupScan(ctx, scanner, retErr)
 	}()
-	counts = make(map[logicalbackup.Scope]uint64)
-	for {
-		key, ok, err := scanner.Next(ctx)
-		if err != nil {
-			return nil, 0, errors.Wrap(err, "scan backup key baseline")
-		}
-		if !ok {
-			break
-		}
-		scope, scoped, err := logicalbackup.ScopeForKey(key)
-		if err != nil {
-			return nil, 0, errors.Wrap(err, "classify backup key baseline")
-		}
-		if scoped {
-			counts[scope]++
-		}
+	counts, err := collectBackupScopeCounts(ctx, scanner, requireLive)
+	if err != nil {
+		return nil, 0, err
 	}
-	applied, err := currentMinBackupAppliedIndex(groups)
+	applied, err = currentMinBackupAppliedIndex(groups)
 	if err != nil {
 		return nil, 0, err
 	}
 	return counts, applied, nil
+}
+
+func collectBackupScopeCounts(
+	ctx context.Context,
+	scanner kv.BackupKeyScanner,
+	requireLive func() error,
+) (map[logicalbackup.Scope]uint64, error) {
+	counts := make(map[logicalbackup.Scope]uint64)
+	for {
+		if err := requireBackupScopeScanLive(requireLive); err != nil {
+			return nil, err
+		}
+		key, ok, err := scanner.Next(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "scan backup key baseline")
+		}
+		if !ok {
+			break
+		}
+		if err := countBackupScopeKey(counts, key); err != nil {
+			return nil, err
+		}
+	}
+	return counts, requireBackupScopeScanLive(requireLive)
+}
+
+func countBackupScopeKey(counts map[logicalbackup.Scope]uint64, key []byte) error {
+	scope, scoped, err := logicalbackup.ScopeForKey(key)
+	if err != nil {
+		return errors.Wrap(err, "classify backup key baseline")
+	}
+	if scoped {
+		counts[scope]++
+	}
+	return nil
+}
+
+func requireBackupScopeScanLive(requireLive func() error) error {
+	if requireLive == nil {
+		return nil
+	}
+	return requireLive()
 }
 
 func (s *AdminServer) rememberBackupSession(tok backupToken, routes kv.BackupRouteSnapshot) {

@@ -650,6 +650,27 @@ func TestListBackupScopesReportsScannerCloseError(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
+func TestListBackupScopesFailsWhenSessionEndsDuringScan(t *testing.T) {
+	t.Parallel()
+	store := &backupTestStore{keys: [][]byte{[]byte(logicalbackup.RedisStringPrefix + "key")}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	decoded, err := srv.decodeBackupToken(begin.GetPinToken())
+	require.NoError(t, err)
+	store.mu.Lock()
+	store.onExhaust = func() {
+		srv.forgetBackupSession(decoded.pinID)
+	}
+	store.mu.Unlock()
+
+	_, err = srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{PinToken: begin.GetPinToken()})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "expired")
+}
+
 func TestBackupProtocolVersionRequiresCompleteControlWiring(t *testing.T) {
 	t.Parallel()
 	srv := NewAdminServer(NodeIdentity{NodeID: "n1"}, nil,

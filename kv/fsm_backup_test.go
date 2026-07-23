@@ -189,6 +189,26 @@ func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
 	}
 }
 
+func TestApplyBackupReserveDoesNotInstallTimestampFloor(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	readTS := uint64(100)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("reserved-only"), Value: []byte("allowed"),
+	}}}))
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+	requireBackupTimestampFenced(t, applyBackupTestRequest(t, fsm, &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("after-pin"), Value: []byte("blocked"),
+	}}}))
+}
+
 func TestBackupTimestampFloorKeyRejectsRawMutation(t *testing.T) {
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 	resp := applyBackupTestRequest(t, fsm, &pb.Request{Ts: 10, Mutations: []*pb.Mutation{{

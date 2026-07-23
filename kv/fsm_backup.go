@@ -46,8 +46,7 @@ func (f *kvFSM) applyDecodedBackup(entry backupEntry) error {
 		f.readTracker.ReleaseBackupPinForGroup(entry.release.PinID, f.shardGroupID)
 		return nil
 	case backupSubtypeReserve:
-		err := f.readTracker.PinWithDeadline(entry.pin.PinID, entry.pin.ReadTS, entry.pin.Deadline)
-		return f.applyBackupTimestampFence(entry.pin.ReadTS, err)
+		return f.readTracker.PinWithDeadline(entry.pin.PinID, entry.pin.ReadTS, entry.pin.Deadline)
 	case backupSubtypeUnreserve:
 		f.readTracker.ReleaseBackupPin(entry.release.PinID)
 		return nil

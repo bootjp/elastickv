@@ -36,6 +36,7 @@ type BackupKeyScanner interface {
 // when the live route catalog changes between those RPCs.
 type BackupRouteSnapshot struct {
 	routes        []distribution.Route
+	scanGroups    []uint64
 	clampToRoutes bool
 	start         []byte
 	end           []byte
@@ -44,6 +45,7 @@ type BackupRouteSnapshot struct {
 type backupScanner struct {
 	store         *ShardStore
 	routes        []distribution.Route
+	scanGroups    []uint64
 	clampToRoutes bool
 	end           []byte
 	ts            uint64
@@ -57,13 +59,15 @@ type backupScanner struct {
 }
 
 type routedScanKey struct {
-	key   []byte
-	route distribution.Route
+	key           []byte
+	route         distribution.Route
+	partitionOnly bool
 }
 
 type backupKeyScanner struct {
 	store         *ShardStore
 	routes        []distribution.Route
+	scanGroups    []uint64
 	clampToRoutes bool
 	end           []byte
 	ts            uint64
@@ -88,6 +92,7 @@ func (s *ShardStore) CaptureBackupRouteSnapshot(start []byte, end []byte) Backup
 	routes, clampToRoutes := s.routesForForwardScan(start, end)
 	return BackupRouteSnapshot{
 		routes:        cloneBackupRoutes(routes),
+		scanGroups:    backupRouteGroupIDs(routes),
 		clampToRoutes: clampToRoutes,
 		start:         bytes.Clone(start),
 		end:           bytes.Clone(end),
@@ -110,7 +115,16 @@ func CaptureBackupRouteSnapshotAt(ctx context.Context, catalog *distribution.Cat
 	if err != nil {
 		return BackupRouteSnapshot{}, errors.Wrap(err, "materialize backup route snapshot")
 	}
-	return BackupRouteSnapshot{routes: cloneBackupRoutes(routes)}, nil
+	return BackupRouteSnapshot{routes: cloneBackupRoutes(routes), scanGroups: backupRouteGroupIDs(routes)}, nil
+}
+
+// BackupRouteSnapshotWithScanGroups returns a snapshot that also scans the
+// supplied Raft groups for resolver-owned partitioned keys even when the durable
+// byte-range catalog has no route for those groups.
+func BackupRouteSnapshotWithScanGroups(snapshot BackupRouteSnapshot, groupIDs []uint64) BackupRouteSnapshot {
+	out := cloneBackupRouteSnapshot(snapshot)
+	out.scanGroups = appendUniqueBackupGroups(out.scanGroups, groupIDs)
+	return out
 }
 
 // ValidateBackupSnapshotAt resolves committed or rolled-back transaction
@@ -123,18 +137,13 @@ func (s *ShardStore) ValidateBackupSnapshotAt(ctx context.Context, snapshot Back
 	if pageSize <= 0 {
 		pageSize = defaultBackupScanPageSize
 	}
-	seenGroups := make(map[uint64]struct{}, len(snapshot.routes))
-	for _, route := range snapshot.routes {
-		if _, seen := seenGroups[route.GroupID]; seen {
-			continue
-		}
-		seenGroups[route.GroupID] = struct{}{}
-		group, ok := s.groupForID(route.GroupID)
+	for _, groupID := range backupSnapshotGroupIDs(snapshot) {
+		group, ok := s.groupForID(groupID)
 		if !ok || group == nil || group.Store == nil {
-			return errors.Wrapf(ErrLeaderNotFound, "backup lock validation group %d is unavailable", route.GroupID)
+			return errors.Wrapf(ErrLeaderNotFound, "backup lock validation group %d is unavailable", groupID)
 		}
 		if err := s.validateBackupGroupLocksAt(ctx, group, ts, pageSize); err != nil {
-			return errors.Wrapf(err, "validate backup locks for group %d", route.GroupID)
+			return errors.Wrapf(err, "validate backup locks for group %d", groupID)
 		}
 	}
 	return nil
@@ -151,7 +160,7 @@ func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *Shar
 		if len(locks) == 0 {
 			return nil
 		}
-		plan, err := s.planScanLockResolutions(ctx, group, nil, locks, ts)
+		plan, err := s.planBackupLockResolutionsAt(ctx, locks, ts)
 		if err != nil {
 			return err
 		}
@@ -170,6 +179,107 @@ func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *Shar
 			return nil
 		}
 	}
+}
+
+func (s *ShardStore) planBackupLockResolutionsAt(ctx context.Context, lockKVs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
+	plan := newScanLockPlan(len(lockKVs))
+	for _, kvp := range lockKVs {
+		if err := s.planBackupLockResolutionAt(ctx, plan, kvp, ts); err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
+}
+
+func (s *ShardStore) planBackupLockResolutionAt(ctx context.Context, plan *scanLockPlan, kvp *store.KVPair, ts uint64) error {
+	if kvp == nil {
+		return nil
+	}
+	userKey, ok := txnUserKeyFromLockKey(kvp.Key)
+	if !ok {
+		return nil
+	}
+	lock, err := decodeTxnLock(kvp.Value)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(lock.PrimaryKey) == 0 {
+		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(userKey))
+	}
+	txnKey := lockTxnKey{startTS: lock.StartTS, primary: string(lock.PrimaryKey)}
+	state, err := s.cachedBackupLockTxnStatusAt(ctx, plan, lock, txnKey, ts)
+	if err != nil {
+		return err
+	}
+	phase, resolveTS, err := lockResolutionForStatus(state, lock, userKey, plan.cleanupNow)
+	if err != nil {
+		return err
+	}
+	appendScanLockResolutionBatch(plan, txnKey, phase, resolveTS, lock, userKey)
+	return nil
+}
+
+func (s *ShardStore) cachedBackupLockTxnStatusAt(
+	ctx context.Context,
+	plan *scanLockPlan,
+	lock txnLock,
+	txnKey lockTxnKey,
+	ts uint64,
+) (lockTxnStatus, error) {
+	if state, ok := plan.statusCache[txnKey]; ok {
+		return state, nil
+	}
+	status, commitTS, err := s.primaryTxnRecordedStatusAt(ctx, lock.PrimaryKey, lock.StartTS, ts)
+	if err != nil {
+		return lockTxnStatus{}, err
+	}
+	state := lockTxnStatus{status: status, commitTS: commitTS}
+	plan.statusCache[txnKey] = state
+	return state, nil
+}
+
+func (s *ShardStore) primaryTxnRecordedStatusAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (txnStatus, uint64, error) {
+	commitTS, committed, err := s.txnCommitTSAt(ctx, primaryKey, startTS, ts)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if committed && commitTS <= ts {
+		return txnStatusCommitted, commitTS, nil
+	}
+	rolledBack, err := s.hasTxnRollbackAt(ctx, primaryKey, startTS, ts)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if rolledBack {
+		return txnStatusRolledBack, 0, nil
+	}
+	return txnStatusPending, 0, nil
+}
+
+func (s *ShardStore) txnCommitTSAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (uint64, bool, error) {
+	b, err := s.GetAt(ctx, txnCommitKey(primaryKey, startTS), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	cts, derr := decodeTxnCommitRecord(b)
+	if derr != nil {
+		return 0, false, errors.WithStack(derr)
+	}
+	return cts, true, nil
+}
+
+func (s *ShardStore) hasTxnRollbackAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (bool, error) {
+	_, err := s.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ts)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // NewBackupScannerAtSnapshot creates a value scanner from a captured route view.
@@ -193,6 +303,7 @@ func NewFilteredBackupScannerAtSnapshot(
 	return &backupScanner{
 		store:         st,
 		routes:        snapshot.routes,
+		scanGroups:    snapshot.scanGroups,
 		clampToRoutes: snapshot.clampToRoutes,
 		cursor:        snapshot.start,
 		end:           snapshot.end,
@@ -233,6 +344,7 @@ func NewBackupKeyScannerAtSnapshot(st *ShardStore, snapshot BackupRouteSnapshot,
 	return &backupKeyScanner{
 		store:         st,
 		routes:        snapshot.routes,
+		scanGroups:    snapshot.scanGroups,
 		clampToRoutes: snapshot.clampToRoutes,
 		cursor:        snapshot.start,
 		end:           snapshot.end,
@@ -312,7 +424,9 @@ func (s *backupKeyScanner) loadNextPage(ctx context.Context) error {
 		s.index = 0
 		return nil
 	}
-	keys, err := s.store.scanKeyRoutesWithSourceAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
+	keys, err := s.store.scanKeyRoutesWithSourceAt(
+		ctx, s.routes, s.scanGroups, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes,
+	)
 	if err != nil {
 		return err
 	}
@@ -344,7 +458,9 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		s.index = 0
 		return nil
 	}
-	keys, err := s.store.scanKeyRoutesWithSourceAt(ctx, s.routes, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes)
+	keys, err := s.store.scanKeyRoutesWithSourceAt(
+		ctx, s.routes, s.scanGroups, s.cursor, s.end, s.pageSize, s.ts, s.clampToRoutes,
+	)
 	if err != nil {
 		return err
 	}
@@ -374,6 +490,13 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 }
 
 func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedScanKey) (*store.KVPair, bool, error) {
+	route, ok, err := s.materializeRouteForKey(item)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
 	if s.keyFilter != nil {
 		selected, err := s.keyFilter(item.key)
 		if err != nil {
@@ -382,13 +505,6 @@ func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedSca
 		if !selected {
 			return nil, false, nil
 		}
-	}
-	route, ok, err := s.materializeRouteForKey(item)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		return nil, false, nil
 	}
 	val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
 	if errors.Is(err, store.ErrKeyNotFound) {
@@ -405,19 +521,32 @@ func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution
 }
 
 func (s *ShardStore) routeForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool, error) {
+	if route, ok, handled, err := s.partitionRouteForRoutedKey(item); handled || err != nil {
+		return route, ok, err
+	}
+	if item.partitionOnly {
+		return distribution.Route{}, false, nil
+	}
+	return byteRangeRouteForRoutedKey(item, routes)
+}
+
+func (s *ShardStore) partitionRouteForRoutedKey(item routedScanKey) (distribution.Route, bool, bool, error) {
 	if s != nil && s.partitionResolver != nil {
 		groupID, ok := s.partitionResolver.ResolveGroup(item.key)
 		if ok {
 			if groupID == item.route.GroupID {
-				return distribution.Route{GroupID: groupID}, true, nil
+				return distribution.Route{GroupID: groupID}, true, true, nil
 			}
-			return distribution.Route{}, false, nil
+			return distribution.Route{}, false, true, nil
 		}
 		if s.partitionResolver.RecognisesPartitionedKey(item.key) {
-			return distribution.Route{}, false, errors.Wrapf(ErrInvalidRequest, "no partition route for backup key %q", item.key)
+			return distribution.Route{}, false, true, errors.Wrapf(ErrInvalidRequest, "no partition route for backup key %q", item.key)
 		}
 	}
+	return distribution.Route{}, false, false, nil
+}
 
+func byteRangeRouteForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool, error) {
 	key := routeKey(item.key)
 	if routeContainsKey(item.route, key) {
 		return item.route, true, nil
@@ -436,6 +565,7 @@ func (s *ShardStore) routeForRoutedKey(item routedScanKey, routes []distribution
 func cloneBackupRouteSnapshot(snapshot BackupRouteSnapshot) BackupRouteSnapshot {
 	return BackupRouteSnapshot{
 		routes:        cloneBackupRoutes(snapshot.routes),
+		scanGroups:    appendUniqueBackupGroups(nil, snapshot.scanGroups),
 		clampToRoutes: snapshot.clampToRoutes,
 		start:         bytes.Clone(snapshot.start),
 		end:           bytes.Clone(snapshot.end),
@@ -452,9 +582,41 @@ func cloneBackupRoutes(routes []distribution.Route) []distribution.Route {
 	return out
 }
 
+func backupRouteGroupIDs(routes []distribution.Route) []uint64 {
+	groups := make([]uint64, 0, len(routes))
+	for _, route := range routes {
+		groups = appendUniqueBackupGroups(groups, []uint64{route.GroupID})
+	}
+	return groups
+}
+
+func backupSnapshotGroupIDs(snapshot BackupRouteSnapshot) []uint64 {
+	groups := backupRouteGroupIDs(snapshot.routes)
+	return appendUniqueBackupGroups(groups, snapshot.scanGroups)
+}
+
+func appendUniqueBackupGroups(dst []uint64, src []uint64) []uint64 {
+	if len(src) == 0 {
+		return dst
+	}
+	seen := make(map[uint64]struct{}, len(dst)+len(src))
+	for _, groupID := range dst {
+		seen[groupID] = struct{}{}
+	}
+	for _, groupID := range src {
+		if _, ok := seen[groupID]; ok {
+			continue
+		}
+		seen[groupID] = struct{}{}
+		dst = append(dst, groupID)
+	}
+	return dst
+}
+
 func (s *ShardStore) scanKeyRoutesWithSourceAt(
 	ctx context.Context,
 	routes []distribution.Route,
+	scanGroups []uint64,
 	start []byte,
 	end []byte,
 	limit int,
@@ -463,27 +625,34 @@ func (s *ShardStore) scanKeyRoutesWithSourceAt(
 ) ([]routedScanKey, error) {
 	out := make([]routedScanKey, 0)
 	seenGroups := make(map[uint64]struct{})
-	for _, route := range routes {
-		scanStart := start
-		scanEnd := end
-		if clampToRoutes {
-			scanStart = clampScanStart(start, route.Start)
-			scanEnd = clampScanEnd(end, route.End)
-		} else {
-			if _, seen := seenGroups[route.GroupID]; seen {
-				continue
-			}
-			seenGroups[route.GroupID] = struct{}{}
-		}
+	out, err := s.scanSnapshotKeyRoutesWithSourceAt(ctx, out, routes, start, end, limit, ts, clampToRoutes, seenGroups)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanPartitionOnlyKeyGroupsAt(ctx, out, routes, scanGroups, seenGroups, start, end, limit, ts)
+}
 
-		keys, err := s.scanKeyRouteAt(ctx, route, scanStart, scanEnd, limit, ts)
+func (s *ShardStore) scanSnapshotKeyRoutesWithSourceAt(
+	ctx context.Context,
+	out []routedScanKey,
+	routes []distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	clampToRoutes bool,
+	seenGroups map[uint64]struct{},
+) ([]routedScanKey, error) {
+	for _, route := range routes {
+		scanStart, scanEnd, skip := backupRouteScanBounds(route, start, end, clampToRoutes, seenGroups)
+		if skip {
+			continue
+		}
+		next, err := s.appendBackupScanRouteKeysAt(ctx, out, routes, route, scanStart, scanEnd, limit, ts, false)
 		if err != nil {
 			return nil, err
 		}
-		out, err = s.mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys), routes, limit)
-		if err != nil {
-			return nil, err
-		}
+		out = next
 		if clampToRoutes && len(out) >= limit {
 			break
 		}
@@ -491,13 +660,75 @@ func (s *ShardStore) scanKeyRoutesWithSourceAt(
 	return out, nil
 }
 
-func routedScanKeys(route distribution.Route, keys [][]byte) []routedScanKey {
+func backupRouteScanBounds(
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	clampToRoutes bool,
+	seenGroups map[uint64]struct{},
+) (scanStart []byte, scanEnd []byte, skip bool) {
+	if clampToRoutes {
+		seenGroups[route.GroupID] = struct{}{}
+		return clampScanStart(start, route.Start), clampScanEnd(end, route.End), false
+	}
+	if _, seen := seenGroups[route.GroupID]; seen {
+		return nil, nil, true
+	}
+	seenGroups[route.GroupID] = struct{}{}
+	return start, end, false
+}
+
+func (s *ShardStore) scanPartitionOnlyKeyGroupsAt(
+	ctx context.Context,
+	out []routedScanKey,
+	routes []distribution.Route,
+	scanGroups []uint64,
+	seenGroups map[uint64]struct{},
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+) ([]routedScanKey, error) {
+	for _, groupID := range scanGroups {
+		if _, seen := seenGroups[groupID]; seen {
+			continue
+		}
+		seenGroups[groupID] = struct{}{}
+		route := distribution.Route{GroupID: groupID}
+		next, err := s.appendBackupScanRouteKeysAt(ctx, out, routes, route, start, end, limit, ts, true)
+		if err != nil {
+			return nil, err
+		}
+		out = next
+	}
+	return out, nil
+}
+
+func (s *ShardStore) appendBackupScanRouteKeysAt(
+	ctx context.Context,
+	out []routedScanKey,
+	routes []distribution.Route,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	partitionOnly bool,
+) ([]routedScanKey, error) {
+	keys, err := s.scanKeyRouteAt(ctx, route, start, end, limit, ts)
+	if err != nil {
+		return nil, err
+	}
+	return s.mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys, partitionOnly), routes, limit)
+}
+
+func routedScanKeys(route distribution.Route, keys [][]byte, partitionOnly bool) []routedScanKey {
 	items := make([]routedScanKey, 0, len(keys))
 	for _, key := range keys {
 		if key == nil {
 			continue
 		}
-		items = append(items, routedScanKey{key: key, route: route})
+		items = append(items, routedScanKey{key: key, route: route, partitionOnly: partitionOnly})
 	}
 	return items
 }
