@@ -268,22 +268,23 @@ func TestDynamoDB_LeaderHealthz(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequestWithContext(
-				context.Background(),
-				http.MethodGet,
-				"http://"+tc.addr+dynamoLeaderHealthPath,
-				nil,
-			)
-			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				req, err := http.NewRequestWithContext(
+					context.Background(),
+					http.MethodGet,
+					"http://"+tc.addr+dynamoLeaderHealthPath,
+					nil,
+				)
+				require.NoError(t, err)
 
-			resp, err := http.DefaultClient.Do(req)
-			require.NoError(t, err)
-			defer resp.Body.Close()
+				resp, err := http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				defer resp.Body.Close()
 
-			require.Equal(t, tc.status, resp.StatusCode)
-			body, err := io.ReadAll(resp.Body)
-			require.NoError(t, err)
-			require.Equal(t, tc.body, string(body))
+				body, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				return resp.StatusCode == tc.status && string(body) == tc.body
+			}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
 		})
 	}
 }
