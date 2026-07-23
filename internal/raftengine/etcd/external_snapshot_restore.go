@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -27,6 +28,7 @@ var (
 )
 
 type ExternalSnapshotRestoreOptions struct {
+	Context               context.Context
 	InputFSMPath          string
 	DataDir               string
 	Index                 uint64
@@ -50,6 +52,7 @@ type ExternalSnapshotRestoreResult struct {
 // emitted by the Raft state machine. Unlike ExternalSnapshotRestoreOptions, the
 // input already contains the KV snapshot header and must not be wrapped again.
 type PhysicalSnapshotRestoreOptions struct {
+	Context               context.Context
 	InputFSMPath          string
 	DataDir               string
 	Index                 uint64
@@ -77,6 +80,7 @@ func PrepareExternalSnapshotRestore(opts ExternalSnapshotRestoreOptions) (*Exter
 // payloads all use the same path without this package parsing their internals.
 func PreparePhysicalSnapshotRestore(opts PhysicalSnapshotRestoreOptions) (*ExternalSnapshotRestoreResult, error) {
 	externalOpts := ExternalSnapshotRestoreOptions{
+		Context:               opts.Context,
 		InputFSMPath:          opts.InputFSMPath,
 		DataDir:               opts.DataDir,
 		Index:                 opts.Index,
@@ -91,12 +95,22 @@ func PreparePhysicalSnapshotRestore(opts PhysicalSnapshotRestoreOptions) (*Exter
 	return prepareExternalSnapshotRestore(normalized, writePhysicalFSMSnapshotFile)
 }
 
-type externalSnapshotFileWriter func(inputPath, fsmSnapDir string, index uint64, ceilingMs uint64) (uint32, int64, string, error)
+type externalSnapshotFileWriter func(
+	ctx context.Context,
+	inputPath string,
+	fsmSnapDir string,
+	index uint64,
+	ceilingMs uint64,
+) (uint32, int64, string, error)
 
 func prepareExternalSnapshotRestore(
 	opts ExternalSnapshotRestoreOptions,
 	writeSnapshot externalSnapshotFileWriter,
 ) (*ExternalSnapshotRestoreResult, error) {
+	ctx := externalSnapshotRestoreContext(opts.Context)
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	destDataDir, tempDir, err := prepareExternalSnapshotRestoreDest(opts.DataDir)
 	if err != nil {
 		return nil, err
@@ -109,7 +123,7 @@ func prepareExternalSnapshotRestore(
 	}()
 
 	fsmSnapDir := filepath.Join(tempDir, fsmSnapDirName)
-	crc, payloadBytes, payloadSHA, err := writeSnapshot(opts.InputFSMPath, fsmSnapDir, opts.Index, opts.SnapshotCeilingMs)
+	crc, payloadBytes, payloadSHA, err := writeSnapshot(ctx, opts.InputFSMPath, fsmSnapDir, opts.Index, opts.SnapshotCeilingMs)
 	if err != nil {
 		return nil, err
 	}
@@ -118,13 +132,10 @@ func prepareExternalSnapshotRestore(
 			"copied payload has %s, expected %s", payloadSHA, opts.ExpectedPayloadSHA256)
 	}
 	token := encodeSnapshotToken(opts.Index, crc)
-	if err := seedExternalSnapshotRestoreDir(tempDir, opts, token); err != nil {
+	if err := seedExternalSnapshotRestoreDir(ctx, tempDir, opts, token); err != nil {
 		return nil, err
 	}
-	if err := finalizeMigrationDir(tempDir, destDataDir); err != nil {
-		if errors.Is(err, errMigrationDestinationExists) {
-			return nil, errors.Wrapf(ErrExternalSnapshotRestoreExists, "destination exists: %s", destDataDir)
-		}
+	if err := finalizeExternalSnapshotRestoreDir(ctx, tempDir, destDataDir); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -138,6 +149,26 @@ func prepareExternalSnapshotRestore(
 		PayloadSHA256: payloadSHA,
 		Peers:         len(opts.Peers),
 	}, nil
+}
+
+func finalizeExternalSnapshotRestoreDir(ctx context.Context, tempDir string, destDataDir string) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := finalizeMigrationDir(tempDir, destDataDir); err != nil {
+		if errors.Is(err, errMigrationDestinationExists) {
+			return errors.Wrapf(ErrExternalSnapshotRestoreExists, "destination exists: %s", destDataDir)
+		}
+		return err
+	}
+	return nil
+}
+
+func externalSnapshotRestoreContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func validateExternalSnapshotRestoreOptions(opts ExternalSnapshotRestoreOptions) error {
@@ -247,16 +278,37 @@ func ensureExternalRestorePathAbsent(path string, kind string) error {
 	return nil
 }
 
-func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ceilingMs uint64) (uint32, int64, string, error) {
+func writeExternalFSMSnapshotFile(
+	ctx context.Context,
+	inputPath string,
+	fsmSnapDir string,
+	index uint64,
+	ceilingMs uint64,
+) (uint32, int64, string, error) {
 	header := encodeExternalRestoreSnapshotHeader(ceilingMs)
-	return writePreparedFSMSnapshotFile(inputPath, fsmSnapDir, index, header[:])
+	return writePreparedFSMSnapshotFile(ctx, inputPath, fsmSnapDir, index, header[:])
 }
 
-func writePhysicalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, _ uint64) (uint32, int64, string, error) {
-	return writePreparedFSMSnapshotFile(inputPath, fsmSnapDir, index, nil)
+func writePhysicalFSMSnapshotFile(
+	ctx context.Context,
+	inputPath string,
+	fsmSnapDir string,
+	index uint64,
+	_ uint64,
+) (uint32, int64, string, error) {
+	return writePreparedFSMSnapshotFile(ctx, inputPath, fsmSnapDir, index, nil)
 }
 
-func writePreparedFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, prefix []byte) (uint32, int64, string, error) {
+func writePreparedFSMSnapshotFile(
+	ctx context.Context,
+	inputPath string,
+	fsmSnapDir string,
+	index uint64,
+	prefix []byte,
+) (uint32, int64, string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, "", errors.WithStack(err)
+	}
 	if err := os.MkdirAll(fsmSnapDir, defaultDirPerm); err != nil {
 		return 0, 0, "", errors.WithStack(err)
 	}
@@ -280,21 +332,34 @@ func writePreparedFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, pr
 		_ = os.Remove(tmpPath)
 	}()
 
-	crc, bytesWritten, payloadSHA, err := copySnapshotPayloadWithPrefixAndFooter(in, tmpFile, prefix)
+	crc, bytesWritten, payloadSHA, err := copySnapshotPayloadWithPrefixAndFooter(ctx, in, tmpFile, prefix)
 	if err != nil {
 		return 0, 0, "", err
 	}
-	closed = true
-	if err := tmpFile.Close(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, 0, "", errors.WithStack(err)
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return 0, 0, "", errors.WithStack(err)
+	if err := closeAndInstallPreparedFSMSnapshot(ctx, tmpFile, finalPath, fsmSnapDir); err != nil {
+		return 0, 0, "", err
+	}
+	closed = true
+	return crc, bytesWritten, payloadSHA, nil
+}
+
+func closeAndInstallPreparedFSMSnapshot(ctx context.Context, file *os.File, finalPath string, fsmSnapDir string) error {
+	if err := file.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := os.Rename(file.Name(), finalPath); err != nil {
+		return errors.WithStack(err)
 	}
 	if err := syncDir(fsmSnapDir); err != nil {
-		return 0, 0, "", errors.WithStack(err)
+		return errors.WithStack(err)
 	}
-	return crc, bytesWritten, payloadSHA, nil
+	return nil
 }
 
 func openRegularExternalFSMInput(inputPath string) (*os.File, error) {
@@ -323,11 +388,14 @@ func requireRegularFile(f *os.File, path string) error {
 	return nil
 }
 
-func copySnapshotPayloadWithPrefixAndFooter(in io.Reader, out *os.File, prefix []byte) (uint32, int64, string, error) {
+func copySnapshotPayloadWithPrefixAndFooter(ctx context.Context, in io.Reader, out *os.File, prefix []byte) (uint32, int64, string, error) {
 	bw := bufio.NewWriterSize(out, fsmWriteBufSize)
 	crcHash := crc32.New(crc32cTable)
 	payloadHash := sha256.New()
 	if len(prefix) != 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, "", errors.WithStack(err)
+		}
 		if _, err := bw.Write(prefix); err != nil {
 			return 0, 0, "", errors.WithStack(err)
 		}
@@ -335,8 +403,14 @@ func copySnapshotPayloadWithPrefixAndFooter(in io.Reader, out *os.File, prefix [
 			return 0, 0, "", errors.WithStack(err)
 		}
 	}
-	n, err := io.Copy(io.MultiWriter(bw, crcHash, payloadHash), in)
+	n, err := io.Copy(io.MultiWriter(bw, crcHash, payloadHash), externalSnapshotRestoreContextReader{
+		ctx:    ctx,
+		reader: in,
+	})
 	if err != nil {
+		return 0, n, "", errors.WithStack(err)
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, n, "", errors.WithStack(err)
 	}
 	crc := crcHash.Sum32()
@@ -350,6 +424,25 @@ func copySnapshotPayloadWithPrefixAndFooter(in io.Reader, out *os.File, prefix [
 		return 0, n, "", errors.WithStack(err)
 	}
 	return crc, n, hex.EncodeToString(payloadHash.Sum(nil)), nil
+}
+
+type externalSnapshotRestoreContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r externalSnapshotRestoreContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	n, err := r.reader.Read(p)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return n, err //nolint:wrapcheck // io.Reader must return io.EOF unwrapped so io.Copy treats it as normal completion.
+		}
+		return n, errors.WithStack(err)
+	}
+	return n, nil
 }
 
 func encodeExternalRestoreSnapshotHeader(ceilingMs uint64) [externalRestoreSnapshotHeaderLen]byte {
@@ -366,7 +459,10 @@ const (
 	externalRestoreSnapshotHeaderLen = 16
 )
 
-func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestoreOptions, token []byte) error {
+func seedExternalSnapshotRestoreDir(ctx context.Context, tempDir string, opts ExternalSnapshotRestoreOptions, token []byte) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
 	confState := confStateForSnapshotRestorePeers(opts.Peers)
 	state := persistedState{
 		HardState: raftpb.HardState{
@@ -396,6 +492,9 @@ func seedExternalSnapshotRestoreDir(tempDir string, opts ExternalSnapshotRestore
 	}
 	if err := closePersist(disk.Persist); err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
 	}
 	return savePersistedPeers(tempDir, opts.Index, opts.Peers)
 }

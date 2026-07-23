@@ -64,6 +64,7 @@ var (
 	ErrEngineSnapshotDuplicateID  = errors.New("engine snapshot has duplicate route id")
 	ErrEngineSnapshotRouteOverlap = errors.New("engine snapshot has overlapping routes")
 	ErrEngineSnapshotRouteOrder   = errors.New("engine snapshot has invalid route order")
+	ErrEngineDeltaVersionGap      = errors.New("engine catalog delta version is not contiguous")
 )
 
 // NewEngine creates an Engine with no hotspot splitting.
@@ -128,6 +129,92 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 	e.catalogVersion = snapshot.Version
 	e.recordHistorySnapshotLocked()
 	return nil
+}
+
+// ApplyDelta atomically publishes one contiguous catalog transition. Readers
+// observe either the complete previous route table or the complete next table.
+func (e *Engine) ApplyDelta(delta CatalogDelta) error {
+	if err := validateCatalogDelta(delta); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	apply, err := validateEngineDeltaVersion(delta, e.catalogVersion)
+	if err != nil {
+		return err
+	}
+	if !apply {
+		return nil
+	}
+	next, err := routesAfterCatalogDelta(e.routes, delta)
+	if err != nil {
+		return err
+	}
+	e.routes = next
+	e.catalogVersion = delta.Version
+	e.recordHistorySnapshotLocked()
+	return nil
+}
+
+func validateEngineDeltaVersion(delta CatalogDelta, currentVersion uint64) (bool, error) {
+	if delta.Version < currentVersion {
+		return false, staleSnapshotVersionErr(delta.Version, currentVersion)
+	}
+	if delta.Version == currentVersion {
+		return false, nil
+	}
+	if delta.PreviousVersion != currentVersion {
+		return false, errors.Wrapf(
+			ErrEngineDeltaVersionGap,
+			"delta %d follows %d, engine is at %d",
+			delta.Version,
+			delta.PreviousVersion,
+			currentVersion,
+		)
+	}
+	return true, nil
+}
+
+func routesAfterCatalogDelta(current []Route, delta CatalogDelta) ([]Route, error) {
+	byID := make(map[uint64]Route, len(current)+len(delta.Mutations))
+	for _, route := range current {
+		if delta.PreviousVersion == 0 && route.RouteID == 0 {
+			continue
+		}
+		byID[route.RouteID] = route
+	}
+	for _, mutation := range delta.Mutations {
+		switch mutation.Op {
+		case CatalogMutationDelete:
+			delete(byID, mutation.RouteID)
+		case CatalogMutationUpsert:
+			load := uint64(0)
+			if current, ok := byID[mutation.RouteID]; ok {
+				load = current.Load
+			}
+			byID[mutation.RouteID] = Route{
+				RouteID: mutation.Route.RouteID,
+				Start:   CloneBytes(mutation.Route.Start),
+				End:     CloneBytes(mutation.Route.End),
+				GroupID: mutation.Route.GroupID,
+				State:   mutation.Route.State,
+				Load:    load,
+			}
+		}
+	}
+
+	next := make([]Route, 0, len(byID))
+	for _, route := range byID {
+		next = append(next, route)
+	}
+	sort.Slice(next, func(i, j int) bool {
+		return bytes.Compare(next[i].Start, next[j].Start) < 0
+	})
+	if err := validateRouteOrder(next); err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 // RouteHistorySnapshot is a point-in-time view of the route catalog at

@@ -3,6 +3,7 @@ package adapter
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/proxy"
 	"github.com/stretchr/testify/require"
 )
 
@@ -10,21 +11,11 @@ const (
 	testPeerLimit = 2
 )
 
-func TestDefaultRedisPeerLimiterUsesNoisyClientBoundedDefault(t *testing.T) {
+func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
 	t.Setenv(redisPerPeerLimitEnv, "")
-
 	limiter := newDefaultRedisPeerLimiter()
 	require.NotNil(t, limiter)
-	require.Equal(t, 8, limiter.limit)
-	require.Equal(t, defaultRedisPerPeerConnectionCap, limiter.limit)
-}
-
-func TestDefaultRedisPeerLimiterCanRaiseProxyDeploymentCap(t *testing.T) {
-	t.Setenv(redisPerPeerLimitEnv, "64")
-
-	limiter := newDefaultRedisPeerLimiter()
-	require.NotNil(t, limiter)
-	require.Equal(t, 64, limiter.limit)
+	require.Equal(t, proxy.DefaultElasticKVBackendOptions().PoolSize+defaultRedisDedicatedPeerHeadroom, limiter.limit)
 }
 
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {

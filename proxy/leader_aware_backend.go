@@ -398,6 +398,20 @@ func (b *LeaderAwareRedisBackend) currentClientOrRefresh(ctx context.Context) *r
 	return b.currentClient()
 }
 
+func (b *LeaderAwareRedisBackend) firstSeedClient() *redis.Client {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil
+	}
+	for _, seed := range b.seeds {
+		if cli := b.clients[seed]; cli != nil {
+			return cli
+		}
+	}
+	return nil
+}
+
 // Do forwards a single command to the current leader. NOTLEADER refreshes the
 // cached leader for the next command, but the current command is not replayed:
 // leadership-loss errors can be returned after an operation has already applied.
@@ -527,6 +541,9 @@ func isLeaderRefreshTransportError(err error) bool {
 // NewPubSub opens a subscribe connection on the current leader.
 func (b *LeaderAwareRedisBackend) NewPubSub(ctx context.Context) *redis.PubSub {
 	cli := b.currentClientOrRefresh(ctx)
+	if cli == nil {
+		cli = b.firstSeedClient()
+	}
 	if cli == nil {
 		return nil
 	}
