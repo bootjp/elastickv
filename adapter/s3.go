@@ -1204,7 +1204,8 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		writeS3InternalError(w, err)
 		return
 	}
-	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,

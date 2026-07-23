@@ -785,7 +785,7 @@ func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *
 		base:        legacyFloor + 100,
 		leader:      true,
 		phaseD:      true,
-		phaseDFloor: legacyFloor - 1,
+		phaseDFloor: legacyFloor,
 	}
 	coordinator := newDistributionCoordinatorStub(baseStore, true)
 	coordinator.allocator = allocator
@@ -802,6 +802,7 @@ func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *
 	})
 	require.NoError(t, err)
 	require.Equal(t, legacyFloor, coordinator.lastStartTS)
+	require.Equal(t, 1, coordinator.vouchCalls)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -1110,6 +1111,7 @@ type distributionCoordinatorStub struct {
 	asyncApplyDone        chan error
 	asyncApplyDelay       time.Duration
 	dispatchCalls         int
+	vouchCalls            int
 }
 
 func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator {
@@ -1117,6 +1119,7 @@ func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator
 }
 
 func (s *distributionCoordinatorStub) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	s.vouchCalls++
 	return nil
 }
 

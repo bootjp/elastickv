@@ -370,7 +370,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	}
 	left, right := splitCatalogRoutes(parent, splitKey, leftID, rightID, 0)
 
-	saved, err := s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
+	saved, err := s.saveSplitResultViaCoordinator(ctx, readTimestamp, req.GetExpectedCatalogVersion(), parent.RouteID, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +448,7 @@ func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
 
 func (s *DistributionServer) saveSplitResultViaCoordinator(
 	ctx context.Context,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 	expectedVersion uint64,
 	parentID uint64,
 	left distribution.RouteDescriptor,
@@ -467,10 +467,11 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
-	resp, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	resp, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		Elems:   ops,
 		IsTxn:   true,
-		StartTS: readTS,
+		StartTS: readTimestamp.Timestamp(),
 	})
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)

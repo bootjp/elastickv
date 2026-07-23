@@ -207,7 +207,8 @@ func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, compl
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
