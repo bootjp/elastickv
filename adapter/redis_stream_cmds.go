@@ -1275,6 +1275,46 @@ func isXReadIterCtxError(err error) bool {
 	}
 }
 
+func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bool {
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisFinalTypeCheckTimeout)
+	defer cancel()
+	var err error
+	if ok := r.runWithHeavyCommandSlot(func() {
+		err = r.xreadCheckTypes(ctx, req)
+	}); !ok {
+		return false
+	}
+	if err != nil {
+		if isXReadIterCtxError(err) {
+			return false
+		}
+		writeRedisError(conn, err)
+		return true
+	}
+	return false
+}
+
+func (r *RedisServer) xreadCheckTypes(ctx context.Context, req xreadRequest) error {
+	for _, key := range req.keys {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeNone && typ != redisTypeStream {
+			return wrongTypeError()
+		}
+	}
+	return nil
+}
+
+func (r *RedisServer) writeXReadFinalOrNull(conn redcon.Conn, req xreadRequest) {
+	if r.xreadFinalTypeCheck(conn, req) {
+		return
+	}
+	conn.WriteNull()
+}
+
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	req, err := parseXReadRequest(cmd.Args)
 	if err != nil {
@@ -1350,7 +1390,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// return DeadlineExceeded, which we'd then surface as an error.
 		iterTimeout := time.Until(deadline)
 		if iterTimeout <= 0 {
-			conn.WriteNull()
+			r.writeXReadFinalOrNull(conn, req)
 			return
 		}
 		// Cap each iteration at redisDispatchTimeout to avoid holding
@@ -1394,7 +1434,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		}
 
 		if !time.Now().Before(deadline) {
-			conn.WriteNull()
+			r.writeXReadFinalOrNull(conn, req)
 			return
 		}
 		waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)

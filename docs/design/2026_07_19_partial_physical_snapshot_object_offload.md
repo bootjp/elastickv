@@ -1,8 +1,9 @@
 # Physical Snapshot Object Offload
 
-Status: Proposed
+Status: Partial — M0/M1 implemented; M2/M3 pending
 Author: bootjp
 Date: 2026-07-19
+Updated: 2026-07-23
 
 ## 1. Scope
 
@@ -29,6 +30,25 @@ only the independent substrate:
 - preserve the existing logical/external restore API and its header behavior.
 
 No object client or runtime scheduling is enabled by this first slice.
+
+The M1 object-store-neutral substrate now adds:
+
+- a `snapshotoffload.ObjectStore` interface with a local filesystem
+  implementation for deterministic tests and offline drills;
+- an S3-compatible implementation backed by AWS SDK v2, including optional
+  path-style endpoints, SDK credential-chain loading, server-side encryption
+  headers, immutable `If-None-Match: *` writes, SHA-256 metadata, and optional
+  checksum headers;
+- the v1 JSON manifest schema and content-addressed payload key layout;
+- payload-first publish from `OpenPersistedSnapshotExport`, including exact
+  byte count and SHA-256 verification before manifest commit;
+- manifest-driven restore that downloads the opaque payload, checks exact
+  length and SHA-256, then calls `PreparePhysicalSnapshotRestore` with
+  operator-supplied target membership.
+- `cmd/elastickv-snapshot-offload publish` and `restore` for local and
+  S3-backed operator workflows.
+
+The runtime scheduler and retention/GC remain pending.
 
 ## 2. Safety boundary
 
@@ -143,11 +163,11 @@ permissions below the configured prefix.
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
-| M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Pending; depends on stable #1130 contract |
+| M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
 | M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
 
-The filename and header remain `proposed` until M1-M3 complete the central
+The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
 rename this file to `2026_07_19_implemented_physical_snapshot_object_offload.md`,
 change the header status, update every reference, and verify with `rg` that the
