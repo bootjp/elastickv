@@ -28,7 +28,7 @@ const (
 	s3DefaultMultipartPart    = int64(64 * 1024 * 1024)
 	s3MaxMultipartPart        = int64(5 * 1024 * 1024 * 1024)
 	s3MaxMultipartParts       = int64(10_000)
-	s3MaxObjectBytes          = int64(5 * 1024 * 1024 * 1024 * 1024)
+	s3MaxObjectBytes          = s3MaxMultipartPart * s3MaxMultipartParts
 	s3MultipartAbortTimeout   = 30 * time.Second
 )
 
@@ -203,7 +203,7 @@ func (s *S3Store) putMultipartIfAbsent(
 			retErr = s.abortMultipartUpload(ctx, key, uploadID, retErr)
 		}
 	}()
-	parts, err := s.uploadParts(ctx, key, uploadID, body, opts.Size, partSize)
+	parts, err := s.uploadParts(ctx, key, uploadID, body, opts, partSize)
 	if err != nil {
 		return err
 	}
@@ -216,13 +216,15 @@ func (s *S3Store) putMultipartIfAbsent(
 
 func (s *S3Store) createMultipartUpload(ctx context.Context, key string, opts PutOptions) (string, error) {
 	input := &s3.CreateMultipartUploadInput{
-		Bucket:            aws.String(s.bucket),
-		Key:               aws.String(key),
-		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
 		Metadata: map[string]string{
 			s3MetadataSHA256: opts.SHA256,
 		},
 		ServerSideEncryption: types.ServerSideEncryption(s.serverSideEncryption),
+	}
+	if !s.disableChecksumHeaders {
+		input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
 	}
 	if stringsTrim(opts.ContentType) != "" {
 		input.ContentType = aws.String(stringsTrim(opts.ContentType))
@@ -263,10 +265,12 @@ func (s *S3Store) uploadParts(
 	key string,
 	uploadID string,
 	body io.Reader,
-	totalBytes int64,
+	opts PutOptions,
 	partSize int64,
 ) ([]types.CompletedPart, error) {
+	totalBytes := opts.Size
 	parts := make([]types.CompletedPart, 0, (totalBytes+partSize-1)/partSize)
+	fullSum := sha256.New()
 	remaining := totalBytes
 	for partNumber := int32(1); remaining > 0; partNumber++ {
 		partBytes := min(remaining, partSize)
@@ -274,33 +278,44 @@ func (s *S3Store) uploadParts(
 		if _, err := io.ReadFull(body, part); err != nil {
 			return nil, errors.Wrap(err, "read s3 multipart source")
 		}
-		sum := sha256.Sum256(part)
-		checksum := base64.StdEncoding.EncodeToString(sum[:])
-		out, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:            aws.String(s.bucket),
-			Key:               aws.String(key),
-			UploadId:          aws.String(uploadID),
-			PartNumber:        aws.Int32(partNumber),
-			Body:              bytes.NewReader(part),
-			ContentLength:     aws.Int64(partBytes),
-			ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
-			ChecksumSHA256:    aws.String(checksum),
-		})
+		_, _ = fullSum.Write(part)
+		input := &s3.UploadPartInput{
+			Bucket:        aws.String(s.bucket),
+			Key:           aws.String(key),
+			UploadId:      aws.String(uploadID),
+			PartNumber:    aws.Int32(partNumber),
+			Body:          bytes.NewReader(part),
+			ContentLength: aws.Int64(partBytes),
+		}
+		var checksum string
+		if !s.disableChecksumHeaders {
+			sum := sha256.Sum256(part)
+			checksum = base64.StdEncoding.EncodeToString(sum[:])
+			input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+			input.ChecksumSHA256 = aws.String(checksum)
+		}
+		out, err := s.client.UploadPart(ctx, input)
 		if err != nil {
 			return nil, errors.Wrap(err, "upload s3 multipart part")
 		}
 		if stringsTrim(aws.ToString(out.ETag)) == "" {
 			return nil, errors.Wrapf(ErrIntegrity, "s3 multipart part %d returned no etag", partNumber)
 		}
-		parts = append(parts, types.CompletedPart{
-			ETag:           out.ETag,
-			PartNumber:     aws.Int32(partNumber),
-			ChecksumSHA256: aws.String(checksum),
-		})
+		completedPart := types.CompletedPart{
+			ETag:       out.ETag,
+			PartNumber: aws.Int32(partNumber),
+		}
+		if checksum != "" {
+			completedPart.ChecksumSHA256 = aws.String(checksum)
+		}
+		parts = append(parts, completedPart)
 		remaining -= partBytes
 	}
 	if err := requireNoTrailingBytes(body); err != nil {
 		return nil, errors.Wrap(err, "s3 multipart source length differs from declared length")
+	}
+	if gotSHA := hex.EncodeToString(fullSum.Sum(nil)); gotSHA != opts.SHA256 {
+		return nil, errors.Wrapf(ErrIntegrity, "s3 multipart source sha256 %s, expected %s", gotSHA, opts.SHA256)
 	}
 	return parts, nil
 }
@@ -530,7 +545,7 @@ func multipartPartSize(totalBytes, configured int64) (int64, error) {
 		return 0, errors.Wrap(ErrInvalidOptions, "s3 multipart length and part size must be positive")
 	}
 	if totalBytes > s3MaxObjectBytes {
-		return 0, errors.Wrapf(ErrInvalidOptions, "s3 object exceeds 5 TiB: bytes=%d", totalBytes)
+		return 0, errors.Wrapf(ErrInvalidOptions, "s3 object exceeds multipart limit: bytes=%d", totalBytes)
 	}
 	partSize := max(configured, (totalBytes+s3MaxMultipartParts-1)/s3MaxMultipartParts)
 	if partSize > s3MaxMultipartPart {
@@ -573,7 +588,7 @@ func s3ObjectInfo(
 	if contentLength == nil || *contentLength < 0 {
 		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s missing content length", key)
 	}
-	sha, err := s3ObjectSHA256(key, metadata, checksumSHA256)
+	sha, err := s3ObjectSHA256(metadata, checksumSHA256)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -586,20 +601,19 @@ func s3ObjectInfo(
 	}, nil
 }
 
-func s3ObjectSHA256(key string, metadata map[string]string, checksumSHA256 *string) (string, error) {
+func s3ObjectSHA256(metadata map[string]string, checksumSHA256 *string) (string, error) {
 	metadataSHA, err := s3MetadataSHA(metadata)
 	if err != nil {
 		return "", err
+	}
+	if metadataSHA != "" {
+		return metadataSHA, nil
 	}
 	checksumSHA, err := s3ChecksumSHA(checksumSHA256)
 	if err != nil {
 		return "", err
 	}
 	switch {
-	case metadataSHA != "" && checksumSHA != "" && metadataSHA != checksumSHA:
-		return "", errors.Wrapf(ErrIntegrity, "s3 object %s sha256 metadata/checksum mismatch", key)
-	case metadataSHA != "":
-		return metadataSHA, nil
 	case checksumSHA != "":
 		return checksumSHA, nil
 	default:

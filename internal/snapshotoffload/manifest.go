@@ -137,10 +137,15 @@ func validateManifestConfState(conf ManifestConfState) error {
 		{name: "learners_next", values: conf.LearnersNext},
 	}
 	for _, role := range roles {
+		seen := make(map[uint64]struct{}, len(role.values))
 		for _, id := range role.values {
 			if id == 0 {
 				return errors.Wrapf(ErrInvalidOptions, "conf_state.%s contains zero", role.name)
 			}
+			if _, ok := seen[id]; ok {
+				return errors.Wrapf(ErrInvalidOptions, "conf_state.%s contains duplicate node %d", role.name, id)
+			}
+			seen[id] = struct{}{}
 		}
 	}
 	return validateManifestConfStateMembership(conf)

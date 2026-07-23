@@ -254,6 +254,10 @@ func TestDecodeManifestRejectsInvalidConfStateMembership(t *testing.T) {
 	testCases := []ManifestConfState{
 		{Voters: nil},
 		{Voters: []uint64{0}},
+		{Voters: []uint64{1, 1}},
+		{Voters: []uint64{1}, Learners: []uint64{2, 2}},
+		{Voters: []uint64{1}, VotersOutgoing: []uint64{2, 2}, LearnersNext: []uint64{2}},
+		{Voters: []uint64{1}, VotersOutgoing: []uint64{2}, LearnersNext: []uint64{2, 2}},
 		{Voters: []uint64{1}, Learners: []uint64{1}},
 		{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, LearnersNext: []uint64{1}},
 		{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, LearnersNext: []uint64{2}},

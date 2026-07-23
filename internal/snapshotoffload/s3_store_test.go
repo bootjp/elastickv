@@ -191,6 +191,77 @@ func TestS3StoreUsesMultipartForLargeObject(t *testing.T) {
 	require.Equal(t, sha, info.SHA256)
 	require.Equal(t, 1, fake.multipartCompletes)
 	require.Greater(t, fake.uploadedParts, 1)
+	require.Equal(t, types.ChecksumAlgorithmSha256, fake.lastMultipartCreateChecksumAlgorithm())
+	require.Equal(t, types.ChecksumAlgorithmSha256, fake.lastUploadPartChecksumAlgorithm())
+	require.NotNil(t, fake.lastUploadPartSHA256())
+	require.Equal(t, fake.uploadedParts, fake.completedPartChecksums())
+}
+
+func TestS3StoreMultipartHonorsDisabledChecksumHeaders(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store, err := NewS3Store(ctx, S3StoreConfig{
+		Client:                 fake,
+		Bucket:                 "backup-bucket",
+		ForcePathStyle:         true,
+		ServerSideEncryption:   string(types.ServerSideEncryptionAes256),
+		DisableChecksumHeaders: true,
+	})
+	require.NoError(t, err)
+	store.multipartThreshold = 4
+	store.multipartPartSize = 3
+	body := []byte("multipart-body")
+	sha := hexSHA256Bytes(body)
+
+	info, err := store.PutObject(ctx, "snapshots/multipart-no-checksum.fsm", bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	require.Equal(t, sha, info.SHA256)
+	require.Equal(t, types.ChecksumAlgorithm(""), fake.lastMultipartCreateChecksumAlgorithm())
+	require.Equal(t, types.ChecksumAlgorithm(""), fake.lastUploadPartChecksumAlgorithm())
+	require.Nil(t, fake.lastUploadPartSHA256())
+	require.Zero(t, fake.completedPartChecksums())
+}
+
+func TestS3StoreMultipartRejectsSourceHashMismatch(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store := newTestS3Store(t, fake)
+	store.multipartThreshold = 4
+	store.multipartPartSize = 3
+	body := []byte("multipart-body")
+	expectedSHA := hexSHA256Bytes([]byte("different-body"))
+
+	_, err := store.PutObject(ctx, "snapshots/multipart-mismatch.fsm", bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: expectedSHA,
+	})
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.Zero(t, fake.multipartCompletes)
+	require.Zero(t, fake.activeMultipartUploads())
+}
+
+func TestS3ObjectSHA256PrefersMetadataForCompositeMultipartChecksum(t *testing.T) {
+	bodySHA := hexSHA256Bytes([]byte("full-object"))
+	compositeSHA, err := sha256HexToBase64(hexSHA256Bytes([]byte("aws-composite-checksum")))
+	require.NoError(t, err)
+
+	got, err := s3ObjectSHA256(map[string]string{
+		s3MetadataSHA256: bodySHA,
+	}, aws.String(compositeSHA))
+	require.NoError(t, err)
+	require.Equal(t, bodySHA, got)
+}
+
+func TestMultipartPartSizeAllowsS3PartCapacity(t *testing.T) {
+	partSize, err := multipartPartSize(s3MaxObjectBytes, s3DefaultMultipartPart)
+	require.NoError(t, err)
+	require.Equal(t, s3MaxMultipartPart, partSize)
+
+	_, err = multipartPartSize(s3MaxObjectBytes+1, s3DefaultMultipartPart)
+	require.ErrorIs(t, err, ErrInvalidOptions)
 }
 
 func TestS3StoreRejectsInvalidKMSConfig(t *testing.T) {
@@ -234,6 +305,10 @@ type fakeS3Client struct {
 	objects              map[string]fakeS3Object
 	multipart            map[string]*fakeMultipartUpload
 	lastPut              types.ChecksumAlgorithm
+	lastMultipartCreate  types.ChecksumAlgorithm
+	lastUploadPart       types.ChecksumAlgorithm
+	lastUploadPartSHA    *string
+	completedChecksums   int
 	attempts             int
 	gets                 int
 	conditionalConflicts int
@@ -352,6 +427,7 @@ func (c *fakeS3Client) CreateMultipartUpload(
 	defer c.mu.Unlock()
 	c.nextUploadID++
 	uploadID := fmt.Sprintf("upload-%d", c.nextUploadID)
+	c.lastMultipartCreate = input.ChecksumAlgorithm
 	metadata := make(map[string]string, len(input.Metadata))
 	for k, v := range input.Metadata {
 		metadata[k] = v
@@ -382,6 +458,8 @@ func (c *fakeS3Client) UploadPart(
 	if err != nil {
 		return nil, err
 	}
+	c.lastUploadPart = input.ChecksumAlgorithm
+	c.lastUploadPartSHA = cloneStringPtr(input.ChecksumSHA256)
 	upload.parts[aws.ToInt32(input.PartNumber)] = append([]byte(nil), body...)
 	c.uploadedParts++
 	return &s3.UploadPartOutput{ETag: aws.String(fmt.Sprintf("etag-%d", aws.ToInt32(input.PartNumber)))}, nil
@@ -405,6 +483,9 @@ func (c *fakeS3Client) CompleteMultipartUpload(
 	}
 	var body []byte
 	for _, part := range input.MultipartUpload.Parts {
+		if part.ChecksumSHA256 != nil {
+			c.completedChecksums++
+		}
 		partBody := upload.parts[aws.ToInt32(part.PartNumber)]
 		body = append(body, partBody...)
 	}
@@ -437,6 +518,36 @@ func (c *fakeS3Client) lastPutChecksumAlgorithm() types.ChecksumAlgorithm {
 	return c.lastPut
 }
 
+func (c *fakeS3Client) lastMultipartCreateChecksumAlgorithm() types.ChecksumAlgorithm {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastMultipartCreate
+}
+
+func (c *fakeS3Client) lastUploadPartChecksumAlgorithm() types.ChecksumAlgorithm {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastUploadPart
+}
+
+func (c *fakeS3Client) lastUploadPartSHA256() *string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return cloneStringPtr(c.lastUploadPartSHA)
+}
+
+func (c *fakeS3Client) completedPartChecksums() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.completedChecksums
+}
+
+func (c *fakeS3Client) activeMultipartUploads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.multipart)
+}
+
 func (c *fakeS3Client) putAttempts() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -466,4 +577,12 @@ func (c *fakeS3Client) putRawObject(bucket string, key string, body []byte, meta
 
 func fakeS3ClientKey(bucket *string, key *string) string {
 	return aws.ToString(bucket) + "/" + aws.ToString(key)
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
