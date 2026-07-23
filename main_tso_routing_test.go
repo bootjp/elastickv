@@ -222,11 +222,13 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
 	opts := internalTimestampOptions(gated)
 	require.Len(t, opts, 1)
-	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeShadow))
-	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeCutover))
 
 	txn := &mainForwardTxn{}
 	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)
+
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeShadow))
+	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeCutover))
+
 	reqs := []*pb.Request{{
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
 	}}
