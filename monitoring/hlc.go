@@ -40,7 +40,7 @@ type HLCSource interface {
 type HLCMetrics struct {
 	// physicalCeilingSeconds is the Raft-agreed physical ceiling,
 	// expressed as a Unix timestamp in seconds.  A leader's
-	// ceiling should sit ~hlcPhysicalWindowMs ms (3 s default)
+	// ceiling should sit ~hlcPhysicalWindowMs ms (10 s default)
 	// ahead of wall_now; a stagnant value means the lease
 	// renewer has stopped landing entries.
 	physicalCeilingSeconds prometheus.Gauge
@@ -49,7 +49,7 @@ type HLCMetrics struct {
 	// (healthy, with the leader's renewer keeping up).  Zero or
 	// positive means the ceiling has expired locally —
 	// NextFenced is at-or-past the rejection boundary.  Alert
-	// on wallSkewSeconds > -0.5 (half of hlcPhysicalWindowMs)
+	// on wallSkewSeconds > -5 (half of hlcPhysicalWindowMs)
 	// to catch a renewal stall before the fence trips.
 	wallSkewSeconds prometheus.Gauge
 	// nextFencedRejectionsTotal is the cumulative number of
@@ -68,7 +68,7 @@ func newHLCMetrics(registerer prometheus.Registerer) *HLCMetrics {
 		}),
 		wallSkewSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "elastickv_hlc_wall_skew_seconds",
-			Help: "wall_now - physicalCeiling, in seconds. Negative is healthy (ceiling is in the future); zero or positive means NextFenced is at-or-past the rejection boundary. Alert on > -0.5 to catch renewal stalls before the HLC-4 (iii) fence trips.",
+			Help: "wall_now - physicalCeiling, in seconds. Negative is healthy (ceiling is in the future); zero or positive means NextFenced is at-or-past the rejection boundary. Alert on > -5 to catch renewal stalls before the HLC-4 (iii) fence trips.",
 		}),
 		nextFencedRejectionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "elastickv_hlc_next_fenced_rejections_total",
@@ -146,12 +146,12 @@ func (o *HLCObserver) observeOnce(source HLCSource) {
 	o.metrics.physicalCeilingSeconds.Set(float64(ceilingMs) / hlcMsPerSecond)
 	// Pre-bootstrap (ceilingMs == 0) the skew computation would produce
 	// nowMs / 1000 ≈ 1.75e9 seconds (~55 years), which would
-	// immediately trip the recommended `wallSkewSeconds > -0.5` alert
+	// immediately trip the recommended `wallSkewSeconds > -5` alert
 	// on every cold-start node until the first HLC lease lands.  Hold
 	// the gauge at 0 in that case — the physicalCeilingSeconds gauge
 	// already exposes the pre-bootstrap state (also 0), so an alert
 	// of the form
-	//   `wallSkewSeconds > -0.5 AND physicalCeilingSeconds > 0`
+	//   `wallSkewSeconds > -5 AND physicalCeilingSeconds > 0`
 	// behaves correctly.  (Claude review medium on PR #879.)
 	if ceilingMs > 0 {
 		o.metrics.wallSkewSeconds.Set(float64(nowMs-ceilingMs) / hlcMsPerSecond)
