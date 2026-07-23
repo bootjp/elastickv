@@ -8,10 +8,12 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 )
@@ -110,6 +112,36 @@ func (c *Coordinate) SetHLCLeaseRenewalBlocker(blocked func() bool) {
 		return
 	}
 	c.hlcRenewalBlocked = blocked
+}
+
+// WithSampler wires a keyviz sampler onto the single-group coordinator.
+// routeID must be the catalog route ID covering the single group; a zero routeID
+// disables sampling so callers cannot accidentally emit unroutable rows.
+func (c *Coordinate) WithSampler(s keyviz.Sampler, routeID uint64) *Coordinate {
+	if c == nil {
+		return c
+	}
+	if routeID == 0 {
+		c.samplerConfig.Store(nil)
+		return c
+	}
+	c.samplerConfig.Store(&samplerConfig{sampler: s, routeID: routeID})
+	return c
+}
+
+// WithSamplerRouteResolver wires keyviz sampling with a route lookup evaluated
+// for every observed key. Single-group deployments need this after a range
+// split, when one fixed startup RouteID no longer covers the keyspace.
+func (c *Coordinate) WithSamplerRouteResolver(s keyviz.Sampler, resolve func(key []byte) (uint64, bool)) *Coordinate {
+	if c == nil {
+		return c
+	}
+	if s == nil || resolve == nil {
+		c.samplerConfig.Store(nil)
+		return c
+	}
+	c.samplerConfig.Store(&samplerConfig{sampler: s, resolve: resolve})
+	return c
 }
 
 // normalizeLeaseObserver flattens a typed-nil LeaseReadObserver to an
@@ -229,9 +261,18 @@ type Coordinate struct {
 	// nil check so production does not pay an interface call when
 	// monitoring is disabled).
 	leaseObserver LeaseReadObserver
+	samplerConfig atomic.Pointer[samplerConfig]
 }
 
 var _ Coordinator = (*Coordinate)(nil)
+
+type samplerRouteResolveFunc func(key []byte) (uint64, bool)
+
+type samplerConfig struct {
+	sampler keyviz.Sampler
+	routeID uint64
+	resolve samplerRouteResolveFunc
+}
 
 type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)
@@ -571,6 +612,7 @@ func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderA
 // monotonicity across the leader transition.
 func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
+		c.observeElems(reqs.Elems)
 		return c.redirect(ctx, reqs)
 	}
 
@@ -895,6 +937,17 @@ func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
 	return c.IsLeader()
 }
 
+// LeadershipForKey reports local leadership and the current Raft term for the
+// single group that owns every key handled by Coordinate.
+func (c *Coordinate) LeadershipForKey(_ []byte) (bool, uint64) {
+	return leadershipForEngine(c.engine)
+}
+
+// GroupLeadership reports leadership for Coordinate's single Raft group.
+func (c *Coordinate) GroupLeadership(_ uint64) (bool, uint64) {
+	return leadershipForEngine(c.engine)
+}
+
 func (c *Coordinate) VerifyLeaderForKey(ctx context.Context, _ []byte) error {
 	return c.VerifyLeader(ctx)
 }
@@ -907,7 +960,8 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 	return linearizableReadEngineCtx(ctx, c.engine)
 }
 
-func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+func (c *Coordinate) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.observeRead(key)
 	return c.LinearizableRead(ctx)
 }
 
@@ -1012,7 +1066,8 @@ func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, lea
 	return now.Sub(ack) < leaseDur
 }
 
-func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
+func (c *Coordinate) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.observeRead(key)
 	return c.LeaseRead(ctx)
 }
 
@@ -1119,6 +1174,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	if err := ValidateElemCommitTSPatches(reqs, commitTS); err != nil {
 		return nil, err
 	}
+	c.observeElems(reqs)
 
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu, eliminating the TOCTOU
@@ -1144,7 +1200,9 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*CoordinateResponse, error) {
 	muts := make([]*pb.Mutation, 0, len(req))
 	for _, elem := range req {
-		muts = append(muts, elemToMutation(elem))
+		mut := elemToMutation(elem)
+		c.observeMutation(mut)
+		muts = append(muts, mut)
 	}
 
 	ts, err := c.allocateTimestamp(ctx, "allocate raw dispatch ts")
@@ -1166,6 +1224,78 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 		CommitIndex: r.CommitIndex,
 		CommitTS:    ts,
 	}, nil
+}
+
+func (c *Coordinate) observeElems(elems []*Elem[OP]) {
+	if c == nil {
+		return
+	}
+	for _, elem := range elems {
+		c.observeMutation(elemToMutation(elem))
+	}
+}
+
+// ObserveForwardedRequests records leader-side sampling evidence for writes
+// that entered through a follower and were committed via Internal.Forward.
+func (c *Coordinate) ObserveForwardedRequests(reqs []*pb.Request) {
+	if c == nil {
+		return
+	}
+	for _, req := range reqs {
+		if req == nil {
+			continue
+		}
+		for _, mut := range req.Mutations {
+			if mut == nil || isTxnMetaKey(mut.Key) {
+				continue
+			}
+			c.observeMutation(mut)
+		}
+	}
+}
+
+func (c *Coordinate) observeMutation(mut *pb.Mutation) {
+	cfg := c.samplerSnapshot()
+	if cfg == nil || mut == nil {
+		return
+	}
+	routeID, sampleKey, ok := cfg.routeForKey(mut.Key)
+	if !ok {
+		return
+	}
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpWrite, len(mut.Value), keyviz.LabelLegacy)
+}
+
+func (c *Coordinate) observeRead(key []byte) {
+	cfg := c.samplerSnapshot()
+	if cfg == nil {
+		return
+	}
+	routeID, sampleKey, ok := cfg.routeForKey(key)
+	if !ok {
+		return
+	}
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpRead, 0, keyviz.LabelLegacy)
+}
+
+func (c *Coordinate) samplerSnapshot() *samplerConfig {
+	if c == nil {
+		return nil
+	}
+	cfg := c.samplerConfig.Load()
+	if cfg == nil || cfg.sampler == nil {
+		return nil
+	}
+	return cfg
+}
+
+func (cfg *samplerConfig) routeForKey(key []byte) (uint64, []byte, bool) {
+	sampleKey := RouteKey(key)
+	if cfg.resolve != nil {
+		routeID, ok := cfg.resolve(sampleKey)
+		return routeID, sampleKey, ok && routeID != 0
+	}
+	return cfg.routeID, sampleKey, cfg.routeID != 0
 }
 
 // toRawRequest builds a forwarded raw Request for the redirect path

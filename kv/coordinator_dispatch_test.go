@@ -1,9 +1,15 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/keyviz"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -180,6 +186,145 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 	require.Equal(t, 1, tx.commits)
 }
 
+func TestCoordinateSamplerObservesRawTxnAndRead(t *testing.T) {
+	t.Parallel()
+
+	const routeID = uint64(7)
+	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 8,
+	})
+	sampler.RegisterRoute(routeID, []byte(""), nil, 1)
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	c := (&Coordinate{
+		transactionManager: &stubTransactional{},
+		engine:             stubLeaderEngine{},
+		clock:              clock,
+	}).WithSampler(sampler, routeID)
+
+	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("raw"), Value: []byte("value")},
+		},
+	})
+	require.NoError(t, err)
+	startTS, err := c.nextStartTS(context.Background())
+	require.NoError(t, err)
+	_, err = c.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("txn"), Value: []byte("value")},
+		},
+	})
+	require.NoError(t, err)
+	_, err = c.LeaseReadForKey(context.Background(), []byte("read"))
+	require.NoError(t, err)
+
+	sampler.Flush()
+	row := requireKeyVizRouteRow(t, sampler, routeID)
+	const expectedWriteBytes uint64 = 16 // raw+value and txn+value.
+	require.Equal(t, uint64(2), row.Writes)
+	require.Equal(t, uint64(1), row.Reads)
+	require.Equal(t, expectedWriteBytes, row.WriteBytes)
+}
+
+func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
+	t.Parallel()
+
+	sampler := &recordingSampler{}
+	rawS3Key := s3keys.ObjectManifestKey("bucket", 1, "z-object")
+	normalizedS3Key := RouteKey(rawS3Key)
+	var resolverKeys [][]byte
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	c := (&Coordinate{
+		transactionManager: &stubTransactional{},
+		engine:             stubLeaderEngine{},
+		clock:              clock,
+	}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
+		resolverKeys = append(resolverKeys, append([]byte(nil), key...))
+		if bytes.Equal(key, normalizedS3Key) {
+			return 8, true
+		}
+		return 7, true
+	})
+
+	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
+		{Op: Put, Key: []byte("a"), Value: []byte("left")},
+		{Op: Put, Key: rawS3Key, Value: []byte("right")},
+	}})
+	require.NoError(t, err)
+
+	require.Equal(t, [][]byte{[]byte("a"), normalizedS3Key}, resolverKeys)
+	calls := sampler.snapshot()
+	require.Len(t, calls, 2)
+	require.Equal(t, uint64(7), calls[0].routeID)
+	require.Equal(t, []byte("a"), calls[0].key)
+	require.Equal(t, uint64(8), calls[1].routeID)
+	require.Equal(t, normalizedS3Key, calls[1].key)
+	require.NotEqual(t, rawS3Key, calls[1].key)
+}
+
+func TestCoordinateObserveForwardedRequestsSkipsTxnMetadata(t *testing.T) {
+	t.Parallel()
+
+	sampler := &recordingSampler{}
+	var resolverKeys [][]byte
+	c := (&Coordinate{}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
+		resolverKeys = append(resolverKeys, append([]byte(nil), key...))
+		return 7, true
+	})
+
+	c.ObserveForwardedRequests([]*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(TxnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("hot")})},
+			{Op: pb.Op_PUT, Key: []byte("hot"), Value: []byte("value")},
+		},
+	}})
+
+	require.Equal(t, [][]byte{[]byte("hot")}, resolverKeys)
+	calls := sampler.snapshot()
+	require.Len(t, calls, 1)
+	require.Equal(t, uint64(7), calls[0].routeID)
+	require.Equal(t, []byte("hot"), calls[0].key)
+}
+
+func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {
+	t.Parallel()
+
+	const routeID = uint64(7)
+	sampler := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 8,
+	})
+	require.True(t, sampler.RegisterRoute(routeID, []byte(""), nil, 1))
+	c := (&Coordinate{
+		engine: redirectSamplerFollowerEngine{},
+	}).WithSampler(sampler, routeID)
+
+	_, err := c.dispatchOnce(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
+		{Op: Put, Key: []byte("forwarded"), Value: []byte("value")},
+	}})
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+	sampler.Flush()
+	require.Equal(t, uint64(1), requireKeyVizRouteRow(t, sampler, routeID).Writes)
+}
+
+type redirectSamplerFollowerEngine struct {
+	stubLeaderEngine
+}
+
+func (redirectSamplerFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
+func (redirectSamplerFollowerEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{}
+}
+
 // TestToRawRequestLeavesTsForLeaderStamping is the regression for the
 // codex P2 review on PR #867.
 //
@@ -219,6 +364,20 @@ func TestToRawRequestLeavesTsForLeaderStamping(t *testing.T) {
 				"forwarded raw requests must arrive with Ts==0 so the leader's stampRawTimestamps assigns the canonical ts (HLC leader-only invariant + HLC-4 (iii) fence)")
 		})
 	}
+}
+
+func requireKeyVizRouteRow(t *testing.T, sampler *keyviz.MemSampler, routeID uint64) keyviz.MatrixRow {
+	t.Helper()
+	cols := sampler.Snapshot(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	for _, col := range cols {
+		for _, row := range col.Rows {
+			if row.RouteID == routeID {
+				return row
+			}
+		}
+	}
+	require.Failf(t, "missing keyviz row", "route_id=%d", routeID)
+	return keyviz.MatrixRow{}
 }
 
 // TestBuildRedirectRequestsSurvivesStaleFollowerCeiling exercises the

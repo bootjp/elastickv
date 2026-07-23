@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -15,10 +16,12 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -46,6 +49,35 @@ var (
 	raftRedisMap   = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
 	raftS3Map      = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap  = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
+
+	keyvizEnabled                = flag.Bool("keyvizEnabled", false, "Enable the in-memory key visualizer sampler")
+	keyvizStep                   = flag.Duration("keyvizStep", keyviz.DefaultStep, "Flush interval / matrix-column resolution for the keyviz sampler")
+	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
+	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket")
+	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer")
+	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route")
+	keyvizHotKeysEnabled         = flag.Bool("keyvizHotKeysEnabled", false, "Enable per-route Top-K hot-key sampling")
+	keyvizHotKeysPerRoute        = flag.Int("keyvizHotKeysPerRoute", keyviz.DefaultHotKeysPerRoute, "Space-Saving sketch capacity per route")
+	keyvizHotKeysSampleRate      = flag.Int("keyvizHotKeysSampleRate", keyviz.DefaultHotKeysSampleRate, "Hot-key observation sample rate")
+	keyvizHotKeysQueueSize       = flag.Int("keyvizHotKeysQueueSize", keyviz.DefaultHotKeysQueueSize, "Hot-key aggregator queue capacity")
+	keyvizHotKeysMaxKeyLen       = flag.Int("keyvizHotKeysMaxKeyLen", keyviz.DefaultHotKeysMaxKeyLen, "Maximum key length retained by hot-key sampling")
+
+	autoSplit                    = flag.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the catalog leader")
+	autoSplitEvalInterval        = flag.Duration("autoSplitEvalInterval", autosplit.DefaultEvalInterval, "Interval between automatic hotspot split evaluations")
+	autoSplitSplitCooldown       = flag.Duration("autoSplitCooldown", autosplit.DefaultSplitCooldown, "Minimum cooldown before a route created by SplitRange can be auto-split again")
+	autoSplitSplitTimeout        = flag.Duration("autoSplitSplitTimeout", autosplit.DefaultSplitTimeout, "Timeout for each automatic SplitRange RPC")
+	autoSplitKillSwitchFile      = flag.String("autoSplitKillSwitchFile", "", "If non-empty and the file exists, the auto-split scheduler observes but skips new splits")
+	autoSplitDefaultBuckets      = flag.Int("autoSplitDefaultBuckets", autosplit.DefaultSamplerBuckets, "KeyViz buckets per route implied by --autoSplit when --keyvizKeyBucketsPerRoute was not explicitly set")
+	autoSplitWriteWeight         = flag.Float64("autoSplitWriteWeight", autosplit.DefaultConfig().WriteWeight, "Weighted ops/min multiplier for writes in automatic hotspot detection")
+	autoSplitReadWeight          = flag.Float64("autoSplitReadWeight", autosplit.DefaultConfig().ReadWeight, "Weighted ops/min multiplier for reads in automatic hotspot detection")
+	autoSplitThresholdOpsMin     = flag.Float64("autoSplitThreshold", autosplit.DefaultConfig().ThresholdOpsMin, "Weighted ops/min threshold per committed KeyViz column for automatic hotspot detection")
+	autoSplitCandidateWindows    = flag.Int("autoSplitCandidateWindows", autosplit.DefaultConfig().CandidateWindows, "Consecutive committed KeyViz columns over threshold required before an automatic split")
+	autoSplitMaxRoutes           = flag.Int("autoSplitMaxRoutes", autosplit.DefaultConfig().MaxRoutes, "Maximum live routes allowed after automatic splits")
+	autoSplitMaxSplitsPerCycle   = flag.Int("autoSplitMaxPerCycle", autosplit.DefaultConfig().MaxSplitsPerCycle, "Maximum automatic split decisions scheduled per evaluation cycle")
+	autoSplitTopKeyShare         = flag.Float64("autoSplitTopKeyShare", autosplit.DefaultConfig().TopKeyShare, "Minimum lower-bound share of route writes required for hot-key isolation")
+	autoSplitTopKeyAbsoluteFloor = flag.Float64("autoSplitTopKeyAbsoluteFloor", 0, "Minimum lower-bound hot-key weighted ops/min; zero uses half --autoSplitThreshold")
+
+	keyvizKeyBucketsPerRouteExplicit bool
 )
 
 const (
@@ -92,6 +124,7 @@ type config struct {
 
 func main() {
 	flag.Parse()
+	recordExplicitDemoFlags(flag.CommandLine)
 
 	eg, runCtx := errgroup.WithContext(context.Background())
 
@@ -231,6 +264,344 @@ func effectiveDemoMetricsToken(token string) string {
 		return token
 	}
 	return "demo-metrics-token"
+}
+
+func recordExplicitDemoFlags(fs *flag.FlagSet) {
+	if fs == nil {
+		return
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "keyvizKeyBucketsPerRoute" {
+			keyvizKeyBucketsPerRouteExplicit = true
+		}
+	})
+}
+
+func buildDemoKeyVizSampler() *keyviz.MemSampler {
+	if !*keyvizEnabled && !*autoSplit {
+		return nil
+	}
+	keyBucketsPerRoute := *keyvizKeyBucketsPerRoute
+	if *autoSplit && !keyvizKeyBucketsPerRouteExplicit && keyBucketsPerRoute <= keyviz.DefaultKeyBucketsPerRoute {
+		keyBucketsPerRoute = *autoSplitDefaultBuckets
+	}
+	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step:                   *keyvizStep,
+		HistoryColumns:         *keyvizHistoryColumns,
+		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
+		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
+		KeyBucketsPerRoute:     keyBucketsPerRoute,
+		HotKeysEnabled:         *keyvizHotKeysEnabled,
+		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
+		HotKeysSampleRate:      *keyvizHotKeysSampleRate,
+		HotKeysQueueSize:       *keyvizHotKeysQueueSize,
+		HotKeysMaxKeyLen:       *keyvizHotKeysMaxKeyLen,
+	})
+}
+
+func seedDemoKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
+	if s == nil || engine == nil {
+		return
+	}
+	for _, route := range engine.Stats() {
+		s.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID)
+	}
+}
+
+func startDemoKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
+	if eg == nil || s == nil {
+		return
+	}
+	eg.Go(func() error {
+		keyviz.RunFlusher(ctx, s, s.Step())
+		s.Flush()
+		return nil
+	})
+	eg.Go(func() error {
+		keyviz.RunHotKeysAggregator(ctx, s)
+		return nil
+	})
+}
+
+func demoAutoSplitConfigFromFlags(coordinator *kv.Coordinate) (autosplit.SchedulerConfig, error) {
+	cfg := autosplit.SchedulerConfig{
+		Enabled:        *autoSplit,
+		EvalInterval:   *autoSplitEvalInterval,
+		SplitCooldown:  *autoSplitSplitCooldown,
+		SplitTimeout:   *autoSplitSplitTimeout,
+		KillSwitchFile: strings.TrimSpace(*autoSplitKillSwitchFile),
+		Logger:         slog.Default(),
+		Detector: autosplit.Config{
+			WriteWeight:         *autoSplitWriteWeight,
+			ReadWeight:          *autoSplitReadWeight,
+			ThresholdOpsMin:     *autoSplitThresholdOpsMin,
+			CandidateWindows:    *autoSplitCandidateWindows,
+			MaxRoutes:           *autoSplitMaxRoutes,
+			MaxSplitsPerCycle:   *autoSplitMaxSplitsPerCycle,
+			TopKeyShare:         *autoSplitTopKeyShare,
+			TopKeyAbsoluteFloor: *autoSplitTopKeyAbsoluteFloor,
+		},
+	}
+	if coordinator != nil {
+		cfg.IsLeader = demoAutoSplitLeaderGate(coordinator)
+		cfg.Leadership = func() (bool, uint64) {
+			return coordinator.LeadershipForKey(distribution.CatalogVersionKey())
+		}
+		cfg.GroupLeadership = coordinator.GroupLeadership
+	}
+	if err := validateDemoAutoSplitConfig(cfg); err != nil {
+		return autosplit.SchedulerConfig{}, err
+	}
+	return cfg, nil
+}
+
+func validateDemoAutoSplitConfig(cfg autosplit.SchedulerConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if err := validateDemoAutoSplitSamplerConfig(cfg.Detector); err != nil {
+		return err
+	}
+	if err := validateDemoAutoSplitDetectorConfig(cfg.Detector); err != nil {
+		return err
+	}
+	return validateDemoAutoSplitSchedulerConfig(cfg)
+}
+
+func validateDemoAutoSplitSamplerConfig(cfg autosplit.Config) error {
+	if demoAutoSplitUsesDefaultBuckets() {
+		if *autoSplitDefaultBuckets <= keyviz.DefaultKeyBucketsPerRoute {
+			return errors.New("--autoSplitDefaultBuckets must be greater than 1")
+		}
+		if *autoSplitDefaultBuckets > keyviz.MaxKeyBucketsPerRoute {
+			return errors.Errorf("--autoSplitDefaultBuckets (%d) must be <= %d", *autoSplitDefaultBuckets, keyviz.MaxKeyBucketsPerRoute)
+		}
+	}
+	if cfg.MaxRoutes > *keyvizMaxTrackedRoutes {
+		return errors.Errorf("--autoSplitMaxRoutes (%d) must be <= --keyvizMaxTrackedRoutes (%d); raise keyviz capacity or lower the auto-split route cap", cfg.MaxRoutes, *keyvizMaxTrackedRoutes)
+	}
+	return nil
+}
+
+func demoAutoSplitUsesDefaultBuckets() bool {
+	return *autoSplit &&
+		!keyvizKeyBucketsPerRouteExplicit &&
+		*keyvizKeyBucketsPerRoute <= keyviz.DefaultKeyBucketsPerRoute
+}
+
+func validateDemoAutoSplitDetectorConfig(cfg autosplit.Config) error {
+	if err := validateDemoAutoSplitWeights(cfg.WriteWeight, cfg.ReadWeight); err != nil {
+		return err
+	}
+	if err := validateDemoAutoSplitDetectorLimits(cfg); err != nil {
+		return err
+	}
+	return validateDemoAutoSplitHotKeyThresholds(cfg)
+}
+
+func validateDemoAutoSplitDetectorLimits(cfg autosplit.Config) error {
+	if !isFiniteDemoAutoSplitFloat(cfg.ThresholdOpsMin) || cfg.ThresholdOpsMin <= 0 {
+		return errors.New("--autoSplitThreshold must be positive")
+	}
+	if cfg.CandidateWindows <= 0 {
+		return errors.New("--autoSplitCandidateWindows must be positive")
+	}
+	if cfg.MaxRoutes <= 0 {
+		return errors.New("--autoSplitMaxRoutes must be positive")
+	}
+	if cfg.MaxSplitsPerCycle <= 0 {
+		return errors.New("--autoSplitMaxPerCycle must be positive")
+	}
+	return nil
+}
+
+func validateDemoAutoSplitHotKeyThresholds(cfg autosplit.Config) error {
+	if !isFiniteDemoAutoSplitFloat(cfg.TopKeyShare) || cfg.TopKeyShare <= 0 || cfg.TopKeyShare > 1 {
+		return errors.New("--autoSplitTopKeyShare must be in (0, 1]")
+	}
+	if !isFiniteDemoAutoSplitFloat(cfg.TopKeyAbsoluteFloor) || cfg.TopKeyAbsoluteFloor < 0 {
+		return errors.New("--autoSplitTopKeyAbsoluteFloor must be non-negative")
+	}
+	return nil
+}
+
+func validateDemoAutoSplitWeights(writeWeight, readWeight float64) error {
+	if !isFiniteDemoAutoSplitFloat(writeWeight) || !isFiniteDemoAutoSplitFloat(readWeight) ||
+		writeWeight < 0 || readWeight < 0 || (writeWeight == 0 && readWeight == 0) {
+		return errors.New("--autoSplitWriteWeight and --autoSplitReadWeight must be non-negative and at least one must be positive")
+	}
+	return nil
+}
+
+func isFiniteDemoAutoSplitFloat(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func validateDemoAutoSplitSchedulerConfig(cfg autosplit.SchedulerConfig) error {
+	if cfg.EvalInterval <= 0 {
+		return errors.New("--autoSplitEvalInterval must be positive")
+	}
+	if cfg.SplitCooldown <= 0 {
+		return errors.New("--autoSplitCooldown must be positive")
+	}
+	if cfg.SplitTimeout <= 0 {
+		return errors.New("--autoSplitSplitTimeout must be positive")
+	}
+	return nil
+}
+
+func startDemoAutoSplitScheduler(
+	ctx context.Context,
+	eg *errgroup.Group,
+	catalog *distribution.CatalogStore,
+	distServer *adapter.DistributionServer,
+	coordinator *kv.Coordinate,
+	sampler *keyviz.MemSampler,
+	cfg autosplit.SchedulerConfig,
+) {
+	if eg == nil || !cfg.Enabled {
+		return
+	}
+	if sampler == nil {
+		cfg.Logger.Warn("autosplit: sampler not configured; scheduler disabled")
+		return
+	}
+	if coordinator != nil {
+		cfg.IsLeader = demoAutoSplitLeaderGate(coordinator)
+		cfg.Leadership = func() (bool, uint64) {
+			return coordinator.LeadershipForKey(distribution.CatalogVersionKey())
+		}
+		cfg.GroupLeadership = coordinator.GroupLeadership
+	}
+	scheduler := autosplit.NewScheduler(
+		cfg,
+		catalog,
+		demoAutoSplitDistributionSplitter{server: distServer},
+		sampler,
+		sampler,
+	)
+	eg.Go(func() error {
+		return scheduler.Run(ctx)
+	})
+}
+
+type demoAutoSplitDistributionSplitter struct {
+	server *adapter.DistributionServer
+}
+
+func demoAutoSplitLeaderGate(coordinator *kv.Coordinate) func() bool {
+	if coordinator == nil {
+		return nil
+	}
+	return func() bool {
+		return coordinator.IsLeaderForKey(distribution.CatalogVersionKey())
+	}
+}
+
+func (s demoAutoSplitDistributionSplitter) SplitRange(ctx context.Context, req autosplit.SplitRequest) (autosplit.SplitResult, error) {
+	if s.server == nil {
+		return autosplit.SplitResult{}, errors.New("autosplit: distribution server is not configured")
+	}
+	if req.TargetGroupID != 0 {
+		return autosplit.SplitResult{}, errors.New("autosplit: cross-group target selection is not enabled")
+	}
+	resp, err := s.server.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: req.ExpectedCatalogVersion,
+		RouteId:                req.RouteID,
+		SplitKey:               distribution.CloneBytes(req.SplitKey),
+	})
+	if err != nil {
+		return autosplit.SplitResult{}, errors.Wrap(err, "autosplit: split range")
+	}
+	return autosplit.SplitResult{
+		CatalogVersion: resp.GetCatalogVersion(),
+		Left:           demoAutoSplitRouteFromProto(resp.GetLeft()),
+		Right:          demoAutoSplitRouteFromProto(resp.GetRight()),
+	}, nil
+}
+
+func demoAutoSplitRouteFromProto(route *pb.RouteDescriptor) distribution.RouteDescriptor {
+	if route == nil {
+		return distribution.RouteDescriptor{}
+	}
+	state := distribution.RouteStateWriteFenced
+	switch route.GetState() {
+	case pb.RouteState_ROUTE_STATE_UNSPECIFIED,
+		pb.RouteState_ROUTE_STATE_WRITE_FENCED:
+		state = distribution.RouteStateWriteFenced
+	case pb.RouteState_ROUTE_STATE_ACTIVE:
+		state = distribution.RouteStateActive
+	case pb.RouteState_ROUTE_STATE_MIGRATING_SOURCE:
+		state = distribution.RouteStateMigratingSource
+	case pb.RouteState_ROUTE_STATE_MIGRATING_TARGET:
+		state = distribution.RouteStateMigratingTarget
+	}
+	return distribution.RouteDescriptor{
+		RouteID:       route.GetRouteId(),
+		Start:         distribution.CloneBytes(route.GetStart()),
+		End:           distribution.CloneBytes(route.GetEnd()),
+		GroupID:       route.GetRaftGroupId(),
+		State:         state,
+		ParentRouteID: route.GetParentRouteId(),
+		SplitAtHLC:    route.GetSplitAtHlc(),
+	}
+}
+
+type demoDistributionRuntime struct {
+	engine       *distribution.Engine
+	catalog      *distribution.CatalogStore
+	server       *adapter.DistributionServer
+	autoSplitCfg autosplit.SchedulerConfig
+	reconciler   *autosplit.RouteReconciler
+	sampler      *keyviz.MemSampler
+}
+
+func setupDemoDistributionRuntime(
+	ctx context.Context,
+	st store.MVCCStore,
+	coordinator *kv.Coordinate,
+	readTracker *kv.ActiveTimestampTracker,
+	metricsRegistry *monitoring.Registry,
+) (demoDistributionRuntime, error) {
+	runtime := demoDistributionRuntime{
+		engine:  distribution.NewEngineWithDefaultRoute(),
+		catalog: distribution.NewCatalogStore(st),
+	}
+	if _, err := distribution.EnsureCatalogSnapshot(ctx, runtime.catalog, runtime.engine); err != nil {
+		return demoDistributionRuntime{}, errors.WithStack(err)
+	}
+	runtime.server = adapter.NewDistributionServer(
+		runtime.engine,
+		runtime.catalog,
+		adapter.WithDistributionCoordinator(coordinator),
+		adapter.WithDistributionActiveTimestampTracker(readTracker),
+	)
+	var err error
+	runtime.autoSplitCfg, err = demoAutoSplitConfigFromFlags(coordinator)
+	if err != nil {
+		return demoDistributionRuntime{}, err
+	}
+	runtime.autoSplitCfg.Observer = autosplit.NewPrometheusObserver(metricsRegistry.Registerer())
+	runtime.sampler = buildDemoKeyVizSampler()
+	seedDemoKeyVizRoutes(runtime.sampler, runtime.engine)
+	if runtime.sampler != nil {
+		runtime.reconciler = autosplit.NewRouteReconciler(runtime.sampler)
+		initialSnapshot, snapshotErr := runtime.catalog.Snapshot(ctx)
+		if snapshotErr != nil {
+			return demoDistributionRuntime{}, errors.Wrap(snapshotErr, "load initial catalog for keyviz reconciliation")
+		}
+		runtime.reconciler.Reconcile(initialSnapshot.Routes)
+		runtime.autoSplitCfg.Reconciler = runtime.reconciler
+	}
+	coordinator.WithSamplerRouteResolver(runtime.sampler, demoSamplerRouteResolver(runtime.engine))
+	return runtime, nil
+}
+
+func demoSamplerRouteResolver(engine *distribution.Engine) func([]byte) (uint64, bool) {
+	return func(key []byte) (uint64, bool) {
+		route, ok := engine.GetRoute(kv.RouteKey(key))
+		return route.RouteID, ok && route.State == distribution.RouteStateActive
+	}
 }
 
 // setupFSMStore creates and returns the MVCCStore for the Raft FSM.
@@ -472,17 +843,16 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 		// the closure here matches the symmetric construction order.
 		_ = coordinator.Close()
 	}()
-	distEngine := distribution.NewEngineWithDefaultRoute()
-	distCatalog := distribution.NewCatalogStore(st)
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, distEngine); err != nil {
-		return errors.WithStack(err)
+	distributionRuntime, err := setupDemoDistributionRuntime(ctx, st, coordinator, readTracker, metricsRegistry)
+	if err != nil {
+		return err
 	}
-	distServer := adapter.NewDistributionServer(
-		distEngine,
-		distCatalog,
-		adapter.WithDistributionCoordinator(coordinator),
-		adapter.WithDistributionActiveTimestampTracker(readTracker),
-	)
+	distEngine := distributionRuntime.engine
+	distCatalog := distributionRuntime.catalog
+	distServer := distributionRuntime.server
+	autoSplitCfg := distributionRuntime.autoSplitCfg
+	autoSplitReconciler := distributionRuntime.reconciler
+	sampler := distributionRuntime.sampler
 	metricsRegistry.RaftObserver().Start(ctx, []monitoring.RaftRuntime{{
 		GroupID:      1,
 		StatusReader: engine,
@@ -531,7 +901,11 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	}
 
 	eg.Go(func() error { coordinator.RunHLCLeaseRenewal(ctx); return nil })
-	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine))
+	eg.Go(catalogWatcherTask(ctx, distCatalog, distEngine, func(snapshot distribution.CatalogSnapshot) {
+		autoSplitReconciler.Reconcile(snapshot.Routes)
+	}))
+	startDemoKeyVizFlusher(ctx, eg, sampler)
+	startDemoAutoSplitScheduler(ctx, eg, distCatalog, distServer, coordinator, sampler, autoSplitCfg)
 	eg.Go(func() error { return compactor.Run(ctx) })
 	eg.Go(func() error { return deltaCompactor.Run(ctx) })
 	eg.Go(grpcShutdownTask(ctx, s, grpcSock, cfg.address, grpcSvc))
@@ -607,9 +981,24 @@ func setupPprofHTTPServer(ctx context.Context, lc net.ListenConfig, pprofAddress
 	return pprofL, ps, nil
 }
 
-func catalogWatcherTask(ctx context.Context, distCatalog *distribution.CatalogStore, distEngine *distribution.Engine) func() error {
+func catalogWatcherTask(
+	ctx context.Context,
+	distCatalog *distribution.CatalogStore,
+	distEngine *distribution.Engine,
+	observers ...distribution.CatalogSnapshotObserver,
+) func() error {
 	return func() error {
-		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default()); err != nil {
+		var opts []distribution.CatalogWatcherOption
+		if len(observers) > 0 {
+			opts = append(opts, distribution.WithCatalogWatcherSnapshotObserver(func(snapshot distribution.CatalogSnapshot) {
+				for _, observer := range observers {
+					if observer != nil {
+						observer(snapshot)
+					}
+				}
+			}))
+		}
+		if err := distribution.RunCatalogWatcher(ctx, distCatalog, distEngine, slog.Default(), opts...); err != nil {
 			return errors.Wrapf(err, "catalog watcher failed")
 		}
 		return nil

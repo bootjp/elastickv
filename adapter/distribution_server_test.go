@@ -653,6 +653,29 @@ func TestDistributionServerSplitRange_ReturnsExactCommittedSplitVersion(t *testi
 	require.Equal(t, uint64(3), latest.Version)
 }
 
+func TestDistributionServerApplyEngineSnapshotAcceptsNewerEngine(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	recent := distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte(""),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}
+	require.NoError(t, engine.ApplySnapshot(recent))
+
+	s := NewDistributionServer(engine, nil)
+	stale := recent
+	stale.Version = 2
+	require.NoError(t, s.applyEngineSnapshot(stale))
+	require.Equal(t, uint64(3), engine.Version())
+}
+
 func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {
 	t.Parallel()
 

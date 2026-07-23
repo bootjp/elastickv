@@ -649,6 +649,9 @@ func (s *DistributionServer) applyEngineSnapshot(snapshot distribution.CatalogSn
 		return grpcStatusError(codes.FailedPrecondition, errDistributionEngineNotConfigured.Error())
 	}
 	if err := s.engine.ApplySnapshot(snapshot); err != nil {
+		if errors.Is(err, distribution.ErrEngineSnapshotVersionStale) {
+			return nil
+		}
 		return grpcStatusErrorf(codes.Internal, "apply engine snapshot: %v", err)
 	}
 	return nil

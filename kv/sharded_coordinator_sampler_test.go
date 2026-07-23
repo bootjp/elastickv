@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -62,8 +63,13 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
-	engine.UpdateRoute([]byte("m"), nil, 2)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 101, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
 
 	s1 := store.NewMVCCStore()
 	r1, stop1 := newSingleRaft(t, "kv-sampler-g1", NewKvFSMWithHLC(s1, NewHLC()))
@@ -110,6 +116,60 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 			valueLen: len(elem.Value),
 		}, calls[i], "Observe call %d for key %q", i, elem.Key)
 	}
+}
+
+func TestShardedCoordinatorObservesForwardedRequests(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 101, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).WithSampler(rec)
+
+	coord.ObserveForwardedRequests([]*pb.Request{
+		{
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("left")},
+			},
+		},
+		{
+			IsTxn: true,
+			Phase: pb.Phase_NONE,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(TxnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("x")})},
+				{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("right")},
+			},
+		},
+	})
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2)
+	require.Equal(t, sampleCall{
+		routeID:  100,
+		op:       keyviz.OpWrite,
+		label:    keyviz.LabelLegacy,
+		key:      []byte("b"),
+		keyLen:   1,
+		valueLen: len("left"),
+	}, calls[0])
+	require.Equal(t, sampleCall{
+		routeID:  101,
+		op:       keyviz.OpWrite,
+		label:    keyviz.LabelLegacy,
+		key:      []byte("x"),
+		keyLen:   1,
+		valueLen: len("right"),
+	}, calls[1])
 }
 
 // TestShardedCoordinatorWithoutSamplerStaysSafe pins the nil-safe

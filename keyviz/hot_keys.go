@@ -39,6 +39,8 @@ type KeyvizHotKeysSnapshot struct {
 	DroppedSamples  uint64    // node-global: bounded-queue back-pressure drops
 	SkippedLongKeys uint64    // node-global: pre-sample length-cap rejects
 	SnapshotAt      time.Time // when the aggregator deep-copied this snapshot
+	WindowStart     time.Time // committed matrix-window lower boundary
+	WindowEnd       time.Time // committed matrix-window upper boundary
 	SampleRate      int       // R at the time of snapshot
 	Capacity        int       // m at the time of snapshot
 	Entries         []KeyvizHotKeyEntry
@@ -60,6 +62,7 @@ type KeyvizHotKeyEntry struct {
 type hotKeysAggregator struct {
 	s          *MemSampler // back-reference, for table.Load() at publish time
 	ch         chan hotKeyEvent
+	flush      chan hotKeyFlushRequest
 	keyPool    *sync.Pool // []byte buffers for hot-path key clones
 	capacity   int        // m
 	sampleRate int        // R (used by Observe)
@@ -86,6 +89,12 @@ type hotKeysAggregator struct {
 	// (Codex P1 round-4 L137). The state is process-local to this
 	// aggregator; concurrent Observe callers race on Add only.
 	rngState atomic.Uint64
+}
+
+type hotKeyFlushRequest struct {
+	windowStart time.Time
+	windowEnd   time.Time
+	reply       chan []KeyvizHotKeysSnapshot
 }
 
 // splitmix64 standard parameters — public-domain mixer used unchanged
@@ -152,6 +161,7 @@ func newHotKeysAggregator(s *MemSampler, opts MemSamplerOptions) *hotKeysAggrega
 	a := &hotKeysAggregator{
 		s:          s,
 		ch:         make(chan hotKeyEvent, opts.HotKeysQueueSize),
+		flush:      make(chan hotKeyFlushRequest),
 		capacity:   opts.HotKeysPerRoute,
 		sampleRate: opts.HotKeysSampleRate,
 		maxKeyLen:  maxKeyLen,
@@ -239,24 +249,10 @@ func (a *hotKeysAggregator) observe(routeID uint64, label Label, key []byte) boo
 	}
 }
 
-// run is the aggregator goroutine's main loop. Single select with two
-// arms (drain events / tick), matching the design §4 pseudocode:
-//
-//	for {
-//	  select {
-//	    case e := <-ch: updateSketch(e)
-//	    case <-tick:
-//	      for len(ch) > 0 { updateSketch(<-ch) }  // best-effort pre-drain
-//	      publishAndReset()
-//	  }
-//	}
-//
-// Single-writer to every per-route/label SS sketch and to perSlotN, so no
-// lock is needed on the update path. ctx cancellation drains a final
-// publish so the last window's data isn't lost on shutdown.
+// run serializes sampled events and matrix-flush snapshot requests. The matrix
+// flusher supplies the exact committed boundaries so Top-K evidence can be
+// attached to the matching MatrixColumn without timestamp heuristics.
 func (a *hotKeysAggregator) run(ctx context.Context) {
-	tick := time.NewTicker(a.step)
-	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -270,18 +266,38 @@ func (a *hotKeysAggregator) run(ctx context.Context) {
 			return
 		case e := <-a.ch:
 			a.consume(e)
-		case <-tick.C:
-			// Pre-drain: process every event currently queued before we
-			// publish + reset, so the just-finished window's tail-end
-			// observations land in this snapshot rather than the next
-			// (Codex P2 round-7 L193 — boundary smear is now bounded by
-			// arrivals during publishAndReset, not by the channel depth
-			// at the tick).
+		case req := <-a.flush:
 			for len(a.ch) > 0 {
 				a.consume(<-a.ch)
 			}
-			a.publishAndReset()
+			req.reply <- a.publishAndResetAt(req.windowStart, req.windowEnd)
 		}
+	}
+}
+
+func (a *hotKeysAggregator) snapshotWindow(
+	ctx context.Context,
+	windowStart time.Time,
+	windowEnd time.Time,
+) ([]KeyvizHotKeysSnapshot, bool) {
+	if a == nil {
+		return nil, true
+	}
+	req := hotKeyFlushRequest{
+		windowStart: windowStart,
+		windowEnd:   windowEnd,
+		reply:       make(chan []KeyvizHotKeysSnapshot, 1),
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case a.flush <- req:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case snapshots := <-req.reply:
+		return snapshots, true
 	}
 }
 
@@ -314,6 +330,11 @@ func (a *hotKeysAggregator) consume(e hotKeyEvent) {
 // per-route / node-global counters so the next keyvizStep window
 // starts empty (design §4 sketch reset; Codex P2 round-6 L186).
 func (a *hotKeysAggregator) publishAndReset() {
+	now := a.clock()
+	a.publishAndResetAt(now.Add(-a.step), now)
+}
+
+func (a *hotKeysAggregator) publishAndResetAt(windowStart, windowEnd time.Time) []KeyvizHotKeysSnapshot {
 	// When no per-route sketch exists this window (e.g. every observe
 	// was filtered by the length cap, or no traffic at all on any
 	// route), we have nowhere to attach the node-global drop / skip
@@ -321,9 +342,8 @@ func (a *hotKeysAggregator) publishAndReset() {
 	// the signal. Carry them forward into the next window instead;
 	// whichever publish tick first has a sketch will surface them.
 	if len(a.sketches) == 0 {
-		return
+		return nil
 	}
-	now := a.clock()
 	// Swap-and-capture (not Load + later Store(0)) — the hot path can
 	// still call a.dropped.Add(1) / a.skipped.Add(1) between a Load and
 	// a Store, and those increments would belong to neither the snapshot
@@ -333,6 +353,7 @@ func (a *hotKeysAggregator) publishAndReset() {
 	dropped := a.dropped.Swap(0)
 	skipped := a.skipped.Swap(0)
 	tbl := a.s.table.Load()
+	out := make([]KeyvizHotKeysSnapshot, 0, len(a.sketches))
 	for skey, sk := range a.sketches {
 		slot := lookupSlotForRoute(tbl, skey.RouteID, skey.Label)
 		if slot == nil {
@@ -355,12 +376,15 @@ func (a *hotKeysAggregator) publishAndReset() {
 			SampledN:        n,
 			DroppedSamples:  dropped,
 			SkippedLongKeys: skipped,
-			SnapshotAt:      now,
+			SnapshotAt:      windowEnd,
+			WindowStart:     windowStart,
+			WindowEnd:       windowEnd,
 			SampleRate:      a.sampleRate,
 			Capacity:        a.capacity,
 			Entries:         toSnapshotEntries(sk.snapshot()),
 		}
 		slot.hotKeysSnap.Store(snap)
+		out = append(out, cloneHotKeysSnapshot(*snap))
 		sk.reset()
 	}
 	// Per-route counters reset; the node-global ones were already
@@ -370,6 +394,17 @@ func (a *hotKeysAggregator) publishAndReset() {
 	for k := range a.perSlotN {
 		*a.perSlotN[k] = 0
 	}
+	return out
+}
+
+func cloneHotKeysSnapshot(snapshot KeyvizHotKeysSnapshot) KeyvizHotKeysSnapshot {
+	out := snapshot
+	out.Entries = make([]KeyvizHotKeyEntry, len(snapshot.Entries))
+	for i, entry := range snapshot.Entries {
+		out.Entries[i] = entry
+		out.Entries[i].Key = cloneBytes(entry.Key)
+	}
+	return out
 }
 
 func toSnapshotEntries(es []ssEntrySnap) []KeyvizHotKeyEntry {

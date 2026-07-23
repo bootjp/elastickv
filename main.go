@@ -20,6 +20,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -297,6 +298,7 @@ const bytesPerMiB = 1024 * 1024
 
 func main() {
 	flag.Parse()
+	recordExplicitRuntimeFlags(flag.CommandLine)
 
 	err := run()
 	if memoryPressureExit.Load() {
@@ -545,48 +547,29 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
-		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], cfg.defaultGroup,
-		encWiring, *raftId, *encryptionSidecarPath)
+	distStartup, err := startDistributionStartup(distributionStartupInput{
+		ctx:             runCtx,
+		eg:              eg,
+		cancel:          cancel,
+		cleanup:         &cleanup,
+		runtimes:        runtimes,
+		cfg:             cfg,
+		coordinate:      coordinate,
+		defaultGroup:    shardGroups[cfg.defaultGroup],
+		encWiring:       encWiring,
+		raftID:          *raftId,
+		sidecarPath:     *encryptionSidecarPath,
+		sampler:         sampler,
+		readTracker:     readTracker,
+		metricsRegistry: metricsRegistry,
+		clock:           clock,
+	})
 	if err != nil {
-		cancel()
 		return err
 	}
-	// Seed AFTER setupDistributionCatalog so the sampler picks up the
-	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
-	// setupDistributionCatalog applies a snapshot back into the engine
-	// with durable non-zero RouteIDs; seeding earlier would register
-	// the placeholder zero IDs from buildEngine and Observe would miss
-	// every dispatched mutation.
-	seedKeyVizRoutes(sampler, cfg.engine)
-
-	// The local durable watcher is the 100 ms fallback required when the
-	// best-effort leader stream is unavailable or reconnecting.
-	eg.Go(func() error {
-		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
-	})
-	catalogWatchConns := &kv.GRPCConnCache{}
-	cleanup.Add(func() { _ = catalogWatchConns.Close() })
-	eg.Go(func() error {
-		return runDistributionCatalogStream(runCtx, catalogRuntime, catalogWatchConns, cfg.engine)
-	})
-	startKeyVizFlusher(runCtx, eg, sampler)
-	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
-	startMemoryWatchdog(runCtx, eg, cancel)
-	distServer := adapter.NewDistributionServer(
-		cfg.engine,
-		distCatalog,
-		adapter.WithDistributionCoordinator(coordinate),
-		adapter.WithDistributionActiveTimestampTracker(readTracker),
-		adapter.WithCatalogWatchLeaderCheck(func() bool {
-			engine := catalogRuntime.snapshotEngine()
-			return engine != nil && engine.State() == raftengine.StateLeader
-		}),
-		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
-	)
-	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
-	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
+	defaultRuntime := distStartup.defaultRuntime
+	distServer := distStartup.distServer
+	autoSplitRuntime := distStartup.autoSplitRuntime
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -620,6 +603,7 @@ func run() error {
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
+		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
 		return err
@@ -635,6 +619,88 @@ func run() error {
 		return errors.Wrapf(err, "failed to serve")
 	}
 	return nil
+}
+
+type distributionStartupInput struct {
+	ctx             context.Context
+	eg              *errgroup.Group
+	cancel          context.CancelFunc
+	cleanup         *internalutil.CleanupStack
+	runtimes        []*raftGroupRuntime
+	cfg             runtimeConfig
+	coordinate      *kv.ShardedCoordinator
+	defaultGroup    *kv.ShardGroup
+	encWiring       encryptionWriteWiring
+	raftID          string
+	sidecarPath     string
+	sampler         *keyviz.MemSampler
+	readTracker     *kv.ActiveTimestampTracker
+	metricsRegistry *monitoring.Registry
+	clock           *kv.HLC
+}
+
+type distributionStartup struct {
+	defaultRuntime   *raftGroupRuntime
+	distServer       *adapter.DistributionServer
+	autoSplitRuntime adapter.AutoSplitRuntime
+}
+
+func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
+	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
+		in.ctx, in.eg, in.runtimes, in.cfg.engine,
+		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
+		in.encWiring, in.raftID, in.sidecarPath)
+	if err != nil {
+		in.cancel()
+		return distributionStartup{}, err
+	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(in.sampler, in.cfg.engine)
+
+	catalogWatchConns := &kv.GRPCConnCache{}
+	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
+	in.eg.Go(func() error {
+		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
+	})
+	startKeyVizFlusher(in.ctx, in.eg, in.sampler)
+	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
+	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
+	distServer := adapter.NewDistributionServer(
+		in.cfg.engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(in.coordinate),
+		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
+		adapter.WithCatalogWatchLeaderCheck(func() bool {
+			engine := catalogRuntime.snapshotEngine()
+			return engine != nil && engine.State() == raftengine.StateLeader
+		}),
+		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
+	)
+	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
+		in.ctx,
+		in.eg,
+		distCatalog,
+		in.cfg.engine,
+		distServer,
+		in.coordinate,
+		in.sampler,
+		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
+	)
+	if err != nil {
+		return distributionStartup{}, err
+	}
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
+	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
+	return distributionStartup{
+		defaultRuntime:   defaultRuntime,
+		distServer:       distServer,
+		autoSplitRuntime: autoSplitRuntime,
+	}, nil
 }
 
 func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
@@ -1806,6 +1872,9 @@ type serversInput struct {
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
 	keyvizSampler *keyviz.MemSampler
+	// autoSplitRuntime is registered on the authenticated Admin gRPC service
+	// when automatic splitting was configured at process startup.
+	autoSplitRuntime adapter.AutoSplitRuntime
 	// encryptionConfChangeInterceptor is the Stage 7c §3.1
 	// pre-register hook for raftadmin AddVoter/AddLearner.
 	// Constructed in run() where concrete *kv.ShardedCoordinator and
@@ -1820,7 +1889,14 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
+	adminServer, adminGRPCOpts, err := setupAdminService(
+		*raftId,
+		*myAddr,
+		in.runtimes,
+		in.bootstrapServers,
+		in.keyvizSampler,
+		in.autoSplitRuntime,
+	)
 	if err != nil {
 		return err
 	}
@@ -2092,6 +2168,7 @@ func setupAdminService(
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
 	keyvizSampler *keyviz.MemSampler,
+	autoSplitRuntime adapter.AutoSplitRuntime,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -2123,6 +2200,9 @@ func setupAdminService(
 	// operators want the explicit "keyviz disabled" signal.
 	if keyvizSampler != nil {
 		srv.RegisterSampler(keyvizSampler)
+	}
+	if autoSplitRuntime != nil {
+		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
 	}
 	if *adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
@@ -2763,10 +2843,14 @@ func startRaftServers(
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
+	var opts []adapter.InternalOption
 	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
-		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
+		opts = append(opts, adapter.WithInternalTimestampAllocator(alloc))
 	}
-	return nil
+	if observer, ok := coordinate.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
+		opts = append(opts, adapter.WithInternalForwardWriteObserver(observer.ObserveForwardedRequests))
+	}
+	return opts
 }
 
 func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
@@ -3003,8 +3087,23 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 	return route.GroupID, nil
 }
 
-func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
-	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
+func runDistributionCatalogWatcher(
+	ctx context.Context,
+	catalog *distribution.CatalogStore,
+	engine *distribution.Engine,
+	observers ...distribution.CatalogSnapshotObserver,
+) error {
+	var opts []distribution.CatalogWatcherOption
+	if len(observers) > 0 {
+		opts = append(opts, distribution.WithCatalogWatcherSnapshotObserver(func(snapshot distribution.CatalogSnapshot) {
+			for _, observer := range observers {
+				if observer != nil {
+					observer(snapshot)
+				}
+			}
+		}))
+	}
+	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil, opts...); err != nil {
 		return errors.Wrapf(err, "catalog watcher failed")
 	}
 	return nil
@@ -3426,20 +3525,26 @@ func (r *runtimeServerRunner) startAdminHTTP() {
 }
 
 // buildKeyVizSampler constructs the in-memory keyviz sampler from
-// flag-supplied options, or returns nil when --keyvizEnabled is
-// false. The coordinator's WithSampler and AdminServer's
+// flag-supplied options, or returns nil when neither --keyvizEnabled nor
+// --autoSplit is set. The coordinator's WithSampler and AdminServer's
 // RegisterSampler both treat a nil receiver as "keyviz disabled," so
 // this is the single decision point.
 func buildKeyVizSampler() *keyviz.MemSampler {
-	if !*keyvizEnabled {
+	if !*keyvizEnabled && !*autoSplit {
 		return nil
 	}
+	keyBucketsPerRoute := effectiveKeyVizBucketsPerRoute(
+		*autoSplit,
+		keyvizKeyBucketsPerRouteExplicit,
+		*keyvizKeyBucketsPerRoute,
+		*autoSplitDefaultBuckets,
+	)
 	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
 		Step:                   *keyvizStep,
 		HistoryColumns:         *keyvizHistoryColumns,
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
-		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		KeyBucketsPerRoute:     keyBucketsPerRoute,
 		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
 		HotKeysEnabled:         *keyvizHotKeysEnabled,
 		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
@@ -3461,12 +3566,9 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 	return s
 }
 
-// seedKeyVizRoutes copies the engine's current route catalogue into
-// the sampler so the first matrix snapshots have non-empty metadata.
-// No-op when the sampler is disabled. The coordinator's
-// distribution.Engine handles route mutations after this point;
-// route-watch propagation into the sampler is a follow-up (the
-// design's Phase 3 persistence work).
+// seedKeyVizRoutes copies the engine's current route catalogue into the sampler
+// so the first matrix snapshots have non-empty metadata. The auto-split
+// scheduler keeps membership reconciled after catalog changes.
 func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 	if s == nil || engine == nil {
 		return
