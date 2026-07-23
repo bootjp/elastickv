@@ -42,3 +42,63 @@ func TestApplyTargetStagedReadinessCommandPersistsGuard(t *testing.T) {
 		Armed:                  true,
 	}}, states)
 }
+
+func TestApplyTargetStagedReadinessCommandPersistsAppliedIndex(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	fsm := &kvFSM{store: st, pendingApplyIdx: 77}
+
+	cmd, err := MarshalTargetStagedReadinessCommand(&pb.TargetStagedReadinessRequest{
+		JobId:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobId:         7,
+		MinWriteTsExclusive:    100,
+		Armed:                  true,
+	})
+	require.NoError(t, err)
+	require.Nil(t, fsm.Apply(cmd))
+
+	appliedReader, ok := st.(interface {
+		LastAppliedIndex() (uint64, bool, error)
+	})
+	require.True(t, ok)
+	idx, present, err := appliedReader.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, uint64(77), idx)
+}
+
+func TestRecordMigrationWriteTracksEmptyDelPrefix(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	writer, ok := st.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	reader, ok := st.(store.MigrationTargetReadinessReader)
+	require.True(t, ok)
+
+	err := recordMigrationWriteInStates(ctx, writer, []store.TargetStagedReadinessState{{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               []byte("n"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+		TrackWrites:            true,
+		RetentionPinTS:         40,
+		MinAdmittedTS:          90,
+	}}, []*pb.Mutation{{Op: pb.Op_DEL_PREFIX}}, 50, 0)
+	require.NoError(t, err)
+
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	require.Equal(t, uint64(50), states[0].MinAdmittedTS)
+}

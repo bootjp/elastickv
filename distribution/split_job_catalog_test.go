@@ -413,6 +413,31 @@ func TestCatalogStoreBeginSplitJobAbandonRecordsPreCutoverPhase(t *testing.T) {
 	assertSplitJobEqual(t, abandoning, got)
 }
 
+func TestCatalogStoreBeginSplitJobAbandonAllowsPlannedPhase(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	job := sampleSplitJob(22)
+	job.Phase = SplitJobPhasePlanned
+	job.RetryPhase = SplitJobPhaseNone
+	job.AbandonFromPhase = SplitJobPhaseNone
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	abandoning, err := cs.BeginSplitJobAbandon(ctx, job.JobID, 1400)
+	if err != nil {
+		t.Fatalf("begin split job abandon: %v", err)
+	}
+	if abandoning.Phase != SplitJobPhaseAbandoning ||
+		abandoning.AbandonFromPhase != SplitJobPhasePlanned ||
+		abandoning.UpdatedAtMs != 1400 {
+		t.Fatalf("unexpected planned abandon transition: %+v", abandoning)
+	}
+	if _, err := EncodeSplitJob(abandoning); err != nil {
+		t.Fatalf("encode planned abandon transition: %v", err)
+	}
+}
+
 func TestCatalogStoreBeginSplitJobAbandonRejectsPostCutoverPhases(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()

@@ -458,6 +458,12 @@ func readinessRouteRangeForScan(start []byte, end []byte) ([]byte, []byte) {
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return routeStart, routeEnd
 	}
+	if s3BucketAuxiliaryScanBounds(start, end) {
+		return s3BucketAuxiliaryScanRouteRange(start, end)
+	}
+	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+		return routeStart, routeEnd
+	}
 	return readinessRouteRange(start, end)
 }
 
@@ -4564,12 +4570,11 @@ func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 	return g, ok
 }
 
-func (s *ShardStore) verifyExplicitGroupRoutesForRange(ctx context.Context, groupID uint64, routes []distribution.Route, start []byte, end []byte) error {
+func (s *ShardStore) verifyExplicitGroupRoutesForRange(ctx context.Context, groupID uint64, routes []distribution.Route, routeStart []byte, routeEnd []byte) error {
 	g, ok := s.groupForID(groupID)
 	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
 	}
-	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
 	for _, route := range routes {
 		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
 			return err

@@ -632,7 +632,7 @@ func (s *DistributionServer) startSplitMigrationParent(
 	if parent.State != distribution.RouteStateActive {
 		return distribution.RouteDescriptor{}, grpcStatusError(codes.FailedPrecondition, errDistributionSourceRouteNotActive.Error())
 	}
-	splitKey := distribution.CloneBytes(req.GetSplitKey())
+	splitKey := normalizeSplitMigrationSplitKey(req)
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return distribution.RouteDescriptor{}, err
 	}
@@ -664,13 +664,17 @@ func (s *DistributionServer) newSplitMigrationJob(
 	job, err := distribution.InitializeSplitJobPlan(distribution.SplitJob{
 		JobID:         jobID,
 		SourceRouteID: parent.RouteID,
-		SplitKey:      distribution.CloneBytes(req.GetSplitKey()),
+		SplitKey:      normalizeSplitMigrationSplitKey(req),
 		TargetGroupID: req.GetTargetGroupId(),
 	}, parent, time.Now().UnixMilli())
 	if err != nil {
 		return distribution.SplitJob{}, splitJobCatalogStatusError(err)
 	}
 	return job, nil
+}
+
+func normalizeSplitMigrationSplitKey(req *pb.StartSplitMigrationRequest) []byte {
+	return distribution.CloneBytes(fskeys.NormalizeSplitBoundary(kv.RouteKey(req.GetSplitKey())))
 }
 
 func (s *DistributionServer) GetSplitJob(ctx context.Context, req *pb.GetSplitJobRequest) (*pb.GetSplitJobResponse, error) {

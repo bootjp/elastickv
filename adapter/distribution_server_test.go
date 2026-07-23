@@ -453,6 +453,46 @@ func TestDistributionServerStartSplitMigration_CreatesPlannedJobWhenGateOpen(t *
 	require.Equal(t, uint64(2), next)
 }
 
+func TestDistributionServerStartSplitMigration_NormalizesFilesystemChunkSplitKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   fskeys.ChunkRouteKey(11, 21),
+		End:     fskeys.ChunkRouteKey(11, 23),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	}})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithDistributionKnownRaftGroups(1, 2),
+		WithSplitMigrationCapabilityGate(func(context.Context) error { return nil }),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+
+	resp, err := s.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               fskeys.ChunkKey(11, 22, 99),
+		TargetGroupId:          2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), resp.JobId)
+
+	jobs, err := catalog.ListSplitJobs(ctx)
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	require.Equal(t, wantBoundary, jobs[0].SplitKey)
+	require.NotEqual(t, fskeys.ChunkKey(11, 22, 99), jobs[0].SplitKey)
+}
+
 func TestDistributionServerStartSplitMigration_RejectsUnknownTargetGroup(t *testing.T) {
 	t.Parallel()
 

@@ -963,8 +963,11 @@ func TestFSMOnePhaseTxnChecksStagedVisibilityReadConflicts(t *testing.T) {
 func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
 	t.Parallel()
 
+	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
-	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+	commitTS := uint64(101)
+	primaryKey := []byte("b")
+	err := fsm.handleTxnRequest(ctx, &pb.Request{
 		IsTxn: true,
 		Phase: pb.Phase_PREPARE,
 		Ts:    50,
@@ -972,12 +975,18 @@ func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
 			{
 				Op:    pb.Op_PUT,
 				Key:   []byte(txnMetaPrefix),
-				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("b"), LockTTLms: defaultTxnLockTTLms, CommitTS: 101}),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: commitTS}),
 			},
-			{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")},
+			{Op: pb.Op_PUT, Key: primaryKey, Value: []byte("v")},
 		},
 	}, 50)
 	require.NoError(t, err)
+
+	rawLock, err := fsm.store.GetAt(ctx, txnLockKey(primaryKey), ^uint64(0))
+	require.NoError(t, err)
+	lock, err := decodeTxnLock(rawLock)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, lock.CommitTS)
 }
 
 func TestFSMPrepareWithoutCommitTSUsesStartTSForRouteFloor(t *testing.T) {

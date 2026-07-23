@@ -1526,7 +1526,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 
 	expireAt := txnLockExpireAt(meta.LockTTLms)
 
-	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt)
+	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt, meta.CommitTS)
 	if err != nil {
 		return err
 	}
@@ -1908,10 +1908,10 @@ func (f *kvFSM) uniqueAbortCleanupMutations(_ context.Context, muts []*pb.Mutati
 	return uniqueMutations(muts)
 }
 
-func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt, commitTS uint64) ([]*store.KVPairMutation, error) {
 	storeMuts := make([]*store.KVPairMutation, 0, len(muts)*txnPrepareStoreMutationFactor)
 	for _, mut := range muts {
-		preparedMuts, err := f.prepareTxnMutation(ctx, mut, primaryKey, startTS, expireAt)
+		preparedMuts, err := f.prepareTxnMutation(ctx, mut, primaryKey, startTS, expireAt, commitTS)
 		if err != nil {
 			return nil, err
 		}
@@ -2044,7 +2044,7 @@ func (f *kvFSM) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint
 	return commitTS, true, nil
 }
 
-func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt, commitTS uint64) ([]*store.KVPairMutation, error) {
 	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, primaryKey, startTS); err != nil {
 		return nil, err
 	}
@@ -2054,6 +2054,7 @@ func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primar
 		TTLExpireAt:  expireAt,
 		PrimaryKey:   primaryKey,
 		IsPrimaryKey: bytes.Equal(mut.Key, primaryKey),
+		CommitTS:     commitTS,
 	})
 	intent, err := txnIntentFromPBMutation(mut, startTS)
 	if err != nil {

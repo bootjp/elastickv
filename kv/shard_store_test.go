@@ -821,6 +821,91 @@ func TestShardStoreS3ManifestScanChecksTargetReadinessInRouteSpace(t *testing.T)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+func TestShardStoreS3BucketAuxiliaryScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+		SourceWriteFence:       true,
+		SourceReadFence:        true,
+		RetentionPinTS:         90,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, s3keys.BucketMetaKey(bucket), []byte("meta"), 120, 0))
+
+	_, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreFilesystemChunkScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const homeSlot uint64 = 11
+	const inode uint64 = 22
+	start := fskeys.ChunkPrefix(homeSlot, inode)
+	end := prefixScanEnd(start)
+	routeStart := fskeys.ChunkRouteKey(homeSlot, inode)
+	routeEnd := prefixScanEnd(routeStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+		SourceWriteFence:       true,
+		SourceReadFence:        true,
+		RetentionPinTS:         90,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, fskeys.ChunkKey(homeSlot, inode, 0), []byte("chunk"), 120, 0))
+
+	_, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, err = st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
 func TestShardStoreTargetReadinessSkipsNonOverlappingGuardForScannedRoute(t *testing.T) {
 	t.Parallel()
 

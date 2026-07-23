@@ -231,6 +231,12 @@ type MigrationTargetReadinessWriter interface {
 	ApplyTargetStagedReadiness(ctx context.Context, state TargetStagedReadinessState) error
 }
 
+// MigrationTargetReadinessRaftWriter persists a target-local readiness guard
+// from the Raft apply loop while bundling the applied index with that update.
+type MigrationTargetReadinessRaftWriter interface {
+	ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, appliedIndex uint64) error
+}
+
 // MigrationTargetReadinessReader reads retained target-local readiness guards.
 type MigrationTargetReadinessReader interface {
 	MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error)

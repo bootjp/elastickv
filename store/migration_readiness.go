@@ -58,6 +58,10 @@ func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetSt
 	return nil
 }
 
+func (s *mvccStore) ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, _ uint64) error {
+	return s.ApplyTargetStagedReadiness(ctx, state)
+}
+
 func (s *mvccStore) MigrationTargetReadinessStates(_ context.Context) ([]TargetStagedReadinessState, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -73,6 +77,40 @@ func (s *pebbleStore) ApplyTargetStagedReadiness(_ context.Context, state Target
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	if err := s.db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), s.directApplyWriteOpts()); err != nil {
+		return errors.WithStack(err)
+	}
+	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
+	return nil
+}
+
+func (s *pebbleStore) ApplyTargetStagedReadinessAt(_ context.Context, state TargetStagedReadinessState, appliedIndex uint64) error {
+	if err := validateTargetStagedReadinessState(state); err != nil {
+		return err
+	}
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	writeAppliedIndex, err := s.shouldWriteAppliedIndexLocked(appliedIndex)
+	if err != nil {
+		return err
+	}
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if writeAppliedIndex {
+		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if err := batch.Commit(s.raftApplyWriteOpts()); err != nil {
 		return errors.WithStack(err)
 	}
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
@@ -218,7 +256,8 @@ func decodeTargetReadinessHeaderV1(data []byte) (TargetStagedReadinessState, []b
 	state.MigrationJobID = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
 	rest = rest[migrationUint64Bytes:]
 	state.MinWriteTSExclusive = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
-	return state, rest[migrationUint64Bytes:], true
+	rest = rest[migrationUint64Bytes:]
+	return state, rest, true
 }
 
 func decodeTargetReadinessRange(state *TargetStagedReadinessState, data []byte) bool {
@@ -315,3 +354,5 @@ var _ MigrationTargetReadinessReader = (*mvccStore)(nil)
 var _ MigrationTargetReadinessReader = (*pebbleStore)(nil)
 var _ MigrationTargetReadinessWriter = (*mvccStore)(nil)
 var _ MigrationTargetReadinessWriter = (*pebbleStore)(nil)
+var _ MigrationTargetReadinessRaftWriter = (*mvccStore)(nil)
+var _ MigrationTargetReadinessRaftWriter = (*pebbleStore)(nil)

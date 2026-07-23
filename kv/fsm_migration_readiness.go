@@ -39,7 +39,7 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 	}
 	state := targetStagedReadinessStateFromProto(req)
 	state = f.preserveMigrationTrackerMinimum(ctx, state)
-	if err := writer.ApplyTargetStagedReadiness(ctx, state); err != nil {
+	if err := applyTargetStagedReadinessAt(ctx, writer, state, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -77,7 +77,7 @@ func (f *kvFSM) recordMigrationWrite(ctx context.Context, muts []*pb.Mutation, c
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return recordMigrationWriteInStates(ctx, writer, states, muts, commitTS)
+	return recordMigrationWriteInStates(ctx, writer, states, muts, commitTS, f.pendingApplyIdx)
 }
 
 func (f *kvFSM) migrationReadinessStore() (store.MigrationTargetReadinessReader, store.MigrationTargetReadinessWriter, bool) {
@@ -92,7 +92,7 @@ func (f *kvFSM) migrationReadinessStore() (store.MigrationTargetReadinessReader,
 	return reader, writer, true
 }
 
-func recordMigrationWriteInStates(ctx context.Context, writer store.MigrationTargetReadinessWriter, states []store.TargetStagedReadinessState, muts []*pb.Mutation, commitTS uint64) error {
+func recordMigrationWriteInStates(ctx context.Context, writer store.MigrationTargetReadinessWriter, states []store.TargetStagedReadinessState, muts []*pb.Mutation, commitTS uint64, appliedIndex uint64) error {
 	for _, state := range states {
 		if !state.Armed || !state.TrackWrites || !migrationMutationsIntersect(muts, state.RouteStart, state.RouteEnd) {
 			continue
@@ -101,22 +101,38 @@ func recordMigrationWriteInStates(ctx context.Context, writer store.MigrationTar
 			continue
 		}
 		state.MinAdmittedTS = commitTS
-		if err := writer.ApplyTargetStagedReadiness(ctx, state); err != nil {
+		if err := applyTargetStagedReadinessAt(ctx, writer, state, appliedIndex); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	return nil
 }
 
+func applyTargetStagedReadinessAt(ctx context.Context, writer store.MigrationTargetReadinessWriter, state store.TargetStagedReadinessState, appliedIndex uint64) error {
+	if raftWriter, ok := writer.(store.MigrationTargetReadinessRaftWriter); ok {
+		if err := raftWriter.ApplyTargetStagedReadinessAt(ctx, state, appliedIndex); err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	}
+	if err := writer.ApplyTargetStagedReadiness(ctx, state); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
 func migrationMutationsIntersect(muts []*pb.Mutation, routeStart []byte, routeEnd []byte) bool {
 	for _, mut := range muts {
-		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+		if mut == nil || isTxnInternalKey(mut.Key) {
 			continue
 		}
 		var start, end []byte
 		if mut.GetOp() == pb.Op_DEL_PREFIX {
 			start, end = routePrefixRange(mut.Key)
 		} else {
+			if len(mut.Key) == 0 {
+				continue
+			}
 			start, end = readinessRouteRangeForScan(mut.Key, nextScanCursor(mut.Key))
 		}
 		if routeRangeIntersects(start, end, routeStart, routeEnd) {
