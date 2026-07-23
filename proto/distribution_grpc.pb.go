@@ -19,10 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Distribution_GetRoute_FullMethodName     = "/Distribution/GetRoute"
-	Distribution_GetTimestamp_FullMethodName = "/Distribution/GetTimestamp"
-	Distribution_ListRoutes_FullMethodName   = "/Distribution/ListRoutes"
-	Distribution_SplitRange_FullMethodName   = "/Distribution/SplitRange"
+	Distribution_GetRoute_FullMethodName               = "/Distribution/GetRoute"
+	Distribution_GetTimestamp_FullMethodName           = "/Distribution/GetTimestamp"
+	Distribution_ListRoutes_FullMethodName             = "/Distribution/ListRoutes"
+	Distribution_SplitRange_FullMethodName             = "/Distribution/SplitRange"
+	Distribution_GetCatalogCapabilities_FullMethodName = "/Distribution/GetCatalogCapabilities"
+	Distribution_WatchCatalog_FullMethodName           = "/Distribution/WatchCatalog"
 )
 
 // DistributionClient is the client API for Distribution service.
@@ -33,6 +35,8 @@ type DistributionClient interface {
 	GetTimestamp(ctx context.Context, in *GetTimestampRequest, opts ...grpc.CallOption) (*GetTimestampResponse, error)
 	ListRoutes(ctx context.Context, in *ListRoutesRequest, opts ...grpc.CallOption) (*ListRoutesResponse, error)
 	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
+	GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error)
+	WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error)
 }
 
 type distributionClient struct {
@@ -83,6 +87,35 @@ func (c *distributionClient) SplitRange(ctx context.Context, in *SplitRangeReque
 	return out, nil
 }
 
+func (c *distributionClient) GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CatalogCapabilitiesResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetCatalogCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Distribution_ServiceDesc.Streams[0], Distribution_WatchCatalog_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CatalogWatchRequest, CatalogWatchEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Distribution_WatchCatalogClient = grpc.ServerStreamingClient[CatalogWatchEvent]
+
 // DistributionServer is the server API for Distribution service.
 // All implementations must embed UnimplementedDistributionServer
 // for forward compatibility.
@@ -91,6 +124,8 @@ type DistributionServer interface {
 	GetTimestamp(context.Context, *GetTimestampRequest) (*GetTimestampResponse, error)
 	ListRoutes(context.Context, *ListRoutesRequest) (*ListRoutesResponse, error)
 	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
+	GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error)
+	WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error
 	mustEmbedUnimplementedDistributionServer()
 }
 
@@ -112,6 +147,12 @@ func (UnimplementedDistributionServer) ListRoutes(context.Context, *ListRoutesRe
 }
 func (UnimplementedDistributionServer) SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SplitRange not implemented")
+}
+func (UnimplementedDistributionServer) GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCatalogCapabilities not implemented")
+}
+func (UnimplementedDistributionServer) WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error {
+	return status.Error(codes.Unimplemented, "method WatchCatalog not implemented")
 }
 func (UnimplementedDistributionServer) mustEmbedUnimplementedDistributionServer() {}
 func (UnimplementedDistributionServer) testEmbeddedByValue()                      {}
@@ -206,6 +247,35 @@ func _Distribution_SplitRange_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Distribution_GetCatalogCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CatalogCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetCatalogCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetCatalogCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetCatalogCapabilities(ctx, req.(*CatalogCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_WatchCatalog_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CatalogWatchRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(DistributionServer).WatchCatalog(m, &grpc.GenericServerStream[CatalogWatchRequest, CatalogWatchEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Distribution_WatchCatalogServer = grpc.ServerStreamingServer[CatalogWatchEvent]
+
 // Distribution_ServiceDesc is the grpc.ServiceDesc for Distribution service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -229,7 +299,17 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "SplitRange",
 			Handler:    _Distribution_SplitRange_Handler,
 		},
+		{
+			MethodName: "GetCatalogCapabilities",
+			Handler:    _Distribution_GetCatalogCapabilities_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchCatalog",
+			Handler:       _Distribution_WatchCatalog_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "distribution.proto",
 }

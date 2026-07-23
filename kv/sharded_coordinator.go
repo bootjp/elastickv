@@ -408,6 +408,7 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	hlcRecoveryMu     sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
@@ -1509,11 +1510,7 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 	if min > 0 {
 		c.clock.Observe(min)
 	}
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	return nextFencedWithRecovery(ctx, c.clock, c, label)
 }
 
 // Next makes ShardedCoordinator usable as a TimestampAllocator for adapter
@@ -2352,7 +2349,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		if group == nil || group.Engine == nil {
 			continue
 		}
-		if group.Engine.State() != raftengine.StateLeader {
+		if !shardGroupAcceptingWrites(group) {
 			continue
 		}
 		if !c.startHLCLeaseRenewal(gid) {
@@ -2416,8 +2413,98 @@ func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
 // the callback latency window. Non-leadership errors (no quorum,
 // validation) are NOT leadership signals and must not tear down a warm
 // lease -- doing so would force every read onto the slow path.
+func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
+	if c == nil || c.clock == nil {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	c.hlcRecoveryMu.Lock()
+	defer c.hlcRecoveryMu.Unlock()
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+		return errors.WithStack(errHLCLeaseRecoveryBlocked)
+	}
+	targets := c.hlcLeaseRecoveryTargets()
+	if len(targets) == 0 {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	rctx, cancel := hlcRecoveryContext(ctx)
+	defer cancel()
+	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+}
+
+func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
+	var recoveryErr error
+	for _, target := range targets {
+		if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+			recoveryErr = combineHLCRecoveryErrors(recoveryErr, errors.Wrapf(err, "recover hlc lease group %d", target.gid))
+		}
+	}
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	return hlcRecoveryFailedError(recoveryErr)
+}
+
+func combineHLCRecoveryErrors(first error, next error) error {
+	if first == nil {
+		return next
+	}
+	return errors.Wrap(errors.CombineErrors(first, next), "combine hlc recovery errors")
+}
+
+func hlcRecoveryFailedError(recoveryErr error) error {
+	expiredErr := errors.Wrap(ErrCeilingExpired, "recover hlc lease did not advance ceiling")
+	if recoveryErr != nil {
+		return errors.Wrap(errors.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
+	}
+	return expiredErr
+}
+
+type hlcLeaseRecoveryTarget struct {
+	gid   uint64
+	group *ShardGroup
+}
+
+func (c *ShardedCoordinator) hlcLeaseRecoveryTargets() []hlcLeaseRecoveryTarget {
+	if c == nil {
+		return nil
+	}
+	if c.timestampGroupConfigured {
+		group := c.groups[c.timestampGroup]
+		if !shardGroupAcceptingWrites(group) {
+			return nil
+		}
+		return []hlcLeaseRecoveryTarget{{gid: c.timestampGroup, group: group}}
+	}
+	ids := c.timestampBridgeCandidateGroupIDs()
+	targets := make([]hlcLeaseRecoveryTarget, 0, len(ids))
+	for _, gid := range ids {
+		group := c.groups[gid]
+		if shardGroupAcceptingWrites(group) {
+			targets = append(targets, hlcLeaseRecoveryTarget{gid: gid, group: group})
+		}
+	}
+	return targets
+}
+
+func shardGroupAcceptingWrites(group *ShardGroup) bool {
+	return group != nil && group.Engine != nil && isLeaderAcceptingWrites(group.Engine)
+}
+
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", gid),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+	}
+}
+
+func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, group *ShardGroup, ceilingMs int64) error {
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
 	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
@@ -2430,16 +2517,12 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, grou
 		if isLeadershipLossError(err) {
 			group.lease.invalidate()
 		}
-		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", gid),
-			slog.Int64("ceiling_ms", ceilingMs),
-			slog.Any("err", err),
-		)
-		return
+		return errors.WithStack(err)
 	}
 	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
 		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
+	return nil
 }
 
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {

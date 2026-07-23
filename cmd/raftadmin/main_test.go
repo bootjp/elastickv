@@ -54,9 +54,11 @@ func (fakeRaftAdminClient) TransferLeadership(context.Context, *pb.RaftAdminTran
 func TestExecuteCommandLeaderAndStateOutput(t *testing.T) {
 	client := fakeRaftAdminClient{
 		statusResp: &pb.RaftAdminStatusResponse{
-			State:         pb.RaftAdminState_RAFT_ADMIN_STATE_LEADER,
-			LeaderId:      "n1",
-			LeaderAddress: "127.0.0.1:50051",
+			State:              pb.RaftAdminState_RAFT_ADMIN_STATE_LEADER,
+			LeaderId:           "n1",
+			LeaderAddress:      "127.0.0.1:50051",
+			ConfigurationIndex: 7,
+			PendingConfChange:  true,
 		},
 	}
 
@@ -78,6 +80,8 @@ func TestExecuteCommandLeaderAndStateOutput(t *testing.T) {
 	require.Contains(t, out, "leader_id: \"n1\"")
 	require.Contains(t, out, "leader_address: \"127.0.0.1:50051\"")
 	require.Contains(t, out, "commit_index: 0")
+	require.Contains(t, out, "configuration_index: 7")
+	require.Contains(t, out, "pending_conf_change: true")
 }
 
 func TestRPCTimeoutHonorsEnvSeconds(t *testing.T) {
