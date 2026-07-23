@@ -53,7 +53,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{bzpopminScoreScanLimit},
+			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "single score entry",
@@ -66,7 +66,29 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  3,
 			wantWide:   true,
 			wantLast:   true,
-			wantScans:  []int{bzpopminScoreScanLimit},
+			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
+		},
+		{
+			name: "mixed partial score index uses lower member row",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "low-unindexed", Score: 1},
+					{Member: "high-indexed", Score: 5},
+				})
+				ctx := context.Background()
+				require.NoError(t, st.PutAt(
+					ctx,
+					store.ZSetScoreKey(key, 5, []byte("high-indexed")),
+					[]byte{},
+					readTS,
+					0,
+				))
+			},
+			wantMember: "low-unindexed",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "member only fallback",

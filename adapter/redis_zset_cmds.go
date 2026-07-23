@@ -1156,15 +1156,34 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 }
 
 func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
-	candidate, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
-	if err != nil || candidate != nil {
-		return candidate, err
+	scoreCandidate, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
 	}
-	candidate, err = r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
-	if err != nil || candidate != nil {
-		return candidate, err
+	memberCandidate, err := r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if scoreCandidate != nil && memberCandidate != nil {
+		if zsetEntryLess(scoreCandidate.entry, memberCandidate.entry) {
+			return scoreCandidate, nil
+		}
+		return memberCandidate, nil
+	}
+	if scoreCandidate != nil {
+		return scoreCandidate, nil
+	}
+	if memberCandidate != nil {
+		return memberCandidate, nil
 	}
 	return r.bzpopminLegacyCandidateAt(ctx, key, readTS)
+}
+
+func zsetEntryLess(left, right redisZSetEntry) bool {
+	if left.Score != right.Score {
+		return left.Score < right.Score
+	}
+	return left.Member < right.Member
 }
 
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
