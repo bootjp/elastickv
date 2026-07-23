@@ -125,11 +125,11 @@ func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 // This is used for blocking commands whose wait time exceeds the backend's
 // default read timeout.
 func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	return b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+	return redisClientWithReadTimeout(b.client, effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
 func (b *RedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	return b.client.WithTimeout(timeout).Do(ctx, args...)
+	return redisClientWithReadTimeout(b.client, timeout).Do(ctx, args...)
 }
 
 func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
@@ -146,11 +146,24 @@ func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd
 // PipelineWithTimeout executes a pipeline using a per-call socket timeout
 // override for async replay classes whose deadline exceeds the backend default.
 func (b *RedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
-	return b.pipeline(ctx, b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)), cmds)
+	return b.pipeline(ctx, redisClientWithReadTimeout(b.client, effectiveBlockingReadTimeout(timeout)), cmds)
 }
 
 func (b *RedisBackend) PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
-	return b.pipeline(ctx, b.client.WithTimeout(timeout), cmds)
+	return b.pipeline(ctx, redisClientWithReadTimeout(b.client, timeout), cmds)
+}
+
+func redisClientWithReadTimeout(client *redis.Client, timeout time.Duration) *redis.Client {
+	if client == nil || timeout <= 0 {
+		return client
+	}
+	clone := client.WithTimeout(timeout)
+	// go-redis WithTimeout intentionally sets both ReadTimeout and
+	// WriteTimeout. This path only extends read-side waits for blocking
+	// commands and async replays; keep socket writes bounded by the backend's
+	// configured write timeout.
+	clone.Options().WriteTimeout = client.Options().WriteTimeout
+	return clone
 }
 
 func (b *RedisBackend) pipeline(ctx context.Context, client *redis.Client, cmds [][]any) ([]*redis.Cmd, error) {

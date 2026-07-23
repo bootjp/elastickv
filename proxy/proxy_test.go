@@ -1401,6 +1401,38 @@ func TestDualWriter_SecondaryReadTimeoutUsesRemainingAsyncDeadline(t *testing.T)
 	assert.LessOrEqual(t, secondary.pipelineTimeout, 80*time.Millisecond)
 }
 
+func TestDualWriter_ExpiredSecondaryReadDeadlineSkipsDispatch(t *testing.T) {
+	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
+	d := NewDualWriter(
+		newMockBackend("primary"),
+		secondary,
+		ProxyConfig{
+			Mode:                   ModeDualWrite,
+			SecondaryTimeout:       30 * time.Second,
+			SecondaryScriptTimeout: 5 * time.Minute,
+		},
+		newTestMetrics(),
+		newTestSentry(),
+		testLogger,
+	)
+	t.Cleanup(d.Close)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+
+	cmd := d.secondaryDo(ctx, "EVALSHA", []any{"EVALSHA", "deadbeef", "0"})
+	_, err := cmd.Result()
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Zero(t, secondary.doCalls)
+	assert.Zero(t, secondary.doWithCalls)
+
+	results, err := d.secondaryPipeline(ctx, [][]any{{"MULTI"}, {"EVALSHA", "deadbeef", "0"}, {"EXEC"}})
+	assert.Nil(t, results)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Zero(t, secondary.pipelineCalls)
+	assert.Zero(t, secondary.pipelineWithCalls)
+}
+
 func TestDualWriter_TxnReplayWithScriptUsesScriptQueueAndTimeout(t *testing.T) {
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	metrics := newTestMetrics()
@@ -1669,6 +1701,24 @@ func TestEffectiveBlockingReadTimeout(t *testing.T) {
 	assert.Equal(t, time.Duration(0), effectiveBlockingReadTimeout(0))
 	assert.Equal(t, 20*time.Second, effectiveBlockingReadTimeout(10*time.Second))
 	assert.Equal(t, 11*time.Second, effectiveBlockingReadTimeout(time.Second))
+}
+
+func TestRedisClientWithReadTimeoutPreservesWriteTimeout(t *testing.T) {
+	client := redis.NewClient(&redis.Options{
+		Addr:         "127.0.0.1:6379",
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+	t.Cleanup(func() {
+		assert.NoError(t, client.Close())
+	})
+
+	clone := redisClientWithReadTimeout(client, 5*time.Minute)
+	assert.Equal(t, 5*time.Minute, clone.Options().ReadTimeout)
+	assert.Equal(t, 3*time.Second, clone.Options().WriteTimeout)
+	assert.Equal(t, 3*time.Second, client.Options().ReadTimeout)
+	assert.Equal(t, 3*time.Second, client.Options().WriteTimeout)
+	assert.Same(t, client, redisClientWithReadTimeout(client, 0))
 }
 
 // ========== Pipeline error handling tests ==========

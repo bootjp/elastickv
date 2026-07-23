@@ -870,7 +870,12 @@ func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
 }
 
 func (d *DualWriter) secondaryDo(ctx context.Context, cmd string, args []any) *redis.Cmd {
-	timeout := d.secondaryCommandReadTimeout(ctx, cmd)
+	timeout, err := d.secondaryCommandReadTimeout(ctx, cmd)
+	if err != nil {
+		result := redis.NewCmd(ctx, args...)
+		result.SetErr(err)
+		return result
+	}
 	if timeout > 0 {
 		if backend, ok := d.secondary.(readTimeoutBackend); ok {
 			return backend.DoWithReadTimeout(ctx, timeout, args...)
@@ -880,7 +885,10 @@ func (d *DualWriter) secondaryDo(ctx context.Context, cmd string, args []any) *r
 }
 
 func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
-	timeout := d.secondaryPipelineReadTimeout(ctx, cmds)
+	timeout, err := d.secondaryPipelineReadTimeout(ctx, cmds)
+	if err != nil {
+		return nil, err
+	}
 	if timeout > 0 {
 		if backend, ok := d.secondary.(pipelineReadTimeoutBackend); ok {
 			results, err := backend.PipelineWithReadTimeout(ctx, timeout, cmds)
@@ -897,36 +905,39 @@ func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*re
 	return results, nil
 }
 
-func (d *DualWriter) secondaryCommandReadTimeout(ctx context.Context, cmd string) time.Duration {
+func (d *DualWriter) secondaryCommandReadTimeout(ctx context.Context, cmd string) (time.Duration, error) {
 	if isRedisScriptCommandName(cmd) {
 		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
 	}
 	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
 }
 
-func (d *DualWriter) secondaryPipelineReadTimeout(ctx context.Context, cmds [][]any) time.Duration {
+func (d *DualWriter) secondaryPipelineReadTimeout(ctx context.Context, cmds [][]any) (time.Duration, error) {
 	if pipelineContainsScript(cmds) {
 		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
 	}
 	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
 }
 
-func secondaryReadTimeout(ctx context.Context, configured time.Duration) time.Duration {
+func secondaryReadTimeout(ctx context.Context, configured time.Duration) (time.Duration, error) {
 	if configured <= 0 {
-		return 0
+		return 0, nil
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return configured
+		return configured, nil
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return 0
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("secondary read timeout deadline expired: %w", err)
+		}
+		return 0, fmt.Errorf("secondary read timeout deadline expired: %w", context.DeadlineExceeded)
 	}
 	if remaining < configured {
-		return remaining
+		return remaining, nil
 	}
-	return configured
+	return configured, nil
 }
 
 func shouldFallbackZRemFast(cmd string, err error) bool {
