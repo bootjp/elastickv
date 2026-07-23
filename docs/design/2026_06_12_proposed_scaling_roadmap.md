@@ -343,9 +343,9 @@ control-plane (`*_proposed_*` doc TBD).**
 
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
-- M2 depends on the M2 hotspot-split migration contract
-  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
-  being implemented so the monotone-merge primitive exists.
+- M2's hotspot-split migration dependency is implemented in
+  [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md), including
+  the monotone-merge primitive.
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
 - M4 depends on M2 and M3.
@@ -538,7 +538,7 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
-`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
+[2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md)) is the
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits
