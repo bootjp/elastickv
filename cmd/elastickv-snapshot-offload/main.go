@@ -26,6 +26,7 @@ const (
 	commandRestore = "restore"
 	storeLocal     = "local"
 	storeS3        = "s3"
+	s3SSEAES256    = "AES256"
 	s3SSEAWSKMS    = "aws:kms"
 )
 
@@ -177,6 +178,7 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	cfg.storeKind = storeLocal
 	cfg.s3Region = "us-east-1"
 	cfg.s3PathStyle = true
+	cfg.s3ServerSideEncryption = string(s3SSEAES256)
 	fs.StringVar(&cfg.storeKind, "store", storeLocal, "Object store backend: local or s3")
 	fs.StringVar(&cfg.localRoot, "local-root", "", "Local object store root when --store=local")
 	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "", "S3 bucket when --store=s3")
@@ -184,8 +186,8 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	fs.StringVar(&cfg.s3Endpoint, "s3-endpoint", "", "S3-compatible endpoint URL")
 	fs.StringVar(&cfg.s3Profile, "s3-profile", "", "AWS shared config profile")
 	fs.BoolVar(&cfg.s3PathStyle, "s3-path-style", cfg.s3PathStyle, "Use path-style S3 addressing")
-	fs.StringVar(&cfg.s3ServerSideEncryption, "s3-sse", "", "Server-side encryption algorithm for uploaded objects, for example AES256 or aws:kms")
-	fs.StringVar(&cfg.s3KMSKeyID, "s3-kms-key-id", "", "KMS key ID when --s3-sse=aws:kms")
+	fs.StringVar(&cfg.s3ServerSideEncryption, "s3-sse", cfg.s3ServerSideEncryption, "Server-side encryption algorithm for uploaded objects: AES256 or aws:kms")
+	fs.StringVar(&cfg.s3KMSKeyID, "s3-kms-key-id", "", "KMS key ARN or bare key ID when --s3-sse=aws:kms; aliases are rejected")
 	fs.BoolVar(&cfg.s3DisableChecksumHeaders, "s3-disable-checksum-headers", false, "Do not send S3 checksum headers; keep metadata and restore-time verification")
 }
 
@@ -199,16 +201,11 @@ func validateStoreFlags(cfg storeFlags) error {
 		if strings.TrimSpace(cfg.s3Bucket) == "" {
 			return errors.New("--s3-bucket is required when --store=s3")
 		}
+		if err := snapshotoffload.ValidateS3StoreEncryption(cfg.s3ServerSideEncryption, cfg.s3KMSKeyID); err != nil {
+			return errors.Wrap(err, "validate s3 encryption")
+		}
 	default:
 		return errors.Errorf("unknown --store %q", cfg.storeKind)
-	}
-	if strings.TrimSpace(cfg.s3KMSKeyID) != "" {
-		if strings.TrimSpace(cfg.s3ServerSideEncryption) == "" {
-			return errors.New("--s3-kms-key-id requires --s3-sse")
-		}
-		if strings.TrimSpace(cfg.s3ServerSideEncryption) != s3SSEAWSKMS {
-			return errors.New("--s3-kms-key-id requires --s3-sse=aws:kms")
-		}
 	}
 	return nil
 }

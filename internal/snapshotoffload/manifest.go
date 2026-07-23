@@ -20,6 +20,7 @@ const (
 var (
 	ErrInvalidOptions = errors.New("snapshot offload: invalid options")
 	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
+	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
 )
 
@@ -82,6 +83,22 @@ func DecodeManifest(data []byte) (Manifest, error) {
 }
 
 func validateManifest(manifest Manifest) error {
+	if err := validateManifestIdentity(manifest); err != nil {
+		return err
+	}
+	if err := validateManifestPayload(manifest.Payload); err != nil {
+		return err
+	}
+	if stringsTrim(manifest.ManifestKey) == "" {
+		return errors.Wrap(ErrInvalidOptions, "manifest key is required")
+	}
+	if len(manifest.ConfState.Voters) == 0 {
+		return errors.Wrap(ErrInvalidOptions, "manifest ConfState requires voters")
+	}
+	return validateManifestConfState(manifest.ConfState)
+}
+
+func validateManifestIdentity(manifest Manifest) error {
 	switch {
 	case manifest.SchemaVersion != ManifestSchemaVersion:
 		return errors.Wrapf(ErrInvalidOptions, "unsupported manifest schema version %d", manifest.SchemaVersion)
@@ -91,16 +108,100 @@ func validateManifest(manifest Manifest) error {
 		return errors.Wrap(ErrInvalidOptions, "snapshot index must be > 0")
 	case manifest.SnapshotTerm == 0:
 		return errors.Wrap(ErrInvalidOptions, "snapshot term must be > 0")
-	case manifest.Payload.Key == "":
+	default:
+		return nil
+	}
+}
+
+func validateManifestPayload(payload PayloadDescriptor) error {
+	switch {
+	case payload.Key == "":
 		return errors.Wrap(ErrInvalidOptions, "payload key is required")
-	case manifest.Payload.Bytes < 0:
+	case payload.Bytes < 0:
 		return errors.Wrap(ErrInvalidOptions, "payload byte count must be >= 0")
-	case !isSHA256Hex(manifest.Payload.SHA256):
+	case !isSHA256Hex(payload.SHA256):
 		return errors.Wrap(ErrInvalidOptions, "payload sha256 must be 64 lowercase hex characters")
-	case manifest.ManifestKey == "":
-		return errors.Wrap(ErrInvalidOptions, "manifest key is required")
+	default:
+		return nil
+	}
+}
+
+func validateManifestConfState(conf ManifestConfState) error {
+	roles := []struct {
+		name   string
+		values []uint64
+	}{
+		{name: "voters", values: conf.Voters},
+		{name: "learners", values: conf.Learners},
+		{name: "voters_outgoing", values: conf.VotersOutgoing},
+		{name: "learners_next", values: conf.LearnersNext},
+	}
+	for _, role := range roles {
+		seen := make(map[uint64]struct{}, len(role.values))
+		for _, id := range role.values {
+			if id == 0 {
+				return errors.Wrapf(ErrInvalidOptions, "conf_state.%s contains zero", role.name)
+			}
+			if _, ok := seen[id]; ok {
+				return errors.Wrapf(ErrInvalidOptions, "conf_state.%s contains duplicate node %d", role.name, id)
+			}
+			seen[id] = struct{}{}
+		}
+	}
+	return validateManifestConfStateMembership(conf)
+}
+
+func validateManifestConfStateMembership(conf ManifestConfState) error {
+	learners := uint64Set(conf.Learners)
+	outgoing := uint64Set(conf.VotersOutgoing)
+	learnersNext := uint64Set(conf.LearnersNext)
+	if err := validateManifestConfStateOverlaps(conf, learners, outgoing, learnersNext); err != nil {
+		return err
+	}
+	for _, id := range conf.LearnersNext {
+		if _, ok := outgoing[id]; !ok {
+			return errors.Wrapf(ErrInvalidOptions, "conf_state.learners_next node %d is not an outgoing voter", id)
+		}
+	}
+	if len(conf.VotersOutgoing) == 0 && conf.AutoLeave {
+		return errors.Wrap(ErrInvalidOptions, "conf_state.auto_leave requires joint consensus")
 	}
 	return nil
+}
+
+func validateManifestConfStateOverlaps(
+	conf ManifestConfState,
+	learners, outgoing, learnersNext map[uint64]struct{},
+) error {
+	for _, id := range conf.Voters {
+		if _, ok := learners[id]; ok {
+			return invalidManifestConfStateOverlap(id, "voters", "learners")
+		}
+		if _, ok := learnersNext[id]; ok {
+			return invalidManifestConfStateOverlap(id, "voters", "learners_next")
+		}
+	}
+	for _, id := range conf.Learners {
+		if _, ok := outgoing[id]; ok {
+			return invalidManifestConfStateOverlap(id, "learners", "voters_outgoing")
+		}
+		if _, ok := learnersNext[id]; ok {
+			return invalidManifestConfStateOverlap(id, "learners", "learners_next")
+		}
+	}
+	return nil
+}
+
+func uint64Set(values []uint64) map[uint64]struct{} {
+	set := make(map[uint64]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func invalidManifestConfStateOverlap(id uint64, first, second string) error {
+	return errors.Wrapf(ErrInvalidOptions, "node %d appears in conf_state.%s and conf_state.%s", id, first, second)
 }
 
 func verifyManifestSelfHash(manifest Manifest) error {

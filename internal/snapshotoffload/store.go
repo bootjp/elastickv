@@ -30,7 +30,9 @@ type ObjectInfo struct {
 	Size int64
 	// SHA256 is optional for metadata-only Head/Get paths; PutObject returns it
 	// when the writer verified the committed content.
-	SHA256 string
+	SHA256               string
+	ServerSideEncryption string
+	SSEKMSKeyID          string
 }
 
 type LocalStore struct {
