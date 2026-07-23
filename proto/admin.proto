@@ -178,6 +178,13 @@ message BackupExpectedKeys {
 
 message BeginBackupRequest {
   uint64 ttl_ms = 1;
+  // Empty means all adapters. Non-empty lets the server build the
+  // expected-key baseline only for adapters the producer will emit.
+  repeated string adapters = 2;
+  // Empty means every scope in the selected adapters. Non-empty narrows the
+  // expected-key baseline to the exact adapter/scope pairs requested by the
+  // producer.
+  repeated BackupScope scopes = 3;
 }
 
 message BeginBackupResponse {

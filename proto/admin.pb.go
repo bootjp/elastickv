@@ -1246,8 +1246,15 @@ func (x *BackupExpectedKeys) GetAppliedIndexAtCount() uint64 {
 }
 
 type BeginBackupRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TtlMs         uint64                 `protobuf:"varint,1,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	TtlMs uint64                 `protobuf:"varint,1,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
+	// Empty means all adapters. Non-empty lets the server build the
+	// expected-key baseline only for adapters the producer will emit.
+	Adapters []string `protobuf:"bytes,2,rep,name=adapters,proto3" json:"adapters,omitempty"`
+	// Empty means every scope in the selected adapters. Non-empty narrows the
+	// expected-key baseline to the exact adapter/scope pairs requested by the
+	// producer.
+	Scopes        []*BackupScope `protobuf:"bytes,3,rep,name=scopes,proto3" json:"scopes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1287,6 +1294,20 @@ func (x *BeginBackupRequest) GetTtlMs() uint64 {
 		return x.TtlMs
 	}
 	return 0
+}
+
+func (x *BeginBackupRequest) GetAdapters() []string {
+	if x != nil {
+		return x.Adapters
+	}
+	return nil
+}
+
+func (x *BeginBackupRequest) GetScopes() []*BackupScope {
+	if x != nil {
+		return x.Scopes
+	}
+	return nil
 }
 
 type BeginBackupResponse struct {
@@ -2236,9 +2257,11 @@ const file_admin_proto_rawDesc = "" +
 	"\aadapter\x18\x01 \x01(\tR\aadapter\x12\x14\n" +
 	"\x05scope\x18\x02 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tkey_count\x18\x03 \x01(\x04R\bkeyCount\x123\n" +
-	"\x16applied_index_at_count\x18\x04 \x01(\x04R\x13appliedIndexAtCount\"+\n" +
+	"\x16applied_index_at_count\x18\x04 \x01(\x04R\x13appliedIndexAtCount\"m\n" +
 	"\x12BeginBackupRequest\x12\x15\n" +
-	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\"\x91\x02\n" +
+	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\x12\x1a\n" +
+	"\badapters\x18\x02 \x03(\tR\badapters\x12$\n" +
+	"\x06scopes\x18\x03 \x03(\v2\f.BackupScopeR\x06scopes\"\x91\x02\n" +
 	"\x13BeginBackupResponse\x12\x17\n" +
 	"\aread_ts\x18\x01 \x01(\x04R\x06readTs\x12\x1b\n" +
 	"\tpin_token\x18\x02 \x01(\fR\bpinToken\x12(\n" +
@@ -2379,43 +2402,44 @@ var file_admin_proto_depIdxs = []int32{
 	12, // 8: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
 	12, // 9: GetRouteDetailResponse.row:type_name -> KeyVizRow
 	9,  // 10: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
-	17, // 11: BeginBackupResponse.shards:type_name -> BackupShardApplied
-	18, // 12: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
-	26, // 13: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
-	26, // 14: StreamBackupRequest.scopes:type_name -> BackupScope
-	34, // 15: StreamEventsEvent.route_transition:type_name -> RouteTransition
-	35, // 16: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
-	0,  // 17: KeyVizColumn.series:type_name -> KeyVizSeries
-	12, // 18: KeyVizColumn.rows:type_name -> KeyVizRow
-	4,  // 19: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
-	7,  // 20: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
-	10, // 21: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
-	13, // 22: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
-	15, // 23: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
-	19, // 24: Admin.BeginBackup:input_type -> BeginBackupRequest
-	21, // 25: Admin.RenewBackup:input_type -> RenewBackupRequest
-	23, // 26: Admin.EndBackup:input_type -> EndBackupRequest
-	25, // 27: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
-	28, // 28: Admin.StreamBackup:input_type -> StreamBackupRequest
-	30, // 29: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
-	32, // 30: Admin.StreamEvents:input_type -> StreamEventsRequest
-	5,  // 31: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
-	8,  // 32: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
-	11, // 33: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
-	14, // 34: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
-	16, // 35: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
-	20, // 36: Admin.BeginBackup:output_type -> BeginBackupResponse
-	22, // 37: Admin.RenewBackup:output_type -> RenewBackupResponse
-	24, // 38: Admin.EndBackup:output_type -> EndBackupResponse
-	27, // 39: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
-	29, // 40: Admin.StreamBackup:output_type -> BackupKV
-	31, // 41: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
-	33, // 42: Admin.StreamEvents:output_type -> StreamEventsEvent
-	31, // [31:43] is the sub-list for method output_type
-	19, // [19:31] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	26, // 11: BeginBackupRequest.scopes:type_name -> BackupScope
+	17, // 12: BeginBackupResponse.shards:type_name -> BackupShardApplied
+	18, // 13: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
+	26, // 14: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
+	26, // 15: StreamBackupRequest.scopes:type_name -> BackupScope
+	34, // 16: StreamEventsEvent.route_transition:type_name -> RouteTransition
+	35, // 17: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
+	0,  // 18: KeyVizColumn.series:type_name -> KeyVizSeries
+	12, // 19: KeyVizColumn.rows:type_name -> KeyVizRow
+	4,  // 20: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
+	7,  // 21: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
+	10, // 22: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
+	13, // 23: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
+	15, // 24: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
+	19, // 25: Admin.BeginBackup:input_type -> BeginBackupRequest
+	21, // 26: Admin.RenewBackup:input_type -> RenewBackupRequest
+	23, // 27: Admin.EndBackup:input_type -> EndBackupRequest
+	25, // 28: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
+	28, // 29: Admin.StreamBackup:input_type -> StreamBackupRequest
+	30, // 30: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
+	32, // 31: Admin.StreamEvents:input_type -> StreamEventsRequest
+	5,  // 32: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
+	8,  // 33: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
+	11, // 34: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
+	14, // 35: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
+	16, // 36: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
+	20, // 37: Admin.BeginBackup:output_type -> BeginBackupResponse
+	22, // 38: Admin.RenewBackup:output_type -> RenewBackupResponse
+	24, // 39: Admin.EndBackup:output_type -> EndBackupResponse
+	27, // 40: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
+	29, // 41: Admin.StreamBackup:output_type -> BackupKV
+	31, // 42: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
+	33, // 43: Admin.StreamEvents:output_type -> StreamEventsEvent
+	32, // [32:44] is the sub-list for method output_type
+	20, // [20:32] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_admin_proto_init() }

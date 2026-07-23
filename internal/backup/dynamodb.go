@@ -65,6 +65,7 @@ type DDBEncoder struct {
 	outRoot     string
 	bundleJSONL bool
 	bundleSize  int64
+	countOnly   bool
 
 	tables map[string]*ddbTableState
 
@@ -76,6 +77,7 @@ type ddbTableState struct {
 	name       string
 	schema     *pb.DynamoTableSchema
 	itemsByGen map[uint64][]*pb.DynamoItem
+	itemCounts map[uint64]uint64
 }
 
 func ensureItemsByGen(m map[uint64][]*pb.DynamoItem) map[uint64][]*pb.DynamoItem {
@@ -109,6 +111,11 @@ func (d *DDBEncoder) WithBundleSizeBytes(size int64) *DDBEncoder {
 	if size > 0 {
 		d.bundleSize = size
 	}
+	return d
+}
+
+func (d *DDBEncoder) WithCountOnly(on bool) *DDBEncoder {
+	d.countOnly = on
 	return d
 }
 
@@ -166,6 +173,14 @@ func (d *DDBEncoder) HandleItem(key, value []byte) error {
 	if err != nil {
 		return err
 	}
+	if d.countOnly {
+		st := d.tableState(encoded)
+		if st.itemCounts == nil {
+			st.itemCounts = make(map[uint64]uint64)
+		}
+		st.itemCounts[generation]++
+		return nil
+	}
 	if !bytes.HasPrefix(value, storedDDBItemMagic) {
 		return errors.Wrap(ErrDDBInvalidItem, "missing magic prefix")
 	}
@@ -217,7 +232,7 @@ func (d *DDBEncoder) RetainedRecordCounts() map[string]uint64 {
 	for _, st := range d.tables {
 		if st.schema != nil {
 			emitOrder := ddbGenerationEmitOrder(st.schema.GetGeneration(), st.schema.GetMigratingFromGeneration())
-			out[st.name] = 1 + retainedDDBItemRecords(st.itemsByGen, emitOrder)
+			out[st.name] = 1 + retainedDDBItemRecords(st, emitOrder)
 		}
 	}
 	return out
@@ -266,10 +281,14 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	return nil
 }
 
-func retainedDDBItemRecords(itemsByGen map[uint64][]*pb.DynamoItem, emitOrder []uint64) uint64 {
+func retainedDDBItemRecords(st *ddbTableState, emitOrder []uint64) uint64 {
 	var count uint64
 	for _, generation := range emitOrder {
-		count += uint64(len(itemsByGen[generation]))
+		if st.itemCounts != nil {
+			count += st.itemCounts[generation]
+			continue
+		}
+		count += uint64(len(st.itemsByGen[generation]))
 	}
 	return count
 }

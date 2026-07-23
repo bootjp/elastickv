@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	stderrors "errors"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 
 	logicalbackup "github.com/bootjp/elastickv/internal/backup"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	kvstore "github.com/bootjp/elastickv/store"
@@ -230,6 +232,13 @@ func backupTestDefaultValueForKey(key []byte) []byte {
 	return []byte("value")
 }
 
+func backupTestJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	out, err := json.Marshal(v)
+	require.NoError(t, err)
+	return out
+}
+
 type backupSliceScanner struct {
 	keys      [][]byte
 	index     int
@@ -443,6 +452,64 @@ func TestBeginBackupExpectedKeysUseRetainedCounts(t *testing.T) {
 	require.Equal(t, "dynamodb", begin.GetExpectedKeys()[0].GetAdapter())
 	require.Equal(t, table, begin.GetExpectedKeys()[0].GetScope())
 	require.EqualValues(t, 2, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{schemaKey}, store.valueKeys)
+}
+
+func TestBeginBackupExpectedKeysAvoidMaterializingBlobValues(t *testing.T) {
+	t.Parallel()
+	const (
+		bucket   = "photos"
+		object   = "large.bin"
+		uploadID = "upload-1"
+	)
+	bucketKey := s3keys.BucketMetaKey(bucket)
+	manifestKey := s3keys.ObjectManifestKey(bucket, 1, object)
+	blobKey := s3keys.BlobKey(bucket, 1, object, uploadID, 1, 0)
+	store := &backupTestStore{
+		keys: [][]byte{bucketKey, manifestKey, blobKey},
+		values: map[string][]byte{
+			string(bucketKey): backupTestJSON(t, map[string]any{
+				"bucket_name": bucket,
+				"generation":  1,
+			}),
+			string(manifestKey): backupTestJSON(t, map[string]any{
+				"upload_id": uploadID,
+				"parts": []map[string]any{{
+					"part_no":     1,
+					"chunk_count": 1,
+				}},
+			}),
+			string(blobKey): []byte("large-blob-body"),
+		},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"s3"}})
+	require.NoError(t, err)
+	require.Len(t, begin.GetExpectedKeys(), 1)
+	require.Equal(t, "s3", begin.GetExpectedKeys()[0].GetAdapter())
+	require.Equal(t, bucket, begin.GetExpectedKeys()[0].GetScope())
+	require.EqualValues(t, 3, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{bucketKey, manifestKey}, store.valueKeys)
+}
+
+func TestBeginBackupBaselineSkipsUnselectedAdapterValues(t *testing.T) {
+	t.Parallel()
+	schemaKey := logicalbackup.EncodeDDBTableMetaKey("orders")
+	store := &backupTestStore{
+		keys:   [][]byte{schemaKey},
+		values: map[string][]byte{string(schemaKey): []byte("future-format")},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+	require.Empty(t, begin.GetExpectedKeys())
+	require.Empty(t, store.valueKeys)
 }
 
 func TestSnapshotBackupGroupsExcludesReservedTSOGroup(t *testing.T) {

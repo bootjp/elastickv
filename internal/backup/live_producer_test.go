@@ -406,6 +406,27 @@ func TestRunLiveBackupScopedManifestOmitsUnselectedAdapters(t *testing.T) {
 	}
 }
 
+func TestRunLiveBackupDefaultManifestPreservesEnabledEmptyAdapters(t *testing.T) {
+	t.Parallel()
+	rpc := successfulLiveBackupRPC()
+	root := filepath.Join(t.TempDir(), "dump")
+	_, err := RunLiveBackup(context.Background(), rpc, LiveBackupOptions{
+		OutputRoot: root,
+		Adapters:   AllAdapters(),
+		TTL:        time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("RunLiveBackup: %v", err)
+	}
+	manifest := readLiveBackupManifest(t, root)
+	if manifest.Adapters.Redis == nil || len(manifest.Adapters.Redis.Databases) != 1 {
+		t.Fatalf("manifest redis adapters=%+v", manifest.Adapters)
+	}
+	if manifest.Adapters.DynamoDB == nil || manifest.Adapters.S3 == nil || manifest.Adapters.SQS == nil {
+		t.Fatalf("manifest omitted enabled empty adapters=%+v", manifest.Adapters)
+	}
+}
+
 func TestCrossAdapterConsistency(t *testing.T) {
 	t.Parallel()
 	rpc, body := crossAdapterLiveBackupRPC(t)

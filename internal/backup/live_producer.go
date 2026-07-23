@@ -160,7 +160,11 @@ func publishCompletedLiveBackup(
 func beginLiveBackup(ctx context.Context, rpc LiveBackupRPC, opts LiveBackupOptions) (*pb.BeginBackupResponse, error) {
 	timeout := effectiveTimeout(opts.BeginTimeout, defaultLiveBackupBeginTimeout)
 	beginCtx, cancel := context.WithTimeout(ctx, timeout)
-	begin, err := rpc.BeginBackup(beginCtx, &pb.BeginBackupRequest{TtlMs: durationMillis(opts.TTL)})
+	begin, err := rpc.BeginBackup(beginCtx, &pb.BeginBackupRequest{
+		TtlMs:    durationMillis(opts.TTL),
+		Adapters: liveBackupAdapterNames(opts.Adapters),
+		Scopes:   protoScopes(scopeSet(opts.Scopes)),
+	})
 	cancel()
 	if err != nil {
 		return nil, errors.Wrap(err, "begin live backup")
@@ -459,18 +463,24 @@ func validateLiveScope(scope Scope) error {
 }
 
 func adapterEnabled(set AdapterSet, name string) bool {
-	switch name {
-	case adapterDynamoDB:
-		return set.DynamoDB
-	case adapterS3:
-		return set.S3
-	case adapterRedis:
-		return set.Redis
-	case adapterSQS:
-		return set.SQS
-	default:
-		return false
+	return AdapterEnabled(set, name)
+}
+
+func liveBackupAdapterNames(set AdapterSet) []string {
+	names := make([]string, 0, 4) //nolint:mnd // four logical backup adapters.
+	if set.DynamoDB {
+		names = append(names, adapterDynamoDB)
 	}
+	if set.S3 {
+		names = append(names, adapterS3)
+	}
+	if set.Redis {
+		names = append(names, adapterRedis)
+	}
+	if set.SQS {
+		names = append(names, adapterSQS)
+	}
+	return names
 }
 
 func protoScopes(scopes map[Scope]struct{}) []*pb.BackupScope {
@@ -574,7 +584,7 @@ func liveBackupManifest(begin *pb.BeginBackupResponse, token []byte, selected ma
 		}
 	}
 	sort.Slice(m.Shards, func(i, j int) bool { return m.Shards[i].RaftGroupID < m.Shards[j].RaftGroupID })
-	m.Adapters = liveManifestAdapters(opts.Adapters, selected)
+	m.Adapters = liveManifestAdapters(opts.Adapters, selected, len(opts.Scopes) == 0)
 	m.Exclusions = &Exclusions{
 		IncludeIncompleteUploads: opts.IncludeIncompleteUploads,
 		IncludeOrphans:           opts.IncludeOrphans,
@@ -588,9 +598,8 @@ func liveBackupManifest(begin *pb.BeginBackupResponse, token []byte, selected ma
 	return m
 }
 
-func liveManifestAdapters(enabled AdapterSet, selected map[Scope]struct{}) *Adapters {
+func liveManifestAdapters(enabled AdapterSet, selected map[Scope]struct{}, includeEnabledEmpty bool) *Adapters {
 	out := &Adapters{}
-	includeEnabledEmpty := len(selected) == 0
 	if includeEnabledEmpty && enabled.DynamoDB {
 		out.DynamoDB = &Adapter{}
 	}

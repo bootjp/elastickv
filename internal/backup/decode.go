@@ -201,6 +201,7 @@ func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
 		d.ddb = NewDDBEncoder(opts.OutRoot).
 			WithBundleJSONL(opts.DynamoDBBundleJSONL).
 			WithBundleSizeBytes(opts.DynamoDBBundleSizeBytes).
+			WithCountOnly(opts.countOnly).
 			WithWarnSink(opts.WarnSink)
 	}
 	if opts.Adapters.S3 {
@@ -219,6 +220,7 @@ func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
 		d.sqs = NewSQSEncoder(opts.OutRoot).
 			WithIncludeSideRecords(opts.IncludeSQSSideRecords).
 			WithPreserveVisibility(opts.PreserveSQSVisibility).
+			WithCountOnly(opts.countOnly).
 			WithWarnSink(opts.WarnSink)
 	}
 	return d, nil

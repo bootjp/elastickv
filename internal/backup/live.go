@@ -59,6 +59,46 @@ func ScopeForKey(key []byte) (Scope, bool, error) {
 	}
 }
 
+// AdapterForKey reports the backup adapter family for keys that belong to a
+// known adapter namespace, including malformed scoped keys. Callers can use it
+// to skip disabled adapters before running stricter scope parsing.
+func AdapterForKey(key []byte) (string, bool) {
+	switch {
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBGSIPrefix):
+		return adapterDynamoDB, true
+	case hasAnyBackupPrefix(key,
+		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix,
+		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3GCUploadPrefix, S3RoutePrefix,
+	):
+		return adapterS3, true
+	case hasAnyBackupPrefix(key,
+		SQSQueueMetaPrefix, SQSQueueGenPrefix, SQSMsgDataPrefix, SQSQueueSeqPrefix,
+		SQSQueueTombstonePrefix, SQSMsgVisPrefix, SQSMsgByAgePrefix, SQSMsgDedupPrefix, SQSMsgGroupPrefix,
+	):
+		return adapterSQS, true
+	case isRedisBackupKey(key):
+		return adapterRedis, true
+	default:
+		return "", false
+	}
+}
+
+// AdapterEnabled reports whether name is enabled in set.
+func AdapterEnabled(set AdapterSet, name string) bool {
+	switch name {
+	case adapterDynamoDB:
+		return set.DynamoDB
+	case adapterS3:
+		return set.S3
+	case adapterRedis:
+		return set.Redis
+	case adapterSQS:
+		return set.SQS
+	default:
+		return false
+	}
+}
+
 func scopeForDDBKey(key []byte) (Scope, bool, error) {
 	switch {
 	case bytes.HasPrefix(key, []byte(DDBTableMetaPrefix)):
@@ -262,15 +302,40 @@ func NewLiveScopeCounter(adapters AdapterSet) (*LiveScopeCounter, error) {
 }
 
 func (c *LiveScopeCounter) Add(key, value []byte) error {
-	if c == nil || c.d == nil {
-		return errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
-	}
-	scope, scoped, err := ScopeForKey(key)
+	needsValue, err := c.AddKey(key)
 	if err != nil {
 		return err
 	}
-	if scoped {
-		c.streamed[scope]++
+	if !needsValue {
+		return nil
+	}
+	return c.AddValue(key, value)
+}
+
+// AddKey records a key observed by a count-only baseline scan. It returns true
+// when the caller must also provide the value through AddValue for metadata
+// needed by retained-count finalization.
+func (c *LiveScopeCounter) AddKey(key []byte) (bool, error) {
+	if c == nil || c.d == nil {
+		return false, errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	scope, scoped, err := ScopeForKey(key)
+	if err != nil {
+		return false, err
+	}
+	if !scoped {
+		return false, nil
+	}
+	c.streamed[scope]++
+	if liveScopeCounterNeedsValue(key) {
+		return true, nil
+	}
+	return false, c.d.route(key, nil)
+}
+
+func (c *LiveScopeCounter) AddValue(key, value []byte) error {
+	if c == nil || c.d == nil {
+		return errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
 	}
 	return c.d.route(key, value)
 }
@@ -280,6 +345,20 @@ func (c *LiveScopeCounter) RetainedCounts() (map[Scope]uint64, error) {
 		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
 	}
 	return finalizedScopeCounts(c.d, c.streamed), nil
+}
+
+func liveScopeCounterNeedsValue(key []byte) bool {
+	switch {
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix):
+		return true
+	case hasAnyBackupPrefix(key, S3BucketMetaPrefix, S3ObjectManifestPrefix):
+		return true
+	case hasAnyBackupPrefix(key, SQSQueueMetaPrefix, SQSQueueGenPrefix):
+		return true
+	default:
+		adapter, ok := AdapterForKey(key)
+		return ok && adapter == adapterRedis
+	}
 }
 
 func finalizedScopeCounts(d *dispatcher, streamed map[Scope]uint64) map[Scope]uint64 {
