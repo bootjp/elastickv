@@ -435,6 +435,27 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
+func (b *LeaderAwareRedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	cmd := b.doWithReadTimeoutOnce(ctx, timeout, args...)
+	switch {
+	case isElasticKVNotLeaderError(cmd.Err()):
+		b.RefreshLeaderNow(ctx)
+	case isLeaderRefreshTransportError(cmd.Err()):
+		b.TriggerRefresh()
+	}
+	return cmd
+}
+
+func (b *LeaderAwareRedisBackend) doWithReadTimeoutOnce(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	cli := b.currentClient()
+	if cli == nil {
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(ErrNoLeaderBackend)
+		return cmd
+	}
+	return cli.WithTimeout(timeout).Do(ctx, args...)
+}
+
 // Pipeline forwards a batch to the current leader.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 	return b.pipeline(ctx, 0, cmds)
@@ -443,6 +464,10 @@ func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([
 // PipelineWithTimeout forwards a batch with a per-call socket timeout override.
 func (b *LeaderAwareRedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
 	return b.pipeline(ctx, effectiveBlockingReadTimeout(timeout), cmds)
+}
+
+func (b *LeaderAwareRedisBackend) PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, timeout, cmds)
 }
 
 func (b *LeaderAwareRedisBackend) pipeline(ctx context.Context, readTimeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {

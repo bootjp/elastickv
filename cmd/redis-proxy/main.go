@@ -24,6 +24,7 @@ const (
 	secondaryWriteConcurrencyDivisor  = 2
 	secondaryScriptConcurrencyDivisor = 32
 	secondaryScriptConcurrencyCap     = 3
+	maxSecondaryScriptTimeout         = 5 * time.Minute
 )
 
 func main() {
@@ -71,6 +72,7 @@ func run() error {
 	flag.Parse()
 
 	mode, resolvedWriteConcurrency, resolvedScriptConcurrency, resolvedBlockingReplayConcurrency, err := resolveRuntimeOptions(
+		cfg,
 		modeStr,
 		primaryPoolSize,
 		elasticKVPoolSize,
@@ -170,11 +172,15 @@ func run() error {
 }
 
 func resolveRuntimeOptions(
+	cfg proxy.ProxyConfig,
 	modeStr string,
 	primaryPoolSize, elasticKVPoolSize int,
 	secondaryWriteConcurrency, secondaryScriptConcurrency, secondaryBlockingReplayConcurrency int,
 	secondaryWriteQueueSize, secondaryScriptQueueSize, secondaryBlockingReplayQueueSize int,
 ) (proxy.ProxyMode, int, int, int, error) {
+	if err := validateRuntimeTimeouts(cfg); err != nil {
+		return 0, 0, 0, 0, err
+	}
 	mode, err := parseRuntimeOptions(
 		modeStr,
 		primaryPoolSize,
@@ -208,6 +214,20 @@ func resolveRuntimeOptions(
 		return 0, 0, 0, 0, err
 	}
 	return mode, writeConcurrency, scriptConcurrency, blockingReplayConcurrency, nil
+}
+
+func validateRuntimeTimeouts(cfg proxy.ProxyConfig) error {
+	if cfg.SecondaryScriptTimeout < 0 {
+		return fmt.Errorf("secondary-script-timeout must be non-negative: %s", cfg.SecondaryScriptTimeout)
+	}
+	effectiveScriptTimeout := cfg.SecondaryScriptTimeout
+	if effectiveScriptTimeout == 0 {
+		effectiveScriptTimeout = cfg.SecondaryTimeout
+	}
+	if effectiveScriptTimeout > maxSecondaryScriptTimeout {
+		return fmt.Errorf("secondary-script-timeout %s exceeds ElasticKV Lua dispatch cap %s", effectiveScriptTimeout, maxSecondaryScriptTimeout)
+	}
+	return nil
 }
 
 func parseRuntimeOptions(

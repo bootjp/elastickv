@@ -128,6 +128,10 @@ func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration,
 	return b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
 }
 
+func (b *RedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	return b.client.WithTimeout(timeout).Do(ctx, args...)
+}
+
 func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
 	if timeout == 0 {
 		return 0
@@ -143,6 +147,10 @@ func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd
 // override for async replay classes whose deadline exceeds the backend default.
 func (b *RedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
 	return b.pipeline(ctx, b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)), cmds)
+}
+
+func (b *RedisBackend) PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, b.client.WithTimeout(timeout), cmds)
 }
 
 func (b *RedisBackend) pipeline(ctx context.Context, client *redis.Client, cmds [][]any) ([]*redis.Cmd, error) {

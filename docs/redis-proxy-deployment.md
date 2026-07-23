@@ -44,7 +44,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-blocking-replay-queue-size` | `0` | Bounded queue for mutating blocking-command replays. `0` derives `64 * concurrency`, clamped to `64..8192` |
 | `-mode` | `dual-write` | Proxy mode (see below) |
 | `-secondary-timeout` | `30s` | End-to-end secondary write deadline, including queue wait |
-| `-secondary-script-timeout` | `5m` | End-to-end secondary Lua-script write deadline, including queue wait. `0` follows `-secondary-timeout` |
+| `-secondary-script-timeout` | `5m` | End-to-end secondary Lua-script write deadline, including queue wait. `0` follows `-secondary-timeout`; the effective value must not exceed the ElasticKV Lua dispatch cap (`5m`) |
 | `-shadow-timeout` | `3s` | Shadow read timeout |
 | `-sentry-dsn` | (empty) | Sentry DSN (empty = disabled) |
 | `-sentry-env` | (empty) | Sentry environment name |
@@ -421,7 +421,7 @@ groups:
 | ElasticKV connection pool size | 192 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
 | ElasticKV Redis per-peer connection cap | 512 | Default server-side cap: two proxy replicas at pool `192`, plus dedicated PubSub/shadow PubSub headroom |
 | Dial timeout | 5s | Backend connection timeout |
-| Read timeout | Redis: 3s, ElasticKV: 5m10s | Backend read timeout; ElasticKV keeps 10s grace beyond `-secondary-script-timeout` |
+| Read timeout | Redis: 3s, ElasticKV: 3s | Default backend read timeout. Async secondary replays override the per-call read timeout with the remaining queue deadline; blocking commands add a 10s read grace to their requested wait |
 | Write timeout | 3s | Backend write timeout |
 | Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |

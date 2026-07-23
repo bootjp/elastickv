@@ -504,6 +504,11 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 		var resp any
 		result := d.secondaryDo(sCtx, cmd, iArgs)
 		resp, sErr = result.Result()
+		if shouldFallbackZRemFast(cmd, sErr) {
+			cmd = zremReplayCommand
+			iArgs = zremFastFallbackArgs(iArgs)
+			continue
+		}
 		if ok, err := positiveIntReplayResult(resp, sErr); ok {
 			elapsed := time.Since(start)
 			d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
@@ -865,20 +870,20 @@ func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
 }
 
 func (d *DualWriter) secondaryDo(ctx context.Context, cmd string, args []any) *redis.Cmd {
-	timeout := d.secondaryCommandReadTimeout(cmd)
+	timeout := d.secondaryCommandReadTimeout(ctx, cmd)
 	if timeout > 0 {
-		if backend, ok := d.secondary.(blockingTimeoutBackend); ok {
-			return backend.DoWithTimeout(ctx, timeout, args...)
+		if backend, ok := d.secondary.(readTimeoutBackend); ok {
+			return backend.DoWithReadTimeout(ctx, timeout, args...)
 		}
 	}
 	return d.secondary.Do(ctx, args...)
 }
 
 func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
-	timeout := d.secondaryPipelineReadTimeout(cmds)
+	timeout := d.secondaryPipelineReadTimeout(ctx, cmds)
 	if timeout > 0 {
-		if backend, ok := d.secondary.(pipelineTimeoutBackend); ok {
-			results, err := backend.PipelineWithTimeout(ctx, timeout, cmds)
+		if backend, ok := d.secondary.(pipelineReadTimeoutBackend); ok {
+			results, err := backend.PipelineWithReadTimeout(ctx, timeout, cmds)
 			if err != nil {
 				return results, fmt.Errorf("secondary pipeline with timeout: %w", err)
 			}
@@ -892,18 +897,56 @@ func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*re
 	return results, nil
 }
 
-func (d *DualWriter) secondaryCommandReadTimeout(cmd string) time.Duration {
+func (d *DualWriter) secondaryCommandReadTimeout(ctx context.Context, cmd string) time.Duration {
 	if isRedisScriptCommandName(cmd) {
-		return secondaryScriptTimeout(d.cfg)
+		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
 	}
-	return d.cfg.SecondaryTimeout
+	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
 }
 
-func (d *DualWriter) secondaryPipelineReadTimeout(cmds [][]any) time.Duration {
+func (d *DualWriter) secondaryPipelineReadTimeout(ctx context.Context, cmds [][]any) time.Duration {
 	if pipelineContainsScript(cmds) {
-		return secondaryScriptTimeout(d.cfg)
+		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
 	}
-	return d.cfg.SecondaryTimeout
+	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
+}
+
+func secondaryReadTimeout(ctx context.Context, configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return 0
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return configured
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < configured {
+		return remaining
+	}
+	return configured
+}
+
+func shouldFallbackZRemFast(cmd string, err error) bool {
+	return strings.EqualFold(cmd, elasticKVZRemFastCommand) && isUnsupportedCommandError(err)
+}
+
+func isUnsupportedCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported command") || strings.Contains(msg, "unknown command")
+}
+
+func zremFastFallbackArgs(args []any) []any {
+	out := append([]any(nil), args...)
+	if len(out) > 0 {
+		out[0] = zremReplayCommand
+	}
+	return out
 }
 
 func pipelineContainsScript(cmds [][]any) bool {

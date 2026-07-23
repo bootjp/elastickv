@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/proxy"
 	"github.com/stretchr/testify/assert"
@@ -34,6 +35,38 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryQueueSize(t *testing.T) {
 	_, err = parseRuntimeOptions("dual-write", 128, 4, 0, 0, 0, 0, 0, -1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary-blocking-replay-queue-size")
+}
+
+func TestValidateRuntimeTimeoutsRejectsUnsupportedScriptTimeout(t *testing.T) {
+	require.NoError(t, validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: 0,
+	}))
+	require.NoError(t, validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: maxSecondaryScriptTimeout,
+	}))
+
+	err := validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: -time.Second,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary-script-timeout")
+
+	err = validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: maxSecondaryScriptTimeout + time.Nanosecond,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ElasticKV Lua dispatch cap")
+
+	err = validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       maxSecondaryScriptTimeout + time.Nanosecond,
+		SecondaryScriptTimeout: 0,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ElasticKV Lua dispatch cap")
 }
 
 func TestValidateSecondaryConcurrency(t *testing.T) {
