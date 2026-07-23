@@ -222,6 +222,19 @@ func TestHLCNextFencedFailsClosedOnExpiredCeiling(t *testing.T) {
 	require.ErrorIs(t, err, ErrCeilingExpired)
 }
 
+func TestHLCNextFencedRejectsExhaustedCeilingWindow(t *testing.T) {
+	t.Parallel()
+
+	h := NewHLC()
+	ceiling := time.Now().Add(time.Hour).UnixMilli()
+	h.SetPhysicalCeiling(ceiling)
+	h.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask) //nolint:gosec // ceiling is a positive Unix ms timestamp.
+
+	_, err := h.NextFenced()
+	require.ErrorIs(t, err, ErrCeilingExpired)
+	require.Equal(t, uint64(1), h.NextFencedRejections())
+}
+
 // TestHLCNextFencedIgnoredPreBootstrap verifies the documented soft-fence
 // semantics: ceiling == 0 (no prior leader) is NOT fenced — NextFenced must
 // behave identically to Next so that demo/test bootstrap can issue ts

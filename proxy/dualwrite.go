@@ -370,7 +370,7 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 					deadlineAsMiss:      true,
 				})
 			})
-		} else if shouldReplayBlockingToSecondary(cmd, resp) {
+		} else if shouldReplayBlockingToSecondary(cmd, resp) && blockingResultMayHaveMutated(resp, err) {
 			d.goBlockingReplay(func(ctx context.Context) {
 				sCtx, cancel := context.WithTimeout(ctx, time.Second)
 				defer cancel()
@@ -380,6 +380,10 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
+}
+
+func blockingResultMayHaveMutated(resp any, err error) bool {
+	return err == nil && resp != nil
 }
 
 // Admin forwards an admin command to the primary only.

@@ -35,7 +35,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
-| `-elastickv-pool-size` | `192` | ElasticKV backend connection pool size |
+| `-elastickv-pool-size` | `192` | ElasticKV backend command pool size; keep the server-side `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` above this, with headroom for dedicated PubSub connections |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
 | `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives one thirty-second of the shared write limit, capped at `3`, minimum `1` |
 | `-secondary-blocking-replay-concurrency` | `0` | Fallback mutating blocking-command replay sublimit. `0` uses remaining secondary backend pool capacity, capped at `32` |
@@ -418,7 +418,7 @@ groups:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Redis connection pool size | 128 | Default go-redis pool size for Redis |
-| ElasticKV connection pool size | 192 | Default per-leader command pool; leave server per-peer headroom for dedicated PubSub connections |
+| ElasticKV connection pool size | 192 | Default per-leader command pool; regular and blocking replay pools share the server per-peer budget, while PubSub uses dedicated sockets outside the pool |
 | ElasticKV Redis per-peer connection cap | 512 | Default server-side cap: two proxy replicas at pool `192`, plus dedicated PubSub/shadow PubSub headroom |
 | Dial timeout | 5s | Backend connection timeout |
 | Read timeout | Redis: 3s, ElasticKV: 3s | Default backend read timeout. Async secondary replays override the per-call read timeout with the remaining queue deadline; blocking commands add a 10s read grace to their requested wait |
@@ -444,7 +444,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ### Secondary writes are falling behind
 - Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
-- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
+- Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool, and detached PubSub sockets may remain counted until cleanup. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
 - Successful `BZPOPMIN` / `BZPOPMAX` calls are replayed to ElasticKV as an internal fast ZREM variant on the normal write queue. Regular client `ZREM` still keeps Redis wrong-type behavior; stale BZPOP replays avoid wide type scans. Timeout/null blocking responses are not replayed because the primary made no mutation.
 - If script drops rise while backend pool waits stay at zero, the bottleneck is server-side Lua replay or wide-column cleanup, not connection acquisition. Keep `-secondary-script-concurrency` low; use `-secondary-script-timeout` for burst backlog and profile ElasticKV before raising concurrency.
 - A sustained `expired` rate means secondary throughput is below ingress. Increasing queue size only delays the loss; profile ElasticKV before raising concurrency.
