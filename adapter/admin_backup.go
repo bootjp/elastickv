@@ -39,6 +39,7 @@ const (
 	defaultLiveBackupRenewAttempts        = 3
 	defaultLiveBackupRenewBackoff         = 500 * time.Millisecond
 	backupAppliedPollInterval             = 10 * time.Millisecond
+	defaultLiveBackupMaxActivePins        = 4
 )
 
 var (
@@ -71,6 +72,11 @@ type filteredBackupScanStore interface {
 	) kv.BackupScanner
 }
 
+type backupBaselineSelection struct {
+	adapters logicalbackup.AdapterSet
+	scopes   map[logicalbackup.Scope]bool
+}
+
 type BackupPinLimiter interface {
 	PinWithDeadline(pinID kv.BackupPinID, readTS uint64, deadline time.Time) error
 	ReleaseBackupPin(pinID kv.BackupPinID)
@@ -83,6 +89,7 @@ type AdminBackupConfig struct {
 	BeginDeadline           time.Duration
 	SnapshotHeadroomEntries uint64
 	ScanPageSize            int
+	MaxActivePins           int
 	RenewAttempts           int
 	RenewBackoff            time.Duration
 }
@@ -94,6 +101,7 @@ type backupConfig struct {
 	beginDeadline           time.Duration
 	snapshotHeadroomEntries uint64
 	scanPageSize            int
+	maxActivePins           int
 	renewAttempts           int
 	renewBackoff            time.Duration
 }
@@ -106,6 +114,7 @@ func defaultBackupConfig() backupConfig {
 		beginDeadline:           defaultLiveBackupBeginDeadline,
 		snapshotHeadroomEntries: defaultLiveBackupHeadroom,
 		scanPageSize:            defaultLiveBackupScanPageSize,
+		maxActivePins:           defaultLiveBackupMaxActivePins,
 		renewAttempts:           defaultLiveBackupRenewAttempts,
 		renewBackoff:            defaultLiveBackupRenewBackoff,
 	}
@@ -150,6 +159,9 @@ func WithAdminBackupConfig(cfg AdminBackupConfig) AdminOption {
 		}
 		if cfg.ScanPageSize > 0 {
 			s.backupConfig.scanPageSize = cfg.ScanPageSize
+		}
+		if cfg.MaxActivePins > 0 {
+			s.backupConfig.maxActivePins = cfg.MaxActivePins
 		}
 		if cfg.RenewAttempts > 0 {
 			s.backupConfig.renewAttempts = cfg.RenewAttempts
@@ -211,6 +223,10 @@ func (s *AdminServer) BeginBackup(ctx context.Context, req *pb.BeginBackupReques
 	if err != nil {
 		return nil, err
 	}
+	selection, err := backupBaselineSelectionFromBeginRequest(req)
+	if err != nil {
+		return nil, err
+	}
 
 	// Serialize BeginBackup on one admin endpoint so local preflight capacity
 	// and proposal compensation cannot interleave.
@@ -223,7 +239,7 @@ func (s *AdminServer) BeginBackup(ctx context.Context, req *pb.BeginBackupReques
 	if err != nil {
 		return nil, err
 	}
-	counts, appliedAtCount, err := s.buildExpectedBackupBaseline(ctx, prepared)
+	counts, appliedAtCount, err := s.buildExpectedBackupBaseline(ctx, prepared, selection)
 	if err != nil {
 		s.compensateBackupRelease(prepared.controlGroup, prepared.groups, prepared.pinID)
 		return nil, err
@@ -245,11 +261,12 @@ func (s *AdminServer) BeginBackup(ctx context.Context, req *pb.BeginBackupReques
 	s.rememberBackupSession(tok, prepared.routes)
 
 	return &pb.BeginBackupResponse{
-		ReadTs:         prepared.readTS,
-		PinToken:       encodedToken,
-		TtlMsEffective: uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
-		Shards:         backupShardResponses(prepared.groups, prepared.commits),
-		ExpectedKeys:   backupExpectedResponses(counts, appliedAtCount),
+		ReadTs:              prepared.readTS,
+		PinToken:            encodedToken,
+		TtlMsEffective:      uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
+		Shards:              backupShardResponses(prepared.groups, prepared.commits),
+		ExpectedKeys:        backupExpectedResponses(counts, appliedAtCount),
+		MaxActiveBackupPins: uint32(s.backupConfig.maxActivePins), //nolint:gosec // startup validation requires a positive int.
 	}, nil
 }
 
@@ -351,6 +368,7 @@ func (s *AdminServer) pinBackupGroups(
 func (s *AdminServer) buildExpectedBackupBaseline(
 	ctx context.Context,
 	prepared preparedBackup,
+	selection backupBaselineSelection,
 ) (map[logicalbackup.Scope]uint64, uint64, error) {
 	stopRenew := make(chan struct{})
 	renewDone := make(chan error, 1)
@@ -368,7 +386,9 @@ func (s *AdminServer) buildExpectedBackupBaseline(
 	if validateErr != nil {
 		scanErr = errors.Wrap(validateErr, "validate backup transaction locks")
 	} else {
-		counts, appliedAtCount, scanErr = s.scanBackupScopeCounts(ctx, prepared.routes, prepared.readTS, prepared.groups, nil)
+		counts, appliedAtCount, scanErr = s.scanBackupScopeCounts(
+			ctx, prepared.routes, prepared.readTS, prepared.groups, selection, nil,
+		)
 	}
 	close(stopRenew)
 	renewErr := <-renewDone
@@ -512,9 +532,13 @@ func (s *AdminServer) ListAdaptersAndScopes(
 	if err != nil {
 		return nil, err
 	}
-	counts, _, err := s.scanBackupScopeCounts(ctx, routes, tok.readTS, groups, func() error {
-		return s.requireLiveBackupSession(tok)
-	})
+	counts, _, err := s.scanBackupScopeCounts(
+		ctx, routes, tok.readTS, groups,
+		backupBaselineSelection{adapters: logicalbackup.AllAdapters()},
+		func() error {
+			return s.requireLiveBackupSession(tok)
+		},
+	)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "list backup scopes: %v", err)
 	}
@@ -537,14 +561,14 @@ func (s *AdminServer) StreamBackup(
 	if err != nil {
 		return err
 	}
-	if err := s.requireUnexpiredBackupToken(tok); err != nil {
-		return err
-	}
 	if _, err := s.backupGroupsForToken(tok); err != nil {
 		return err
 	}
 	routes, err := s.backupRouteSnapshotForToken(tok)
 	if err != nil {
+		return err
+	}
+	if err := s.requireLiveBackupSession(tok); err != nil {
 		return err
 	}
 	selected, err := selectedBackupScopes(req.GetScopes())
@@ -669,6 +693,69 @@ func selectedBackupScopes(scopes []*pb.BackupScope) (map[logicalbackup.Scope]boo
 		selected[logicalbackup.Scope{Adapter: scope.GetAdapter(), Name: scope.GetScope()}] = true
 	}
 	return selected, nil
+}
+
+func backupBaselineSelectionFromBeginRequest(req *pb.BeginBackupRequest) (backupBaselineSelection, error) {
+	adapters, err := backupAdaptersFromNames(req.GetAdapters())
+	if err != nil {
+		return backupBaselineSelection{}, err
+	}
+	scopes, err := selectedBackupScopes(req.GetScopes())
+	if err != nil {
+		return backupBaselineSelection{}, err
+	}
+	for scope := range scopes {
+		if !logicalbackup.AdapterEnabled(adapters, scope.Adapter) {
+			return backupBaselineSelection{}, status.Errorf(codes.InvalidArgument, "%s is excluded by adapters", scope.Adapter)
+		}
+	}
+	return backupBaselineSelection{adapters: adapters, scopes: scopes}, nil
+}
+
+func backupAdaptersFromNames(names []string) (logicalbackup.AdapterSet, error) {
+	if len(names) == 0 {
+		return logicalbackup.AllAdapters(), nil
+	}
+	var out logicalbackup.AdapterSet
+	for _, name := range names {
+		switch name {
+		case "dynamodb":
+			out.DynamoDB = true
+		case "s3":
+			out.S3 = true
+		case "redis":
+			out.Redis = true
+		case "sqs":
+			out.SQS = true
+		default:
+			return logicalbackup.AdapterSet{}, status.Errorf(codes.InvalidArgument, "unknown backup adapter %q", name)
+		}
+	}
+	if out == (logicalbackup.AdapterSet{}) {
+		return logicalbackup.AdapterSet{}, status.Errorf(codes.InvalidArgument, "%s", "backup requires at least one adapter")
+	}
+	return out, nil
+}
+
+func backupBaselineKeySelected(key []byte, selection backupBaselineSelection) (bool, error) {
+	adapter, ok := logicalbackup.AdapterForKey(key)
+	if !ok {
+		return false, nil
+	}
+	if !logicalbackup.AdapterEnabled(selection.adapters, adapter) {
+		return false, nil
+	}
+	scope, scoped, err := logicalbackup.ScopeForKey(key)
+	if err != nil {
+		return false, errors.Wrap(err, "classify backup baseline key")
+	}
+	if !scoped {
+		return false, nil
+	}
+	if len(selection.scopes) > 0 && !selection.scopes[scope] {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *AdminServer) requireBackupControl() error {
@@ -1049,59 +1136,122 @@ func (s *AdminServer) scanBackupScopeCounts(
 	routes kv.BackupRouteSnapshot,
 	readTS uint64,
 	groups []backupGroup,
+	selection backupBaselineSelection,
 	requireLive func() error,
 ) (counts map[logicalbackup.Scope]uint64, applied uint64, retErr error) {
-	scanner := s.backupStore.NewBackupKeyScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
-	if scanner == nil {
-		return nil, 0, errors.New("backup key scanner is nil")
+	if selection.adapters == (logicalbackup.AdapterSet{}) {
+		selection.adapters = logicalbackup.AllAdapters()
 	}
-	defer func() {
-		retErr = finishBackupScan(ctx, scanner, retErr)
-	}()
-	counts, err := collectBackupScopeCounts(ctx, scanner, requireLive)
+	counter, err := logicalbackup.NewLiveScopeCounter(selection.adapters)
 	if err != nil {
+		return nil, 0, errors.Wrap(err, "create retained backup baseline counter")
+	}
+	metadataKeys, err := s.scanBackupScopeKeys(ctx, routes, readTS, selection, counter, requireLive)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.scanBackupScopeMetadata(ctx, routes, readTS, metadataKeys, counter, requireLive); err != nil {
+		return nil, 0, err
+	}
+	if err := requireBackupScopeScanLive(requireLive); err != nil {
 		return nil, 0, err
 	}
 	applied, err = currentMinBackupAppliedIndex(groups)
 	if err != nil {
 		return nil, 0, err
 	}
+	counts, err = counter.RetainedCounts()
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "finalize retained backup baseline")
+	}
 	return counts, applied, nil
 }
 
-func collectBackupScopeCounts(
+func (s *AdminServer) scanBackupScopeKeys(
 	ctx context.Context,
-	scanner kv.BackupKeyScanner,
+	routes kv.BackupRouteSnapshot,
+	readTS uint64,
+	selection backupBaselineSelection,
+	counter *logicalbackup.LiveScopeCounter,
 	requireLive func() error,
-) (map[logicalbackup.Scope]uint64, error) {
-	counts := make(map[logicalbackup.Scope]uint64)
+) (metadataKeys map[string]struct{}, retErr error) {
+	scanner := s.backupStore.NewBackupKeyScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
+	if scanner == nil {
+		return nil, errors.New("backup key scanner is nil")
+	}
+	defer func() {
+		retErr = finishBackupScan(ctx, scanner, retErr)
+	}()
+	metadataKeys = make(map[string]struct{})
 	for {
 		if err := requireBackupScopeScanLive(requireLive); err != nil {
 			return nil, err
 		}
 		key, ok, err := scanner.Next(ctx)
 		if err != nil {
-			return nil, errors.Wrap(err, "scan backup key baseline")
+			return nil, errors.Wrap(err, "scan backup baseline")
 		}
 		if !ok {
 			break
 		}
-		if err := countBackupScopeKey(counts, key); err != nil {
-			return nil, err
+		selected, err := backupBaselineKeySelected(key, selection)
+		if err != nil {
+			return nil, errors.Wrap(err, "select backup baseline key")
+		}
+		if !selected {
+			continue
+		}
+		needsValue, err := counter.AddKey(key)
+		if err != nil {
+			return nil, errors.Wrap(err, "count retained backup baseline key")
+		}
+		if needsValue {
+			metadataKeys[string(key)] = struct{}{}
 		}
 	}
-	return counts, requireBackupScopeScanLive(requireLive)
+	return metadataKeys, requireBackupScopeScanLive(requireLive)
 }
 
-func countBackupScopeKey(counts map[logicalbackup.Scope]uint64, key []byte) error {
-	scope, scoped, err := logicalbackup.ScopeForKey(key)
-	if err != nil {
-		return errors.Wrap(err, "classify backup key baseline")
+func (s *AdminServer) scanBackupScopeMetadata(
+	ctx context.Context,
+	routes kv.BackupRouteSnapshot,
+	readTS uint64,
+	metadataKeys map[string]struct{},
+	counter *logicalbackup.LiveScopeCounter,
+	requireLive func() error,
+) (retErr error) {
+	if len(metadataKeys) == 0 {
+		return requireBackupScopeScanLive(requireLive)
 	}
-	if scoped {
-		counts[scope]++
+	scanner := s.newBackupBaselineMetadataScanner(routes, readTS, metadataKeys)
+	if scanner == nil {
+		return errors.New("backup metadata scanner is nil")
 	}
-	return nil
+	defer func() {
+		retErr = finishBackupScan(ctx, scanner, retErr)
+	}()
+	for {
+		if err := requireBackupScopeScanLive(requireLive); err != nil {
+			return err
+		}
+		pair, ok, err := scanner.Next(ctx)
+		if err != nil {
+			return errors.Wrap(err, "scan backup baseline metadata")
+		}
+		if !ok {
+			break
+		}
+		if pair == nil {
+			return errors.New("backup metadata scanner returned a nil record")
+		}
+		if _, ok := metadataKeys[string(pair.Key)]; !ok {
+			continue
+		}
+		if err := counter.AddValue(pair.Key, pair.Value); err != nil {
+			return errors.Wrap(err, "count retained backup baseline metadata")
+		}
+	}
+	return requireBackupScopeScanLive(requireLive)
 }
 
 func requireBackupScopeScanLive(requireLive func() error) error {
@@ -1109,6 +1259,20 @@ func requireBackupScopeScanLive(requireLive func() error) error {
 		return nil
 	}
 	return requireLive()
+}
+
+func (s *AdminServer) newBackupBaselineMetadataScanner(
+	routes kv.BackupRouteSnapshot,
+	readTS uint64,
+	metadataKeys map[string]struct{},
+) kv.BackupScanner {
+	if filtered, ok := s.backupStore.(filteredBackupScanStore); ok {
+		return filtered.NewFilteredBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize, func(key []byte) (bool, error) {
+			_, ok := metadataKeys[string(key)]
+			return ok, nil
+		})
+	}
+	return s.backupStore.NewBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
 }
 
 func (s *AdminServer) rememberBackupSession(tok backupToken, routes kv.BackupRouteSnapshot) {
@@ -1138,11 +1302,15 @@ func (s *AdminServer) requireLiveBackupSession(tok backupToken) error {
 	now := s.nowSnapshot()
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
-	s.reapBackupSessionsLocked(now)
 	session, ok := s.backupSessions[tok.pinID]
 	if !ok || session.readTS != tok.readTS {
 		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
 	}
+	if session.deadline.IsZero() || !now.Before(session.deadline) {
+		delete(s.backupSessions, tok.pinID)
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	}
+	s.reapBackupSessionsLocked(now)
 	return nil
 }
 

@@ -112,6 +112,7 @@ type redisZSetState struct {
 	declaredLen    int64
 	members        map[string]float64
 	sawWide        bool
+	legacySeen     bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
@@ -287,6 +288,7 @@ func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 		// would surface stale post-migration leftovers in the dump.
 		return nil
 	}
+	st.legacySeen = true
 	for _, e := range entries {
 		st.members[e.member] = e.score
 	}

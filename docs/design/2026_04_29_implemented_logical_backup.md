@@ -1,6 +1,6 @@
 # Logical Backup: Live Cluster, PIT-Consistent Extraction (Phase 1)
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-04-29
 
@@ -11,10 +11,14 @@ design doc; both produce dumps in the **same on-disk format** so
 restorers and external tools do not care which phase produced a
 given dump.
 
+The Phase 1 central scope in this document is implemented. Phase 2 restore
+replay and Phase 3 incremental backup remain intentional future extensions;
+they are not prerequisites for Phase 1's live PIT producer status.
+
 | Phase | Doc | Scope |
 |-------|-----|-------|
-| **Phase 0** | [`2026_04_29_proposed_snapshot_logical_decoder.md`](./2026_04_29_proposed_snapshot_logical_decoder.md) | Offline `.fsm` ↔ logical-format directory tree converter. No live cluster, no admin RPCs, no FSM/Raft changes. **Owns the format definition.** Sufficient for single-shard clusters, one-time exports off elastickv, and any use case where the latest available snapshot is a good-enough recovery point. |
-| **Phase 1 (this doc)** | This file | Live, running-cluster extraction with cluster-wide point-in-time consistency across multiple Raft groups. Adds `BeginBackup` / `RenewBackup` / `EndBackup` admin RPCs, replicated `BackupPin` / `Extend` / `Release` Raft FSM commands, version-gated rolling-upgrade safety, expected-keys baseline. Required only when cross-shard PIT consistency or "snapshot now" cadence is needed. |
+| **Phase 0** | [`2026_04_29_implemented_snapshot_logical_decoder.md`](./2026_04_29_implemented_snapshot_logical_decoder.md) | Offline `.fsm` ↔ logical-format directory tree converter. No live cluster, no admin RPCs, no FSM/Raft changes. **Owns the format definition.** Sufficient for single-shard clusters, one-time exports off elastickv, and any use case where the latest available snapshot is a good-enough recovery point. |
+| **Phase 1 (this doc)** | This file | Live, running-cluster extraction with cluster-wide point-in-time consistency across multiple Raft groups. Adds `BeginBackup` / `RenewBackup` / `EndBackup` / `ListAdaptersAndScopes` / `StreamBackup` admin RPCs, replicated capacity reservation and pin lifecycle commands, version-gated rolling-upgrade safety, and an expected-keys baseline. Required only when cross-shard PIT consistency or "snapshot now" cadence is needed. |
 
 The format details (per-adapter directory layout, filename encoding,
 `MANIFEST.json` schema, per-adapter record shapes) are defined in the
@@ -357,11 +361,9 @@ item table emits 50 million inodes. On most modern filesystems
 (ext4/xfs/zfs/apfs) this is fine for write-once-and-tar dumps but
 slow for live filesystem operations.
 
-For tables where the inode count is the binding constraint, the
-producer accepts an opt-in `--dynamodb-bundle-mode jsonl` (paired
-with `--dynamodb-bundle-size 64MiB`, defaulting to that value) that
-emits items as `items/data-<part-id>.jsonl` instead, packed up to the
-configurable per-file size budget:
+The logical decoder implements an opt-in JSONL layout (paired with a
+configurable part-size budget) that emits items as
+`items/data-<part-id>.jsonl`:
 
 ```text
 dynamodb/orders/
@@ -373,17 +375,15 @@ dynamodb/orders/
 ```
 
 `MANIFEST.json` records the choice (`dynamodb_layout: "per-item" |
-"jsonl"`) so a restore tool dispatches the right reader. The bundle
-mode is an explicit operational decision; the default stays per-file
-because that is the layout the user asked for and the layout that
-makes one-line recovery scripts trivial. Operators are also free to
-post-process a per-item dump into bundles (`find … | xargs cat`)
-without losing any information, so the choice is not load-bearing on
-the format itself.
+"jsonl"`) so a restore tool can dispatch the right reader. The live
+producer currently rejects `--dynamodb-bundle-mode jsonl` when DynamoDB is
+selected because the documented native snapshot encoder cannot reverse that
+layout yet. Shipping the producer mode and reverse encoder together is an
+intentional future extension; completed live backups therefore remain
+restorable by the current native path.
 
-The producer emits a structured warning when an unbundled scope
-exceeds 1 million items so operators can decide whether to switch
-modes for that table.
+The producer emits a structured warning when an unbundled scope exceeds one
+million items so operators can provision inode capacity explicitly.
 
 GSIs are **not materialized** under the dump because they are derivable
 from `_schema.json` plus the base item set. Re-creating the table from
@@ -441,9 +441,10 @@ Multipart parts are **flattened on dump**: the user gets the assembled
 object, not the per-part fragments. Tools like `aws s3 cp --recursive`
 work on the dump directory tree directly. In-flight multipart uploads
 (`!s3|upload|meta|`, `!s3|upload|part|`, blob chunks not yet committed by
-`CompleteMultipartUpload`) are excluded by default; an
-`--include-incomplete-uploads` dump flag emits them under
-`s3/<bucket>/_incomplete_uploads/<uploadID>/`.
+`CompleteMultipartUpload`) are excluded. The decoder has an
+`--include-incomplete-uploads` representation under
+`s3/<bucket>/_incomplete_uploads/<uploadID>/`, but the live producer rejects
+that mode until the native snapshot encoder can reverse it.
 
 `_bucket.json`:
 
@@ -462,8 +463,9 @@ Generation handling: only the live (latest) generation per bucket is
 included. Pre-generation orphans (objects under
 `!s3|blob|<bucket>|<oldGen>|...`) are deliberately omitted — they exist on
 disk only because GC has not run yet, and replaying them into a fresh
-elastickv would resurrect deleted state. They land under
-`_orphans/<oldGen>/` only when `--include-orphans` is passed.
+elastickv would resurrect deleted state. The decoder can place them under
+`_orphans/<oldGen>/`, but the live producer rejects `--include-orphans` until
+the native snapshot encoder supports that subtree.
 
 ### Redis
 
@@ -595,10 +597,10 @@ The schema is the dump-time projection of `sqsMessageRecord`
 (`adapter/sqs_messages.go:80`) with **all visibility-state fields present
 but zeroed**. A restored queue starts with every message visible — which
 matches what AWS SQS does when a queue is rehydrated from a backup. If the
-operator explicitly requests `--preserve-visibility`, the live
-`visible_at_millis` / `current_receipt_token` are kept, but this is opt-in
-because resuming with a stale receipt token mid-flight is almost never
-the right behavior.
+decoder can preserve live `visible_at_millis` / `current_receipt_token`, but
+the live producer rejects that opt-in until the native snapshot encoder can
+round-trip those fields. Resuming with a stale receipt token mid-flight is
+also rarely the desired restore behavior.
 
 JSONL was chosen over per-message files for two reasons: (1) production
 queues commonly hold tens of thousands of messages, and one file per
@@ -610,8 +612,9 @@ In-flight side records (`!sqs|msg|dedup|`, `!sqs|msg|group|`,
 `!sqs|msg|byage|`, `!sqs|msg|vis|`, `!sqs|queue|tombstone|`) are derivable
 from the queue config + message records and are not dumped. The dedup
 window will reset on restore; this is documented as expected behavior.
-Operators who need exactness pass `--include-sqs-side-records`, which
-emits an `_internals/` subdirectory of newline-delimited records.
+The decoder can emit an `_internals/` subdirectory of newline-delimited side
+records, but the live producer rejects `--include-sqs-side-records` until the
+native snapshot encoder can reverse them.
 
 ## MANIFEST.json
 
@@ -720,8 +723,9 @@ in `main.go` (listed in Phase 1 scope below).
 > review of the Phase 1 producer will flag the `ScanAt` use as
 > contradicting the warning.
 
-`pageSize` is the same `ScanAt` `limit` parameter; the producer's
-default is 1024 and is exposed as a `--scan-page-size` CLI flag.
+`pageSize` is the same `ScanAt` `limit` parameter. It defaults to 1024
+and is configured on each server with `--backupScanPageSize`; the
+producer cannot weaken the server's paging or snapshot-headroom policy.
 Per-adapter encoders consume `BackupScanner` and emit one record per
 `Next` (or batch records into the same JSONL file for SQS / streams).
 
@@ -740,7 +744,7 @@ service Admin {
 message BeginBackupRequest {
   // Time-to-live for the read_ts pin on the active timestamp tracker.
   // If neither EndBackup nor RenewBackup is called within this window
-  // the pin is auto-released. Range: 60s–24h. Default: 30m.
+  // the pin is auto-released. Default range: 60s–1h. Default: 30m.
   uint64 ttl_ms = 1;
 }
 message BeginBackupResponse {
@@ -753,26 +757,19 @@ message BeginBackupResponse {
   // own scope-level traversal count against expected_keys[i].key_count
   // and aborts with ErrCompactionDuringDump on shortfall.
   repeated ScopeKeyCount expected_keys = 5;
+  uint32 max_active_backup_pins = 6;
 }
 
 message ShardApplied {
-  string group_id      = 1;  // distribution.GroupID stringified
+  uint64 group_id      = 1;
   uint64 applied_index = 2;
 }
 
 message ScopeKeyCount {
-  // scope_id is the canonical "<adapter>/<scope-name>" string, used
-  // by the producer to match each baseline against the directory it
-  // is about to write. Mapping per adapter:
-  //   - DynamoDB: "dynamodb/<table>"        e.g. "dynamodb/orders"
-  //   - S3      : "s3/<bucket>"             e.g. "s3/photos"
-  //   - Redis   : "redis/db_<n>"            e.g. "redis/db_0"
-  //                (n is the uint32 from
-  //                 ListAdaptersAndScopesResponse.redis_databases)
-  //   - SQS     : "sqs/<queue-name>"        e.g. "sqs/orders-fifo.fifo"
-  string scope_id                = 1;
-  uint64 key_count               = 2;
-  uint64 applied_index_at_count  = 3;
+  string adapter                 = 1;
+  string scope                   = 2;
+  uint64 key_count               = 3;
+  uint64 applied_index_at_count  = 4;
 }
 
 // RenewBackup extends the deadline for an existing pin. A long-running
@@ -782,11 +779,14 @@ message ScopeKeyCount {
 message RenewBackupRequest {
   bytes  pin_token = 1;
   // Same range constraint as BeginBackupRequest.ttl_ms:
-  // 60s–24h, bounded above by backup_max_ttl_ms. Out-of-range values
+  // 60s–backupMaxTTL (1h by default). Out-of-range values
   // are rejected with InvalidArgument.
   uint64 ttl_ms    = 2;
 }
-message RenewBackupResponse { uint64 ttl_ms_effective = 1; }
+message RenewBackupResponse {
+  uint64 ttl_ms_effective = 1;
+  bytes pin_token = 2; // replacement token with the committed hard deadline
+}
 
 message EndBackupRequest  { bytes pin_token = 1; }
 message EndBackupResponse {}
@@ -797,12 +797,13 @@ message EndBackupResponse {}
 // created by a concurrent client between BeginBackup and this call is
 // invisible at the pinned read_ts and therefore not listed.
 message ListAdaptersAndScopesRequest  { bytes pin_token = 1; }
-message ListAdaptersAndScopesResponse {
-  repeated string dynamodb_tables = 1;  // from !ddb|meta|table| scan at read_ts
-  repeated string s3_buckets       = 2;  // from !s3|bucket|meta| scan at read_ts
-  repeated uint32 redis_databases  = 3;  // {0} until multi-db lands
-  repeated string sqs_queues       = 4;  // from !sqs|queue|meta| scan at read_ts
+message BackupScope { string adapter = 1; string scope = 2; }
+message ListAdaptersAndScopesResponse { repeated BackupScope scopes = 1; }
+message StreamBackupRequest {
+  bytes pin_token = 1;
+  repeated BackupScope scopes = 2; // empty means every scope at read_ts
 }
+message BackupKV { bytes key = 1; bytes value = 2; }
 ```
 
 `ListAdaptersAndScopes` is a thin wrapper over per-adapter metadata
@@ -836,8 +837,8 @@ deployment, a pin recorded on the node receiving the admin RPC is not
 sufficient — the producer's `BackupScanner` reads from group leaders
 that may live on different nodes whose compactors are oblivious to the
 local pin. Pins are therefore **propagated through each Raft group's
-log** as `BackupPin{pin_id, read_ts, deadline}` / `BackupExtend` /
-`BackupRelease` FSM commands. Every replica applies these to its
+log** as capacity reservation plus `BackupPin{pin_id, read_ts,
+deadline}` / `BackupExtend` / `BackupRelease` FSM commands. Every replica applies these to its
 local tracker on log apply, so the pin set is replicated and durable
 across leader changes (a newly-elected leader inherits the pin from
 the same log it just applied). Compaction on each replica continues to
@@ -860,15 +861,18 @@ follower catching up via snapshot will never replay it. The replica's
 compactor (now bounded only by other live pins, or unbounded) becomes
 free to retire MVCC versions at `read_ts`.
 
-This bounds when the design is safe:
+Every renewal replays the complete pin rather than only extending a
+deadline, so the next successful renewal repairs this replica-local
+loss. The remaining safety bound is the repair window:
 
 > **Safe-bound invariant**:
-> `backup_duration + worst_case_compaction_lag < mvcc_retention_horizon`.
+> `renewal_interval + worst_case_compaction_lag < mvcc_retention_horizon`.
 
-Concretely, with a 1-hour MVCC retention and a 10-minute Raft
-snapshot interval, the design tolerates dumps up to ~50 minutes
-without hitting the corner case. Beyond that, a snapshot triggered
-by a freshly-restarted follower can quietly unprotect a replica.
+With the default 30-minute TTL, renewal runs every 10 minutes. A
+snapshot-installed replica is therefore unprotected for at most one
+successful-renewal interval; renewal failure aborts the producer, and
+the expected-key check remains the final defense before manifest
+publication.
 
 `BeginBackup` enforces a soft form of this invariant: it reads each
 group's `Status.AppliedIndex` and `Status.LastSnapshotIndex`
@@ -880,7 +884,7 @@ configurable margin:
 ```text
 entries_since_last_snapshot = AppliedIndex - LastSnapshotIndex
 remaining_headroom          = SnapshotEvery - entries_since_last_snapshot
-refuse if: remaining_headroom < --snapshot-headroom-entries
+refuse if: remaining_headroom < --backupSnapshotHeadroomEntries
 ```
 
 `SnapshotEvery` is the per-engine snapshot trigger (default
@@ -907,7 +911,7 @@ place, `BeginBackup` reads each group's `SnapshotEvery` rather than
 hardcoding `defaultSnapshotEvery`, so an operator who tuned
 `ELASTICKV_RAFT_SNAPSHOT_COUNT` sees consistent behavior. With
 `SnapshotEvery = 10000` and
-`--snapshot-headroom-entries = 1000` (default; one-tenth of
+`--backupSnapshotHeadroomEntries = 1000` (default; one-tenth of
 SnapshotEvery), the check refuses backups when fewer than 1000 entries
 remain before the next snapshot fires — i.e. when an in-flight backup
 is at risk of triggering the snapshot-installation corner case. A
@@ -923,8 +927,8 @@ become eventually-consistent (versions at `read_ts` may already have
 been compacted on that replica), and the producer surfaces the
 inconsistency via a per-scope **expected-keys baseline**:
 
-> **Expected-keys baseline.** **After step 2 (every shard has applied
-> through `read_ts`) and before step 3 (the pin is installed)**, the
+> **Expected-keys baseline.** **After every shard has applied through
+> `read_ts` and after the pin is installed**, the
 > admin server runs a *count-only* scan of each adapter scope at
 > `read_ts` (`ShardStore.ScanKeysAt`, returning
 > per-scope `(scope_id, key_count, applied_index_at_count)`). The
@@ -947,8 +951,9 @@ inconsistency via a per-scope **expected-keys baseline**:
 > cheaper than the data-bearing scan that follows. For a 100M-key
 > scope the baseline pass adds seconds, not minutes.
 >
-> If the producer's actual key count for a scope is `< 99% × baseline
-> ± sqrt(baseline)` (binomial-noise tolerance for legitimate
+> If the producer's actual key count for a scope is below
+> `baseline - ceil(baseline/100) - floor(sqrt(baseline))` (integer-only
+> binomial-noise tolerance for legitimate
 > compaction of TTL'd keys between baseline and dump), the dump fails
 > with `ErrCompactionDuringDump` and the partial directory tree is
 > rejected by the restore tool (no `MANIFEST.json` is written). The
@@ -1046,14 +1051,16 @@ dumps with retention pressure.
    `BackupScanner.Next(at_ts=read_ts)`.
 5. **Renew on long dumps**: the producer calls
    `RenewBackup(pin_token, ttl_ms)` every `ttl_ms / 3`. The admin
-   server proposes `BackupExtend{pin_id, deadline}` on every group
-   recorded in `pin_token`. The `read_ts` is preserved across
-   renewals; only the deadline shifts. A multi-hour dump never relies
+   server replays a complete `BackupPin{pin_id, read_ts, deadline}` on
+   every group recorded in `pin_token`. Replaying the complete pin
+   restores a replica-local fence lost during snapshot installation;
+   `read_ts` is preserved and the response rotates the HMAC token to
+   carry the newly committed hard deadline. A multi-hour dump never relies
    on a single 30-minute pin. Renewals are cheap (one Raft entry per
    group per renewal — at `ttl_ms/3 = 10 min`, that is 6 entries per
    hour per group, negligible alongside production traffic).
 
-   **Per-group renewal retry**: `BackupExtend` proposes through
+   **Per-group renewal retry**: the replacement `BackupPin` proposes through
    `ShardGroup.Propose`, which fails transiently during a leader
    election (typically <1 s under etcd/raft defaults). The admin
    server retries each per-group proposal **up to 3 times with 500 ms
@@ -1064,8 +1071,15 @@ dumps with retention pressure.
    compactor would have already retired versions the in-flight scan
    still depends on). If renewal succeeds on some groups but fails on
    others after retries, the producer aborts and issues `EndBackup`
-   (which itself tolerates partial state — see step 6).
-6. **`EndBackup(pin_token)`** proposes `BackupRelease{pin_id}` on
+   (which itself tolerates partial state — see step 7).
+6. **Publish the completion marker only after renewal quiesces.** After the
+   stream and all adapter finalizers complete, the producer stops the renewal
+   goroutine and waits for it to exit. Any renewal error or parent-context
+   cancellation aborts publication. Only a clean stop may write `CHECKSUMS`
+   and atomically publish `MANIFEST.json`. This ordering prevents a renewal
+   failure racing with manifest publication and leaving a completed-looking
+   artifact whose pin had already become unsafe.
+7. **`EndBackup(pin_token)`** proposes `BackupRelease{pin_id}` on
    every group recorded in `pin_token`. The release is idempotent: a
    group that has already swept the pin via deadline expiry treats
    the release as a no-op. A producer crash before EndBackup leaves
@@ -1113,22 +1127,25 @@ piping straight to S3 / GCS / a tape device.
 elastickv-backup dump \
   --address     127.0.0.1:50051 \
   --output-dir  /backups/2026-04-29 \
+  [--output-format directory|tar|tar+zstd] \
+  [--admin-token-file /run/secrets/elastickv-admin-token] \
   [--adapter dynamodb,s3,redis,sqs] \
   [--scope    dynamodb=orders,users] \
   [--scope    s3=photos] \
-  [--include-incomplete-uploads] \
-  [--include-orphans] \
-  [--preserve-sqs-visibility] \
-  [--include-sqs-side-records] \
   [--checksums sha256] \
   [--ttl-ms 1800000] \
-  [--begin-backup-deadline 5s] \
-  [--snapshot-headroom-entries 1000] \
-  [--scan-page-size 1024] \
-  [--dynamodb-bundle-mode per-item|jsonl] \
+  [--begin-backup-deadline 30s] \
+  [--end-backup-deadline 30s] \
+  [--dynamodb-bundle-mode per-item] \
   [--dynamodb-bundle-size 64MiB] \
   [--rename-collisions]
 ```
+
+`--begin-backup-deadline` is the producer-side RPC deadline. The
+server-side pin fan-out deadline, snapshot headroom, and scan page size
+remain operator-controlled server flags (`--backupBeginDeadline`,
+`--backupSnapshotHeadroomEntries`, and `--backupScanPageSize`) so a
+backup client cannot weaken cluster safety policy.
 
 Internally it runs:
 
@@ -1136,7 +1153,8 @@ Internally it runs:
 BeginBackup(ttl_ms=1800000) → ListAdaptersAndScopes
                             → BackupScanner.Next* (per scope, at read_ts)
                             → encode-and-write per adapter
-                            → CHECKSUMS → MANIFEST.json
+                            → CHECKSUMS (including the prepared manifest digest)
+                            → atomically publish MANIFEST.json last
                             → EndBackup(pin_token)
 ```
 
@@ -1234,10 +1252,9 @@ parser, the format has failed its goal.
   restore (the body hash drives dedup; replaying the dump produces the
   same hashes). For ID-based dedup, callers replaying messages from
   the dump *and* from a still-live source concurrently can produce
-  duplicates. Operators who depend on exact dedup state across a
-  restore use `--include-sqs-side-records` to opt in to the
-  `_internals/dedup.jsonl` artifact, then replay it through a
-  follow-up tool that re-seeds the dedup keys.
+  duplicates. Exact side-record backup and replay remains a future extension;
+  the live producer rejects `--include-sqs-side-records` until the native
+  reverse encoder and a supported replay path can preserve it.
 - **Redis TTL keys may already be expired by the time of restore.**
   TTLs are dumped as absolute Unix-millis (`expire_at_ms`). The
   default restore behavior is **skip-expired**: keys whose
@@ -1294,7 +1311,7 @@ trustworthy off-cluster artifact even before the restore tool is fully
 written.
 
 - New admin RPCs on `proto/admin.proto`: `BeginBackup` (with `ttl_ms`),
-  `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes`,
+  `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes`, `StreamBackup`,
   `GetNodeVersion` (signatures in "Read-Side Consistency" and the
   "Two-version rolling-upgrade plan" subsection). Plus a one-field
   extension to the existing `RaftGroupState` message
@@ -1346,46 +1363,18 @@ written.
 - Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline`,
   `Extend`, and the per-second sweeper goroutine that reaps expired
   pins and emits the `backup_pin_expired` structured warning.
-- **FSM plumbing for cluster-wide pins** (the propagation described
-  in "Cluster-wide propagation" only works if these land):
-  - New byte tag constants in `kv/fsm.go` alongside the existing
-    `raftEncodeHLCLease = 0x02` (`kv/fsm.go:116`):
-    `raftEncodeBackupPin = 0x03`, `raftEncodeBackupExtend = 0x04`,
-    `raftEncodeBackupRelease = 0x05`. New
-    `applyBackupPin` / `applyBackupExtend` / `applyBackupRelease`
-    handlers on `kvFSM`, dispatched from `kvFSM.Apply`
-    (`kv/fsm.go:60`) in the same shape as `applyHLCLease`.
+- **FSM plumbing for cluster-wide pins.** `kv/backup_codec.go` uses
+  envelope opcode `0x0e` and subtypes for reserve, pin, extend,
+  release, and unreserve. `kvFSM.Apply` dispatches that envelope to
+  `applyBackupEntry`; malformed lengths and unknown subtypes fail
+  closed instead of entering protobuf decoding. The reserve/unreserve
+  pair is committed through one deterministic control group so the
+  configured active-backup cap is cluster-wide rather than per admin
+  process.
 
-  - **Two-version rolling-upgrade plan.** Today, an unknown leading
-    tag falls through `decodeRaftRequests` (`kv/fsm.go:140`) into
-    `decodeLegacyRaftRequest` (`kv/fsm.go:145`), which calls
-    `proto.Unmarshal` on the raw bytes. A `BackupPin` entry with
-    leading byte `0x03` would fail the unmarshal and surface as an
-    error from `Apply`, stalling the apply loop on any node that
-    hasn't been upgraded. Introducing the new tags in a single
-    release would therefore corrupt apply on old replicas the moment
-    the first `BeginBackup` lands during a rolling upgrade.
-
-    Phase 1 ships in **two releases** to avoid this:
-
-    1. **Release N (forward-compat handler only).** `kvFSM.Apply` is
-       extended so unknown tags in the reserved range
-       `[0x03, 0x0F]` are treated as no-ops with a structured
-       `unknown_fsm_tag` warning — no error returned. The new check
-       is added in `kvFSM.Apply` (`kv/fsm.go:60`) **immediately after
-       the `raftEncodeHLCLease` guard and before the call to
-       `decodeRaftRequests`**, so all leading-byte dispatch lives in
-       one place rather than splitting the table between `Apply` and
-       `decodeRaftRequests`'s `default:` case. Tags `0x10` and above
-       still fall through to `decodeRaftRequests` and error as
-       before, bounding the forward-compat door. No new admin RPCs,
-       no producer, no `BackupPin` entries are ever written at this
-       version. Operators upgrade their clusters fleet-wide to
-       release N before the next step is enabled.
-    2. **Release N+1 (BackupPin enabled).** The actual `applyBackupPin`
-       / `Extend` / `Release` handlers ship and the admin RPCs are
-       activated. `BeginBackup` itself **gates on every cluster
-       member reporting `node_version ≥ N`**. The naïve approach of
+  - **Rolling-upgrade capability gate.** `BeginBackup` is disabled
+    until every live member reports `backup_protocol_version >= 1`.
+    The naïve approach of
        reading versions from `Admin.GetRaftGroups` does **not** work:
        `GetRaftGroups` (`adapter/admin_grpc.go:382-416`) iterates the
        *local* `AdminServer`'s registered groups and populates each
@@ -1403,7 +1392,10 @@ written.
              returns (GetNodeVersionResponse) {}
        }
        message GetNodeVersionRequest  {}
-       message GetNodeVersionResponse { string node_version = 1; }
+       message GetNodeVersionResponse {
+         string node_version = 1;
+         uint32 backup_protocol_version = 2;
+       }
        ```
        The admin server handling `BeginBackup` issues `GetNodeVersion`
        to **the live cluster member set, not the static
@@ -1486,10 +1478,9 @@ written.
     Releases N and N+1 may be the same calendar release if the
     operator is willing to enforce a fleet-wide upgrade window
     before the first backup; the gate check still runs and
-    short-circuits if upgrade is incomplete. The reserved tag range
-    `[0x03, 0x0F]` lets future entry types (e.g. CDC tags for the
-    Phase 3 incremental backup) follow the same forward-compat
-    path without re-running the full upgrade dance.
+    short-circuits if upgrade is incomplete. Backup maintenance
+    entries use the existing FSM envelope opcode `0x0e` with bounded
+    subtypes, avoiding collisions with encrypted/protobuf wire starts.
   - New `*ActiveTimestampTracker` field on `kvFSM` (`kv/fsm.go:26`),
     wired via a new `NewKvFSMWithHLCAndTracker(store, hlc, tracker)`
     constructor — analogous to how `*HLC` is shared today via
@@ -1501,20 +1492,23 @@ written.
     types. Hand-coded fixed-layout binary (matching the HLC lease
     style):
     ```
-    BackupPin     : [tag:1][pin_id:16][read_ts:8][deadline_ms:8]   = 33 bytes
-    BackupExtend  : [tag:1][pin_id:16][deadline_ms:8]              = 25 bytes
-    BackupRelease : [tag:1][pin_id:16]                             = 17 bytes
+    BackupPin       : [0x0e][subtype:1][pin_id:16][read_ts:8][deadline_ms:8] = 34 bytes
+    BackupExtend    : [0x0e][subtype:2][pin_id:16][deadline_ms:8]            = 26 bytes
+    BackupRelease   : [0x0e][subtype:3][pin_id:16]                           = 18 bytes
+    BackupReserve   : [0x0e][subtype:4][pin_id:16][read_ts:8][deadline_ms:8] = 34 bytes
+    BackupUnreserve : [0x0e][subtype:5][pin_id:16]                           = 18 bytes
     ```
     `pin_id` is a UUIDv4 generated by the admin server at
-    `BeginBackup` time and echoed in every subsequent `BackupExtend`
-    / `BackupRelease` so the FSM can target the right tracker entry.
+    `BeginBackup` time and echoed in every subsequent pin lifecycle
+    entry so the FSM can target the right tracker record.
     Hand-coded binary (vs. proto) keeps the entry small enough to
     stay well within the `MaxSizePerMsg` limit (default 1 MiB,
     `internal/raftengine/etcd/engine.go:55`) and avoids
     pulling proto codegen into the FSM apply hot path.
 - New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
   existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
-  million-key ranges page through `ScanAt` calls of `--scan-page-size`
+  million-key ranges page through `ScanAt` calls sized by
+  `--backupScanPageSize`
   rather than materializing in one call.
 - New `MVCCStore.ScanKeysAt` / `ShardStore.ScanKeysAt` overload
   (returning `[][]byte` rather than `[]*KVPair`) so the expected-keys
@@ -1528,12 +1522,13 @@ written.
   helper that takes a `keysOnly` flag, sharing the route-resolution
   and merge logic with the existing path.
 - Add `BeginBackupResponse.expected_keys` per scope (the count
-  produced by the baseline pass at `read_ts` before the pin is
+  produced by the baseline pass at `read_ts` after the pin is
   installed) and `ErrCompactionDuringDump` in the producer when the
   actual count falls below `99% × baseline ± sqrt(baseline)`.
 - New tool `cmd/elastickv-backup/` performing
-  `BeginBackup → ListAdaptersAndScopes → BackupScanner.Next* (per scope)
-  → encode → write directory tree → CHECKSUMS → MANIFEST.json
+  `BeginBackup → ListAdaptersAndScopes → StreamBackup
+  → encode → stop/verify renewal → write directory tree
+  → CHECKSUMS → MANIFEST.json (last)
   → EndBackup`.
 - Per-adapter encoders:
   - `internal/backup/dynamodb.go` — items + `_schema.json`.
@@ -1544,8 +1539,7 @@ written.
   - `internal/backup/sqs.go` — `_queue.json` + `messages.jsonl`.
 - Filename encoding lives in `internal/backup/filename.go` with shared
   unit tests for round-trip safety.
-- Documentation: `docs/operations/backup_restore.md` runbook (separate
-  PR after this design lands).
+- Documentation: `docs/operations/backup_restore.md` runbook.
 
 ### Phase 2 — Restore consumer
 
@@ -1575,6 +1569,12 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 
 ## Required Tests
 
+Phase 1 completion is gated by the control-plane, scanner, producer, format,
+and manifest-publication rows below. Rows that require applying records to a
+running destination (`TestRestoreReplaceMode`, `TestExternalToolReplay`, and
+the Redis restore-policy tests) are Phase 2 acceptance criteria and are not
+claimed by the Phase 1 implementation status at the top of this document.
+
 ### P0
 
 | Test | Verifies |
@@ -1589,13 +1589,13 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupPinFanOutAllNodes` | A 3-node cluster: `BeginBackup` issued to node A; verify nodes B and C have applied the `BackupPin` Raft entry and their compactors retain MVCC versions at `read_ts`. Compactor on B forced to run mid-dump must not retire pinned versions |
 | `TestBeginBackupPinSurvivesLeaderChange` | After `BeginBackup` on node A, force a leadership change on a group; the new leader still honors the pin (its FSM applied the same entry); subsequent `BackupScanner.Next` calls succeed |
 | `TestBeginBackupGroupUnreachable` | If one group cannot commit `BackupPin` within `--begin-backup-deadline`, `BeginBackup` returns `Unavailable` and proposes `BackupRelease` on every group that did commit; no stranded pins remain |
-| `TestBackupPinFSMCodecRoundTrip` | `BackupPin` / `BackupExtend` / `BackupRelease` byte layouts (33 / 25 / 17 bytes) round-trip through the FSM apply path; unknown tag bytes return `ErrUnknownRequestType` rather than panicking |
-| `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope expected-keys baseline detects the resulting `ScanAt` shortfall (count below `99% × baseline ± sqrt(baseline)`) and fails the dump with `ErrCompactionDuringDump` rather than emitting a corrupted artifact |
-| `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `SnapshotEvery - (AppliedIndex - LastSnapshotIndex) < --snapshot-headroom-entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path. Verify a freshly-snapshotted cluster (largest remaining headroom) is allowed |
+| `TestBackupPinFSMCodecRoundTrip` | The `0x0e` envelope and reserve/pin/extend/release/unreserve subtypes round-trip through the FSM apply path; malformed payloads and unknown subtypes fail closed |
+| `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its local pin; the next complete-pin renewal restores the fence, while any resulting count shortfall still fails with `ErrCompactionDuringDump` before manifest publication |
+| `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `SnapshotEvery - (AppliedIndex - LastSnapshotIndex) < --backupSnapshotHeadroomEntries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path. Verify a freshly-snapshotted cluster (largest remaining headroom) is allowed |
 | `TestExpectedKeysBaselineToleratesTTLExpiry` | Routine TTL expiry between baseline and dump (1% of keys gone) does NOT trigger `ErrCompactionDuringDump`; a 5% drop DOES |
 | `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
 | `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
-| `TestForwardCompatUnknownFSMTag` | A release-N FSM receiving a synthetic `0x03`-tagged entry (representing a future `BackupPin` from a release-N+1 leader) returns nil from `Apply` and emits an `unknown_fsm_tag` warning, with no apply-loop stall and no FSM mutation. Tags `0x10+` (outside the reserved range) still error so the forward-compat door is bounded |
+| `TestBackupFSMEnvelopeDoesNotCollideWithProto` | `0x0e` remains invalid as a protobuf wire start and is dispatched only by the explicit backup envelope handler |
 | `TestBeginBackupGatesOnMinVersion` | The `BeginBackup` handler derives its fan-out target from `snapshotMembers` (live `Configuration()` union, not the static `AdminServer.members` seed) and issues `GetNodeVersion` per peer concurrently. If any peer returns `node_version < N` or is unreachable within `--begin-backup-deadline`, the call returns `FailedPrecondition` with an error message that distinguishes the two cases ("reports version vX" vs. "did not respond within Ns") and proposes no `BackupPin` entries on any group; once every live member reports `node_version ≥ N`, the same call succeeds |
 | `TestBeginBackupGatesIncludesDynamicallyAddedNodes` | Start a 3-node cluster, add a 4th node at `v(N-1)` via `AddVoter` after `AdminServer` startup (so it is NOT in the bootstrap `members` seed), then call `BeginBackup`; the gate fails with the new node identified in the error. The previous seed-only design would have falsely passed |
 | `TestGetRaftGroupsLeaderVersionAsync` | `GetRaftGroups` returns within local-snapshot latency even when a leader is unreachable; `leader_node_version` is empty string in that case. Verify the 500 ms per-leader timeout and the 10 s response cache prevent repeated fan-outs across rapid polls |
@@ -1603,7 +1603,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupPropagatesAdminAuthToken` | A cluster booted with `--adminToken` accepts a `BeginBackup` call carrying `authorization: Bearer <token>`; the handler propagates the same metadata via `metadata.NewOutgoingContext` to every `GetNodeVersion` fan-out dial, so peers return their version (not `Unauthenticated`). A `BeginBackup` call without the token is itself rejected before any fan-out happens |
 | `TestVersionCacheRaceUnderLoad` | `go test -race` with 50 concurrent `GetRaftGroups` callers and async `GetNodeVersion` probe goroutines writing the cache simultaneously emits no data-race report; the `sync.Map` choice is enforced by the lack of a separate `versionCacheMu` field on `AdminServer` |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
-| `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
+| `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries the complete replacement pin up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
 | `TestBackupScannerPaging` | A range with > pageSize keys is returned across multiple `ScanAt` pages with no overlap, no gaps; iteration tolerates concurrent writes by completing at the pinned `read_ts` |
@@ -1611,6 +1611,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestS3PathFileVsDirectoryCollision` | Bucket holds both `path/to` (object) and `path/to/obj`; producer renames the shorter key to `path/to.elastickv-leaf-data` and records it in `KEYMAP.jsonl`; restore tool reverses it via `MANIFEST.s3_collision_strategy` |
 | `TestBeginBackupTooManyActiveBackups` | Reaching `max_active_backup_pins` returns `ResourceExhausted`; releasing one pin frees a slot for the next request |
 | `TestRenewBackupExtendsDeadline` | `RenewBackup` shifts the deadline; producer's failed-renewal path aborts the dump with a critical log line rather than continuing past the TTL |
+| `TestRunLiveBackupStopsRenewalBeforeManifestPublication` | The producer waits for an in-flight renewal to quiesce before `MANIFEST.json` publication, closing the completion-marker race |
 | `TestRenewBackupTTLRangeValidation` | `RenewBackup` with `ttl_ms < 60s` or `ttl_ms > backup_max_ttl_ms` returns `InvalidArgument`; in-range values succeed |
 | `TestListAdaptersAndScopesAtPinTS` | A scope created (e.g. CreateTable) after `BeginBackup` is not surfaced by `ListAdaptersAndScopes(pin_token)`; pre-existing scopes are |
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -325,14 +326,81 @@ func TestDDB_AttributeValueToPublic_EmptyOneofSurfacedAsNull(t *testing.T) {
 	}
 }
 
-func TestDDB_BundleJSONLNotImplementedYet(t *testing.T) {
+func TestDDB_BundleJSONLSplitsWithinLimitAndUsesActiveGeneration(t *testing.T) {
 	t.Parallel()
-	enc, _ := newDDBEncoder(t)
-	enc.WithBundleJSONL(true)
-	err := enc.Finalize()
-	if err == nil {
-		t.Fatalf("expected not-implemented error from Finalize on bundle mode")
+	enc, root := newDDBEncoder(t)
+	enc.WithBundleJSONL(true).WithBundleSizeBytes(60)
+	schema := &pb.DynamoTableSchema{
+		TableName: "t", PrimaryKey: &pb.DynamoKeySchema{HashKey: "pk"},
+		AttributeDefinitions: map[string]string{"pk": "S"}, Generation: 2, MigratingFromGeneration: 1,
 	}
+	addDDBBundleTestItems(t, enc)
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatalf("HandleTableMeta: %v", err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	rows := readDDBBundleRows(t, root, 60)
+	assertDDBBundleRows(t, rows)
+}
+
+func addDDBBundleTestItems(t *testing.T, enc *DDBEncoder) {
+	t.Helper()
+	for gen, value := range map[uint64]string{1: "old", 2: "new"} {
+		item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{"pk": sAttr("same"), "value": sAttr(value)}}
+		if err := enc.HandleItem(EncodeDDBItemKey("t", gen, "same", ""), encodeItemValue(t, item)); err != nil {
+			t.Fatalf("HandleItem: %v", err)
+		}
+	}
+	for _, key := range []string{"a", "b"} {
+		item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{"pk": sAttr(key)}}
+		if err := enc.HandleItem(EncodeDDBItemKey("t", 2, key, ""), encodeItemValue(t, item)); err != nil {
+			t.Fatalf("HandleItem: %v", err)
+		}
+	}
+}
+
+func assertDDBBundleRows(t *testing.T, rows []map[string]any) {
+	t.Helper()
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d, want 3 deduplicated rows", len(rows))
+	}
+	for _, row := range rows {
+		pk := mustSubMap(t, row, "pk")["S"]
+		if pk == "same" && mustSubMap(t, row, "value")["S"] != "new" {
+			t.Fatalf("migration source won over active row: %v", row)
+		}
+	}
+}
+
+func readDDBBundleRows(t *testing.T, root string, maxPartBytes int) []map[string]any {
+	t.Helper()
+	parts, err := filepath.Glob(filepath.Join(root, "dynamodb", "t", "items", "data-*.jsonl"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(parts) < 2 {
+		t.Fatalf("parts=%v, want split output", parts)
+	}
+	var rows []map[string]any
+	for _, part := range parts {
+		body, err := os.ReadFile(part) //nolint:gosec // test path
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if len(body) > maxPartBytes {
+			t.Fatalf("part %s is %d bytes, limit %d", part, len(body), maxPartBytes)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+			var row map[string]any
+			if err := json.Unmarshal([]byte(line), &row); err != nil {
+				t.Fatalf("Unmarshal row: %v", err)
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
 }
 
 func TestDDB_MigrationSourceGenerationItemsAreEmitted(t *testing.T) {

@@ -62,7 +62,7 @@ backup: **vendor-independent recovery**.
 
 The full live-cluster, point-in-time-consistent extraction pipeline
 described in
-`2026_04_29_proposed_logical_backup.md` (the Phase 1 design)
+`2026_04_29_implemented_logical_backup.md` (the Phase 1 design)
 introduces non-trivial machinery: replicated `BackupPin` Raft FSM
 commands, version-gated RPC fan-outs, expected-keys baselines,
 admin-side connection caches, etc. That machinery exists to chase a
@@ -731,7 +731,7 @@ bespoke parser, the format has failed its goal.
 
 - `2026_04_14_implemented_etcd_snapshot_disk_offload.md` — the
   `.fsm` file format Phase 0 reads and writes.
-- `2026_04_29_proposed_logical_backup.md` — Phase 1 (live PIT
+- `2026_04_29_implemented_logical_backup.md` — Phase 1 (live PIT
   extraction). Phase 1 produces dumps in the same format defined
   here.
 - `internal/s3keys/keys.go`, `kv/shard_key.go`, `adapter/sqs_keys.go`,

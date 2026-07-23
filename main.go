@@ -2485,6 +2485,7 @@ func adminServerOptions(
 				BeginDeadline:           *backupBeginDeadline,
 				SnapshotHeadroomEntries: *backupSnapshotHeadroomEntries,
 				ScanPageSize:            *backupScanPageSize,
+				MaxActivePins:           *backupMaxActivePins,
 			}),
 		)
 	}

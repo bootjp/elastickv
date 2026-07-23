@@ -98,6 +98,7 @@ It refuses to proceed when:
 5. Add other nodes as fresh members so they catch up from the seeded node's
    snapshot.
 
-Phase 0 restores one snapshot's state. It does not create a new live point-in-
-time backup and does not provide cross-shard consistency. Use a Phase 1 live
-extractor once that path exists when those properties are required.
+This runbook restores one logical tree through a native snapshot. To create a
+cluster-wide point-in-time tree from a running cluster, first follow the
+[Live Logical Backup Runbook](./backup_restore.md), then return to the Encode
+step above.
