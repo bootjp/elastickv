@@ -174,7 +174,7 @@ func TestDistributionServerValidateTimestamp(t *testing.T) {
 	require.Equal(t, uint64(501), resp.GetAllocationFloor())
 
 	_, err = s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 499})
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, codes.OutOfRange, status.Code(err))
 }
 
 func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
@@ -197,7 +197,9 @@ func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 
 	require.NoError(t, routed.ValidateDurableTimestamp(context.Background(), 700))
-	require.ErrorIs(t, routed.ValidateDurableTimestamp(context.Background(), 699), kv.ErrTSOTimestampInvalid)
+	err = routed.ValidateDurableTimestamp(context.Background(), 699)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
 
 func TestDistributionServerGetTimestamp_RejectsFollower(t *testing.T) {
