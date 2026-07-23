@@ -200,6 +200,8 @@ message RaftAdminStatusResponse {
   uint64 fsm_pending = 9;
   uint64 num_peers = 10;
   int64 last_contact_nanos = 11;
+  reserved 12, 13;
+  reserved "configuration_index", "pending_conf_change";
 }
 
 message RaftAdminConfigurationRequest {}

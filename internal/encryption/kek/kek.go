@@ -6,8 +6,8 @@
 // in a KMS, a sealed file, or HashiCorp Vault — and only exercised at
 // process boot and at DEK rotation.
 //
-// Stage 0 ships only the FileWrapper for tests / single-host clusters.
-// AWS KMS, GCP KMS, and Vault providers are added in Stage 9.
+// Implementations include AWS KMS, GCP KMS, Vault Transit, a static file, and
+// the test/CI-only environment provider described by the design.
 package kek
 
 // Wrapper wraps and unwraps DEK bytes under an externally-held KEK.

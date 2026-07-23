@@ -159,7 +159,7 @@ var (
 	// and the operator's clear intent (enable encryption) cannot be
 	// satisfied. Fail fast at startup rather than discover the
 	// mismatch later via a halted apply loop.
-	ErrKEKRequiredWithFlag = errors.New("encryption: --encryption-enabled is set but no KEK source (--kekFile) was provided; refusing to start (set --kekFile or unset --encryption-enabled)")
+	ErrKEKRequiredWithFlag = errors.New("encryption: --encryption-enabled is set but no KEK source was provided; refusing to start (set --kekFile, --kekUri, or ELASTICKV_KEK_BASE64, or unset --encryption-enabled)")
 
 	// ErrKEKMismatch is the §9.1 startup-refusal guard raised when
 	// the data dir contains a sidecar whose wrapped DEKs do NOT
@@ -171,7 +171,7 @@ var (
 	// DEK. Recovery requires the operator to either point
 	// --kekFile at the correct KEK file or restore the data dir
 	// from a backup that matches the supplied KEK.
-	ErrKEKMismatch = errors.New("encryption: configured KEK cannot unwrap one or more wrapped DEKs in the sidecar; refusing to start (verify --kekFile matches the KEK that bootstrapped this data dir)")
+	ErrKEKMismatch = errors.New("encryption: configured KEK cannot unwrap one or more wrapped DEKs in the sidecar; refusing to start (verify the configured KEK source matches the KEK that bootstrapped this data dir)")
 
 	// ErrLocalEpochExhausted is the §9.1 startup-refusal guard
 	// raised when any active DEK in the sidecar has reached the

@@ -14,7 +14,7 @@ import (
 // readback. Returns true iff THIS NODE has all three of:
 //
 //   - --encryption-enabled (explicit operator opt-in)
-//   - --kekFile non-empty (KEK source loaded so ApplyBootstrap
+//   - a KEK source loaded (file, URI, or test/CI environment source, so ApplyBootstrap
 //     / ApplyRotation can KEK-unwrap)
 //   - --encryptionSidecarPath non-empty (so the applier can
 //     crash-durably persist Active.{Storage,Raft} + keys[])
@@ -62,8 +62,8 @@ import (
 // Kept in this file (not main.go) so the flag-driven gate logic
 // is colocated with the registerEncryptionAdminServer helper
 // that consumes it.
-func encryptionMutatorsEnabled() bool {
-	return *encryptionEnabled && *kekFile != "" && *encryptionSidecarPath != ""
+func encryptionMutatorsEnabled(kekConfigured bool) bool {
+	return *encryptionEnabled && kekConfigured && *encryptionSidecarPath != ""
 }
 
 func encryptionAdminMutatorAuthority(enabled bool, groupID, defaultGroup uint64) bool {
@@ -123,7 +123,7 @@ type encryptionAdminEngine interface {
 //
 // Stage 6B-2: the mutator wiring (Proposer + LeaderView) is now
 // gated on the supplied enableMutators boolean, which the caller
-// in main.go computes as (--encryption-enabled AND --kekFile
+// in main.go computes as (--encryption-enabled AND loaded KEK
 // non-empty AND engine non-nil). When enableMutators is false,
 // Proposer + LeaderView stay unwired and EncryptionAdminServer's
 // BootstrapEncryption / RotateDEK / RegisterEncryptionWriter
@@ -142,7 +142,7 @@ type encryptionAdminEngine interface {
 //     means the cluster has explicitly chosen NOT to participate
 //     in the §7.1 rollout, so mutator RPCs MUST refuse even on
 //     a fully-keyed binary.
-//   - --kekFile being non-empty means a KEK source is loaded;
+//   - kekConfigured means a file, URI, or environment KEK source is loaded;
 //     without it, a mutator that committed would land in the
 //     applier with no KEK and return ErrKEKNotConfigured from
 //     the §6.3 HaltApply path — that is fail-closed but it
