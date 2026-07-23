@@ -206,8 +206,11 @@ func encodeRouteDescriptorWithSplitAtHLCOffset(route RouteDescriptor) ([]byte, u
 	}
 
 	out := make([]byte, 0, routeDescriptorEncodedSize(route))
-	version := catalogRouteCodecVersionV2
-	if routeDescriptorRequiresV2(route) {
+	version := catalogRouteCodecVersionV1
+	if route.SplitAtHLC != 0 {
+		version = catalogRouteCodecVersionV2
+	}
+	if routeDescriptorRequiresV3(route) {
 		version = catalogRouteCodecVersionV3
 	}
 	out = append(out, version)
@@ -226,10 +229,13 @@ func encodeRouteDescriptorWithSplitAtHLCOffset(route RouteDescriptor) ([]byte, u
 		out = append(out, route.End...)
 	}
 
-	splitAtHLCOffset := uint64(len(out))
-	if version == catalogRouteCodecVersionV3 {
+	splitAtHLCOffset := uint64(0)
+	switch version {
+	case catalogRouteCodecVersionV3:
+		splitAtHLCOffset = uint64(len(out))
 		out = appendRouteDescriptorV3Tail(out, route)
-	} else {
+	case catalogRouteCodecVersionV2:
+		splitAtHLCOffset = uint64(len(out))
 		out = appendU64(out, route.SplitAtHLC)
 	}
 	return out, splitAtHLCOffset, nil
@@ -826,14 +832,19 @@ func routeDescriptorEncodedSize(route RouteDescriptor) int {
 	if route.End != nil {
 		size += catalogUint64Bytes + len(route.End)
 	}
-	size += catalogUint64Bytes
-	if routeDescriptorRequiresV2(route) {
-		size += 1 + catalogUint64Bytes + catalogUint64Bytes
+	if routeDescriptorRequiresV3(route) {
+		size += catalogRouteV3TailSize
+	} else if route.SplitAtHLC != 0 {
+		size += catalogUint64Bytes
 	}
 	return size
 }
 
 func routeDescriptorRequiresV2(route RouteDescriptor) bool {
+	return routeDescriptorRequiresV3(route)
+}
+
+func routeDescriptorRequiresV3(route RouteDescriptor) bool {
 	return route.StagedVisibilityActive || route.MigrationJobID != 0 || route.MinWriteTSExclusive != 0
 }
 

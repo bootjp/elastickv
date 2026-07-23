@@ -183,26 +183,21 @@ func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint
 	if groupID != 0 {
 		return s.getGroupAtWithReadFence(ctx, groupID, key, ts, readRouteVersion)
 	}
-	route, routeVersion, ok := s.engine.GetRouteWithVersion(routeKey(key))
+	routes, routeVersion := s.pointReadRoutesWithVersion(key)
 	readRouteVersion = max(readRouteVersion, routeVersion)
-	if !ok {
+	if len(routes) == 0 {
 		return nil, store.ErrKeyNotFound
 	}
-	g, ok := s.groupForID(route.GroupID)
-	if !ok || g.Store == nil {
-		return nil, store.ErrKeyNotFound
+	for _, route := range routes {
+		value, err := s.getRouteAt(ctx, route, key, ts, readRouteVersion)
+		if err == nil {
+			return value, nil
+		}
+		if !errors.Is(err, store.ErrKeyNotFound) {
+			return nil, err
+		}
 	}
-
-	// Some tests use ShardStore without raft; in that case serve reads locally.
-	if engineForGroup(g) == nil {
-		return s.localGetAt(ctx, g, key, ts)
-	}
-
-	// Wait for a leader read fence before serving from local state.
-	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		return s.leaderGetAt(ctx, g, key, ts)
-	}
-	return s.proxyRawGet(ctx, g, key, ts, 0, readRouteVersion)
+	return nil, store.ErrKeyNotFound
 }
 
 // GetGroupAt reads a key from the explicitly selected Raft group.
@@ -221,12 +216,12 @@ func (s *ShardStore) getGroupAtWithReadFence(ctx context.Context, groupID uint64
 	return s.getGroupAt(ctx, g, key, ts, groupID, readRouteVersion)
 }
 
-func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g.Store == nil {
 		return nil, store.ErrKeyNotFound
 	}
-	return s.getGroupAt(ctx, g, key, ts, route.GroupID, 0)
+	return s.getGroupAt(ctx, g, key, ts, route.GroupID, readRouteVersion)
 }
 
 func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
@@ -237,6 +232,26 @@ func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, 
 		return s.leaderGetAt(ctx, g, key, ts)
 	}
 	return s.proxyRawGet(ctx, g, key, ts, groupID, readRouteVersion)
+}
+
+func (s *ShardStore) pointReadRoutesWithVersion(key []byte) ([]distribution.Route, uint64) {
+	primaryKey := routeKey(key)
+	primary, version, ok := s.engine.GetRouteWithVersion(primaryKey)
+	if !ok {
+		return nil, version
+	}
+	routes := []distribution.Route{primary}
+
+	legacyKey := redisWideColumnLegacyPointRouteKey(key)
+	if legacyKey == nil || bytes.Equal(legacyKey, primaryKey) {
+		return routes, version
+	}
+	legacy, legacyVersion, ok := s.engine.GetRouteWithVersion(legacyKey)
+	version = max(version, legacyVersion)
+	if !ok || legacy.GroupID == primary.GroupID {
+		return routes, version
+	}
+	return append(routes, legacy), version
 }
 
 func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView) bool {
@@ -366,7 +381,7 @@ func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end 
 	if reverse {
 		if groupID != 0 {
 			if routeScanBoundsPresent(routeStart, routeEnd) {
-				return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true, readRouteVersion, routeStart, routeEnd)
+				return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, readRouteVersion, routeStart, routeEnd)
 			}
 			return nil, errors.WithStack(store.ErrNotSupported)
 		}
@@ -381,7 +396,7 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 	}
 
 	if groupID != 0 {
-		return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false, true, readRouteVersion, routeStart, routeEnd)
+		return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false, readRouteVersion, routeStart, routeEnd)
 	}
 
 	routes, clampToRoutes, routeVersion := s.routesForFencedScanWithVersion(start, end, routeStart, routeEnd)
@@ -390,9 +405,10 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(out, func(i, j int) bool {
+	sort.SliceStable(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
+	out = dedupeSortedScanResults(out)
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -411,7 +427,7 @@ func (s *ShardStore) ScanKeysAtWithReadFence(ctx context.Context, start []byte, 
 		return nil, err
 	}
 	if groupID != 0 {
-		return s.scanKeyRouteAtWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, readRouteVersion)
+		return s.scanKeyRouteAtWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, readRouteVersion)
 	}
 
 	routes, clampToRoutes, routeVersion := s.routesForScanWithVersion(start, end)
@@ -450,7 +466,7 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false, true)
+	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, false)
 }
 
 // ReverseScanGroupAt reverse-scans a range on the explicitly selected Raft group.
@@ -458,7 +474,7 @@ func (s *ShardStore) ReverseScanGroupAt(ctx context.Context, groupID uint64, sta
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
-	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true)
+	return s.scanRouteAtDirection(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true)
 }
 
 // ScanGroupKeysAt scans keys on the explicitly selected Raft group without
@@ -524,16 +540,8 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 	if routes, version, ok := s.routesForEncodedScanWithVersion(start, end); ok {
 		return routes, false, version
 	}
-	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
-		if !exact {
-			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
-			return routes, false, version
-		}
-		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
-		if !ok {
-			return []distribution.Route{}, false, version
-		}
-		return []distribution.Route{route}, false, version
+	if routes, version, ok := s.routesForRedisWideColumnScanWithVersion(start, end); ok {
+		return routes, false, version
 	}
 
 	routes, version := s.engine.GetIntersectingRoutesWithVersion(start, end)
@@ -547,12 +555,47 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 	return routes, true, version
 }
 
+func (s *ShardStore) routesForRedisWideColumnScanWithVersion(start []byte, end []byte) ([]distribution.Route, uint64, bool) {
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end)
+	if !ok {
+		return nil, 0, false
+	}
+	if !exact {
+		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+		return routes, version, true
+	}
+	route, version, ok := s.engine.GetRouteWithVersion(routeStart)
+	if !ok {
+		return []distribution.Route{}, version, true
+	}
+	routes := []distribution.Route{route}
+	if legacyKey := redisWideColumnExactScanLegacyRouteKey(start, end); legacyKey != nil {
+		legacyRoute, legacyVersion, ok := s.engine.GetRouteWithVersion(legacyKey)
+		version = max(version, legacyVersion)
+		if ok && legacyRoute.GroupID != route.GroupID {
+			routes = append(routes, legacyRoute)
+		}
+	}
+	return routes, version, true
+}
+
 func (s *ShardStore) routesForEncodedScanWithVersion(start []byte, end []byte) ([]distribution.Route, uint64, bool) {
 	if routes, version, ok := s.routesForFilesystemUsageScanWithVersion(start, end); ok {
 		return routes, version, true
 	}
 	if routes, version, ok := s.routesForFilesystemChunkScanWithVersion(start, end); ok {
 		return routes, version, true
+	}
+	if routeStart, exact, ok := listAuxiliaryScanRouteRange(start, end); ok {
+		if !exact {
+			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, nil)
+			return routes, version, true
+		}
+		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
+		if !ok {
+			return []distribution.Route{}, version, true
+		}
+		return []distribution.Route{route}, version, true
 	}
 	userKey := listScanUserKey(start)
 	if userKey == nil {
@@ -615,7 +658,7 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 		}
 
 		kvs, err := s.scanRouteAtWithOptionalFilesystemUsageOwnerFilter(
-			ctx, route, scanStart, scanEnd, limit, ts, false, !clampToRoutes,
+			ctx, route, scanStart, scanEnd, limit, ts, false,
 			readRouteVersion, routeStart, routeEnd, filterUsageOwners,
 		)
 		if err != nil {
@@ -642,7 +685,6 @@ func (s *ShardStore) scanRouteAtWithOptionalFilesystemUsageOwnerFilter(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -650,12 +692,12 @@ func (s *ShardStore) scanRouteAtWithOptionalFilesystemUsageOwnerFilter(
 ) ([]*store.KVPair, error) {
 	if filterUsageOwners {
 		return s.scanRouteAtWithFilesystemUsageOwnerFilter(
-			ctx, route, start, end, limit, ts, reverse, explicitGroup,
+			ctx, route, start, end, limit, ts, reverse,
 			readRouteVersion, routeStart, routeEnd,
 		)
 	}
 	return s.scanRouteAtDirectionWithReadFence(
-		ctx, route, start, end, limit, ts, reverse, explicitGroup,
+		ctx, route, start, end, limit, ts, reverse,
 		readRouteVersion, routeStart, routeEnd,
 	)
 }
@@ -671,18 +713,19 @@ func (s *ShardStore) routesForFilesystemUsageScanWithVersion(start []byte, end [
 }
 
 func (s *ShardStore) routesForFilesystemChunkScanWithVersion(start []byte, end []byte) ([]distribution.Route, uint64, bool) {
-	allRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
 	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+		allRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
 		return intersectingRoutes(allRoutes, routeStart, routeEnd), version, true
 	}
 	chunkStart, chunkEnd, ok := filesystemChunkScanOverlap(start, end)
 	if !ok {
-		return nil, version, false
+		return nil, 0, false
 	}
 	routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(chunkStart, chunkEnd)
 	if !ok {
-		return nil, version, false
+		return nil, 0, false
 	}
+	allRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
 	// Raw scans can continue from the chunk keyspace into later filesystem
 	// families, so include both raw and virtual chunk route groups rather than
 	// narrowing the scan to chunks only.
@@ -764,7 +807,7 @@ func (s *ShardStore) scanKeyRoutesAtWithReadFence(ctx context.Context, routes []
 				ctx, route, scanStart, scanEnd, limit, ts, readRouteVersion,
 			)
 		} else {
-			keys, err = s.scanKeyRouteAtWithReadFence(ctx, route, scanStart, scanEnd, limit, ts, !clampToRoutes, readRouteVersion)
+			keys, err = s.scanKeyRouteAtWithReadFence(ctx, route, scanStart, scanEnd, limit, ts, readRouteVersion)
 		}
 		if err != nil {
 			return nil, err
@@ -819,7 +862,6 @@ func (s *ShardStore) scanRouteAtWithFilesystemUsageOwnerFilter(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -833,7 +875,7 @@ func (s *ShardStore) scanRouteAtWithFilesystemUsageOwnerFilter(
 	cursorEnd := end
 	for len(out) < limit {
 		page, err := s.scanRouteAtDirectionWithReadFence(
-			ctx, route, cursorStart, cursorEnd, limit, ts, reverse, explicitGroup,
+			ctx, route, cursorStart, cursorEnd, limit, ts, reverse,
 			readRouteVersion, routeStart, routeEnd,
 		)
 		if err != nil {
@@ -881,7 +923,7 @@ func (s *ShardStore) scanKeyRouteAtWithFilesystemUsageOwnerFilter(
 	out := make([][]byte, 0, limit)
 	cursor := start
 	for len(out) < limit {
-		page, err := s.scanKeyRouteAtWithReadFence(ctx, route, cursor, end, limit, ts, true, readRouteVersion)
+		page, err := s.scanKeyRouteAtWithReadFence(ctx, route, cursor, end, limit, ts, readRouteVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -944,7 +986,7 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 			seenGroups[route.GroupID] = struct{}{}
 		}
 		kvs, err := s.scanRouteAtWithOptionalFilesystemUsageOwnerFilter(
-			ctx, route, start, end, limit, ts, true, true,
+			ctx, route, start, end, limit, ts, true,
 			readRouteVersion, routeStart, routeEnd, filterUsageOwners,
 		)
 		if err != nil {
@@ -963,7 +1005,7 @@ func (s *ShardStore) scanKeyRouteAt(
 	limit int,
 	ts uint64,
 ) ([][]byte, error) {
-	return s.scanKeyRouteAtWithReadFence(ctx, route, start, end, limit, ts, false, 0)
+	return s.scanKeyRouteAtWithReadFence(ctx, route, start, end, limit, ts, 0)
 }
 
 func (s *ShardStore) scanKeyRouteAtWithReadFence(
@@ -973,7 +1015,6 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 	end []byte,
 	limit int,
 	ts uint64,
-	explicitGroup bool,
 	readRouteVersion uint64,
 ) ([][]byte, error) {
 	g, ok := s.groupForID(route.GroupID)
@@ -989,8 +1030,7 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 		return s.scanKeysRouteAtLeader(ctx, g, start, end, limit, ts)
 	}
 
-	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, nil, nil)
-	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts, groupID, readRouteVersion)
+	return s.proxyScanKeysAt(ctx, g, start, end, limit, ts, route.GroupID, readRouteVersion)
 }
 
 func (s *ShardStore) scanKeysRouteLocal(
@@ -1167,7 +1207,7 @@ func (s *ShardStore) clampedReverseScanRouteAtWithReadFence(
 
 	scanStart := clampScanStart(start, route.Start)
 	scanEnd := clampScanEnd(end, route.End)
-	kvs, err := s.scanRouteAtDirectionWithReadFence(ctx, route, scanStart, scanEnd, limit-currentLen, ts, true, false, readRouteVersion, routeStart, routeEnd)
+	kvs, err := s.scanRouteAtDirectionWithReadFence(ctx, route, scanStart, scanEnd, limit-currentLen, ts, true, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1182,9 +1222,8 @@ func (s *ShardStore) scanRouteAtDirection(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 ) ([]*store.KVPair, error) {
-	return s.scanRouteAtDirectionWithReadFence(ctx, route, start, end, limit, ts, reverse, explicitGroup, 0, nil, nil)
+	return s.scanRouteAtDirectionWithReadFence(ctx, route, start, end, limit, ts, reverse, 0, nil, nil)
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFence(
@@ -1195,15 +1234,14 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFence(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
 ) ([]*store.KVPair, error) {
 	if routeScanBoundsPresent(routeStart, routeEnd) {
-		return s.scanRouteAtDirectionWithReadFenceRouteFilter(ctx, route, start, end, limit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
+		return s.scanRouteAtDirectionWithReadFenceRouteFilter(ctx, route, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
 	}
-	return s.scanRouteAtDirectionWithReadFenceOnce(ctx, route, start, end, limit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
+	return s.scanRouteAtDirectionWithReadFenceOnce(ctx, route, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
@@ -1214,7 +1252,6 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -1229,7 +1266,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
 	for len(out) < limit {
 		remaining := limit - len(out)
 		batchLimit := routeFilteredScanBatchLimit(remaining)
-		kvs, cursorKVs, err := s.scanRouteAtDirectionWithReadFenceRouteFilterPage(ctx, route, scanStart, scanEnd, batchLimit, remaining, ts, reverse, explicitGroup, readRouteVersion, filterStart, filterEnd)
+		kvs, cursorKVs, err := s.scanRouteAtDirectionWithReadFenceRouteFilterPage(ctx, route, scanStart, scanEnd, batchLimit, remaining, ts, reverse, readRouteVersion, filterStart, filterEnd)
 		if err != nil {
 			return nil, err
 		}
@@ -1270,7 +1307,6 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	visibleLimit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -1292,20 +1328,12 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 		return s.scanRouteAtLeaderRouteFilter(ctx, g, start, end, limit, visibleLimit, ts, reverse, routeStart, routeEnd)
 	}
 
-	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, route.GroupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, nil, err
 	}
 	filtered := filterTxnInternalKVs(kvs)
 	return filtered, kvs, nil
-}
-
-func proxyScanGroupID(route distribution.Route, explicitGroup bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) uint64 {
-	if explicitGroup || readRouteVersion == 0 || routeScanBoundsPresent(routeStart, routeEnd) {
-		return route.GroupID
-	}
-	return 0
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
@@ -1316,7 +1344,6 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	limit int,
 	ts uint64,
 	reverse bool,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -1327,7 +1354,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	}
 
 	if !reverse {
-		return s.scanRouteAtForward(ctx, route, g, start, end, limit, ts, explicitGroup, readRouteVersion, routeStart, routeEnd)
+		return s.scanRouteAtForward(ctx, route, g, start, end, limit, ts, readRouteVersion, routeStart, routeEnd)
 	}
 
 	if engineForGroup(g) == nil {
@@ -1342,8 +1369,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 		return s.scanRouteAtLeader(ctx, g, start, end, limit, ts, reverse)
 	}
 
-	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
-	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
+	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, route.GroupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -1434,7 +1460,7 @@ func minScanEnd(a []byte, b []byte) []byte {
 }
 
 func routeKeyInScanBounds(key []byte, routeStart []byte, routeEnd []byte) bool {
-	key = routeKey(key)
+	key = routeFilterKey(key)
 	if len(routeStart) > 0 && bytes.Compare(key, routeStart) < 0 {
 		return false
 	}
@@ -1458,7 +1484,6 @@ func (s *ShardStore) scanRouteAtForward(
 	end []byte,
 	limit int,
 	ts uint64,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -1470,7 +1495,7 @@ func (s *ShardStore) scanRouteAtForward(
 	out := make([]*store.KVPair, 0, limit)
 	cursor := start
 	for len(out) < limit {
-		page, err := s.scanRouteAtForwardPage(ctx, route, g, cursor, end, limit, ts, explicitGroup, readRouteVersion, routeStart, routeEnd)
+		page, err := s.scanRouteAtForwardPage(ctx, route, g, cursor, end, limit, ts, readRouteVersion, routeStart, routeEnd)
 		if err != nil {
 			return nil, err
 		}
@@ -1505,7 +1530,6 @@ func (s *ShardStore) scanRouteAtForwardPage(
 	end []byte,
 	limit int,
 	ts uint64,
-	explicitGroup bool,
 	readRouteVersion uint64,
 	routeStart []byte,
 	routeEnd []byte,
@@ -1544,8 +1568,7 @@ func (s *ShardStore) scanRouteAtForwardPage(
 		}, nil
 	}
 
-	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
-	raw, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, groupID, readRouteVersion, routeStart, routeEnd)
+	raw, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, route.GroupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -1830,14 +1853,31 @@ func mergeAndTrimScanResults(out []*store.KVPair, kvs []*store.KVPair, limit int
 		return out
 	}
 	out = append(out, kvs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	out = dedupeSortedScanResults(out)
 	if len(out) <= limit {
 		return out
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(out[i].Key, out[j].Key) < 0
-	})
 	clear(out[limit:])
 	return out[:limit]
+}
+
+func dedupeSortedScanResults(kvs []*store.KVPair) []*store.KVPair {
+	write := 0
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		if write > 0 && bytes.Equal(kvs[write-1].Key, kvp.Key) {
+			continue
+		}
+		kvs[write] = kvp
+		write++
+	}
+	clear(kvs[write:])
+	return kvs[:write]
 }
 
 func mergeAndTrimScanKeys(out [][]byte, keys [][]byte, limit int) [][]byte {
@@ -1873,9 +1913,10 @@ func mergeAndTrimReverseScanResults(out []*store.KVPair, kvs []*store.KVPair, li
 		return out
 	}
 	out = append(out, kvs...)
-	sort.Slice(out, func(i, j int) bool {
+	sort.SliceStable(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) > 0
 	})
+	out = dedupeSortedScanResults(out)
 	if len(out) <= limit {
 		return out
 	}
@@ -1958,33 +1999,33 @@ func clampScanEnd(end []byte, routeEnd []byte) []byte {
 }
 
 func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
-		return store.ErrNotSupported
+	g, err := s.writeGroupForKey(key, commitTS)
+	if err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
-		return store.ErrNotSupported
+	g, err := s.writeGroupForKey(key, commitTS)
+	if err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.DeleteAt(ctx, key, commitTS))
 }
 
 func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
-		return store.ErrNotSupported
+	g, err := s.writeGroupForKey(key, commitTS)
+	if err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
-	g, ok := s.groupForKey(key)
-	if !ok || g.Store == nil {
-		return store.ErrNotSupported
+	g, err := s.writeGroupForKey(key, commitTS)
+	if err != nil {
+		return err
 	}
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
 }
@@ -1997,11 +2038,27 @@ func (s *ShardStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return 0, false, err
 	}
-	route, routeVersion, ok := s.engine.GetRouteWithVersion(routeKey(key))
+	routes, routeVersion := s.pointReadRoutesWithVersion(key)
 	readRouteVersion = max(readRouteVersion, routeVersion)
-	if !ok {
+	if len(routes) == 0 {
 		return 0, false, nil
 	}
+	var latest uint64
+	found := false
+	for _, route := range routes {
+		ts, exists, err := s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
+		if err != nil {
+			return 0, false, err
+		}
+		if exists && (!found || ts > latest) {
+			latest = ts
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
+func (s *ShardStore) latestCommitTSForRoute(ctx context.Context, route distribution.Route, key []byte, readRouteVersion uint64) (uint64, bool, error) {
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g.Store == nil {
 		return 0, false, nil
@@ -2684,7 +2741,7 @@ func cleanupTSWithNow(startTS, now uint64) uint64 {
 // All mutations must belong to the same shard. Cross-shard mutation batches are
 // not supported.
 func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	group, err := s.resolveSingleShardGroup(mutations)
+	group, err := s.resolveSingleShardGroup(mutations, commitTS)
 	if err != nil || group == nil {
 		return err
 	}
@@ -2694,7 +2751,7 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 // ApplyMutationsRaft is the raft-apply variant; see store.MVCCStore for the
 // durability contract. Only the FSM may call this method.
 func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	group, err := s.resolveSingleShardGroup(mutations)
+	group, err := s.resolveSingleShardGroup(mutations, commitTS)
 	if err != nil || group == nil {
 		return err
 	}
@@ -2705,29 +2762,70 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 // appliedIndex through to the single owning shard so the leaf can
 // bundle metaAppliedIndex with the mutation. See PR #910 design §2.
 func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
-	group, err := s.resolveSingleShardGroup(mutations)
+	group, err := s.resolveSingleShardGroup(mutations, commitTS)
 	if err != nil || group == nil {
 		return err
 	}
 	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
 }
 
-// resolveSingleShardGroup returns the shard group that owns every
-// mutation in the batch, or an error if the batch is cross-shard or
-// references an unknown group. A nil group with nil error means "empty
-// batch — caller should no-op".
-func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) (*ShardGroup, error) {
+func (s *ShardStore) writeGroupForKey(key []byte, commitTS uint64) (*ShardGroup, error) {
+	route, ok := s.engine.GetRoute(routeKey(key))
+	if !ok {
+		return nil, store.ErrNotSupported
+	}
+	if err := ensureRouteWriteAllowed(route, key, commitTS); err != nil {
+		return nil, err
+	}
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g.Store == nil {
+		return nil, store.ErrNotSupported
+	}
+	return g, nil
+}
+
+func ensureRouteWriteAllowed(route distribution.Route, key []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(
+		store.NewWriteConflictError(key),
+		"route min_write_ts_exclusive=%d rejects commit_ts=%d",
+		route.MinWriteTSExclusive,
+		commitTS,
+	)
+}
+
+func (s *ShardStore) ensurePrefixWriteAllowed(prefix []byte, commitTS uint64) error {
+	routes := s.engine.GetIntersectingRoutes(prefix, prefixScanEnd(prefix))
+	for _, route := range routes {
+		if err := ensureRouteWriteAllowed(route, prefix, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveSingleShardGroup returns the shard group that owns every mutation in
+// the batch, or an error if the batch is cross-shard, below a route write
+// timestamp floor, or references an unknown group. A nil group with nil error
+// means "empty batch; caller should no-op".
+func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation, commitTS uint64) (*ShardGroup, error) {
 	if len(mutations) == 0 {
 		return nil, nil
 	}
-	firstGroup, ok := s.groupForKey(mutations[0].Key)
-	if !ok || firstGroup == nil || firstGroup.Store == nil {
-		return nil, store.ErrNotSupported
-	}
-	for i := 1; i < len(mutations); i++ {
-		g, ok := s.groupForKey(mutations[i].Key)
-		if !ok || g == nil || g.Store == nil {
-			return nil, store.ErrNotSupported
+	var firstGroup *ShardGroup
+	for _, mutation := range mutations {
+		g, err := s.writeGroupForMutation(mutation, commitTS)
+		if err != nil {
+			return nil, err
+		}
+		if g == nil {
+			continue
+		}
+		if firstGroup == nil {
+			firstGroup = g
+			continue
 		}
 		if g != firstGroup {
 			return nil, errors.WithStack(ErrCrossShardMutationBatchNotSupported)
@@ -2736,8 +2834,18 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 	return firstGroup, nil
 }
 
+func (s *ShardStore) writeGroupForMutation(mutation *store.KVPairMutation, commitTS uint64) (*ShardGroup, error) {
+	if mutation == nil {
+		return nil, nil
+	}
+	return s.writeGroupForKey(mutation.Key, commitTS)
+}
+
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.ensurePrefixWriteAllowed(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -2751,6 +2859,9 @@ func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludeP
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	if err := s.ensurePrefixWriteAllowed(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
@@ -2777,6 +2888,9 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if err := s.ensurePrefixWriteAllowed(prefix, commitTS); err != nil {
+		return err
+	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue

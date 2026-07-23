@@ -200,12 +200,15 @@ func routesAfterCatalogDelta(current []Route, delta CatalogDelta) ([]Route, erro
 				load = current.Load
 			}
 			byID[mutation.RouteID] = Route{
-				RouteID: mutation.Route.RouteID,
-				Start:   CloneBytes(mutation.Route.Start),
-				End:     CloneBytes(mutation.Route.End),
-				GroupID: mutation.Route.GroupID,
-				State:   mutation.Route.State,
-				Load:    load,
+				RouteID:                mutation.Route.RouteID,
+				Start:                  CloneBytes(mutation.Route.Start),
+				End:                    CloneBytes(mutation.Route.End),
+				GroupID:                mutation.Route.GroupID,
+				State:                  mutation.Route.State,
+				StagedVisibilityActive: mutation.Route.StagedVisibilityActive,
+				MigrationJobID:         mutation.Route.MigrationJobID,
+				MinWriteTSExclusive:    mutation.Route.MinWriteTSExclusive,
+				Load:                   load,
 			}
 		}
 	}

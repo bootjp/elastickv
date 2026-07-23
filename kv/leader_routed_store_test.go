@@ -199,17 +199,45 @@ func TestLeaderRoutedStore_ScanAtWithReadFenceFiltersRouteBoundsLocally(t *testi
 	s := NewLeaderRoutedStore(local, coord)
 	t.Cleanup(func() { _ = s.Close() })
 
-	kvs, err := s.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, 7, []byte("m"), nil)
+	kvs, err := s.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, 0, []byte("m"), nil)
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, right, kvs[0].Key)
 	require.Equal(t, []byte("right"), kvs[0].Value)
 
-	kvs, err = s.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, 7, []byte{}, []byte("m"))
+	kvs, err = s.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, 0, []byte{}, []byte("m"))
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, left, kvs[0].Key)
 	require.Equal(t, []byte("left"), kvs[0].Value)
+}
+
+func TestLeaderRoutedStore_RejectsLocalReadRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("k"), []byte("v"), 10, 0))
+	require.NoError(t, local.PutAt(ctx, []byte("a"), []byte("va"), 10, 0))
+
+	coord := &stubLeaderCoordinator{
+		isLeader: true,
+		clock:    NewHLC(),
+	}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err := s.GetAtWithReadFence(ctx, []byte("k"), 10, 0, 7)
+	require.ErrorIs(t, err, store.ErrNotSupported)
+
+	_, _, err = s.LatestCommitTSWithReadFence(ctx, []byte("k"), 7)
+	require.ErrorIs(t, err, store.ErrNotSupported)
+
+	_, err = s.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 10, false, 0, 7, nil, nil)
+	require.ErrorIs(t, err, store.ErrNotSupported)
+
+	_, err = s.ScanKeysAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 10, 0, 7)
+	require.ErrorIs(t, err, store.ErrNotSupported)
 }
 
 func TestLeaderRoutedStore_PrefersLinearizableReadFence(t *testing.T) {

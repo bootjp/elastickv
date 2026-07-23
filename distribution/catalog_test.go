@@ -65,8 +65,8 @@ func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
-	if raw[0] != catalogRouteCodecVersionV1 {
-		t.Fatalf("zero-M2 route encoded version = %d, want v1", raw[0])
+	if raw[0] != catalogRouteCodecVersionV2 {
+		t.Fatalf("split route encoded version = %d, want v2", raw[0])
 	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
@@ -89,8 +89,8 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
 	}
-	if raw[0] != catalogRouteCodecVersionV1 {
-		t.Fatalf("zero-M2 nil-end route encoded version = %d, want v1", raw[0])
+	if raw[0] != catalogRouteCodecVersionV2 {
+		t.Fatalf("split nil-end route encoded version = %d, want v2", raw[0])
 	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
@@ -911,6 +911,13 @@ func TestCatalogStoreApplySaveMutations_UsesMonotonicCommitTS(t *testing.T) {
 
 func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	t.Helper()
+	assertRouteIdentityEqual(t, want, got)
+	assertRouteMetadataEqual(t, want, got)
+	assertRouteBoundsEqual(t, want, got)
+}
+
+func assertRouteIdentityEqual(t *testing.T, want, got RouteDescriptor) {
+	t.Helper()
 	if want.RouteID != got.RouteID {
 		t.Fatalf("route id mismatch: want %d, got %d", want.RouteID, got.RouteID)
 	}
@@ -920,6 +927,13 @@ func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	if want.ParentRouteID != got.ParentRouteID {
 		t.Fatalf("parent route id mismatch: want %d, got %d", want.ParentRouteID, got.ParentRouteID)
 	}
+	if want.State != got.State {
+		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)
+	}
+}
+
+func assertRouteMetadataEqual(t *testing.T, want, got RouteDescriptor) {
+	t.Helper()
 	if want.SplitAtHLC != got.SplitAtHLC {
 		t.Fatalf("split at HLC mismatch: want %d, got %d", want.SplitAtHLC, got.SplitAtHLC)
 	}
@@ -932,9 +946,10 @@ func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	if want.MinWriteTSExclusive != got.MinWriteTSExclusive {
 		t.Fatalf("min write ts mismatch: want %d, got %d", want.MinWriteTSExclusive, got.MinWriteTSExclusive)
 	}
-	if want.State != got.State {
-		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)
-	}
+}
+
+func assertRouteBoundsEqual(t *testing.T, want, got RouteDescriptor) {
+	t.Helper()
 	if !bytes.Equal(want.Start, got.Start) {
 		t.Fatalf("start mismatch: want %q, got %q", want.Start, got.Start)
 	}
@@ -949,6 +964,9 @@ func encodeRouteDescriptorV1ForTest(t *testing.T, route RouteDescriptor) []byte 
 	raw, err := EncodeRouteDescriptor(route)
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
+	}
+	if raw[0] == catalogRouteCodecVersionV1 {
+		return raw
 	}
 	if len(raw) < catalogUint64Bytes+1 {
 		t.Fatalf("encoded route too short: %d", len(raw))

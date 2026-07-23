@@ -109,6 +109,9 @@ func (s *LeaderRoutedStore) GetAtWithReadFence(ctx context.Context, key []byte, 
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, key)
 	if ok {
+		if readRouteVersion != 0 {
+			return nil, errors.WithStack(store.ErrNotSupported)
+		}
 		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
 		return val, errors.WithStack(err)
 	}
@@ -145,6 +148,9 @@ func (s *LeaderRoutedStore) LatestCommitTSWithReadFence(ctx context.Context, key
 		return 0, false, nil
 	}
 	if s.leaderOKForKey(ctx, key) {
+		if readRouteVersion != 0 {
+			return 0, false, errors.WithStack(store.ErrNotSupported)
+		}
 		ts, exists, err := s.local.LatestCommitTS(ctx, key)
 		return ts, exists, errors.WithStack(err)
 	}
@@ -267,6 +273,9 @@ func (s *LeaderRoutedStore) ScanAtWithReadFence(ctx context.Context, start []byt
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if !ok {
 		return s.proxyRawScanAtWithReadFence(ctx, start, end, limit, ts, reverse, readRouteVersion, routeStart, routeEnd)
+	}
+	if readRouteVersion != 0 {
+		return nil, errors.WithStack(store.ErrNotSupported)
 	}
 	readTS := max(ts, fenceTS)
 	if routeScanBoundsPresent(routeStart, routeEnd) {
@@ -434,6 +443,9 @@ func (s *LeaderRoutedStore) ScanKeysAtWithReadFence(ctx context.Context, start [
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if ok {
+		if readRouteVersion != 0 {
+			return nil, errors.WithStack(store.ErrNotSupported)
+		}
 		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
 		return keys, errors.WithStack(err)
 	}
