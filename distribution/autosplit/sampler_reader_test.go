@@ -60,9 +60,11 @@ func TestCommittedWindowsFallbackRequiresPreviousBoundary(t *testing.T) {
 
 	require.Equal(t, at.Add(time.Minute), newest)
 	require.Equal(t, 1, skipped)
-	require.Len(t, windows, 1)
-	require.Equal(t, at.Add(time.Minute), windows[0].Column.At)
-	require.Equal(t, time.Minute, windows[0].Duration)
+	require.Len(t, windows, 2)
+	require.Equal(t, at, windows[0].Column.At)
+	require.Zero(t, windows[0].Duration)
+	require.Equal(t, at.Add(time.Minute), windows[1].Column.At)
+	require.Equal(t, time.Minute, windows[1].Duration)
 }
 
 func TestReadCommittedWindowsFetchesFromLastProcessedMinusStep(t *testing.T) {
@@ -116,6 +118,133 @@ func TestObserveSnapshotProcessesSilentGapAsReset(t *testing.T) {
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 	require.Equal(t, at.Add(2*time.Minute), state.RouteStatus(1).LastProcessedAt)
+}
+
+func TestObserveSnapshotResetsWhenHistoryNoLongerReachesWatermark(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1_700_000_500, 0)
+	route := testRoute(1, 1, "a", "z")
+	state := NewDetectorState()
+	cfg := testConfig()
+	cfg.CandidateWindows = 3
+	warmup := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(-time.Minute)),
+			hotWindow(at),
+		},
+		Now: at,
+	})
+	require.Empty(t, warmup.Decisions)
+	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+
+	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+		readerColumn(at.Add(10*time.Minute), at.Add(9*time.Minute), []keyviz.MatrixRow{
+			readerRow(60),
+		}),
+		readerColumn(at.Add(11*time.Minute), at.Add(10*time.Minute), []keyviz.MatrixRow{
+			readerRow(60),
+		}),
+	}}
+
+	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
+		Step:             time.Minute,
+		CandidateWindows: 3,
+		LastProcessedAt:  at,
+		Now:              at.Add(12 * time.Minute),
+	})
+
+	require.Len(t, read.Windows, 2)
+	require.Zero(t, read.Windows[0].Duration)
+	require.Equal(t, at.Add(10*time.Minute), read.Windows[0].Column.At)
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, at.Add(11*time.Minute), state.RouteStatus(1).LastProcessedAt)
+	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
+}
+
+func TestObserveSnapshotResetsWhenWindowOverlapsWatermark(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1_700_000_550, 0)
+	route := testRoute(1, 1, "a", "z")
+	state := NewDetectorState()
+	cfg := testConfig()
+	cfg.CandidateWindows = 3
+	warmup := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(-time.Minute)),
+			hotWindow(at),
+		},
+		Now: at,
+	})
+	require.Empty(t, warmup.Decisions)
+	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+
+	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+		readerColumn(at.Add(2*time.Minute), at.Add(-time.Minute), []keyviz.MatrixRow{
+			readerRow(60),
+		}),
+		readerColumn(at.Add(3*time.Minute), at.Add(2*time.Minute), []keyviz.MatrixRow{
+			readerRow(60),
+		}),
+	}}
+
+	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
+		Step:             time.Minute,
+		CandidateWindows: 3,
+		LastProcessedAt:  at,
+		Now:              at.Add(4 * time.Minute),
+	})
+
+	require.Len(t, read.Windows, 2)
+	require.Zero(t, read.Windows[0].Duration)
+	require.Equal(t, at.Add(2*time.Minute), read.Windows[0].Column.At)
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, at.Add(3*time.Minute), state.RouteStatus(1).LastProcessedAt)
+	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
+}
+
+func TestObserveSnapshotResetsOnInvalidCommittedColumn(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1_700_000_600, 0)
+	route := testRoute(1, 1, "a", "z")
+	state := NewDetectorState()
+	cfg := testConfig()
+	cfg.CandidateWindows = 3
+	warmup := Evaluate(cfg, state, Input{
+		Routes: []distribution.RouteDescriptor{route},
+		Windows: []ColumnWindow{
+			hotWindow(at.Add(-time.Minute)),
+			hotWindow(at),
+		},
+		Now: at,
+	})
+	require.Empty(t, warmup.Decisions)
+	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
+
+	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+		{At: at.Add(time.Minute), Rows: []keyviz.MatrixRow{readerRow(60)}},
+		readerColumn(at.Add(2*time.Minute), at.Add(time.Minute), []keyviz.MatrixRow{
+			readerRow(60),
+		}),
+	}}
+
+	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
+		Step:             time.Minute,
+		CandidateWindows: 3,
+		LastProcessedAt:  at,
+		Now:              at.Add(3 * time.Minute),
+	})
+
+	require.Equal(t, 1, read.SkippedInvalid)
+	require.Len(t, read.Windows, 2)
+	require.Zero(t, read.Windows[0].Duration)
+	require.Empty(t, result.Decisions)
+	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
+	require.Equal(t, at.Add(2*time.Minute), state.RouteStatus(1).LastProcessedAt)
+	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
 }
 
 func readerColumn(at, start time.Time, rows []keyviz.MatrixRow) keyviz.MatrixColumn {

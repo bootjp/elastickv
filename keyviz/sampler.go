@@ -212,6 +212,12 @@ type MemSampler struct {
 	// Held only by non-hot-path callers.
 	routesMu sync.Mutex
 
+	// flushMu serialises the full Flush flow from timestamp capture
+	// through history append. That keeps column order and window
+	// boundaries aligned when callers accidentally run concurrent
+	// flushers.
+	flushMu sync.Mutex
+
 	// historyMu guards the ring buffer. Reads (Snapshot) and writes
 	// (Flush) acquire it; Observe never touches it.
 	historyMu sync.Mutex
@@ -1212,6 +1218,9 @@ func (s *MemSampler) Flush() {
 	if s == nil {
 		return
 	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	col := MatrixColumn{At: s.now()}
 	// Snapshot the per-group leader-term map once at the top of
 	// Flush so every row in this column sees a consistent view, even
