@@ -590,7 +590,8 @@ func TestRedis_StreamLegacyDataIsDiscarded(t *testing.T) {
 	}}
 	payload, err := marshalStreamValue(legacy)
 	require.NoError(t, err)
-	seedTS := nowNanos(t)
+	seedTS, err := nodes[0].redisServer.coordinator.Clock().NextFenced()
+	require.NoError(t, err)
 	require.NoError(t, nodes[0].redisServer.store.PutAt(ctx, redisStreamKey(key), payload, seedTS, 0))
 
 	// XLEN on the legacy-only stream must report zero — the legacy blob
@@ -616,7 +617,7 @@ func TestRedis_StreamLegacyDataIsDiscarded(t *testing.T) {
 
 	// Legacy blob is now gone; pick a readTS clearly in the future of
 	// any commit above so MVCC visibility does not hide a still-living blob.
-	readTS := nowNanos(t) + uint64(time.Minute)
+	readTS := nodes[0].redisServer.store.LastCommitTS() + 1
 	_, getErr := nodes[0].redisServer.store.GetAt(ctx, redisStreamKey(key), readTS)
 	require.Error(t, getErr, "legacy blob must be deleted by the first write")
 
@@ -755,21 +756,6 @@ func TestRedis_StreamXAddRecreatesExpiredStreamWithoutStaleEntriesOrTTL(t *testi
 
 	server := nodes[0].redisServer
 	requireMissingAt(t, server.store, redisTTLKey([]byte(key)), server.readTS())
-}
-
-// nowNanos returns the current UnixNano timestamp as uint64, failing the
-// test if the reading is non-positive. Centralising the bounds check here
-// keeps the int64->uint64 conversion safe and the individual test sites
-// free of gosec waivers.
-func nowNanos(t *testing.T) uint64 {
-	t.Helper()
-	ns := time.Now().UnixNano()
-	require.Positive(t, ns)
-	if ns < 0 {
-		// Unreachable after require.Positive, but lets gosec see the bound.
-		return 0
-	}
-	return uint64(ns)
 }
 
 // TestXAddEnforceMaxWideColumn is a pure-function regression guard: the

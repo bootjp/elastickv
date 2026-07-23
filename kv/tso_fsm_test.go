@@ -21,7 +21,7 @@ func TestTSOStateMachineApplyHLCLeaseUpdatesCeiling(t *testing.T) {
 	require.Equal(t, ceilingMs, fsm.committedCeiling())
 }
 
-func TestTSOStateMachineApplyHLCLeaseAdvancesAllocationFloor(t *testing.T) {
+func TestTSOStateMachineApplyHLCLeaseExhaustsCommittedCeiling(t *testing.T) {
 	t.Parallel()
 
 	ceilingMs := time.Now().Add(time.Hour).UnixMilli()
@@ -29,9 +29,9 @@ func TestTSOStateMachineApplyHLCLeaseAdvancesAllocationFloor(t *testing.T) {
 	fsm := NewTSOStateMachine(clock)
 
 	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(ceilingMs)))
-	base, err := clock.NextBatchFenced(1)
-	require.NoError(t, err)
-	require.Equal(t, (uint64(ceilingMs+1) << hlcLogicalBits), base) //nolint:gosec // ceilingMs is a positive Unix ms timestamp.
+	_, err := clock.NextBatchFenced(1)
+	require.ErrorIs(t, err, ErrCeilingExpired)
+	require.Equal(t, uint64(1), clock.NextFencedRejections())
 }
 
 func TestTSOStateMachineApplyIgnoresNonLeasePayload(t *testing.T) {

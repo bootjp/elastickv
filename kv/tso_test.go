@@ -36,6 +36,17 @@ func TestHLCNextBatchFencedRejectsExpiredCeiling(t *testing.T) {
 	require.ErrorIs(t, err, ErrCeilingExpired)
 }
 
+func TestHLCNextBatchFencedRejectsExhaustedCeilingWindow(t *testing.T) {
+	h := NewHLC()
+	ceiling := time.Now().Add(testTSOFutureCeiling).UnixMilli()
+	h.SetPhysicalCeiling(ceiling)
+	h.Observe((uint64(ceiling) << hlcLogicalBits) | (hlcLogicalMask - 1)) //nolint:gosec // ceiling is a positive Unix ms timestamp.
+
+	_, err := h.NextBatchFenced(2)
+	require.ErrorIs(t, err, ErrCeilingExpired)
+	require.Equal(t, uint64(1), h.NextFencedRejections())
+}
+
 func TestHLCNextBatchFencedBumpsWallOnLogicalOverflow(t *testing.T) {
 	h := NewHLC()
 	futureWall := uint64(time.Now().Add(testTSOFutureCeiling).UnixMilli()) //nolint:gosec // Unix ms is non-negative.

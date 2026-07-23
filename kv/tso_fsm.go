@@ -72,8 +72,8 @@ func (f *TSOStateMachine) applyTSOCeiling(ceilingMs int64) {
 	}
 	f.advanceCommittedCeiling(ceilingMs)
 	if f.hlc != nil {
-		f.hlc.SetPhysicalCeiling(ceilingMs)
 		f.hlc.Observe(tsoCeilingMaxTimestamp(ceilingMs))
+		f.hlc.SetPhysicalCeiling(ceilingMs)
 	}
 }
 

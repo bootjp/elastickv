@@ -9,11 +9,11 @@ import (
 )
 
 // ErrCeilingExpired is returned by HLC.NextFenced() when the
-// Raft-agreed physical ceiling has expired — i.e. the wall clock has
-// caught up to or passed the ceiling, meaning RunHLCLeaseRenewal has
-// not applied a fresh ceiling within `hlcPhysicalWindowMs` of the
-// current wall time. Callers MUST refuse to commit and propagate this
-// to the client.
+// Raft-agreed physical ceiling has expired or the current in-memory
+// logical window has been exhausted — i.e. issuing another fenced
+// timestamp would require a physical millisecond above the committed
+// ceiling. Callers MUST refuse to commit and propagate this to the
+// client.
 //
 // This implements HLC-4 precondition (iii) from
 // docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1: every
@@ -143,6 +143,8 @@ func (h *HLC) Next() uint64 {
 //   - ceiling == 0 (pre-bootstrap, no prior leader): no fence, identical to Next.
 //   - ceiling > 0 AND wall_now >= ceiling: returns (0, ErrCeilingExpired).
 //   - ceiling > 0 AND wall_now < ceiling: floor wall at ceiling, then proceed.
+//   - ceiling > 0 AND the next timestamp's physical part would exceed ceiling:
+//     returns (0, ErrCeilingExpired) and waits for a fresh committed lease.
 //
 // The TLA+ proof for this lives in tla/hlc/MCHLC_gap.cfg (HLC-4
 // counterexample, depth 5) — see docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1.
@@ -157,6 +159,30 @@ func (h *HLC) NextBatchFenced(n int) (uint64, error) {
 	return h.nextBatchLocked(n, true)
 }
 
+func (h *HLC) fencedNowMillis(fence bool) (int64, int64, error) {
+	nowMs := time.Now().UnixMilli()
+	ceiling := h.physicalCeiling.Load()
+	if ceiling <= 0 {
+		return nowMs, ceiling, nil
+	}
+	if fence && nowMs >= ceiling {
+		h.nextFencedRejections.Add(1)
+		return 0, ceiling, errors.WithStack(ErrCeilingExpired)
+	}
+	if nowMs < ceiling {
+		return ceiling, ceiling, nil
+	}
+	return nowMs, ceiling, nil
+}
+
+func (h *HLC) rejectFencedPhysicalOverflow(fence bool, ceiling, newWall int64) error {
+	if !fence || ceiling <= 0 || newWall <= ceiling {
+		return nil
+	}
+	h.nextFencedRejections.Add(1)
+	return errors.WithStack(ErrCeilingExpired)
+}
+
 func (h *HLC) nextLocked(fence bool) (uint64, error) {
 	for {
 		prev := h.last.Load()
@@ -165,25 +191,9 @@ func (h *HLC) nextLocked(fence bool) (uint64, error) {
 		prevWall := clampUint64ToInt64(wallPart)
 		prevLogical := clampUint64ToUint16(logicalPart)
 
-		nowMs := time.Now().UnixMilli()
-		ceiling := h.physicalCeiling.Load()
-		if ceiling > 0 {
-			if fence && nowMs >= ceiling {
-				// HLC-4 precondition (iii): ceiling has expired.  Fail
-				// closed rather than issue a timestamp that could collide
-				// with a subsequent leader's window after renewal catches
-				// up.  Increment the counter so the monitoring layer can
-				// alert on the rate (see NextFencedRejections).
-				h.nextFencedRejections.Add(1)
-				return 0, errors.WithStack(ErrCeilingExpired)
-			}
-			if nowMs < ceiling {
-				// Physical part: floor at the Raft-agreed ceiling so a
-				// new leader always starts above the previous leader's
-				// issued window.
-				nowMs = ceiling
-			}
-			// Non-fenced path with nowMs >= ceiling: keep nowMs as-is.
+		nowMs, ceiling, err := h.fencedNowMillis(fence)
+		if err != nil {
+			return 0, err
 		}
 
 		newWall := nowMs
@@ -196,6 +206,9 @@ func (h *HLC) nextLocked(fence bool) (uint64, error) {
 			if newLogical == 0 { // overflow: bump physical ms by one
 				newWall++
 			}
+		}
+		if err := h.rejectFencedPhysicalOverflow(fence, ceiling, newWall); err != nil {
+			return 0, err
 		}
 
 		next := (nonNegativeUint64(newWall) << hlcLogicalBits) | uint64(newLogical)
@@ -216,16 +229,9 @@ func (h *HLC) nextBatchLocked(n int, fence bool) (uint64, error) {
 		prevWall := clampUint64ToInt64(prev >> hlcLogicalBits)
 		prevLogical := prev & hlcLogicalMask
 
-		nowMs := time.Now().UnixMilli()
-		ceiling := h.physicalCeiling.Load()
-		if ceiling > 0 {
-			if fence && nowMs >= ceiling {
-				h.nextFencedRejections.Add(1)
-				return 0, errors.WithStack(ErrCeilingExpired)
-			}
-			if nowMs < ceiling {
-				nowMs = ceiling
-			}
+		nowMs, ceiling, err := h.fencedNowMillis(fence)
+		if err != nil {
+			return 0, err
 		}
 
 		newWall := nowMs
@@ -237,6 +243,9 @@ func (h *HLC) nextBatchLocked(n int, fence bool) (uint64, error) {
 				newWall++
 				baseLogical = 0
 			}
+		}
+		if err := h.rejectFencedPhysicalOverflow(fence, ceiling, newWall); err != nil {
+			return 0, err
 		}
 		base := (nonNegativeUint64(newWall) << hlcLogicalBits) | baseLogical
 		next := base + batch - 1

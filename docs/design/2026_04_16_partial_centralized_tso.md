@@ -47,10 +47,11 @@ Implemented:
    until the TSO-leader redirect path exists.
 9. `TSOStateMachine` implements a TSO-only Raft FSM that accepts HLC lease
    entries, snapshots exactly the physical ceiling as eight big-endian bytes,
-   restores with malformed-input rejection, and classifies HLC lease entries
-   as volatile-only for safe cold-start replay. This removes the requirement
-   for group 0 to carry the KV FSM's data store once startup wiring switches
-   to the dedicated FSM.
+   restores with malformed-input rejection, advances the HLC handoff floor
+   through the committed ceiling, and classifies HLC lease entries as
+   volatile-only for safe cold-start replay. This removes the requirement for
+   group 0 to carry the KV FSM's data store once startup wiring switches to
+   the dedicated FSM.
 
 Remaining:
 
@@ -459,6 +460,7 @@ TSO Leader
   ├─ Propose([0x02][ceilingMs]) to TSO Raft group
   │
   └─ TSO FSM.Apply() on all TSO members
+       → HLC.Observe(ceilingMs|maxLogical)
        → HLC.SetPhysicalCeiling(ceilingMs)
          ↳ shared HLC ceiling updated on every node ✅
 ```
@@ -474,8 +476,10 @@ New TSO leader elected via Raft
   ├─ FSM.Restore() or Raft log replay
   │    → physicalCeiling restored to the last committed value
   │
-  └─ HLC.Next() uses max(now, physicalCeiling)
-       → new leader issues timestamps strictly above the old leader's window ✅
+  └─ HLC.NextBatchFenced() rejects the restored exhausted ceiling; group-0
+     timestamp serving stays deferred until it can publish a fresh usable
+     lease window before allocation
+       → new leader does not reuse timestamps from the old leader's window ✅
 ```
 
 ---
