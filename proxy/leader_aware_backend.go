@@ -481,7 +481,7 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 		cmd.SetErr(ErrNoLeaderBackend)
 		return cmd
 	}
-	return redisClientWithReadTimeout(cli, effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+	return redisClientWithBlockingReadTimeout(cli, timeout).Do(ctx, args...)
 }
 
 func (b *LeaderAwareRedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {

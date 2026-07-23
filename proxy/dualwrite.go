@@ -511,6 +511,8 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 		if shouldFallbackZRemFast(cmd, sErr) {
 			cmd = zremReplayCommand
 			iArgs = zremFastFallbackArgs(iArgs)
+			attempt = -1
+			backoff = compactedRetryInitialBackoff
 			continue
 		}
 		if ok, err := positiveIntReplayResult(resp, sErr); ok {

@@ -834,6 +834,52 @@ func TestDualWriter_Blocking_ZRemFastFallsBackToZRemWhenUnsupported(t *testing.T
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.SecondaryWriteErrors), 0.001)
 }
 
+func TestDualWriter_Blocking_ZRemFastFallbackResetsNoEffectRetryBudget(t *testing.T) {
+	primary := &timeoutCapturingBackend{
+		name:        "primary",
+		returnValue: []any{"queue", "job-1", "12.5"},
+	}
+	secondary := newMockBackend("elastickv")
+	var zremCalls atomic.Int32
+	secondary.doFunc = func(ctx context.Context, args ...any) *redis.Cmd {
+		cmd := redis.NewCmd(ctx, args...)
+		switch name := fmt.Sprint(args[0]); name {
+		case elasticKVZRemFastCommand:
+			cmd.SetErr(testRedisErr("ERR unsupported command 'ELASTICKV.ZREMFAST'"))
+		case zremReplayCommand:
+			zremCalls.Add(1)
+			cmd.SetVal(int64(0))
+		default:
+			cmd.SetErr(fmt.Errorf("unexpected replay command %s", name))
+		}
+		return cmd
+	}
+
+	metrics := newTestMetrics()
+	d := NewDualWriter(
+		primary,
+		secondary,
+		ProxyConfig{
+			Mode:                               ModeDualWrite,
+			SecondaryTimeout:                   2 * time.Second,
+			SecondaryBlockingReplayConcurrency: 1,
+		},
+		metrics,
+		newTestSentry(),
+		testLogger,
+	)
+
+	_, err := d.Blocking(context.Background(), "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("queue"), []byte("5")})
+	assert.NoError(t, err)
+	d.Close()
+
+	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
+	assert.EqualValues(t, limit+1, zremCalls.Load())
+	assert.Equal(t, limit+2, secondary.CallCount())
+	assert.InDelta(t, 1, testutil.ToFloat64(
+		metrics.CommandTotal.WithLabelValues(zremReplayCommand, "elastickv", "miss")), 0.001)
+}
+
 func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.T) {
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
@@ -1748,6 +1794,24 @@ func TestRedisClientWithReadTimeoutPreservesWriteTimeout(t *testing.T) {
 	assert.Equal(t, 3*time.Second, client.Options().ReadTimeout)
 	assert.Equal(t, 3*time.Second, client.Options().WriteTimeout)
 	assert.Same(t, client, redisClientWithReadTimeout(client, 0))
+}
+
+func TestRedisClientWithBlockingReadTimeoutZeroDisablesReadDeadline(t *testing.T) {
+	client := redis.NewClient(&redis.Options{
+		Addr:         "127.0.0.1:6379",
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+	t.Cleanup(func() {
+		assert.NoError(t, client.Close())
+	})
+
+	clone := redisClientWithBlockingReadTimeout(client, 0)
+	assert.NotSame(t, client, clone)
+	assert.Equal(t, time.Duration(0), clone.Options().ReadTimeout)
+	assert.Equal(t, 3*time.Second, clone.Options().WriteTimeout)
+	assert.Equal(t, 3*time.Second, client.Options().ReadTimeout)
+	assert.Equal(t, 3*time.Second, client.Options().WriteTimeout)
 }
 
 // ========== Pipeline error handling tests ==========

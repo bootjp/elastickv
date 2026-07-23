@@ -127,7 +127,7 @@ func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 // This is used for blocking commands whose wait time exceeds the backend's
 // default read timeout.
 func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	return redisClientWithReadTimeout(b.client, effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+	return redisClientWithBlockingReadTimeout(b.client, timeout).Do(ctx, args...)
 }
 
 func (b *RedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
@@ -159,6 +159,17 @@ func redisClientWithReadTimeout(client *redis.Client, timeout time.Duration) *re
 	if client == nil || timeout <= 0 {
 		return client
 	}
+	return redisClientWithReadTimeoutValue(client, timeout)
+}
+
+func redisClientWithBlockingReadTimeout(client *redis.Client, timeout time.Duration) *redis.Client {
+	if client == nil {
+		return client
+	}
+	return redisClientWithReadTimeoutValue(client, effectiveBlockingReadTimeout(timeout))
+}
+
+func redisClientWithReadTimeoutValue(client *redis.Client, timeout time.Duration) *redis.Client {
 	clone := client.WithTimeout(timeout)
 	// go-redis WithTimeout intentionally sets both ReadTimeout and
 	// WriteTimeout. This path only extends read-side waits for blocking
