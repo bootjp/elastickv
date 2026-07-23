@@ -154,3 +154,28 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 		})
 	}
 }
+
+func TestDeriveSecondaryConcurrencyFromDefaultElasticKVPool(t *testing.T) {
+	poolSize := proxy.DefaultElasticKVBackendOptions().PoolSize
+	writeConcurrency, scriptConcurrency, blockingConcurrency := deriveSecondaryConcurrency(
+		proxy.ModeDualWrite,
+		proxy.DefaultBackendOptions().PoolSize,
+		poolSize,
+		0,
+		0,
+		0,
+	)
+
+	require.Equal(t, 128, poolSize)
+	require.Equal(t, 64, writeConcurrency)
+	require.Equal(t, 32, scriptConcurrency)
+	require.Equal(t, 20, blockingConcurrency)
+	require.NoError(t, validateSecondaryConcurrency(
+		proxy.ModeDualWrite,
+		proxy.DefaultBackendOptions().PoolSize,
+		poolSize,
+		writeConcurrency,
+		scriptConcurrency,
+		blockingConcurrency,
+	))
+}

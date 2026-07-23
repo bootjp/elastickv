@@ -202,9 +202,9 @@ docker run --rm \
   -listen :6479 \
   -primary redis.internal:6379 \
   -secondary elastickv.internal:6380 \
-  -elastickv-pool-size 4 \
-  -secondary-write-concurrency 2 \
-  -secondary-script-concurrency 1 \
+  -elastickv-pool-size 128 \
+  -secondary-write-concurrency 64 \
+  -secondary-script-concurrency 32 \
   -mode dual-write
 ```
 
