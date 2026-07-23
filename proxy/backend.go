@@ -14,9 +14,9 @@ const (
 	defaultElasticKVPoolSize    = 192
 	defaultDialTimeout          = 5 * time.Second
 	defaultReadTimeout          = 3 * time.Second
-	defaultElasticKVReadTimeout = 35 * time.Second
-	defaultWriteTimeout         = 3 * time.Second
 	blockingReadGrace           = 10 * time.Second
+	defaultElasticKVReadTimeout = defaultSecondaryScriptTimeout + blockingReadGrace
+	defaultWriteTimeout         = 3 * time.Second
 	respProtocolV2              = 2
 )
 
@@ -77,8 +77,9 @@ func DefaultBackendOptions() BackendOptions {
 // should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS sized for
 // every proxy replica that may share one client IP, plus dedicated PubSub and
 // shadow PubSub connections outside this command pool. Lower the proxy pool
-// instead for clusters that keep the server-side per-peer cap below the
-// default.
+// instead for clusters that keep the server-side per-peer cap below the default.
+// The read timeout intentionally exceeds the proxy's script replay timeout so
+// per-operation contexts, not socket deadlines, decide script cancellation.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize

@@ -1379,7 +1379,7 @@ func TestDefaultElasticKVBackendOptions(t *testing.T) {
 	opts := DefaultElasticKVBackendOptions()
 	assert.Equal(t, 192, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
-	assert.Equal(t, 35*time.Second, opts.ReadTimeout)
+	assert.Equal(t, defaultSecondaryScriptTimeout+blockingReadGrace, opts.ReadTimeout)
 	assert.Equal(t, 3*time.Second, opts.WriteTimeout)
 }
 
