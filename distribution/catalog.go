@@ -22,8 +22,11 @@ const (
 
 	catalogVersionCodecVersion  byte = 1
 	catalogRouteCodecVersionMin byte = 1
+	catalogRouteCodecVersionV1  byte = 1
 	catalogRouteCodecVersionV2  byte = 2
-	catalogRouteCodecVersion    byte = catalogRouteCodecVersionV2
+	catalogRouteCodecVersionV3  byte = 3
+	catalogRouteCodecVersion    byte = catalogRouteCodecVersionV3
+	catalogRouteV3TailSize           = catalogUint64Bytes + 1 + catalogUint64Bytes + catalogUint64Bytes
 
 	catalogScanPageSize          = 256
 	catalogSaveMetaMutationCount = 2
@@ -44,6 +47,7 @@ var (
 	ErrCatalogInvalidRouteState    = errors.New("catalog route state is invalid")
 	ErrCatalogInvalidRouteKey      = errors.New("catalog route key is invalid")
 	ErrCatalogRouteKeyIDMismatch   = errors.New("catalog route key and record route id mismatch")
+	ErrCatalogRouteV2WriteDisabled = errors.New("catalog route descriptor v2 writes are disabled")
 )
 
 // RouteState describes the control-plane state of a route.
@@ -71,13 +75,16 @@ func (s RouteState) valid() bool {
 
 // RouteDescriptor is the durable representation of a route.
 type RouteDescriptor struct {
-	RouteID       uint64
-	Start         []byte
-	End           []byte
-	GroupID       uint64
-	State         RouteState
-	ParentRouteID uint64
-	SplitAtHLC    uint64
+	RouteID                uint64
+	Start                  []byte
+	End                    []byte
+	GroupID                uint64
+	State                  RouteState
+	ParentRouteID          uint64
+	StagedVisibilityActive bool
+	MigrationJobID         uint64
+	MinWriteTSExclusive    uint64
+	SplitAtHLC             uint64
 }
 
 // CatalogSnapshot is a point-in-time snapshot of the route catalog.
@@ -89,12 +96,31 @@ type CatalogSnapshot struct {
 
 // CatalogStore provides persistence helpers for route catalog state.
 type CatalogStore struct {
-	store store.MVCCStore
+	store                        store.MVCCStore
+	allowRouteDescriptorV2Writes bool
+}
+
+type CatalogStoreOption func(*CatalogStore)
+
+func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.allowRouteDescriptorV2Writes = enabled
+	}
 }
 
 // NewCatalogStore creates a route catalog persistence helper.
-func NewCatalogStore(st store.MVCCStore) *CatalogStore {
-	return &CatalogStore{store: st}
+func NewCatalogStore(st store.MVCCStore, opts ...CatalogStoreOption) *CatalogStore {
+	s := &CatalogStore{store: st}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
+}
+
+func (s *CatalogStore) AllowsRouteDescriptorV2Writes() bool {
+	return s != nil && s.allowRouteDescriptorV2Writes
 }
 
 // CatalogVersionKey returns the reserved key used for catalog version storage.
@@ -170,12 +196,24 @@ func DecodeCatalogNextRouteID(raw []byte) (uint64, error) {
 
 // EncodeRouteDescriptor serializes a route descriptor record.
 func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
+	raw, _, err := encodeRouteDescriptorWithSplitAtHLCOffset(route)
+	return raw, err
+}
+
+func encodeRouteDescriptorWithSplitAtHLCOffset(route RouteDescriptor) ([]byte, uint64, error) {
 	if err := validateRouteDescriptor(route); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	out := make([]byte, 0, routeDescriptorEncodedSize(route))
-	out = append(out, catalogRouteCodecVersion)
+	version := catalogRouteCodecVersionV1
+	if route.SplitAtHLC != 0 {
+		version = catalogRouteCodecVersionV2
+	}
+	if routeDescriptorRequiresV3(route) {
+		version = catalogRouteCodecVersionV3
+	}
+	out = append(out, version)
 	out = appendU64(out, route.RouteID)
 	out = appendU64(out, route.GroupID)
 	out = append(out, byte(route.State))
@@ -185,16 +223,38 @@ func EncodeRouteDescriptor(route RouteDescriptor) ([]byte, error) {
 
 	if route.End == nil {
 		out = append(out, 0)
-		out = appendU64(out, route.SplitAtHLC)
-		return out, nil
+	} else {
+		out = append(out, 1)
+		out = appendU64(out, uint64(len(route.End)))
+		out = append(out, route.End...)
 	}
 
-	out = append(out, 1)
-	out = appendU64(out, uint64(len(route.End)))
-	out = append(out, route.End...)
-	out = appendU64(out, route.SplitAtHLC)
+	splitAtHLCOffset := uint64(0)
+	switch version {
+	case catalogRouteCodecVersionV3:
+		splitAtHLCOffset = uint64(len(out))
+		out = appendRouteDescriptorV3Tail(out, route)
+	case catalogRouteCodecVersionV2:
+		splitAtHLCOffset = uint64(len(out))
+		out = appendU64(out, route.SplitAtHLC)
+	}
+	return out, splitAtHLCOffset, nil
+}
 
-	return out, nil
+func EncodeRouteDescriptorForCatalogWrite(route RouteDescriptor, allowV2 bool) ([]byte, error) {
+	if routeDescriptorRequiresV2(route) && !allowV2 {
+		return nil, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
+	}
+	return EncodeRouteDescriptor(route)
+}
+
+// EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset serializes a route
+// descriptor and returns the byte offset of its SplitAtHLC field.
+func EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(route RouteDescriptor, allowV2 bool) ([]byte, uint64, error) {
+	if routeDescriptorRequiresV2(route) && !allowV2 {
+		return nil, 0, errors.WithStack(ErrCatalogRouteV2WriteDisabled)
+	}
+	return encodeRouteDescriptorWithSplitAtHLCOffset(route)
 }
 
 // DecodeRouteDescriptor deserializes a route descriptor record.
@@ -203,7 +263,7 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
 	}
 	version := raw[0]
-	if version < catalogRouteCodecVersionMin {
+	if version < catalogRouteCodecVersionMin || version > catalogRouteCodecVersion {
 		return RouteDescriptor{}, errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", raw[0])
 	}
 
@@ -216,14 +276,8 @@ func DecodeRouteDescriptor(raw []byte) (RouteDescriptor, error) {
 	if err != nil {
 		return RouteDescriptor{}, err
 	}
-	if version >= catalogRouteCodecVersionV2 {
-		route.SplitAtHLC, err = decodeRouteDescriptorSplitAtHLC(r)
-		if err != nil {
-			return RouteDescriptor{}, err
-		}
-	}
-	if version <= catalogRouteCodecVersion && r.Len() != 0 {
-		return RouteDescriptor{}, errors.WithStack(ErrCatalogInvalidRouteRecord)
+	if err := decodeRouteDescriptorTail(version, r, &route); err != nil {
+		return RouteDescriptor{}, err
 	}
 	if err := validateRouteDescriptor(route); err != nil {
 		return RouteDescriptor{}, err
@@ -320,7 +374,7 @@ func (s *CatalogStore) Save(ctx context.Context, expectedVersion uint64, routes 
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
-	mutations, err := s.buildSaveMutations(ctx, plan)
+	mutations, err := s.buildSaveMutations(ctx, &plan)
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
@@ -381,19 +435,28 @@ func validateRouteDescriptor(route RouteDescriptor) error {
 	if route.End != nil && bytes.Compare(route.Start, route.End) >= 0 {
 		return errors.WithStack(ErrCatalogInvalidRouteRange)
 	}
+	if route.StagedVisibilityActive && route.MigrationJobID == 0 {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	if !route.StagedVisibilityActive && route.MigrationJobID != 0 {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
 	return nil
 }
 
 // CloneRouteDescriptor returns a deep copy of route.
 func CloneRouteDescriptor(route RouteDescriptor) RouteDescriptor {
 	return RouteDescriptor{
-		RouteID:       route.RouteID,
-		Start:         CloneBytes(route.Start),
-		End:           CloneBytes(route.End),
-		GroupID:       route.GroupID,
-		State:         route.State,
-		ParentRouteID: route.ParentRouteID,
-		SplitAtHLC:    route.SplitAtHLC,
+		RouteID:                route.RouteID,
+		Start:                  CloneBytes(route.Start),
+		End:                    CloneBytes(route.End),
+		GroupID:                route.GroupID,
+		State:                  route.State,
+		ParentRouteID:          route.ParentRouteID,
+		StagedVisibilityActive: route.StagedVisibilityActive,
+		MigrationJobID:         route.MigrationJobID,
+		MinWriteTSExclusive:    route.MinWriteTSExclusive,
+		SplitAtHLC:             route.SplitAtHLC,
 	}
 }
 
@@ -605,11 +668,16 @@ func (s *CatalogStore) prepareSave(ctx context.Context, expectedVersion uint64, 
 	}, nil
 }
 
-func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([]*store.KVPairMutation, error) {
+func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan *savePlan) ([]*store.KVPairMutation, error) {
+	if plan == nil {
+		return nil, errors.WithStack(ErrCatalogStoreRequired)
+	}
 	existingRoutes, err := s.routesAt(ctx, plan.readTS)
 	if err != nil {
 		return nil, err
 	}
+	plan.routes = mergeRouteDescriptorWriteFloors(existingRoutes, plan.routes)
+
 	nextRouteID, err := s.nextRouteIDAt(ctx, plan.readTS)
 	if err != nil {
 		return nil, err
@@ -626,7 +694,7 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 
 	mutations := make([]*store.KVPairMutation, 0, len(existingRoutes)+len(plan.routes)+catalogSaveMetaMutationCount)
 	mutations = appendDeleteRouteMutations(mutations, existingRoutes, plan.routes)
-	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes)
+	mutations, err = appendUpsertRouteMutations(mutations, existingRoutes, plan.routes, s.allowRouteDescriptorV2Writes)
 	if err != nil {
 		return nil, err
 	}
@@ -650,6 +718,26 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan savePlan) ([
 		Value: EncodeCatalogNextRouteID(nextRouteID),
 	})
 	return mutations, nil
+}
+
+func mergeRouteDescriptorWriteFloors(existing []RouteDescriptor, desired []RouteDescriptor) []RouteDescriptor {
+	if len(existing) == 0 || len(desired) == 0 {
+		return desired
+	}
+	existingByID := make(map[uint64]RouteDescriptor, len(existing))
+	for _, route := range existing {
+		existingByID[route.RouteID] = route
+	}
+	for i := range desired {
+		existingRoute, ok := existingByID[desired[i].RouteID]
+		if !ok {
+			continue
+		}
+		if existingRoute.MinWriteTSExclusive > desired[i].MinWriteTSExclusive {
+			desired[i].MinWriteTSExclusive = existingRoute.MinWriteTSExclusive
+		}
+	}
+	return desired
 }
 
 func (s *CatalogStore) applySaveMutations(ctx context.Context, plan savePlan, mutations []*store.KVPairMutation) error {
@@ -697,7 +785,7 @@ func appendDeleteRouteMutations(out []*store.KVPairMutation, existing []RouteDes
 	return out
 }
 
-func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor) ([]*store.KVPairMutation, error) {
+func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDescriptor, desired []RouteDescriptor, allowRouteDescriptorV2Writes bool) ([]*store.KVPairMutation, error) {
 	existingByID := make(map[uint64]RouteDescriptor, len(existing))
 	for _, route := range existing {
 		existingByID[route.RouteID] = route
@@ -707,7 +795,7 @@ func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDes
 		if existingRoute, ok := existingByID[route.RouteID]; ok && routeDescriptorEqual(existingRoute, route) {
 			continue
 		}
-		encoded, err := EncodeRouteDescriptor(route)
+		encoded, err := EncodeRouteDescriptorForCatalogWrite(route, allowRouteDescriptorV2Writes)
 		if err != nil {
 			return nil, err
 		}
@@ -727,6 +815,9 @@ func routeDescriptorEqual(left, right RouteDescriptor) bool {
 		left.GroupID == right.GroupID &&
 		left.State == right.State &&
 		left.ParentRouteID == right.ParentRouteID &&
+		left.StagedVisibilityActive == right.StagedVisibilityActive &&
+		left.MigrationJobID == right.MigrationJobID &&
+		left.MinWriteTSExclusive == right.MinWriteTSExclusive &&
 		left.SplitAtHLC == right.SplitAtHLC
 }
 
@@ -741,8 +832,86 @@ func routeDescriptorEncodedSize(route RouteDescriptor) int {
 	if route.End != nil {
 		size += catalogUint64Bytes + len(route.End)
 	}
-	size += catalogUint64Bytes
+	if routeDescriptorRequiresV3(route) {
+		size += catalogRouteV3TailSize
+	} else if route.SplitAtHLC != 0 {
+		size += catalogUint64Bytes
+	}
 	return size
+}
+
+func routeDescriptorRequiresV2(route RouteDescriptor) bool {
+	return routeDescriptorRequiresV3(route)
+}
+
+func routeDescriptorRequiresV3(route RouteDescriptor) bool {
+	return route.StagedVisibilityActive || route.MigrationJobID != 0 || route.MinWriteTSExclusive != 0
+}
+
+func appendRouteDescriptorV3Tail(out []byte, route RouteDescriptor) []byte {
+	out = appendU64(out, route.SplitAtHLC)
+	if route.StagedVisibilityActive {
+		out = append(out, 1)
+	} else {
+		out = append(out, 0)
+	}
+	out = appendU64(out, route.MigrationJobID)
+	out = appendU64(out, route.MinWriteTSExclusive)
+	return out
+}
+
+func decodeRouteDescriptorTail(version byte, r *bytes.Reader, route *RouteDescriptor) error {
+	switch version {
+	case catalogRouteCodecVersionV1:
+		if r.Len() != 0 {
+			return errors.WithStack(ErrCatalogInvalidRouteRecord)
+		}
+		return nil
+	case catalogRouteCodecVersionV2:
+		var err error
+		route.SplitAtHLC, err = decodeRouteDescriptorSplitAtHLC(r)
+		if err != nil {
+			return err
+		}
+		if r.Len() != 0 {
+			return errors.WithStack(ErrCatalogInvalidRouteRecord)
+		}
+		return nil
+	case catalogRouteCodecVersionV3:
+		return decodeRouteDescriptorV3Tail(r, route)
+	default:
+		return errors.Wrapf(ErrCatalogInvalidRouteRecord, "unsupported version %d", version)
+	}
+}
+
+func decodeRouteDescriptorV3Tail(r *bytes.Reader, route *RouteDescriptor) error {
+	if r.Len() != catalogRouteV3TailSize {
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	var err error
+	route.SplitAtHLC, err = decodeRouteDescriptorSplitAtHLC(r)
+	if err != nil {
+		return err
+	}
+	stagedRaw, err := r.ReadByte()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	switch stagedRaw {
+	case 0:
+		route.StagedVisibilityActive = false
+	case 1:
+		route.StagedVisibilityActive = true
+	default:
+		return errors.WithStack(ErrCatalogInvalidRouteRecord)
+	}
+	if err := binary.Read(r, binary.BigEndian, &route.MigrationJobID); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Read(r, binary.BigEndian, &route.MinWriteTSExclusive); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func decodeRouteDescriptorHeader(r *bytes.Reader) (RouteDescriptor, error) {

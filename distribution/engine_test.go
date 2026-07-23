@@ -86,6 +86,124 @@ func TestNewEngineWithDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestEngineApplySnapshot_PreservesMigrationRouteFields(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{
+				RouteID:                7,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                2,
+				State:                  RouteStateMigratingTarget,
+				StagedVisibilityActive: true,
+				MigrationJobID:         42,
+				MinWriteTSExclusive:    99,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	route, ok := e.GetRoute([]byte("m"))
+	if !ok {
+		t.Fatal("expected route")
+	}
+	requireMigrationRouteFields(t, "GetRoute", route)
+
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat route, got %d", len(stats))
+	}
+	requireMigrationRouteFields(t, "Stats", stats[0])
+
+	intersections := e.GetIntersectingRoutes([]byte("b"), []byte("c"))
+	if len(intersections) != 1 {
+		t.Fatalf("expected 1 intersecting route, got %d", len(intersections))
+	}
+	requireMigrationRouteFields(t, "GetIntersectingRoutes", intersections[0])
+}
+
+func TestEngineApplyDelta_PreservesMigrationRouteFields(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{
+				RouteID: 1,
+				Start:   []byte(""),
+				End:     nil,
+				GroupID: 1,
+				State:   RouteStateActive,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	err := e.ApplyDelta(CatalogDelta{
+		PreviousVersion: 1,
+		Version:         2,
+		Mutations: []CatalogRouteMutation{
+			{Op: CatalogMutationDelete, RouteID: 1},
+			{
+				Op:      CatalogMutationUpsert,
+				RouteID: 7,
+				Route: RouteDescriptor{
+					RouteID:                7,
+					Start:                  []byte("a"),
+					End:                    []byte("z"),
+					GroupID:                2,
+					State:                  RouteStateMigratingTarget,
+					StagedVisibilityActive: true,
+					MigrationJobID:         42,
+					MinWriteTSExclusive:    99,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyDelta: %v", err)
+	}
+
+	route, ok := e.GetRoute([]byte("m"))
+	if !ok {
+		t.Fatal("expected route")
+	}
+	requireMigrationRouteFields(t, "GetRoute", route)
+
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat route, got %d", len(stats))
+	}
+	requireMigrationRouteFields(t, "Stats", stats[0])
+
+	intersections := e.GetIntersectingRoutes([]byte("b"), []byte("c"))
+	if len(intersections) != 1 {
+		t.Fatalf("expected 1 intersecting route, got %d", len(intersections))
+	}
+	requireMigrationRouteFields(t, "GetIntersectingRoutes", intersections[0])
+}
+
+func requireMigrationRouteFields(t *testing.T, label string, route Route) {
+	t.Helper()
+	if !route.StagedVisibilityActive {
+		t.Fatalf("%s lost staged visibility: %+v", label, route)
+	}
+	if route.MigrationJobID != 42 {
+		t.Fatalf("%s lost migration job id: %+v", label, route)
+	}
+	if route.MinWriteTSExclusive != 99 {
+		t.Fatalf("%s lost min write ts: %+v", label, route)
+	}
+}
+
 func TestEngineGetIntersectingRoutes(t *testing.T) {
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
@@ -189,6 +307,31 @@ func TestEngineApplySnapshot_ReplacesRoutesAndVersion(t *testing.T) {
 	}
 	if stats[1].RouteID != 11 || stats[1].State != RouteStateWriteFenced {
 		t.Fatalf("unexpected second route metadata: %+v", stats[1])
+	}
+}
+
+func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 12,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 11, Start: []byte("m"), GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	route, version, ok := e.GetRouteWithVersion([]byte("z"))
+	if !ok || route.GroupID != 2 || version != 12 {
+		t.Fatalf("unexpected atomic route lookup: route=%+v version=%d ok=%v", route, version, ok)
+	}
+
+	routes, version := e.GetIntersectingRoutesWithVersion([]byte("a"), []byte("z"))
+	if len(routes) != 2 || version != 12 {
+		t.Fatalf("unexpected atomic range lookup: routes=%+v version=%d", routes, version)
 	}
 }
 

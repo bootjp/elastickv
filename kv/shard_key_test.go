@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,6 +53,102 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 	} {
 		require.Equal(t, userKey, routeKey(raw))
 	}
+}
+
+func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.HashMetaDeltaKey(userKey, 10, 0),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.SetMetaDeltaKey(userKey, 11, 0),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 12, 0),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.5, []byte("member")),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
+	}
+}
+
+func TestRouteFilterKey_NormalizesRedisAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.ListMetaDeltaKey(userKey, 10, 0),
+		store.ListClaimKey(userKey, 1),
+		store.StreamMetaKey(userKey),
+		store.StreamEntryKey(userKey, 123, 4),
+	} {
+		require.Equal(t, userKey, routeFilterKey(raw))
+		require.Equal(t, userKey, routeFilterKey(txnLockKey(raw)))
+	}
+}
+
+func TestRedisWideColumnScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.HashFieldPrefix)
+	familyEnd := prefixScanEnd(prefix)
+	start := store.HashFieldScanPrefix([]byte("alice"))
+	cursor := append(append([]byte(nil), start...), []byte("field\x00")...)
+
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "bare family", start: prefix},
+		{name: "physical cursor", start: cursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(tc.start, familyEnd)
+			require.True(t, ok)
+			require.False(t, exact)
+			require.Nil(t, routeStart)
+			require.Nil(t, routeEnd)
+		})
+	}
+
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, prefixScanEnd(start))
+	require.True(t, ok)
+	require.True(t, exact)
+	require.Equal(t, []byte("alice"), routeStart)
+	require.Nil(t, routeEnd)
+}
+
+func TestListAuxiliaryScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.ListMetaDeltaPrefix)
+	familyEnd := prefixScanEnd(prefix)
+	userPrefix := store.ListMetaDeltaScanPrefix([]byte("alice"))
+	cursor := store.ListMetaDeltaKey([]byte("alice"), 10, 0)
+
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "bare family", start: prefix},
+		{name: "physical cursor", start: cursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, exact, ok := listAuxiliaryScanRouteRange(tc.start, familyEnd)
+			require.True(t, ok)
+			require.False(t, exact)
+			require.Nil(t, routeStart)
+		})
+	}
+
+	routeStart, exact, ok := listAuxiliaryScanRouteRange(userPrefix, prefixScanEnd(userPrefix))
+	require.True(t, ok)
+	require.True(t, exact)
+	require.Equal(t, []byte("alice"), routeStart)
 }
 
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {

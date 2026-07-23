@@ -1104,6 +1104,33 @@ func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 	return s.getAt(ctx, key, ts)
 }
 
+func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
+		return false, ErrReadTSCompacted
+	}
+
+	seekKey := encodeKey(key, ts)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: seekKey,
+		UpperBound: keyUpperBound(key),
+	})
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	if !iter.SeekGE(seekKey) {
+		return false, nil
+	}
+	userKey, _ := decodeKeyView(iter.Key())
+	return bytes.Equal(userKey, key), nil
+}
+
 func (s *pebbleStore) GetAtBatch(ctx context.Context, keys [][]byte, ts uint64) (map[string][]byte, error) {
 	if len(keys) == 0 {
 		return map[string][]byte{}, nil

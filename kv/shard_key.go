@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -11,6 +12,8 @@ import (
 const redisInternalRoutePrefix = "!redis|"
 
 var redisInternalRoutePrefixBytes = []byte(redisInternalRoutePrefix)
+
+const wideColumnEncodedKeyLengthSize = 4
 
 const (
 	dynamoRoutePrefix = "!ddb|route|table|"
@@ -47,6 +50,22 @@ var (
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
 	sqsRoutePrefixBytes              = []byte(sqsRoutePrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
+	redisWideColumnScanPrefixes      = [][]byte{
+		[]byte(store.HashMetaDeltaPrefix),
+		[]byte(store.HashMetaPrefix),
+		[]byte(store.HashFieldPrefix),
+		[]byte(store.SetMetaDeltaPrefix),
+		[]byte(store.SetMetaPrefix),
+		[]byte(store.SetMemberPrefix),
+		[]byte(store.ZSetMetaDeltaPrefix),
+		[]byte(store.ZSetMetaPrefix),
+		[]byte(store.ZSetMemberPrefix),
+		[]byte(store.ZSetScorePrefix),
+	}
+	redisListAuxiliaryScanPrefixes = [][]byte{
+		[]byte(store.ListMetaDeltaPrefix),
+		[]byte(store.ListClaimPrefix),
+	}
 )
 
 // RouteKey normalizes internal keys (e.g., list metadata/items) to the logical
@@ -65,8 +84,21 @@ func routeKey(key []byte) []byte {
 	return normalizeRouteKey(key)
 }
 
+func routeFilterKey(key []byte) []byte {
+	if key == nil {
+		return nil
+	}
+	if embedded, ok := txnRouteKey(key); ok {
+		return normalizeRouteFilterKey(embedded)
+	}
+	return normalizeRouteFilterKey(key)
+}
+
 func normalizeRouteKey(key []byte) []byte {
 	if user := redisRouteKey(key); user != nil {
+		return user
+	}
+	if user := redisWideColumnRouteKey(key); user != nil {
 		return user
 	}
 	if table := dynamoRouteKey(key); table != nil {
@@ -85,6 +117,177 @@ func normalizeRouteKey(key []byte) []byte {
 		return user
 	}
 	return key
+}
+
+func normalizeRouteFilterKey(key []byte) []byte {
+	if user := redisListAuxiliaryRouteKey(key); user != nil {
+		return user
+	}
+	if user := redisStreamRouteKey(key); user != nil {
+		return user
+	}
+	return normalizeRouteKey(key)
+}
+
+func redisWideColumnLegacyPointRouteKey(key []byte) []byte {
+	if embedded, ok := txnRouteKey(key); ok {
+		key = embedded
+	}
+	if redisWideColumnRouteKey(key) == nil {
+		return nil
+	}
+	return key
+}
+
+func redisWideColumnRouteKey(key []byte) []byte {
+	if user := redisHashRouteKey(key); user != nil {
+		return user
+	}
+	if user := redisSetRouteKey(key); user != nil {
+		return user
+	}
+	return redisZSetRouteKey(key)
+}
+
+func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
+	for _, prefix := range redisWideColumnScanPrefixes {
+		if !bytes.HasPrefix(key, prefix) {
+			continue
+		}
+		user := wideColumnScanUserKey(key, prefix)
+		if user == nil {
+			return prefix, nil, nil, true, false
+		}
+		prefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		return prefix, user, key[:prefixLen], true, true
+	}
+	return nil, nil, nil, false, false
+}
+
+func redisWideColumnLegacyScanRouteRange(start []byte, end []byte) ([]byte, []byte, bool) {
+	_, _, _, owned, parsed := redisWideColumnScanRouteParts(start)
+	if !owned || !parsed {
+		return nil, nil, false
+	}
+	return start, end, true
+}
+
+func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
+	prefix, userKey, userPrefix, owned, parsed := redisWideColumnScanRouteParts(start)
+	if !owned {
+		return nil, nil, false, false
+	}
+	if !parsed {
+		return nil, nil, false, true
+	}
+	if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+		return userKey, nil, true, true
+	}
+	if bytes.Equal(start, userPrefix) && end != nil && bytes.Compare(end, prefixScanEnd(prefix)) <= 0 {
+		return userKey, prefixScanEnd(userKey), false, true
+	}
+	// Physical wide-column cursors include a field/member suffix. Their raw
+	// ordering cannot be projected to a logical user-key lower bound, so the
+	// remaining namespace must fan out to every logical route.
+	return nil, nil, false, true
+}
+
+func listAuxiliaryScanRouteRange(start []byte, end []byte) (routeStart []byte, exact bool, ok bool) {
+	for _, prefix := range redisListAuxiliaryScanPrefixes {
+		if !bytes.HasPrefix(start, prefix) {
+			continue
+		}
+		user := wideColumnScanUserKey(start, prefix)
+		if user == nil {
+			return nil, false, true
+		}
+		userPrefixLen := len(prefix) + wideColumnEncodedKeyLengthSize + len(user)
+		userPrefix := start[:userPrefixLen]
+		if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
+			return user, true, true
+		}
+		return nil, false, true
+	}
+	return nil, false, false
+}
+
+func wideColumnScanUserKey(key []byte, prefix []byte) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	rest := key[len(prefix):]
+	if len(rest) < wideColumnEncodedKeyLengthSize {
+		return nil
+	}
+	keyLen := binary.BigEndian.Uint32(rest[:wideColumnEncodedKeyLengthSize])
+	rest = rest[wideColumnEncodedKeyLengthSize:]
+	if uint64(keyLen) > uint64(len(rest)) {
+		return nil
+	}
+	return rest[:keyLen]
+}
+
+func redisHashRouteKey(key []byte) []byte {
+	switch {
+	case store.IsHashMetaDeltaKey(key):
+		return store.ExtractHashUserKeyFromDelta(key)
+	case store.IsHashMetaKey(key):
+		return store.ExtractHashUserKeyFromMeta(key)
+	case store.IsHashFieldKey(key):
+		return store.ExtractHashUserKeyFromField(key)
+	default:
+		return nil
+	}
+}
+
+func redisSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsSetMetaDeltaKey(key):
+		return store.ExtractSetUserKeyFromDelta(key)
+	case store.IsSetMetaKey(key):
+		return store.ExtractSetUserKeyFromMeta(key)
+	case store.IsSetMemberKey(key):
+		return store.ExtractSetUserKeyFromMember(key)
+	default:
+		return nil
+	}
+}
+
+func redisZSetRouteKey(key []byte) []byte {
+	switch {
+	case store.IsZSetMetaDeltaKey(key):
+		return store.ExtractZSetUserKeyFromDelta(key)
+	case store.IsZSetMetaKey(key):
+		return store.ExtractZSetUserKeyFromMeta(key)
+	case store.IsZSetMemberKey(key):
+		return store.ExtractZSetUserKeyFromMember(key)
+	case store.IsZSetScoreKey(key):
+		return store.ExtractZSetUserKeyFromScore(key)
+	default:
+		return nil
+	}
+}
+
+func redisListAuxiliaryRouteKey(key []byte) []byte {
+	switch {
+	case store.IsListMetaDeltaKey(key):
+		return store.ExtractListUserKeyFromDelta(key)
+	case store.IsListClaimKey(key):
+		return store.ExtractListUserKeyFromClaim(key)
+	default:
+		return nil
+	}
+}
+
+func redisStreamRouteKey(key []byte) []byte {
+	switch {
+	case store.IsStreamMetaKey(key):
+		return store.ExtractStreamUserKeyFromMeta(key)
+	case store.IsStreamEntryKey(key):
+		return store.ExtractStreamUserKeyFromEntry(key)
+	default:
+		return nil
+	}
 }
 
 func redisRouteKey(key []byte) []byte {
