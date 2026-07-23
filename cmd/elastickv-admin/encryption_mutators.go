@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -451,13 +452,15 @@ func runEncryptionBootstrap(args []string, out io.Writer) error {
 		}
 	}()
 	if len(parsed.discoverFrom) > 0 {
-		batch, err := discoverBootstrapWriterBatch(ctx, parsed.discoverFrom)
+		batch, err := discoverBootstrapWriterBatch(context.Background(), parsed.discoverFrom, *endpoint.timeout)
 		if err != nil {
 			return err
 		}
 		parsed.request.WriterBatch = batch
 	}
-	resp, err := client.BootstrapEncryption(ctx, parsed.request)
+	rpcCtx, cancel := context.WithTimeout(context.Background(), *endpoint.timeout)
+	defer cancel()
+	resp, err := client.BootstrapEncryption(rpcCtx, parsed.request)
 	if err != nil {
 		return errors.Wrap(err, "BootstrapEncryption")
 	}
@@ -615,10 +618,10 @@ func parseDiscoverFromFlags(raw []string) ([]string, error) {
 	return out, nil
 }
 
-func discoverBootstrapWriterBatch(ctx context.Context, addrs []string) ([]*pb.WriterRegistryEntry, error) {
+func discoverBootstrapWriterBatch(ctx context.Context, addrs []string, timeout time.Duration) ([]*pb.WriterRegistryEntry, error) {
 	batch := make([]*pb.WriterRegistryEntry, 0, len(addrs))
 	for i, addr := range addrs {
-		report, err := getBootstrapCapability(ctx, addr)
+		report, err := getBootstrapCapability(ctx, addr, timeout)
 		if err != nil {
 			return nil, err
 		}
@@ -634,14 +637,15 @@ func discoverBootstrapWriterBatch(ctx context.Context, addrs []string) ([]*pb.Wr
 	return batch, nil
 }
 
-func getBootstrapCapability(ctx context.Context, addr string) (*pb.CapabilityReport, error) {
-	timeout := encryptionDialTimeout
+func getBootstrapCapability(ctx context.Context, addr string, timeout time.Duration) (*pb.CapabilityReport, error) {
 	endpoint := &encryptionEndpointFlags{endpoint: &addr, timeout: &timeout}
 	client, closeFn, err := dialEncryption(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	report, rpcErr := client.GetCapability(ctx, &pb.Empty{})
+	rpcCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	report, rpcErr := client.GetCapability(rpcCtx, &pb.Empty{})
 	closeErr := closeFn()
 	if rpcErr != nil {
 		return nil, errors.Wrapf(rpcErr, "GetCapability %s", addr)

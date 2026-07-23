@@ -4,6 +4,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -87,6 +88,17 @@ func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, group
 		return nil, errors.Wrapf(err, "failed to construct encryption admin writer registry for group %d", groupID)
 	}
 	return reg, nil
+}
+
+func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64) (encryption.WriterRegistryStore, error) {
+	if sidecarPath == "" {
+		return nil, nil
+	}
+	defaultGroup := shardGroups[defaultGroupID]
+	if defaultGroup == nil || defaultGroup.Store == nil {
+		return nil, errors.Errorf("failed to construct encryption admin writer registry: default group %d store is unavailable", defaultGroupID)
+	}
+	return encryptionAdminWriterRegistry(sidecarPath, defaultGroup.Store, defaultGroupID)
 }
 
 // registerEncryptionAdminServer constructs and registers an

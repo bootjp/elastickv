@@ -178,6 +178,8 @@ type stubMutatorServer struct {
 	bootstrapCalls          []*pb.BootstrapEncryptionRequest
 	capability              *pb.CapabilityReport
 	capabilityErr           error
+	capabilityDelay         time.Duration
+	bootstrapDelay          time.Duration
 	enableEnvelopeCalls     []*pb.EnableStorageEnvelopeRequest
 	enableEnvelopeResp      *pb.EnableStorageEnvelopeResponse
 	enableRaftEnvelopeCalls []*pb.EnableRaftEnvelopeRequest
@@ -202,15 +204,21 @@ func (s *stubMutatorServer) RegisterEncryptionWriter(_ context.Context, req *pb.
 	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: s.appliedIndex}, nil
 }
 
-func (s *stubMutatorServer) BootstrapEncryption(_ context.Context, req *pb.BootstrapEncryptionRequest) (*pb.BootstrapEncryptionResponse, error) {
+func (s *stubMutatorServer) BootstrapEncryption(ctx context.Context, req *pb.BootstrapEncryptionRequest) (*pb.BootstrapEncryptionResponse, error) {
 	s.bootstrapCalls = append(s.bootstrapCalls, req)
+	if err := waitStubDelay(ctx, s.bootstrapDelay); err != nil {
+		return nil, err
+	}
 	if s.returnErr != nil {
 		return nil, s.returnErr
 	}
 	return &pb.BootstrapEncryptionResponse{AppliedIndex: s.appliedIndex}, nil
 }
 
-func (s *stubMutatorServer) GetCapability(context.Context, *pb.Empty) (*pb.CapabilityReport, error) {
+func (s *stubMutatorServer) GetCapability(ctx context.Context, _ *pb.Empty) (*pb.CapabilityReport, error) {
+	if err := waitStubDelay(ctx, s.capabilityDelay); err != nil {
+		return nil, err
+	}
 	if s.capabilityErr != nil {
 		return nil, s.capabilityErr
 	}
@@ -221,6 +229,20 @@ func (s *stubMutatorServer) GetCapability(context.Context, *pb.Empty) (*pb.Capab
 		EncryptionCapable: true,
 		FullNodeId:        1,
 	}, nil
+}
+
+func waitStubDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *stubMutatorServer) EnableStorageEnvelope(_ context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
@@ -322,6 +344,50 @@ func TestRunEncryptionBootstrap_DiscoverFromHappyPath(t *testing.T) {
 		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
 	}
 	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
+}
+
+func TestRunEncryptionBootstrap_DiscoverFromUsesPerRPCTimeout(t *testing.T) {
+	t.Parallel()
+
+	const rpcDelay = 150 * time.Millisecond
+	leader := &stubMutatorServer{
+		appliedIndex:    117,
+		capabilityDelay: rpcDelay,
+		bootstrapDelay:  rpcDelay,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+	follower := &stubMutatorServer{
+		capabilityDelay: rpcDelay,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        22,
+			LocalEpoch:        5,
+		},
+	}
+	followerAddr := startCustomEncryptionAdminTestServer(t, follower)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", leaderAddr,
+		"--timeout", "300ms",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--discover-from", leaderAddr,
+		"--discover-from", followerAddr,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionBootstrap: %v", err)
+	}
+	if len(leader.bootstrapCalls) != 1 {
+		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
+	}
 }
 
 func TestRunEncryptionBootstrap_RejectsWriterAndDiscoverFrom(t *testing.T) {

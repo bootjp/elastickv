@@ -1874,6 +1874,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
+		defaultGroupID:     in.cfg.defaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
 		s3BlobBackfiller:   in.s3BlobBackfiller,
 		dynamoAddress:      *dynamoAddr,
@@ -2630,6 +2631,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	defaultGroupID uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
@@ -2640,6 +2642,10 @@ func startRaftServers(
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	writerRegistry, err := encryptionAdminDefaultWriterRegistry(*encryptionSidecarPath, shardGroups, defaultGroupID)
+	if err != nil {
+		return err
+	}
 	for _, rt := range runtimes {
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
@@ -2693,10 +2699,6 @@ func startRaftServers(
 		// Proposer + LeaderView for the cutover marker, while
 		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
 		// path for normal admin entries.
-		writerRegistry, err := encryptionAdminWriterRegistry(*encryptionSidecarPath, rt.store, rt.spec.id)
-		if err != nil {
-			return err
-		}
 		registerEncryptionAdminServer(
 			gs,
 			etcdraftengine.DeriveNodeID(*raftId),
@@ -3044,6 +3046,7 @@ type runtimeServerRunner struct {
 	redisApplyObserver              *adapter.RedisApplyObserver
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
+	defaultGroupID                  uint64
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
 	s3Address                       string
@@ -3163,6 +3166,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.defaultGroupID,
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		s3BlobPushBlocked,
 	); err != nil {
