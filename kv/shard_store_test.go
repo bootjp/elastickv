@@ -1654,6 +1654,30 @@ func TestShardStoreScanAt_RoutesExactRedisWideColumnScanToOneShard(t *testing.T)
 	require.Equal(t, uint64(1), routes[0].GroupID)
 }
 
+func TestShardStoreRoutesForWideColumnBoundedPatternIncludesLegacyRawRoute(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	start := store.HashFieldScanPrefix([]byte("m"))
+	routes, clamp, _ := st.routesForScanWithVersion(start, prefixScanEnd([]byte(store.HashFieldPrefix)))
+	require.False(t, clamp)
+	require.Len(t, routes, 2)
+	require.Equal(t, uint64(2), routes[0].GroupID)
+	require.Equal(t, uint64(1), routes[1].GroupID)
+}
+
 func TestShardStoreRedisWideColumnReadsLegacyRawRoute(t *testing.T) {
 	t.Parallel()
 
@@ -1700,6 +1724,63 @@ func TestShardStoreRedisWideColumnReadsLegacyRawRoute(t *testing.T) {
 	require.Equal(t, uint64(6), ts)
 
 	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("current"), kvs[0].Value)
+
+	kvs, err = st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("current"), kvs[0].Value)
+
+	require.NoError(t, st.DeleteAt(ctx, key, 7))
+	_, err = st.GetAt(ctx, key, 7)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 7)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	kvs, err = st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 7)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	require.NoError(t, st.PutAt(ctx, key, []byte("future"), 9, 0))
+	_, err = st.GetAt(ctx, key, 8)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 8)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	value, err = st.GetAt(ctx, key, 9)
+	require.NoError(t, err)
+	require.Equal(t, []byte("future"), value)
+}
+
+func TestShardStoreReverseRedisWideColumnScanPrefersLogicalRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	key := store.HashFieldKey([]byte("zulu"), []byte("field"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
+	require.NoError(t, st.PutAt(ctx, key, []byte("current"), 6, 0))
+
+	prefix := store.HashFieldScanPrefix([]byte("zulu"))
+	kvs, err := st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, []byte("current"), kvs[0].Value)

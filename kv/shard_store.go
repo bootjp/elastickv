@@ -188,13 +188,20 @@ func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint
 	if len(routes) == 0 {
 		return nil, store.ErrKeyNotFound
 	}
-	for _, route := range routes {
+	for i, route := range routes {
 		value, err := s.getRouteAt(ctx, route, key, ts, readRouteVersion)
 		if err == nil {
 			return value, nil
 		}
 		if !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, err
+		}
+		stop, err := s.routeMissStopsPointFallback(ctx, routes, i, route, key, ts, readRouteVersion)
+		if err != nil {
+			return nil, err
+		}
+		if stop {
+			return nil, store.ErrKeyNotFound
 		}
 	}
 	return nil, store.ErrKeyNotFound
@@ -222,6 +229,40 @@ func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, k
 		return nil, store.ErrKeyNotFound
 	}
 	return s.getGroupAt(ctx, g, key, ts, route.GroupID, readRouteVersion)
+}
+
+func (s *ShardStore) routeHasLatestVersionVisibleAt(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, error) {
+	if exists, ok, err := s.routeHasVersionAtOrBefore(ctx, route, key, ts); ok || err != nil {
+		return exists, err
+	}
+	latest, exists, err := s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
+	if err != nil {
+		return false, err
+	}
+	return exists && latest <= ts, nil
+}
+
+func (s *ShardStore) routeHasVersionAtOrBefore(ctx context.Context, route distribution.Route, key []byte, ts uint64) (bool, bool, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g.Store == nil {
+		return false, true, nil
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return false, false, nil
+	}
+	checker, ok := g.Store.(store.VersionPresenceReader)
+	if !ok {
+		return false, false, nil
+	}
+	exists, err := checker.VersionExistsAtOrBefore(ctx, key, ts)
+	return exists, true, errors.WithStack(err)
+}
+
+func (s *ShardStore) routeMissStopsPointFallback(ctx context.Context, routes []distribution.Route, routeIndex int, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, error) {
+	if routeIndex != 0 || len(routes) < 2 {
+		return false, nil
+	}
+	return s.routeHasLatestVersionVisibleAt(ctx, route, key, ts, readRouteVersion)
 }
 
 func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
@@ -409,6 +450,10 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
 	out = dedupeSortedScanResults(out)
+	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, end, ts, readRouteVersion)
+	if err != nil {
+		return nil, err
+	}
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -501,8 +546,37 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 	if err != nil {
 		return nil, err
 	}
+	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, end, ts, readRouteVersion)
+	if err != nil {
+		return nil, err
+	}
 	if len(out) > limit {
 		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *ShardStore) canonicalizeRedisWideColumnScanResults(ctx context.Context, kvs []*store.KVPair, start []byte, end []byte, ts uint64, readRouteVersion uint64) ([]*store.KVPair, error) {
+	if len(kvs) == 0 {
+		return kvs, nil
+	}
+	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); !ok {
+		return kvs, nil
+	}
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil || redisWideColumnLegacyPointRouteKey(kvp.Key) == nil {
+			out = append(out, kvp)
+			continue
+		}
+		value, err := s.GetAtWithReadFence(ctx, kvp.Key, ts, 0, readRouteVersion)
+		if err != nil {
+			if errors.Is(err, store.ErrKeyNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, &store.KVPair{Key: bytes.Clone(kvp.Key), Value: value})
 	}
 	return out, nil
 }
@@ -562,6 +636,7 @@ func (s *ShardStore) routesForRedisWideColumnScanWithVersion(start []byte, end [
 	}
 	if !exact {
 		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+		routes, version = s.appendRedisWideColumnLegacyScanRoutesWithVersion(routes, version, start, end)
 		return routes, version, true
 	}
 	route, version, ok := s.engine.GetRouteWithVersion(routeStart)
@@ -569,14 +644,33 @@ func (s *ShardStore) routesForRedisWideColumnScanWithVersion(start []byte, end [
 		return []distribution.Route{}, version, true
 	}
 	routes := []distribution.Route{route}
-	if legacyKey := redisWideColumnExactScanLegacyRouteKey(start, end); legacyKey != nil {
-		legacyRoute, legacyVersion, ok := s.engine.GetRouteWithVersion(legacyKey)
-		version = max(version, legacyVersion)
-		if ok && legacyRoute.GroupID != route.GroupID {
-			routes = append(routes, legacyRoute)
-		}
-	}
+	routes, version = s.appendRedisWideColumnLegacyScanRoutesWithVersion(routes, version, start, end)
 	return routes, version, true
+}
+
+func (s *ShardStore) appendRedisWideColumnLegacyScanRoutesWithVersion(routes []distribution.Route, version uint64, start []byte, end []byte) ([]distribution.Route, uint64) {
+	legacyStart, legacyEnd, ok := redisWideColumnLegacyScanRouteRange(start, end)
+	if !ok {
+		return routes, version
+	}
+	legacyRoutes, legacyVersion := s.engine.GetIntersectingRoutesWithVersion(legacyStart, legacyEnd)
+	version = max(version, legacyVersion)
+	return appendDistinctRoutesByGroup(routes, legacyRoutes), version
+}
+
+func appendDistinctRoutesByGroup(routes []distribution.Route, candidates []distribution.Route) []distribution.Route {
+	seen := make(map[uint64]struct{}, len(routes))
+	for _, route := range routes {
+		seen[route.GroupID] = struct{}{}
+	}
+	for _, route := range candidates {
+		if _, ok := seen[route.GroupID]; ok {
+			continue
+		}
+		seen[route.GroupID] = struct{}{}
+		routes = append(routes, route)
+	}
+	return routes
 }
 
 func (s *ShardStore) routesForEncodedScanWithVersion(start []byte, end []byte) ([]distribution.Route, uint64, bool) {
@@ -958,9 +1052,10 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 	seenGroups := make(map[uint64]struct{})
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
 	filterUsageOwners := !clampToRoutes && !routeFilterPresent && filesystemUsageScanOverlap(start, end)
-	for i := len(routes) - 1; i >= 0; i-- {
+	for i := range routes {
 		route := routes[i]
 		if clampToRoutes {
+			route = routes[len(routes)-1-i]
 			kvs, done, err := s.clampedReverseScanRouteAtWithReadFence(ctx, route, start, end, limit, len(out), ts, readRouteVersion, routeStart, routeEnd)
 			if err != nil {
 				return nil, err

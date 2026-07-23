@@ -164,15 +164,12 @@ func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, u
 	return nil, nil, nil, false, false
 }
 
-func redisWideColumnExactScanLegacyRouteKey(start []byte, end []byte) []byte {
-	_, _, userPrefix, owned, parsed := redisWideColumnScanRouteParts(start)
+func redisWideColumnLegacyScanRouteRange(start []byte, end []byte) ([]byte, []byte, bool) {
+	_, _, _, owned, parsed := redisWideColumnScanRouteParts(start)
 	if !owned || !parsed {
-		return nil
+		return nil, nil, false
 	}
-	if exactEnd := prefixScanEnd(userPrefix); end != nil && bytes.Compare(end, exactEnd) <= 0 {
-		return start
-	}
-	return nil
+	return start, end, true
 }
 
 func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {

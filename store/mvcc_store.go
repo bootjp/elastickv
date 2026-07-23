@@ -137,6 +137,15 @@ func latestVisible(vs []VersionedValue, ts uint64) (VersionedValue, bool) {
 	return VersionedValue{}, false
 }
 
+func versionExistsAtOrBefore(vs []VersionedValue, ts uint64) bool {
+	for i := len(vs) - 1; i >= 0; i-- {
+		if vs[i].TS <= ts {
+			return true
+		}
+	}
+	return false
+}
+
 func visibleValue(versions []VersionedValue, ts uint64) ([]byte, bool) {
 	ver, ok := latestVisible(versions, ts)
 	if !ok || ver.Tombstone {
@@ -292,6 +301,21 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 		return false, nil
 	}
 	return true, nil
+}
+
+func (s *mvccStore) VersionExistsAtOrBefore(_ context.Context, key []byte, ts uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return false, ErrReadTSCompacted
+	}
+
+	v, ok := s.tree.Get(key)
+	if !ok {
+		return false, nil
+	}
+	versions, _ := v.([]VersionedValue)
+	return versionExistsAtOrBefore(versions, ts), nil
 }
 
 func computeScanCapHint(treeSize, limit int) int {
