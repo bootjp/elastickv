@@ -71,6 +71,49 @@ func TestSnapshotOffloadCLIRequiresLocalRoot(t *testing.T) {
 	require.Equal(t, exitUserErr, code)
 }
 
+func TestSnapshotOffloadCLIRejectsPositionalArgs(t *testing.T) {
+	_, err := parsePublishFlags([]string{
+		"--store", storeLocal,
+		"--local-root", "objects",
+		"--data-dir", "data",
+		"--group-id", "1",
+		"extra",
+	})
+	require.ErrorContains(t, err, "unexpected positional argument")
+
+	_, err = parseRestoreFlags([]string{
+		"--store", storeLocal,
+		"--local-root", "objects",
+		"--manifest-key", "manifest.json",
+		"--data-dir", "data",
+		"--peers", "n1=127.0.0.1:12001",
+		"extra",
+	})
+	require.ErrorContains(t, err, "unexpected positional argument")
+}
+
+func TestSnapshotOffloadCLIS3KMSRequiresAWSKMS(t *testing.T) {
+	_, err := parsePublishFlags([]string{
+		"--store", storeS3,
+		"--s3-bucket", "bucket",
+		"--s3-sse", s3SSEAWSKMS,
+		"--s3-kms-key-id", "key-id",
+		"--data-dir", "data",
+		"--group-id", "1",
+	})
+	require.NoError(t, err)
+
+	_, err = parsePublishFlags([]string{
+		"--store", storeS3,
+		"--s3-bucket", "bucket",
+		"--s3-sse", "AES256",
+		"--s3-kms-key-id", "key-id",
+		"--data-dir", "data",
+		"--group-id", "1",
+	})
+	require.ErrorContains(t, err, "--s3-kms-key-id requires --s3-sse=aws:kms")
+}
+
 func seedCLISnapshot(t *testing.T, root string, payload []byte, index uint64, term uint64) string {
 	t.Helper()
 	input := filepath.Join(root, "source.fsm")

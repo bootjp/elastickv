@@ -1283,8 +1283,7 @@ func (r *RedisServer) xreadFinalCheck(conn redcon.Conn, req xreadRequest) bool {
 	if ok := r.runWithHeavyCommandSlot(func() {
 		results, err = r.xreadOnce(ctx, req)
 	}); !ok {
-		conn.WriteError(errRedisHeavyCommandPoolFull.Error())
-		return true
+		return false
 	}
 	if err != nil {
 		if isXReadIterCtxError(err) {

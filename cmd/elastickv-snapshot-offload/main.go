@@ -26,6 +26,7 @@ const (
 	commandRestore = "restore"
 	storeLocal     = "local"
 	storeS3        = "s3"
+	s3SSEAWSKMS    = "aws:kms"
 )
 
 type storeFlags struct {
@@ -121,6 +122,9 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	if err := fs.Parse(argv); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if err := rejectPositionalArgs(fs); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(cfg.dataDir) == "" {
 		return nil, errors.New("--data-dir is required")
 	}
@@ -144,6 +148,9 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 	if err := fs.Parse(argv); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if err := rejectPositionalArgs(fs); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(cfg.manifestKey) == "" {
 		return nil, errors.New("--manifest-key is required")
 	}
@@ -157,6 +164,13 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func rejectPositionalArgs(fs *flag.FlagSet) error {
+	if fs.NArg() == 0 {
+		return nil
+	}
+	return errors.Errorf("unexpected positional argument %q", fs.Arg(0))
 }
 
 func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
@@ -188,8 +202,13 @@ func validateStoreFlags(cfg storeFlags) error {
 	default:
 		return errors.Errorf("unknown --store %q", cfg.storeKind)
 	}
-	if strings.TrimSpace(cfg.s3KMSKeyID) != "" && strings.TrimSpace(cfg.s3ServerSideEncryption) == "" {
-		return errors.New("--s3-kms-key-id requires --s3-sse")
+	if strings.TrimSpace(cfg.s3KMSKeyID) != "" {
+		if strings.TrimSpace(cfg.s3ServerSideEncryption) == "" {
+			return errors.New("--s3-kms-key-id requires --s3-sse")
+		}
+		if strings.TrimSpace(cfg.s3ServerSideEncryption) != s3SSEAWSKMS {
+			return errors.New("--s3-kms-key-id requires --s3-sse=aws:kms")
+		}
 	}
 	return nil
 }
