@@ -293,7 +293,7 @@ func TestS3Server_AdminDeleteBucket_RetriesSafetyNetRouteFence(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "safety-net retry must sweep the orphan before acknowledging delete")
 }
 
-func TestS3Server_AdminDeleteBucket_PropagatesPersistentSafetyNetRouteFence(t *testing.T) {
+func TestS3Server_AdminDeleteBucket_SwallowsPersistentSafetyNetRouteFence(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
@@ -310,8 +310,11 @@ func TestS3Server_AdminDeleteBucket_PropagatesPersistentSafetyNetRouteFence(t *t
 
 	err = server.AdminDeleteBucket(ctx,
 		fullAdminBucketsPrincipal(), "to-delete")
-	require.ErrorIs(t, err, kv.ErrRouteWriteFenced)
+	require.NoError(t, err)
 	require.Equal(t, s3TxnRetryMaxAttempts, coord.safetyNetCalls)
+	_, exists, err := server.AdminDescribeBucket(ctx, "to-delete")
+	require.NoError(t, err)
+	require.False(t, exists)
 }
 
 func TestS3Server_AdminDeleteBucket_MissingBucket(t *testing.T) {

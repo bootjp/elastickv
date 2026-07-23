@@ -624,10 +624,10 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 }
 
 func isListMetaMigrationDelta(pair *store.KVPair) bool {
-	if pair == nil || !store.IsListMetaDeltaKey(pair.Key) {
+	if pair == nil || !store.IsListMetaDeltaValue(pair.Value) {
 		return false
 	}
-	return len(pair.Value) != redisWideMetaLegacySizeBytes && len(pair.Value) != redisWideMetaInlineSizeBytes
+	return store.IsListMetaDeltaKey(pair.Key) || store.ExtractLegacyListUserKeyFromDelta(pair.Key) != nil
 }
 
 func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -61,7 +62,9 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilyS3UploadMeta:                    s3keys.UploadMetaPrefix,
 		MigrationFamilyS3UploadPart:                    s3keys.UploadPartPrefix,
 		MigrationFamilyS3Blob:                          s3keys.BlobPrefix,
+		MigrationFamilyS3ChunkRef:                      s3keys.ChunkRefPrefix,
 		MigrationFamilyS3GCUpload:                      s3keys.GCUploadPrefix,
+		MigrationFamilyFilesystemChunk:                 string(fskeys.ChunkAllPrefix()),
 	}
 
 	for family, prefix := range required {
@@ -121,6 +124,8 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	user := byFamily[MigrationFamilyUser]
 	user.Start = nil
 	user.End = nil
+	require.False(t, user.ContainsRawKey(s3keys.ChunkRefKey("bucket", 1, "object", "upload", 1, 0)))
+	require.False(t, user.ContainsRawKey(fskeys.ChunkKey(1, 2, 3)))
 	for _, raw := range [][]byte{
 		[]byte("!txn|foo"),
 		[]byte("!stream|foo"),
@@ -247,6 +252,46 @@ func TestMigrationBracketContainsRoutedKeyUsesObjectRoutes(t *testing.T) {
 		s3keys.RouteKey("bucket-c", 1, "a"),
 		nil,
 		s3keys.ExtractRouteKey,
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyUsesS3ChunkRefRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	chunkRef := bracketsByFamily(brackets)[MigrationFamilyS3ChunkRef]
+	key := s3keys.ChunkRefKey("bucket-b", 7, "m", "upload", 1, 0)
+
+	require.True(t, chunkRef.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-b", 7, "a"),
+		s3keys.RouteKey("bucket-b", 7, "z"),
+		s3keys.ExtractRouteKey,
+	))
+	require.False(t, chunkRef.ContainsRoutedKey(
+		key,
+		s3keys.RouteKey("bucket-c", 1, "a"),
+		nil,
+		s3keys.ExtractRouteKey,
+	))
+}
+
+func TestMigrationBracketContainsRoutedKeyUsesFilesystemChunkRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	chunk := bracketsByFamily(brackets)[MigrationFamilyFilesystemChunk]
+	key := fskeys.ChunkKey(10, 20, 3)
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+
+	require.True(t, chunk.ContainsRoutedKey(key, routeKey, prefixScanEnd(routeKey), fskeys.ExtractRouteKey))
+	require.False(t, chunk.ContainsRoutedKey(
+		key,
+		fskeys.ChunkRouteKey(11, 20),
+		nil,
+		fskeys.ExtractRouteKey,
 	))
 }
 

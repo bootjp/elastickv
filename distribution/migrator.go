@@ -3,6 +3,7 @@ package distribution
 import (
 	"bytes"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -52,6 +53,8 @@ const (
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
 	MigrationFamilyLegacyListMetaDelta
+	MigrationFamilyS3ChunkRef
+	MigrationFamilyFilesystemChunk
 )
 
 const (
@@ -135,7 +138,9 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.UploadMetaPrefix),
 	[]byte(s3keys.UploadPartPrefix),
 	[]byte(s3keys.BlobPrefix),
+	[]byte(s3keys.ChunkRefPrefix),
 	[]byte(s3keys.GCUploadPrefix),
+	fskeys.ChunkAllPrefix(),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -440,7 +445,9 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyS3UploadMeta, prefix: s3keys.UploadMetaPrefix},
 		{family: MigrationFamilyS3UploadPart, prefix: s3keys.UploadPartPrefix},
 		{family: MigrationFamilyS3Blob, prefix: s3keys.BlobPrefix},
+		{family: MigrationFamilyS3ChunkRef, prefix: s3keys.ChunkRefPrefix},
 		{family: MigrationFamilyS3GCUpload, prefix: s3keys.GCUploadPrefix},
+		{family: MigrationFamilyFilesystemChunk, prefix: string(fskeys.ChunkAllPrefix())},
 	}
 
 	out := make([]MigrationBracket, 0, len(defs))

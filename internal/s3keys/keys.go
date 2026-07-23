@@ -314,6 +314,8 @@ func bucketGenerationFamilyPrefix(key []byte) []byte {
 		return uploadPartPrefixBytes
 	case bytes.HasPrefix(key, blobPrefixBytes):
 		return blobPrefixBytes
+	case bytes.HasPrefix(key, chunkRefPrefixBytes):
+		return chunkRefPrefixBytes
 	case bytes.HasPrefix(key, gcUploadPrefixBytes):
 		return gcUploadPrefixBytes
 	case bytes.HasPrefix(key, routePrefixBytes):

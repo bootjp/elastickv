@@ -978,22 +978,11 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 }
 
 func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engine, error) {
-	if !waitForLeader {
-		select {
-		case <-ctx.Done():
-			_ = engine.Close()
-			return nil, errors.WithStack(ctx.Err())
-		case <-engine.doneCh:
-			if err := engine.currentError(); err != nil {
-				return nil, err
-			}
-			return nil, errors.WithStack(errClosed)
-		default:
-		}
-		return engine, nil
-	}
 	if err := waitForOpenSignal(ctx, engine, engine.startedCh); err != nil {
 		return nil, err
+	}
+	if !waitForLeader {
+		return engine, nil
 	}
 	if err := waitForOpenSignal(ctx, engine, engine.leaderReady); err != nil {
 		return nil, err

@@ -130,6 +130,24 @@ func TestDeltaCompactor_TTLInlineMigratesListUserKeyStartingWithDeltaPrefix(t *t
 	require.Equal(t, delta, rawDelta)
 }
 
+func TestIsListMetaMigrationDeltaRecognizesLegacyRowsByValue(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("list")
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	legacyKey := legacyListMetaDeltaKey(userKey, 2)
+
+	require.True(t, isListMetaMigrationDelta(&store.KVPair{Key: legacyKey, Value: delta}))
+	require.True(t, isListMetaMigrationDelta(&store.KVPair{
+		Key:   store.ListMetaDeltaKey(userKey, 2, 0),
+		Value: delta,
+	}))
+	require.False(t, isListMetaMigrationDelta(&store.KVPair{
+		Key:   store.ListMetaKey(append([]byte("d|"), userKey...)),
+		Value: make([]byte, redisWideMetaLegacySizeBytes),
+	}))
+}
+
 func TestDeltaCompactor_TTLInlineMigratesLegacyStreamTTL(t *testing.T) {
 	t.Parallel()
 

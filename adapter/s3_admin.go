@@ -514,7 +514,7 @@ func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, 
 			slog.Uint64("generation", generation),
 			slog.String("error", err.Error()),
 		)
-		return err
+		return nil
 	}
 	return nil
 }

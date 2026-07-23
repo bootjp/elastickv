@@ -526,3 +526,13 @@ func TestPerBucketPrefixes_IsolateByBucketAndGeneration(t *testing.T) {
 		})
 	}
 }
+
+func TestBucketGenerationRoutePrefixForCleanupPrefixIncludesChunkRefs(t *testing.T) {
+	t.Parallel()
+
+	prefix := ChunkRefPrefixForBucket("bucket-a", 7)
+	got, ok := BucketGenerationRoutePrefixForCleanupPrefix(prefix)
+
+	require.True(t, ok)
+	require.Equal(t, RoutePrefixForBucket("bucket-a", 7), got)
+}

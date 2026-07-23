@@ -378,6 +378,7 @@ func (r *RedisServer) listMetaExpireScanErr(
 		return nil, false, err
 	}
 	r.triggerUrgentCompaction("list", key)
+	r.triggerUrgentCompaction("list-legacy", key)
 	if exists {
 		return listMetaTTLUpdateElem(key, meta, expireAtMs)
 	}
