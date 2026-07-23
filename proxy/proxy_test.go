@@ -912,6 +912,41 @@ func TestDualWriter_Blocking_XReadDoesNotUseWriteSemaphore(t *testing.T) {
 	d.Close()
 }
 
+func TestDualWriter_Blocking_ReplaysXReadGroupToSecondary(t *testing.T) {
+	resp := []any{
+		[]any{
+			[]byte("jobs"),
+			[]any{
+				[]any{[]byte("1-0"), []any{[]byte("field"), []byte("value")}},
+			},
+		},
+	}
+	primary := &timeoutCapturingBackend{name: "primary", returnValue: resp}
+	secondary := newMockBackend("secondary")
+	secondary.doFunc = makeCmd(resp, nil)
+
+	metrics := newTestMetrics()
+	cfg := ProxyConfig{
+		Mode:                               ModeDualWrite,
+		SecondaryTimeout:                   10 * time.Second,
+		SecondaryBlockingReplayConcurrency: 1,
+	}
+	d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+	args := [][]byte{
+		[]byte(cmdNameXREADGROUP), []byte("GROUP"), []byte("g"), []byte("c"),
+		[]byte("BLOCK"), []byte("1"), []byte("STREAMS"), []byte("jobs"), []byte(">"),
+	}
+	got, err := d.Blocking(context.Background(), cmdNameXREADGROUP, args)
+	assert.NoError(t, err)
+	assert.Equal(t, resp, got)
+	d.Close()
+
+	assert.Equal(t, [][]any{bytesArgsToInterfaces(args)}, secondary.Calls())
+	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues(cmdNameXREADGROUP, "secondary", "ok")), 0.001)
+}
+
 func TestDualWriter_GoAsync_Bounded(t *testing.T) {
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)

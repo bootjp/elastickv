@@ -401,6 +401,10 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	if d.hasSecondaryWrite() {
 		if replayCmd, replayArgs, ok := blockingReplayCommand(cmd, args, resp); ok {
 			d.goBlockingReplay(func(ctx context.Context) {
+				if strings.EqualFold(replayCmd, cmdNameXREADGROUP) {
+					d.writeSecondary(ctx, replayCmd, replayArgs)
+					return
+				}
 				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
 					initialDelay:        blockingReplayInitialDelay,
 					noEffectRetryWindow: blockingReplayNoEffectRetryWindow,

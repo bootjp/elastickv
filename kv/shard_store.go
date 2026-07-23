@@ -683,15 +683,8 @@ func (s *ShardStore) routesForInternalScanWithVersion(start []byte, end []byte) 
 		return internalScanRouteSelection{routes: routesForLegacyListDeltaScan(catalogRoutes, start, end), version: version}, true
 	}
 	if routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, end); ok {
-		if !exact {
-			routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
-			return internalScanRouteSelection{routes: routes, version: version}, true
-		}
-		route, version, ok := s.engine.GetRouteWithVersion(routeStart)
-		if !ok {
-			return internalScanRouteSelection{routes: []distribution.Route{}, version: version}, true
-		}
-		return internalScanRouteSelection{routes: []distribution.Route{route}, version: version}, true
+		routes, version := s.redisWideColumnScanRoutesWithVersion(start, end, routeStart, routeEnd, exact)
+		return internalScanRouteSelection{routes: routes, version: version}, true
 	}
 	// Remaining internal collection scans route by their logical user key.
 	if userKey := scanRouteUserKey(start); userKey != nil {
@@ -702,6 +695,44 @@ func (s *ShardStore) routesForInternalScanWithVersion(start []byte, end []byte) 
 		return internalScanRouteSelection{routes: []distribution.Route{route}, version: version}, true
 	}
 	return internalScanRouteSelection{}, false
+}
+
+func (s *ShardStore) redisWideColumnScanRoutesWithVersion(start []byte, end []byte, routeStart []byte, routeEnd []byte, exact bool) ([]distribution.Route, uint64) {
+	var routes []distribution.Route
+	var version uint64
+	if exact {
+		route, routeVersion, ok := s.engine.GetRouteWithVersion(routeStart)
+		version = routeVersion
+		if ok {
+			routes = append(routes, route)
+		}
+	} else {
+		routes, version = s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+	}
+
+	legacyRoutes, legacyVersion := s.engine.GetIntersectingRoutesWithVersion(start, end)
+	version = max(version, legacyVersion)
+	return appendUniqueRouteGroups(routes, legacyRoutes...), version
+}
+
+func appendUniqueRouteGroups(routes []distribution.Route, extra ...distribution.Route) []distribution.Route {
+	seen := make(map[uint64]struct{}, len(routes)+len(extra))
+	out := make([]distribution.Route, 0, len(routes)+len(extra))
+	for _, route := range routes {
+		if _, ok := seen[route.GroupID]; ok {
+			continue
+		}
+		seen[route.GroupID] = struct{}{}
+		out = append(out, route)
+	}
+	for _, route := range extra {
+		if _, ok := seen[route.GroupID]; ok {
+			continue
+		}
+		seen[route.GroupID] = struct{}{}
+		out = append(out, route)
+	}
+	return out
 }
 
 func (s *ShardStore) routesForListAuxiliaryScanWithVersion(start []byte, end []byte) (internalScanRouteSelection, bool) {
@@ -2218,12 +2249,24 @@ func (s *ShardStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return 0, false, err
 	}
-	route, routeVersion, ok := s.engine.GetRouteWithVersion(routeKey(key))
+	routes, routeVersion := s.pointReadRoutesWithVersion(key)
 	readRouteVersion = max(readRouteVersion, routeVersion)
-	if !ok {
+	if len(routes) == 0 {
 		return 0, false, nil
 	}
-	return s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
+	var latest uint64
+	var exists bool
+	for _, route := range routes {
+		ts, ok, err := s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
+		if err != nil {
+			return 0, false, err
+		}
+		if ok && (!exists || ts > latest) {
+			latest = ts
+			exists = true
+		}
+	}
+	return latest, exists, nil
 }
 
 func (s *ShardStore) latestCommitTSForRoute(ctx context.Context, route distribution.Route, key []byte, readRouteVersion uint64) (uint64, bool, error) {

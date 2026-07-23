@@ -65,7 +65,7 @@ func blockingCommandTimeout(cmd string, args [][]byte) time.Duration {
 			return 0
 		}
 		return parseBlockingSecondsArg(args[1])
-	case "XREAD", "XREADGROUP":
+	case "XREAD", cmdNameXREADGROUP:
 		for i := 1; i+1 < len(args); i++ {
 			if strings.EqualFold(string(args[i]), "BLOCK") {
 				return parseBlockingMillisecondsArg(args[i+1])
@@ -105,9 +105,36 @@ func blockingReplayCommand(cmd string, args [][]byte, resp any) (string, []any, 
 		return blockingBLMPopReplay(args, resp)
 	case "BZPOPMIN", "BZPOPMAX":
 		return blockingZSetPopReplay(resp)
+	case cmdNameXREADGROUP:
+		return blockingXReadGroupReplay(args, resp)
 	default:
 		return "", nil, false
 	}
+}
+
+func blockingXReadGroupReplay(args [][]byte, resp any) (string, []any, bool) {
+	if !xreadGroupResponseHasEntries(resp) {
+		return "", nil, false
+	}
+	return cmdNameXREADGROUP, bytesArgsToInterfaces(args), true
+}
+
+func xreadGroupResponseHasEntries(resp any) bool {
+	streams, ok := redisArray(resp)
+	if !ok {
+		return false
+	}
+	for _, stream := range streams {
+		parts, ok := redisArray(stream)
+		if !ok || len(parts) < 2 {
+			continue
+		}
+		entries, ok := redisArray(parts[1])
+		if ok && len(entries) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func blockingListPopReplay(count int64, resp any) (string, []any, bool) {

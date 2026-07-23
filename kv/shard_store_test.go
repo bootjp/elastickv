@@ -408,7 +408,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
 }
 
-func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
+func TestShardStoreRoutesForScanUsesWideColumnUserKeyAndLegacyRoute(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -432,8 +432,8 @@ func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			routes, clamp := st.routesForScan(tc.prefix, prefixScanEnd(tc.prefix))
 			require.False(t, clamp)
-			require.Len(t, routes, 1)
-			require.Equal(t, uint64(2), routes[0].GroupID)
+			require.Len(t, routes, 2)
+			require.ElementsMatch(t, []uint64{1, 2}, []uint64{routes[0].GroupID, routes[1].GroupID})
 		})
 	}
 }
@@ -1603,6 +1603,61 @@ func TestShardStoreScanAt_RoutesExactRedisWideColumnScanToOneShard(t *testing.T)
 	require.False(t, clamp)
 	require.Len(t, routes, 1)
 	require.Equal(t, uint64(1), routes[0].GroupID)
+}
+
+func TestShardStoreScanAt_RoutesExactRedisWideColumnScanIncludesLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	key := store.HashFieldKey([]byte("zulu"), []byte("field"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 10, 0))
+
+	start := store.HashFieldScanPrefix([]byte("zulu"))
+	kvs, err := st.ScanAt(ctx, start, prefixScanEnd(start), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, []byte("legacy"), kvs[0].Value)
+}
+
+func TestShardStoreLatestCommitTS_IncludesLegacyRedisWideColumnRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	key := store.HashFieldKey([]byte("zulu"), []byte("field"))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("normalized"), 10, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 20, 0))
+
+	latest, ok, err := st.LatestCommitTS(ctx, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(20), latest)
 }
 
 func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T) {
