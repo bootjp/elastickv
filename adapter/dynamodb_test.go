@@ -269,20 +269,29 @@ func TestDynamoDB_LeaderHealthz(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Eventually(t, func() bool {
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+
 				req, err := http.NewRequestWithContext(
-					context.Background(),
+					ctx,
 					http.MethodGet,
 					"http://"+tc.addr+dynamoLeaderHealthPath,
 					nil,
 				)
-				require.NoError(t, err)
+				if err != nil {
+					return false
+				}
 
 				resp, err := http.DefaultClient.Do(req)
-				require.NoError(t, err)
+				if err != nil {
+					return false
+				}
 				defer resp.Body.Close()
 
 				body, err := io.ReadAll(resp.Body)
-				require.NoError(t, err)
+				if err != nil {
+					return false
+				}
 				return resp.StatusCode == tc.status && string(body) == tc.body
 			}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
 		})
