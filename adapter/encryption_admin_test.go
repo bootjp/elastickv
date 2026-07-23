@@ -190,6 +190,41 @@ func TestEncryptionAdmin_GetSidecarState_ProjectsLocalWriterRegistry(t *testing.
 	}
 }
 
+func TestEncryptionAdmin_GetSidecarState_UsesRegistryLeaderView(t *testing.T) {
+	t.Parallel()
+	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
+		Keys: map[string]encryption.SidecarKey{
+			"10": {Purpose: "storage", Wrapped: []byte("storage")},
+			"11": {Purpose: "raft", Wrapped: []byte("raft")},
+		},
+	})
+	reg := newTestWriterRegistryStore()
+	reg.seed(t, 10, callerFullNodeID, 3)
+
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminFullNodeID(callerFullNodeID),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminRegistryLeaderView(stubLeaderView{
+			state: raftengine.StateFollower,
+			leader: raftengine.LeaderInfo{
+				ID:      "n1",
+				Address: "127.0.0.1:50051",
+			},
+		}),
+		WithEncryptionAdminWriterRegistry(reg),
+	)
+	_, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	if got, want := status.Code(err), codes.FailedPrecondition; got != want {
+		t.Errorf("GetSidecarState status=%v, want %v (err=%v)", got, want, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "127.0.0.1:50051") {
+		t.Errorf("GetSidecarState error %q does not surface the registry leader view", err)
+	}
+}
+
 func assertSidecarHeader(t *testing.T, got *pb.SidecarStateReport) {
 	t.Helper()
 	if got.ActiveStorageId != 1 || got.ActiveRaftId != 2 {

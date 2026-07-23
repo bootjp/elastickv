@@ -252,7 +252,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", enableMutators, engine, nil, nil, nil)
+	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", enableMutators, engine, nil, nil, nil))
 	go func() { _ = gs.Serve(listener) }()
 	t.Cleanup(gs.Stop)
 	conn, err := grpc.NewClient(
@@ -278,7 +278,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 
 func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", false, nil, nil, nil, nil)
+	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", false, nil, nil, nil, nil))
 	info := gs.GetServiceInfo()
 	if _, ok := info["EncryptionAdmin"]; !ok {
 		var registered []string
@@ -286,5 +286,19 @@ func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 			registered = append(registered, name)
 		}
 		t.Fatalf("EncryptionAdmin not registered; got services=%v", registered)
+	}
+}
+
+func TestRegisterEncryptionAdminServer_CanReuseInstance(t *testing.T) {
+	srv := newEncryptionAdminServer(1, "", false, nil, nil, nil, nil)
+	first := grpc.NewServer()
+	second := grpc.NewServer()
+	registerEncryptionAdminServer(first, srv)
+	registerEncryptionAdminServer(second, srv)
+	if _, ok := first.GetServiceInfo()["EncryptionAdmin"]; !ok {
+		t.Fatal("EncryptionAdmin service not registered on first gRPC server")
+	}
+	if _, ok := second.GetServiceInfo()["EncryptionAdmin"]; !ok {
+		t.Fatal("EncryptionAdmin service not registered on second gRPC server")
 	}
 }

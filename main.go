@@ -2668,6 +2668,17 @@ func startRaftServers(
 	if err != nil {
 		return err
 	}
+	encryptionAdminServer := newEncryptionAdminServer(
+		etcdraftengine.DeriveNodeID(*raftId),
+		*encryptionSidecarPath,
+		enableMutators,
+		defaultAdmin.engine,
+		encryptionCapabilityFanout,
+		writerRegistry,
+		defaultAdmin.latestAppliedIndex,
+		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
+		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+	)
 	for _, rt := range runtimes {
 		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
 		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
@@ -2708,18 +2719,7 @@ func startRaftServers(
 		// ResyncSidecar's freshness gate must verify that group's
 		// leader, and all mutating admin RPCs must commit into the
 		// same FSM whose registry GetSidecarState/ResyncSidecar read.
-		registerEncryptionAdminServer(
-			gs,
-			etcdraftengine.DeriveNodeID(*raftId),
-			*encryptionSidecarPath,
-			enableMutators,
-			defaultAdmin.engine,
-			encryptionCapabilityFanout,
-			writerRegistry,
-			defaultAdmin.latestAppliedIndex,
-			adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
-			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
-		)
+		registerEncryptionAdminServer(gs, encryptionAdminServer)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook

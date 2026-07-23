@@ -122,11 +122,10 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 	}, nil
 }
 
-// registerEncryptionAdminServer constructs and registers an
-// EncryptionAdminServer on the supplied gRPC server. The function
-// is intentionally per-shard: the §7.1 Phase-0 GetCapability
-// fan-out polls every member, and the §5.1 sidecar contents are
-// per-node.
+// newEncryptionAdminServer constructs the per-node EncryptionAdminServer.
+// Production registers the returned instance on every group listener so
+// the default-group admin runtime also shares its cutover serialization
+// and unsafe-cutover latch across those frontends.
 //
 // fullNodeID MUST be per-node-stable (every replica of the same
 // group sees a distinct value), NOT the Raft group id (which is
@@ -181,7 +180,7 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) {
+func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) *adapter.EncryptionAdminServer {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
@@ -215,5 +214,9 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 	if err := srv.Validate(); err != nil {
 		panic(errors.Wrap(err, "encryption admin server validation"))
 	}
+	return srv
+}
+
+func registerEncryptionAdminServer(gs *grpc.Server, srv pb.EncryptionAdminServer) {
 	pb.RegisterEncryptionAdminServer(gs, srv)
 }
