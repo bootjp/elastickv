@@ -162,7 +162,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
-func TestReleaseProtectedReceivedFSMSnapshotsUpToDoesNotBlockSnapshotMu(t *testing.T) {
+func TestReleaseProtectedReceivedFSMSnapshotsUpToRetriesAfterSnapshotMuUnlock(t *testing.T) {
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{7: 1},
 	}
@@ -182,8 +182,11 @@ func TestReleaseProtectedReceivedFSMSnapshotsUpToDoesNotBlockSnapshotMu(t *testi
 	require.Equal(t, map[uint64]int{7: 1}, e.protectedReceivedFSMSnaps)
 
 	e.snapshotMu.Unlock()
-	e.releaseProtectedReceivedFSMSnapshotsUpTo(7)
-	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.Eventually(t, func() bool {
+		e.snapshotMu.Lock()
+		defer e.snapshotMu.Unlock()
+		return len(e.protectedReceivedFSMSnaps) == 0
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {

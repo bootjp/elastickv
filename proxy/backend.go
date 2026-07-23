@@ -73,9 +73,10 @@ func DefaultBackendOptions() BackendOptions {
 
 // DefaultElasticKVBackendOptions returns defaults for proxy backends that
 // connect to ElasticKV's Redis adapter. Production dual-write deployments
-// should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS at least as
-// high as this pool size; lower the proxy pool instead for clusters that keep
-// the server-side per-peer cap below the default.
+// should run the cluster with ELASTICKV_REDIS_PER_PEER_CONNECTIONS above this
+// pool size because PubSub and shadow PubSub use dedicated connections outside
+// the go-redis command pool. Lower the proxy pool instead for clusters that
+// keep the server-side per-peer cap below the default.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize

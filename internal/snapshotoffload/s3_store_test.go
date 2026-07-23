@@ -121,6 +121,41 @@ func TestS3StoreRejectsExistingObjectMismatch(t *testing.T) {
 	require.ErrorIs(t, err, ErrIntegrity)
 }
 
+func TestS3StoreConflictHashesExistingObjectWithoutIntegrityMetadata(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store := newTestS3Store(t, fake)
+	key := "snapshots/body.fsm"
+	body := []byte("same-body")
+	sha := hexSHA256Bytes(body)
+	fake.putRawObject("backup-bucket", key, body, nil, nil)
+
+	info, err := store.PutObject(ctx, key, strings.NewReader("not-read-on-conflict"), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	require.Equal(t, sha, info.SHA256)
+	require.Equal(t, 1, fake.getAttempts())
+}
+
+func TestS3StoreConflictRejectsExistingObjectWithoutIntegrityMetadataMismatch(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeS3Client()
+	store := newTestS3Store(t, fake)
+	key := "snapshots/body.fsm"
+	existing := []byte("aaaa")
+	candidate := []byte("bbbb")
+	fake.putRawObject("backup-bucket", key, existing, nil, nil)
+
+	_, err := store.PutObject(ctx, key, strings.NewReader("not-read-on-conflict"), PutOptions{
+		Size:   int64(len(candidate)),
+		SHA256: hexSHA256Bytes(candidate),
+	})
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.Equal(t, 1, fake.getAttempts())
+}
+
 func TestS3StoreRejectsParentDirectoryKeys(t *testing.T) {
 	ctx := context.Background()
 	store := newTestS3Store(t, newFakeS3Client())
@@ -150,6 +185,7 @@ type fakeS3Client struct {
 	objects  map[string]fakeS3Object
 	lastPut  types.ChecksumAlgorithm
 	attempts int
+	gets     int
 }
 
 type fakeS3Object struct {
@@ -211,6 +247,7 @@ func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, 
 func (c *fakeS3Client) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gets++
 	obj, ok := c.objects[fakeS3ClientKey(input.Bucket, input.Key)]
 	if !ok {
 		return nil, &types.NotFound{}
@@ -237,6 +274,26 @@ func (c *fakeS3Client) putAttempts() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.attempts
+}
+
+func (c *fakeS3Client) getAttempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets
+}
+
+func (c *fakeS3Client) putRawObject(bucket string, key string, body []byte, metadata map[string]string, checksum *string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clonedMetadata := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		clonedMetadata[k] = v
+	}
+	c.objects[bucket+"/"+key] = fakeS3Object{
+		body:     append([]byte(nil), body...),
+		metadata: clonedMetadata,
+		checksum: checksum,
+	}
 }
 
 func fakeS3ClientKey(bucket *string, key *string) string {

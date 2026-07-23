@@ -1275,13 +1275,12 @@ func isXReadIterCtxError(err error) bool {
 	}
 }
 
-func (r *RedisServer) xreadFinalCheck(conn redcon.Conn, req xreadRequest) bool {
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bool {
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisFinalTypeCheckTimeout)
 	defer cancel()
-	var results []xreadResult
 	var err error
 	if ok := r.runWithHeavyCommandSlot(func() {
-		results, err = r.xreadOnce(ctx, req)
+		err = r.xreadCheckTypes(ctx, req)
 	}); !ok {
 		return false
 	}
@@ -1292,15 +1291,25 @@ func (r *RedisServer) xreadFinalCheck(conn redcon.Conn, req xreadRequest) bool {
 		writeRedisError(conn, err)
 		return true
 	}
-	if len(results) > 0 {
-		writeXReadResults(conn, results)
-		return true
-	}
 	return false
 }
 
+func (r *RedisServer) xreadCheckTypes(ctx context.Context, req xreadRequest) error {
+	for _, key := range req.keys {
+		readTS := r.readTS()
+		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeNone && typ != redisTypeStream {
+			return wrongTypeError()
+		}
+	}
+	return nil
+}
+
 func (r *RedisServer) writeXReadFinalOrNull(conn redcon.Conn, req xreadRequest) {
-	if r.xreadFinalCheck(conn, req) {
+	if r.xreadFinalTypeCheck(conn, req) {
 		return
 	}
 	conn.WriteNull()

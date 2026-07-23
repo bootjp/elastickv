@@ -135,7 +135,11 @@ func (s *S3Store) verifyS3PutObject(ctx context.Context, key string, opts PutOpt
 		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s remote integrity mismatch", key)
 	}
 	if info.SHA256 == "" {
-		info.SHA256 = opts.SHA256
+		verified, err := s.verifyS3ObjectBytes(ctx, key, opts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		info = verified
 	}
 	return info, nil
 }
@@ -227,13 +231,36 @@ func (s *S3Store) verifyS3ExistingObject(ctx context.Context, key string, opts P
 	if !ok {
 		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s conflicted but is not visible", key)
 	}
-	if info.Size == opts.Size && (info.SHA256 == "" || info.SHA256 == opts.SHA256) {
-		if info.SHA256 == "" {
-			info.SHA256 = opts.SHA256
-		}
+	if info.Size != opts.Size {
+		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s already exists with different content", key)
+	}
+	if info.SHA256 == opts.SHA256 {
 		return info, nil
 	}
+	if info.SHA256 == "" {
+		return s.verifyS3ObjectBytes(ctx, key, opts)
+	}
 	return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s already exists with different content", key)
+}
+
+func (s *S3Store) verifyS3ObjectBytes(ctx context.Context, key string, opts PutOptions) (ObjectInfo, error) {
+	body, info, err := s.GetObject(ctx, key)
+	if err != nil {
+		return ObjectInfo{}, errors.Wrap(err, "get s3 object for integrity verification")
+	}
+	defer func() { _ = body.Close() }()
+	sum := sha256.New()
+	n, err := io.Copy(sum, contextReader{ctx: ctx, reader: body})
+	if err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	gotSHA := hex.EncodeToString(sum.Sum(nil))
+	if n != opts.Size || gotSHA != opts.SHA256 {
+		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "s3 object %s already exists with different content", key)
+	}
+	info.Size = n
+	info.SHA256 = gotSHA
+	return info, nil
 }
 
 func validateStoreObjectKey(key string) (string, error) {

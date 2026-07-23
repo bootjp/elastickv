@@ -123,6 +123,7 @@ const (
 	// Keep normal producer wakeups event-driven while reducing idle fallback scans
 	// from blocked consumers waiting on empty collections.
 	defaultRedisBlockWaitFallback = time.Second
+	redisFinalTypeCheckTimeout    = 100 * time.Millisecond
 	redisFlushLegacyTimeout       = 10 * time.Minute
 	redisRelayPublishTimeout      = 2 * time.Second
 	redisTraceArgLimit            = 6

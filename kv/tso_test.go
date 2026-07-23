@@ -323,6 +323,31 @@ func TestCoordinateTimestampRecoveryKeepsFailClosedWhenRenewalFails(t *testing.T
 	require.Equal(t, int32(1), eng.proposeCalls.Load())
 }
 
+func TestCoordinateTimestampRecoveryPreservesContextErrorWhenRenewalFails(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clock := NewHLC()
+			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+			eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour, proposeErr: tc.err}
+			coord := WithKeyVizLabel(NewCoordinatorWithEngine(nil, eng, WithHLC(clock)), keyviz.LabelRedis)
+
+			_, err := NextTimestampThrough(context.Background(), coord, "redis allocate ts")
+			require.ErrorIs(t, err, ErrCeilingExpired)
+			require.ErrorIs(t, err, tc.err)
+			require.Contains(t, err.Error(), "on-demand HLC lease renewal failed")
+			require.Equal(t, int32(1), eng.proposeCalls.Load())
+		})
+	}
+}
+
 func TestLocalTSOAllocatorRecoversExpiredHLCCeiling(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()

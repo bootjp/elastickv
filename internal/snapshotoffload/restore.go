@@ -30,6 +30,7 @@ const (
 )
 
 func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest, error) {
+	ctx = restoreContext(ctx)
 	if store == nil {
 		return Manifest{}, errors.Wrap(ErrInvalidOptions, "object store is required")
 	}
@@ -53,31 +54,15 @@ func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest,
 }
 
 func RestorePhysicalSnapshot(ctx context.Context, opts RestoreOptions) (*etcdraftengine.ExternalSnapshotRestoreResult, error) {
+	ctx = restoreContext(ctx)
 	if err := validateRestoreOptions(opts); err != nil {
 		return nil, err
 	}
-	manifest, err := restoreManifest(ctx, opts)
+	manifest, payloadPath, cleanup, err := prepareRestorePayload(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateManifest(manifest); err != nil {
-		return nil, err
-	}
-	if err := ensureRestoreDestinationAbsent(opts.DataDir); err != nil {
-		return nil, err
-	}
-	downloadDir, err := prepareRestoreDownloadDir(opts.DataDir)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = os.RemoveAll(downloadDir) }()
-	payloadPath := filepath.Join(downloadDir, "payload.fsm")
-	if err := downloadVerifiedPayload(ctx, opts.Store, manifest, payloadPath); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, errors.WithStack(err)
-	}
+	defer cleanup()
 	result, err := etcdraftengine.PreparePhysicalSnapshotRestore(etcdraftengine.PhysicalSnapshotRestoreOptions{
 		Context:               ctx,
 		InputFSMPath:          payloadPath,
@@ -91,6 +76,64 @@ func RestorePhysicalSnapshot(ctx context.Context, opts RestoreOptions) (*etcdraf
 		return nil, errors.Wrap(err, "prepare physical snapshot restore")
 	}
 	return result, nil
+}
+
+func prepareRestorePayload(ctx context.Context, opts RestoreOptions) (Manifest, string, func(), error) {
+	if err := checkRestoreContext(ctx); err != nil {
+		return Manifest{}, "", nil, err
+	}
+	manifest, err := restoreManifest(ctx, opts)
+	if err != nil {
+		return Manifest{}, "", nil, err
+	}
+	if err := validateManifest(manifest); err != nil {
+		return Manifest{}, "", nil, err
+	}
+	if err := checkRestorePreflight(ctx, opts.DataDir); err != nil {
+		return Manifest{}, "", nil, err
+	}
+	downloadDir, err := prepareRestoreDownloadDir(opts.DataDir)
+	if err != nil {
+		return Manifest{}, "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(downloadDir) }
+	payloadPath := filepath.Join(downloadDir, "payload.fsm")
+	if err := downloadRestorePayload(ctx, opts.Store, manifest, payloadPath); err != nil {
+		cleanup()
+		return Manifest{}, "", nil, err
+	}
+	return manifest, payloadPath, cleanup, nil
+}
+
+func checkRestorePreflight(ctx context.Context, dataDir string) error {
+	if err := checkRestoreContext(ctx); err != nil {
+		return err
+	}
+	return ensureRestoreDestinationAbsent(dataDir)
+}
+
+func downloadRestorePayload(ctx context.Context, store ObjectStore, manifest Manifest, payloadPath string) error {
+	if err := checkRestoreContext(ctx); err != nil {
+		return err
+	}
+	if err := downloadVerifiedPayload(ctx, store, manifest, payloadPath); err != nil {
+		return err
+	}
+	return checkRestoreContext(ctx)
+}
+
+func checkRestoreContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func restoreContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func readLimitedManifest(ctx context.Context, body io.Reader) ([]byte, error) {
@@ -168,13 +211,83 @@ func validateRestoreOptions(opts RestoreOptions) error {
 	case len(opts.Peers) == 0:
 		return errors.Wrap(ErrInvalidOptions, "restore peers are required")
 	default:
+		return validateRestorePeers(opts.Peers)
+	}
+}
+
+func validateRestorePeers(peers []etcdraftengine.Peer) error {
+	seenNodeIDs := make(map[uint64]struct{}, len(peers))
+	seenIDs := make(map[string]struct{}, len(peers))
+	voters := 0
+	for i, peer := range peers {
+		isVoter, err := validateRestorePeer(i, peer, seenNodeIDs, seenIDs)
+		if err != nil {
+			return err
+		}
+		if isVoter {
+			voters++
+		}
+	}
+	if voters == 0 {
+		return errors.Wrap(ErrInvalidOptions, "restore peers require at least one voter")
+	}
+	return nil
+}
+
+func validateRestorePeer(
+	i int,
+	peer etcdraftengine.Peer,
+	seenNodeIDs map[uint64]struct{},
+	seenIDs map[string]struct{},
+) (bool, error) {
+	if err := validateRestorePeerShape(i, peer); err != nil {
+		return false, err
+	}
+	if _, ok := seenNodeIDs[peer.NodeID]; ok {
+		return false, errors.Wrapf(ErrInvalidOptions, "restore peer[%d] has duplicate node id %d", i, peer.NodeID)
+	}
+	seenNodeIDs[peer.NodeID] = struct{}{}
+	peerID := restorePeerIdentity(peer)
+	if _, ok := seenIDs[peerID]; ok {
+		return false, errors.Wrapf(ErrInvalidOptions, "restore peer[%d] has duplicate id %q", i, peerID)
+	}
+	seenIDs[peerID] = struct{}{}
+	return peer.Suffrage != etcdraftengine.SuffrageLearner, nil
+}
+
+func validateRestorePeerShape(i int, peer etcdraftengine.Peer) error {
+	switch {
+	case peer.NodeID == 0:
+		return errors.Wrapf(ErrInvalidOptions, "restore peer[%d] has zero node id", i)
+	case stringsTrim(peer.Address) == "":
+		return errors.Wrapf(ErrInvalidOptions, "restore peer[%d] has empty address", i)
+	case peer.Suffrage != "" &&
+		peer.Suffrage != etcdraftengine.SuffrageVoter &&
+		peer.Suffrage != etcdraftengine.SuffrageLearner:
+		return errors.Wrapf(ErrInvalidOptions, "restore peer[%d] has invalid suffrage %q", i, peer.Suffrage)
+	default:
 		return nil
 	}
 }
 
+func restorePeerIdentity(peer etcdraftengine.Peer) string {
+	peerID := stringsTrim(peer.ID)
+	if peerID != "" {
+		return peerID
+	}
+	return stringsTrim(peer.Address)
+}
+
 func restoreManifest(ctx context.Context, opts RestoreOptions) (Manifest, error) {
 	if opts.Manifest != nil {
-		return *opts.Manifest, nil
+		manifest := *opts.Manifest
+		if err := validateManifest(manifest); err != nil {
+			return Manifest{}, err
+		}
+		if err := verifyManifestSelfHash(manifest); err != nil {
+			return Manifest{}, err
+		}
+		return manifest, nil
 	}
 	return LoadManifest(ctx, opts.Store, opts.ManifestKey)
 }

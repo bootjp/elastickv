@@ -182,7 +182,7 @@ func nextFencedWithRecovery(ctx context.Context, clock *HLC, recoverer hlcLeaseR
 		return 0, errors.Wrap(err, label)
 	}
 	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
-		return 0, errors.Wrapf(err, "%s: on-demand HLC lease renewal failed: %v", label, recoverErr)
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
 	}
 	ts, err = clock.NextFenced()
 	if err != nil {
@@ -200,13 +200,20 @@ func nextBatchFencedWithRecovery(ctx context.Context, clock *HLC, n int, recover
 		return 0, errors.Wrap(err, label)
 	}
 	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
-		return 0, errors.Wrapf(err, "%s: on-demand HLC lease renewal failed: %v", label, recoverErr)
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
 	}
 	base, err = clock.NextBatchFenced(n)
 	if err != nil {
 		return 0, errors.Wrap(err, label)
 	}
 	return base, nil
+}
+
+func wrapHLCLeaseRecoveryFailure(err, recoverErr error, label string) error {
+	return errors.Join(
+		errors.Wrapf(err, "%s: on-demand HLC lease renewal failed", label),
+		errors.Wrap(recoverErr, "hlc lease recovery"),
+	)
 }
 
 func hlcRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {

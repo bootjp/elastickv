@@ -118,27 +118,76 @@ func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reu
 	if err != nil {
 		return err
 	}
+	size := int64(len(data))
 	objectSHA := hexSHA256Bytes(data)
-	if exists, err := verifyExistingManifest(ctx, store, manifest, int64(len(data)), objectSHA, reuseExistingCreatedAt); err != nil {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
 		return err
 	} else if exists {
-		if manifest.ManifestSHA256 == "" {
-			manifest.ManifestSHA256 = manifestSHA
-		}
 		return nil
 	}
+	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt); err != nil {
+		return err
+	}
+	manifest.ManifestSHA256 = manifestSHA
+	return verifyCommittedManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt)
+}
+
+func createManifestObject(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	data []byte,
+	size int64,
+	objectSHA string,
+	reuseExistingCreatedAt bool,
+) error {
 	info, err := store.PutObject(ctx, manifest.ManifestKey, bytes.NewReader(data), PutOptions{
-		Size:        int64(len(data)),
+		Size:        size,
 		SHA256:      objectSHA,
 		ContentType: "application/json",
 	})
 	if err != nil {
-		return errors.Wrap(err, "put snapshot manifest")
+		return handleManifestPutError(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt, err)
 	}
-	if info.Size != int64(len(data)) || (info.SHA256 != "" && info.SHA256 != objectSHA) {
+	if info.Size != size || (info.SHA256 != "" && info.SHA256 != objectSHA) {
 		return errors.Wrapf(ErrIntegrity, "manifest object %s remote integrity mismatch", manifest.ManifestKey)
 	}
-	manifest.ManifestSHA256 = manifestSHA
+	return nil
+}
+
+func handleManifestPutError(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	size int64,
+	objectSHA string,
+	reuseExistingCreatedAt bool,
+	err error,
+) error {
+	if !errors.Is(err, ErrIntegrity) {
+		return errors.Wrap(err, "put snapshot manifest")
+	}
+	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); verifyErr != nil {
+		return errors.Wrap(verifyErr, "verify conflicting snapshot manifest")
+	} else if exists {
+		return nil
+	}
+	return errors.Wrap(err, "put snapshot manifest")
+}
+
+func verifyCommittedManifest(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	size int64,
+	objectSHA string,
+	reuseExistingCreatedAt bool,
+) error {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
+		return errors.Wrap(err, "verify committed snapshot manifest")
+	} else if !exists {
+		return errors.Wrapf(ErrIntegrity, "manifest object %s missing after put", manifest.ManifestKey)
+	}
 	return nil
 }
 
@@ -157,37 +206,29 @@ func verifyExistingManifest(
 	if !ok {
 		return false, nil
 	}
-	if matches, err := existingStoreObjectMatches(ctx, store, manifest.ManifestKey, info, size, sha); err != nil {
-		return true, errors.Wrap(err, "verify existing snapshot manifest")
-	} else if matches {
-		return true, nil
+	if info.Size != size && !reuseExistingCreatedAt {
+		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different size", manifest.ManifestKey)
 	}
-	if !reuseExistingCreatedAt {
-		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
+	if info.SHA256 != "" && info.SHA256 != sha && !reuseExistingCreatedAt {
+		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different sha256", manifest.ManifestKey)
 	}
 	existing, err := LoadManifest(ctx, store, manifest.ManifestKey)
 	if err != nil {
 		return true, errors.Wrap(err, "load existing snapshot manifest")
 	}
-	if !sameManifestExceptCreation(existing, *manifest) {
+	if !manifestMatchesCandidate(existing, *manifest, reuseExistingCreatedAt) {
 		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
 	}
 	*manifest = existing
 	return true, nil
 }
 
-func existingStoreObjectMatches(ctx context.Context, store ObjectStore, key string, info ObjectInfo, size int64, sha string) (bool, error) {
-	if info.Size != size {
-		return false, nil
+func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExistingCreatedAt bool) bool {
+	if reuseExistingCreatedAt {
+		return sameManifestExceptCreation(existing, candidate)
 	}
-	if info.SHA256 != "" {
-		return info.SHA256 == sha, nil
-	}
-	gotSize, gotSHA, err := hashExistingStoreObject(ctx, store, key)
-	if err != nil {
-		return false, err
-	}
-	return gotSize == size && gotSHA == sha, nil
+	candidate.ManifestSHA256 = existing.ManifestSHA256
+	return reflect.DeepEqual(existing, candidate)
 }
 
 func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {

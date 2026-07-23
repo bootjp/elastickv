@@ -2431,13 +2431,35 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 	}
 	rctx, cancel := hlcRecoveryContext(ctx)
 	defer cancel()
-	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+}
+
+func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
+	var recoveryErr error
 	for _, target := range targets {
-		if err := c.proposeHLCLeaseForGroup(rctx, target.group, ceilingMs); err != nil {
-			return errors.Wrapf(err, "recover hlc lease group %d", target.gid)
+		if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+			recoveryErr = combineHLCRecoveryErrors(recoveryErr, errors.Wrapf(err, "recover hlc lease group %d", target.gid))
 		}
 	}
-	return nil
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	return hlcRecoveryFailedError(recoveryErr)
+}
+
+func combineHLCRecoveryErrors(first error, next error) error {
+	if first == nil {
+		return next
+	}
+	return errors.Wrap(errors.CombineErrors(first, next), "combine hlc recovery errors")
+}
+
+func hlcRecoveryFailedError(recoveryErr error) error {
+	expiredErr := errors.Wrap(ErrCeilingExpired, "recover hlc lease did not advance ceiling")
+	if recoveryErr != nil {
+		return errors.Wrap(errors.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
+	}
+	return expiredErr
 }
 
 type hlcLeaseRecoveryTarget struct {
