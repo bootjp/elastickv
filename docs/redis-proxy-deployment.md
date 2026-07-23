@@ -35,7 +35,7 @@ go build -o redis-proxy ./cmd/redis-proxy/
 | `-secondary-db` | `0` | Secondary Redis DB number |
 | `-secondary-password` | (empty) | Secondary Redis password |
 | `-primary-pool-size` | `128` | Primary Redis backend connection pool size |
-| `-elastickv-pool-size` | `64` | ElasticKV backend connection pool size |
+| `-elastickv-pool-size` | `64` | ElasticKV backend command pool size; keep the server-side `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` above this to leave room for dedicated PubSub connections |
 | `-secondary-write-concurrency` | `0` | Shared maximum for all asynchronous secondary writes, including scripts. `0` derives half of the secondary backend pool size, minimum `1` |
 | `-secondary-script-concurrency` | `0` | Lua-script sublimit within `-secondary-write-concurrency`. `0` derives half of the shared write limit, minimum `1` |
 | `-secondary-write-queue-size` | `0` | Bounded queue for non-script secondary writes. `0` derives `64 * concurrency`, clamped to `64..8192` |
