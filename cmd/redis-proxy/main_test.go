@@ -75,7 +75,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       64,
 			wantWriteConcurrency:    32,
 			wantScriptConcurrency:   16,
-			wantBlockingConcurrency: 20,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "shadow mode derives from ElasticKV pool",
