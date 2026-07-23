@@ -161,8 +161,14 @@ func (r *raceFireRotateStartupController) State() raftengine.State {
 }
 
 type stubStartupCoordinator struct {
-	dispatches atomic.Int32
-	clock      *kv.HLC
+	dispatches   atomic.Int32
+	nextCalls    atomic.Int32
+	nextAfter    atomic.Int32
+	recoverCalls atomic.Int32
+	clock        *kv.HLC
+	nextErr      error
+	nextAfterErr error
+	recoverErr   error
 }
 
 func (s *stubStartupCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -189,6 +195,21 @@ func (s *stubStartupCoordinator) Clock() *kv.HLC {
 		s.clock = kv.NewHLC()
 	}
 	return s.clock
+}
+
+func (s *stubStartupCoordinator) Next(context.Context) (uint64, error) {
+	s.nextCalls.Add(1)
+	return 101, s.nextErr
+}
+
+func (s *stubStartupCoordinator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	s.nextAfter.Add(1)
+	return min + 1, s.nextAfterErr
+}
+
+func (s *stubStartupCoordinator) RecoverHLCLease(context.Context) error {
+	s.recoverCalls.Add(1)
+	return s.recoverErr
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_ImmediateLeaderWaitRuns(t *testing.T) {
@@ -599,6 +620,40 @@ func TestStartupGatedCoordinator_BlocksAdapterDispatchDuringAsyncRotation(t *tes
 	}
 	if got := inner.dispatches.Load(); got != 1 {
 		t.Fatalf("inner Dispatch calls after unblock=%d, want 1", got)
+	}
+}
+
+func TestStartupGatedCoordinator_ForwardsTimestampCapabilities(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("recover failed")
+	inner := &stubStartupCoordinator{clock: kv.NewHLC(), recoverErr: sentinel}
+	coord := startupGatedCoordinator{
+		inner: inner,
+		gate:  &startupPublicKVGate{blockMutator: func() bool { return true }},
+	}
+
+	ts, err := coord.Next(context.Background())
+	if err != nil || ts != 101 {
+		t.Fatalf("Next() = (%d, %v), want (101, nil)", ts, err)
+	}
+	next, err := coord.NextAfter(context.Background(), 200)
+	if err != nil || next != 201 {
+		t.Fatalf("NextAfter() = (%d, %v), want (201, nil)", next, err)
+	}
+	if err := coord.RecoverHLCLease(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("RecoverHLCLease() err=%v, want sentinel", err)
+	}
+	if got := inner.nextCalls.Load(); got != 1 {
+		t.Fatalf("inner Next calls=%d, want 1", got)
+	}
+	if got := inner.nextAfter.Load(); got != 1 {
+		t.Fatalf("inner NextAfter calls=%d, want 1", got)
+	}
+	if got := inner.recoverCalls.Load(); got != 1 {
+		t.Fatalf("inner RecoverHLCLease calls=%d, want 1", got)
+	}
+	if got := inner.dispatches.Load(); got != 0 {
+		t.Fatalf("timestamp capability forwarding called Dispatch %d times, want 0", got)
 	}
 }
 

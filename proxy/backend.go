@@ -11,11 +11,11 @@ import (
 
 const (
 	defaultPoolSize          = 128
-	defaultElasticKVPoolSize = 64
+	defaultElasticKVPoolSize = 192
 	defaultDialTimeout       = 5 * time.Second
 	defaultReadTimeout       = 3 * time.Second
-	defaultWriteTimeout      = 3 * time.Second
 	blockingReadGrace        = 10 * time.Second
+	defaultWriteTimeout      = 3 * time.Second
 	respProtocolV2           = 2
 )
 
@@ -76,8 +76,9 @@ func DefaultBackendOptions() BackendOptions {
 // replay pool share ElasticKV's per-peer connection budget. PubSub and shadow
 // PubSub use dedicated sockets outside those pools, and detached sockets may
 // remain counted until cleanup. Run the cluster with
-// ELASTICKV_REDIS_PER_PEER_CONNECTIONS above this pool size before using the
-// default in production, or lower the proxy pool to fit the configured cap.
+// ELASTICKV_REDIS_PER_PEER_CONNECTIONS sized for every proxy replica that may
+// share one client IP, plus headroom for dedicated sockets, or lower the proxy
+// pool to fit the configured cap.
 func DefaultElasticKVBackendOptions() BackendOptions {
 	opts := DefaultBackendOptions()
 	opts.PoolSize = defaultElasticKVPoolSize
@@ -126,7 +127,11 @@ func (b *RedisBackend) Do(ctx context.Context, args ...any) *redis.Cmd {
 // This is used for blocking commands whose wait time exceeds the backend's
 // default read timeout.
 func (b *RedisBackend) DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
-	return b.client.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+	return redisClientWithBlockingReadTimeout(b.client, timeout).Do(ctx, args...)
+}
+
+func (b *RedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	return redisClientWithReadTimeout(b.client, timeout).Do(ctx, args...)
 }
 
 func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
@@ -137,7 +142,45 @@ func effectiveBlockingReadTimeout(timeout time.Duration) time.Duration {
 }
 
 func (b *RedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
-	pipe := b.client.Pipeline()
+	return b.pipeline(ctx, b.client, cmds)
+}
+
+// PipelineWithTimeout executes a pipeline using a per-call socket timeout
+// override for async replay classes whose deadline exceeds the backend default.
+func (b *RedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, redisClientWithReadTimeout(b.client, effectiveBlockingReadTimeout(timeout)), cmds)
+}
+
+func (b *RedisBackend) PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, redisClientWithReadTimeout(b.client, timeout), cmds)
+}
+
+func redisClientWithReadTimeout(client *redis.Client, timeout time.Duration) *redis.Client {
+	if client == nil || timeout <= 0 {
+		return client
+	}
+	return redisClientWithReadTimeoutValue(client, timeout)
+}
+
+func redisClientWithBlockingReadTimeout(client *redis.Client, timeout time.Duration) *redis.Client {
+	if client == nil {
+		return client
+	}
+	return redisClientWithReadTimeoutValue(client, effectiveBlockingReadTimeout(timeout))
+}
+
+func redisClientWithReadTimeoutValue(client *redis.Client, timeout time.Duration) *redis.Client {
+	clone := client.WithTimeout(timeout)
+	// go-redis WithTimeout intentionally sets both ReadTimeout and
+	// WriteTimeout. This path only extends read-side waits for blocking
+	// commands and async replays; keep socket writes bounded by the backend's
+	// configured write timeout.
+	clone.Options().WriteTimeout = client.Options().WriteTimeout
+	return clone
+}
+
+func (b *RedisBackend) pipeline(ctx context.Context, client *redis.Client, cmds [][]any) ([]*redis.Cmd, error) {
+	pipe := client.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))
 	for i, args := range cmds {
 		results[i] = pipe.Do(ctx, args...)

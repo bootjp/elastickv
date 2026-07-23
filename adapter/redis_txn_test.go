@@ -639,6 +639,110 @@ func TestLuaWideFenceReadKeysForPlan(t *testing.T) {
 	require.Nil(t, luaWideFenceReadKeysForPlan(key, redisTypeString, redisTypeString, true))
 }
 
+type luaCleanupScanTrackingStore struct {
+	store.MVCCStore
+	fullScanStarts [][]byte
+}
+
+func (s *luaCleanupScanTrackingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if limit == store.MaxDeltaScanLimit {
+		s.fullScanStarts = append(s.fullScanStarts, bytes.Clone(start))
+	}
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func newLuaCommitPlanTestContext(server *RedisServer, startTS uint64) *luaScriptContext {
+	return &luaScriptContext{
+		server:       server,
+		startTS:      startTS,
+		touched:      map[string]struct{}{},
+		readKeys:     map[string][]byte{},
+		deleted:      map[string]bool{},
+		everDeleted:  map[string]bool{},
+		negativeType: map[string]bool{},
+		strings:      map[string]*luaStringState{},
+		lists:        map[string]*luaListState{},
+		hashes:       map[string]*luaHashState{},
+		sets:         map[string]*luaSetState{},
+		zsets:        map[string]*luaZSetState{},
+		streams:      map[string]*luaStreamState{},
+		ttls:         map[string]*luaTTLState{},
+	}
+}
+
+func TestLuaCommitPlanForAbsentRewriteSkipsFullLogicalCleanupScans(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := store.NewMVCCStore()
+	tracking := &luaCleanupScanTrackingStore{MVCCStore: base}
+	server := NewRedisServer(nil, "", tracking, newLocalAdapterCoordinator(base), nil, nil)
+	key := "lua:absent-rewrite"
+
+	scriptCtx := newLuaCommitPlanTestContext(server, 10)
+	scriptCtx.strings[key] = &luaStringState{loaded: true, exists: true, dirty: true, value: []byte("v")}
+	scriptCtx.ttls[key] = &luaTTLState{loaded: true}
+
+	plan, err := scriptCtx.commitPlanForKey(ctx, key, 11)
+	require.NoError(t, err)
+	require.Empty(t, tracking.fullScanStarts)
+	require.True(t, elemKeysContain(plan.elems, redisStrKey([]byte(key))))
+	require.True(t, elemKeysContain(plan.elems, redisTxnWideHashFenceKey([]byte(key))))
+}
+
+func TestLuaCommitPlanForExistingListRewriteOnlyScansListCleanup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := store.NewMVCCStore()
+	tracking := &luaCleanupScanTrackingStore{MVCCStore: base}
+	server := NewRedisServer(nil, "", tracking, newLocalAdapterCoordinator(base), nil, nil)
+	key := []byte("lua:list-rewrite")
+	keyString := string(key)
+	meta, err := store.MarshalListMeta(store.ListMeta{Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, base.PutAt(ctx, store.ListMetaKey(key), meta, 10, 0))
+	require.NoError(t, base.PutAt(ctx, listItemKey(key, 0), []byte("old"), 10, 0))
+
+	scriptCtx := newLuaCommitPlanTestContext(server, 11)
+	scriptCtx.lists[keyString] = &luaListState{
+		loaded:       true,
+		exists:       true,
+		dirty:        true,
+		materialized: true,
+		values:       []string{"new"},
+	}
+	scriptCtx.ttls[keyString] = &luaTTLState{loaded: true}
+
+	_, err = scriptCtx.commitPlanForKey(ctx, keyString, 12)
+	require.NoError(t, err)
+	requireScanStartsIncludePrefix(t, tracking.fullScanStarts, append(append([]byte(nil), []byte(store.ListItemPrefix)...), key...))
+	requireScanStartsIncludePrefix(t, tracking.fullScanStarts, store.ListMetaDeltaScanPrefix(key))
+	requireScanStartsIncludePrefix(t, tracking.fullScanStarts, store.ListClaimScanPrefix(key))
+	requireScanStartsExcludePrefix(t, tracking.fullScanStarts, store.HashFieldScanPrefix(key))
+	requireScanStartsExcludePrefix(t, tracking.fullScanStarts, store.SetMemberScanPrefix(key))
+	requireScanStartsExcludePrefix(t, tracking.fullScanStarts, store.ZSetMemberScanPrefix(key))
+	requireScanStartsExcludePrefix(t, tracking.fullScanStarts, store.ZSetScoreScanPrefix(key))
+	requireScanStartsExcludePrefix(t, tracking.fullScanStarts, store.StreamEntryScanPrefix(key))
+}
+
+func requireScanStartsIncludePrefix(t *testing.T, starts [][]byte, prefix []byte) {
+	t.Helper()
+	for _, start := range starts {
+		if bytes.HasPrefix(start, prefix) {
+			return
+		}
+	}
+	t.Fatalf("expected a scan under prefix %q, got %q", prefix, starts)
+}
+
+func requireScanStartsExcludePrefix(t *testing.T, starts [][]byte, prefix []byte) {
+	t.Helper()
+	for _, start := range starts {
+		require.Falsef(t, bytes.HasPrefix(start, prefix), "unexpected scan under prefix %q in %q", prefix, starts)
+	}
+}
+
 func TestRedisTxnSetReplacementConflictsWithConcurrentWideHashWrite(t *testing.T) {
 	t.Parallel()
 

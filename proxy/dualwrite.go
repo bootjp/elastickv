@@ -29,11 +29,11 @@ const (
 	// contention bounded; this is only tolerable in modes where the script write
 	// is targeting the non-authoritative backend.
 	maxScriptWriteGoroutines = 64
-	// maxBlockingReplayGoroutines isolates mutating blocking command replays
-	// from normal secondary writes. Blocking replays may wait for the secondary
-	// to observe a producer write, and they hit the secondary's heavy-command
-	// limiter, so keep the default well below the normal write limit.
-	maxBlockingReplayGoroutines = 20
+	// maxBlockingReplayGoroutines isolates fallback mutating blocking-command
+	// replays from normal secondary writes. BZPOP success replays are translated
+	// to ordinary ZREM writes before they reach the secondary, so they use the
+	// normal write queue instead.
+	maxBlockingReplayGoroutines = 32
 	// Async queues absorb short bursts without allowing an unavailable or slow
 	// secondary to build an unbounded replay backlog.
 	minAsyncQueueCapacity       = 64
@@ -188,7 +188,8 @@ func NewDualWriter(primary, secondary Backend, cfg ProxyConfig, metrics *ProxyMe
 		"write_queue_capacity", cap(d.writeQueueSlots),
 		"script_queue_capacity", cap(d.scriptQueueSlots),
 		"blocking_replay_queue_capacity", cap(d.blockingReplayQueueSlots),
-		"timeout", cfg.SecondaryTimeout)
+		"timeout", cfg.SecondaryTimeout,
+		"script_timeout", secondaryScriptTimeout(cfg))
 
 	return d
 }
@@ -361,15 +362,15 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	if d.hasSecondaryWrite() {
-		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp); ok {
-			d.goBlockingReplay(func(ctx context.Context) {
+		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp, d.secondary); ok {
+			d.goTranslatedBlockingReplay(func(ctx context.Context) {
 				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
 					initialDelay:        blockingReplayInitialDelay,
 					noEffectRetryWindow: blockingReplayNoEffectRetryWindow,
 					deadlineAsMiss:      true,
 				})
 			})
-		} else if shouldReplayBlockingToSecondary(cmd) && blockingResultMayHaveMutated(resp, err) {
+		} else if shouldReplayBlockingToSecondary(cmd, resp) && blockingResultMayHaveMutated(resp, err) {
 			d.goBlockingReplay(func(ctx context.Context) {
 				sCtx, cancel := context.WithTimeout(ctx, time.Second)
 				defer cancel()
@@ -447,7 +448,7 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 	var usedNOSCRIPTFallback bool
 	args := iArgs
 	for ; ; attempt++ {
-		result := d.secondary.Do(sCtx, args...)
+		result := d.secondaryDo(sCtx, cmd, args)
 		_, sErr = result.Result()
 		if isNoScriptError(sErr) {
 			// After a successful NOSCRIPT→EVAL resolution, retries reuse the
@@ -456,7 +457,7 @@ func (d *DualWriter) writeSecondary(sCtx context.Context, cmd string, iArgs []an
 			if fallbackArgs, ok := d.evalFallbackArgs(cmd, args); ok {
 				usedNOSCRIPTFallback = true
 				args = fallbackArgs
-				result = d.secondary.Do(sCtx, args...)
+				result = d.secondaryDo(sCtx, cmd, args)
 				_, sErr = result.Result()
 			}
 		}
@@ -505,8 +506,15 @@ func (d *DualWriter) writeSecondaryPositiveIntWithOptions(sCtx context.Context, 
 	var attempt int
 	for ; ; attempt++ {
 		var resp any
-		result := d.secondary.Do(sCtx, iArgs...)
+		result := d.secondaryDo(sCtx, cmd, iArgs)
 		resp, sErr = result.Result()
+		if shouldFallbackZRemFast(cmd, sErr) {
+			cmd = zremReplayCommand
+			iArgs = zremFastFallbackArgs(iArgs)
+			attempt = -1
+			backoff = compactedRetryInitialBackoff
+			continue
+		}
 		if ok, err := positiveIntReplayResult(resp, sErr); ok {
 			elapsed := time.Since(start)
 			d.metrics.CommandDuration.WithLabelValues(cmd, d.secondary.Name()).Observe(elapsed.Seconds())
@@ -674,7 +682,7 @@ func (d *DualWriter) writeSecondaryPipeline(sCtx context.Context, cmds [][]any) 
 	var sErr error
 	var attempt int
 	for ; ; attempt++ {
-		results, pErr := d.secondary.Pipeline(sCtx, cmds)
+		results, pErr := d.secondaryPipeline(sCtx, cmds)
 		sErr = secondaryPipelineError(results, pErr)
 		retryReason, retryLimit := secondaryPipelineRetryReasonAndLimit(sErr)
 		if retryReason == "" {
@@ -826,7 +834,7 @@ func (d *DualWriter) goWrite(fn func(context.Context)) {
 // goScript launches fn in a bounded Lua-script write goroutine.
 // It uses a smaller class limit while also consuming the shared write limit.
 func (d *DualWriter) goScript(fn func(context.Context)) {
-	d.enqueueAsync(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, fn)
+	d.enqueueAsyncWithTimeout(d.scriptQueue, d.scriptQueueSlots, asyncQueueScript, secondaryScriptTimeout(d.cfg), fn)
 }
 
 // goBlockingReplay queues fn for bounded secondary replay of mutating blocking
@@ -838,14 +846,147 @@ func (d *DualWriter) goBlockingReplay(fn func(context.Context)) {
 	d.enqueueAsync(d.blockingReplayQueue, d.blockingReplayQueueSlots, asyncQueueBlocking, fn)
 }
 
+func (d *DualWriter) goTranslatedBlockingReplay(fn func(context.Context)) {
+	d.goWrite(fn)
+}
+
 // goShadow launches fn in a bounded shadow-read goroutine.
 func (d *DualWriter) goShadow(fn func()) {
 	d.goShadowWithSem(fn)
 }
 
-// goAsync queues fn with the write class (for txn replay).
+// goAsync queues fn with the write class (for txn replay without scripts).
 func (d *DualWriter) goAsync(fn func(context.Context)) {
 	d.goWrite(fn)
+}
+
+func (d *DualWriter) goTxnReplay(cmds [][]any, fn func(context.Context)) {
+	if pipelineContainsScript(cmds) {
+		d.goScript(fn)
+		return
+	}
+	d.goAsync(fn)
+}
+
+func secondaryScriptTimeout(cfg ProxyConfig) time.Duration {
+	if cfg.SecondaryScriptTimeout > 0 {
+		return cfg.SecondaryScriptTimeout
+	}
+	return cfg.SecondaryTimeout
+}
+
+func (d *DualWriter) secondaryDo(ctx context.Context, cmd string, args []any) *redis.Cmd {
+	timeout, err := d.secondaryCommandReadTimeout(ctx, cmd)
+	if err != nil {
+		result := redis.NewCmd(ctx, args...)
+		result.SetErr(err)
+		return result
+	}
+	if timeout > 0 {
+		if backend, ok := d.secondary.(readTimeoutBackend); ok {
+			return backend.DoWithReadTimeout(ctx, timeout, args...)
+		}
+	}
+	return d.secondary.Do(ctx, args...)
+}
+
+func (d *DualWriter) secondaryPipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	timeout, err := d.secondaryPipelineReadTimeout(ctx, cmds)
+	if err != nil {
+		return nil, err
+	}
+	if timeout > 0 {
+		if backend, ok := d.secondary.(pipelineReadTimeoutBackend); ok {
+			results, err := backend.PipelineWithReadTimeout(ctx, timeout, cmds)
+			if err != nil {
+				return results, fmt.Errorf("secondary pipeline with timeout: %w", err)
+			}
+			return results, nil
+		}
+	}
+	results, err := d.secondary.Pipeline(ctx, cmds)
+	if err != nil {
+		return results, fmt.Errorf("secondary pipeline: %w", err)
+	}
+	return results, nil
+}
+
+func (d *DualWriter) secondaryCommandReadTimeout(ctx context.Context, cmd string) (time.Duration, error) {
+	if isRedisScriptCommandName(cmd) {
+		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
+	}
+	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
+}
+
+func (d *DualWriter) secondaryPipelineReadTimeout(ctx context.Context, cmds [][]any) (time.Duration, error) {
+	if pipelineContainsScript(cmds) {
+		return secondaryReadTimeout(ctx, secondaryScriptTimeout(d.cfg))
+	}
+	return secondaryReadTimeout(ctx, d.cfg.SecondaryTimeout)
+}
+
+func secondaryReadTimeout(ctx context.Context, configured time.Duration) (time.Duration, error) {
+	if configured <= 0 {
+		return 0, nil
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return configured, nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("secondary read timeout deadline expired: %w", err)
+		}
+		return 0, fmt.Errorf("secondary read timeout deadline expired: %w", context.DeadlineExceeded)
+	}
+	if remaining < configured {
+		return remaining, nil
+	}
+	return configured, nil
+}
+
+func shouldFallbackZRemFast(cmd string, err error) bool {
+	return strings.EqualFold(cmd, elasticKVZRemFastCommand) && isUnsupportedCommandError(err)
+}
+
+func isUnsupportedCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported command") || strings.Contains(msg, "unknown command")
+}
+
+func zremFastFallbackArgs(args []any) []any {
+	out := append([]any(nil), args...)
+	if len(out) > 0 {
+		out[0] = zremReplayCommand
+	}
+	return out
+}
+
+func pipelineContainsScript(cmds [][]any) bool {
+	for _, args := range cmds {
+		if len(args) == 0 {
+			continue
+		}
+		if isRedisScriptCommandName(redisCommandName(args[0])) {
+			return true
+		}
+	}
+	return false
+}
+
+func redisCommandName(arg any) string {
+	switch v := arg.(type) {
+	case []byte:
+		return string(v)
+	case string:
+		return v
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func (d *DualWriter) startBackendPoolSampler() {

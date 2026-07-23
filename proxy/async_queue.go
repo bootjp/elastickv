@@ -33,10 +33,14 @@ func (d *DualWriter) startAsyncDispatchers() {
 }
 
 func (d *DualWriter) enqueueAsync(queue chan asyncTask, slots chan struct{}, queueName string, fn func(context.Context)) {
+	d.enqueueAsyncWithTimeout(queue, slots, queueName, d.cfg.SecondaryTimeout, fn)
+}
+
+func (d *DualWriter) enqueueAsyncWithTimeout(queue chan asyncTask, slots chan struct{}, queueName string, timeout time.Duration, fn func(context.Context)) {
 	now := time.Now()
 	task := asyncTask{enqueuedAt: now, fn: fn}
-	if d.cfg.SecondaryTimeout > 0 {
-		task.deadline = now.Add(d.cfg.SecondaryTimeout)
+	if timeout > 0 {
+		task.deadline = now.Add(timeout)
 	}
 
 	// Holding mu makes the closed check and channel send atomic with Close.

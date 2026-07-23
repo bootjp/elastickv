@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/proxy"
 	"github.com/stretchr/testify/assert"
@@ -34,6 +35,38 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryQueueSize(t *testing.T) {
 	_, err = parseRuntimeOptions("dual-write", 128, 4, 0, 0, 0, 0, 0, -1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary-blocking-replay-queue-size")
+}
+
+func TestValidateRuntimeTimeoutsRejectsUnsupportedScriptTimeout(t *testing.T) {
+	require.NoError(t, validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: 0,
+	}))
+	require.NoError(t, validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: maxSecondaryScriptTimeout,
+	}))
+
+	err := validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: -time.Second,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary-script-timeout")
+
+	err = validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       30 * time.Second,
+		SecondaryScriptTimeout: maxSecondaryScriptTimeout + time.Nanosecond,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ElasticKV Lua dispatch cap")
+
+	err = validateRuntimeTimeouts(proxy.ProxyConfig{
+		SecondaryTimeout:       maxSecondaryScriptTimeout + time.Nanosecond,
+		SecondaryScriptTimeout: 0,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ElasticKV Lua dispatch cap")
 }
 
 func TestValidateSecondaryConcurrency(t *testing.T) {
@@ -74,8 +107,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       64,
 			wantWriteConcurrency:    32,
-			wantScriptConcurrency:   16,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   1,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "shadow mode derives from ElasticKV pool",
@@ -83,7 +116,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       8,
 			wantWriteConcurrency:    4,
-			wantScriptConcurrency:   2,
+			wantScriptConcurrency:   1,
 			wantBlockingConcurrency: 4,
 		},
 		{
@@ -92,8 +125,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       4,
 			wantWriteConcurrency:    64,
-			wantScriptConcurrency:   32,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   2,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "large remaining pool caps blocking replay",
@@ -102,8 +135,8 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       144,
 			writeConcurrency:        80,
 			wantWriteConcurrency:    80,
-			wantScriptConcurrency:   40,
-			wantBlockingConcurrency: 20,
+			wantScriptConcurrency:   2,
+			wantBlockingConcurrency: 32,
 		},
 		{
 			name:                    "explicit write keeps derived script",
@@ -112,7 +145,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			elasticKVPoolSize:       8,
 			writeConcurrency:        5,
 			wantWriteConcurrency:    5,
-			wantScriptConcurrency:   2,
+			wantScriptConcurrency:   1,
 			wantBlockingConcurrency: 3,
 		},
 		{
@@ -153,4 +186,29 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			assert.Equal(t, tt.wantBlockingConcurrency, blockingConcurrency)
 		})
 	}
+}
+
+func TestDeriveSecondaryConcurrencyFromDefaultElasticKVPool(t *testing.T) {
+	poolSize := proxy.DefaultElasticKVBackendOptions().PoolSize
+	writeConcurrency, scriptConcurrency, blockingConcurrency := deriveSecondaryConcurrency(
+		proxy.ModeDualWrite,
+		proxy.DefaultBackendOptions().PoolSize,
+		poolSize,
+		0,
+		0,
+		0,
+	)
+
+	require.Equal(t, 192, poolSize)
+	require.Equal(t, 96, writeConcurrency)
+	require.Equal(t, 3, scriptConcurrency)
+	require.Equal(t, 32, blockingConcurrency)
+	require.NoError(t, validateSecondaryConcurrency(
+		proxy.ModeDualWrite,
+		proxy.DefaultBackendOptions().PoolSize,
+		poolSize,
+		writeConcurrency,
+		scriptConcurrency,
+		blockingConcurrency,
+	))
 }

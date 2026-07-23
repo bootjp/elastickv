@@ -749,3 +749,56 @@ func TestZRemDeletesWideColumnRows(t *testing.T) {
 	require.True(t, exists)
 	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2.0}}, zset.Entries)
 }
+
+func TestElasticKVZRemFastSkipsWrongTypeMiss(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("internal:zremfast:string")
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), encodeRedisStr([]byte("value"), nil), 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+	srv := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	normalConn := &recordingConn{}
+	srv.zrem(normalConn, redcon.Command{Args: [][]byte{[]byte("ZREM"), key, []byte("member")}})
+	require.Contains(t, normalConn.err, wrongTypeMessage)
+
+	fastConn := &recordingConn{}
+	srv.elasticKVZRemFast(fastConn, redcon.Command{Args: [][]byte{[]byte(cmdElasticKVZRemFast), key, []byte("member")}})
+	require.Empty(t, fastConn.err)
+	require.Equal(t, int64(0), fastConn.int)
+}
+
+func TestElasticKVZRemFastRemovesLegacyBlobZSet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("internal:zremfast:legacy")
+	payload, err := marshalZSetValue(redisZSetValue{
+		Entries: []redisZSetEntry{
+			{Member: "a", Score: 1},
+			{Member: "b", Score: 2},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisZSetKey(key), payload, 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+	srv := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	conn := &recordingConn{}
+	srv.elasticKVZRemFast(conn, redcon.Command{Args: [][]byte{[]byte(cmdElasticKVZRemFast), key, []byte("a")}})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+
+	zset, exists, err := srv.loadZSetAt(ctx, key, snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2}}, zset.Entries)
+}

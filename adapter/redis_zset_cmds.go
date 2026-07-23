@@ -1009,6 +1009,14 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, false)
+}
+
+func (r *RedisServer) elasticKVZRemFast(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, true)
+}
+
+func (r *RedisServer) zremWithTypeProbe(conn redcon.Conn, cmd redcon.Command, fastMiss bool) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1017,7 +1025,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		typ, err := r.zremTypeAt(ctx, cmd.Args[1], readTS, fastMiss)
 		if err != nil {
 			return err
 		}
@@ -1044,6 +1052,28 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zremTypeAt(ctx context.Context, key []byte, readTS uint64, fastMiss bool) (redisValueType, error) {
+	if !fastMiss {
+		return r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	}
+	typ, err := r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+	if err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.legacyZSetTypeAt(ctx, key, readTS)
+}
+
+func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	exists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		return redisTypeNone, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, redisTypeZSet)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {

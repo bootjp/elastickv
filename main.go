@@ -2203,6 +2203,8 @@ var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2241,6 +2243,34 @@ func (c startupGatedCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c startupGatedCoordinator) Clock() *kv.HLC {
 	return c.inner.Clock()
+}
+
+func (c startupGatedCoordinator) Next(ctx context.Context) (uint64, error) {
+	if alloc, ok := c.inner.(kv.TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		return ts, errors.WithStack(err)
+	}
+	ts, err := kv.NextTimestampThrough(ctx, c.inner, "startup-gated timestamp")
+	return ts, errors.WithStack(err)
+}
+
+func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	if alloc, ok := c.inner.(kv.TimestampAfterAllocator); ok {
+		ts, err := alloc.NextAfter(ctx, min)
+		return ts, errors.WithStack(err)
+	}
+	ts, err := kv.NextTimestampAfterThrough(ctx, c.inner, min, "startup-gated timestamp after observed ts")
+	return ts, errors.WithStack(err)
+}
+
+func (c startupGatedCoordinator) RecoverHLCLease(ctx context.Context) error {
+	type hlcLeaseRecoverer interface {
+		RecoverHLCLease(context.Context) error
+	}
+	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
+		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
+	}
+	return errors.New("startup-gated coordinator: hlc lease recovery unavailable")
 }
 
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

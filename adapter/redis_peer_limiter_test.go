@@ -15,7 +15,11 @@ func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
 	t.Setenv(redisPerPeerLimitEnv, "")
 	limiter := newDefaultRedisPeerLimiter()
 	require.NotNil(t, limiter)
-	require.Equal(t, proxy.DefaultElasticKVBackendOptions().PoolSize+defaultRedisDedicatedPeerHeadroom, limiter.limit)
+	require.Equal(t, proxy.DefaultElasticKVBackendOptions().PoolSize, defaultRedisProxyPoolPeerCap)
+	require.Equal(t,
+		proxy.DefaultElasticKVBackendOptions().PoolSize*defaultRedisProxyReplicasPerPeer+defaultRedisDedicatedPeerHeadroom,
+		limiter.limit,
+	)
 }
 
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
