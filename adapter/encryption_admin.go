@@ -413,25 +413,30 @@ func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*
 //
 // GetSidecarState has no caller-id request field, so the
 // writer_registry_for_caller map is populated for this server's own
-// fullNodeID when both fullNodeID and writerRegistry are wired. The
+// fullNodeID only when both fullNodeID and writerRegistry are wired
+// and the registry leader view can satisfy an applied read. Followers
+// still return their local sidecar snapshot with an empty projection so
+// encryption status remains available from any node. The
 // follower-repair flow that needs a remote caller projection uses
 // ResyncSidecar, whose request carries caller_full_node_id.
 func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty) (*pb.SidecarStateReport, error) {
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
 	}
-	if s.writerRegistry != nil && s.fullNodeID != 0 {
-		if err := s.requireRegistryLeader(ctx); err != nil {
-			return nil, err
-		}
+	projectRegistryForCaller, err := s.canProjectWriterRegistryForCaller(ctx, s.fullNodeID)
+	if err != nil {
+		return nil, err
 	}
 	sc, err := encryption.ReadSidecar(s.sidecarPath)
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
-	registryForCaller, err := s.writerRegistryForCaller(sc, s.fullNodeID)
-	if err != nil {
-		return nil, err
+	registryForCaller := map[uint32]uint32{}
+	if projectRegistryForCaller {
+		registryForCaller, err = s.writerRegistryForCaller(sc, s.fullNodeID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	resp := &pb.SidecarStateReport{
 		ActiveStorageId:          sc.Active.Storage,
@@ -443,6 +448,19 @@ func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty
 		WriterRegistryForCaller:  registryForCaller,
 	}
 	return resp, nil
+}
+
+func (s *EncryptionAdminServer) canProjectWriterRegistryForCaller(ctx context.Context, callerFullNodeID uint64) (bool, error) {
+	if s.writerRegistry == nil || callerFullNodeID == 0 {
+		return false, nil
+	}
+	if err := s.requireRegistryLeader(ctx); err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ResyncSidecar is the §5.5 follower-repair RPC. The follower asks

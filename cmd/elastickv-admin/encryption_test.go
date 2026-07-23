@@ -346,7 +346,51 @@ func TestRunEncryptionBootstrap_DiscoverFromHappyPath(t *testing.T) {
 	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
 }
 
-func TestRunEncryptionBootstrap_DiscoverFromDeduplicatesFullNodeID(t *testing.T) {
+func TestRunEncryptionBootstrap_DiscoverFromDeduplicatesSameAddress(t *testing.T) {
+	t.Parallel()
+	leader := &stubMutatorServer{
+		appliedIndex: 117,
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        11,
+			LocalEpoch:        0,
+		},
+	}
+	leaderAddr := startCustomEncryptionAdminTestServer(t, leader)
+	follower := &stubMutatorServer{
+		capability: &pb.CapabilityReport{
+			EncryptionCapable: true,
+			FullNodeId:        22,
+			LocalEpoch:        5,
+		},
+	}
+	followerAddr := startCustomEncryptionAdminTestServer(t, follower)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", leaderAddr,
+		"--timeout", "3s",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--discover-from", leaderAddr,
+		"--discover-from", leaderAddr,
+		"--discover-from", followerAddr,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionBootstrap: %v", err)
+	}
+	if !strings.Contains(buf.String(), "writers=2") {
+		t.Errorf("output missing writers=2 after same-address deduplication, got:\n%s", buf.String())
+	}
+	if len(leader.bootstrapCalls) != 1 {
+		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
+	}
+	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
+}
+
+func TestRunEncryptionBootstrap_DiscoverFromRejectsDuplicateFullNodeID(t *testing.T) {
 	t.Parallel()
 	leader := &stubMutatorServer{
 		appliedIndex: 117,
@@ -386,16 +430,15 @@ func TestRunEncryptionBootstrap_DiscoverFromDeduplicatesFullNodeID(t *testing.T)
 		"--discover-from", duplicateAddr,
 		"--discover-from", followerAddr,
 	}, &buf)
-	if err != nil {
-		t.Fatalf("runEncryptionBootstrap: %v", err)
+	if err == nil {
+		t.Fatal("runEncryptionBootstrap returned nil, want duplicate full_node_id error")
 	}
-	if !strings.Contains(buf.String(), "writers=2") {
-		t.Errorf("output missing writers=2 after deduplication, got:\n%s", buf.String())
+	if !strings.Contains(err.Error(), "duplicates full_node_id") {
+		t.Errorf("error %q does not mention duplicate full_node_id", err)
 	}
-	if len(leader.bootstrapCalls) != 1 {
-		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(leader.bootstrapCalls))
+	if len(leader.bootstrapCalls) != 0 {
+		t.Errorf("BootstrapEncryption calls=%d, want 0 after duplicate discovery rejection", len(leader.bootstrapCalls))
 	}
-	assertBootstrapCallMatches(t, leader.bootstrapCalls[0])
 }
 
 func TestRunEncryptionBootstrap_DiscoverFromRejectsConflictingDuplicateEpoch(t *testing.T) {
@@ -432,8 +475,8 @@ func TestRunEncryptionBootstrap_DiscoverFromRejectsConflictingDuplicateEpoch(t *
 	if err == nil {
 		t.Fatal("runEncryptionBootstrap returned nil, want conflicting duplicate epoch error")
 	}
-	if !strings.Contains(err.Error(), "conflicting") {
-		t.Errorf("error %q does not mention conflicting duplicate epoch", err)
+	if !strings.Contains(err.Error(), "duplicates full_node_id") {
+		t.Errorf("error %q does not mention duplicate full_node_id", err)
 	}
 	if len(leader.bootstrapCalls) != 0 {
 		t.Errorf("BootstrapEncryption calls=%d, want 0 after conflicting discovery rejection", len(leader.bootstrapCalls))

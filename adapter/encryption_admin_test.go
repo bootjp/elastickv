@@ -190,11 +190,14 @@ func TestEncryptionAdmin_GetSidecarState_ProjectsLocalWriterRegistry(t *testing.
 	}
 }
 
-func TestEncryptionAdmin_GetSidecarState_UsesRegistryLeaderView(t *testing.T) {
+func TestEncryptionAdmin_GetSidecarState_OmitsRegistryProjectionOnFollower(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
 	path := writeSidecarFixture(t, &encryption.Sidecar{
-		Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
+		RaftAppliedIndex:         42,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: 100,
+		Active:                   encryption.ActiveKeys{Storage: 10, Raft: 11},
 		Keys: map[string]encryption.SidecarKey{
 			"10": {Purpose: "storage", Wrapped: []byte("storage")},
 			"11": {Purpose: "raft", Wrapped: []byte("raft")},
@@ -216,12 +219,24 @@ func TestEncryptionAdmin_GetSidecarState_UsesRegistryLeaderView(t *testing.T) {
 		}),
 		WithEncryptionAdminWriterRegistry(reg),
 	)
-	_, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
-	if got, want := status.Code(err), codes.FailedPrecondition; got != want {
-		t.Errorf("GetSidecarState status=%v, want %v (err=%v)", got, want, err)
+	got, err := srv.GetSidecarState(context.Background(), &pb.Empty{})
+	if err != nil {
+		t.Fatalf("GetSidecarState: %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "127.0.0.1:50051") {
-		t.Errorf("GetSidecarState error %q does not surface the registry leader view", err)
+	if got.ActiveStorageId != 10 || got.ActiveRaftId != 11 {
+		t.Fatalf("active=(%d,%d), want local sidecar active ids (10,11)", got.ActiveStorageId, got.ActiveRaftId)
+	}
+	if got.LatestAppliedIndex != 42 {
+		t.Fatalf("LatestAppliedIndex=%d, want local sidecar applied index 42", got.LatestAppliedIndex)
+	}
+	if string(got.WrappedDeksById[10]) != "storage" || string(got.WrappedDeksById[11]) != "raft" {
+		t.Fatalf("wrapped=%v, want local sidecar DEK set", got.WrappedDeksById)
+	}
+	if got.WriterRegistryForCaller == nil {
+		t.Fatalf("WriterRegistryForCaller=nil, want non-nil empty map on follower")
+	}
+	if len(got.WriterRegistryForCaller) != 0 {
+		t.Fatalf("WriterRegistryForCaller=%v, want empty on follower", got.WriterRegistryForCaller)
 	}
 }
 
