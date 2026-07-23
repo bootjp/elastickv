@@ -227,6 +227,7 @@ type backupTestStream struct {
 	ctx     context.Context
 	got     []*pb.BackupKV
 	sendErr error
+	onSend  func()
 }
 
 func (s *backupTestStream) Context() context.Context { return s.ctx }
@@ -236,6 +237,9 @@ func (s *backupTestStream) Send(pair *pb.BackupKV) error {
 		return s.sendErr
 	}
 	s.got = append(s.got, pair)
+	if s.onSend != nil {
+		s.onSend()
+	}
 	return nil
 }
 
@@ -486,6 +490,40 @@ func TestStreamBackupPreservesContextStatusAndReportsCloseErrors(t *testing.T) {
 	store.mu.Unlock()
 	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, &backupTestStream{ctx: context.Background()})
 	require.Equal(t, codes.Internal, status.Code(err))
+}
+
+func TestStreamBackupStopsWhenTokenExpiresMidStream(t *testing.T) {
+	t.Parallel()
+	const ttl = 30 * time.Millisecond
+	nowMS := atomic.Int64{}
+	base := time.Unix(1_000_000, 0)
+	nowMS.Store(base.UnixMilli())
+	store := &backupTestStore{keys: [][]byte{
+		[]byte(logicalbackup.RedisStringPrefix + "a"),
+		[]byte(logicalbackup.RedisStringPrefix + "b"),
+	}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil,
+		WithAdminBackupConfig(AdminBackupConfig{DefaultTTL: ttl, MinTTL: time.Millisecond, MaxTTL: time.Second}),
+	)
+	srv.SetClock(func() time.Time { return time.UnixMilli(nowMS.Load()) })
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+
+	var expireOnce sync.Once
+	stream := &backupTestStream{
+		ctx: context.Background(),
+		onSend: func() {
+			expireOnce.Do(func() {
+				nowMS.Add(ttl.Milliseconds())
+			})
+		},
+	}
+	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, stream)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "expired")
+	require.Len(t, stream.got, 1)
 }
 
 func TestStreamBackupFailsClosedWithoutPinnedRouteSnapshot(t *testing.T) {

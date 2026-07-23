@@ -253,6 +253,23 @@ func TestBackupTimestampFloorSurvivesSnapshotRestore(t *testing.T) {
 	}}}))
 }
 
+func TestFSMSnapshotRejectsActiveBackupPin(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: pinID, ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	_, err := fsm.Snapshot()
+	require.ErrorIs(t, err, ErrBackupSnapshotBlocked)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID}))))
+	snapshot, err := fsm.Snapshot()
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+}
+
 func TestBackupTimestampFloorRejectsDelayedRaftProposal(t *testing.T) {
 	st := store.NewMVCCStore()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))

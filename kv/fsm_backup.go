@@ -11,6 +11,7 @@ import (
 
 var ErrBackupApply = errors.New("backup fsm apply failed")
 var ErrBackupTimestampFenced = errors.New("backup timestamp fence rejects stale write")
+var ErrBackupSnapshotBlocked = errors.New("active backup pin blocks fsm snapshot")
 
 var backupTimestampFloorKey = []byte(TxnKeyPrefix + "backup|timestamp_floor")
 
@@ -112,6 +113,16 @@ func (f *kvFSM) verifyBackupTimestampFloor(r *pb.Request, commitTS uint64) error
 		return nil
 	}
 	return errors.Wrapf(ErrBackupTimestampFenced, "commit_ts %d is not above backup read_ts %d", commitTS, floor)
+}
+
+func (f *kvFSM) rejectSnapshotWithActiveBackupPin() error {
+	if f == nil || f.readTracker == nil {
+		return nil
+	}
+	if readTS := f.readTracker.OldestBackupForGroup(f.shardGroupID); readTS != 0 {
+		return errors.Wrapf(ErrBackupSnapshotBlocked, "raft group %d has active backup read_ts %d", f.shardGroupID, readTS)
+	}
+	return nil
 }
 
 func (f *kvFSM) observeBackupReadTimestamp(readTS uint64, applyErr error) error {

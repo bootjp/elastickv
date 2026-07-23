@@ -144,6 +144,18 @@ func (t *ActiveTimestampTracker) OldestForGroup(groupID uint64) uint64 {
 	return t.oldestForGroup(groupID, true)
 }
 
+// OldestBackupForGroup returns the oldest live backup pin for groupID,
+// excluding ordinary read pins. FSM snapshot generation uses this to avoid
+// emitting a snapshot that would drop active backup retention state.
+func (t *ActiveTimestampTracker) OldestBackupForGroup(groupID uint64) uint64 {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return oldestBackupTimestamp(t.backupPins, groupID, true, time.Now())
+}
+
 func (t *ActiveTimestampTracker) oldestForGroup(groupID uint64, scoped bool) uint64 {
 	if t == nil {
 		return 0

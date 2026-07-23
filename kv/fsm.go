@@ -568,6 +568,9 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 var ErrNotImplemented = errors.New("not implemented")
 
 func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
+	if err := f.rejectSnapshotWithActiveBackupPin(); err != nil {
+		return nil, err
+	}
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)

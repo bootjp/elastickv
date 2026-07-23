@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -531,7 +532,9 @@ func (s *AdminServer) StreamBackup(
 	if scanner == nil {
 		return status.Errorf(codes.Unavailable, "%s", "backup scanner is nil")
 	}
-	scanErr := streamBackupRecords(stream, scanner, selected)
+	scanErr := streamBackupRecords(stream, scanner, selected, func() error {
+		return s.requireUnexpiredBackupToken(tok)
+	})
 	if err := finishBackupScan(stream.Context(), scanner, scanErr); err != nil {
 		if scanErr != nil {
 			return err
@@ -545,8 +548,12 @@ func streamBackupRecords(
 	stream grpc.ServerStreamingServer[pb.BackupKV],
 	scanner kv.BackupScanner,
 	selected map[logicalbackup.Scope]bool,
+	requireLive func() error,
 ) error {
 	for {
+		if err := requireLive(); err != nil {
+			return err
+		}
 		pair, ok, err := scanner.Next(stream.Context())
 		if err != nil {
 			return backupScanStreamError(err)
@@ -554,20 +561,31 @@ func streamBackupRecords(
 		if !ok {
 			return nil
 		}
-		if pair == nil {
-			return status.Errorf(codes.Internal, "%s", "backup scanner returned a nil record")
-		}
-		scope, scoped, err := logicalbackup.ScopeForKey(pair.Key)
+		selectedRecord, err := backupRecordSelected(pair, selected)
 		if err != nil {
-			return status.Errorf(codes.FailedPrecondition, "classify backup key: %v", err)
+			return err
 		}
-		if !scoped || (len(selected) > 0 && !selected[scope]) {
+		if !selectedRecord {
 			continue
+		}
+		if err := requireLive(); err != nil {
+			return err
 		}
 		if err := stream.Send(&pb.BackupKV{Key: pair.Key, Value: pair.Value}); err != nil {
 			return backupSendStreamError(err)
 		}
 	}
+}
+
+func backupRecordSelected(pair *store.KVPair, selected map[logicalbackup.Scope]bool) (bool, error) {
+	if pair == nil {
+		return false, status.Errorf(codes.Internal, "%s", "backup scanner returned a nil record")
+	}
+	scope, scoped, err := logicalbackup.ScopeForKey(pair.Key)
+	if err != nil {
+		return false, status.Errorf(codes.FailedPrecondition, "classify backup key: %v", err)
+	}
+	return scoped && (len(selected) == 0 || selected[scope]), nil
 }
 
 func backupScanStreamError(err error) error {
