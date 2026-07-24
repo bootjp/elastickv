@@ -3217,23 +3217,30 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, uint64, uint64, []TargetStagedReadinessState, error) {
+func readStreamingMVCCRestoreHeader(
+	r io.Reader,
+) (io.Reader, hash.Hash32, uint32, uint64, uint64, []TargetStagedReadinessState, map[migrationAckID]migrationImportAck, map[uint64]uint64, error) {
 	expectedChecksum, version, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return nil, nil, 0, 0, 0, nil, err
+		return nil, nil, 0, 0, 0, nil, nil, nil, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
 	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
 	if err != nil {
-		return nil, nil, 0, 0, 0, nil, err
+		return nil, nil, 0, 0, 0, nil, nil, nil, err
 	}
 	readinessStates, err := readMVCCSnapshotReadinessStates(body, version)
 	if err != nil {
-		return nil, nil, 0, 0, 0, nil, err
+		return nil, nil, 0, 0, 0, nil, nil, nil, err
 	}
-	return body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, nil
+	bufferedBody := bufio.NewReader(body)
+	importAcks, hlcFloors, err := readMVCCSnapshotMigrationMetadata(bufferedBody, version)
+	if err != nil {
+		return nil, nil, 0, 0, 0, nil, nil, nil, err
+	}
+	return bufferedBody, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, importAcks, hlcFloors, nil
 }
 
 func writeStreamingMVCCRestoreTempDB(
@@ -3244,6 +3251,8 @@ func writeStreamingMVCCRestoreTempDB(
 	lastCommitTS uint64,
 	minRetainedTS uint64,
 	readinessStates []TargetStagedReadinessState,
+	importAcks map[migrationAckID]migrationImportAck,
+	hlcFloors map[uint64]uint64,
 ) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
@@ -3265,6 +3274,10 @@ func writeStreamingMVCCRestoreTempDB(
 	}
 
 	if err := writePebbleTargetReadinessStates(tmpDB, readinessStates); err != nil {
+		cleanupTmp()
+		return "", err
+	}
+	if err := writePebbleMigrationImportMetadata(tmpDB, importAcks, hlcFloors); err != nil {
 		cleanupTmp()
 		return "", err
 	}
@@ -3296,13 +3309,41 @@ func writePebbleTargetReadinessStates(db *pebble.DB, states []TargetStagedReadin
 	return nil
 }
 
+func writePebbleMigrationImportMetadata(
+	db *pebble.DB,
+	acks map[migrationAckID]migrationImportAck,
+	floors map[uint64]uint64,
+) error {
+	if len(acks) != 0 {
+		if err := db.Set(migrationAckMetaKeyBytes, encodeMigrationImportAcks(acks), pebble.NoSync); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	if len(floors) != 0 {
+		if err := db.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(floors), pebble.NoSync); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, err := readStreamingMVCCRestoreHeader(r)
+	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, importAcks, hlcFloors, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(
+		s.dir,
+		body,
+		hash,
+		expectedChecksum,
+		lastCommitTS,
+		minRetainedTS,
+		readinessStates,
+		importAcks,
+		hlcFloors,
+	)
 	if err != nil {
 		return err
 	}

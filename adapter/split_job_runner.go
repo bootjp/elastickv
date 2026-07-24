@@ -32,12 +32,19 @@ const (
 	splitJobHistoryGCInterval            = time.Minute
 )
 
-var splitCleanupDoneCursor = []byte{splitCleanupCursorVersion, 0xff, 0xff, 0xff, 0xff}
+var (
+	splitCleanupDoneCursor                  = []byte{splitCleanupCursorVersion, 0xff, 0xff, 0xff, 0xff}
+	errSplitMigrationVoterBarrierIncomplete = errors.New("split migration voter barrier incomplete")
+)
 
 type splitVoterAck struct {
 	id      string
 	address string
 	acked   bool
+}
+
+func splitMigrationVoterBarrierIncompleteError(jobID uint64, kind pb.MigrationStateProbeKind) error {
+	return errors.Wrapf(errSplitMigrationVoterBarrierIncomplete, "job_id=%d kind=%s", jobID, kind.String())
 }
 
 func (s *DistributionServer) syncSplitMigrationVoterBarrier(
@@ -311,8 +318,11 @@ func (s *DistributionServer) cleanupSplitJobTargetProofs(ctx context.Context, jo
 		JobId: job.JobID,
 		Kind:  pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
 	})
-	if err != nil || !metadataComplete {
+	if err != nil {
 		return err
+	}
+	if !metadataComplete {
+		return splitMigrationVoterBarrierIncompleteError(job.JobID, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED)
 	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseCleanup && current.TargetPromotionDone {
@@ -554,8 +564,11 @@ func (s *DistributionServer) cleanupAbandonedSplitJobTarget(ctx context.Context,
 		JobId: job.JobID,
 		Kind:  pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
 	})
-	if err != nil || !metadataComplete {
+	if err != nil {
 		return err
+	}
+	if !metadataComplete {
+		return splitMigrationVoterBarrierIncompleteError(job.JobID, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED)
 	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseAbandoning {
@@ -638,8 +651,11 @@ func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, 
 		JobId: job.JobID,
 		Kind:  pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
 	})
-	if err != nil || !metadataComplete {
+	if err != nil {
 		return err
+	}
+	if !metadataComplete {
+		return splitMigrationVoterBarrierIncompleteError(job.JobID, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED)
 	}
 	return nil
 }

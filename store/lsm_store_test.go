@@ -946,6 +946,50 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 	require.Equal(t, []TargetStagedReadinessState{readyState}, states)
 }
 
+func TestPebbleStore_RestoreFromStreamingMVCCPreservesMigrationImportMetadata(t *testing.T) {
+	ctx := context.Background()
+	src := NewMVCCStore()
+	_, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("c1"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+
+	dir, err := os.MkdirTemp("", "pebble-migrate-import-metadata-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	dst, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer dst.Close()
+	require.NoError(t, dst.Restore(bytes.NewReader(snapshotBytes(t, snap))))
+
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("c1"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
 func TestPebbleStore_RestoreFromStreamingMVCCPreservesMinRetainedTS(t *testing.T) {
 	ctx := context.Background()
 

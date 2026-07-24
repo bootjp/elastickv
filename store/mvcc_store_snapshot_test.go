@@ -96,6 +96,67 @@ func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
 	require.Equal(t, []byte("old"), states[0].RouteStart)
 }
 
+func TestMVCCStore_SnapshotRestorePreservesMigrationImportMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+	res, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("c1"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+	present, err := dst.MigrationImportMetadataPresent(ctx, 7)
+	require.NoError(t, err)
+	require.True(t, present)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("c1"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  2,
+		Cursor:    []byte("c2"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("c2"), res.AckedCursor)
+	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v60"), val)
+}
+
 func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 	t.Parallel()
 

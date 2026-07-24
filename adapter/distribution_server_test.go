@@ -1291,6 +1291,66 @@ func TestDistributionServerRunSplitJobRunnerOnce_PausesOnCapabilityRegression(t 
 	require.NotZero(t, armed.SnapshotTS)
 }
 
+func TestDistributionServerCleanupSplitJobSourceProofsWaitsForMetadataBarrier(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 7,
+		State:   distribution.RouteStateActive,
+	}})
+	require.NoError(t, err)
+	job := sampleDistributionSplitJob(17)
+	job.Phase = distribution.SplitJobPhaseCleanup
+	job.TargetPromotionDone = true
+	job.TargetClearedDescriptorAckCursor = distribution.CloneBytes(splitCleanupDoneCursor)
+	job.SourceCutoverAckCursor = distribution.CloneBytes(splitCleanupDoneCursor)
+	job.SourceReadDrainCursor = distribution.CloneBytes(splitCleanupDoneCursor)
+	job.Cursor = distribution.CloneBytes(splitCleanupDoneCursor)
+	job.SourceRetentionPinTS = 90
+	job.CutoverVersion = saved.Version
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+
+	source := &splitMigrationClientStub{}
+	target := &splitMigrationClientStub{}
+	readyVoter := &splitMigrationClientStub{}
+	blockedVoter := &splitMigrationClientStub{
+		probeFn: func(req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+			require.Equal(t, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED, req.GetKind())
+			return &pb.ProbeMigrationStateResponse{}, nil
+		},
+	}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			return source, target, nil
+		}),
+		WithSplitMigrationVoterFactory(func(_ context.Context, groupID uint64) ([]SplitMigrationVoter, error) {
+			require.Equal(t, uint64(7), groupID)
+			return []SplitMigrationVoter{
+				{ID: "n1", Address: "n1:50051", Client: readyVoter},
+				{ID: "n2", Address: "n2:50051", Client: blockedVoter},
+			}, nil
+		}),
+	)
+
+	err = s.cleanupSplitJobSourceProofs(ctx, job)
+	require.ErrorIs(t, err, errSplitMigrationVoterBarrierIncomplete)
+	require.Len(t, source.cleanups, 1)
+	require.Equal(t, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA, source.cleanups[0].GetMode())
+	current, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(90), current.SourceRetentionPinTS)
+}
+
 func TestDistributionServerRunSplitJobRunnerOnce_FailClosesCapabilityRegressionAfterSideEffects(t *testing.T) {
 	t.Parallel()
 
