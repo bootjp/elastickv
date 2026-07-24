@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	_ "github.com/Jille/grpc-multi-resolver"
+	"github.com/bootjp/elastickv/distribution"
+	kvstore "github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
@@ -640,6 +642,40 @@ func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithReadFenceStore(t
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithShardStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	mvcc := store.NewMVCCStore()
+	t.Cleanup(func() { _ = mvcc.Close() })
+	st := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{
+		1: {Store: mvcc},
+	})
+	s := NewGRPCServer(st, nil)
+
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, mvcc.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, mvcc.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:           []byte("!redis|meta|"),
+		EndKey:             []byte("!redis|meta}"),
+		Limit:              1,
+		Ts:                 2,
+		GroupId:            1,
+		Reverse:            true,
+		RouteStart:         []byte("m"),
+		RouteBoundsPresent: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Kv, 1)
+	require.Equal(t, right, resp.Kv[0].Key)
+	require.Equal(t, []byte("right"), resp.Kv[0].Value)
 }
 
 func TestGRPCServer_RawScanAt_KeysOnlyWithRouteBoundsUsesReadFence(t *testing.T) {

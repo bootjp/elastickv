@@ -1839,6 +1839,52 @@ func TestShardStoreRedisWideColumnScanRefillsAfterLogicalTombstones(t *testing.T
 	require.Equal(t, [][]byte{c, d}, keys)
 }
 
+func TestShardStoreReverseRedisWideColumnScanRefillsAfterLogicalTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	userKey := []byte("zulu")
+	a := store.HashFieldKey(userKey, []byte("a"))
+	b := store.HashFieldKey(userKey, []byte("b"))
+	c := store.HashFieldKey(userKey, []byte("c"))
+	d := store.HashFieldKey(userKey, []byte("d"))
+	for _, item := range []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: a, value: []byte("legacy-a")},
+		{key: b, value: []byte("legacy-b")},
+		{key: c, value: []byte("legacy-c")},
+		{key: d, value: []byte("legacy-d")},
+	} {
+		require.NoError(t, groups[1].Store.PutAt(ctx, item.key, item.value, 5, 0))
+	}
+	require.NoError(t, st.DeleteAt(ctx, d, 7))
+	require.NoError(t, st.DeleteAt(ctx, c, 7))
+
+	prefix := store.HashFieldScanPrefix(userKey)
+	kvs, err := st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, b, kvs[0].Key)
+	require.Equal(t, []byte("legacy-b"), kvs[0].Value)
+	require.Equal(t, a, kvs[1].Key)
+	require.Equal(t, []byte("legacy-a"), kvs[1].Value)
+}
+
 func TestShardStoreReverseRedisWideColumnScanPrefersLogicalRoute(t *testing.T) {
 	t.Parallel()
 
