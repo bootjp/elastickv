@@ -199,9 +199,10 @@ func sortedExactSetMembers(existing map[string]struct{}) []string {
 	return out
 }
 
-func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string, key []byte, readTS uint64, members map[string]struct{}) error {
+func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string, key []byte, readTimestamp kv.ReadTimestamp, members map[string]struct{}) error {
+	readTS := readTimestamp.Timestamp()
 	if kind != setKind {
-		return r.persistHLLMembersTxn(ctx, key, readTS, members)
+		return r.persistHLLMembersTxn(ctx, key, readTimestamp, members)
 	}
 	// Wide-column set: full rewrite (used when the whole state is available).
 	if len(members) == 0 {
@@ -209,7 +210,7 @@ func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(members)+setWideColOverhead)
 	for member := range members {
@@ -226,10 +227,11 @@ func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string
 	})
 	// Remove legacy blob if present.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
-	return r.dispatchElems(ctx, true, readTS, elems)
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
-func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, readTS uint64, members map[string]struct{}) error {
+func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, members map[string]struct{}) error {
+	readTS := readTimestamp.Timestamp()
 	// HLL keeps a single anchor payload, now wrapped in an inline-TTL envelope
 	// while preserving legacy payload reads during migration.
 	if len(members) == 0 {
@@ -237,7 +239,7 @@ func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, read
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 	ttl, err := r.ttlAt(ctx, key, readTS)
 	if err != nil {
@@ -251,7 +253,7 @@ func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, read
 		return err
 	}
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisHLLKey(key), Value: payload}}
-	return r.dispatchElems(ctx, true, readTS, appendHLLScanIndexElem(elems, key, ttl))
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, appendHLLScanIndexElem(elems, key, ttl))
 }
 
 func appendHLLScanIndexElem(elems []*kv.Elem[kv.OP], key []byte, ttl *time.Time) []*kv.Elem[kv.OP] {
@@ -278,10 +280,11 @@ func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, a
 func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context, kind string, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis set mutation: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis set mutation: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		if err := r.validateExactSetKind(kind, key, readTS); err != nil {
 			return err
 		}
@@ -294,7 +297,7 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 		if changed == 0 {
 			return nil
 		}
-		return r.persistExactSetMembersTxn(ctx, kind, key, readTS, existing)
+		return r.persistExactSetMembersTxn(ctx, kind, key, readTimestamp, existing)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
@@ -306,10 +309,11 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis set mutation: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis set mutation: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		prepared, err := r.prepareExactSetWideMutation(ctx, key, members, add, readTS)
 		if err != nil {
 			return err
@@ -318,7 +322,8 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		if prepared.skip {
 			return nil
 		}
-		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  prepared.startTS,
 			CommitTS: prepared.commitTS,
@@ -740,10 +745,11 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis pfadd: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis pfadd: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		if err := r.validateExactSetKind(hllKind, cmd.Args[1], readTS); err != nil {
 			return err
 		}
@@ -758,7 +764,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 			return nil
 		}
 
-		return r.persistExactSetMembersTxn(ctx, hllKind, cmd.Args[1], readTS, existing)
+		return r.persistExactSetMembersTxn(ctx, hllKind, cmd.Args[1], readTimestamp, existing)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return

@@ -4,15 +4,20 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (updated July 7, 2026):
+Current implementation status (updated July 23, 2026):
 
 - M1 durable route catalog, watcher refresh, and same-group manual
   `SplitRange` are implemented.
+- M2 has the SplitJob catalog substrate (`distribution/split_job_catalog.go`)
+  and codec/list/history tests, tracked in
+  [`2026_06_11_partial_hotspot_split_milestone2_migration.md`](2026_06_11_partial_hotspot_split_milestone2_migration.md);
+  the actual migration RPC, export/import, fence, cutover, promotion, and
+  cleanup workflow are still open.
 - The old in-memory `RecordAccess` / midpoint `splitRange` path has been
-  removed by the M3-PR1a slice in
+  removed by the M3-PR1a slice, `RouteDescriptor.SplitAtHLC` and the v2
+  route codec shipped in M3-PR1b, and the pure detector core shipped in
   [`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md);
-  keyviz remains the only wired load-observation signal for future auto-split.
-- There is no data movement workflow to relocate part of a split range to another Raft group.
+  runtime scheduler wiring remains open.
 
 So practical “hotspot splitting” is currently not connected end-to-end.
 
@@ -300,8 +305,9 @@ Add RPCs:
 3. Auto-split scheduler (cooldown/hysteresis)
 
 Status: partial. M3-PR1a removed the dead engine-local `RecordAccess` /
-`splitRange` path and relaxed the route-catalog decoder for the later
-`SplitAtHLC` schema tail. Detector and scheduler wiring remain open in
+`splitRange` path, M3-PR1b shipped the `SplitAtHLC` route-codec field, and
+M3-PR2a shipped the pure autosplit detector core. Observe-mode integration and
+scheduler wiring remain open in
 [`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md).
 
 ### Milestone 4: Hardening

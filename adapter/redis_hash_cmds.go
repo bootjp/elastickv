@@ -162,10 +162,11 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	defer cancel()
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis hash field write: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis hash field write: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
 		if err != nil {
 			return err
@@ -212,7 +213,8 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 			return nil
 		}
 
-		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
@@ -411,7 +413,8 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 }
 
 // hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
-func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTS uint64) (int, error) {
+func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTimestamp kv.ReadTimestamp) (int, error) {
+	readTS := readTimestamp.Timestamp()
 	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
 	if err != nil {
 		return 0, err
@@ -431,7 +434,8 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 		Key:   store.HashMetaDeltaKey(key, commitTS, 0),
 		Value: deltaVal,
 	})
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -475,10 +479,11 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 }
 
 func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) (int, error) {
-	readTS, err := r.beginTxnStartTS(ctx, "redis hash field delete: begin read timestamp")
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis hash field delete: begin read timestamp")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
+	readTS := readTimestamp.Timestamp()
 	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
@@ -498,7 +503,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 		return 0, cockerrors.WithStack(err)
 	}
 	if len(wideKVs) > 0 {
-		return r.hdelWideColumn(ctx, key, fields, readTS)
+		return r.hdelWideColumn(ctx, key, fields, readTimestamp)
 	}
 
 	// Legacy blob path.
@@ -510,7 +515,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	if removed == 0 {
 		return 0, nil
 	}
-	return removed, r.persistHashTxn(ctx, key, readTS, value)
+	return removed, r.persistHashReadTimestampTxn(ctx, key, readTimestamp, value)
 }
 
 func removeHashFields(value redisHashValue, fields [][]byte) int {
@@ -557,6 +562,39 @@ func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uin
 	// Also remove the legacy blob if it was present.
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
 	return r.dispatchElems(ctx, true, readTS, elems)
+}
+
+func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, value redisHashValue) error {
+	readTS := readTimestamp.Timestamp()
+	if len(value) == 0 {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+	}
+	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
+	if err != nil {
+		return err
+	}
+	if expired {
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, legacyExpiredCollectionCleanupElems(key, redisHashKey(key)))
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
+	for field, val := range value {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(key, []byte(field)),
+			Value: []byte(val),
+		})
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.HashMetaKey(key),
+		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
+	})
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
 func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
@@ -735,7 +773,8 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 
 // hincrbyWithMigration handles the HINCRBY case where a legacy JSON blob must be migrated
 // atomically with the increment operation.
-func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTS, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64, cleanupElems []*kv.Elem[kv.OP]) (int64, error) {
+func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []byte, readTimestamp kv.ReadTimestamp, commitTS uint64, current int64, isNewField bool, typ redisValueType, increment int64, cleanupElems []*kv.Elem[kv.OP]) (int64, error) {
+	readTS := readTimestamp.Timestamp()
 	migrationElems, migErr := r.buildHashLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
 		return 0, migErr
@@ -757,7 +796,8 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 			},
 		)
 	}
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
@@ -768,10 +808,11 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 }
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
-	readTS, err := r.beginTxnStartTS(ctx, "redis hash increment: begin read timestamp")
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis hash increment: begin read timestamp")
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
+	readTS := readTimestamp.Timestamp()
 	typ, err := r.keyTypeOrEmptyAt(ctx, key, readTS, redisTypeHash)
 	if err != nil {
 		return 0, err
@@ -796,7 +837,7 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 
 	// If a legacy blob exists, migrate it atomically with the increment.
 	if len(legacyValue) > 0 {
-		return r.hincrbyWithMigration(ctx, key, fieldKey, readTS, commitTS, current, isNewField, typ, increment, cleanupElems)
+		return r.hincrbyWithMigration(ctx, key, fieldKey, readTimestamp, commitTS, current, isNewField, typ, increment, cleanupElems)
 	}
 
 	current += increment
@@ -815,7 +856,8 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 			},
 		)
 	}
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -840,10 +882,11 @@ func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis incr: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis incr: begin read timestamp")
 		if err != nil {
 			return cockerrors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
@@ -879,7 +922,7 @@ func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 			// cannot later expire a now-persistent key.
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return

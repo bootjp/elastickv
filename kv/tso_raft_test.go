@@ -189,7 +189,12 @@ func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
 			changeTerm.Do(func() { engine.setTerm(2) })
 		}
 	}
-	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	provider := &recordingTSOFloorProvider{floor: 100}
+	alloc, err := NewRaftTSOAllocator(
+		&ShardGroup{Engine: engine, TSOState: fsm},
+		clock,
+		WithTSOCutoverFloorProvider(provider),
+	)
 	require.NoError(t, err)
 
 	_, err = alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
@@ -200,7 +205,9 @@ func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
 	payloads := engine.proposedPayloads()
 	require.Len(t, payloads, 2)
 	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
-	require.Equal(t, marshalTSOPhaseD(0), payloads[1])
+	require.True(t, bytes.HasPrefix(payloads[1], []byte(tsoPhaseDEnvelope)))
+	require.Greater(t, fsm.PhaseDFloor(), uint64(0))
+	require.Equal(t, marshalTSOPhaseD(fsm.PhaseDFloor()), payloads[1])
 }
 
 func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
@@ -235,7 +242,12 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 		term:   1,
 		apply:  applyTSOTestFSM(fsm),
 	}
-	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	provider := &recordingTSOFloorProvider{floor: 100}
+	alloc, err := NewRaftTSOAllocator(
+		&ShardGroup{Engine: engine, TSOState: fsm},
+		clock,
+		WithTSOCutoverFloorProvider(provider),
+	)
 	require.NoError(t, err)
 
 	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
@@ -243,12 +255,13 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 	require.True(t, reservation.CutoverActive)
 	require.True(t, reservation.PhaseDActive)
 	require.Equal(t, reservation.PreviousAllocationFloor, reservation.PhaseDFloor)
+	require.Equal(t, reservation.Base-1, reservation.PhaseDFloor)
 	require.Greater(t, reservation.Base, reservation.PhaseDFloor)
 
 	payloads := engine.proposedPayloads()
 	require.Len(t, payloads, 3)
 	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
-	require.Equal(t, marshalTSOPhaseD(reservation.PreviousAllocationFloor), payloads[1])
+	require.Equal(t, marshalTSOPhaseD(reservation.Base-1), payloads[1])
 	require.True(t, bytes.HasPrefix(payloads[2], []byte(tsoAllocationFloorEnvelope)))
 
 	end := reservation.Base + positiveIntToUint64(reservation.Count) - 1
@@ -256,7 +269,67 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), end))
 	err = alloc.ValidateDurableTimestamp(context.Background(), reservation.PhaseDFloor)
 	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), 1), ErrTSOTimestampInvalid)
 	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), end+1), ErrTSOTimestampInvalid)
+}
+
+func TestRaftTSOAllocatorPhaseDReservationsStayContiguousAcrossWallClockJump(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(2 * testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	provider := &recordingTSOFloorProvider{}
+	provider.setFloor(uint64(time.Now().UnixMilli()) << hlcLogicalBits) //nolint:gosec // test floor is positive.
+	alloc, err := NewRaftTSOAllocator(
+		&ShardGroup{Engine: engine, TSOState: fsm},
+		clock,
+		WithTSOCutoverFloorProvider(provider),
+	)
+	require.NoError(t, err)
+
+	first, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
+	require.NoError(t, err)
+	firstEnd := first.Base + positiveIntToUint64(first.Count) - 1
+	require.Equal(t, firstEnd, fsm.AllocationFloor())
+	require.Equal(t, first.Base-1, fsm.PhaseDFloor())
+
+	clock.Observe(uint64(time.Now().Add(testTSOFutureCeiling).UnixMilli()) << hlcLogicalBits) //nolint:gosec // test HLC timestamp is positive.
+	second, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, false, false)
+	require.NoError(t, err)
+	secondEnd := second.Base + positiveIntToUint64(second.Count) - 1
+	require.Equal(t, firstEnd+1, second.Base)
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), second.Base))
+	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), secondEnd))
+	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), secondEnd+1), ErrTSOTimestampInvalid)
+
+	_, err = alloc.ReserveBatchAfter(context.Background(), 1, secondEnd+10, false, false)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.Equal(t, secondEnd, fsm.AllocationFloor())
+}
+
+func TestRaftTSOAllocatorRejectsNearOverflowMinimumBeforeObserve(t *testing.T) {
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
+	require.NoError(t, err)
+
+	_, err = alloc.ReserveBatchAfter(context.Background(), 2, ^uint64(0)-1, false, false)
+	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
+	require.Zero(t, clock.Current())
+	require.Zero(t, fsm.AllocationFloor())
+	require.Empty(t, engine.proposedPayloads())
 }
 
 func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTerm(t *testing.T) {
@@ -286,8 +359,9 @@ func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTe
 	reservation, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, true, true)
 	require.NoError(t, err)
 	require.Equal(t, 2, provider.callCount(), "Phase-D activation must resample the data commit floor even within an initialized term")
-	require.Equal(t, laterDataFloor, reservation.PreviousAllocationFloor)
-	require.Equal(t, laterDataFloor, reservation.PhaseDFloor)
+	require.GreaterOrEqual(t, reservation.PreviousAllocationFloor, laterDataFloor)
+	require.Equal(t, reservation.Base-1, reservation.PreviousAllocationFloor)
+	require.Equal(t, reservation.Base-1, reservation.PhaseDFloor)
 	require.Greater(t, reservation.Base, laterDataFloor)
 }
 
@@ -629,6 +703,7 @@ type recordingTSOEngine struct {
 	proposals    [][]byte
 	apply        func([]byte) error
 	afterPropose func([]byte)
+	readIndex    func(context.Context) (uint64, error)
 	term         uint64
 }
 
@@ -688,7 +763,12 @@ func (e *recordingTSOEngine) VerifyLeader(context.Context) error {
 	return nil
 }
 
-func (e *recordingTSOEngine) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
+func (e *recordingTSOEngine) LinearizableRead(ctx context.Context) (uint64, error) {
+	if e.readIndex != nil {
+		return e.readIndex(ctx)
+	}
+	return 0, nil
+}
 
 func (e *recordingTSOEngine) Status() raftengine.Status {
 	e.mu.Lock()

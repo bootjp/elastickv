@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
@@ -21,6 +22,8 @@ type s3ChunkUploadConfig struct {
 	tooLargeMessage    string
 	expectedPayloadSHA string
 	chunkKey           func(chunkNo uint64) []byte
+	chunkRefKey        func(chunkNo uint64) []byte
+	offloaded          bool
 }
 
 type s3ChunkUploadResult struct {
@@ -29,6 +32,8 @@ type s3ChunkUploadResult struct {
 	ChunkSizes      []uint64
 	PersistedChunks int
 	ChunkCount      uint64
+	Offloaded       bool
+	ChunkRefElems   []*kv.Elem[kv.OP]
 }
 
 type s3ChunkUploader struct {
@@ -50,16 +55,21 @@ type s3ChunkUploader struct {
 // The caller remains responsible for protocol setup, metadata transactions,
 // and cleanup of any chunks reported in the result.
 func (s *S3Server) uploadS3Chunks(ctx context.Context, cfg s3ChunkUploadConfig) (s3ChunkUploadResult, *s3PutBodyError, error) {
+	batchOps := s3ChunkBatchOps
+	if cfg.offloaded {
+		batchOps = s3MetaBatchOps
+	}
 	uploader := &s3ChunkUploader{
 		server:            s,
 		ctx:               ctx,
 		cfg:               cfg,
 		etagHasher:        md5.New(), //nolint:gosec // S3 ETag compatibility requires MD5.
 		buf:               make([]byte, s3ChunkSize),
-		pendingBatch:      make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps),
+		pendingBatch:      make([]*kv.Elem[kv.OP], 0, batchOps),
 		pendingChunkSizes: make([]uint64, 0, s3ChunkBatchOps),
 		pendingAdmission:  make([]func(), 0, s3ChunkBatchOps),
 	}
+	uploader.result.Offloaded = cfg.offloaded
 	if cfg.expectedPayloadSHA != "" {
 		uploader.payloadHasher = sha256.New()
 	}
@@ -77,11 +87,16 @@ func (u *s3ChunkUploader) run() (s3ChunkUploadResult, *s3PutBodyError, error) {
 			break
 		}
 	}
-	if err := u.flushBatch(); err != nil {
-		return u.result, nil, err
+	if !u.cfg.offloaded {
+		if err := u.flushBatch(); err != nil {
+			return u.result, nil, err
+		}
 	}
 	if bodyErr := u.verifyChecksums(); bodyErr != nil {
 		return u.result, bodyErr, nil
+	}
+	if u.cfg.offloaded {
+		u.result.ChunkRefElems = append([]*kv.Elem[kv.OP](nil), u.pendingBatch...)
 	}
 	u.result.ETag = hex.EncodeToString(u.etagHasher.Sum(nil))
 	return u.result, nil, nil
@@ -127,7 +142,11 @@ func (u *s3ChunkUploader) flushBeforeRead() error {
 }
 
 func (u *s3ChunkUploader) flushFullBatch() error {
-	if len(u.pendingBatch) < s3ChunkBatchOps {
+	batchOps := s3ChunkBatchOps
+	if u.cfg.offloaded {
+		batchOps = s3MetaBatchOps
+	}
+	if len(u.pendingBatch) < batchOps {
 		return nil
 	}
 	return u.flushBatch()
@@ -141,7 +160,6 @@ func (u *s3ChunkUploader) classifyReadError(err error) (bool, *s3PutBodyError, e
 }
 
 func (u *s3ChunkUploader) appendChunk(data []byte, release func()) error {
-	u.pendingAdmission = append(u.pendingAdmission, release)
 	chunk := append([]byte(nil), data...)
 	if _, err := u.etagHasher.Write(chunk); err != nil {
 		return errors.WithStack(err)
@@ -152,29 +170,75 @@ func (u *s3ChunkUploader) appendChunk(data []byte, release func()) error {
 		}
 	}
 	u.cfg.streamBody.writeDecoded(chunk)
+	if u.cfg.offloaded {
+		if err := u.appendOffloadedChunk(chunk, release); err != nil {
+			return err
+		}
+	} else {
+		u.appendLegacyChunk(chunk, release)
+	}
+	chunkSize := uint64(len(data))
+	u.result.ChunkSizes = append(u.result.ChunkSizes, chunkSize)
+	if !u.cfg.offloaded {
+		u.pendingChunkSizes = append(u.pendingChunkSizes, chunkSize)
+	}
+	u.result.SizeBytes += int64(len(data))
+	u.result.ChunkCount++
+	return nil
+}
+
+func (u *s3ChunkUploader) appendOffloadedChunk(chunk []byte, release func()) error {
+	defer release()
+	if u.cfg.chunkRefKey == nil {
+		return errors.New("s3 chunkref key builder is not configured")
+	}
+	digest := sha256.Sum256(chunk)
+	refKey := u.cfg.chunkRefKey(u.result.ChunkCount)
+	commitTS, err := u.server.nextTxnCommitTS(u.ctx, 0)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	ref, err := u.server.persistS3ChunkBlob(u.ctx, refKey, digest, chunk, commitTS)
+	if err != nil {
+		return err
+	}
+	refValue, err := s3keys.EncodeChunkRefValue(ref)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	u.pendingBatch = append(u.pendingBatch, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   refKey,
+		Value: refValue,
+	})
+	u.result.PersistedChunks++
+	return nil
+}
+
+func (u *s3ChunkUploader) appendLegacyChunk(chunk []byte, release func()) {
+	u.pendingAdmission = append(u.pendingAdmission, release)
 	u.pendingBatch = append(u.pendingBatch, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   u.cfg.chunkKey(u.result.ChunkCount),
 		Value: chunk,
 	})
-	chunkSize := uint64(len(data))
-	u.result.ChunkSizes = append(u.result.ChunkSizes, chunkSize)
-	u.pendingChunkSizes = append(u.pendingChunkSizes, chunkSize)
-	u.result.SizeBytes += int64(len(data))
-	u.result.ChunkCount++
-	return nil
 }
 
 func (u *s3ChunkUploader) flushBatch() error {
 	if len(u.pendingBatch) == 0 {
 		return nil
 	}
+	// Full offloaded batches are immutable staged refs. Object readers cannot
+	// discover them until the final manifest or part descriptor transaction;
+	// that final metadata commit remains the public linearization point.
 	_, err := u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
 	u.releasePendingAdmission()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	u.result.PersistedChunks += len(u.pendingChunkSizes)
+	if !u.cfg.offloaded {
+		u.result.PersistedChunks += len(u.pendingChunkSizes)
+	}
 	u.pendingBatch = u.pendingBatch[:0]
 	u.pendingChunkSizes = u.pendingChunkSizes[:0]
 	return nil

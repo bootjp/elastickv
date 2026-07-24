@@ -256,6 +256,8 @@ func printStatus(ctx context.Context, client pb.RaftAdminClient) error {
 	fmt.Printf("fsm_pending: %d\n", resp.FsmPending)
 	fmt.Printf("num_peers: %d\n", resp.NumPeers)
 	fmt.Printf("last_contact_nanos: %d\n", resp.LastContactNanos)
+	fmt.Printf("configuration_index: %d\n", resp.ConfigurationIndex)
+	fmt.Printf("pending_conf_change: %t\n", resp.PendingConfChange)
 	return nil
 }
 

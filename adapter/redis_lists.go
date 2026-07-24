@@ -99,10 +99,11 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis list push: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis list push: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -125,7 +126,8 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		}
 
 		// Dispatch with the pre-allocated commitTS.
-		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, dispErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
@@ -192,7 +194,8 @@ type reusableListPush struct {
 	// boundary-touching commit fires WriteConflict and the adapter drops
 	// pending → recomputes. Empty when attempt 1 read an empty list (no
 	// boundary to fence; the OCC on the write key suffices for that case).
-	readKeys [][]byte
+	readKeys      [][]byte
+	readTimestamp kv.ReadTimestamp
 }
 
 // dispatchListPushReuse runs one iteration of the option-2 reuse path:
@@ -215,7 +218,8 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	if allocErr != nil {
 		return 0, false, errors.WithStack(allocErr)
 	}
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := pending.readTimestamp.WithDispatchVoucher(ctx)
+	_, dispErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
 		StartTS:      pending.startTS,
 		CommitTS:     commitTS,
@@ -391,10 +395,11 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			newLen = length
 			return nil
 		}
-		readTS, err := r.beginTxnStartTS(ctx, "redis list push: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis list push: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		meta, metaExists, typ, cleanupElems, err := r.listPushSnapshot(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -418,7 +423,8 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		boundaryReads := listPushReadKeys(key, meta, typ, metaExists)
-		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, dispErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
@@ -444,11 +450,12 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		// idempotency cache) and out of scope for this design.
 		if isRetryableRedisTxnErr(dispErr) {
 			pending = &reusableListPush{
-				ops:      ops,
-				startTS:  startTS,
-				commitTS: commitTS,
-				length:   updatedMeta.Len,
-				readKeys: boundaryReads,
+				ops:           ops,
+				startTS:       startTS,
+				commitTS:      commitTS,
+				length:        updatedMeta.Len,
+				readKeys:      boundaryReads,
+				readTimestamp: readTimestamp,
 			}
 		}
 		return errors.WithStack(dispErr)
@@ -610,7 +617,8 @@ func (r *RedisServer) checkListKeyType(ctx context.Context, key []byte, readTS u
 // listPopClaimOnce executes one attempt of a pop-with-claim transaction.
 // Returns (nil, nil) for a missing key or an empty list, and the popped
 // values otherwise.
-func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count int, left bool, readTS uint64) ([]string, error) {
+func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count int, left bool, readTimestamp kv.ReadTimestamp) ([]string, error) {
+	readTS := readTimestamp.Timestamp()
 	found, typeErr := r.checkListKeyType(ctx, key, readTS)
 	if typeErr != nil || !found {
 		return nil, typeErr
@@ -635,7 +643,7 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 		return nil, buildErr
 	}
 
-	if err := r.commitListPop(ctx, key, elems, n, left, readTS); err != nil {
+	if err := r.commitListPop(ctx, key, elems, n, left, readTimestamp); err != nil {
 		return nil, err
 	}
 	return values, nil
@@ -645,7 +653,8 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 // and dispatches the pop transaction. Extracted from listPopClaimOnce
 // so that function stays under the cyclop ceiling after the HLC-4
 // (iii) NextFenced fence added a new error branch (PR #867 Phase 2b).
-func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv.Elem[kv.OP], n int64, left bool, readTS uint64) error {
+func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv.Elem[kv.OP], n int64, left bool, readTimestamp kv.ReadTimestamp) error {
+	readTS := readTimestamp.Timestamp()
 	// n is the number of sequence positions claimed (including any holes).
 	// HeadDelta and LenDelta must use n, not len(values), so that Head
 	// advances past holes and the metadata stays consistent with Tail.
@@ -668,7 +677,8 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 		},
 	)
 
-	if _, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, dispErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -692,11 +702,11 @@ func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, l
 
 	var popped []string
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS, readErr := r.beginTxnStartTS(ctx, "redis list pop: begin read timestamp")
+		readTimestamp, readErr := r.beginTxnReadTimestamp(ctx, "redis list pop: begin read timestamp")
 		if readErr != nil {
 			return errors.WithStack(readErr)
 		}
-		result, popErr := r.listPopClaimOnce(ctx, key, count, left, readTS)
+		result, popErr := r.listPopClaimOnce(ctx, key, count, left, readTimestamp)
 		if popErr != nil {
 			return popErr
 		}
@@ -847,10 +857,11 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	key := cmd.Args[1]
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis ltrim: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis ltrim: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -865,7 +876,7 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 		if err != nil {
 			return err
 		}
-		return r.rewriteListTxn(ctx, key, readTS, trimListValues(current, start, stop))
+		return r.rewriteListTxn(ctx, key, readTimestamp, trimListValues(current, start, stop))
 	}); err != nil {
 		writeRedisError(conn, err)
 		return

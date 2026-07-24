@@ -484,7 +484,8 @@ func buildStreamEntryKey(userKey []byte, ms, seq uint64) []byte {
 }
 
 // marshalStreamMeta encodes [Length][LastMs][LastSeq], optionally with
-// trailing ExpireAtMs (mirror of store.MarshalStreamMeta).
+// trailing ExpireAtMs. Logical backups do not preserve StreamMeta's trim
+// cursor because restore replays only live stream entries.
 func marshalStreamMeta(length int64, lastMs, lastSeq uint64, expireMs *uint64) []byte {
 	size := redisStreamMetaSize
 	if expireMs != nil && *expireMs != 0 {

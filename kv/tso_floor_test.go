@@ -147,6 +147,30 @@ func TestShardStoreGroupCommittedTimestampFloorRequiresLocalLeadership(t *testin
 	require.Equal(t, uint64(77), floor)
 }
 
+func TestShardStoreGroupCommittedTimestampFloorBoundsLocalReadIndex(t *testing.T) {
+	t.Parallel()
+
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(context.Background(), []byte("local"), []byte("v"), 88, 0))
+	deadlineSeen := false
+	engine := &recordingTSOEngine{
+		state: raftengine.StateLeader,
+		readIndex: func(ctx context.Context) (uint64, error) {
+			_, deadlineSeen = ctx.Deadline()
+			return 0, nil
+		},
+	}
+	shards := NewShardStore(nil, map[uint64]*ShardGroup{
+		1: {Engine: engine, Store: local},
+	})
+	t.Cleanup(func() { require.NoError(t, shards.Close()) })
+
+	floor, err := shards.GroupCommittedTimestampFloor(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(88), floor)
+	require.True(t, deadlineSeen, "local TSO floor ReadIndex must be bounded even when caller has no deadline")
+}
+
 func TestShardStoreGlobalCommittedTimestampFloorQueriesGroupsConcurrently(t *testing.T) {
 	t.Parallel()
 

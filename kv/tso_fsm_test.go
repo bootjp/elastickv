@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 	"time"
 
@@ -23,6 +24,22 @@ func TestTSOStateMachineApplyHLCLeaseUpdatesCeiling(t *testing.T) {
 	require.Nil(t, result)
 	require.Equal(t, ceilingMs, hlc.PhysicalCeiling())
 	require.Zero(t, hlc.Current())
+	require.Equal(t, ceilingMs, fsm.ceilingMs.Load())
+}
+
+func TestTSOStateMachineApplyRejectsOutOfRangeHLCLease(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	clock.Observe(123)
+	clock.SetPhysicalCeiling(456)
+	fsm := NewTSOStateMachine(clock)
+
+	err := requireTSOHaltError(t, fsm.Apply(marshalRawHLCLeaseRenew(uint64(maxHLCPhysicalMillis)+1)))
+	require.ErrorIs(t, err, ErrTSOStateMachineInvalidEntry)
+	require.Equal(t, uint64(123), clock.Current())
+	require.Equal(t, int64(456), clock.PhysicalCeiling())
+	require.Zero(t, fsm.ceilingMs.Load())
 }
 
 func TestTSOStateMachineApplyAllocationFloorAdvancesHLC(t *testing.T) {
@@ -33,7 +50,7 @@ func TestTSOStateMachineApplyAllocationFloorAdvancesHLC(t *testing.T) {
 	fsm := NewTSOStateMachine(hlc)
 
 	require.Nil(t, fsm.Apply(marshalHLCLeaseRenew(ceilingMs)))
-	floor := tsoLeaseAllocationFloor(ceilingMs)
+	floor := tsoLeaseAllocationFloor(ceilingMs - 1)
 	require.Zero(t, hlc.Current())
 
 	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(floor)))
@@ -245,6 +262,21 @@ func TestTSOStateMachineNilHLCDoesNotPanic(t *testing.T) {
 	require.Nil(t, NewTSOStateMachine(nil).Apply(marshalTSOAllocationFloor(1)))
 }
 
+func TestTSOStateMachineSnapshotWithNilHLCWritesZeroState(t *testing.T) {
+	t.Parallel()
+
+	fsm := NewTSOStateMachine(nil)
+	snap, err := fsm.Snapshot()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
+
+	var buf bytes.Buffer
+	n, err := snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.EqualValues(t, tsoSnapshotV3Len, n)
+	require.Equal(t, make([]byte, tsoSnapshotV3Len), buf.Bytes())
+}
+
 func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -310,6 +342,22 @@ func TestTSOStateMachineRestoreRejectsTruncatedSnapshot(t *testing.T) {
 
 	err := NewTSOStateMachine(NewHLC()).Restore(bytes.NewReader([]byte{0x01, 0x02}))
 	require.Error(t, err)
+}
+
+func TestTSOStateMachineRestoreRejectsOutOfRangeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	clock.Observe(123)
+	clock.SetPhysicalCeiling(456)
+	fsm := NewTSOStateMachine(clock)
+
+	var buf [tsoSnapshotV1Len]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(maxHLCPhysicalMillis)+1)
+	require.Error(t, fsm.Restore(bytes.NewReader(buf[:])))
+	require.Equal(t, uint64(123), clock.Current())
+	require.Equal(t, int64(456), clock.PhysicalCeiling())
+	require.Zero(t, fsm.ceilingMs.Load())
 }
 
 func TestTSOStateMachineLegacySnapshotProbeRejectsEveryShortMagicPrefix(t *testing.T) {
@@ -429,6 +477,46 @@ func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
 	}
 }
 
+func TestTSOStateMachineDrainsHeaderlessLegacyKVFSMSnapshot(t *testing.T) {
+	t.Parallel()
+
+	legacySnapshot, err := store.NewMVCCStore().Snapshot()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, legacySnapshot.Close()) })
+
+	var legacy bytes.Buffer
+	_, err = legacySnapshot.WriteTo(&legacy)
+	require.NoError(t, err)
+
+	targetClock := NewHLC()
+	target := NewTSOStateMachine(targetClock)
+	require.NoError(t, target.Restore(bytes.NewReader(legacy.Bytes())))
+	require.Zero(t, targetClock.PhysicalCeiling())
+	require.Zero(t, targetClock.Current())
+}
+
+func TestTSOStateMachineDrainsLongHeaderlessLegacyKVFSMSnapshot(t *testing.T) {
+	t.Parallel()
+
+	legacy := bytes.Repeat([]byte("legacy-kvfsm-headerless-body"), 2)
+	require.Greater(t, len(legacy), tsoSnapshotV4Len)
+
+	targetClock := NewHLC()
+	target := NewTSOStateMachine(targetClock)
+	require.NoError(t, target.Restore(bytes.NewReader(legacy)))
+	require.Zero(t, targetClock.PhysicalCeiling())
+	require.Zero(t, targetClock.Current())
+}
+
+func TestTSOStateMachineSnapshotWriteWrapsShortWrite(t *testing.T) {
+	t.Parallel()
+
+	snap := &tsoFSMSnapshot{ceilingMs: 1}
+	n, err := snap.WriteTo(shortTSOWriter{})
+	require.EqualValues(t, tsoSnapshotV3Len-1, n)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+}
+
 func TestTSOStateMachineClassifiesOnlyFullLeaseEntriesAsVolatile(t *testing.T) {
 	t.Parallel()
 
@@ -455,4 +543,17 @@ func requireTSOHaltError(t *testing.T, result any) error {
 	err := halt.HaltApply()
 	require.Error(t, err)
 	return err
+}
+
+func marshalRawHLCLeaseRenew(raw uint64) []byte {
+	payload := []byte{raftEncodeHLCLease}
+	var buf [hlcLeasePayloadLen]byte
+	binary.BigEndian.PutUint64(buf[:], raw)
+	return append(payload, buf[:]...)
+}
+
+type shortTSOWriter struct{}
+
+func (shortTSOWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
 }

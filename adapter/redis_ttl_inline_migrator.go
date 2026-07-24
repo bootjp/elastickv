@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -20,6 +21,20 @@ type ttlInlineMigrationHandler struct {
 	prefix         []byte
 	extractUserKey func([]byte) []byte
 	buildElems     func(context.Context, *store.KVPair, uint64) ([]*kv.Elem[kv.OP], error)
+}
+
+type ttlInlineGroupScanner interface {
+	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+}
+
+type ttlInlineLocalLeaderGroups interface {
+	LocalLeaderGroupIDs() []uint64
+}
+
+type ttlInlineMigrationScanPlan struct {
+	cursorName string
+	groupID    uint64
+	scanner    ttlInlineGroupScanner
 }
 
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
@@ -165,7 +180,25 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 }
 
 func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlineMigrationHandler, readTS uint64) error {
-	kvs, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, readTS)
+	var combined error
+	for _, plan := range c.ttlInlineMigrationScanPlans(h) {
+		if ctx.Err() != nil {
+			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
+		}
+		if err := c.migrateTTLInlineScanPlan(ctx, h, plan, readTS); err != nil {
+			combined = errors.CombineErrors(combined, err)
+		}
+	}
+	return errors.WithStack(combined)
+}
+
+func (c *DeltaCompactor) migrateTTLInlineScanPlan(
+	ctx context.Context,
+	h ttlInlineMigrationHandler,
+	plan ttlInlineMigrationScanPlan,
+	readTS uint64,
+) error {
+	kvs, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
 	if err != nil {
 		return err
 	}
@@ -205,20 +238,55 @@ func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlin
 	if err := flushBatch(); err != nil {
 		return err
 	}
-	c.advanceCursor(h.typeName, lastKVKey(kvs), truncated)
+	c.advanceCursor(plan.cursorName, lastKVKey(kvs), truncated)
 	return nil
 }
 
-func (c *DeltaCompactor) scanTTLInlineMigrationRaw(ctx context.Context, h ttlInlineMigrationHandler, readTS uint64) ([]*store.KVPair, bool, error) {
+func (c *DeltaCompactor) ttlInlineMigrationScanPlans(h ttlInlineMigrationHandler) []ttlInlineMigrationScanPlan {
+	scanner, hasGroupScanner := c.st.(ttlInlineGroupScanner)
+	groups, hasLocalGroups := c.coord.(ttlInlineLocalLeaderGroups)
+	if hasGroupScanner && hasLocalGroups {
+		groupIDs := groups.LocalLeaderGroupIDs()
+		plans := make([]ttlInlineMigrationScanPlan, 0, len(groupIDs))
+		for _, groupID := range groupIDs {
+			plans = append(plans, ttlInlineMigrationScanPlan{
+				cursorName: ttlInlineMigrationGroupCursorName(h.typeName, groupID),
+				groupID:    groupID,
+				scanner:    scanner,
+			})
+		}
+		return plans
+	}
+	return []ttlInlineMigrationScanPlan{{cursorName: h.typeName}}
+}
+
+func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {
+	return typeName + ":group:" + strconv.FormatUint(groupID, 10)
+}
+
+func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
+	ctx context.Context,
+	h ttlInlineMigrationHandler,
+	plan ttlInlineMigrationScanPlan,
+	readTS uint64,
+) ([]*store.KVPair, bool, error) {
 	c.cursorMu.Lock()
 	start := h.prefix
-	if cur := c.cursors[h.typeName]; len(cur) > 0 {
+	if cur := c.cursors[plan.cursorName]; len(cur) > 0 {
 		start = append(bytes.Clone(cur), cursorNextByte)
 	}
 	c.cursorMu.Unlock()
 
 	end := store.PrefixScanEnd(h.prefix)
-	kvs, err := c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
+	var (
+		kvs []*store.KVPair
+		err error
+	)
+	if plan.scanner != nil {
+		kvs, err = plan.scanner.ScanGroupAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+	} else {
+		kvs, err = c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
+	}
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}

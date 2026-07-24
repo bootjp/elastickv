@@ -1071,7 +1071,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Worst wall_now - physicalCeiling across nodes. Negative is healthy (ceiling sits in the future). Alert on > -0.5s for HLC-4 (i) approaching violation, > 0s for the (iii) fence having tripped on at least one node.",
+      "description": "Worst wall_now - physicalCeiling across nodes after the first HLC lease has landed. Negative is healthy (ceiling sits in the future). Alert on > -5s with physicalCeiling > 0 for renewal stalls, > 0s for the (iii) fence having tripped on at least one node.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1086,7 +1086,7 @@
               },
               {
                 "color": "yellow",
-                "value": -0.5
+                "value": -5
               },
               {
                 "color": "red",
@@ -1120,7 +1120,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max(elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "max(elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} > 0)",
           "refId": "A",
           "instant": true
         }
@@ -1240,7 +1240,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "wall_now minus physicalCeiling per node. Negative = healthy (ceiling sits in the future). Zero or positive = the (iii) fence rejection boundary has been reached. Pre-bootstrap (ceiling=0) is held at 0 by the observer to avoid a spurious ~55-year skew on cold start.",
+      "description": "wall_now minus physicalCeiling per node. Negative = healthy after physicalCeiling > 0. Zero or positive = the (iii) fence rejection boundary has been reached. Pre-bootstrap (ceiling=0) is held at 0 by the observer to avoid a spurious ~55-year skew on cold start; alerts should also require physicalCeiling > 0.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1264,7 +1264,7 @@
               },
               {
                 "color": "yellow",
-                "value": -0.5
+                "value": -5
               },
               {
                 "color": "red",

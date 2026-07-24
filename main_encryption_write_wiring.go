@@ -37,7 +37,7 @@ func buildShardGroupsWithEncryptionWiring(
 	sidecarPath string,
 	encryptionEnabled bool,
 	routeEngine *distribution.Engine,
-	applyObserver kv.ApplyObserver,
+	applyObservers ...kv.ApplyObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
 	if guardErr := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            raftID,
@@ -57,7 +57,7 @@ func buildShardGroupsWithEncryptionWiring(
 	}
 	configureRaftEnvelopeFactory(factory, encWiring)
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapCfg,
-		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine, applyObserver)
+		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine, applyObservers...)
 	if err != nil {
 		return runtimes, shardGroups, encWiring, err
 	}

@@ -150,6 +150,46 @@ func TestS3AdminPutObjectPhaseDBindsReadVoucher(t *testing.T) {
 	require.Equal(t, uint64(1), coord.lastStartTS)
 }
 
+func TestS3DeleteObjectPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedS3ObjectForReadVoucherTest(t, ctx, st, "voucher-bucket", "key.txt")
+
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	req := httptest.NewRequest(http.MethodDelete, "/voucher-bucket/key.txt", nil)
+	rec := httptest.NewRecorder()
+	server.deleteObject(rec, req, "voucher-bucket", "key.txt")
+
+	require.Equalf(t, http.StatusNoContent, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, 1, coord.vouchCalls, "delete object must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
+func TestS3AdminDeleteObjectPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedS3ObjectForReadVoucherTest(t, ctx, st, "admin-voucher-bucket", "key.txt")
+
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	err := server.AdminDeleteObject(ctx, fullAdminBucketsPrincipal(), "admin-voucher-bucket", "key.txt")
+
+	require.NoError(t, err)
+	require.Equal(t, 1, coord.vouchCalls, "admin delete object must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
 // TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling verifies that
 // nextTxnCommitTS surfaces ErrCeilingExpired through the
 // NextFenced() it calls after Observe(startTS).  This is the
@@ -192,7 +232,7 @@ func TestS3CommitUploadPartRechecksUploadAtLatestAppliedWatermark(t *testing.T) 
 		readTS:        10,
 		meta:          &s3BucketMeta{Generation: generation},
 		uploadMetaKey: uploadMetaKey,
-	}, s3ChunkUploadResult{}, "bucket", "object", "upload", 10, 30)
+	}, s3ChunkUploadResult{}, "bucket", "object", "upload", s3UploadPartVersion{startTS: 10, commitTS: 30})
 	require.ErrorContains(t, err, "upload not found")
 	require.Nil(t, coord.request, "an upload removed after startTS must not dispatch an orphan part")
 }
@@ -210,10 +250,36 @@ func TestS3CommitUploadPartIncludesUploadMetaInReadSet(t *testing.T) {
 		readTS:        10,
 		meta:          &s3BucketMeta{Generation: generation},
 		uploadMetaKey: uploadMetaKey,
-	}, s3ChunkUploadResult{}, "bucket", "object", "upload", 10, 30)
+	}, s3ChunkUploadResult{}, "bucket", "object", "upload", s3UploadPartVersion{startTS: 10, commitTS: 30})
 	require.NoError(t, err)
 	require.NotNil(t, coord.request)
 	require.Equal(t, [][]byte{uploadMetaKey}, coord.request.ReadKeys)
+}
+
+func seedS3ObjectForReadVoucherTest(t *testing.T, ctx context.Context, st store.MVCCStore, bucket, key string) {
+	t.Helper()
+
+	const generation = uint64(1)
+	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{
+		BucketName:   bucket,
+		Generation:   generation,
+		CreatedAtHLC: 1,
+		Region:       s3DefaultRegion,
+		Owner:        "AKIA_FULL",
+		Acl:          s3AclPrivate,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, s3keys.BucketMetaKey(bucket), bucketMeta, 1, 0))
+
+	manifest, err := encodeS3ObjectManifest(&s3ObjectManifest{
+		UploadID:        "upload",
+		ETag:            quoteS3ETag("etag"),
+		SizeBytes:       0,
+		LastModifiedHLC: 1,
+		ContentType:     "text/plain",
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, s3keys.ObjectManifestKey(bucket, generation, key), manifest, 1, 0))
 }
 
 type recordingS3DispatchCoordinator struct {

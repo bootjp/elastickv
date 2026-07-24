@@ -132,11 +132,8 @@ func (a *RaftTSOAllocator) ReserveBatchAfter(
 	activatePhaseD bool,
 ) (TSOReservation, error) {
 	var empty TSOReservation
-	if err := validateTSOBatchSize(n); err != nil {
+	if err := validateTSOMinimumWindow(min, n); err != nil {
 		return empty, err
-	}
-	if min == ^uint64(0) {
-		return empty, errors.WithStack(ErrTxnCommitTSRequired)
 	}
 	ctx = nonNilTSOContext(ctx)
 	a.mu.Lock()
@@ -160,19 +157,21 @@ func (a *RaftTSOAllocator) reserveBatchAfterLocked(
 	if term == 0 {
 		return empty, errors.Wrap(ErrTSONotLeader, "tso leader has no active term")
 	}
-	previousFloor, err := a.prepareLeaderTermReservation(ctx, engine, term, activateCutover, activatePhaseD)
+	previousFloor, commitPhaseD, err := a.prepareLeaderTermReservation(ctx, engine, term, activateCutover, activatePhaseD)
 	if err != nil {
 		return empty, err
 	}
-	minimum := max(min, previousFloor)
-	if minimum > 0 {
-		a.clock.Observe(minimum)
-	}
-	base, err := a.clock.NextBatchFenced(n)
+	base, end, err := a.reservePreparedLocalWindow(n, min, previousFloor, commitPhaseD)
 	if err != nil {
-		return empty, errors.Wrap(err, "tso reserve local batch")
+		return empty, err
 	}
-	end := base + uint64(n) - 1 //nolint:gosec // n is positive and bounded above.
+	reservationFloor := previousFloor
+	if commitPhaseD {
+		reservationFloor, err = a.commitPhaseDReservation(ctx, engine, term, base)
+		if err != nil {
+			return empty, err
+		}
+	}
 	if err := a.commitAllocationFloor(ctx, engine, end); err != nil {
 		return empty, err
 	}
@@ -183,11 +182,88 @@ func (a *RaftTSOAllocator) reserveBatchAfterLocked(
 	return TSOReservation{
 		Base:                    base,
 		Count:                   n,
-		PreviousAllocationFloor: previousFloor,
+		PreviousAllocationFloor: reservationFloor,
 		CutoverActive:           a.state.CutoverActive(),
 		PhaseDActive:            a.state.PhaseDActive(),
 		PhaseDFloor:             a.state.PhaseDFloor(),
 	}, nil
+}
+
+func (a *RaftTSOAllocator) reservePreparedLocalWindow(
+	n int,
+	min uint64,
+	previousFloor uint64,
+	commitPhaseD bool,
+) (uint64, uint64, error) {
+	phaseDContiguous := commitPhaseD || a.state.PhaseDActive()
+	if phaseDContiguous && min > previousFloor {
+		return 0, 0, errors.Wrapf(ErrTSOTimestampInvalid,
+			"phase-D TSO minimum %d exceeds contiguous allocation floor %d", min, previousFloor)
+	}
+	return a.reserveLocalWindow(n, max(min, previousFloor), phaseDContiguous)
+}
+
+func (a *RaftTSOAllocator) reserveLocalWindow(n int, minimum uint64, phaseDContiguous bool) (uint64, uint64, error) {
+	if !phaseDContiguous {
+		if minimum > 0 {
+			a.clock.Observe(minimum)
+		}
+		base, err := a.clock.NextBatchFenced(n)
+		if err != nil {
+			return 0, 0, errors.Wrap(err, "tso reserve local batch")
+		}
+		end := base + positiveIntToUint64(n) - 1
+		return base, end, nil
+	}
+	return a.reserveContiguousPhaseDWindow(n, minimum)
+}
+
+func (a *RaftTSOAllocator) reserveContiguousPhaseDWindow(n int, floor uint64) (uint64, uint64, error) {
+	if err := validateTSOMinimumWindow(floor, n); err != nil {
+		return 0, 0, err
+	}
+	base := floor + 1
+	end := base + positiveIntToUint64(n) - 1
+	if err := a.validateContiguousPhaseDWindow(end); err != nil {
+		return 0, 0, err
+	}
+	a.clock.Observe(end)
+	return base, end, nil
+}
+
+func (a *RaftTSOAllocator) validateContiguousPhaseDWindow(end uint64) error {
+	ceiling := a.clock.PhysicalCeiling()
+	if ceiling <= 0 {
+		return nil
+	}
+	if time.Now().UnixMilli() >= ceiling {
+		a.clock.nextFencedRejections.Add(1)
+		return errors.Wrap(ErrCeilingExpired, "tso reserve contiguous phase-D window")
+	}
+	if end>>hlcLogicalBits > uint64(ceiling) {
+		a.clock.nextFencedRejections.Add(1)
+		return errors.Wrap(ErrCeilingExpired, "tso contiguous phase-D window exceeds ceiling")
+	}
+	return nil
+}
+
+func (a *RaftTSOAllocator) commitPhaseDReservation(
+	ctx context.Context,
+	engine raftengine.Engine,
+	term uint64,
+	base uint64,
+) (uint64, error) {
+	if base == 0 {
+		return 0, errors.Wrap(ErrTxnCommitTSRequired, "tso phase-D reservation base is zero")
+	}
+	reservationFloor := base - 1
+	if err := a.commitPhaseD(ctx, engine, reservationFloor); err != nil {
+		return 0, err
+	}
+	if err := verifyTSOLeaderTerm(ctx, engine, term, true); err != nil {
+		return 0, err
+	}
+	return reservationFloor, nil
 }
 
 func (a *RaftTSOAllocator) prepareLeaderTermReservation(
@@ -196,7 +272,7 @@ func (a *RaftTSOAllocator) prepareLeaderTermReservation(
 	term uint64,
 	activateCutover bool,
 	activatePhaseD bool,
-) (uint64, error) {
+) (uint64, bool, error) {
 	// The ordinary per-term cache protects all reservations served by this TSO
 	// leader term. Phase-D activation is a one-way cutover boundary, so it must
 	// fence legacy data-group commits that may have landed after this term's
@@ -204,37 +280,37 @@ func (a *RaftTSOAllocator) prepareLeaderTermReservation(
 	forceFreshFloor := activatePhaseD && !a.state.PhaseDActive()
 	termFloor, err := a.termCommitFloor(ctx, term, forceFreshFloor)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	previousFloor := max(a.state.AllocationFloor(), termFloor, a.state.PhaseDFloor())
-	if err := a.activateDurableMarkers(ctx, engine, previousFloor, activateCutover, activatePhaseD); err != nil {
-		return 0, err
+	commitPhaseD, err := a.activateDurableMarkers(ctx, engine, activateCutover, activatePhaseD)
+	if err != nil {
+		return 0, false, err
 	}
 	if err := verifyTSOLeaderTerm(ctx, engine, term, true); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return previousFloor, nil
+	return previousFloor, commitPhaseD, nil
 }
 
 func (a *RaftTSOAllocator) activateDurableMarkers(
 	ctx context.Context,
 	engine raftengine.Engine,
-	previousFloor uint64,
 	activateCutover bool,
 	activatePhaseD bool,
-) error {
+) (bool, error) {
 	if activateCutover && !a.state.CutoverActive() {
 		if err := a.commitCutover(ctx, engine); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if !activatePhaseD || a.state.PhaseDActive() {
-		return nil
+		return false, nil
 	}
 	if !a.state.CutoverActive() {
-		return errors.Wrap(ErrTSOPhaseDInactive, "phase D activation requires durable cutover")
+		return false, errors.Wrap(ErrTSOPhaseDInactive, "phase D activation requires durable cutover")
 	}
-	return a.commitPhaseD(ctx, engine, previousFloor)
+	return true, nil
 }
 
 func (a *RaftTSOAllocator) termCommitFloor(ctx context.Context, term uint64, forceFresh bool) (uint64, error) {
@@ -489,7 +565,7 @@ func (a *LeaderRoutedTSOAllocator) nextReservation(
 	requireReservation bool,
 ) (TSOReservation, error) {
 	var empty TSOReservation
-	if err := validateTSOBatchSize(n); err != nil {
+	if err := validateTSOMinimumWindow(min, n); err != nil {
 		return empty, err
 	}
 	ctx = nonNilTSOContext(ctx)
@@ -772,6 +848,17 @@ func isTransientTSORouteError(err error) bool {
 func validateTSOBatchSize(n int) error {
 	if n <= 0 || n > maxHLCBatchSize {
 		return errors.WithStack(ErrInvalidTSOBatchSize)
+	}
+	return nil
+}
+
+func validateTSOMinimumWindow(min uint64, n int) error {
+	if err := validateTSOBatchSize(n); err != nil {
+		return err
+	}
+	if min > ^uint64(0)-uint64(n) { //nolint:gosec // n is already positive and bounded.
+		return errors.Wrapf(ErrTxnCommitTSRequired,
+			"tso minimum %d cannot fit a %d-timestamp window", min, n)
 	}
 	return nil
 }

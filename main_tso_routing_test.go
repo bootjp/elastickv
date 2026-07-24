@@ -67,7 +67,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{floor: 42})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	decorated := kv.WithKeyVizLabel(startupGatedCoordinator{inner: coord}, keyviz.LabelRedis)
@@ -176,11 +176,13 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 
 	got, ok := kv.TimestampAllocatorThrough(gated)
 	require.True(t, ok)
-	require.Same(t, allocator, got)
+	require.IsType(t, startupGatedCoordinator{}, got)
+	_, err := got.Next(context.Background())
+	require.Error(t, err)
 	require.Len(t, internalTimestampOptions(gated), 1)
 
 	legacy := startupGatedCoordinator{inner: newMainTSOCoordinator(kv.NewHLC(), nil)}
-	require.Empty(t, internalTimestampOptions(legacy))
+	require.Len(t, internalTimestampOptions(legacy), 1)
 }
 
 func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainTSOEngine, map[uint64]*kv.ShardGroup) {
@@ -227,7 +229,9 @@ type mainTSOEngine struct {
 	tsoState  *kv.TSOStateMachine
 }
 
-type mainTSOFloorProvider struct{}
+type mainTSOFloorProvider struct {
+	floor uint64
+}
 
 type mainTimestampAllocator struct {
 	next uint64
@@ -237,8 +241,8 @@ func (a *mainTimestampAllocator) Next(context.Context) (uint64, error) {
 	return a.next, nil
 }
 
-func (mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
-	return 0, nil
+func (p mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
+	return p.floor, nil
 }
 
 func (e *mainTSOEngine) Propose(_ context.Context, payload []byte) (*raftengine.ProposalResult, error) {

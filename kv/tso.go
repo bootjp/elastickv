@@ -24,6 +24,9 @@ var (
 	ErrTSOTimestampInvalid   = errors.New("tso: timestamp is not a durable phase-D allocation")
 	ErrTSOTimestampPrePhaseD = errors.New("tso: timestamp predates phase D")
 	ErrTSOReadVoucherLimit   = errors.New("tso: applied read timestamp voucher limit reached")
+
+	errHLCLeaseRecoveryUnavailable = errors.New("hlc lease recovery unavailable")
+	errHLCLeaseRecoveryBlocked     = errors.New("hlc lease recovery blocked")
 )
 
 // TSOAllocator issues globally monotonic timestamps. NextBatch returns the
@@ -155,12 +158,13 @@ func DispatchWithReadTimestamp(
 	if reqs == nil || reqs.StartTS != readTimestamp.timestamp {
 		return nil, errors.WithStack(ErrTSOTimestampInvalid)
 	}
-	revoke, err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp)
+	preparedReadTimestamp, revoke, err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp)
 	if err != nil {
 		return nil, err
 	}
 	defer revoke()
-	resp, err := coord.Dispatch(ctx, reqs)
+	dispatchCtx := preparedReadTimestamp.WithDispatchVoucher(ctx)
+	resp, err := coord.Dispatch(dispatchCtx, reqs)
 	return resp, errors.WithStack(err)
 }
 
@@ -172,29 +176,34 @@ func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
 	return &appliedReadDispatchVoucher{ref: AppliedReadTimestampVoucherRef{id: id}}
 }
 
-func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (func(), error) {
+func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (ReadTimestamp, func(), error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	voucher, ok := coord.(AppliedReadTimestampVoucher)
 	if !ok {
-		return nil, errors.WithStack(ErrTSOProtocolUnsupported)
+		return ReadTimestamp{}, nil, errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	if err := voucher.VouchAppliedReadTimestamp(timestamp, v.ref); err != nil {
-		return nil, errors.WithStack(err)
+	preparedVoucher := newAppliedReadDispatchVoucher()
+	if err := voucher.VouchAppliedReadTimestamp(timestamp, preparedVoucher.ref); err != nil {
+		return ReadTimestamp{}, nil, errors.WithStack(err)
 	}
 	v.prepared++
 	revoke := func() {}
 	if revoker, ok := coord.(AppliedReadTimestampVoucherRevoker); ok {
-		ref := v.ref
+		ref := preparedVoucher.ref
 		revoke = func() {
 			revoker.RevokeAppliedReadTimestamp(timestamp, ref)
 		}
 	}
-	return revoke, nil
+	return ReadTimestamp{timestamp: timestamp, voucher: preparedVoucher}, revoke, nil
 }
 
 type tsoBatchAfterAllocator interface {
 	NextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error)
+}
+
+type hlcLeaseRecoverer interface {
+	RecoverHLCLease(context.Context) error
 }
 
 type timestampIssuer interface {
@@ -221,11 +230,8 @@ func NextTimestampThrough(ctx context.Context, coord Coordinator, label string) 
 	if coord == nil || coord.Clock() == nil {
 		return 1, nil
 	}
-	ts, err := coord.Clock().NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	recoverer, _ := coord.(hlcLeaseRecoverer)
+	return nextFencedWithRecovery(ctx, coord.Clock(), recoverer, label)
 }
 
 // NextTimestampAfterThrough allocates a timestamp strictly greater than
@@ -421,6 +427,67 @@ func nextTimestampAfterFallback(startTS uint64) (uint64, error) {
 	return nextTS, nil
 }
 
+func nextFencedWithRecovery(ctx context.Context, clock *HLC, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	ts, err := clock.NextFenced()
+	if err == nil {
+		return ts, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	ts, err = clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+func nextBatchFencedWithRecovery(ctx context.Context, clock *HLC, n int, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	base, err := clock.NextBatchFenced(n)
+	if err == nil {
+		return base, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	base, err = clock.NextBatchFenced(n)
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return base, nil
+}
+
+func wrapHLCLeaseRecoveryFailure(err, recoverErr error, label string) error {
+	return errors.Join(
+		errors.Wrapf(err, "%s: on-demand HLC lease renewal failed", label),
+		errors.Wrap(recoverErr, "hlc lease recovery"),
+	)
+}
+
+func hlcRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, dispatchLeaderRetryBudget)
+}
+
+func hlcCeilingExpired(clock *HLC) bool {
+	if clock == nil {
+		return false
+	}
+	ceiling := clock.PhysicalCeiling()
+	return ceiling > 0 && time.Now().UnixMilli() >= ceiling
+}
+
 type tsoCoordinator interface {
 	IsLeader() bool
 	Clock() *HLC
@@ -479,8 +546,8 @@ func (a *LocalTSOAllocator) NextBatchAfter(ctx context.Context, n int, min uint6
 }
 
 func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error) {
-	if n <= 0 {
-		return 0, errors.WithStack(ErrInvalidTSOBatchSize)
+	if err := validateTSOMinimumWindow(min, n); err != nil {
+		return 0, err
 	}
 	if err := a.waitLeader(ctx); err != nil {
 		return 0, err
@@ -492,8 +559,8 @@ func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint6
 	if min > 0 {
 		clock.Observe(min)
 	}
-	base, err := clock.NextBatchFenced(n)
-	return base, errors.Wrap(err, "tso next batch")
+	recoverer, _ := a.coord.(hlcLeaseRecoverer)
+	return nextBatchFencedWithRecovery(ctx, clock, n, recoverer, "tso next batch")
 }
 
 func (a *LocalTSOAllocator) IsLeader() bool {

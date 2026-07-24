@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,6 +27,8 @@ type DistributionServer struct {
 	coordinator        kv.Coordinator
 	timestampAllocator kv.TSOAllocator
 	readTracker        *kv.ActiveTimestampTracker
+	watchInterval      time.Duration
+	watchLeader        func() bool
 	fsObserver         DistributionFilesystemObserver
 	reloadRetry        struct {
 		attempts int
@@ -85,6 +88,25 @@ func WithCatalogReloadRetryPolicy(attempts int, interval time.Duration) Distribu
 	}
 }
 
+// WithCatalogWatchInterval sets how often an idle catalog stream checks for a
+// newly committed version.
+func WithCatalogWatchInterval(interval time.Duration) DistributionServerOption {
+	return func(s *DistributionServer) {
+		if interval > 0 {
+			s.watchInterval = interval
+		}
+	}
+}
+
+// WithCatalogWatchLeaderCheck restricts long-lived catalog streams to the
+// current default-group leader. Existing callers without a check retain the
+// package-level server behavior used by tests and embedded deployments.
+func WithCatalogWatchLeaderCheck(check func() bool) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.watchLeader = check
+	}
+}
+
 const (
 	childRouteCount      = 2
 	splitMutationOpCount = childRouteCount + 3
@@ -93,23 +115,26 @@ const (
 var (
 	defaultCatalogReloadRetryAttempts = 20
 	defaultCatalogReloadRetryInterval = 10 * time.Millisecond
+	defaultCatalogWatchInterval       = 100 * time.Millisecond
 
-	errDistributionCatalogNotConfigured = errors.New("route catalog is not configured")
-	errDistributionUnknownRoute         = errors.New("unknown route")
-	errDistributionInvalidSplitKey      = errors.New("invalid split key")
-	errDistributionSplitKeyAtBoundary   = errors.New("split key at route boundary")
-	errDistributionCatalogConflict      = errors.New("catalog version conflict")
-	errDistributionRouteIDOverflow      = errors.New("route id overflow")
-	errDistributionNotLeader            = errors.New("not leader for distribution catalog")
-	errDistributionCoordinatorRequired  = errors.New("distribution coordinator is not configured")
-	errDistributionEngineNotConfigured  = errors.New("distribution engine is not configured")
+	errDistributionCatalogNotConfigured   = errors.New("route catalog is not configured")
+	errDistributionUnknownRoute           = errors.New("unknown route")
+	errDistributionInvalidSplitKey        = errors.New("invalid split key")
+	errDistributionSplitKeyAtBoundary     = errors.New("split key at route boundary")
+	errDistributionCatalogConflict        = errors.New("catalog version conflict")
+	errDistributionRouteIDOverflow        = errors.New("route id overflow")
+	errDistributionNotLeader              = errors.New("not leader for distribution catalog")
+	errDistributionCoordinatorRequired    = errors.New("distribution coordinator is not configured")
+	errDistributionEngineNotConfigured    = errors.New("distribution engine is not configured")
+	errDistributionCatalogMutationInvalid = errors.New("catalog store mutation is invalid")
 )
 
 // NewDistributionServer creates a new server.
 func NewDistributionServer(e *distribution.Engine, catalog *distribution.CatalogStore, opts ...DistributionServerOption) *DistributionServer {
 	s := &DistributionServer{
-		engine:  e,
-		catalog: catalog,
+		engine:        e,
+		catalog:       catalog,
+		watchInterval: defaultCatalogWatchInterval,
 	}
 	s.reloadRetry.attempts = defaultCatalogReloadRetryAttempts
 	s.reloadRetry.interval = defaultCatalogReloadRetryInterval
@@ -329,6 +354,164 @@ func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesR
 	}, nil
 }
 
+// GetCatalogCapabilities negotiates the durable delta-watch protocol.
+func (s *DistributionServer) GetCatalogCapabilities(ctx context.Context, _ *pb.CatalogCapabilitiesRequest) (*pb.CatalogCapabilitiesResponse, error) {
+	if s.catalog == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	version, err := s.catalog.Version(ctx)
+	if err != nil {
+		return nil, grpcStatusErrorf(codes.Internal, "load catalog version: %v", err)
+	}
+	floor, err := s.catalog.DeltaFloor(ctx)
+	if err != nil {
+		return nil, grpcStatusErrorf(codes.Internal, "load catalog delta floor: %v", err)
+	}
+	return &pb.CatalogCapabilitiesResponse{
+		SupportedProtocolVersions: []uint32{distribution.CatalogWatchProtocolVersion},
+		CurrentVersion:            version,
+		OldestDeltaVersion:        floor,
+		MaxBatchSize:              distribution.MaxCatalogDeltaBatchSize,
+	}, nil
+}
+
+// WatchCatalog streams contiguous deltas and emits a snapshot reset when the
+// requested reconnect cursor predates retained history.
+func (s *DistributionServer) WatchCatalog(req *pb.CatalogWatchRequest, stream pb.Distribution_WatchCatalogServer) error {
+	config, err := s.catalogWatchConfig(req)
+	if err != nil {
+		return err
+	}
+	for {
+		if s.watchLeader != nil && !s.watchLeader() {
+			return grpcStatusError(codes.Unavailable, "catalog watch requires the catalog-group leader")
+		}
+		nextCursor, sent, err := s.sendCatalogChanges(stream, config.cursor, config.batchSize)
+		if err != nil {
+			return err
+		}
+		config.cursor = nextCursor
+		if sent {
+			continue
+		}
+		stop, err := waitCatalogStream(stream.Context(), config.interval)
+		if err != nil {
+			return err
+		}
+		if stop {
+			return nil
+		}
+	}
+}
+
+type catalogWatchConfig struct {
+	cursor    uint64
+	batchSize int
+	interval  time.Duration
+}
+
+func (s *DistributionServer) catalogWatchConfig(req *pb.CatalogWatchRequest) (catalogWatchConfig, error) {
+	if s.catalog == nil {
+		return catalogWatchConfig{}, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
+	}
+	if req.GetProtocolVersion() != distribution.CatalogWatchProtocolVersion {
+		return catalogWatchConfig{}, grpcStatusErrorf(codes.FailedPrecondition, "unsupported catalog watch protocol %d", req.GetProtocolVersion())
+	}
+	batchSize := int(req.GetMaxBatchSize())
+	if batchSize <= 0 {
+		batchSize = distribution.DefaultCatalogDeltaBatchSize
+	}
+	if batchSize > distribution.MaxCatalogDeltaBatchSize {
+		batchSize = distribution.MaxCatalogDeltaBatchSize
+	}
+	interval := s.watchInterval
+	if interval <= 0 {
+		interval = defaultCatalogWatchInterval
+	}
+	return catalogWatchConfig{cursor: req.GetAfterVersion(), batchSize: batchSize, interval: interval}, nil
+}
+
+func (s *DistributionServer) sendCatalogChanges(
+	stream pb.Distribution_WatchCatalogServer,
+	cursor uint64,
+	batchSize int,
+) (uint64, bool, error) {
+	changes, err := s.catalog.ChangesSince(stream.Context(), cursor, batchSize)
+	if err != nil {
+		if errors.Is(err, distribution.ErrCatalogDeltaVersionFuture) {
+			return cursor, false, grpcStatusError(codes.InvalidArgument, err.Error())
+		}
+		return cursor, false, grpcStatusErrorf(codes.Internal, "read catalog changes: %v", err)
+	}
+	if changes.Reset != nil {
+		return s.sendCatalogReset(stream, changes.Reset)
+	}
+	return sendCatalogDeltas(stream, cursor, changes.Deltas)
+}
+
+func (s *DistributionServer) sendCatalogReset(
+	stream pb.Distribution_WatchCatalogServer,
+	snapshot *distribution.CatalogSnapshot,
+) (uint64, bool, error) {
+	event := &pb.CatalogWatchEvent{Payload: &pb.CatalogWatchEvent_Snapshot{
+		Snapshot: &pb.CatalogSnapshotReset{
+			Version: snapshot.Version,
+			Routes:  toProtoRouteDescriptors(snapshot.Routes),
+		},
+	}}
+	if err := stream.Send(event); err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return snapshot.Version, true, nil
+}
+
+func sendCatalogDeltas(
+	stream pb.Distribution_WatchCatalogServer,
+	cursor uint64,
+	deltas []distribution.CatalogDelta,
+) (uint64, bool, error) {
+	for _, delta := range deltas {
+		event := &pb.CatalogWatchEvent{Payload: &pb.CatalogWatchEvent_Delta{
+			Delta: toProtoCatalogDelta(delta),
+		}}
+		if err := stream.Send(event); err != nil {
+			return cursor, false, errors.WithStack(err)
+		}
+		cursor = delta.Version
+	}
+	return cursor, len(deltas) > 0, nil
+}
+
+func waitCatalogStream(ctx context.Context, interval time.Duration) (bool, error) {
+	err := waitWithContext(ctx, interval)
+	if errors.Is(err, context.Canceled) || status.Code(errors.Cause(err)) == codes.Canceled {
+		return true, nil
+	}
+	return false, err
+}
+
+func toProtoCatalogDelta(delta distribution.CatalogDelta) *pb.CatalogDeltaRecord {
+	mutations := make([]*pb.CatalogDeltaMutation, 0, len(delta.Mutations))
+	for _, mutation := range delta.Mutations {
+		op := pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_DELETE
+		var route *pb.RouteDescriptor
+		if mutation.Op == distribution.CatalogMutationUpsert {
+			op = pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_UPSERT
+			route = toProtoRouteDescriptor(mutation.Route)
+		}
+		mutations = append(mutations, &pb.CatalogDeltaMutation{
+			Op:      op,
+			RouteId: mutation.RouteID,
+			Route:   route,
+		})
+	}
+	return &pb.CatalogDeltaRecord{
+		PreviousVersion: delta.PreviousVersion,
+		Version:         delta.Version,
+		Mutations:       mutations,
+	}
+}
+
 // SplitRange splits a route into two child routes in the same raft group.
 func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeRequest) (*pb.SplitRangeResponse, error) {
 	// SplitRange performs a read-modify-write cycle across catalog and engine.
@@ -462,16 +645,42 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, errDistributionRouteIDOverflow.Error())
 	}
 	nextRouteID := right.RouteID + 1
+	readTS := readTimestamp.Timestamp()
+	commitTS, err := kv.NextTimestampAfterThrough(ctx, s.coordinator, readTS, "split range: allocate commitTS")
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "allocate split commit timestamp: %v", err)
+	}
+	left.SplitAtHLC = commitTS
+	right.SplitAtHLC = commitTS
 
 	ops, err := buildCatalogSplitOps(parentID, left, right, nextVersion, nextRouteID)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build split mutations: %v", err)
 	}
+	delta := distribution.CatalogDelta{
+		PreviousVersion: expectedVersion,
+		Version:         nextVersion,
+		Mutations: []distribution.CatalogRouteMutation{
+			{Op: distribution.CatalogMutationDelete, RouteID: parentID},
+			{Op: distribution.CatalogMutationUpsert, RouteID: left.RouteID, Route: left},
+			{Op: distribution.CatalogMutationUpsert, RouteID: right.RouteID, Route: right},
+		},
+	}
+	deltaMutations, err := s.catalog.BuildDeltaMutationsAt(ctx, readTS, delta)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build catalog delta mutations: %v", err)
+	}
+	deltaOps, err := catalogStoreMutationsToOps(deltaMutations)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "convert catalog delta mutations: %v", err)
+	}
+	ops = append(ops, deltaOps...)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	resp, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-		Elems:   ops,
-		IsTxn:   true,
-		StartTS: readTimestamp.Timestamp(),
+		Elems:    ops,
+		IsTxn:    true,
+		StartTS:  readTS,
+		CommitTS: commitTS,
 	})
 	if err != nil {
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
@@ -480,6 +689,30 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "split commit timestamp missing")
 	}
 	return s.loadCatalogSnapshotAtVersion(ctx, resp.CommitTS, nextVersion)
+}
+
+func catalogStoreMutationsToOps(mutations []*store.KVPairMutation) ([]*kv.Elem[kv.OP], error) {
+	ops := make([]*kv.Elem[kv.OP], 0, len(mutations))
+	for _, mutation := range mutations {
+		if mutation == nil {
+			return nil, errors.WithStack(errDistributionCatalogMutationInvalid)
+		}
+		var op kv.OP
+		switch mutation.Op {
+		case store.OpTypePut:
+			op = kv.Put
+		case store.OpTypeDelete:
+			op = kv.Del
+		default:
+			return nil, errors.Wrapf(errDistributionCatalogMutationInvalid, "unknown operation %d", mutation.Op)
+		}
+		ops = append(ops, &kv.Elem[kv.OP]{
+			Op:    op,
+			Key:   distribution.CloneBytes(mutation.Key),
+			Value: distribution.CloneBytes(mutation.Value),
+		})
+	}
+	return ops, nil
 }
 
 func buildCatalogSplitOps(

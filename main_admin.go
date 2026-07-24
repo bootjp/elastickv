@@ -154,7 +154,7 @@ func prepareAdminFromFlags(
 // design returned true on any local-group leadership; in a multi-group
 // deployment that could surface 200 on a node leading only a non-
 // default group while admin writes there still 503'd or forwarded.
-// Codex P1 on PR #689 caught this; using the coordinator keeps the
+// P1 review on PR #689 caught this; using the coordinator keeps the
 // healthz contract aligned with the actual admin-write leader.
 //
 // Returns nil when no coordinator is wired so the router answers
@@ -849,7 +849,7 @@ func translateAdminItemsError(err error) error {
 		// adapter's isVerifiedDynamoLeader check and the actual
 		// Raft propose). Map to the Items not-leader sentinel so the
 		// handler returns 503 + Retry-After: 1 and the SPA's retry
-		// contract stays intact (Codex P2 on PR #813 — the table-side
+		// contract stays intact (P2 review on PR #813 — the table-side
 		// translator already does this; the item-side translator
 		// initially shipped without the parallel branch).
 		return admin.ErrItemsNotLeader
@@ -939,7 +939,7 @@ func translateAdminTablesError(err error) error {
 		// dispatch — the kv coordinator can drop leadership in
 		// that window and the resulting transient error should
 		// surface as 503 leader_unavailable + Retry-After: 1
-		// rather than a generic 500. Codex P2 on PR #634.
+		// rather than a generic 500. P2 review on PR #634.
 		return admin.ErrTablesNotLeader
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
@@ -948,9 +948,10 @@ func translateAdminTablesError(err error) error {
 
 // isLeaderChurnError reports whether err looks like one of the
 // transient leader sentinels the kv coordinator and adapter
-// internals emit during a leadership change. The set mirrors the
-// closed list in kv.leaderErrorPhrases — keep them in sync if a
-// new sentinel is added on the kv side.
+// internals emit during a leadership change. The suffix set mirrors the
+// closed list in kv.leaderErrorPhrases and also includes availability
+// sentinels that intentionally bypass coordinator retry, such as the
+// leader-proxy circuit.
 //
 // Phrase matching uses HasSuffix (not Contains) on the standard
 // canonical strings because every kv-internal sentinel emits the
@@ -958,7 +959,7 @@ func translateAdminTablesError(err error) error {
 // "raft engine: not leader", "dispatch failed: leader not found").
 // A user-supplied string that happens to contain a leader phrase
 // in the MIDDLE of an unrelated error message therefore does not
-// false-positive — Codex P2 on PR #634 flagged the original
+// false-positive — P2 review on PR #634 flagged the original
 // strings.Contains form for misclassifying validation messages
 // like "conflicting attribute type for <user-name>" when the
 // name itself was "not leader".
@@ -967,6 +968,7 @@ func isLeaderChurnError(err error) bool {
 		return false
 	}
 	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, kv.ErrLeaderProxyCircuitOpen) ||
 		errors.Is(err, adapter.ErrNotLeader) ||
 		errors.Is(err, adapter.ErrLeaderNotFound) {
 		return true
@@ -975,7 +977,8 @@ func isLeaderChurnError(err error) bool {
 	return strings.HasSuffix(msg, "not leader") ||
 		strings.HasSuffix(msg, "leader not found") ||
 		strings.HasSuffix(msg, "leadership lost") ||
-		strings.HasSuffix(msg, "leadership transfer in progress")
+		strings.HasSuffix(msg, "leadership transfer in progress") ||
+		strings.HasSuffix(msg, "leader proxy circuit open")
 }
 
 func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
@@ -1212,7 +1215,7 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 			// HTTP/gRPC handler running on its own goroutine
 			// cannot race rt.Close() clearing the field on
 			// shutdown. Same race class as the keyviz
-			// leader-term publisher (Codex P2 on PR #720).
+			// leader-term publisher (P2 review on PR #720).
 			engine := rt.snapshotEngine()
 			if engine == nil {
 				continue

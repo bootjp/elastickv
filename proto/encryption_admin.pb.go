@@ -191,6 +191,9 @@ func (x *CapabilityReport) GetLocalEpoch() uint32 {
 // SidecarStateReport is the §5.5 compaction-fallback RPC. Served on
 // every node but the cutover-recovery flow only consults the
 // leader's response. wrapped_deks_by_id covers every unretired DEK.
+// Because this request is Empty, writer_registry_for_caller is the
+// server's local-node projection; caller-specific follower repair
+// uses ResyncSidecarRequest.caller_full_node_id.
 type SidecarStateReport struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	WrappedDeksById          map[uint32][]byte      `protobuf:"bytes,1,rep,name=wrapped_deks_by_id,json=wrappedDeksById,proto3" json:"wrapped_deks_by_id,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -745,9 +748,9 @@ type ResyncSidecarResponse struct {
 	// (dek_id, last_seen_local_epoch) for the calling node so the
 	// follower can re-derive its §4.1 local_epoch monotonically.
 	// Values MUST be <= 0xFFFF and the decode site MUST enforce
-	// that bound. Empty until Stage 7 wires the registry; the
-	// §5.5 recovery flow tolerates an empty map because a node
-	// recovering before any DEK exists has nothing to re-derive.
+	// that bound. Missing rows are omitted; an empty map means the
+	// leader has no recorded local_epoch for this caller under the
+	// returned DEKs.
 	WriterRegistryForCaller map[uint32]uint32 `protobuf:"bytes,5,rep,name=writer_registry_for_caller,json=writerRegistryForCaller,proto3" json:"writer_registry_for_caller,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
