@@ -643,6 +643,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 	key := []byte("txn:command-specific-fence-ranges")
 	otherKey := []byte("txn:command-specific-fence-ranges-other")
 	field := []byte("field-a")
+	member := []byte("member-a")
 	listTypeRoute := []byte("list-type-route")
 	listClaimRoute := []byte("list-claim-route")
 	hashFieldRoute := []byte("hash-field-route")
@@ -655,6 +656,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 	streamEntryRoute := []byte("stream-entry-route")
 	otherListTypeRoute := []byte("other-list-type-route")
 	exactFieldKey := store.HashFieldKey(key, field)
+	exactZSetMemberKey := store.ZSetMemberKey(key, member)
 	st := &redisReadFenceRangeStore{
 		MVCCStore: store.NewMVCCStore(),
 		rangeKeysByStart: map[string][][]byte{
@@ -673,18 +675,29 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 	}
 	coord := newVerifyHookCoordinator(st)
 	groupIDsByKey := map[string]uint64{
-		string(listTypeRoute):      101,
-		string(listClaimRoute):     102,
-		string(hashFieldRoute):     103,
-		string(hashDeltaRoute):     104,
-		string(setMemberRoute):     105,
-		string(setDeltaRoute):      106,
-		string(zsetMemberRoute):    107,
-		string(zsetScoreRoute):     108,
-		string(zsetDeltaRoute):     109,
-		string(streamEntryRoute):   110,
-		string(otherListTypeRoute): 111,
-		string(exactFieldKey):      112,
+		string(listTypeRoute):                      101,
+		string(listClaimRoute):                     102,
+		string(hashFieldRoute):                     103,
+		string(hashDeltaRoute):                     104,
+		string(setMemberRoute):                     105,
+		string(setDeltaRoute):                      106,
+		string(zsetMemberRoute):                    107,
+		string(zsetScoreRoute):                     108,
+		string(zsetDeltaRoute):                     109,
+		string(streamEntryRoute):                   110,
+		string(otherListTypeRoute):                 111,
+		string(exactFieldKey):                      112,
+		string(exactZSetMemberKey):                 113,
+		string(store.ListMetaDeltaScanPrefix(key)): 201,
+		string(store.ListClaimScanPrefix(key)):     202,
+		string(store.HashFieldScanPrefix(key)):     203,
+		string(store.HashMetaDeltaScanPrefix(key)): 204,
+		string(store.SetMemberScanPrefix(key)):     205,
+		string(store.SetMetaDeltaScanPrefix(key)):  206,
+		string(store.ZSetMemberScanPrefix(key)):    207,
+		string(store.ZSetScoreScanPrefix(key)):     208,
+		string(store.ZSetMetaDeltaScanPrefix(key)): 209,
+		string(store.StreamEntryScanPrefix(key)):   210,
 	}
 	coord.groupForKey = func(got []byte) uint64 {
 		if gid, ok := groupIDsByKey[string(got)]; ok {
@@ -730,15 +743,57 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		redisStrKey(key),
 		listTypeRoute,
 		listClaimRoute,
+		hashFieldRoute,
+		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetDeltaRoute,
 	}, lrangeKeys)
+
+	rpushKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdRPush), key, []byte("value")},
+	}})
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listTypeRoute,
+		listClaimRoute,
+		hashFieldRoute,
+		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetDeltaRoute,
+	}, rpushKeys)
+
+	zincrbyKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), member},
+	}})
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listTypeRoute,
+		hashFieldRoute,
+		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetScoreRoute,
+		zsetDeltaRoute,
+		exactZSetMemberKey,
+	}, zincrbyKeys)
 
 	hsetKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdHSet), key, field, []byte("value")},
 	}})
 	require.ElementsMatch(t, [][]byte{
 		redisStrKey(key),
+		listTypeRoute,
 		hashFieldRoute,
 		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetDeltaRoute,
 		exactFieldKey,
 	}, hsetKeys)
 }

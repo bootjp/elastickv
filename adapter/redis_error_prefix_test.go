@@ -184,9 +184,28 @@ func TestHandleProxyTxnTerminalExecError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
+		want string
 	}{
-		{name: "typed", err: errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)},
-		{name: "decoded RESP", err: errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error())},
+		{
+			name: "ambiguous route change typed",
+			err:  errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt),
+			want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+		},
+		{
+			name: "ambiguous route change decoded RESP",
+			err:  errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error()),
+			want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+		},
+		{
+			name: "split leader typed",
+			err:  errors.WithStack(errRedisExecSplitShardLeaders),
+			want: errRedisExecSplitShardLeaders.Error(),
+		},
+		{
+			name: "split leader decoded RESP",
+			err:  errors.New(errRedisExecSplitShardLeaders.Error()),
+			want: errRedisExecSplitShardLeaders.Error(),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -195,7 +214,7 @@ func TestHandleProxyTxnTerminalExecError(t *testing.T) {
 			if !handled {
 				t.Fatal("handleProxyTxnError returned false")
 			}
-			if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
+			if c.lastErr != tc.want {
 				t.Fatalf("last error = %q", c.lastErr)
 			}
 			if c.wroteArray {
@@ -255,9 +274,28 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 		for _, tc := range []struct {
 			name string
 			err  error
+			want string
 		}{
-			{name: "typed", err: errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)},
-			{name: "decoded RESP", err: errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error())},
+			{
+				name: "ambiguous route change typed",
+				err:  errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt),
+				want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+			},
+			{
+				name: "ambiguous route change decoded RESP",
+				err:  errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error()),
+				want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+			},
+			{
+				name: "split leader typed",
+				err:  errors.WithStack(errRedisExecSplitShardLeaders),
+				want: errRedisExecSplitShardLeaders.Error(),
+			},
+			{
+				name: "split leader decoded RESP",
+				err:  errors.New(errRedisExecSplitShardLeaders.Error()),
+				want: errRedisExecSplitShardLeaders.Error(),
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
@@ -268,7 +306,7 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 				if !handled {
 					t.Fatal("handleProxyTxnCommandError returned false")
 				}
-				if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
+				if c.lastErr != tc.want {
 					t.Fatalf("last error = %q", c.lastErr)
 				}
 			})

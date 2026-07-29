@@ -71,34 +71,41 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 }
 
 func redisTxnReadFenceKeys(userKey []byte) [][]byte {
+	keys := append([][]byte{}, redisTxnReadFencePointKeys(userKey)...)
+	keys = append(keys,
+		store.ListMetaDeltaScanPrefix(userKey),
+		store.ListClaimScanPrefix(userKey),
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+		store.StreamEntryScanPrefix(userKey),
+	)
+	return keys
+}
+
+func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
 	keys := [][]byte{
 		redisStrKey(userKey),
 		redisHLLKey(userKey),
 		redisTTLKey(userKey),
 		listMetaKey(userKey),
 		listItemKey(userKey, 0),
-		store.ListMetaDeltaScanPrefix(userKey),
-		store.ListClaimScanPrefix(userKey),
 		redisTxnWideListFenceKey(userKey),
 		redisHashKey(userKey),
 		store.HashMetaKey(userKey),
-		store.HashFieldScanPrefix(userKey),
-		store.HashMetaDeltaScanPrefix(userKey),
 		redisTxnWideHashFenceKey(userKey),
 		redisSetKey(userKey),
 		store.SetMetaKey(userKey),
-		store.SetMemberScanPrefix(userKey),
-		store.SetMetaDeltaScanPrefix(userKey),
 		redisTxnWideSetFenceKey(userKey),
 		redisZSetKey(userKey),
 		store.ZSetMetaKey(userKey),
-		store.ZSetMemberScanPrefix(userKey),
-		store.ZSetScoreScanPrefix(userKey),
-		store.ZSetMetaDeltaScanPrefix(userKey),
 		redisTxnWideZSetFenceKey(userKey),
 		redisStreamKey(userKey),
 		store.StreamMetaKey(userKey),
-		store.StreamEntryScanPrefix(userKey),
 	}
 	if redisLegacyBareReadFenceAllowed(userKey) {
 		keys = append(keys, userKey)
@@ -114,9 +121,13 @@ func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
 }
 
 func (r *RedisServer) redisTxnReadFenceKeysForRanges(userKey []byte, ranges []redisReadFenceRange) [][]byte {
-	keys := append([][]byte{}, redisTxnReadFenceKeys(userKey)...)
+	keys := append([][]byte{}, redisTxnReadFencePointKeys(userKey)...)
 	for _, readRange := range ranges {
-		keys = append(keys, r.redisReadFenceRangeGroupKeys(readRange.start, readRange.end)...)
+		rangeGroupKeys := r.redisReadFenceRangeGroupKeys(readRange.start, readRange.end)
+		if len(rangeGroupKeys) == 0 {
+			rangeGroupKeys = [][]byte{readRange.start}
+		}
+		keys = append(keys, rangeGroupKeys...)
 	}
 	return keys
 }
@@ -284,16 +295,21 @@ func redisCommandReadFenceRanges(cmdName string, userKey []byte) []redisReadFenc
 	case cmdGet, cmdExists:
 		return redisTypeDetectionReadFenceRanges(userKey)
 	case cmdHSet, cmdHMSet:
-		return redisHashReadFenceRanges(userKey)
+		return redisTypeCheckedReadFenceRanges(userKey, redisHashReadFenceRanges(userKey))
 	case cmdRPush, cmdLRange:
-		return redisListReadFenceRanges(userKey)
+		return redisTypeCheckedReadFenceRanges(userKey, redisListReadFenceRanges(userKey))
 	case cmdZIncrBy:
-		return redisZSetReadFenceRanges(userKey)
+		return redisTypeCheckedReadFenceRanges(userKey, redisZSetReadFenceRanges(userKey))
 	case cmdSet, cmdDel, cmdIncr, cmdExpire, cmdPExpire:
 		return redisTxnReadFenceRanges(userKey)
 	default:
 		return nil
 	}
+}
+
+func redisTypeCheckedReadFenceRanges(userKey []byte, ranges []redisReadFenceRange) []redisReadFenceRange {
+	typeRanges := redisTypeDetectionReadFenceRanges(userKey)
+	return append(typeRanges, ranges...)
 }
 
 func redisCommandExactReadFenceKeys(cmd redcon.Command) [][]byte {

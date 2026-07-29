@@ -187,9 +187,13 @@ func isTerminalProxyTxnError(err error) bool {
 }
 
 func isRedisExecTerminalProxyError(err error) bool {
+	return isExactRedisExecTerminalProxyError(err, errRedisExecRouteChangedAfterAmbiguousAttempt) ||
+		isExactRedisExecTerminalProxyError(err, errRedisExecSplitShardLeaders)
+}
+
+func isExactRedisExecTerminalProxyError(err error, sentinel error) bool {
 	return err != nil &&
-		(errors.Is(err, errRedisExecRouteChangedAfterAmbiguousAttempt) ||
-			err.Error() == errRedisExecRouteChangedAfterAmbiguousAttempt.Error())
+		(errors.Is(err, sentinel) || err.Error() == sentinel.Error())
 }
 
 // writeProxyCmdsResult writes an EXEC-style array reply for the given pipeline
