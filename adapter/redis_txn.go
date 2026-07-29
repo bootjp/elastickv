@@ -38,6 +38,33 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
 }
 
+func (r *RedisServer) verifyQueuedCommandLeaders(ctx context.Context, queue []redcon.Command) error {
+	if r.coordinator == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(queue))
+	for _, cmd := range queue {
+		if len(cmd.Args) == 0 {
+			continue
+		}
+		meta, ok := redisCommandTable[strings.ToUpper(string(cmd.Args[0]))]
+		if !ok {
+			continue
+		}
+		for _, key := range redisCommandGetKeys(meta, cmd.Args) {
+			keyID := string(key)
+			if _, ok := seen[keyID]; ok {
+				continue
+			}
+			seen[keyID] = struct{}{}
+			if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+	}
+	return nil
+}
+
 // MULTI/EXEC/DISCARD handling
 func (r *RedisServer) multi(conn redcon.Conn, _ redcon.Command) {
 	state := getConnState(conn)
@@ -2379,6 +2406,10 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
+		if err := r.verifyQueuedCommandLeaders(dispatchCtx, queue); err != nil {
+			return err
+		}
+
 		startTS := r.txnStartTS()
 		readPin := r.pinReadTS(startTS)
 		defer readPin.Release()
@@ -2593,6 +2624,10 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 // from runTransactionWithDedup to keep that loop under the cyclop
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
+	if err := r.verifyQueuedCommandLeaders(dispatchCtx, queue); err != nil {
+		return nil, nil, err
+	}
+
 	startTS := r.txnStartTS()
 	readPin := r.pinReadTS(startTS)
 	defer readPin.Release()

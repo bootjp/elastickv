@@ -42,6 +42,34 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 	}
 }
 
+type verifyHookCoordinator struct {
+	*localAdapterCoordinator
+	verifyForKey func(context.Context, []byte) error
+	verifyCalls  int
+}
+
+func newVerifyHookCoordinator(st store.MVCCStore) *verifyHookCoordinator {
+	return &verifyHookCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st)}
+}
+
+func (c *verifyHookCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
+	c.verifyCalls++
+	if c.verifyForKey != nil {
+		return c.verifyForKey(ctx, key)
+	}
+	return c.localAdapterCoordinator.VerifyLeaderForKey(ctx, key)
+}
+
+func seedRedisListAt(t *testing.T, st store.MVCCStore, key []byte, ts uint64, values ...string) {
+	t.Helper()
+	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: int64(len(values))})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, ts, 0))
+	for i, value := range values {
+		require.NoError(t, st.PutAt(context.Background(), listItemKey(key, int64(i)), []byte(value), ts, 0))
+	}
+}
+
 func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
 	for _, elem := range elems {
 		if elem != nil && string(elem.Key) == string(want) {
@@ -115,6 +143,75 @@ func requireReadKeysMatch(t *testing.T, got [][]byte, want [][]byte) {
 		wantSet[string(key)] = struct{}{}
 	}
 	require.Equal(t, wantSet, gotSet)
+}
+
+func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	key := []byte("list:leader-fence-lrange")
+	coord := newVerifyHookCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	seeded := false
+	coord.verifyForKey = func(_ context.Context, got []byte) error {
+		require.Equal(t, key, got)
+		if !seeded {
+			seedRedisListAt(t, st, key, 10, "v1")
+			seeded = true
+		}
+		return nil
+	}
+
+	got, err := server.rangeList(context.Background(), key, []byte("0"), []byte("-1"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"v1"}, got)
+	require.Equal(t, 1, coord.verifyCalls)
+}
+
+func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		dedup bool
+	}{
+		{name: "direct", dedup: false},
+		{name: "dedup", dedup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewMVCCStore()
+			key := []byte("list:leader-fence-exec:" + tc.name)
+			coord := newVerifyHookCoordinator(st)
+			server := &RedisServer{
+				store:            st,
+				coordinator:      coord,
+				scriptCache:      map[string]string{},
+				onePhaseTxnDedup: tc.dedup,
+			}
+
+			seeded := false
+			coord.verifyForKey = func(_ context.Context, got []byte) error {
+				require.Equal(t, key, got)
+				if !seeded {
+					seedRedisListAt(t, st, key, 10, "v1")
+					seeded = true
+				}
+				return nil
+			}
+
+			results, err := server.runTransaction([]redcon.Command{{
+				Args: [][]byte{[]byte(cmdLRange), key, []byte("0"), []byte("-1")},
+			}})
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			require.Equal(t, resultArray, results[0].typ)
+			require.Equal(t, []string{"v1"}, results[0].arr)
+			require.Equal(t, 1, coord.verifyCalls)
+		})
+	}
 }
 
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a

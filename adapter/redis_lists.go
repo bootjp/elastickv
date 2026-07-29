@@ -713,6 +713,14 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 		return r.proxyLRange(key, startRaw, endRaw)
 	}
 
+	// PR #749 follow-up: pass the per-call dispatch ctx so a stalled
+	// VerifyLeaderForKey honours the caller's deadline rather than the
+	// long-lived handlerContext + verifyLeaderEngineCtx fallback. Same
+	// shape as keys() / FLUSHDB.
+	if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
@@ -723,14 +731,6 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 	}
 	if typ != redisTypeList {
 		return nil, wrongTypeError()
-	}
-
-	// PR #749 follow-up: pass the per-call dispatch ctx so a stalled
-	// VerifyLeaderForKey honours the caller's deadline rather than the
-	// long-lived handlerContext + verifyLeaderEngineCtx fallback. Same
-	// shape as keys() / FLUSHDB.
-	if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
-		return nil, errors.WithStack(err)
 	}
 
 	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
