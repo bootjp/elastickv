@@ -20,11 +20,17 @@ const (
 // this internal encoding; normal catalog versions are far below this boundary.
 const ObservedRouteVersionZero = ^uint64(0)
 
+// observedRouteVersionZeroWireEncodingEnabled stays disabled until every Raft
+// member advertises support for ObservedRouteVersionZero. Mixed-version groups
+// must keep literal zero on the wire so old followers do not treat the sentinel
+// as an impossibly new catalog version and diverge from a new leader.
+const observedRouteVersionZeroWireEncodingEnabled = false
+
 // EncodeObservedRouteVersion converts a tracked catalog version into the wire
-// value carried by OperationGroup. A caller that leaves ObservedRouteVersion at
-// literal zero is still unpinned.
+// value carried by OperationGroup. Version zero is left as the legacy unpinned
+// zero until the version-zero sentinel is capability-gated across Raft members.
 func EncodeObservedRouteVersion(version uint64) uint64 {
-	if version == 0 {
+	if version == 0 && observedRouteVersionZeroWireEncodingEnabled {
 		return ObservedRouteVersionZero
 	}
 	return version
@@ -80,9 +86,9 @@ type OperationGroup[T OP] struct {
 	ReadKeys [][]byte
 	// ObservedRouteVersion is the encoded durable catalog version this
 	// transaction's read set was captured at (typically set on BeginTxn
-	// from distribution.Engine.Version()). Zero means "unpinned"; a real
-	// version-0 observation is encoded as ObservedRouteVersionZero. M3 of
-	// the Composed-1 design
+	// from distribution.Engine.Version()). Zero means "unpinned"; the
+	// version-0 sentinel is decoded for compatibility but is not emitted
+	// until every Raft member advertises support. M3 of the Composed-1 design
 	// (docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md)
 	// will gate the FSM apply path on this version so a route shift
 	// between BeginTxn and Commit is caught before it can produce a

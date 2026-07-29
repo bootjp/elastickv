@@ -108,12 +108,31 @@ func parseWireRedisTxnErr(err error) error {
 		return nil
 	}
 	msg := st.Message()
-	if strings.Contains(msg, kv.ErrComposed1Violation.Error()) {
+	if parsed := parseWireRedisTxnKeyErr(msg); parsed != nil {
+		return parsed
+	}
+	if isWireComposedRouteMessage(msg, kv.ErrComposed1Violation) {
 		return errors.WithStack(kv.ErrComposed1Violation)
 	}
-	if strings.Contains(msg, kv.ErrComposed1VersionGCd.Error()) {
+	if isWireComposedRouteMessage(msg, kv.ErrComposed1VersionGCd) {
 		return errors.WithStack(kv.ErrComposed1VersionGCd)
 	}
+	return nil
+}
+
+func isWireComposedRouteMessage(msg string, sentinel error) bool {
+	sentinelMsg := sentinel.Error()
+	if msg == sentinelMsg {
+		return true
+	}
+	if !strings.HasSuffix(msg, ": "+sentinelMsg) {
+		return false
+	}
+	return strings.HasPrefix(msg, "observed-version v=") ||
+		strings.HasPrefix(msg, "current-version v=")
+}
+
+func parseWireRedisTxnKeyErr(msg string) error {
 	if !strings.HasPrefix(msg, "key: ") {
 		return nil
 	}
@@ -294,14 +313,14 @@ func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if userKey := redisTxnWideFenceUserKey(key); userKey != nil {
 		return userKey
 	}
-	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
-		return store.ExtractListUserKey(key)
-	}
 	if store.IsListMetaDeltaKey(key) {
 		return store.ExtractListUserKeyFromDelta(key)
 	}
 	if store.IsListClaimKey(key) {
 		return store.ExtractListUserKeyFromClaim(key)
+	}
+	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
+		return store.ExtractListUserKey(key)
 	}
 	if wideKey, ok := normalizeWideColumnKey(key); ok {
 		return wideKey

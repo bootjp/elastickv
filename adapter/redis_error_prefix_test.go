@@ -180,16 +180,28 @@ func TestHandleProxyTxnError(t *testing.T) {
 
 func TestHandleProxyTxnTerminalExecError(t *testing.T) {
 	t.Parallel()
-	c := &captureConn{}
-	handled := handleProxyTxnError(c, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt))
-	if !handled {
-		t.Fatal("handleProxyTxnError returned false")
-	}
-	if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
-		t.Fatalf("last error = %q", c.lastErr)
-	}
-	if c.wroteArray {
-		t.Fatalf("unexpected array reply %d", c.lastArray)
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "typed", err: errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)},
+		{name: "decoded RESP", err: errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &captureConn{}
+			handled := handleProxyTxnError(c, tc.err)
+			if !handled {
+				t.Fatal("handleProxyTxnError returned false")
+			}
+			if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
+				t.Fatalf("last error = %q", c.lastErr)
+			}
+			if c.wroteArray {
+				t.Fatalf("unexpected array reply %d", c.lastArray)
+			}
+		})
 	}
 }
 
@@ -239,15 +251,27 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 
 	t.Run("ambiguous route change is promoted to top-level EXEC error", func(t *testing.T) {
 		t.Parallel()
-		cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
-		cmd.SetErr(errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt))
-		c := &captureConn{}
-		handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
-		if !handled {
-			t.Fatal("handleProxyTxnCommandError returned false")
-		}
-		if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
-			t.Fatalf("last error = %q", c.lastErr)
+
+		for _, tc := range []struct {
+			name string
+			err  error
+		}{
+			{name: "typed", err: errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)},
+			{name: "decoded RESP", err: errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error())},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+				cmd.SetErr(tc.err)
+				c := &captureConn{}
+				handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
+				if !handled {
+					t.Fatal("handleProxyTxnCommandError returned false")
+				}
+				if c.lastErr != errRedisExecRouteChangedAfterAmbiguousAttempt.Error() {
+					t.Fatalf("last error = %q", c.lastErr)
+				}
+			})
 		}
 	})
 

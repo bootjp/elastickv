@@ -441,6 +441,9 @@ func scanReadFenceRouteKey(route distribution.Route, start []byte, clampToRoutes
 	if clampToRoutes {
 		return bytes.Clone(clampScanStart(start, route.Start))
 	}
+	if listRouteKey(start) != nil {
+		return bytes.Clone(start)
+	}
 	if len(route.Start) > 0 {
 		return bytes.Clone(route.Start)
 	}
@@ -461,7 +464,7 @@ func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkR
 	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
-	if userKey := store.ExtractListUserKey(start); userKey != nil {
+	if userKey := listRouteKey(start); userKey != nil {
 		route, ok := s.engine.GetRoute(userKey)
 		if !ok {
 			return []distribution.Route{}, false

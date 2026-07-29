@@ -137,6 +137,18 @@ func redisListReadFenceRanges(userKey []byte) []redisReadFenceRange {
 	})
 }
 
+func redisTypeDetectionReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.ListMetaDeltaScanPrefix(userKey),
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+	})
+}
+
 func redisHashReadFenceRanges(userKey []byte) []redisReadFenceRange {
 	return redisReadFenceRangesForPrefixes([][]byte{
 		store.HashFieldScanPrefix(userKey),
@@ -269,6 +281,8 @@ func redisCommandReadFenceKeysForServer(r *RedisServer, cmd redcon.Command) [][]
 
 func redisCommandReadFenceRanges(cmdName string, userKey []byte) []redisReadFenceRange {
 	switch cmdName {
+	case cmdGet, cmdExists:
+		return redisTypeDetectionReadFenceRanges(userKey)
 	case cmdHSet, cmdHMSet:
 		return redisHashReadFenceRanges(userKey)
 	case cmdRPush, cmdLRange:
