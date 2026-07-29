@@ -38,11 +38,58 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
 }
 
-func (r *RedisServer) verifyQueuedCommandLeaders(ctx context.Context, queue []redcon.Command) error {
-	if r.coordinator == nil {
-		return nil
+func redisTxnReadFenceKeys(userKey []byte) [][]byte {
+	keys := [][]byte{
+		redisStrKey(userKey),
+		redisHLLKey(userKey),
+		redisTTLKey(userKey),
+		listMetaKey(userKey),
+		store.ListMetaDeltaScanPrefix(userKey),
+		redisTxnWideListFenceKey(userKey),
+		redisHashKey(userKey),
+		store.HashMetaKey(userKey),
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+		redisTxnWideHashFenceKey(userKey),
+		redisSetKey(userKey),
+		store.SetMetaKey(userKey),
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+		redisTxnWideSetFenceKey(userKey),
+		redisZSetKey(userKey),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+		redisTxnWideZSetFenceKey(userKey),
+		redisStreamKey(userKey),
+		store.StreamMetaKey(userKey),
+		store.StreamEntryScanPrefix(userKey),
 	}
+	if redisLegacyBareReadFenceAllowed(userKey) {
+		keys = append(keys, userKey)
+	}
+	return keys
+}
+
+func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
+	if isKnownInternalKey(userKey) {
+		return false
+	}
+	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
+}
+
+func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
 	seen := make(map[string]struct{}, len(queue))
+	keys := make([][]byte, 0, len(queue))
+	appendKey := func(key []byte) {
+		keyID := string(key)
+		if _, ok := seen[keyID]; ok {
+			return
+		}
+		seen[keyID] = struct{}{}
+		keys = append(keys, key)
+	}
 	for _, cmd := range queue {
 		if len(cmd.Args) == 0 {
 			continue
@@ -51,15 +98,22 @@ func (r *RedisServer) verifyQueuedCommandLeaders(ctx context.Context, queue []re
 		if !ok {
 			continue
 		}
-		for _, key := range redisCommandGetKeys(meta, cmd.Args) {
-			keyID := string(key)
-			if _, ok := seen[keyID]; ok {
-				continue
+		for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
+			for _, fenceKey := range redisTxnReadFenceKeys(userKey) {
+				appendKey(fenceKey)
 			}
-			seen[keyID] = struct{}{}
-			if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
-				return errors.WithStack(err)
-			}
+		}
+	}
+	return keys
+}
+
+func (r *RedisServer) leaseQueuedCommandReadGroups(ctx context.Context, queue []redcon.Command) error {
+	if r.coordinator == nil {
+		return nil
+	}
+	for _, key := range kv.LeaseReadGroupKeys(r.coordinator, redisQueuedCommandReadFenceKeys(queue)) {
+		if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
+			return errors.WithStack(err)
 		}
 	}
 	return nil
@@ -2406,7 +2460,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		if err := r.verifyQueuedCommandLeaders(dispatchCtx, queue); err != nil {
+		if err := r.leaseQueuedCommandReadGroups(dispatchCtx, queue); err != nil {
 			return err
 		}
 
@@ -2624,7 +2678,7 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 // from runTransactionWithDedup to keep that loop under the cyclop
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
-	if err := r.verifyQueuedCommandLeaders(dispatchCtx, queue); err != nil {
+	if err := r.leaseQueuedCommandReadGroups(dispatchCtx, queue); err != nil {
 		return nil, nil, err
 	}
 

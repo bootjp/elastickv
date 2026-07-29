@@ -161,8 +161,8 @@ func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
 	}
 }
 
-func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string, error) {
-	leader := r.coordinator.RaftLeaderForKey(key)
+func (r *RedisServer) proxyLRange(key, routingKey []byte, startRaw, endRaw []byte) ([]string, error) {
+	leader := r.coordinator.RaftLeaderForKey(routingKey)
 	if leader == "" {
 		return nil, ErrLeaderNotFound
 	}

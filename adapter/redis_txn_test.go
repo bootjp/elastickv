@@ -44,20 +44,30 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 
 type verifyHookCoordinator struct {
 	*localAdapterCoordinator
-	verifyForKey func(context.Context, []byte) error
-	verifyCalls  int
+	leaseForKey func(context.Context, []byte) (uint64, error)
+	groupForKey func([]byte) uint64
+	leaseCalls  int
+	leaseKeys   [][]byte
 }
 
 func newVerifyHookCoordinator(st store.MVCCStore) *verifyHookCoordinator {
 	return &verifyHookCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st)}
 }
 
-func (c *verifyHookCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	c.verifyCalls++
-	if c.verifyForKey != nil {
-		return c.verifyForKey(ctx, key)
+func (c *verifyHookCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.leaseCalls++
+	c.leaseKeys = append(c.leaseKeys, bytes.Clone(key))
+	if c.leaseForKey != nil {
+		return c.leaseForKey(ctx, key)
 	}
-	return c.localAdapterCoordinator.VerifyLeaderForKey(ctx, key)
+	return c.localAdapterCoordinator.LeaseReadForKey(ctx, key)
+}
+
+func (c *verifyHookCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	if c.groupForKey != nil {
+		return c.groupForKey(key)
+	}
+	return 1
 }
 
 func seedRedisListAt(t *testing.T, st store.MVCCStore, key []byte, ts uint64, values ...string) {
@@ -154,19 +164,19 @@ func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	server := NewRedisServer(nil, "", st, coord, nil, nil)
 
 	seeded := false
-	coord.verifyForKey = func(_ context.Context, got []byte) error {
-		require.Equal(t, key, got)
+	coord.leaseForKey = func(_ context.Context, got []byte) (uint64, error) {
+		require.Equal(t, listMetaKey(key), got)
 		if !seeded {
 			seedRedisListAt(t, st, key, 10, "v1")
 			seeded = true
 		}
-		return nil
+		return 0, nil
 	}
 
 	got, err := server.rangeList(context.Background(), key, []byte("0"), []byte("-1"))
 	require.NoError(t, err)
 	require.Equal(t, []string{"v1"}, got)
-	require.Equal(t, 1, coord.verifyCalls)
+	require.Equal(t, 1, coord.leaseCalls)
 }
 
 func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
@@ -193,13 +203,12 @@ func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
 			}
 
 			seeded := false
-			coord.verifyForKey = func(_ context.Context, got []byte) error {
-				require.Equal(t, key, got)
+			coord.leaseForKey = func(_ context.Context, _ []byte) (uint64, error) {
 				if !seeded {
 					seedRedisListAt(t, st, key, 10, "v1")
 					seeded = true
 				}
-				return nil
+				return 0, nil
 			}
 
 			results, err := server.runTransaction([]redcon.Command{{
@@ -209,9 +218,25 @@ func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
 			require.Len(t, results, 1)
 			require.Equal(t, resultArray, results[0].typ)
 			require.Equal(t, []string{"v1"}, results[0].arr)
-			require.Equal(t, 1, coord.verifyCalls)
+			require.Equal(t, 1, coord.leaseCalls)
 		})
 	}
+}
+
+func TestRedisExecReadFenceUsesRedisStorageKeys(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("!sqs|user-visible")
+	keys := redisQueuedCommandReadFenceKeys([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdGet), key},
+	}})
+	keySet := make(map[string]struct{}, len(keys))
+	for _, got := range keys {
+		keySet[string(got)] = struct{}{}
+	}
+
+	require.Contains(t, keySet, string(redisStrKey(key)))
+	require.NotContains(t, keySet, string(key))
 }
 
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a

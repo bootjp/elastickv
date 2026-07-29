@@ -709,15 +709,12 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
+	routeKey := listMetaKey(key)
+	if !r.coordinator.IsLeaderForKey(routeKey) {
+		return r.proxyLRange(key, routeKey, startRaw, endRaw)
 	}
 
-	// PR #749 follow-up: pass the per-call dispatch ctx so a stalled
-	// VerifyLeaderForKey honours the caller's deadline rather than the
-	// long-lived handlerContext + verifyLeaderEngineCtx fallback. Same
-	// shape as keys() / FLUSHDB.
-	if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
+	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, routeKey); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
