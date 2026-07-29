@@ -709,13 +709,10 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
-	routeKey := listMetaKey(key)
-	if !r.coordinator.IsLeaderForKey(routeKey) {
-		return r.proxyLRange(key, routeKey, startRaw, endRaw)
-	}
-
-	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, routeKey); err != nil {
-		return nil, errors.WithStack(err)
+	if proxied, ok, err := r.fenceRangeListReadGroups(ctx, key, startRaw, endRaw); err != nil {
+		return nil, err
+	} else if ok {
+		return proxied, nil
 	}
 
 	readTS := r.readTS()
@@ -744,6 +741,22 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 	}
 
 	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
+}
+
+func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, bool, error) {
+	groupKeys := r.redisReadFenceGroupKeys(redisTxnReadFenceKeys(key))
+	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
+	if err != nil {
+		return nil, false, err
+	}
+	if ok {
+		proxied, err := r.proxyLRange(key, proxyKey, startRaw, endRaw)
+		return proxied, true, err
+	}
+	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
+		return nil, false, err
+	}
+	return nil, false, nil
 }
 
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)

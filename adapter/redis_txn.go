@@ -21,6 +21,8 @@ var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
 var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
 var redisTxnWideZSetFencePrefix = []byte("!redis|txn-wide-zset|")
 
+var errRedisExecSplitShardLeaders = errors.New("ERR EXEC read fence spans multiple shard leaders")
+
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
 
 var txnApplyHandlers = map[string]txnCommandHandler{
@@ -107,16 +109,111 @@ func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
 	return keys
 }
 
-func (r *RedisServer) leaseQueuedCommandReadGroups(ctx context.Context, queue []redcon.Command) error {
-	if r.coordinator == nil {
+type redisTxnProxyRoute struct {
+	defaultLeader bool
+	key           []byte
+}
+
+func (r *RedisServer) redisReadFenceGroupKeys(keys [][]byte) [][]byte {
+	if r == nil || r.coordinator == nil {
 		return nil
 	}
-	for _, key := range kv.LeaseReadGroupKeys(r.coordinator, redisQueuedCommandReadFenceKeys(queue)) {
+	return kv.LeaseReadGroupKeys(r.coordinator, keys)
+}
+
+func (r *RedisServer) queuedCommandReadFenceGroupKeys(queue []redcon.Command) [][]byte {
+	return r.redisReadFenceGroupKeys(redisQueuedCommandReadFenceKeys(queue))
+}
+
+func (r *RedisServer) readFenceProxyKey(groupKeys [][]byte) ([]byte, bool, error) {
+	if r == nil || r.coordinator == nil || len(groupKeys) == 0 {
+		return nil, false, nil
+	}
+
+	var targetLeader string
+	var proxyKey []byte
+	for _, key := range groupKeys {
+		leader, localLeader, err := r.readFenceLeader(key)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := recordReadFenceTargetLeader(&targetLeader, leader); err != nil {
+			return nil, false, err
+		}
+		if localLeader || len(proxyKey) > 0 {
+			continue
+		}
+		proxyKey = key
+	}
+	if len(proxyKey) == 0 {
+		return nil, false, nil
+	}
+	return proxyKey, true, nil
+}
+
+func (r *RedisServer) readFenceLeader(key []byte) (string, bool, error) {
+	localLeader := r.coordinator.IsLeaderForKey(key)
+	leader := r.coordinator.RaftLeaderForKey(key)
+	if !localLeader && leader == "" {
+		return "", false, ErrLeaderNotFound
+	}
+	return leader, localLeader, nil
+}
+
+func recordReadFenceTargetLeader(target *string, leader string) error {
+	if leader == "" {
+		return nil
+	}
+	if *target == "" {
+		*target = leader
+		return nil
+	}
+	if *target != leader {
+		return errRedisExecSplitShardLeaders
+	}
+	return nil
+}
+
+func (r *RedisServer) transactionProxyRoute(queue []redcon.Command) (redisTxnProxyRoute, error) {
+	if r == nil || r.coordinator == nil {
+		return redisTxnProxyRoute{}, nil
+	}
+
+	groupKeys := r.queuedCommandReadFenceGroupKeys(queue)
+	if len(groupKeys) == 0 {
+		if !r.coordinator.IsLeader() {
+			return redisTxnProxyRoute{defaultLeader: true}, nil
+		}
+		return redisTxnProxyRoute{}, nil
+	}
+
+	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
+	if err != nil {
+		return redisTxnProxyRoute{}, err
+	}
+	if ok {
+		return redisTxnProxyRoute{key: proxyKey}, nil
+	}
+	return redisTxnProxyRoute{}, nil
+}
+
+func (r *RedisServer) leaseRedisReadFenceGroups(ctx context.Context, groupKeys [][]byte) error {
+	if r == nil || r.coordinator == nil {
+		return nil
+	}
+	for _, key := range groupKeys {
 		if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	return nil
+}
+
+func (r *RedisServer) leaseQueuedCommandReadGroups(ctx context.Context, queue []redcon.Command) error {
+	if r.coordinator == nil {
+		return nil
+	}
+	return r.leaseRedisReadFenceGroups(ctx, r.queuedCommandReadFenceGroupKeys(queue))
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -153,11 +250,17 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 	state.inTxn = false
 	state.queue = nil
 
-	// Always execute MULTI/EXEC on the leader so that reads and writes within
-	// the transaction see consistent, up-to-date data. Serving transactions
-	// on followers risks reading stale MVCC state and producing write cycles.
-	if !r.coordinator.IsLeader() {
+	route, err := r.transactionProxyRoute(queue)
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	if route.defaultLeader {
 		r.proxyTransactionToLeader(conn, queue)
+		return
+	}
+	if len(route.key) > 0 {
+		r.proxyTransactionToLeaderForKey(conn, route.key, queue)
 		return
 	}
 

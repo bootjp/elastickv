@@ -50,6 +50,18 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 	if !ok {
 		return
 	}
+	r.proxyTransactionToLeaderAddr(conn, queue, leaderAddr)
+}
+
+func (r *RedisServer) proxyTransactionToLeaderForKey(conn redcon.Conn, routingKey []byte, queue []redcon.Command) {
+	leaderAddr, ok := r.resolveLeaderRedisAddrForKey(conn, routingKey)
+	if !ok {
+		return
+	}
+	r.proxyTransactionToLeaderAddr(conn, queue, leaderAddr)
+}
+
+func (r *RedisServer) proxyTransactionToLeaderAddr(conn redcon.Conn, queue []redcon.Command, leaderAddr string) {
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
@@ -69,6 +81,20 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 // writes an error reply to conn on failure and returns ("", false).
 func (r *RedisServer) resolveLeaderRedisAddr(conn redcon.Conn) (string, bool) {
 	leader := r.coordinator.RaftLeader()
+	if leader == "" {
+		writeRedisError(conn, ErrLeaderNotFound)
+		return "", false
+	}
+	leaderAddr, ok := r.leaderRedis[leader]
+	if !ok || leaderAddr == "" {
+		conn.WriteError(fmt.Sprintf("ERR leader redis address unknown for raft address %s", leader))
+		return "", false
+	}
+	return leaderAddr, true
+}
+
+func (r *RedisServer) resolveLeaderRedisAddrForKey(conn redcon.Conn, key []byte) (string, bool) {
+	leader := r.coordinator.RaftLeaderForKey(key)
 	if leader == "" {
 		writeRedisError(conn, ErrLeaderNotFound)
 		return "", false

@@ -155,6 +155,39 @@ func requireReadKeysMatch(t *testing.T, got [][]byte, want [][]byte) {
 	require.Equal(t, wantSet, gotSet)
 }
 
+type redisTxnFenceRoutingCoordinator struct {
+	stubAdapterCoordinator
+	defaultLeader bool
+	localLeader   func([]byte) bool
+	raftLeader    func([]byte) string
+	groupID       func([]byte) uint64
+}
+
+func (c *redisTxnFenceRoutingCoordinator) IsLeader() bool {
+	return c.defaultLeader
+}
+
+func (c *redisTxnFenceRoutingCoordinator) IsLeaderForKey(key []byte) bool {
+	if c.localLeader != nil {
+		return c.localLeader(key)
+	}
+	return true
+}
+
+func (c *redisTxnFenceRoutingCoordinator) RaftLeaderForKey(key []byte) string {
+	if c.raftLeader != nil {
+		return c.raftLeader(key)
+	}
+	return ""
+}
+
+func (c *redisTxnFenceRoutingCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	if c.groupID != nil {
+		return c.groupID(key)
+	}
+	return 1
+}
+
 func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -165,7 +198,6 @@ func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 
 	seeded := false
 	coord.leaseForKey = func(_ context.Context, got []byte) (uint64, error) {
-		require.Equal(t, listMetaKey(key), got)
 		if !seeded {
 			seedRedisListAt(t, st, key, 10, "v1")
 			seeded = true
@@ -177,6 +209,124 @@ func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"v1"}, got)
 	require.Equal(t, 1, coord.leaseCalls)
+}
+
+func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	key := []byte("list:multi-fence-lrange")
+	coord := newVerifyHookCoordinator(st)
+	coord.groupForKey = func(got []byte) uint64 {
+		switch string(got) {
+		case string(redisStrKey(key)):
+			return 1
+		case string(listMetaKey(key)):
+			return 2
+		case string(store.ListMetaDeltaScanPrefix(key)):
+			return 3
+		default:
+			return 1
+		}
+	}
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	seeded := false
+	coord.leaseForKey = func(_ context.Context, _ []byte) (uint64, error) {
+		if !seeded {
+			seedRedisListAt(t, st, key, 10, "v1")
+			seeded = true
+		}
+		return 0, nil
+	}
+
+	got, err := server.rangeList(context.Background(), key, []byte("0"), []byte("-1"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"v1"}, got)
+	require.Equal(t, 3, coord.leaseCalls)
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listMetaKey(key),
+		store.ListMetaDeltaScanPrefix(key),
+	}, coord.leaseKeys)
+}
+
+func TestRedisExecProxyRouteUsesShardLeaderInsteadOfDefaultLeader(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:shard-local")
+	coord := &redisTxnFenceRoutingCoordinator{
+		defaultLeader: false,
+		localLeader: func([]byte) bool {
+			return true
+		},
+		raftLeader: func([]byte) string {
+			return "raft-local"
+		},
+	}
+	server := &RedisServer{coordinator: coord}
+
+	route, err := server.transactionProxyRoute([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdGet), key},
+	}})
+	require.NoError(t, err)
+	require.False(t, route.defaultLeader)
+	require.Empty(t, route.key)
+}
+
+func TestRedisExecProxyRouteTargetsRemoteShardLeader(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:shard-remote")
+	coord := &redisTxnFenceRoutingCoordinator{
+		defaultLeader: true,
+		localLeader: func([]byte) bool {
+			return false
+		},
+		raftLeader: func([]byte) string {
+			return "raft-remote"
+		},
+	}
+	server := &RedisServer{coordinator: coord}
+
+	route, err := server.transactionProxyRoute([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdGet), key},
+	}})
+	require.NoError(t, err)
+	require.False(t, route.defaultLeader)
+	require.Equal(t, redisStrKey(key), route.key)
+}
+
+func TestRedisExecProxyRouteFailsClosedOnSplitShardLeaders(t *testing.T) {
+	t.Parallel()
+
+	keyA := []byte("txn:split-a")
+	keyB := []byte("txn:split-b")
+	coord := &redisTxnFenceRoutingCoordinator{
+		defaultLeader: true,
+		localLeader: func([]byte) bool {
+			return false
+		},
+		raftLeader: func(key []byte) string {
+			if bytes.Contains(key, keyA) {
+				return "raft-a"
+			}
+			return "raft-b"
+		},
+		groupID: func(key []byte) uint64 {
+			if bytes.Contains(key, keyA) {
+				return 1
+			}
+			return 2
+		},
+	}
+	server := &RedisServer{coordinator: coord}
+
+	_, err := server.transactionProxyRoute([]redcon.Command{
+		{Args: [][]byte{[]byte(cmdGet), keyA}},
+		{Args: [][]byte{[]byte(cmdGet), keyB}},
+	})
+	require.ErrorIs(t, err, errRedisExecSplitShardLeaders)
 }
 
 func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
