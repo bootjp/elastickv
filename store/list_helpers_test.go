@@ -51,3 +51,67 @@ func TestExtractListUserKeyRejectsMalformedFullKeyLength(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractListUserKeyFromScanPrefixes(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("list:user")
+	deltaPrefix := ListMetaDeltaScanPrefix(userKey)
+	claimPrefix := ListClaimScanPrefix(userKey)
+
+	for _, tc := range []struct {
+		name    string
+		key     []byte
+		extract func([]byte) []byte
+		want    []byte
+	}{
+		{
+			name:    "delta valid",
+			key:     deltaPrefix,
+			extract: ExtractListUserKeyFromDeltaScanPrefix,
+			want:    userKey,
+		},
+		{
+			name:    "delta rejects different prefix",
+			key:     claimPrefix,
+			extract: ExtractListUserKeyFromDeltaScanPrefix,
+		},
+		{
+			name:    "delta rejects truncated user key",
+			key:     deltaPrefix[:len(deltaPrefix)-1],
+			extract: ExtractListUserKeyFromDeltaScanPrefix,
+		},
+		{
+			name:    "delta rejects trailing bytes",
+			key:     append(append([]byte{}, deltaPrefix...), 0),
+			extract: ExtractListUserKeyFromDeltaScanPrefix,
+		},
+		{
+			name:    "claim valid",
+			key:     claimPrefix,
+			extract: ExtractListUserKeyFromClaimScanPrefix,
+			want:    userKey,
+		},
+		{
+			name:    "claim rejects different prefix",
+			key:     deltaPrefix,
+			extract: ExtractListUserKeyFromClaimScanPrefix,
+		},
+		{
+			name:    "claim rejects truncated user key",
+			key:     claimPrefix[:len(claimPrefix)-1],
+			extract: ExtractListUserKeyFromClaimScanPrefix,
+		},
+		{
+			name:    "claim rejects trailing bytes",
+			key:     append(append([]byte{}, claimPrefix...), 0),
+			extract: ExtractListUserKeyFromClaimScanPrefix,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tc.want, tc.extract(tc.key))
+		})
+	}
+}
