@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,6 +47,7 @@ type verifyHookCoordinator struct {
 	*localAdapterCoordinator
 	leaseForKey func(context.Context, []byte) (uint64, error)
 	groupForKey func([]byte) uint64
+	mu          sync.Mutex
 	leaseCalls  int
 	leaseKeys   [][]byte
 }
@@ -55,8 +57,10 @@ func newVerifyHookCoordinator(st store.MVCCStore) *verifyHookCoordinator {
 }
 
 func (c *verifyHookCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	c.mu.Lock()
 	c.leaseCalls++
 	c.leaseKeys = append(c.leaseKeys, bytes.Clone(key))
+	c.mu.Unlock()
 	if c.leaseForKey != nil {
 		return c.leaseForKey(ctx, key)
 	}
@@ -231,12 +235,11 @@ func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
 	}
 	server := NewRedisServer(nil, "", st, coord, nil, nil)
 
-	seeded := false
+	var seedOnce sync.Once
 	coord.leaseForKey = func(_ context.Context, _ []byte) (uint64, error) {
-		if !seeded {
+		seedOnce.Do(func() {
 			seedRedisListAt(t, st, key, 10, "v1")
-			seeded = true
-		}
+		})
 		return 0, nil
 	}
 
@@ -325,6 +328,38 @@ func TestRedisExecProxyRouteFailsClosedOnSplitShardLeaders(t *testing.T) {
 	_, err := server.transactionProxyRoute([]redcon.Command{
 		{Args: [][]byte{[]byte(cmdGet), keyA}},
 		{Args: [][]byte{[]byte(cmdGet), keyB}},
+	})
+	require.ErrorIs(t, err, errRedisExecSplitShardLeaders)
+}
+
+func TestRedisExecProxyRouteFailsClosedOnMixedLocalAndRemoteShardLeaders(t *testing.T) {
+	t.Parallel()
+
+	localKey := []byte("txn:split-local")
+	remoteKey := []byte("txn:split-remote")
+	coord := &redisTxnFenceRoutingCoordinator{
+		defaultLeader: true,
+		localLeader: func(key []byte) bool {
+			return bytes.Contains(key, localKey)
+		},
+		raftLeader: func(key []byte) string {
+			if bytes.Contains(key, remoteKey) {
+				return "raft-remote"
+			}
+			return ""
+		},
+		groupID: func(key []byte) uint64 {
+			if bytes.Contains(key, localKey) {
+				return 1
+			}
+			return 2
+		},
+	}
+	server := &RedisServer{coordinator: coord}
+
+	_, err := server.transactionProxyRoute([]redcon.Command{
+		{Args: [][]byte{[]byte(cmdGet), localKey}},
+		{Args: [][]byte{[]byte(cmdGet), remoteKey}},
 	})
 	require.ErrorIs(t, err, errRedisExecSplitShardLeaders)
 }

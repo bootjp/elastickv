@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -20,6 +21,8 @@ var redisTxnWideHashFencePrefix = []byte("!redis|txn-wide-hash|")
 var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
 var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
 var redisTxnWideZSetFencePrefix = []byte("!redis|txn-wide-zset|")
+
+const redisReadFenceLocalLeaderTarget = "\x00redis-read-fence-local-leader"
 
 var errRedisExecSplitShardLeaders = errors.New("ERR EXEC read fence spans multiple shard leaders")
 
@@ -153,11 +156,14 @@ func (r *RedisServer) readFenceProxyKey(groupKeys [][]byte) ([]byte, bool, error
 
 func (r *RedisServer) readFenceLeader(key []byte) (string, bool, error) {
 	localLeader := r.coordinator.IsLeaderForKey(key)
+	if localLeader {
+		return redisReadFenceLocalLeaderTarget, true, nil
+	}
 	leader := r.coordinator.RaftLeaderForKey(key)
-	if !localLeader && leader == "" {
+	if leader == "" {
 		return "", false, ErrLeaderNotFound
 	}
-	return leader, localLeader, nil
+	return leader, false, nil
 }
 
 func recordReadFenceTargetLeader(target *string, leader string) error {
@@ -201,9 +207,35 @@ func (r *RedisServer) leaseRedisReadFenceGroups(ctx context.Context, groupKeys [
 	if r == nil || r.coordinator == nil {
 		return nil
 	}
+	if len(groupKeys) == 0 {
+		return nil
+	}
+	if len(groupKeys) == 1 {
+		_, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, groupKeys[0])
+		return errors.WithStack(err)
+	}
+
+	leaseCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, len(groupKeys))
+	var wg sync.WaitGroup
+	var cancelOnce sync.Once
 	for _, key := range groupKeys {
-		if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
-			return errors.WithStack(err)
+		wg.Add(1)
+		go func(k []byte) {
+			defer wg.Done()
+			if _, err := kv.LeaseReadForKeyThrough(r.coordinator, leaseCtx, k); err != nil {
+				errCh <- errors.WithStack(err)
+				cancelOnce.Do(cancel)
+			}
+		}(key)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2562,8 +2594,9 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 	defer cancel()
 
 	var results []redisResult
+	fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		if err := r.leaseQueuedCommandReadGroups(dispatchCtx, queue); err != nil {
+		if err := r.leaseRedisReadFenceGroups(dispatchCtx, fenceGroupKeys); err != nil {
 			return err
 		}
 
