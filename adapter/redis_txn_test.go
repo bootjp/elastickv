@@ -103,6 +103,7 @@ type redisReadFenceRouteVersionStore struct {
 	mu                         sync.Mutex
 	routeVersion               uint64
 	rangeKeysByVersion         map[uint64][][]byte
+	lastReadFenceGroupKeys     [][]byte
 	readFenceGroupKeyCallCount int
 	onLastCommitTS             func()
 	onScanAt                   func()
@@ -131,7 +132,9 @@ func (s *redisReadFenceRouteVersionStore) ReadFenceGroupKeysForRange(_ []byte, _
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.readFenceGroupKeyCallCount++
-	return cloneReadKeys(s.rangeKeysByVersion[s.routeVersion])
+	keys := cloneReadKeys(s.rangeKeysByVersion[s.routeVersion])
+	s.lastReadFenceGroupKeys = cloneReadKeys(keys)
+	return keys
 }
 
 func (s *redisReadFenceRouteVersionStore) readFenceGroupKeyCalls() int {
@@ -694,42 +697,50 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 	getKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdGet), key},
 	}})
-	require.Contains(t, getKeys, listTypeRoute)
-	require.Contains(t, getKeys, hashFieldRoute)
-	require.Contains(t, getKeys, hashDeltaRoute)
-	require.Contains(t, getKeys, setMemberRoute)
-	require.Contains(t, getKeys, setDeltaRoute)
-	require.Contains(t, getKeys, zsetMemberRoute)
-	require.Contains(t, getKeys, zsetDeltaRoute)
-	require.NotContains(t, getKeys, listClaimRoute)
-	require.NotContains(t, getKeys, zsetScoreRoute)
-	require.NotContains(t, getKeys, streamEntryRoute)
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listTypeRoute,
+		hashFieldRoute,
+		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetDeltaRoute,
+	}, getKeys)
 
 	existsKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdExists), key, otherKey},
 	}})
-	require.Contains(t, existsKeys, listTypeRoute)
-	require.Contains(t, existsKeys, otherListTypeRoute)
-	require.NotContains(t, existsKeys, listClaimRoute)
-	require.NotContains(t, existsKeys, zsetScoreRoute)
-	require.NotContains(t, existsKeys, streamEntryRoute)
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listTypeRoute,
+		hashFieldRoute,
+		hashDeltaRoute,
+		setMemberRoute,
+		setDeltaRoute,
+		zsetMemberRoute,
+		zsetDeltaRoute,
+		otherListTypeRoute,
+	}, existsKeys)
 
 	lrangeKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdLRange), key, []byte("0"), []byte("-1")},
 	}})
-	require.Contains(t, lrangeKeys, listTypeRoute)
-	require.Contains(t, lrangeKeys, listClaimRoute)
-	require.NotContains(t, lrangeKeys, hashFieldRoute)
-	require.NotContains(t, lrangeKeys, zsetMemberRoute)
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listTypeRoute,
+		listClaimRoute,
+	}, lrangeKeys)
 
 	hsetKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdHSet), key, field, []byte("value")},
 	}})
-	require.Contains(t, hsetKeys, hashFieldRoute)
-	require.Contains(t, hsetKeys, hashDeltaRoute)
-	require.Contains(t, hsetKeys, exactFieldKey)
-	require.NotContains(t, hsetKeys, listTypeRoute)
-	require.NotContains(t, hsetKeys, zsetMemberRoute)
+	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		hashFieldRoute,
+		hashDeltaRoute,
+		exactFieldKey,
+	}, hsetKeys)
 }
 
 func TestRedisReadFencedTimestampLeasesBeforeAndAfterSelectingTimestamp(t *testing.T) {
@@ -1076,7 +1087,11 @@ func TestRedisExecProxyRouteRetriesWhenReadFenceRouteVersionChanges(t *testing.T
 		Args: [][]byte{[]byte(cmdLRange), key, []byte("0"), []byte("-1")},
 	}})
 	require.NoError(t, err)
-	require.NotEmpty(t, route.key)
+	require.Equal(t, redisStrKey(key), route.key)
+	st.mu.Lock()
+	lastReadFenceGroupKeys := cloneReadKeys(st.lastReadFenceGroupKeys)
+	st.mu.Unlock()
+	require.Equal(t, [][]byte{routeB}, lastReadFenceGroupKeys)
 	require.Greater(t, st.readFenceGroupKeyCalls(), len(redisListReadFenceRanges(key)))
 }
 

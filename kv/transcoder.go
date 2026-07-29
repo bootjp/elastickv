@@ -24,7 +24,7 @@ const ObservedRouteVersionZero = ^uint64(0)
 // member advertises support for ObservedRouteVersionZero. Mixed-version groups
 // must keep literal zero on the wire so old followers do not treat the sentinel
 // as an impossibly new catalog version and diverge from a new leader.
-const observedRouteVersionZeroWireEncodingEnabled = false
+var observedRouteVersionZeroWireEncodingEnabled = false
 
 // EncodeObservedRouteVersion converts a tracked catalog version into the wire
 // value carried by OperationGroup. Version zero is left as the legacy unpinned

@@ -7,8 +7,6 @@ import (
 )
 
 func TestEncodeObservedRouteVersionZeroGatedForRollingUpgrade(t *testing.T) {
-	t.Parallel()
-
 	require.Equal(t, uint64(0), EncodeObservedRouteVersion(0))
 
 	decoded, pinned := DecodeObservedRouteVersion(0)
@@ -18,6 +16,13 @@ func TestEncodeObservedRouteVersionZeroGatedForRollingUpgrade(t *testing.T) {
 	decoded, pinned = DecodeObservedRouteVersion(ObservedRouteVersionZero)
 	require.Equal(t, uint64(0), decoded)
 	require.True(t, pinned)
+
+	previous := observedRouteVersionZeroWireEncodingEnabled
+	observedRouteVersionZeroWireEncodingEnabled = true
+	t.Cleanup(func() {
+		observedRouteVersionZeroWireEncodingEnabled = previous
+	})
+	require.Equal(t, ObservedRouteVersionZero, EncodeObservedRouteVersion(0))
 }
 
 func TestEncodeObservedRouteVersionNonZeroPassesThrough(t *testing.T) {

@@ -176,7 +176,7 @@ func extractListUserKeyFromLenPrefixedScanPrefix(key []byte, prefix []byte) []by
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) != uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // len is bounded by max slice size
+	if uint64(len(trimmed)) != uint64(wideColKeyLenSize)+uint64(ukLen) {
 		return nil
 	}
 	return trimmed[wideColKeyLenSize:]
