@@ -858,7 +858,7 @@ func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGro
 	if c.anyResolverClaimedKey(reqs.Elems) {
 		return
 	}
-	reqs.ObservedRouteVersion = c.engine.Version()
+	reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 }
 
 // anyResolverClaimedKey reports whether any element's key is
@@ -936,7 +936,7 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// so a key whose owning group changed since the last
 		// attempt naturally lands on the new group's FSM.
 		if c.engine != nil {
-			reqs.ObservedRouteVersion = c.engine.Version()
+			reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 		}
 		// Clear the timestamps so the next attempt allocates a
 		// fresh pair against the post-shift HLC.  The OCC

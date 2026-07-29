@@ -399,6 +399,25 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(wireErr))
 }
 
+func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
+	t.Parallel()
+
+	wireErr := errors.WithStack(status.Error(codes.Aborted,
+		"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error()))
+	attempts := 0
+	srv := &RedisServer{}
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		if attempts == 1 {
+			return wireErr
+		}
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
+}
+
 func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 	t.Parallel()
 

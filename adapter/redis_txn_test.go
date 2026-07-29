@@ -208,6 +208,8 @@ type readKeyRecordingCoordinator struct {
 	*localAdapterCoordinator
 	lastReadKeys             [][]byte
 	lastObservedRouteVersion uint64
+	dispatches               int
+	prevCommitTS             []uint64
 }
 
 func newReadKeyRecordingCoordinator(st store.MVCCStore) *readKeyRecordingCoordinator {
@@ -215,8 +217,29 @@ func newReadKeyRecordingCoordinator(st store.MVCCStore) *readKeyRecordingCoordin
 }
 
 func (c *readKeyRecordingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.dispatches++
 	c.lastReadKeys = cloneReadKeys(req.ReadKeys)
 	c.lastObservedRouteVersion = req.ObservedRouteVersion
+	c.prevCommitTS = append(c.prevCommitTS, req.PrevCommitTS)
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+type composedRetryCoordinator struct {
+	*localAdapterCoordinator
+	dispatches   int
+	prevCommitTS []uint64
+	firstErr     error
+}
+
+func (c *composedRetryCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.dispatches++
+	c.prevCommitTS = append(c.prevCommitTS, req.PrevCommitTS)
+	if c.dispatches == 1 {
+		if c.firstErr != nil {
+			return nil, c.firstErr
+		}
+		return nil, kv.ErrComposed1Violation
+	}
 	return c.localAdapterCoordinator.Dispatch(ctx, req)
 }
 
@@ -705,7 +728,33 @@ func TestRedisExecDispatchCarriesReadFenceRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(7), coord.lastObservedRouteVersion)
 }
 
-func TestRedisExecDedupDropsPendingWhenReadFenceRouteVersionChanges(t *testing.T) {
+func TestRedisExecDispatchCarriesEncodedReadFenceRouteVersionZero(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:observed-route-version-zero")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 0,
+		rangeKeysByVersion: map[uint64][][]byte{
+			0: {[]byte("txn-observed-route-zero")},
+		},
+	}
+	coord := newReadKeyRecordingCoordinator(st)
+	server := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+
+	results, err := server.runTransactionDirect([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
+	}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, kv.ObservedRouteVersionZero, coord.lastObservedRouteVersion)
+}
+
+func TestRedisExecDedupFailsClosedWhenReadFenceRouteVersionChangesAfterAmbiguousAttempt(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("txn:route-version-dedup")
@@ -738,11 +787,116 @@ func TestRedisExecDedupDropsPendingWhenReadFenceRouteVersionChanges(t *testing.T
 	results, err := server.runTransactionWithDedup([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
 	}})
+	require.ErrorIs(t, err, errRedisExecRouteChangedAfterAmbiguousAttempt)
+	require.Nil(t, results)
+	require.Equal(t, 1, coord.dispatches)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
+	require.Zero(t, countReadKey(coord.leaseKeys, routeB))
+}
+
+func TestRedisTxnCommitRechecksReadFenceRouteVersionAfterPrepare(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("txn:prepare-route-version-direct")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+	}
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("field")), []byte("old"), redisTxnTestStartTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), redisTxnTestStartTS, 0))
+
+	var bumpOnce sync.Once
+	st.onScanAt = func() {
+		bumpOnce.Do(func() {
+			st.advanceRouteVersionForTest()
+		})
+	}
+
+	coord := newReadKeyRecordingCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	txn := newRedisTxnTestContext(server)
+	txn.ctx = ctx
+	txn.logicalDeletes[string(key)] = key
+
+	err := txn.commit(redisReadFenceRouteVersion{tracked: true, version: 1})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.Zero(t, coord.dispatches)
+}
+
+func TestRedisExecDedupRetriesWhenReadFenceRouteVersionChangesDuringPrepare(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:prepare-route-version-dedup")
+	routeA := []byte("txn-prepare-route-a")
+	routeB := []byte("txn-prepare-route-b")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+		rangeKeysByVersion: map[uint64][][]byte{
+			1: {routeA},
+			2: {routeB},
+		},
+	}
+	var bumpOnce sync.Once
+	st.onScanAt = func() {
+		bumpOnce.Do(func() {
+			st.advanceRouteVersionForTest()
+		})
+	}
+
+	coord := newReadKeyRecordingCoordinator(st)
+	server := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+
+	results, err := server.runTransactionWithDedup([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
+	}})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
-	require.Equal(t, 2, coord.dispatches)
-	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
-	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeB), 2)
+	require.Equal(t, 1, coord.dispatches)
+	require.Equal(t, uint64(2), coord.lastObservedRouteVersion)
+}
+
+func TestRedisExecRetriesComposedRouteRejectionByRebuilding(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		dedup bool
+	}{
+		{name: "direct", dedup: false},
+		{name: "dedup", dedup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			key := []byte("txn:composed-retry:" + tc.name)
+			st := store.NewMVCCStore()
+			coord := &composedRetryCoordinator{
+				localAdapterCoordinator: newLocalAdapterCoordinator(st),
+			}
+			server := &RedisServer{
+				store:            st,
+				coordinator:      coord,
+				scriptCache:      map[string]string{},
+				onePhaseTxnDedup: tc.dedup,
+			}
+
+			results, err := server.runTransaction([]redcon.Command{{
+				Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
+			}})
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			require.Equal(t, "OK", results[0].str)
+			require.Equal(t, 2, coord.dispatches)
+			require.Equal(t, []uint64{0, 0}, coord.prevCommitTS)
+		})
+	}
 }
 
 func TestRedisExecProxyRouteRetriesWhenReadFenceRouteVersionChanges(t *testing.T) {

@@ -26,6 +26,7 @@ var redisReadFenceRouteChangedKey = []byte("!redis|read-fence-route-changed")
 const redisReadFenceLocalLeaderTarget = "\x00redis-read-fence-local-leader"
 
 var errRedisExecSplitShardLeaders = errors.New("ERR EXEC read fence spans multiple shard leaders")
+var errRedisExecRouteChangedAfterAmbiguousAttempt = errors.New("ERR EXEC read fence route changed after ambiguous dispatch")
 
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
 
@@ -183,7 +184,7 @@ func (v redisReadFenceRouteVersion) observedRouteVersion() uint64 {
 	if !v.tracked {
 		return 0
 	}
-	return v.version
+	return kv.EncodeObservedRouteVersion(v.version)
 }
 
 func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
@@ -1963,12 +1964,15 @@ func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, redisDispatchTimeout)
 }
 
-func (t *txnContext) commit(observedRouteVersion uint64) error {
+func (t *txnContext) commit(routeVersion redisReadFenceRouteVersion) error {
 	prepared, err := t.prepareDispatch()
 	if err != nil {
 		return err
 	}
 	defer prepared.cancel()
+	if err := t.server.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return err
+	}
 	if len(prepared.elems) == 0 {
 		return nil
 	}
@@ -1978,7 +1982,7 @@ func (t *txnContext) commit(observedRouteVersion uint64) error {
 		StartTS:              t.startTS,
 		CommitTS:             prepared.commitTS,
 		ReadKeys:             prepared.readKeys,
-		ObservedRouteVersion: observedRouteVersion,
+		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
 	if _, err := t.server.coordinator.Dispatch(prepared.ctx, group); err != nil {
 		return errors.WithStack(err)
@@ -2840,7 +2844,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 			return err
 		}
-		if err := txn.commit(routeVersion.observedRouteVersion()); err != nil {
+		if err := txn.commit(routeVersion); err != nil {
 			return err
 		}
 		results = nextResults
@@ -2895,7 +2899,7 @@ type reusableExecTxn struct {
 // cached results array.
 func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableExecTxn) (results []redisResult, drop bool, err error) {
 	if err := r.ensureReusableExecRouteStable(pending); err != nil {
-		return nil, true, err
+		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
 	}
 	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
 	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
@@ -2924,6 +2928,9 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// Normalize before the typed conflict branch; the generic retry loop keeps
 	// raw wire write conflicts fail-closed for callers without this protection.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if isRedisComposedRouteErr(dispErr) {
+		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
+	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (mirrors dispatchListPushReuse):
 		// the apply might have landed at this fresh commitTS but bubbled
@@ -2951,19 +2958,23 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// advance pending.commitTS if retryRedisWrite will actually loop
 	// (non-retryable errors escape to the client; pending is then
 	// discarded with the goroutine).
-	if isRetryableRedisTxnErr(dispErr) {
+	if isReusableRedisTxnErr(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return nil, false, errors.WithStack(dispErr)
 }
 
 func (r *RedisServer) ensureReusableExecRouteStable(pending *reusableExecTxn) error {
-	if pending == nil || pending.observedRouteVersion == 0 {
+	if pending == nil {
+		return nil
+	}
+	version, tracked := kv.DecodeObservedRouteVersion(pending.observedRouteVersion)
+	if !tracked {
 		return nil
 	}
 	return r.ensureRedisReadFenceRouteStable(redisReadFenceRouteVersion{
 		tracked: true,
-		version: pending.observedRouteVersion,
+		version: version,
 	})
 }
 
@@ -3023,6 +3034,21 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 	return results, nil
 }
 
+func (r *RedisServer) prepareExecDispatchWithStableRoute(
+	txn *txnContext,
+	routeVersion redisReadFenceRouteVersion,
+) (preparedTxnDispatch, error) {
+	prepared, err := txn.prepareDispatch()
+	if err != nil {
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		prepared.cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	return prepared, nil
+}
+
 // firstExecAttempt runs the initial (no-reuse) EXEC attempt: builds the
 // txn snapshot, applies each command to capture the client-visible
 // results, validates the read set, and dispatches. On success returns
@@ -3056,7 +3082,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		return nil, nil, err
 	}
 
-	prepared, err := txn.prepareDispatch()
+	prepared, err := r.prepareExecDispatchWithStableRoute(txn, routeVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3085,7 +3111,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		// context deadline, FSM apply error) leave pending pointing at
 		// state wasted with the goroutine; ambiguous errors that
 		// escape to the client are out of scope for this loop.
-		if isRetryableRedisTxnErr(dispErr) {
+		if isReusableRedisTxnErr(dispErr) {
 			return nil, &reusableExecTxn{
 				elems:                prepared.elems,
 				startTS:              txn.startTS,
