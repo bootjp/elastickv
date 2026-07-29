@@ -55,6 +55,19 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 	}
 }
 
+func TestRouteKey_NormalizesRedisInternalEmptyUserKey(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		[]byte("!redis|str|"),
+		[]byte("!redis|route|"),
+	} {
+		got := routeKey(raw)
+		require.NotNil(t, got)
+		require.Empty(t, got)
+	}
+}
+
 func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
 	t.Parallel()
 

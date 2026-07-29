@@ -112,7 +112,7 @@ func redisRouteKey(key []byte) []byte {
 	}
 	rest := key[len(redisInternalRoutePrefix):]
 	sep := bytes.IndexByte(rest, '|')
-	if sep < 0 || sep+1 >= len(rest) {
+	if sep <= 0 {
 		return nil
 	}
 	return rest[sep+1:]

@@ -34,6 +34,7 @@ func TestRedisUserRouteKeyPreservesListStorageShapedUserKey(t *testing.T) {
 		name    string
 		userKey []byte
 	}{
+		{"empty", []byte{}},
 		{"delta", store.ListMetaDeltaKey([]byte("other"), 1, 1)},
 		{"claim", store.ListClaimKey([]byte("other"), 3)},
 		{"meta", store.ListMetaKey([]byte("other"))},
