@@ -98,13 +98,57 @@ func (s *redisReadFenceRangeStore) ReadFenceGroupKeysForRange(start []byte, _ []
 	return cloneReadKeys(s.rangeKeysByStart[string(start)])
 }
 
-func seedRedisListAt(t *testing.T, st store.MVCCStore, key []byte, ts uint64, values ...string) {
+type redisReadFenceRouteVersionStore struct {
+	store.MVCCStore
+	mu                 sync.Mutex
+	routeVersion       uint64
+	rangeKeysByVersion map[uint64][][]byte
+	onLastCommitTS     func()
+	onScanAt           func()
+}
+
+func (s *redisReadFenceRouteVersionStore) ReadFenceRouteVersion() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.routeVersion
+}
+
+func (s *redisReadFenceRouteVersionStore) setRouteVersion(version uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routeVersion = version
+}
+
+func (s *redisReadFenceRouteVersionStore) ReadFenceGroupKeysForRange(_ []byte, _ []byte) [][]byte {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneReadKeys(s.rangeKeysByVersion[s.routeVersion])
+}
+
+func (s *redisReadFenceRouteVersionStore) LastCommitTS() uint64 {
+	if s.onLastCommitTS != nil {
+		s.onLastCommitTS()
+	}
+	return s.MVCCStore.LastCommitTS()
+}
+
+func (s *redisReadFenceRouteVersionStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if s.onScanAt != nil {
+		s.onScanAt()
+	}
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func seedRedisListAt(t *testing.T, st store.MVCCStore, key []byte, values ...string) {
 	t.Helper()
 	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: int64(len(values))})
 	require.NoError(t, err)
-	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, ts, 0))
+	require.NoError(t, st.PutAt(context.Background(), store.ListMetaKey(key), metaBytes, redisTxnTestStartTS, 0))
 	for i, value := range values {
-		require.NoError(t, st.PutAt(context.Background(), listItemKey(key, int64(i)), []byte(value), ts, 0))
+		require.NoError(t, st.PutAt(context.Background(), listItemKey(key, int64(i)), []byte(value), redisTxnTestStartTS, 0))
 	}
 }
 
@@ -170,6 +214,29 @@ func cloneReadKeys(in [][]byte) [][]byte {
 	return out
 }
 
+func countReadKey(in [][]byte, want []byte) int {
+	count := 0
+	for _, key := range in {
+		if bytes.Equal(key, want) {
+			count++
+		}
+	}
+	return count
+}
+
+func readFenceRouteVersionGroupForKey(routeA, routeB []byte) func([]byte) uint64 {
+	return func(got []byte) uint64 {
+		switch {
+		case bytes.Equal(got, routeA):
+			return 101
+		case bytes.Equal(got, routeB):
+			return 102
+		default:
+			return 1
+		}
+	}
+}
+
 func requireReadKeysMatch(t *testing.T, got [][]byte, want [][]byte) {
 	t.Helper()
 	gotSet := make(map[string]struct{}, len(got))
@@ -227,7 +294,7 @@ func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	seeded := false
 	coord.leaseForKey = func(_ context.Context, got []byte) (uint64, error) {
 		if !seeded {
-			seedRedisListAt(t, st, key, 10, "v1")
+			seedRedisListAt(t, st, key, "v1")
 			seeded = true
 		}
 		return 0, nil
@@ -262,7 +329,7 @@ func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
 	var seedOnce sync.Once
 	coord.leaseForKey = func(_ context.Context, _ []byte) (uint64, error) {
 		seedOnce.Do(func() {
-			seedRedisListAt(t, st, key, 10, "v1")
+			seedRedisListAt(t, st, key, "v1")
 		})
 		return 0, nil
 	}
@@ -279,6 +346,42 @@ func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
 		listMetaKey(key),
 		store.ListMetaDeltaScanPrefix(key),
 	}, coord.leaseKeys)
+}
+
+func TestRedisRangeListRetriesWhenReadFenceRouteVersionChangesDuringScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("list:route-version-retry")
+	routeA := []byte("list-route-a")
+	routeB := []byte("list-route-b")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+		rangeKeysByVersion: map[uint64][][]byte{
+			1: {routeA},
+			2: {routeB},
+		},
+	}
+	seedRedisListAt(t, st, key, "v1")
+
+	var scanOnce sync.Once
+	st.onScanAt = func() {
+		scanOnce.Do(func() {
+			require.NoError(t, st.PutAt(ctx, listItemKey(key, 0), []byte("v2"), 20, 0))
+			st.setRouteVersion(2)
+		})
+	}
+
+	coord := newVerifyHookCoordinator(st)
+	coord.groupForKey = readFenceRouteVersionGroupForKey(routeA, routeB)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	got, err := server.rangeList(ctx, key, []byte("0"), []byte("-1"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"v2"}, got)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeB), 2)
 }
 
 func TestRedisExecProxyRouteUsesShardLeaderInsteadOfDefaultLeader(t *testing.T) {
@@ -505,6 +608,46 @@ func TestRedisReadFencedTimestampLeasesBeforeAndAfterSelectingTimestamp(t *testi
 	require.Equal(t, 2, leaseCalls)
 }
 
+func TestRedisExecRetriesWhenReadFenceRouteVersionChanges(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:route-version-retry")
+	routeA := []byte("txn-route-a")
+	routeB := []byte("txn-route-b")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+		rangeKeysByVersion: map[uint64][][]byte{
+			1: {routeA},
+			2: {routeB},
+		},
+	}
+
+	var bumpOnce sync.Once
+	st.onLastCommitTS = func() {
+		bumpOnce.Do(func() {
+			st.setRouteVersion(2)
+		})
+	}
+
+	coord := newVerifyHookCoordinator(st)
+	coord.groupForKey = readFenceRouteVersionGroupForKey(routeA, routeB)
+	server := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+
+	results, err := server.runTransactionDirect([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdGet), key},
+	}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, resultNil, results[0].typ)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeB), 2)
+}
+
 func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -531,7 +674,7 @@ func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
 			seeded := false
 			coord.leaseForKey = func(_ context.Context, _ []byte) (uint64, error) {
 				if !seeded {
-					seedRedisListAt(t, st, key, 10, "v1")
+					seedRedisListAt(t, st, key, "v1")
 					seeded = true
 				}
 				return 0, nil

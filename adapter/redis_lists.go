@@ -709,14 +709,40 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
-	readTS, readPin, proxied, ok, err := r.fenceRangeListReadGroups(ctx, key, startRaw, endRaw)
+	var out []string
+	err := r.retryRedisWrite(ctx, func() error {
+		routeVersion := r.redisReadFenceRouteVersion()
+		readTS, readPin, proxied, ok, err := r.fenceRangeListReadGroups(ctx, key, startRaw, endRaw)
+		if err != nil {
+			return err
+		} else if ok {
+			if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+				return err
+			}
+			out = proxied
+			return nil
+		}
+		defer readPin.Release()
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
+		}
+		next, err := r.rangeListAt(ctx, key, startRaw, endRaw, readTS)
+		if err != nil {
+			return err
+		}
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
+		}
+		out = next
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	} else if ok {
-		return proxied, nil
 	}
-	defer readPin.Release()
+	return out, nil
+}
 
+func (r *RedisServer) rangeListAt(ctx context.Context, key []byte, startRaw, endRaw []byte, readTS uint64) ([]string, error) {
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err

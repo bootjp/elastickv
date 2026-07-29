@@ -427,6 +427,16 @@ func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]by
 	return keys
 }
 
+// ReadFenceRouteVersion returns the route catalog version paired with
+// ReadFenceGroupKeysForRange so callers can discard reads whose route set
+// changed before the scan completed.
+func (s *ShardStore) ReadFenceRouteVersion() uint64 {
+	if s == nil || s.engine == nil {
+		return 0
+	}
+	return s.engine.Version()
+}
+
 func scanReadFenceRouteKey(route distribution.Route, start []byte, clampToRoutes bool) []byte {
 	if clampToRoutes {
 		return bytes.Clone(clampScanStart(start, route.Start))

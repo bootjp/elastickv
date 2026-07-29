@@ -21,6 +21,7 @@ var redisTxnWideHashFencePrefix = []byte("!redis|txn-wide-hash|")
 var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
 var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
 var redisTxnWideZSetFencePrefix = []byte("!redis|txn-wide-zset|")
+var redisReadFenceRouteChangedKey = []byte("!redis|read-fence-route-changed")
 
 const redisReadFenceLocalLeaderTarget = "\x00redis-read-fence-local-leader"
 
@@ -42,6 +43,15 @@ type redisReadFenceRange struct {
 
 type redisReadFenceRangeGroupKeyProvider interface {
 	ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte
+}
+
+type redisReadFenceRouteVersionProvider interface {
+	ReadFenceRouteVersion() uint64
+}
+
+type redisReadFenceRouteVersion struct {
+	tracked bool
+	version uint64
 }
 
 var txnApplyHandlers = map[string]txnCommandHandler{
@@ -142,6 +152,31 @@ func (r *RedisServer) redisReadFenceRangeGroupKeys(start []byte, end []byte) [][
 		return nil
 	}
 	return provider.ReadFenceGroupKeysForRange(start, end)
+}
+
+func (r *RedisServer) redisReadFenceRouteVersion() redisReadFenceRouteVersion {
+	if r == nil || r.store == nil {
+		return redisReadFenceRouteVersion{}
+	}
+	provider, ok := r.store.(redisReadFenceRouteVersionProvider)
+	if !ok {
+		return redisReadFenceRouteVersion{}
+	}
+	return redisReadFenceRouteVersion{
+		tracked: true,
+		version: provider.ReadFenceRouteVersion(),
+	}
+}
+
+func (r *RedisServer) ensureRedisReadFenceRouteStable(observed redisReadFenceRouteVersion) error {
+	if !observed.tracked || r == nil || r.store == nil {
+		return nil
+	}
+	provider, ok := r.store.(redisReadFenceRouteVersionProvider)
+	if !ok || provider.ReadFenceRouteVersion() == observed.version {
+		return nil
+	}
+	return errors.WithStack(store.NewWriteConflictError(redisReadFenceRouteChangedKey))
 }
 
 func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
@@ -2707,6 +2742,42 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return r.runTransactionDirect(queue)
 }
 
+func (r *RedisServer) applyExecQueueAtSnapshot(
+	dispatchCtx context.Context,
+	queue []redcon.Command,
+	startTS uint64,
+) (*txnContext, []redisResult, error) {
+	txn := &txnContext{
+		server:                r,
+		ctx:                   dispatchCtx,
+		working:               map[string]*txnValue{},
+		replacers:             map[string]*stringReplacement{},
+		listStates:            map[string]*listTxnState{},
+		hashStates:            map[string]*hashTxnState{},
+		zsetStates:            map[string]*zsetTxnState{},
+		ttlStates:             map[string]*ttlTxnState{},
+		readKeys:              map[string][]byte{},
+		deletedKeys:           map[string]struct{}{},
+		logicalDeletes:        map[string][]byte{},
+		hashDeletes:           map[string][]byte{},
+		setDeletes:            map[string][]byte{},
+		hashCreates:           map[string]struct{}{},
+		collectionExpireTypes: map[string]redisValueType{},
+		streamDeletions:       map[string][]byte{},
+		startTS:               startTS,
+	}
+
+	nextResults := make([]redisResult, 0, len(queue))
+	for _, cmd := range queue {
+		res, err := txn.apply(cmd)
+		if err != nil {
+			return nil, nil, err
+		}
+		nextResults = append(nextResults, res)
+	}
+	return txn, nextResults, nil
+}
+
 func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResult, error) {
 	if r.onePhaseTxnDedup {
 		return r.runTransactionWithDedup(queue)
@@ -2716,44 +2787,27 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 	defer cancel()
 
 	var results []redisResult
-	fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
 	err := r.retryRedisWrite(dispatchCtx, func() error {
+		routeVersion := r.redisReadFenceRouteVersion()
+		fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
 		startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
 		if err != nil {
 			return err
 		}
 		defer readPin.Release()
-
-		txn := &txnContext{
-			server:                r,
-			ctx:                   dispatchCtx,
-			working:               map[string]*txnValue{},
-			replacers:             map[string]*stringReplacement{},
-			listStates:            map[string]*listTxnState{},
-			hashStates:            map[string]*hashTxnState{},
-			zsetStates:            map[string]*zsetTxnState{},
-			ttlStates:             map[string]*ttlTxnState{},
-			readKeys:              map[string][]byte{},
-			deletedKeys:           map[string]struct{}{},
-			logicalDeletes:        map[string][]byte{},
-			hashDeletes:           map[string][]byte{},
-			setDeletes:            map[string][]byte{},
-			hashCreates:           map[string]struct{}{},
-			collectionExpireTypes: map[string]redisValueType{},
-			streamDeletions:       map[string][]byte{},
-			startTS:               startTS,
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
 		}
 
-		nextResults := make([]redisResult, 0, len(queue))
-		for _, cmd := range queue {
-			res, err := txn.apply(cmd)
-			if err != nil {
-				return err
-			}
-			nextResults = append(nextResults, res)
+		txn, nextResults, err := r.applyExecQueueAtSnapshot(dispatchCtx, queue, startTS)
+		if err != nil {
+			return err
 		}
 
 		if err := txn.validateReadSet(dispatchCtx); err != nil {
+			return err
+		}
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 			return err
 		}
 		if err := txn.commit(); err != nil {
@@ -2934,43 +2988,26 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 // from runTransactionWithDedup to keep that loop under the cyclop
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
+	routeVersion := r.redisReadFenceRouteVersion()
 	fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
 	startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer readPin.Release()
-
-	txn := &txnContext{
-		server:                r,
-		ctx:                   dispatchCtx,
-		working:               map[string]*txnValue{},
-		replacers:             map[string]*stringReplacement{},
-		listStates:            map[string]*listTxnState{},
-		hashStates:            map[string]*hashTxnState{},
-		zsetStates:            map[string]*zsetTxnState{},
-		ttlStates:             map[string]*ttlTxnState{},
-		readKeys:              map[string][]byte{},
-		deletedKeys:           map[string]struct{}{},
-		logicalDeletes:        map[string][]byte{},
-		hashDeletes:           map[string][]byte{},
-		setDeletes:            map[string][]byte{},
-		hashCreates:           map[string]struct{}{},
-		collectionExpireTypes: map[string]redisValueType{},
-		streamDeletions:       map[string][]byte{},
-		startTS:               startTS,
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return nil, nil, err
 	}
 
-	nextResults := make([]redisResult, 0, len(queue))
-	for _, cmd := range queue {
-		res, err := txn.apply(cmd)
-		if err != nil {
-			return nil, nil, err
-		}
-		nextResults = append(nextResults, res)
+	txn, nextResults, err := r.applyExecQueueAtSnapshot(dispatchCtx, queue, startTS)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if err := txn.validateReadSet(dispatchCtx); err != nil {
+		return nil, nil, err
+	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 		return nil, nil, err
 	}
 
