@@ -142,6 +142,7 @@ const (
 	redisHLLPrefix    = "!redis|hll|"
 	redisStreamPrefix = "!redis|stream|"
 	redisTTLPrefix    = "!redis|ttl|"
+	redisRoutePrefix  = "!redis|route|"
 )
 
 var redisInternalPrefixes = []string{
@@ -248,6 +249,12 @@ func redisStreamKey(userKey []byte) []byte {
 
 func redisTTLKey(userKey []byte) []byte {
 	return append([]byte(redisTTLPrefix), userKey...)
+}
+
+// redisUserRouteKey routes a literal Redis user key without recursively
+// decoding bytes that happen to look like another internal storage key.
+func redisUserRouteKey(userKey []byte) []byte {
+	return append([]byte(redisRoutePrefix), userKey...)
 }
 
 func redisExactSetStorageKey(kind string, userKey []byte) []byte {

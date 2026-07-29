@@ -884,11 +884,11 @@ func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
-	// Leadership is partitioned by the logical user key, so strip the internal
-	// prefix before asking the coordinator.
+	// Leadership is partitioned by the logical user key, but route through a
+	// Redis wrapper so list-internal-shaped user keys remain literal.
 	routingKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		routingKey = userKey
+		routingKey = redisUserRouteKey(userKey)
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {

@@ -235,7 +235,7 @@ func (r *RedisServer) proxyLRange(key, routingKey []byte, startRaw, endRaw []byt
 }
 
 func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
-	leader := r.coordinator.RaftLeaderForKey(key)
+	leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(key))
 	if leader == "" {
 		return 0, ErrLeaderNotFound
 	}
@@ -259,7 +259,7 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 }
 
 func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
-	leader := r.coordinator.RaftLeaderForKey(key)
+	leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(key))
 	if leader == "" {
 		return 0, ErrLeaderNotFound
 	}
@@ -364,10 +364,10 @@ func (r *RedisServer) leaderProxyPoolSizes() (normal, blocking int) {
 	return normal, blocking
 }
 
-// leaderClientForKey returns a cached go-redis client connected to the leader
-// for the given key.
-func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
-	leader := r.coordinator.RaftLeaderForKey(key)
+// leaderClientForRedisUserKey returns a cached go-redis client connected to
+// the leader for the literal Redis user key.
+func (r *RedisServer) leaderClientForRedisUserKey(key []byte) (*redis.Client, error) {
+	leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(key))
 	if leader == "" {
 		return nil, ErrLeaderNotFound
 	}
@@ -382,10 +382,11 @@ func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
 // response to conn. Returns true if the command was proxied (caller should
 // return immediately), false if this node is the leader.
 func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []byte) bool {
-	if r.coordinator.IsLeaderForKey(key) {
+	routeKey := redisUserRouteKey(key)
+	if r.coordinator.IsLeaderForKey(routeKey) {
 		return false
 	}
-	cli, err := r.leaderClientForKey(key)
+	cli, err := r.leaderClientForRedisUserKey(key)
 	if err != nil {
 		writeRedisError(conn, err)
 		return true
@@ -403,10 +404,11 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 }
 
 func (r *RedisServer) proxyBlockingToLeader(conn redcon.Conn, cmd redcon.Command, key []byte) bool {
-	if r.coordinator.IsLeaderForKey(key) {
+	routeKey := redisUserRouteKey(key)
+	if r.coordinator.IsLeaderForKey(routeKey) {
 		return false
 	}
-	leader := r.coordinator.RaftLeaderForKey(key)
+	leader := r.coordinator.RaftLeaderForKey(routeKey)
 	if leader == "" {
 		writeRedisError(conn, ErrLeaderNotFound)
 		return true

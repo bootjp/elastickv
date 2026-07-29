@@ -124,7 +124,7 @@ func TestWriteRedisError(t *testing.T) {
 		// instead of :prefix :leader. This covers proxyDBSize / proxyDel /
 		// proxyFlushDatabase / proxyFlushLegacy in redis_proxy.go +
 		// proxyKeys / proxyLRange / proxyRPush / proxyLPush /
-		// leaderClientForKey / resolveLeaderRedisAddr in redis.go — all
+		// leaderClientForRedisUserKey / resolveLeaderRedisAddr in redis.go — all
 		// errors.Newf'd with the same "ERR leader redis address unknown
 		// for %s" prefix.
 		{"leader-address-unknown config-gap is already ERR-prefixed",

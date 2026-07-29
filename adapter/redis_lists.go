@@ -792,7 +792,7 @@ type listProxyFunc func(key []byte, values [][]byte) (int64, error)
 
 func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
 	key := cmd.Args[1]
-	if !r.coordinator.IsLeaderForKey(key) {
+	if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 		length, err := proxyFn(key, cmd.Args[2:])
 		if err != nil {
 			writeRedisError(conn, err)
