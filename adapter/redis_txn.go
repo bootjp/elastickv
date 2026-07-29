@@ -179,6 +179,13 @@ func (r *RedisServer) ensureRedisReadFenceRouteStable(observed redisReadFenceRou
 	return errors.WithStack(store.NewWriteConflictError(redisReadFenceRouteChangedKey))
 }
 
+func (v redisReadFenceRouteVersion) observedRouteVersion() uint64 {
+	if !v.tracked {
+		return 0
+	}
+	return v.version
+}
+
 func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
 	return redisQueuedCommandReadFenceKeysForServer(nil, queue)
 }
@@ -332,7 +339,11 @@ func (r *RedisServer) transactionProxyRoute(queue []redcon.Command) (redisTxnPro
 		return redisTxnProxyRoute{}, nil
 	}
 
+	routeVersion := r.redisReadFenceRouteVersion()
 	groupKeys := r.queuedCommandReadFenceGroupKeys(queue)
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return redisTxnProxyRoute{}, err
+	}
 	if len(groupKeys) == 0 {
 		if !r.coordinator.IsLeader() {
 			return redisTxnProxyRoute{defaultLeader: true}, nil
@@ -344,10 +355,26 @@ func (r *RedisServer) transactionProxyRoute(queue []redcon.Command) (redisTxnPro
 	if err != nil {
 		return redisTxnProxyRoute{}, err
 	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return redisTxnProxyRoute{}, err
+	}
 	if ok {
 		return redisTxnProxyRoute{key: proxyKey}, nil
 	}
 	return redisTxnProxyRoute{}, nil
+}
+
+func (r *RedisServer) retryTransactionProxyRoute(ctx context.Context, queue []redcon.Command) (redisTxnProxyRoute, error) {
+	var route redisTxnProxyRoute
+	err := r.retryRedisWrite(ctx, func() error {
+		next, err := r.transactionProxyRoute(queue)
+		if err != nil {
+			return err
+		}
+		route = next
+		return nil
+	})
+	return route, err
 }
 
 func (r *RedisServer) leaseRedisReadFenceGroups(ctx context.Context, groupKeys [][]byte) error {
@@ -439,7 +466,9 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 	state.inTxn = false
 	state.queue = nil
 
-	route, err := r.transactionProxyRoute(queue)
+	routeCtx, routeCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	route, err := r.retryTransactionProxyRoute(routeCtx, queue)
+	routeCancel()
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1934,7 +1963,7 @@ func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, redisDispatchTimeout)
 }
 
-func (t *txnContext) commit() error {
+func (t *txnContext) commit(observedRouteVersion uint64) error {
 	prepared, err := t.prepareDispatch()
 	if err != nil {
 		return err
@@ -1944,11 +1973,12 @@ func (t *txnContext) commit() error {
 		return nil
 	}
 	group := &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		Elems:    prepared.elems,
-		StartTS:  t.startTS,
-		CommitTS: prepared.commitTS,
-		ReadKeys: prepared.readKeys,
+		IsTxn:                true,
+		Elems:                prepared.elems,
+		StartTS:              t.startTS,
+		CommitTS:             prepared.commitTS,
+		ReadKeys:             prepared.readKeys,
+		ObservedRouteVersion: observedRouteVersion,
 	}
 	if _, err := t.server.coordinator.Dispatch(prepared.ctx, group); err != nil {
 		return errors.WithStack(err)
@@ -2810,7 +2840,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 			return err
 		}
-		if err := txn.commit(); err != nil {
+		if err := txn.commit(routeVersion.observedRouteVersion()); err != nil {
 			return err
 		}
 		results = nextResults
@@ -2841,11 +2871,12 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 // results are only returned when reuse actually represents the
 // outcome of attempt 1's intent.
 type reusableExecTxn struct {
-	elems    []*kv.Elem[kv.OP]
-	startTS  uint64
-	commitTS uint64
-	readKeys [][]byte
-	results  []redisResult
+	elems                []*kv.Elem[kv.OP]
+	startTS              uint64
+	commitTS             uint64
+	observedRouteVersion uint64
+	readKeys             [][]byte
+	results              []redisResult
 }
 
 // dispatchExecReuse runs one iteration of the option-2 reuse path for
@@ -2863,6 +2894,9 @@ type reusableExecTxn struct {
 // is the current length" question; the client-visible result IS the
 // cached results array.
 func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableExecTxn) (results []redisResult, drop bool, err error) {
+	if err := r.ensureReusableExecRouteStable(pending); err != nil {
+		return nil, true, err
+	}
 	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
 	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
 	// at tla/hlc/MCHLC_gap.cfg). Clock().Next() bypasses the ceiling and
@@ -2874,12 +2908,13 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		return nil, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn:        true,
-		StartTS:      pending.startTS,
-		CommitTS:     commitTS,
-		PrevCommitTS: pending.commitTS,
-		ReadKeys:     pending.readKeys,
-		Elems:        pending.elems,
+		IsTxn:                true,
+		StartTS:              pending.startTS,
+		CommitTS:             commitTS,
+		PrevCommitTS:         pending.commitTS,
+		ReadKeys:             pending.readKeys,
+		Elems:                pending.elems,
+		ObservedRouteVersion: pending.observedRouteVersion,
 	})
 	if dispErr == nil {
 		return pending.results, false, nil
@@ -2920,6 +2955,16 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		pending.commitTS = commitTS
 	}
 	return nil, false, errors.WithStack(dispErr)
+}
+
+func (r *RedisServer) ensureReusableExecRouteStable(pending *reusableExecTxn) error {
+	if pending == nil || pending.observedRouteVersion == 0 {
+		return nil
+	}
+	return r.ensureRedisReadFenceRouteStable(redisReadFenceRouteVersion{
+		tracked: true,
+		version: pending.observedRouteVersion,
+	})
 }
 
 // runTransactionWithDedup is the option-2 retry loop for MULTI/EXEC.
@@ -3022,11 +3067,12 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 	}
 
 	group := &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		Elems:    prepared.elems,
-		StartTS:  txn.startTS,
-		CommitTS: prepared.commitTS,
-		ReadKeys: prepared.readKeys,
+		IsTxn:                true,
+		Elems:                prepared.elems,
+		StartTS:              txn.startTS,
+		CommitTS:             prepared.commitTS,
+		ReadKeys:             prepared.readKeys,
+		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
 	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
 		// Preserve the exact attempt for a forwarded conflict only after
@@ -3041,11 +3087,12 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		// escape to the client are out of scope for this loop.
 		if isRetryableRedisTxnErr(dispErr) {
 			return nil, &reusableExecTxn{
-				elems:    prepared.elems,
-				startTS:  txn.startTS,
-				commitTS: prepared.commitTS,
-				readKeys: prepared.readKeys,
-				results:  nextResults,
+				elems:                prepared.elems,
+				startTS:              txn.startTS,
+				commitTS:             prepared.commitTS,
+				observedRouteVersion: routeVersion.observedRouteVersion(),
+				readKeys:             prepared.readKeys,
+				results:              nextResults,
 			}, errors.WithStack(dispErr)
 		}
 		return nil, nil, errors.WithStack(dispErr)

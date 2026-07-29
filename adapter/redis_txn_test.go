@@ -100,11 +100,13 @@ func (s *redisReadFenceRangeStore) ReadFenceGroupKeysForRange(start []byte, _ []
 
 type redisReadFenceRouteVersionStore struct {
 	store.MVCCStore
-	mu                 sync.Mutex
-	routeVersion       uint64
-	rangeKeysByVersion map[uint64][][]byte
-	onLastCommitTS     func()
-	onScanAt           func()
+	mu                         sync.Mutex
+	routeVersion               uint64
+	rangeKeysByVersion         map[uint64][][]byte
+	readFenceGroupKeyCallCount int
+	onLastCommitTS             func()
+	onScanAt                   func()
+	onReadFenceGroupKeys       func()
 }
 
 func (s *redisReadFenceRouteVersionStore) ReadFenceRouteVersion() uint64 {
@@ -113,19 +115,29 @@ func (s *redisReadFenceRouteVersionStore) ReadFenceRouteVersion() uint64 {
 	return s.routeVersion
 }
 
-func (s *redisReadFenceRouteVersionStore) setRouteVersion(version uint64) {
+func (s *redisReadFenceRouteVersionStore) advanceRouteVersionForTest() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.routeVersion = version
+	s.routeVersion = 2
 }
 
 func (s *redisReadFenceRouteVersionStore) ReadFenceGroupKeysForRange(_ []byte, _ []byte) [][]byte {
 	if s == nil {
 		return nil
 	}
+	if s.onReadFenceGroupKeys != nil {
+		s.onReadFenceGroupKeys()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.readFenceGroupKeyCallCount++
 	return cloneReadKeys(s.rangeKeysByVersion[s.routeVersion])
+}
+
+func (s *redisReadFenceRouteVersionStore) readFenceGroupKeyCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readFenceGroupKeyCallCount
 }
 
 func (s *redisReadFenceRouteVersionStore) LastCommitTS() uint64 {
@@ -194,7 +206,8 @@ func requireTTLNear(t *testing.T, raw []byte, want time.Time) {
 
 type readKeyRecordingCoordinator struct {
 	*localAdapterCoordinator
-	lastReadKeys [][]byte
+	lastReadKeys             [][]byte
+	lastObservedRouteVersion uint64
 }
 
 func newReadKeyRecordingCoordinator(st store.MVCCStore) *readKeyRecordingCoordinator {
@@ -203,6 +216,24 @@ func newReadKeyRecordingCoordinator(st store.MVCCStore) *readKeyRecordingCoordin
 
 func (c *readKeyRecordingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.lastReadKeys = cloneReadKeys(req.ReadKeys)
+	c.lastObservedRouteVersion = req.ObservedRouteVersion
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+type routeChangingDispatchCoordinator struct {
+	*verifyHookCoordinator
+	dispatches     int
+	beforeDispatch func(int)
+}
+
+func (c *routeChangingDispatchCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.dispatches++
+	if c.beforeDispatch != nil {
+		c.beforeDispatch(c.dispatches)
+	}
+	if c.dispatches == 1 {
+		return nil, store.NewWriteConflictError([]byte("redis-route-version-retry"))
+	}
 	return c.localAdapterCoordinator.Dispatch(ctx, req)
 }
 
@@ -369,7 +400,7 @@ func TestRedisRangeListRetriesWhenReadFenceRouteVersionChangesDuringScan(t *test
 	st.onScanAt = func() {
 		scanOnce.Do(func() {
 			require.NoError(t, st.PutAt(ctx, listItemKey(key, 0), []byte("v2"), 20, 0))
-			st.setRouteVersion(2)
+			st.advanceRouteVersionForTest()
 		})
 	}
 
@@ -626,7 +657,7 @@ func TestRedisExecRetriesWhenReadFenceRouteVersionChanges(t *testing.T) {
 	var bumpOnce sync.Once
 	st.onLastCommitTS = func() {
 		bumpOnce.Do(func() {
-			st.setRouteVersion(2)
+			st.advanceRouteVersionForTest()
 		})
 	}
 
@@ -646,6 +677,115 @@ func TestRedisExecRetriesWhenReadFenceRouteVersionChanges(t *testing.T) {
 	require.Equal(t, resultNil, results[0].typ)
 	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
 	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeB), 2)
+}
+
+func TestRedisExecDispatchCarriesReadFenceRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:observed-route-version")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 7,
+		rangeKeysByVersion: map[uint64][][]byte{
+			7: {[]byte("txn-observed-route")},
+		},
+	}
+	coord := newReadKeyRecordingCoordinator(st)
+	server := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+
+	results, err := server.runTransactionDirect([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
+	}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, uint64(7), coord.lastObservedRouteVersion)
+}
+
+func TestRedisExecDedupDropsPendingWhenReadFenceRouteVersionChanges(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:route-version-dedup")
+	routeA := []byte("txn-dedup-route-a")
+	routeB := []byte("txn-dedup-route-b")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+		rangeKeysByVersion: map[uint64][][]byte{
+			1: {routeA},
+			2: {routeB},
+		},
+	}
+	coord := &routeChangingDispatchCoordinator{
+		verifyHookCoordinator: newVerifyHookCoordinator(st),
+	}
+	coord.groupForKey = readFenceRouteVersionGroupForKey(routeA, routeB)
+	coord.beforeDispatch = func(n int) {
+		if n == 1 {
+			st.advanceRouteVersionForTest()
+		}
+	}
+	server := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+
+	results, err := server.runTransactionWithDedup([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdSet), key, []byte("value")},
+	}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, 2, coord.dispatches)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeA), 2)
+	require.GreaterOrEqual(t, countReadKey(coord.leaseKeys, routeB), 2)
+}
+
+func TestRedisExecProxyRouteRetriesWhenReadFenceRouteVersionChanges(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:route-version-proxy")
+	routeA := []byte("txn-proxy-route-a")
+	routeB := []byte("txn-proxy-route-b")
+	st := &redisReadFenceRouteVersionStore{
+		MVCCStore:    store.NewMVCCStore(),
+		routeVersion: 1,
+		rangeKeysByVersion: map[uint64][][]byte{
+			1: {routeA},
+			2: {routeB},
+		},
+	}
+	var bumpOnce sync.Once
+	st.onReadFenceGroupKeys = func() {
+		bumpOnce.Do(func() {
+			st.advanceRouteVersionForTest()
+		})
+	}
+	coord := &redisTxnFenceRoutingCoordinator{
+		localLeader: func([]byte) bool {
+			return false
+		},
+		raftLeader: func([]byte) string {
+			return "raft-remote"
+		},
+		groupID: readFenceRouteVersionGroupForKey(routeA, routeB),
+	}
+	server := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		leaderRedis: map[string]string{"raft-remote": "redis-remote"},
+	}
+
+	route, err := server.retryTransactionProxyRoute(context.Background(), []redcon.Command{{
+		Args: [][]byte{[]byte(cmdGet), key},
+	}})
+	require.NoError(t, err)
+	require.NotEmpty(t, route.key)
+	require.Greater(t, st.readFenceGroupKeyCalls(), len(redisTxnReadFenceRanges(key)))
 }
 
 func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
