@@ -74,6 +74,30 @@ func (c *verifyHookCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	return 1
 }
 
+type observingLastCommitStore struct {
+	store.MVCCStore
+	onLastCommitTS func()
+}
+
+func (s *observingLastCommitStore) LastCommitTS() uint64 {
+	if s.onLastCommitTS != nil {
+		s.onLastCommitTS()
+	}
+	return s.MVCCStore.LastCommitTS()
+}
+
+type redisReadFenceRangeStore struct {
+	store.MVCCStore
+	rangeKeysByStart map[string][][]byte
+}
+
+func (s *redisReadFenceRangeStore) ReadFenceGroupKeysForRange(start []byte, _ []byte) [][]byte {
+	if s == nil {
+		return nil
+	}
+	return cloneReadKeys(s.rangeKeysByStart[string(start)])
+}
+
 func seedRedisListAt(t *testing.T, st store.MVCCStore, key []byte, ts uint64, values ...string) {
 	t.Helper()
 	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: int64(len(values))})
@@ -212,7 +236,7 @@ func TestRedisRangeListVerifiesLeaderBeforeSnapshot(t *testing.T) {
 	got, err := server.rangeList(context.Background(), key, []byte("0"), []byte("-1"))
 	require.NoError(t, err)
 	require.Equal(t, []string{"v1"}, got)
-	require.Equal(t, 1, coord.leaseCalls)
+	require.Equal(t, 2, coord.leaseCalls)
 }
 
 func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
@@ -246,8 +270,11 @@ func TestRedisRangeListFencesEveryStorageReadGroup(t *testing.T) {
 	got, err := server.rangeList(context.Background(), key, []byte("0"), []byte("-1"))
 	require.NoError(t, err)
 	require.Equal(t, []string{"v1"}, got)
-	require.Equal(t, 3, coord.leaseCalls)
+	require.Equal(t, 6, coord.leaseCalls)
 	require.ElementsMatch(t, [][]byte{
+		redisStrKey(key),
+		listMetaKey(key),
+		store.ListMetaDeltaScanPrefix(key),
 		redisStrKey(key),
 		listMetaKey(key),
 		store.ListMetaDeltaScanPrefix(key),
@@ -267,7 +294,7 @@ func TestRedisExecProxyRouteUsesShardLeaderInsteadOfDefaultLeader(t *testing.T) 
 			return "raft-local"
 		},
 	}
-	server := &RedisServer{coordinator: coord}
+	server := &RedisServer{coordinator: coord, leaderRedis: map[string]string{"raft-remote": "redis-remote"}}
 
 	route, err := server.transactionProxyRoute([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdGet), key},
@@ -290,7 +317,7 @@ func TestRedisExecProxyRouteTargetsRemoteShardLeader(t *testing.T) {
 			return "raft-remote"
 		},
 	}
-	server := &RedisServer{coordinator: coord}
+	server := &RedisServer{coordinator: coord, leaderRedis: map[string]string{"raft-remote": "redis-remote"}}
 
 	route, err := server.transactionProxyRoute([]redcon.Command{{
 		Args: [][]byte{[]byte(cmdGet), key},
@@ -323,7 +350,10 @@ func TestRedisExecProxyRouteFailsClosedOnSplitShardLeaders(t *testing.T) {
 			return 2
 		},
 	}
-	server := &RedisServer{coordinator: coord}
+	server := &RedisServer{coordinator: coord, leaderRedis: map[string]string{
+		"raft-a": "redis-a",
+		"raft-b": "redis-b",
+	}}
 
 	_, err := server.transactionProxyRoute([]redcon.Command{
 		{Args: [][]byte{[]byte(cmdGet), keyA}},
@@ -362,6 +392,117 @@ func TestRedisExecProxyRouteFailsClosedOnMixedLocalAndRemoteShardLeaders(t *test
 		{Args: [][]byte{[]byte(cmdGet), remoteKey}},
 	})
 	require.ErrorIs(t, err, errRedisExecSplitShardLeaders)
+}
+
+func TestRedisExecProxyRouteAllowsDistinctRaftEndpointsWithSameRedisTarget(t *testing.T) {
+	t.Parallel()
+
+	keyA := []byte("txn:same-redis-a")
+	keyB := []byte("txn:same-redis-b")
+	coord := &redisTxnFenceRoutingCoordinator{
+		defaultLeader: true,
+		localLeader: func([]byte) bool {
+			return false
+		},
+		raftLeader: func(key []byte) string {
+			if bytes.Contains(key, keyA) {
+				return "raft-a"
+			}
+			return "raft-b"
+		},
+		groupID: func(key []byte) uint64 {
+			if bytes.Contains(key, keyA) {
+				return 1
+			}
+			return 2
+		},
+	}
+	server := &RedisServer{
+		coordinator: coord,
+		leaderRedis: map[string]string{
+			"raft-a": "redis-remote",
+			"raft-b": "redis-remote",
+		},
+	}
+
+	route, err := server.transactionProxyRoute([]redcon.Command{
+		{Args: [][]byte{[]byte(cmdGet), keyA}},
+		{Args: [][]byte{[]byte(cmdGet), keyB}},
+	})
+	require.NoError(t, err)
+	require.False(t, route.defaultLeader)
+	require.Equal(t, redisStrKey(keyA), route.key)
+}
+
+func TestRedisExecReadFenceUsesRangeRoutesAndExactHashFields(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("txn:hash-fence-ranges")
+	field := []byte("field-b")
+	hashPrefix := store.HashFieldScanPrefix(key)
+	rangeKeyA := []byte("hash-route-a")
+	rangeKeyB := []byte("hash-route-b")
+	exactFieldKey := store.HashFieldKey(key, field)
+	st := &redisReadFenceRangeStore{
+		MVCCStore: store.NewMVCCStore(),
+		rangeKeysByStart: map[string][][]byte{
+			string(hashPrefix): {rangeKeyA, rangeKeyB},
+		},
+	}
+	coord := newVerifyHookCoordinator(st)
+	coord.groupForKey = func(got []byte) uint64 {
+		switch string(got) {
+		case string(rangeKeyA):
+			return 101
+		case string(rangeKeyB):
+			return 102
+		case string(exactFieldKey):
+			return 103
+		default:
+			return 1
+		}
+	}
+	server := &RedisServer{store: st, coordinator: coord}
+
+	got := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+		Args: [][]byte{[]byte(cmdHSet), key, field, []byte("value")},
+	}})
+
+	require.Contains(t, got, rangeKeyA)
+	require.Contains(t, got, rangeKeyB)
+	require.Contains(t, got, exactFieldKey)
+}
+
+func TestRedisReadFencedTimestampLeasesBeforeAndAfterSelectingTimestamp(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	coord := newVerifyHookCoordinator(base)
+	var leaseCallsAtLastCommitTS int
+	st := &observingLastCommitStore{
+		MVCCStore: base,
+		onLastCommitTS: func() {
+			coord.mu.Lock()
+			defer coord.mu.Unlock()
+			leaseCallsAtLastCommitTS = coord.leaseCalls
+		},
+	}
+	server := &RedisServer{store: st, coordinator: coord}
+
+	startTS, readPin, err := server.redisReadFencedTimestamp(
+		context.Background(),
+		[][]byte{redisStrKey([]byte("txn:fence-order"))},
+		server.txnStartTS,
+	)
+	defer readPin.Release()
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), startTS)
+	coord.mu.Lock()
+	leaseCalls := coord.leaseCalls
+	coord.mu.Unlock()
+	require.Equal(t, 1, leaseCallsAtLastCommitTS)
+	require.Equal(t, 2, leaseCalls)
 }
 
 func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
@@ -403,7 +544,7 @@ func TestRedisExecVerifiesLeaderBeforeSnapshot(t *testing.T) {
 			require.Len(t, results, 1)
 			require.Equal(t, resultArray, results[0].typ)
 			require.Equal(t, []string{"v1"}, results[0].arr)
-			require.Equal(t, 1, coord.leaseCalls)
+			require.Equal(t, 2, coord.leaseCalls)
 		})
 	}
 }
