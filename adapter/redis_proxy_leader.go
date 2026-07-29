@@ -141,13 +141,7 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
 			return true
 		}
-		var netErr net.Error
-		if isTransientLeaderRedisError(err) ||
-			errors.Is(err, context.DeadlineExceeded) ||
-			errors.Is(err, context.Canceled) ||
-			errors.Is(err, io.EOF) ||
-			errors.Is(err, io.ErrUnexpectedEOF) ||
-			errors.As(err, &netErr) {
+		if isTerminalProxyTxnError(err) {
 			writeRedisError(conn, err)
 			return true
 		}
@@ -169,12 +163,31 @@ func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
 			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
 			return true
 		}
+		if isRedisExecTerminalProxyError(err) {
+			writeRedisError(conn, err)
+			return true
+		}
 		if isTransientLeaderRedisError(err) {
 			writeRedisError(conn, err)
 			return true
 		}
 	}
 	return false
+}
+
+func isTerminalProxyTxnError(err error) bool {
+	var netErr net.Error
+	return isRedisExecTerminalProxyError(err) ||
+		isTransientLeaderRedisError(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.As(err, &netErr)
+}
+
+func isRedisExecTerminalProxyError(err error) bool {
+	return errors.Is(err, errRedisExecRouteChangedAfterAmbiguousAttempt)
 }
 
 // writeProxyCmdsResult writes an EXEC-style array reply for the given pipeline

@@ -113,27 +113,59 @@ func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
 	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
 }
 
-func (r *RedisServer) redisTxnReadFenceKeys(userKey []byte) [][]byte {
+func (r *RedisServer) redisTxnReadFenceKeysForRanges(userKey []byte, ranges []redisReadFenceRange) [][]byte {
 	keys := append([][]byte{}, redisTxnReadFenceKeys(userKey)...)
-	for _, readRange := range redisTxnReadFenceRanges(userKey) {
+	for _, readRange := range ranges {
 		keys = append(keys, r.redisReadFenceRangeGroupKeys(readRange.start, readRange.end)...)
 	}
 	return keys
 }
 
 func redisTxnReadFenceRanges(userKey []byte) []redisReadFenceRange {
-	prefixes := [][]byte{
+	ranges := redisListReadFenceRanges(userKey)
+	ranges = append(ranges, redisHashReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisSetReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisZSetReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisStreamReadFenceRanges(userKey)...)
+	return ranges
+}
+
+func redisListReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
 		store.ListMetaDeltaScanPrefix(userKey),
 		store.ListClaimScanPrefix(userKey),
+	})
+}
+
+func redisHashReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
 		store.HashFieldScanPrefix(userKey),
 		store.HashMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisSetReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
 		store.SetMemberScanPrefix(userKey),
 		store.SetMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisZSetReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
 		store.ZSetMemberScanPrefix(userKey),
 		store.ZSetScoreScanPrefix(userKey),
 		store.ZSetMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisStreamReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
 		store.StreamEntryScanPrefix(userKey),
-	}
+	})
+}
+
+func redisReadFenceRangesForPrefixes(prefixes [][]byte) []redisReadFenceRange {
 	ranges := make([]redisReadFenceRange, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		ranges = append(ranges, redisReadFenceRange{
@@ -218,7 +250,8 @@ func redisCommandReadFenceKeysForServer(r *RedisServer, cmd redcon.Command) [][]
 	if len(cmd.Args) == 0 {
 		return nil
 	}
-	meta, ok := redisCommandTable[strings.ToUpper(string(cmd.Args[0]))]
+	cmdName := strings.ToUpper(string(cmd.Args[0]))
+	meta, ok := redisCommandTable[cmdName]
 	if !ok {
 		return nil
 	}
@@ -228,10 +261,25 @@ func redisCommandReadFenceKeysForServer(r *RedisServer, cmd redcon.Command) [][]
 			keys = append(keys, redisTxnReadFenceKeys(userKey)...)
 			continue
 		}
-		keys = append(keys, r.redisTxnReadFenceKeys(userKey)...)
+		keys = append(keys, r.redisTxnReadFenceKeysForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
 	}
 	keys = append(keys, redisCommandExactReadFenceKeys(cmd)...)
 	return keys
+}
+
+func redisCommandReadFenceRanges(cmdName string, userKey []byte) []redisReadFenceRange {
+	switch cmdName {
+	case cmdHSet, cmdHMSet:
+		return redisHashReadFenceRanges(userKey)
+	case cmdRPush, cmdLRange:
+		return redisListReadFenceRanges(userKey)
+	case cmdZIncrBy:
+		return redisZSetReadFenceRanges(userKey)
+	case cmdSet, cmdDel, cmdIncr, cmdExpire, cmdPExpire:
+		return redisTxnReadFenceRanges(userKey)
+	default:
+		return nil
+	}
 }
 
 func redisCommandExactReadFenceKeys(cmd redcon.Command) [][]byte {
@@ -2953,14 +3001,10 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		// iteration rebuilds from a fresh snapshot.
 		return nil, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): the reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine).
-	if isReusableRedisTxnErr(dispErr) {
-		pending.commitTS = commitTS
-	}
+	// TxnLocked did not apply the reuse attempt, and non-retryable errors will
+	// escape the retry loop. In both cases, keep pending.commitTS pointing at
+	// the last ambiguous dispatch so a later retry probes the only commit_ts
+	// that might already have landed.
 	return nil, false, errors.WithStack(dispErr)
 }
 
@@ -3105,13 +3149,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		// restoring its typed form. runTransactionWithDedup can then reuse this
 		// write set instead of replaying the EXEC body from a new snapshot.
 		dispErr = normalizeRetryableRedisTxnErr(dispErr)
-		// Only remember the attempt for reuse if retryRedisWrite will
-		// actually loop. Mirrors listPushCoreWithDedup's gating
-		// rationale — errors that escape the loop (transient-leader,
-		// context deadline, FSM apply error) leave pending pointing at
-		// state wasted with the goroutine; ambiguous errors that
-		// escape to the client are out of scope for this loop.
-		if isReusableRedisTxnErr(dispErr) {
+		// Only remember the attempt when the dispatch outcome is ambiguous.
+		// TxnLocked is retryable, but it did not apply; keeping no pending lets
+		// the next iteration rebuild against the current read-fence route.
+		if isAmbiguousRedisExecDispatchErr(dispErr) {
 			return nil, &reusableExecTxn{
 				elems:                prepared.elems,
 				startTS:              txn.startTS,
@@ -3124,6 +3165,10 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		return nil, nil, errors.WithStack(dispErr)
 	}
 	return nextResults, nil, nil
+}
+
+func isAmbiguousRedisExecDispatchErr(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict)
 }
 
 func (r *RedisServer) txnStartTS() uint64 {

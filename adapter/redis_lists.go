@@ -771,7 +771,7 @@ func (r *RedisServer) rangeListAt(ctx context.Context, key []byte, startRaw, end
 }
 
 func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, startRaw, endRaw []byte) (uint64, *kv.ActiveTimestampToken, []string, bool, error) {
-	groupKeys := r.redisReadFenceGroupKeys(r.redisTxnReadFenceKeys(key))
+	groupKeys := r.redisReadFenceGroupKeys(r.redisTxnReadFenceKeysForRanges(key, redisListReadFenceRanges(key)))
 	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
 	if err != nil {
 		return 0, nil, nil, false, err
