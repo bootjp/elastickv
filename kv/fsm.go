@@ -729,8 +729,8 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	if f.routes == nil || f.shardGroupID == 0 {
 		return nil
 	}
-	observedVer := r.GetObservedRouteVersion()
-	if observedVer == 0 {
+	observedVer, pinned := DecodeObservedRouteVersion(r.GetObservedRouteVersion())
+	if !pinned {
 		return nil
 	}
 

@@ -399,6 +399,65 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(wireErr))
 }
 
+func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
+	t.Parallel()
+
+	wireErr := errors.WithStack(status.Error(codes.Aborted,
+		"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error()))
+	attempts := 0
+	srv := &RedisServer{}
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		if attempts == 1 {
+			return wireErr
+		}
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
+}
+
+func TestRetryRedisWriteDoesNotTreatComposedSentinelInWireConflictKeyAsRouteError(t *testing.T) {
+	t.Parallel()
+
+	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+			wireErr := errors.WithStack(status.Error(codes.Unknown,
+				store.NewWriteConflictError([]byte("retry:"+sentinel.Error())).Error()))
+			attempts := 0
+			srv := &RedisServer{}
+
+			err := srv.retryRedisWrite(context.Background(), func() error {
+				attempts++
+				return wireErr
+			})
+
+			require.ErrorIs(t, err, store.ErrWriteConflict)
+			require.NotErrorIs(t, err, sentinel)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
+func TestNormalizeRetryableRedisTxnErrPrefersWireTxnKeyEnvelope(t *testing.T) {
+	t.Parallel()
+
+	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+			wireErr := errors.WithStack(status.Error(codes.Aborted,
+				kv.NewTxnLockedError([]byte("locked:"+sentinel.Error())).Error()))
+
+			err := normalizeRetryableRedisTxnErr(wireErr)
+
+			require.ErrorIs(t, err, kv.ErrTxnLocked)
+			require.NotErrorIs(t, err, sentinel)
+		})
+	}
+}
+
 func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 	t.Parallel()
 
