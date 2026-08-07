@@ -189,7 +189,7 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 	// Only use the fast path when we are the leader for this key so the local
 	// type check is authoritative. On followers, stale MVCC state could miss a
 	// non-string type, leaving orphaned internal keys after overwrite.
-	if !r.coordinator.IsLeaderForKey(key) {
+	if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 		return false
 	}
 	readTS := r.readTS()
@@ -333,7 +333,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// that can actually block on quorum / I/O.
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
-	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
+	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, redisUserRouteKey(key)); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
@@ -457,7 +457,7 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 	// existence with ttlAt() semantics (including the in-memory TTL buffer).
 	// If this path is unavailable we fall back to raw-KV probing, which is
 	// best-effort and may lag unflushed buffer-only TTL updates.
-	if cli, err := r.leaderClientForKey(key); err == nil {
+	if cli, err := r.leaderClientForRedisUserKey(key); err == nil {
 		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 		defer cancel()
 		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
@@ -483,7 +483,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	localKeys := make([][]byte, 0, len(cmd.Args)-1)
 	proxyKeys := make([][]byte, 0)
 	for _, key := range cmd.Args[1:] {
-		if r.coordinator.IsLeaderForKey(key) {
+		if r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 			localKeys = append(localKeys, key)
 		} else {
 			proxyKeys = append(proxyKeys, key)
@@ -566,7 +566,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		}
 		if ok {
 			count++
-		} else if !r.coordinator.IsLeaderForKey(key) {
+		} else if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 			// Local MVCC may be stale on a follower; proxy to the leader.
 			if r.tryLeaderLogicalExists(key) {
 				count++

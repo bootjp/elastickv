@@ -1062,7 +1062,8 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// against the newly-created incarnation publish gauges newer
 	// than the cleanup cutoff below.
 	throttleResetCutoff := s.beginThrottleReset(requested.Name)
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	// Drop any throttle bucket that survived a delete-then-create
@@ -1194,7 +1195,8 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		// A same-name CreateQueue that commits immediately afterward can
 		// then publish token gauges newer than this stale delete cleanup.
 		throttleResetCutoff := s.beginThrottleReset(queueName)
-		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
 			return throttleResetCutoff, nil
 		} else if !isRetryableTransactWriteError(err) {
 			return 0, errors.WithStack(err)
@@ -1730,7 +1732,8 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		// this commit must publish a gauge newer than the cleanup cutoff.
 		throttleResetCutoff = s.beginThrottleReset(queueName)
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, nil, nil, 0, false, errors.WithStack(err)
 	}
 	return throttleChanged, postThrottle, resetActions, throttleResetCutoff, true, nil

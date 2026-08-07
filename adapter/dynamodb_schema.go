@@ -204,7 +204,8 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 			return err
 		}
 		req.StartTS = readTS
-		if _, err := d.coordinator.Dispatch(ctx, req); err == nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
 			return nil
 		}
 		if !isRetryableTransactWriteError(err) {
@@ -318,7 +319,8 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 				{Op: kv.Del, Key: dynamoTableMetaKey(tableName)},
 			},
 		}
-		if _, err := d.coordinator.Dispatch(ctx, req); err != nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return errors.WithStack(err)
 			}

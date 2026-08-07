@@ -272,7 +272,7 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	// (non-retryable errors escape to the client; pending is then
 	// discarded with the goroutine, so the update is wasted and the
 	// stale value would be misleading if some future caller reads it).
-	if isRetryableRedisTxnErr(dispErr) {
+	if isReusableRedisTxnErr(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return 0, false, errors.WithStack(dispErr)
@@ -448,7 +448,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		// retryRedisWrite's retry predicate; ambiguous errors that escape
 		// to the client are a separate problem space (cross-request
 		// idempotency cache) and out of scope for this design.
-		if isRetryableRedisTxnErr(dispErr) {
+		if isReusableRedisTxnErr(dispErr) {
 			pending = &reusableListPush{
 				ops:           ops,
 				startTS:       startTS,
@@ -740,11 +740,40 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 }
 
 func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
-	if !r.coordinator.IsLeaderForKey(key) {
-		return r.proxyLRange(key, startRaw, endRaw)
+	var out []string
+	err := r.retryRedisWrite(ctx, func() error {
+		routeVersion := r.redisReadFenceRouteVersion()
+		readTS, readPin, proxied, ok, err := r.fenceRangeListReadGroups(ctx, key, startRaw, endRaw)
+		if err != nil {
+			return err
+		} else if ok {
+			if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+				return err
+			}
+			out = proxied
+			return nil
+		}
+		defer readPin.Release()
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
+		}
+		next, err := r.rangeListAt(ctx, key, startRaw, endRaw, readTS)
+		if err != nil {
+			return err
+		}
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
+		}
+		out = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	return out, nil
+}
 
-	readTS := r.readTS()
+func (r *RedisServer) rangeListAt(ctx context.Context, key []byte, startRaw, endRaw []byte, readTS uint64) ([]string, error) {
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
@@ -754,14 +783,6 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 	}
 	if typ != redisTypeList {
 		return nil, wrongTypeError()
-	}
-
-	// PR #749 follow-up: pass the per-call dispatch ctx so a stalled
-	// VerifyLeaderForKey honours the caller's deadline rather than the
-	// long-lived handlerContext + verifyLeaderEngineCtx fallback. Same
-	// shape as keys() / FLUSHDB.
-	if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
-		return nil, errors.WithStack(err)
 	}
 
 	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
@@ -780,12 +801,29 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
 }
 
+func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, startRaw, endRaw []byte) (uint64, *kv.ActiveTimestampToken, []string, bool, error) {
+	groupKeys := r.redisReadFenceGroupKeys(r.redisTxnReadFenceKeysForRanges(key, redisListReadFenceRanges(key)))
+	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
+	if err != nil {
+		return 0, nil, nil, false, err
+	}
+	if ok {
+		proxied, err := r.proxyLRange(key, proxyKey, startRaw, endRaw)
+		return 0, nil, proxied, true, err
+	}
+	readTS, readPin, err := r.redisReadFencedTimestamp(ctx, groupKeys, r.readTS)
+	if err != nil {
+		return 0, nil, nil, false, err
+	}
+	return readTS, readPin, nil, false, nil
+}
+
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)
 type listProxyFunc func(key []byte, values [][]byte) (int64, error)
 
 func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
 	key := cmd.Args[1]
-	if !r.coordinator.IsLeaderForKey(key) {
+	if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 		length, err := proxyFn(key, cmd.Args[2:])
 		if err != nil {
 			writeRedisError(conn, err)

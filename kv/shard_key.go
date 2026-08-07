@@ -66,6 +66,9 @@ func routeKey(key []byte) []byte {
 }
 
 func normalizeRouteKey(key []byte) []byte {
+	if user := listRouteKey(key); user != nil {
+		return user
+	}
 	if user := redisRouteKey(key); user != nil {
 		return user
 	}
@@ -81,10 +84,26 @@ func normalizeRouteKey(key []byte) []byte {
 	if user := fskeys.ExtractRouteKey(key); user != nil {
 		return user
 	}
+	return key
+}
+
+func listRouteKey(key []byte) []byte {
+	if store.IsListMetaDeltaKey(key) {
+		if user := store.ExtractListUserKeyFromDelta(key); user != nil {
+			return user
+		}
+		return store.ExtractListUserKeyFromDeltaScanPrefix(key)
+	}
+	if store.IsListClaimKey(key) {
+		if user := store.ExtractListUserKeyFromClaim(key); user != nil {
+			return user
+		}
+		return store.ExtractListUserKeyFromClaimScanPrefix(key)
+	}
 	if user := store.ExtractListUserKey(key); user != nil {
 		return user
 	}
-	return key
+	return nil
 }
 
 func redisRouteKey(key []byte) []byte {
@@ -93,7 +112,7 @@ func redisRouteKey(key []byte) []byte {
 	}
 	rest := key[len(redisInternalRoutePrefix):]
 	sep := bytes.IndexByte(rest, '|')
-	if sep < 0 || sep+1 >= len(rest) {
+	if sep <= 0 {
 		return nil
 	}
 	return rest[sep+1:]

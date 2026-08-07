@@ -196,7 +196,7 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	if meta.IsFIFO {
 		return s.sendBatchFifoEntries(ctx, queueName, meta, entries)
 	}
-	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, identities, readTS)
+	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, identities, readTimestamp)
 }
 
 // sendBatchStandardOnce is the original single-OCC fast path for
@@ -208,8 +208,9 @@ func (s *SQSServer) sendBatchStandardOnce(
 	meta *sqsQueueMeta,
 	entries []sqsSendMessageBatchEntryInput,
 	identities []sqsSendIdentity,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
+	readTS := readTimestamp.Timestamp()
 	successful := make([]sqsSendMessageBatchResultEntry, 0, len(entries))
 	failed := make([]sqsBatchResultErrorEntry, 0)
 	// Each entry produces three OCC ops: data, vis, byage. Pre-sizing
@@ -258,7 +259,8 @@ func (s *SQSServer) sendBatchStandardOnce(
 		ReadKeys: [][]byte{sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
 		Elems:    elems,
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, nil, true, nil
 		}

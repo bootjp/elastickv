@@ -473,30 +473,30 @@ func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (
 // 400 against a non-existent bucket). It still sits OUTSIDE the
 // OCC transaction (§4.2): a rejected request never reaches the
 // coordinator.
-func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
+func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, kv.ReadTimestamp, int64, bool) {
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
+	meta, readTimestamp, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return nil, 0, 0, false
+		return nil, kv.ReadTimestamp{}, 0, false
 	}
 	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch) {
-		return nil, 0, 0, false
+		return nil, kv.ReadTimestamp{}, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return nil, 0, 0, false
+		return nil, kv.ReadTimestamp{}, 0, false
 	}
 	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return nil, 0, 0, false
+		return nil, kv.ReadTimestamp{}, 0, false
 	}
 	delay, apiErr := resolveSendDelay(meta, in.DelaySeconds)
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return nil, 0, 0, false
+		return nil, kv.ReadTimestamp{}, 0, false
 	}
-	return meta, readTS, delay, true
+	return meta, readTimestamp, delay, true
 }
 
 func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
@@ -504,10 +504,11 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	meta, readTS, delay, ok := s.validateSend(w, r, queueName, in)
+	meta, readTimestamp, delay, ok := s.validateSend(w, r, queueName, in)
 	if !ok {
 		return
 	}
+	readTS := readTimestamp.Timestamp()
 	if meta.IsFIFO {
 		s.sendMessageFifoLoop(w, r, queueName, meta, in, delay, readTS)
 		return
@@ -547,7 +548,8 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 			{Op: kv.Put, Key: byAgeKey, Value: []byte(rec.MessageID)},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(r.Context(), req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
@@ -561,10 +563,11 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sqsSendMessageInput) (map[string]string, error) {
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	meta, readTS, apiErr := s.loadQueueMetaForSend(ctx, queueName, []byte(in.MessageBody))
+	meta, readTimestamp, apiErr := s.loadQueueMetaForSend(ctx, queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	readTS := readTimestamp.Timestamp()
 	if err := s.chargeQueueWithThrottleErr(queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation, throttleEpoch); err != nil {
 		return nil, err
 	}
@@ -600,7 +603,8 @@ func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sq
 			{Op: kv.Put, Key: byAgeKey, Value: []byte(rec.MessageID)},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return map[string]string{
@@ -630,18 +634,18 @@ func (s *SQSServer) sendMessageFifoLoop(w http.ResponseWriter, r *http.Request, 
 // the caller can pin its OCC dispatch to it; without that fence a
 // concurrent DeleteQueue / PurgeQueue could slip in between our read
 // and the write, storing a message under a dead generation.
-func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, body []byte) (*sqsQueueMeta, uint64, error) {
+func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, body []byte) (*sqsQueueMeta, kv.ReadTimestamp, error) {
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs send message: begin read timestamp")
 	if err != nil {
-		return nil, 0, errors.WithStack(err)
+		return nil, kv.ReadTimestamp{}, errors.WithStack(err)
 	}
 	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, readTS, errors.WithStack(err)
+		return nil, readTimestamp, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	// AWS rejects SendMessage when MessageBody is empty (InvalidParameterValue
 	// "Message body cannot be empty"). Silently enqueuing a zero-length
@@ -649,12 +653,12 @@ func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, 
 	// body parameter) land in the queue where they later look like real
 	// messages to consumers.
 	if len(body) == 0 {
-		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
+		return nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
 	}
 	if int64(len(body)) > meta.MaximumMessageSize {
-		return nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
+		return nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
 	}
-	return meta, readTS, nil
+	return meta, readTimestamp, nil
 }
 
 // validateSendFIFOParams enforces the AWS-compatible rules around
