@@ -18,6 +18,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/secondary"
 )
 
 type ShardGroup struct {
@@ -962,7 +963,7 @@ func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGro
 	if c.anyResolverClaimedKey(reqs.Elems) {
 		return
 	}
-	reqs.ObservedRouteVersion = c.engine.Version()
+	reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 }
 
 // anyResolverClaimedKey reports whether any element's key is
@@ -1050,7 +1051,7 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// so a key whose owning group changed since the last
 		// attempt naturally lands on the new group's FSM.
 		if c.engine != nil {
-			reqs.ObservedRouteVersion = c.engine.Version()
+			reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 		}
 		// Clear the timestamps so the next attempt allocates a
 		// fresh pair against the post-shift HLC.  The OCC
@@ -2644,11 +2645,22 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 }
 
 func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
+	errCh := make(chan error, len(targets))
+	var wg sync.WaitGroup
 	var recoveryErr error
 	for _, target := range targets {
-		if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
-			recoveryErr = combineHLCRecoveryErrors(recoveryErr, errors.Wrapf(err, "recover hlc lease group %d", target.gid))
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+				errCh <- errors.Wrapf(err, "recover hlc lease group %d", target.gid)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
 	}
 	if !hlcCeilingExpired(c.clock) {
 		return nil
@@ -2660,13 +2672,13 @@ func combineHLCRecoveryErrors(first error, next error) error {
 	if first == nil {
 		return next
 	}
-	return errors.Wrap(errors.CombineErrors(first, next), "combine hlc recovery errors")
+	return errors.Wrap(secondary.CombineErrors(first, next), "combine hlc recovery errors")
 }
 
 func hlcRecoveryFailedError(recoveryErr error) error {
 	expiredErr := errors.Wrap(ErrCeilingExpired, "recover hlc lease did not advance ceiling")
 	if recoveryErr != nil {
-		return errors.Wrap(errors.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
+		return errors.Wrap(secondary.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
 	}
 	return expiredErr
 }

@@ -160,7 +160,8 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 			{Op: kv.Put, Key: tombstoneKey, Value: tombstoneValue},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, 0, 0, errors.WithStack(err)
 	}
 	return true, lastGen, meta.Generation, nil
