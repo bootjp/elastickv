@@ -95,6 +95,11 @@ func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
 	return alloc
 }
 
+func (c keyVizLabeledCoordinator) ConfiguredTimestampAllocator() TimestampAllocator {
+	alloc, _ := ConfiguredTimestampAllocatorThrough(c.inner)
+	return alloc
+}
+
 func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
 	ctx = contextWithKeyVizLabel(ctx, c.label)
 	if alloc, ok := c.inner.(TimestampAllocator); ok {
