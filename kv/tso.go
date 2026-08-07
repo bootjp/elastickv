@@ -24,6 +24,9 @@ var (
 	ErrTSOTimestampInvalid   = errors.New("tso: timestamp is not a durable phase-D allocation")
 	ErrTSOTimestampPrePhaseD = errors.New("tso: timestamp predates phase D")
 	ErrTSOReadVoucherLimit   = errors.New("tso: applied read timestamp voucher limit reached")
+
+	errHLCLeaseRecoveryUnavailable = errors.New("hlc lease recovery unavailable")
+	errHLCLeaseRecoveryBlocked     = errors.New("hlc lease recovery blocked")
 )
 
 // TSOAllocator issues globally monotonic timestamps. NextBatch returns the
@@ -77,7 +80,20 @@ type TSOPhaseDState interface {
 // It is a process-local capability used only to distinguish audited adapter
 // snapshots from arbitrary caller-supplied StartTS values during Phase D.
 type AppliedReadTimestampVoucher interface {
-	VouchAppliedReadTimestamp(uint64) error
+	VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error
+}
+
+// AppliedReadTimestampVoucherRevoker removes an unused voucher registration.
+// Decorators that forward VouchAppliedReadTimestamp should forward revocation
+// too so pre-dispatch gates cannot leak inner-coordinator voucher entries.
+type AppliedReadTimestampVoucherRevoker interface {
+	RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef)
+}
+
+// AppliedReadTimestampVoucherRef is an opaque process-local dispatch
+// capability. Only this package can mint a non-zero ref.
+type AppliedReadTimestampVoucherRef struct {
+	id uint64
 }
 
 // ReadTimestamp is the adapter-side result of beginning a transaction snapshot.
@@ -94,9 +110,19 @@ func (t ReadTimestamp) Timestamp() uint64 {
 	return t.timestamp
 }
 
+func (t ReadTimestamp) voucherRef() (AppliedReadTimestampVoucherRef, bool) {
+	if t.voucher == nil || t.voucher.ref.id == 0 {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return t.voucher.ref, true
+}
+
+var nextAppliedReadDispatchVoucherID atomic.Uint64
+
 type appliedReadDispatchVoucher struct {
 	mu       sync.Mutex
 	prepared uint64
+	ref      AppliedReadTimestampVoucherRef
 }
 
 type appliedReadDispatchVoucherContextKey struct{}
@@ -108,10 +134,21 @@ func (t ReadTimestamp) WithDispatchVoucher(ctx context.Context) context.Context 
 	return context.WithValue(nonNilTSOContext(ctx), appliedReadDispatchVoucherContextKey{}, t)
 }
 
+func appliedReadTimestampVoucherRefFromContext(ctx context.Context, timestamp uint64) (AppliedReadTimestampVoucherRef, bool) {
+	if ctx == nil {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	readTimestamp, ok := ctx.Value(appliedReadDispatchVoucherContextKey{}).(ReadTimestamp)
+	if !ok || readTimestamp.timestamp != timestamp {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return readTimestamp.voucherRef()
+}
+
 // DispatchWithReadTimestamp dispatches an OCC operation under the applied-read
-// capability bound by ReadTimestamp.WithDispatchVoucher. The first dispatch
-// consumes the voucher reserved by BeginReadTimestampThrough; every subsequent
-// dispatch reserves one additional use immediately before dispatching.
+// capability bound by ReadTimestamp.WithDispatchVoucher. Each dispatch reserves
+// one token tied to that bound capability immediately before dispatching, so a
+// same-valued StartTS from another request cannot consume it.
 func DispatchWithReadTimestamp(
 	ctx context.Context,
 	coord Coordinator,
@@ -129,33 +166,52 @@ func DispatchWithReadTimestamp(
 	if reqs == nil || reqs.StartTS != readTimestamp.timestamp {
 		return nil, errors.WithStack(ErrTSOTimestampInvalid)
 	}
-	if err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp); err != nil {
+	preparedReadTimestamp, revoke, err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp)
+	if err != nil {
 		return nil, err
 	}
-	resp, err := coord.Dispatch(ctx, reqs)
+	defer revoke()
+	dispatchCtx := preparedReadTimestamp.WithDispatchVoucher(ctx)
+	resp, err := coord.Dispatch(dispatchCtx, reqs)
 	return resp, errors.WithStack(err)
 }
 
-func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) error {
+func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
+	id := nextAppliedReadDispatchVoucherID.Add(1)
+	if id == 0 {
+		id = nextAppliedReadDispatchVoucherID.Add(1)
+	}
+	return &appliedReadDispatchVoucher{ref: AppliedReadTimestampVoucherRef{id: id}}
+}
+
+func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (ReadTimestamp, func(), error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.prepared == 0 {
-		v.prepared = 1
-		return nil
-	}
 	voucher, ok := coord.(AppliedReadTimestampVoucher)
 	if !ok {
-		return errors.WithStack(ErrTSOProtocolUnsupported)
+		return ReadTimestamp{}, nil, errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	if err := voucher.VouchAppliedReadTimestamp(timestamp); err != nil {
-		return errors.WithStack(err)
+	preparedVoucher := newAppliedReadDispatchVoucher()
+	if err := voucher.VouchAppliedReadTimestamp(timestamp, preparedVoucher.ref); err != nil {
+		return ReadTimestamp{}, nil, errors.WithStack(err)
 	}
 	v.prepared++
-	return nil
+	revoke := func() {}
+	if revoker, ok := coord.(AppliedReadTimestampVoucherRevoker); ok {
+		ref := preparedVoucher.ref
+		revoke = func() {
+			revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+		}
+	}
+	return ReadTimestamp{timestamp: timestamp, voucher: preparedVoucher}, revoke, nil
 }
 
 type tsoBatchAfterAllocator interface {
 	NextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error)
+}
+
+type hlcLeaseRecoverer interface {
+	RecoverHLCLease(context.Context) error
 }
 
 type timestampIssuer interface {
@@ -182,11 +238,8 @@ func NextTimestampThrough(ctx context.Context, coord Coordinator, label string) 
 	if coord == nil || coord.Clock() == nil {
 		return 1, nil
 	}
-	ts, err := coord.Clock().NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	recoverer, _ := coord.(hlcLeaseRecoverer)
+	return nextFencedWithRecovery(ctx, coord.Clock(), recoverer, label)
 }
 
 // NextTimestampAfterThrough allocates a timestamp strictly greater than
@@ -317,7 +370,7 @@ func BeginReadTimestampThrough(
 	}
 	readTimestamp := ReadTimestamp{timestamp: legacyTimestamp}
 	if vouched {
-		readTimestamp.voucher = &appliedReadDispatchVoucher{}
+		readTimestamp.voucher = newAppliedReadDispatchVoucher()
 	}
 	return readTimestamp, nil
 }
@@ -352,12 +405,8 @@ func validateAppliedReadTimestamp(
 	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return false, errors.Wrap(err, label)
 	}
-	voucher, ok := coord.(AppliedReadTimestampVoucher)
-	if !ok {
+	if _, ok := coord.(AppliedReadTimestampVoucher); !ok {
 		return false, errors.Wrap(ErrTSOProtocolUnsupported, label+": applied read voucher unavailable")
-	}
-	if err := voucher.VouchAppliedReadTimestamp(timestamp); err != nil {
-		return false, errors.Wrap(err, label)
 	}
 	return true, nil
 }
@@ -434,6 +483,67 @@ func nextTimestampAfterFallback(startTS uint64) (uint64, error) {
 	return nextTS, nil
 }
 
+func nextFencedWithRecovery(ctx context.Context, clock *HLC, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	ts, err := clock.NextFenced()
+	if err == nil {
+		return ts, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	ts, err = clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+func nextBatchFencedWithRecovery(ctx context.Context, clock *HLC, n int, recoverer hlcLeaseRecoverer, label string) (uint64, error) {
+	base, err := clock.NextBatchFenced(n)
+	if err == nil {
+		return base, nil
+	}
+	if !errors.Is(err, ErrCeilingExpired) || recoverer == nil {
+		return 0, errors.Wrap(err, label)
+	}
+	if recoverErr := recoverer.RecoverHLCLease(ctx); recoverErr != nil {
+		return 0, wrapHLCLeaseRecoveryFailure(err, recoverErr, label)
+	}
+	base, err = clock.NextBatchFenced(n)
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return base, nil
+}
+
+func wrapHLCLeaseRecoveryFailure(err, recoverErr error, label string) error {
+	return errors.Join(
+		errors.Wrapf(err, "%s: on-demand HLC lease renewal failed", label),
+		errors.Wrap(recoverErr, "hlc lease recovery"),
+	)
+}
+
+func hlcRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, dispatchLeaderRetryBudget)
+}
+
+func hlcCeilingExpired(clock *HLC) bool {
+	if clock == nil {
+		return false
+	}
+	ceiling := clock.PhysicalCeiling()
+	return ceiling > 0 && time.Now().UnixMilli() >= ceiling
+}
+
 type tsoCoordinator interface {
 	IsLeader() bool
 	Clock() *HLC
@@ -492,8 +602,8 @@ func (a *LocalTSOAllocator) NextBatchAfter(ctx context.Context, n int, min uint6
 }
 
 func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error) {
-	if n <= 0 {
-		return 0, errors.WithStack(ErrInvalidTSOBatchSize)
+	if err := validateTSOMinimumWindow(min, n); err != nil {
+		return 0, err
 	}
 	if err := a.waitLeader(ctx); err != nil {
 		return 0, err
@@ -505,8 +615,8 @@ func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint6
 	if min > 0 {
 		clock.Observe(min)
 	}
-	base, err := clock.NextBatchFenced(n)
-	return base, errors.Wrap(err, "tso next batch")
+	recoverer, _ := a.coord.(hlcLeaseRecoverer)
+	return nextBatchFencedWithRecovery(ctx, clock, n, recoverer, "tso next batch")
 }
 
 func (a *LocalTSOAllocator) IsLeader() bool {

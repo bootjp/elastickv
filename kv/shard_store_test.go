@@ -118,6 +118,20 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
+func TestShardStoreLocalStoresUsesStableGroupOrder(t *testing.T) {
+	t.Parallel()
+
+	first := store.NewMVCCStore()
+	second := store.NewMVCCStore()
+	shards := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		20: {Store: second},
+		10: {Store: first},
+		30: nil,
+	})
+
+	require.Equal(t, []store.MVCCStore{first, second}, shards.LocalStores())
+}
+
 func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 

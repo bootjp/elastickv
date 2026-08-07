@@ -100,12 +100,44 @@ func (c keyVizLabeledCoordinator) ConfiguredTimestampAllocator() TimestampAlloca
 	return alloc
 }
 
-func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
+func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if alloc, ok := c.inner.(TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		return ts, errors.WithStack(err)
+	}
+	return NextTimestampThrough(ctx, c.inner, "allocate keyviz-labeled timestamp")
+}
+
+func (c keyVizLabeledCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if after, ok := c.inner.(TimestampAfterAllocator); ok {
+		ts, err := after.NextAfter(ctx, min)
+		return ts, errors.WithStack(err)
+	}
+	return NextTimestampAfterThrough(ctx, c.inner, min, "allocate keyviz-labeled timestamp after observed ts")
+}
+
+func (c keyVizLabeledCoordinator) RecoverHLCLease(ctx context.Context) error {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
+		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
+	}
+	return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+}
+
+func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
 	voucher, ok := c.inner.(AppliedReadTimestampVoucher)
 	if !ok {
 		return errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp))
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
+}
+
+func (c keyVizLabeledCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if revoker, ok := c.inner.(AppliedReadTimestampVoucherRevoker); ok {
+		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+	}
 }
 
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
@@ -140,4 +172,11 @@ func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 		return gr.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+func (c keyVizLabeledCoordinator) LocalLeaderGroupIDs() []uint64 {
+	if lg, ok := c.inner.(interface{ LocalLeaderGroupIDs() []uint64 }); ok {
+		return lg.LocalLeaderGroupIDs()
+	}
+	return nil
 }

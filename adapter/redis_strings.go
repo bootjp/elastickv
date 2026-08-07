@@ -130,7 +130,8 @@ func (r *RedisServer) loadRedisSetState(ctx context.Context, key []byte, readTS 
 	return state, nil
 }
 
-func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTS uint64) error {
+func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTimestamp kv.ReadTimestamp) error {
+	readTS := readTimestamp.Timestamp()
 	var elems []*kv.Elem[kv.OP]
 	if isNonStringCollectionType(typ) {
 		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
@@ -139,25 +140,24 @@ func (r *RedisServer) replaceWithStringTxn(ctx context.Context, key, value []byt
 		}
 		elems = append(elems, delElems...)
 	}
-	// Embed TTL in the string value; write !redis|ttl| as a secondary scan index.
 	encoded := encodeRedisStr(bytes.Clone(value), ttl)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encoded})
 	if ttl != nil {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
 	} else {
-		// Clear any prior scan index so a persistent string is not later expired.
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	return r.dispatchElems(ctx, true, readTS, elems)
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
 	var result redisSetExecution
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS, err := r.beginTxnStartTS(ctx, "redis set string: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis set string: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		state, err := r.loadRedisSetState(ctx, key, readTS, opts.returnOld)
 		if err != nil {
 			return err
@@ -172,7 +172,7 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 			return wrongTypeError()
 		}
 		// Use rawTyp for cleanup so expired-but-lingering internal keys are deleted.
-		if err := r.replaceWithStringTxn(ctx, key, value, opts.ttl, state.rawTyp, readTS); err != nil {
+		if err := r.replaceWithStringReadTimestampTxn(ctx, key, value, opts.ttl, state.rawTyp, readTimestamp); err != nil {
 			return err
 		}
 		result = redisSetExecution{state: state, wroteOldBulk: opts.returnOld}
@@ -522,10 +522,11 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 	err := r.retryRedisWrite(ctx, func() error {
 		elems := []*kv.Elem[kv.OP]{}
 		nextRemoved := 0
-		readTS, err := r.beginTxnStartTS(ctx, "redis del: begin read timestamp")
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis del: begin read timestamp")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		readTS := readTimestamp.Timestamp()
 		for _, key := range keys {
 			keyElems, existed, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 			if err != nil {
@@ -536,7 +537,7 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 			}
 			elems = append(elems, keyElems...)
 		}
-		if err := r.dispatchElems(ctx, true, readTS, elems); err != nil {
+		if err := r.dispatchReadTimestampElems(ctx, readTimestamp, elems); err != nil {
 			return err
 		}
 		removed = nextRemoved

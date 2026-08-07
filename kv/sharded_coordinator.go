@@ -392,7 +392,7 @@ type ShardedCoordinator struct {
 		PhaseDActive() bool
 	}
 	appliedReadVoucherMu sync.Mutex
-	appliedReadVouchers  map[uint64]uint64
+	appliedReadVouchers  map[appliedReadVoucherKey]uint64
 	// allShardGroupIDs, when configured, is the explicit set of data groups
 	// that whole-keyspace operations must visit. It lets callers keep
 	// non-data groups (for example a reserved timestamp group) in c.groups
@@ -421,6 +421,7 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	hlcRecoveryMu     sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
@@ -431,6 +432,11 @@ type ShardedCoordinator struct {
 	// commits. nil when encryption is off / no registration is pending
 	// (the common case — ungated). See RegistrationGate.
 	registrationGate *RegistrationGate
+}
+
+type appliedReadVoucherKey struct {
+	timestamp uint64
+	ref       AppliedReadTimestampVoucherRef
 }
 
 // RegistrationGate carries the Stage 7a §4.1 registration-before-
@@ -487,40 +493,67 @@ func (c *ShardedCoordinator) TimestampAllocator() TimestampAllocator {
 
 // VouchAppliedReadTimestamp records one use of an audited adapter watermark.
 // The bounded map prevents abandoned requests from growing process memory.
-func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64) error {
-	if c == nil || timestamp == 0 || timestamp == ^uint64(0) {
+func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
 		return errors.WithStack(ErrTSOTimestampInvalid)
 	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
 	c.appliedReadVoucherMu.Lock()
 	defer c.appliedReadVoucherMu.Unlock()
 	if c.appliedReadVouchers == nil {
-		c.appliedReadVouchers = make(map[uint64]uint64)
+		c.appliedReadVouchers = make(map[appliedReadVoucherKey]uint64)
 	}
-	if uses, ok := c.appliedReadVouchers[timestamp]; ok {
-		c.appliedReadVouchers[timestamp] = uses + 1
+	if uses, ok := c.appliedReadVouchers[key]; ok {
+		c.appliedReadVouchers[key] = uses + 1
 		return nil
 	}
 	if len(c.appliedReadVouchers) >= maxAppliedReadTimestampVouches {
 		return errors.WithStack(ErrTSOReadVoucherLimit)
 	}
-	c.appliedReadVouchers[timestamp] = 1
+	c.appliedReadVouchers[key] = 1
 	return nil
 }
 
-func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(timestamp uint64) bool {
+// RevokeAppliedReadTimestamp removes one prepared voucher that did not reach
+// ShardedCoordinator dispatch validation, for example because an outer
+// coordinator decorator rejected the dispatch first.
+func (c *ShardedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+		return
+	}
+	c.appliedReadVouchers[key] = uses - 1
+}
+
+func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
 	if c == nil {
 		return false
 	}
+	ref, ok := appliedReadTimestampVoucherRefFromContext(ctx, timestamp)
+	if !ok {
+		return false
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
 	c.appliedReadVoucherMu.Lock()
 	defer c.appliedReadVoucherMu.Unlock()
-	uses, ok := c.appliedReadVouchers[timestamp]
+	uses, ok := c.appliedReadVouchers[key]
 	if !ok {
 		return false
 	}
 	if uses <= 1 {
-		delete(c.appliedReadVouchers, timestamp)
+		delete(c.appliedReadVouchers, key)
 	} else {
-		c.appliedReadVouchers[timestamp] = uses - 1
+		c.appliedReadVouchers[key] = uses - 1
 	}
 	return true
 }
@@ -1246,7 +1279,7 @@ func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context,
 	if !callerSupplied {
 		return nil
 	}
-	if c.consumeAppliedReadTimestampVoucher(startTS) || singleShard {
+	if c.consumeAppliedReadTimestampVoucher(ctx, startTS) || singleShard {
 		return nil
 	}
 	return c.validateCrossShardReadTimestamp(ctx, startTS)
@@ -1645,11 +1678,7 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 	if min > 0 {
 		c.clock.Observe(min)
 	}
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	return nextFencedWithRecovery(ctx, c.clock, c, label)
 }
 
 // Next makes ShardedCoordinator usable as a TimestampAllocator for adapter
@@ -1801,6 +1830,22 @@ func (c *ShardedCoordinator) timestampBridgeCandidateGroupIDs() []uint64 {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// LocalLeaderGroupIDs returns the configured data shard groups this process
+// currently leads. Background maintenance uses this to avoid issuing
+// whole-keyspace scans from every node and proxying those scans back to the
+// same hot leaders.
+func (c *ShardedCoordinator) LocalLeaderGroupIDs() []uint64 {
+	ids := c.timestampBridgeCandidateGroupIDs()
+	out := make([]uint64, 0, len(ids))
+	for _, gid := range ids {
+		g, ok := c.groups[gid]
+		if ok && isLeaderEngine(engineForGroup(g)) {
+			out = append(out, gid)
+		}
+	}
+	return out
 }
 
 func (c *ShardedCoordinator) invalidateTimestampWindow() {
@@ -2001,6 +2046,67 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 
 func (c *ShardedCoordinator) Clock() *HLC {
 	return c.clock
+}
+
+// RaftMembers returns every configured Raft endpoint across all local groups.
+// Endpoints, rather than node IDs, are deduplicated because one process can
+// expose a distinct listener per group. The stable sort keeps capability-cache
+// fingerprints deterministic despite map iteration order.
+func (c *ShardedCoordinator) RaftMembers(ctx context.Context) ([]RaftMember, error) {
+	if c == nil || len(c.groups) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	membersByEndpoint := make(map[string]RaftMember)
+	for _, group := range c.groups {
+		members, err := raftMembersForGroup(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		for _, member := range members {
+			endpoint := member.NodeID + "\x00" + member.Address
+			membersByEndpoint[endpoint] = member
+		}
+	}
+	endpoints := make([]string, 0, len(membersByEndpoint))
+	for endpoint := range membersByEndpoint {
+		endpoints = append(endpoints, endpoint)
+	}
+	slices.Sort(endpoints)
+	members := make([]RaftMember, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		members = append(members, membersByEndpoint[endpoint])
+	}
+	return members, nil
+}
+
+// RaftMembersForKey returns a stable value copy of the current configuration
+// for the key's owning group. It is intentionally membership-only: callers do
+// not gain access to the mutable ShardGroup or its local store.
+func (c *ShardedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	return raftMembersForGroup(ctx, g)
+}
+
+func raftMembersForGroup(ctx context.Context, group *ShardGroup) ([]RaftMember, error) {
+	if group == nil || group.Engine == nil {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	cfg, err := group.Engine.Configuration(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	members := make([]RaftMember, 0, len(cfg.Servers))
+	for _, server := range cfg.Servers {
+		members = append(members, RaftMember{
+			NodeID:   server.ID,
+			Address:  server.Address,
+			Suffrage: server.Suffrage,
+		})
+	}
+	return members, nil
 }
 
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
@@ -2399,6 +2505,40 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
+func (c *ShardedCoordinator) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var firstErr error
+	for _, gid := range c.timestampLeaseRenewalGroupIDs() {
+		group := c.groups[gid]
+		if group == nil || group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "hlc lease renewal group %d", gid)
+			}
+			continue
+		}
+		return nil
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return errors.WithStack(ErrLeaderNotFound)
+}
+
+func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if c.timestampGroupConfigured {
+		return []uint64{c.timestampGroup}
+	}
+	return c.timestampBridgeCandidateGroupIDs()
+}
+
 // renewHLCLeases starts one renewal proposal for every shard group this node
 // currently leads. It does not wait for those proposals before returning; the
 // returned channel closes when the launched proposals finish and exists for
@@ -2420,7 +2560,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		go func(gid uint64, group *ShardGroup) {
 			defer wg.Done()
 			defer c.finishHLCLeaseRenewal(gid)
-			pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+			pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
 			defer cancel()
 			c.renewHLCLease(pctx, gid, group)
 		}(gid, group)
@@ -2437,7 +2577,7 @@ func (c *ShardedCoordinator) shouldRenewHLCGroup(gid uint64, group *ShardGroup) 
 		(!c.timestampGroupConfigured || gid != c.timestampGroup) {
 		return false
 	}
-	return group != nil && group.Engine != nil && group.Engine.State() == raftengine.StateLeader
+	return shardGroupAcceptingWrites(group)
 }
 
 func (c *ShardedCoordinator) startHLCLeaseRenewal(gid uint64) bool {
@@ -2482,8 +2622,98 @@ func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
 // the callback latency window. Non-leadership errors (no quorum,
 // validation) are NOT leadership signals and must not tear down a warm
 // lease -- doing so would force every read onto the slow path.
+func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
+	if c == nil || c.clock == nil {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	c.hlcRecoveryMu.Lock()
+	defer c.hlcRecoveryMu.Unlock()
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+		return errors.WithStack(errHLCLeaseRecoveryBlocked)
+	}
+	targets := c.hlcLeaseRecoveryTargets()
+	if len(targets) == 0 {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	rctx, cancel := hlcRecoveryContext(ctx)
+	defer cancel()
+	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+}
+
+func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
+	var recoveryErr error
+	for _, target := range targets {
+		if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+			recoveryErr = combineHLCRecoveryErrors(recoveryErr, errors.Wrapf(err, "recover hlc lease group %d", target.gid))
+		}
+	}
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	return hlcRecoveryFailedError(recoveryErr)
+}
+
+func combineHLCRecoveryErrors(first error, next error) error {
+	if first == nil {
+		return next
+	}
+	return errors.Wrap(errors.CombineErrors(first, next), "combine hlc recovery errors")
+}
+
+func hlcRecoveryFailedError(recoveryErr error) error {
+	expiredErr := errors.Wrap(ErrCeilingExpired, "recover hlc lease did not advance ceiling")
+	if recoveryErr != nil {
+		return errors.Wrap(errors.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
+	}
+	return expiredErr
+}
+
+type hlcLeaseRecoveryTarget struct {
+	gid   uint64
+	group *ShardGroup
+}
+
+func (c *ShardedCoordinator) hlcLeaseRecoveryTargets() []hlcLeaseRecoveryTarget {
+	if c == nil {
+		return nil
+	}
+	if c.timestampGroupConfigured {
+		group := c.groups[c.timestampGroup]
+		if !shardGroupAcceptingWrites(group) {
+			return nil
+		}
+		return []hlcLeaseRecoveryTarget{{gid: c.timestampGroup, group: group}}
+	}
+	ids := c.timestampBridgeCandidateGroupIDs()
+	targets := make([]hlcLeaseRecoveryTarget, 0, len(ids))
+	for _, gid := range ids {
+		group := c.groups[gid]
+		if shardGroupAcceptingWrites(group) {
+			targets = append(targets, hlcLeaseRecoveryTarget{gid: gid, group: group})
+		}
+	}
+	return targets
+}
+
+func shardGroupAcceptingWrites(group *ShardGroup) bool {
+	return group != nil && group.Engine != nil && isLeaderAcceptingWrites(group.Engine)
+}
+
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", gid),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+	}
+}
+
+func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, group *ShardGroup, ceilingMs int64) error {
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
 	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
@@ -2496,16 +2726,12 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, grou
 		if isLeadershipLossError(err) {
 			group.lease.invalidate()
 		}
-		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", gid),
-			slog.Int64("ceiling_ms", ceilingMs),
-			slog.Any("err", err),
-		)
-		return
+		return errors.WithStack(err)
 	}
 	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
 		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
+	return nil
 }
 
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {

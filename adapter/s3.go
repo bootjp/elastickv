@@ -112,8 +112,14 @@ type S3Server struct {
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
 	blobOffloadEnabled   bool
+	blobOffloadGCReady   bool
 	blobOffloadChecker   S3BlobOffloadCapabilityChecker
 	blobOffloadObserver  S3BlobOffloadObserver
+	blobCluster          S3BlobCluster
+	blobLocalStores      S3BlobLocalStoreResolver
+	blobMinReplicas      int
+	blobPushBlocked      func() bool
+	blobBackfiller       *S3BlobBackfiller
 }
 
 type s3BucketMeta struct {
@@ -139,12 +145,14 @@ type s3ObjectManifest struct {
 }
 
 type s3ObjectPart struct {
-	PartNo      uint64   `json:"part_no"`
-	ETag        string   `json:"etag"`
-	SizeBytes   int64    `json:"size_bytes"`
-	ChunkCount  uint64   `json:"chunk_count"`
-	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
-	PartVersion uint64   `json:"part_version,omitempty"`
+	PartNo          uint64   `json:"part_no"`
+	ETag            string   `json:"etag"`
+	SizeBytes       int64    `json:"size_bytes"`
+	ChunkCount      uint64   `json:"chunk_count"`
+	ChunkSizes      []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion     uint64   `json:"part_version,omitempty"`
+	ChunkRefVersion uint64   `json:"chunk_ref_version,omitempty"`
+	Offloaded       bool     `json:"offloaded,omitempty"`
 }
 
 type s3ContinuationToken struct {
@@ -186,6 +194,10 @@ func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
 	var responseErr *s3ResponseError
 	if errors.As(err, &responseErr) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
+		return
+	}
+	if isS3ServiceUnavailable(err) {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", "", "")
 		return
 	}
 	writeS3InternalError(w, err)
@@ -282,12 +294,14 @@ type s3UploadMeta struct {
 }
 
 type s3PartDescriptor struct {
-	PartNo      uint64   `json:"part_no"`
-	ETag        string   `json:"etag"`
-	SizeBytes   int64    `json:"size_bytes"`
-	ChunkCount  uint64   `json:"chunk_count"`
-	ChunkSizes  []uint64 `json:"chunk_sizes,omitempty"`
-	PartVersion uint64   `json:"part_version,omitempty"`
+	PartNo          uint64   `json:"part_no"`
+	ETag            string   `json:"etag"`
+	SizeBytes       int64    `json:"size_bytes"`
+	ChunkCount      uint64   `json:"chunk_count"`
+	ChunkSizes      []uint64 `json:"chunk_sizes,omitempty"`
+	PartVersion     uint64   `json:"part_version,omitempty"`
+	ChunkRefVersion uint64   `json:"chunk_ref_version,omitempty"`
+	Offloaded       bool     `json:"offloaded,omitempty"`
 }
 
 type s3InitiateMultipartUploadResult struct {
@@ -347,7 +361,10 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		leaderS3:           cloneLeaderAddrMap(leaderS3),
 		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
 		putAdmission:       newS3PutAdmissionFromEnv(),
-		blobOffloadEnabled: newS3BlobOffloadEnabledFromEnv(),
+		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
+	}
+	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
+		s.blobLocalStores = localStores
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -390,9 +407,22 @@ func (s *S3Server) Run() error {
 }
 
 func (s *S3Server) Stop() {
+	if s != nil && s.blobBackfiller != nil {
+		s.blobBackfiller.Stop()
+	}
+	if s != nil && s.blobCluster != nil {
+		_ = s.blobCluster.Close()
+	}
 	if s != nil && s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
 	}
+}
+
+func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
+	if s == nil || s.blobBackfiller == nil {
+		return nil
+	}
+	return s.blobBackfiller.Start(ctx, s)
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
@@ -646,7 +676,8 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 				{Op: kv.Put, Key: s3keys.BucketGenerationKey(bucket), Value: encodeS3Generation(nextGeneration)},
 			},
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), req)
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req)
 		return errors.WithStack(err)
 	})
 	if err != nil {
@@ -721,7 +752,8 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		// groups (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast).
 		// See AdminDeleteBucket's doc comment for the full
 		// rationale.
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)}},
@@ -854,7 +886,8 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -887,9 +920,9 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
 		return
 	}
-	s.observeS3BlobOffloadDecision(r.Context())
+	offload := s.observeS3BlobOffloadDecision(r.Context()).mode == s3BlobOffloadModeOffload
 	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(
-		r.Context(), r, streamBody, state, bucket, objectKey, expectedPayloadSHA,
+		r.Context(), r, streamBody, state, bucket, objectKey, expectedPayloadSHA, offload,
 	)
 	if uploadErr != nil || uploadBodyErr != nil {
 		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
@@ -962,6 +995,12 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 
 	// GET without Range: stream the full object.
 	if rangeHeader == "" {
+		if s3ManifestHasOffloadedParts(manifest) {
+			if err := s.ensureS3ObjectRangeLocal(r.Context(), bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes); err != nil {
+				writeS3InternalError(w, err)
+				return
+			}
+		}
 		writeS3ObjectHeaders(w.Header(), manifest)
 		w.WriteHeader(http.StatusOK)
 		s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes)
@@ -977,6 +1016,12 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 
 	contentLength := rangeEnd - rangeStart + 1
+	if s3ManifestHasOffloadedParts(manifest) {
+		if err := s.ensureS3ObjectRangeLocal(r.Context(), bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength); err != nil {
+			writeS3InternalError(w, err)
+			return
+		}
+	}
 	writeS3ObjectHeaders(w.Header(), manifest)
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
@@ -1012,13 +1057,11 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 				)
 				return
 			}
-			chunkKey := s3keys.VersionedBlobKey(bucket, generation, objectKey, manifest.UploadID, part.PartNo, chunkIndex, part.PartVersion)
-			chunk, err := s.store.GetAt(r.Context(), chunkKey, readTS)
+			chunk, err := s.readS3ObjectChunk(r.Context(), bucket, generation, objectKey, manifest.UploadID, part, chunkIndex, chunkSize, readTS)
 			if err != nil {
-				slog.ErrorContext(r.Context(), "streamObjectChunks: GetAt failed",
+				slog.ErrorContext(r.Context(), "streamObjectChunks: read chunk failed",
 					"bucket", bucket,
 					"object_key", objectKey,
-					"chunk_key", string(chunkKey),
 					"err", err,
 				)
 				return
@@ -1133,7 +1176,8 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 			cleanupManifest = nil
 			return nil
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -1204,7 +1248,8 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		writeS3InternalError(w, err)
 		return
 	}
-	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -1214,7 +1259,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 		},
 	}); err != nil {
-		writeS3InternalError(w, err)
+		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}
 	writeS3XML(w, http.StatusOK, s3InitiateMultipartUploadResult{
@@ -1243,9 +1288,9 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
-	s.observeS3BlobOffloadDecision(r.Context())
+	offload := s.observeS3BlobOffloadDecision(r.Context()).mode == s3BlobOffloadModeOffload
 	upload, previous, uploadBodyErr, uploadErr := s.storeS3UploadPart(
-		r.Context(), r, streamBody, state, bucket, objectKey, uploadID, admissionProtocol,
+		r.Context(), r, streamBody, state, bucket, objectKey, uploadID, admissionProtocol, offload,
 	)
 	if uploadErr != nil || uploadBodyErr != nil {
 		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
@@ -1256,6 +1301,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		s.cleanupPartBlobsAsync(
 			bucket, state.meta.Generation, objectKey, uploadID,
 			previous.PartNo, previous.ChunkCount, previous.PartVersion,
+			previous.ChunkRefVersion, previous.Offloaded,
 		)
 	}
 	w.Header().Set("ETag", quoteS3ETag(upload.ETag))
@@ -1334,7 +1380,8 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// Transactional delete with startTS fencing — conflicts with concurrent Complete.
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -1453,8 +1500,18 @@ func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, genera
 // cleanupPartBlobsAsync asynchronously deletes the blob chunk keys for a single
 // upload part. It is used to garbage-collect orphaned chunks when a part
 // descriptor write fails after the chunks have already been committed.
-// partVersion must match the value used when writing the chunk keys.
-func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objectKey string, uploadID string, partNo uint64, chunkCount uint64, partVersion uint64) {
+// The applicable version must match the legacy blob or offloaded chunkref keys.
+func (s *S3Server) cleanupPartBlobsAsync(
+	bucket string,
+	generation uint64,
+	objectKey string,
+	uploadID string,
+	partNo uint64,
+	chunkCount uint64,
+	partVersion uint64,
+	chunkRefVersion uint64,
+	offloaded bool,
+) {
 	select {
 	case s.cleanupSem <- struct{}{}:
 	default:
@@ -1482,9 +1539,13 @@ func (s *S3Server) cleanupPartBlobsAsync(bucket string, generation uint64, objec
 			pending = pending[:0]
 		}
 		for i := uint64(0); i < chunkCount; i++ {
+			key := s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion)
+			if offloaded {
+				key = s3keys.VersionedChunkRefKey(bucket, generation, objectKey, uploadID, partNo, i, chunkRefVersion)
+			}
 			pending = append(pending, &kv.Elem[kv.OP]{
 				Op:  kv.Del,
-				Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion),
+				Key: key,
 			})
 			if len(pending) >= s3MetaBatchOps {
 				flush()
@@ -1507,9 +1568,12 @@ func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, obje
 		defer cancel()
 		// Delete part descriptors.
 		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
-		// Delete blob chunks.
+		// Delete legacy blob chunks and offloaded chunk references. Content-
+		// addressed chunkblobs are reclaimed by the reference-counted GC.
 		blobPrefix := s3keys.BlobPrefixForUpload(bucket, generation, objectKey, uploadID)
 		s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
+		chunkRefPrefix := s3keys.ChunkRefPrefixForUpload(bucket, generation, objectKey, uploadID)
+		s.deleteByPrefix(ctx, chunkRefPrefix, bucket, generation, objectKey, uploadID)
 	}()
 }
 
@@ -1819,9 +1883,13 @@ func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string,
 		if err != nil {
 			return false
 		}
+		key := s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion)
+		if part.Offloaded {
+			key = s3keys.VersionedChunkRefKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.ChunkRefVersion)
+		}
 		*pending = append(*pending, &kv.Elem[kv.OP]{
 			Op:  kv.Del,
-			Key: s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion),
+			Key: key,
 		})
 		if len(*pending) >= s3MetaBatchOps {
 			flush()
@@ -2447,6 +2515,7 @@ func (s *S3Server) beginTxnReadTimestamp(ctx context.Context, readTS uint64, lab
 	if readTS == ^uint64(0) {
 		if alloc, ok := kv.TimestampAllocatorThrough(s.coordinator); ok {
 			if phaseD, phaseDOK := alloc.(kv.TSOPhaseDState); phaseDOK && (phaseD.PhaseDRequired() || phaseD.PhaseDActive()) {
+				readTS = 1
 				readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, readTS, label)
 				return readTimestamp, errors.WithStack(err)
 			}
@@ -2549,11 +2618,15 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isS3ServiceUnavailable(err) {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)
+}
+
+func isS3ServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 var errUnsupportedCannedAcl = errors.New("unsupported canned ACL")

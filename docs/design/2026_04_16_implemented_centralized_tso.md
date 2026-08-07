@@ -3,7 +3,7 @@
 Status: Implemented
 Author: bootjp
 Date: 2026-04-16
-Updated: 2026-07-19
+Updated: 2026-07-24
 
 M1-M8 implement the central subsystem: the dedicated group-0 FSM,
 leader-routed durable windows, strict term bootstrap, serialized shadow
@@ -115,9 +115,12 @@ Implemented:
     is needed for the dedicated allocator's physical-ceiling fence.
 17. Cross-shard transactions with a caller-supplied `StartTS` are accepted only
     when the group-0 leader verifies `phase_d_floor < StartTS <=
-    allocation_floor`. The upper bound is a committed TSO reservation floor and
-    the lower bound excludes every legacy or pre-Phase-D value. Follower-local
-    state is never authoritative for this check.
+    allocation_floor`. Phase-D reservations are contiguous from the previous
+    committed floor, so that interval contains only group-0-issued timestamps;
+    a `min_timestamp` above the floor is rejected instead of opening an
+    unallocated gap. The upper bound is a committed TSO reservation floor and the
+    lower bound excludes every legacy or pre-Phase-D value. Follower-local state
+    is never authoritative for this check.
 18. Adapter read-modify-write paths call `BeginReadTimestampThrough` before the
     first read and pass an applied store/catalog watermark, never a freshly
     allocated clock value. If Phase D is required but not yet locally active,
@@ -603,6 +606,7 @@ TSO Leader
   ├─ Propose([0x02][ceilingMs]) to TSO Raft group
   │
   └─ TSO FSM.Apply() on all TSO members
+       → HLC.Observe(ceilingMs|maxLogical)
        → HLC.SetPhysicalCeiling(ceilingMs)
          ↳ shared HLC ceiling updated on every node ✅
 ```
@@ -786,6 +790,11 @@ approach enables a live cutover.
   the Phase-D marker and its pre-Phase-D floor, then a new allocation window
   strictly above that floor. The switch is one-way and survives restart through
   the TSO V4 snapshot.
+- From that marker onward, group 0 reserves contiguous windows from the previous
+  committed allocation floor even if wall time or the local HLC mirror has
+  advanced. Requests carrying a `min_timestamp` above the committed floor fail
+  closed; callers must first validate or use an already issued timestamp rather
+  than forcing the allocator to bless a gap.
 - `ShardedCoordinator` dynamically stops data-group ceiling proposals and
   fails closed instead of issuing from its legacy HLC. It continues group-0
   renewal only. Shadow mode observes durable cutover and directly uses the
@@ -808,10 +817,11 @@ approach enables a live cutover.
   caller-supplied cross-shard `StartTS` before allocating `CommitTS` or proposing
   to any data group. The allocator's configured `PhaseDRequired` state activates
   this check before the local group-0 replica has applied the marker. Values
-  at/below the marker floor, beyond the committed TSO allocation floor, zero
-  values, inactive Phase-D state, missing validation support, and unavailable
-  leadership all fail closed. Existing single-shard caller-supplied `StartTS`
-  remains compatible because it does not establish a cross-shard SSI snapshot.
+  at/below the marker floor, beyond the committed TSO allocation floor, inside a
+  rejected allocation gap, zero values, inactive Phase-D state, missing
+  validation support, and unavailable leadership all fail closed. Existing
+  single-shard caller-supplied `StartTS` remains compatible because it does not
+  establish a cross-shard SSI snapshot.
 
 ### 7.5 Monotonicity Invariant Across Phases
 
@@ -890,9 +900,11 @@ and benchmark evidence are maintained in
    logs already carry compatible HLC lease entries. `TSOStateMachine.Restore`
    recognizes legacy `kvFSM` snapshot headers, imports the ceiling, derives the
    allocation floor, and drains the old store payload before Raft resumes log
-   replay. Valid historical encryption control entries are decoded and rejected
-   as obsolete ordinary apply responses, so replay advances without mutating
-   TSO state; new group-0 encryption mutators are disabled at the RPC boundary,
-   while the group-0 engine remains wired as a leader view so read-only sidecar
-   recovery cannot be served from a stale follower. Runtime wiring therefore
+   replay. Headerless legacy store payloads that exceed every TSO snapshot
+   length are also drained instead of being parsed as raw TSO state. Valid
+   historical encryption control entries are decoded and rejected as obsolete
+   ordinary apply responses, so replay advances without mutating TSO state; new
+   group-0 encryption mutators are disabled at the RPC boundary, while the
+   group-0 engine remains wired as a leader view so read-only sidecar recovery
+   cannot be served from a stale follower. Runtime wiring therefore
    does not require deleting group-0 state.

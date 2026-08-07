@@ -37,6 +37,7 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 		{"adapter.ErrLeaderNotFound", ErrLeaderNotFound, true},
 		{"adapter.ErrNotLeader", ErrNotLeader, true},
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound, true},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen, true},
 		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader, true},
 		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost, true},
 		{"raftengine.ErrLeadershipTransferInProgress",
@@ -67,6 +68,8 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 			errors.New("rpc error: code = Aborted desc = raft engine: leadership lost"), true},
 		{"grpc-wrapped leadership transfer",
 			errors.New("rpc error: code = Aborted desc = raft engine: leadership transfer in progress"), true},
+		{"grpc-wrapped leader proxy circuit open",
+			errors.New("rpc error: code = Unavailable desc = leader proxy circuit open"), true},
 		// Suffix discipline: a user-controlled key in the middle
 		// of the message must NOT trigger a false positive. The kv
 		// suffix matcher pins this exact scenario; mirror it here.

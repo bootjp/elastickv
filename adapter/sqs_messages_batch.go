@@ -380,7 +380,7 @@ func (s *SQSServer) runFifoSendWithRetry(
 		if err != nil {
 			return nil, err
 		}
-		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
+		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTimestamp)
 		if err != nil {
 			return nil, err
 		}

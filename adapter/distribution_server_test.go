@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"encoding/binary"
+	stderrors "errors"
 	"net"
 	"testing"
 	"time"
@@ -173,7 +174,7 @@ func TestDistributionServerValidateTimestamp(t *testing.T) {
 	require.Equal(t, uint64(501), resp.GetAllocationFloor())
 
 	_, err = s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 499})
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, codes.OutOfRange, status.Code(err))
 }
 
 func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
@@ -196,7 +197,9 @@ func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 
 	require.NoError(t, routed.ValidateDurableTimestamp(context.Background(), 700))
-	require.ErrorIs(t, routed.ValidateDurableTimestamp(context.Background(), 699), kv.ErrTSOTimestampInvalid)
+	err = routed.ValidateDurableTimestamp(context.Background(), 699)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
 
 func TestDistributionServerGetTimestamp_RejectsFollower(t *testing.T) {
@@ -738,8 +741,9 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
-	require.Zero(t, coordinator.lastRequestedCommitTS)
+	require.NotZero(t, coordinator.lastRequestedCommitTS)
 	require.NotZero(t, coordinator.lastCommitTS)
+	require.Equal(t, coordinator.lastRequestedCommitTS, coordinator.lastCommitTS)
 	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
 
 	snapshot, err := catalog.Snapshot(ctx)
@@ -752,6 +756,14 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
 	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
 	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	changes, err := catalog.ChangesSince(ctx, saved.Version, 1)
+	require.NoError(t, err)
+	require.Len(t, changes.Deltas, 1)
+	require.Len(t, changes.Deltas[0].Mutations, 3)
+	require.Equal(t, distribution.CatalogMutationDelete, changes.Deltas[0].Mutations[0].Op)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[1].Route.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[2].Route.SplitAtHLC)
 }
 
 func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *testing.T) {
@@ -782,7 +794,7 @@ func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *
 		base:        legacyFloor + 100,
 		leader:      true,
 		phaseD:      true,
-		phaseDFloor: legacyFloor - 1,
+		phaseDFloor: legacyFloor,
 	}
 	coordinator := newDistributionCoordinatorStub(baseStore, true)
 	coordinator.allocator = allocator
@@ -799,6 +811,7 @@ func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *
 	})
 	require.NoError(t, err)
 	require.Equal(t, legacyFloor, coordinator.lastStartTS)
+	require.Equal(t, 1, coordinator.vouchCalls)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -1107,10 +1120,16 @@ type distributionCoordinatorStub struct {
 	asyncApplyDone        chan error
 	asyncApplyDelay       time.Duration
 	dispatchCalls         int
+	vouchCalls            int
 }
 
 func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator {
 	return s.allocator
+}
+
+func (s *distributionCoordinatorStub) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	s.vouchCalls++
+	return nil
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
@@ -1376,8 +1395,11 @@ func (a *distributionTSOAllocator) ValidateDurableTimestamp(_ context.Context, t
 	if a.err != nil {
 		return a.err
 	}
-	if !a.phaseD || timestamp <= a.phaseDFloor || timestamp > a.base {
+	if !a.phaseD || timestamp == 0 || timestamp > a.base {
 		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.phaseDFloor {
+		return stderrors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
 	}
 	return nil
 }

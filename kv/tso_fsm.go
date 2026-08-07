@@ -13,6 +13,7 @@ import (
 )
 
 var _ raftengine.StateMachine = (*TSOStateMachine)(nil)
+var _ raftengine.Snapshot = (*tsoFSMSnapshot)(nil)
 var _ raftengine.VolatileEntryClassifier = (*TSOStateMachine)(nil)
 
 var (
@@ -35,6 +36,8 @@ const (
 	tsoSnapshotV2Len  = hlcLeasePayloadLen * 2
 	tsoSnapshotV3Len  = tsoSnapshotV2Len + 1
 	tsoSnapshotV4Len  = tsoSnapshotV3Len + 1 + hlcLeasePayloadLen
+
+	maxHLCPhysicalMillis = int64((uint64(1) << hlcPhysicalBits) - 1)
 )
 
 // TSOStateMachine is the minimal state machine for the dedicated timestamp
@@ -51,6 +54,7 @@ type TSOStateMachine struct {
 	phaseDFloor     atomic.Uint64
 }
 
+// NewTSOStateMachine constructs the dedicated TSO FSM over the shared HLC.
 func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
 	return &TSOStateMachine{hlc: hlc}
 }
@@ -106,7 +110,10 @@ func (f *TSOStateMachine) applyLeaseEntry(data []byte) any {
 	if len(data) != hlcLeaseEntryLen {
 		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry, "expected HLC lease entry length %d, got %d", hlcLeaseEntryLen, len(data)))
 	}
-	ceilingMs := int64(binary.BigEndian.Uint64(data[1:])) //nolint:gosec // value is a Unix ms timestamp encoded as uint64.
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(data[1:]), "HLC lease")
+	if err != nil {
+		return haltErr(err)
+	}
 	if ceilingMs <= 0 {
 		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry, "non-positive HLC lease ceiling %d", ceilingMs))
 	}
@@ -277,14 +284,25 @@ func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, uint64
 	switch len(payload) {
 	case tsoSnapshotV1Len:
 		legacySnapshot = true
-		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // legacy snapshot value.
+		var err error
+		ceilingMs, err = decodeTSOCeiling(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen]), "legacy snapshot")
+		if err != nil {
+			return 0, 0, false, false, 0, false, err
+		}
 	case tsoSnapshotV2Len:
-		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
+		var err error
+		ceilingMs, err = decodeTSOCeiling(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen]), "snapshot")
+		if err != nil {
+			return 0, 0, false, false, 0, false, err
+		}
 		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:])
 	case tsoSnapshotV3Len:
-		ceilingMs = int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
-		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len])
 		var err error
+		ceilingMs, err = decodeTSOCeiling(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen]), "snapshot")
+		if err != nil {
+			return 0, 0, false, false, 0, false, err
+		}
+		allocationFloor = binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len])
 		cutoverActive, err = decodeTSOCutoverByte(payload[tsoSnapshotV2Len])
 		if err != nil {
 			return 0, 0, false, false, 0, false, err
@@ -300,7 +318,10 @@ func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, uint64
 }
 
 func decodeTSOSnapshotV4(payload []byte) (int64, uint64, bool, bool, uint64, bool, error) {
-	ceilingMs := int64(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen])) //nolint:gosec // snapshot value.
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(payload[:hlcLeasePayloadLen]), "snapshot")
+	if err != nil {
+		return 0, 0, false, false, 0, false, err
+	}
 	allocationFloor := binary.BigEndian.Uint64(payload[hlcLeasePayloadLen:tsoSnapshotV2Len])
 	cutoverActive, err := decodeTSOCutoverByte(payload[tsoSnapshotV2Len])
 	if err != nil {
@@ -320,6 +341,14 @@ func decodeTSOSnapshotV4(payload []byte) (int64, uint64, bool, bool, uint64, boo
 			"tso fsm snapshot: inactive phase-D has floor %d", phaseDFloor)
 	}
 	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, false, nil
+}
+
+func decodeTSOCeiling(raw uint64, field string) (int64, error) {
+	if raw > uint64(maxHLCPhysicalMillis) {
+		return 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm: %s physical ceiling %d exceeds max %d", field, raw, maxHLCPhysicalMillis)
+	}
+	return int64(raw), nil // #nosec G115 -- raw is bounded by maxHLCPhysicalMillis above.
 }
 
 func decodeTSOCutoverByte(value byte) (bool, error) {
@@ -344,8 +373,11 @@ func decodeTSOBooleanByte(name string, value byte) (bool, error) {
 // complete snapshot CRC. Non-kvFSM snapshots are left untouched in br.
 func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, error) {
 	legacy, err := hasLegacyKVFSMSnapshotHeader(br)
-	if err != nil || !legacy {
-		return legacy, err
+	if err != nil {
+		return false, err
+	}
+	if !legacy {
+		return restoreHeaderlessLegacyKVFSMSnapshot(br)
 	}
 	ceiling, _, err := ReadSnapshotHeader(br)
 	if err != nil {
@@ -354,14 +386,25 @@ func restoreLegacyKVFSMSnapshot(f *TSOStateMachine, br *bufio.Reader) (bool, err
 	if _, err := io.Copy(io.Discard, br); err != nil {
 		return true, errors.Wrap(err, "tso fsm snapshot: drain legacy kv fsm payload")
 	}
-	ceilingMs := int64(ceiling) //nolint:gosec // validated below before use.
-	if ceilingMs < 0 {
-		return true, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative legacy ceiling %d", ceilingMs)
+	ceilingMs, err := decodeTSOCeiling(ceiling, "legacy kv fsm snapshot")
+	if err != nil {
+		return true, err
 	}
 	if f == nil || ceilingMs == 0 {
 		return true, nil
 	}
 	f.restoreSnapshotState(ceilingMs, tsoLeaseAllocationFloor(ceilingMs), false, false, 0)
+	return true, nil
+}
+
+func restoreHeaderlessLegacyKVFSMSnapshot(br *bufio.Reader) (bool, error) {
+	headerless, err := hasHeaderlessLegacyKVFSMSnapshotPayload(br)
+	if err != nil || !headerless {
+		return headerless, err
+	}
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return true, errors.Wrap(err, "tso fsm snapshot: drain headerless legacy kv fsm payload")
+	}
 	return true, nil
 }
 
@@ -380,8 +423,35 @@ func hasLegacyKVFSMSnapshotHeader(br *bufio.Reader) (bool, error) {
 		return true, nil
 	case isUnknownEKVTHLC(peeked):
 		return true, nil
+	case isLegacyKVFSMStoreSnapshot(peeked):
+		return true, nil
 	default:
 		return false, nil
+	}
+}
+
+func hasHeaderlessLegacyKVFSMSnapshotPayload(br *bufio.Reader) (bool, error) {
+	peeked, err := br.Peek(tsoSnapshotV4Len + 1)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, errors.Wrap(err, "tso fsm snapshot: peek headerless legacy payload")
+	}
+	return len(peeked) > tsoSnapshotV4Len, nil
+}
+
+func isLegacyKVFSMStoreSnapshot(peeked []byte) bool {
+	for _, magic := range legacyKVFSMStoreSnapshotMagics() {
+		if bytes.Equal(peeked, magic) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyKVFSMStoreSnapshotMagics() [][]byte {
+	return [][]byte{
+		[]byte("EKVMVCC2"),
+		[]byte("EKVPBBL1"),
+		[]byte("EKVSSTI1"),
 	}
 }
 
@@ -524,7 +594,9 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 		snapshotLen = tsoSnapshotV4Len
 	}
 	buf := make([]byte, snapshotLen)
-	binary.BigEndian.PutUint64(buf, uint64(ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp.
+	if err := encodeTSOCeiling(buf, ceilingMs); err != nil {
+		return 0, err
+	}
 	binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
 	if cutoverActive {
 		buf[tsoSnapshotV2Len] = 1
@@ -541,6 +613,19 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return int64(n), errors.WithStack(io.ErrShortWrite)
 	}
 	return int64(n), nil
+}
+
+func encodeTSOCeiling(dst []byte, ceilingMs int64) error {
+	if len(dst) < hlcLeasePayloadLen {
+		return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: ceiling buffer too short: %d", len(dst))
+	}
+	if ceilingMs < 0 || ceilingMs > maxHLCPhysicalMillis {
+		return errors.Wrapf(ErrTSOStateMachineInvalidEntry,
+			"tso fsm snapshot: invalid ceiling %d", ceilingMs)
+	}
+	binary.BigEndian.PutUint64(dst, uint64(ceilingMs)) // #nosec G115 -- ceilingMs is validated non-negative above.
+	return nil
 }
 
 func (s *tsoFSMSnapshot) Close() error {

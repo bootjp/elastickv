@@ -71,7 +71,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{floor: 42})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	decorated := kv.WithKeyVizLabel(startupGatedCoordinator{inner: coord}, keyviz.LabelRedis)
@@ -180,15 +180,17 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 
 	got, ok := kv.TimestampAllocatorThrough(gated)
 	require.True(t, ok)
-	require.Same(t, allocator, got)
+	require.IsType(t, startupGatedCoordinator{}, got)
+	_, err := got.Next(context.Background())
+	require.Error(t, err)
 	require.Len(t, internalTimestampOptions(gated), 1)
 
 	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
 	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
 	runtimeGated := startupGatedCoordinator{inner: runtimeCoord, gate: &startupPublicKVGate{}}
 	got, ok = kv.TimestampAllocatorThrough(runtimeGated)
-	require.False(t, ok)
-	require.Nil(t, got)
+	require.True(t, ok)
+	require.IsType(t, startupGatedCoordinator{}, got)
 	configured, ok := kv.ConfiguredTimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
 	require.Same(t, runtimeAllocator, configured)
@@ -325,7 +327,9 @@ type mainTSOEngine struct {
 	tsoState  *kv.TSOStateMachine
 }
 
-type mainTSOFloorProvider struct{}
+type mainTSOFloorProvider struct {
+	floor uint64
+}
 
 type mainTimestampAllocator struct {
 	next uint64
@@ -348,8 +352,8 @@ func (t *mainForwardTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionR
 	return &kv.TransactionResponse{}, nil
 }
 
-func (mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
-	return 0, nil
+func (p mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
+	return p.floor, nil
 }
 
 func (e *mainTSOEngine) Propose(_ context.Context, payload []byte) (*raftengine.ProposalResult, error) {

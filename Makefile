@@ -49,16 +49,17 @@ tla-tools:
 		exit 0; \
 	fi; \
 	echo "Downloading tla2tools.jar $(TLA_VERSION)..."; \
-	trap 'rm -f "$(TLA_JAR).tmp"' EXIT HUP INT TERM; \
-	curl -fsSL -o "$(TLA_JAR).tmp" "$(TLA_URL)"; \
-	actual=$$(sha256_file "$(TLA_JAR).tmp"); \
+	tmp="$(TLA_JAR).tmp.$$$$"; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	curl -fsSL -o "$$tmp" "$(TLA_URL)"; \
+	actual=$$(sha256_file "$$tmp"); \
 	if [ "$$actual" != "$(TLA_SHA256)" ]; then \
 		echo "ERROR: tla2tools.jar SHA-256 mismatch."; \
 		echo "  expected: $(TLA_SHA256)"; \
 		echo "  actual:   $$actual"; \
 		exit 1; \
 	fi; \
-	mv "$(TLA_JAR).tmp" "$(TLA_JAR)"; \
+	mv "$$tmp" "$(TLA_JAR)"; \
 	trap - EXIT HUP INT TERM; \
 	echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"
 

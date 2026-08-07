@@ -1622,18 +1622,20 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		meta, rec, dataKey, readTS, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
+		meta, rec, dataKey, readTimestamp, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
 		if err != nil {
 			return err
 		}
 		if outcome == sqsDeleteNoOp {
 			return nil
 		}
+		readTS := readTimestamp.Timestamp()
 		req, err := s.buildDeleteOps(ctx, queueName, meta, handle, rec, dataKey, readTS)
 		if err != nil {
 			return err
 		}
-		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
 			// Hot-partition observability (§11 PR 7): record the
 			// successful delete on the partitioned commit branch
 			// only. Legacy queues stay off the metric.
@@ -1697,8 +1699,9 @@ const (
 // outcome for AWS-compatible DeleteMessage semantics: structural errors
 // propagate; missing records and token mismatches on an otherwise-valid
 // queue return sqsDeleteNoOp; matching tokens return sqsDeleteProceed
-// with the loaded record. The readTS it took the snapshot at is
-// returned so the caller can pass it as StartTS on the OCC dispatch,
+// with the loaded record. The ReadTimestamp it took the snapshot at is
+// returned so the caller can pass it as StartTS on the OCC dispatch and
+// bind any Phase-D applied-read voucher to that dispatch,
 // pinning the read-write conflict detection window.
 //
 // The caller-supplied QueueUrl is cross-checked against the handle's
@@ -1707,41 +1710,41 @@ const (
 // to a different (or recreated) queue and we reject it as a structural
 // error — silently succeeding would let misrouted deletes ack messages
 // that cannot possibly be deleted on this queue.
-func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
+func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, kv.ReadTimestamp, sqsDeleteOutcome, error) {
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs delete message: begin read timestamp")
 	if err != nil {
-		return nil, nil, nil, 0, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, kv.ReadTimestamp{}, sqsDeleteProceed, errors.WithStack(err)
 	}
 	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	if meta.Generation != handle.QueueGeneration {
-		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
 	}
 	if err := validateReceiptHandleVersion(meta, handle); err != nil {
-		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return meta, nil, nil, readTS, sqsDeleteNoOp, nil
+			return meta, nil, nil, readTimestamp, sqsDeleteNoOp, nil
 		}
-		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, sqsDeleteProceed, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return meta, nil, nil, readTS, sqsDeleteNoOp, nil
+		return meta, nil, nil, readTimestamp, sqsDeleteNoOp, nil
 	}
-	return meta, rec, dataKey, readTS, sqsDeleteProceed, nil
+	return meta, rec, dataKey, readTimestamp, sqsDeleteProceed, nil
 }
 
 func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Request) {
@@ -1795,10 +1798,11 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		meta, rec, dataKey, readTS, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
+		meta, rec, dataKey, readTimestamp, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
 		if apiErr != nil {
 			return apiErr
 		}
+		readTS := readTimestamp.Timestamp()
 		now := time.Now().UnixMilli()
 		if rec.VisibleAtMillis <= now {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
@@ -1826,7 +1830,8 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 				{Op: kv.Put, Key: dataKey, Value: recordBytes},
 			},
 		}
-		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
@@ -1855,9 +1860,10 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 
 // loadAndVerifyMessage reads the data record for the given handle and
 // verifies that the receipt token matches the current one on record.
-// Returns the record, its key, the snapshot timestamp the read ran at,
-// or a typed SQS error. Callers use the snapshot as StartTS on the
-// OCC dispatch so concurrent commits cannot slip past ReadKeys.
+// Returns the record, its key, the ReadTimestamp the read ran at, or a
+// typed SQS error. Callers use the snapshot as StartTS on the OCC
+// dispatch and bind its Phase-D applied-read voucher so concurrent commits
+// cannot slip past ReadKeys.
 //
 // The caller-supplied QueueUrl is cross-checked against the handle's
 // embedded queue_generation, mirroring loadMessageForDelete: an
@@ -1865,41 +1871,41 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 // cleans them up, so a handle from a deleted / recreated queue must
 // be rejected with ReceiptHandleIsInvalid instead of silently
 // mutating the orphan record.
-func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, error) {
+func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, kv.ReadTimestamp, error) {
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs change message visibility: begin read timestamp")
 	if err != nil {
-		return nil, nil, nil, 0, errors.WithStack(err)
+		return nil, nil, nil, kv.ReadTimestamp{}, errors.WithStack(err)
 	}
 	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	if meta.Generation != handle.QueueGeneration {
-		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
 	}
 	if err := validateReceiptHandleVersion(meta, handle); err != nil {
-		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
+		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
+			return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
 		}
-		return nil, nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTimestamp, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
+		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
 	}
-	return meta, rec, dataKey, readTS, nil
+	return meta, rec, dataKey, readTimestamp, nil
 }
 
 // ------------------------ small helpers ------------------------

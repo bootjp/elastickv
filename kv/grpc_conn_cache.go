@@ -35,9 +35,6 @@ func (c *GRPCConnCache) cachedConn(addr string) *grpc.ClientConn {
 		delete(c.conns, addr)
 		return nil
 	}
-	if st == connectivity.TransientFailure {
-		conn.ResetConnectBackoff()
-	}
 	return conn
 }
 
@@ -53,9 +50,6 @@ func (c *GRPCConnCache) storeConn(addr string, conn *grpc.ClientConn) *grpc.Clie
 	if ok && existing != nil {
 		st := existing.GetState()
 		if st != connectivity.Shutdown {
-			if st == connectivity.TransientFailure {
-				existing.ResetConnectBackoff()
-			}
 			return existing
 		}
 		delete(c.conns, addr)

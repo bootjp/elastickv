@@ -141,7 +141,8 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 	if !found {
 		return nil, 0, nil
 	}
-	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems: []*kv.Elem[kv.OP]{
@@ -347,7 +348,8 @@ func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string,
 		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
 		return nil, 0, errors.WithStack(err)
 	}
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -542,9 +544,18 @@ func (r *s3AdminObjectReader) ensureBuffered() error {
 			r.chunkIdx = 0
 			continue
 		}
-		chunkKey := s3keys.VersionedBlobKey(r.bucket, r.generation, r.key,
-			r.manifest.UploadID, part.PartNo, r.chunkIdx, part.PartVersion)
-		chunk, err := r.server.store.GetAt(r.ctx, chunkKey, r.readTS)
+		expectedSize := part.ChunkSizes[r.chunkIdx]
+		chunk, err := r.server.readS3ObjectChunk(
+			r.ctx,
+			r.bucket,
+			r.generation,
+			r.key,
+			r.manifest.UploadID,
+			part,
+			r.chunkIdx,
+			expectedSize,
+			r.readTS,
+		)
 		if err != nil {
 			return errors.WithStack(err)
 		}

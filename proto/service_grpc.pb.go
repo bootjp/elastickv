@@ -931,3 +931,139 @@ var RaftAdmin_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "service.proto",
 }
+
+const (
+	S3BlobFetch_FetchChunkBlob_FullMethodName = "/S3BlobFetch/FetchChunkBlob"
+	S3BlobFetch_PushChunkBlob_FullMethodName  = "/S3BlobFetch/PushChunkBlob"
+)
+
+// S3BlobFetchClient is the client API for S3BlobFetch service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type S3BlobFetchClient interface {
+	FetchChunkBlob(ctx context.Context, in *FetchChunkBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchChunkBlobResponse], error)
+	PushChunkBlob(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushChunkBlobRequest, PushChunkBlobResponse], error)
+}
+
+type s3BlobFetchClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewS3BlobFetchClient(cc grpc.ClientConnInterface) S3BlobFetchClient {
+	return &s3BlobFetchClient{cc}
+}
+
+func (c *s3BlobFetchClient) FetchChunkBlob(ctx context.Context, in *FetchChunkBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchChunkBlobResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &S3BlobFetch_ServiceDesc.Streams[0], S3BlobFetch_FetchChunkBlob_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchChunkBlobRequest, FetchChunkBlobResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type S3BlobFetch_FetchChunkBlobClient = grpc.ServerStreamingClient[FetchChunkBlobResponse]
+
+func (c *s3BlobFetchClient) PushChunkBlob(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushChunkBlobRequest, PushChunkBlobResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &S3BlobFetch_ServiceDesc.Streams[1], S3BlobFetch_PushChunkBlob_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PushChunkBlobRequest, PushChunkBlobResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type S3BlobFetch_PushChunkBlobClient = grpc.ClientStreamingClient[PushChunkBlobRequest, PushChunkBlobResponse]
+
+// S3BlobFetchServer is the server API for S3BlobFetch service.
+// All implementations must embed UnimplementedS3BlobFetchServer
+// for forward compatibility.
+type S3BlobFetchServer interface {
+	FetchChunkBlob(*FetchChunkBlobRequest, grpc.ServerStreamingServer[FetchChunkBlobResponse]) error
+	PushChunkBlob(grpc.ClientStreamingServer[PushChunkBlobRequest, PushChunkBlobResponse]) error
+	mustEmbedUnimplementedS3BlobFetchServer()
+}
+
+// UnimplementedS3BlobFetchServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedS3BlobFetchServer struct{}
+
+func (UnimplementedS3BlobFetchServer) FetchChunkBlob(*FetchChunkBlobRequest, grpc.ServerStreamingServer[FetchChunkBlobResponse]) error {
+	return status.Error(codes.Unimplemented, "method FetchChunkBlob not implemented")
+}
+func (UnimplementedS3BlobFetchServer) PushChunkBlob(grpc.ClientStreamingServer[PushChunkBlobRequest, PushChunkBlobResponse]) error {
+	return status.Error(codes.Unimplemented, "method PushChunkBlob not implemented")
+}
+func (UnimplementedS3BlobFetchServer) mustEmbedUnimplementedS3BlobFetchServer() {}
+func (UnimplementedS3BlobFetchServer) testEmbeddedByValue()                     {}
+
+// UnsafeS3BlobFetchServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to S3BlobFetchServer will
+// result in compilation errors.
+type UnsafeS3BlobFetchServer interface {
+	mustEmbedUnimplementedS3BlobFetchServer()
+}
+
+func RegisterS3BlobFetchServer(s grpc.ServiceRegistrar, srv S3BlobFetchServer) {
+	// If the following call panics, it indicates UnimplementedS3BlobFetchServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&S3BlobFetch_ServiceDesc, srv)
+}
+
+func _S3BlobFetch_FetchChunkBlob_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchChunkBlobRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(S3BlobFetchServer).FetchChunkBlob(m, &grpc.GenericServerStream[FetchChunkBlobRequest, FetchChunkBlobResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type S3BlobFetch_FetchChunkBlobServer = grpc.ServerStreamingServer[FetchChunkBlobResponse]
+
+func _S3BlobFetch_PushChunkBlob_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(S3BlobFetchServer).PushChunkBlob(&grpc.GenericServerStream[PushChunkBlobRequest, PushChunkBlobResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type S3BlobFetch_PushChunkBlobServer = grpc.ClientStreamingServer[PushChunkBlobRequest, PushChunkBlobResponse]
+
+// S3BlobFetch_ServiceDesc is the grpc.ServiceDesc for S3BlobFetch service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var S3BlobFetch_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "S3BlobFetch",
+	HandlerType: (*S3BlobFetchServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "FetchChunkBlob",
+			Handler:       _S3BlobFetch_FetchChunkBlob_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "PushChunkBlob",
+			Handler:       _S3BlobFetch_PushChunkBlob_Handler,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "service.proto",
+}

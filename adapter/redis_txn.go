@@ -2728,14 +2728,6 @@ func (r *RedisServer) beginTxnReadTimestamp(ctx context.Context, label string) (
 	return readTimestamp, errors.WithStack(err)
 }
 
-func (r *RedisServer) beginTxnStartTS(ctx context.Context, label string) (uint64, error) {
-	readTimestamp, err := r.beginTxnReadTimestamp(ctx, label)
-	if err != nil {
-		return 0, err
-	}
-	return readTimestamp.Timestamp(), nil
-}
-
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 	conn.WriteArray(len(results))
 	for _, res := range results {

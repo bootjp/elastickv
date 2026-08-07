@@ -326,6 +326,8 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(S3UploadMetaPrefix), routeS3UploadMeta(S3UploadMetaPrefix)},
 		{[]byte(S3UploadPartPrefix), routeS3UploadMeta(S3UploadPartPrefix)},
 		{[]byte(S3BlobPrefix), routeS3Blob},
+		{[]byte(S3ChunkRefPrefix), routeS3ChunkRef},
+		{[]byte(S3ChunkBlobPrefix), routeS3ChunkBlob},
 		{[]byte(S3GCUploadPrefix), routeInternalDrop},
 		{[]byte(S3RoutePrefix), routeInternalDrop},
 		// SQS
@@ -470,6 +472,24 @@ func routeS3Blob(d *dispatcher, k, v []byte) error {
 	}
 	d.counters.S3++
 	return d.s3.HandleBlob(k, v)
+}
+
+func routeS3ChunkRef(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkRef(k, v)
+}
+
+func routeS3ChunkBlob(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkBlob(k, v)
 }
 
 // routeS3UploadMeta returns a handler that forwards a specific
