@@ -116,8 +116,10 @@ the general data-plane leader proxy has the proposed circuit breaker.
 
 The next focused designs should be written and implemented in this order:
 
-1. Finish the open hotspot split M2/M3, shared-cache, dedicated-TSO, and S3 offload
-   stacks without moving their mechanisms into this roadmap.
+1. Finish the open hotspot split M2/M3, dedicated-TSO, and S3 offload stacks
+   without moving their mechanisms into this roadmap. The shared Pebble block
+   cache is no longer in this list: PR #1082 merged and §3 records it as
+   implemented on `main`.
 2. Catalog delta/watch, then catalog index and batched mutation.
 3. Follower reads and cross-shard transaction completion, both gated on the
    dedicated timestamp invariant where required.
