@@ -17,9 +17,16 @@ type Scope struct {
 	Name    string
 }
 
+const (
+	adapterDynamoDB = "dynamodb"
+	adapterS3       = "s3"
+	adapterRedis    = "redis"
+	adapterSQS      = "sqs"
+)
+
 func (s Scope) ID() string {
-	if s.Adapter == "redis" {
-		return "redis/" + s.Name
+	if s.Adapter == adapterRedis {
+		return adapterRedis + "/" + s.Name
 	}
 	return s.Adapter + "/" + s.Name
 }
@@ -46,9 +53,49 @@ func ScopeForKey(key []byte) (Scope, bool, error) {
 	):
 		return scopeForSQSKey(key)
 	case isRedisBackupKey(key):
-		return Scope{Adapter: "redis", Name: "db_0"}, true, nil
+		return Scope{Adapter: adapterRedis, Name: "db_0"}, true, nil
 	default:
 		return Scope{}, false, nil
+	}
+}
+
+// AdapterForKey reports the backup adapter family for keys that belong to a
+// known adapter namespace, including malformed scoped keys. Callers can use it
+// to skip disabled adapters before running stricter scope parsing.
+func AdapterForKey(key []byte) (string, bool) {
+	switch {
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBGSIPrefix):
+		return adapterDynamoDB, true
+	case hasAnyBackupPrefix(key,
+		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix,
+		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3GCUploadPrefix, S3RoutePrefix,
+	):
+		return adapterS3, true
+	case hasAnyBackupPrefix(key,
+		SQSQueueMetaPrefix, SQSQueueGenPrefix, SQSMsgDataPrefix, SQSQueueSeqPrefix,
+		SQSQueueTombstonePrefix, SQSMsgVisPrefix, SQSMsgByAgePrefix, SQSMsgDedupPrefix, SQSMsgGroupPrefix,
+	):
+		return adapterSQS, true
+	case isRedisBackupKey(key):
+		return adapterRedis, true
+	default:
+		return "", false
+	}
+}
+
+// AdapterEnabled reports whether name is enabled in set.
+func AdapterEnabled(set AdapterSet, name string) bool {
+	switch name {
+	case adapterDynamoDB:
+		return set.DynamoDB
+	case adapterS3:
+		return set.S3
+	case adapterRedis:
+		return set.Redis
+	case adapterSQS:
+		return set.SQS
+	default:
+		return false
 	}
 }
 
@@ -56,6 +103,8 @@ func scopeForDDBKey(key []byte) (Scope, bool, error) {
 	switch {
 	case bytes.HasPrefix(key, []byte(DDBTableMetaPrefix)):
 		return ddbScopeFromDirectSegment(key, DDBTableMetaPrefix)
+	case bytes.HasPrefix(key, []byte(DDBTableGenPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(DDBItemPrefix)):
 		encoded, _, err := parseDDBItemKey(key)
 		if err != nil {
@@ -74,15 +123,13 @@ func scopeForS3Key(key []byte) (Scope, bool, error) {
 	case bytes.HasPrefix(key, []byte(S3BucketMetaPrefix)):
 		bucket, ok := s3keys.ParseBucketMetaKey(key)
 		return parsedS3Scope(bucket, ok, key)
+	case bytes.HasPrefix(key, []byte(S3BucketGenPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(S3ObjectManifestPrefix)):
 		bucket, _, _, ok := s3keys.ParseObjectManifestKey(key)
 		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3UploadMetaPrefix)):
-		bucket, ok := parseUploadFamily(S3UploadMetaPrefix, key)
-		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3UploadPartPrefix)):
-		bucket, _, _, _, _, ok := s3keys.ParseUploadPartKey(key)
-		return parsedS3Scope(bucket, ok, key)
+	case bytes.HasPrefix(key, []byte(S3UploadMetaPrefix)), bytes.HasPrefix(key, []byte(S3UploadPartPrefix)):
+		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(S3BlobPrefix)):
 		bucket, _, _, _, _, _, _, ok := s3keys.ParseBlobKey(key)
 		return parsedS3Scope(bucket, ok, key)
@@ -105,26 +152,9 @@ func scopeForSQSKey(key []byte) (Scope, bool, error) {
 			return Scope{}, false, err
 		}
 		return decodedScope("sqs", encoded)
-	case bytes.HasPrefix(key, []byte(SQSQueueSeqPrefix)):
-		return sqsScopeFromDirectSegment(key, SQSQueueSeqPrefix)
 	default:
-		prefix, ok := sqsDerivedBackupPrefix(key)
-		if !ok {
-			return Scope{}, false, nil
-		}
-		return sqsScopeFromGenericKey(key, prefix)
+		return Scope{}, false, nil
 	}
-}
-
-func sqsDerivedBackupPrefix(key []byte) (string, bool) {
-	for _, prefix := range [...]string{
-		SQSQueueTombstonePrefix, SQSMsgVisPrefix, SQSMsgByAgePrefix, SQSMsgDedupPrefix, SQSMsgGroupPrefix,
-	} {
-		if bytes.HasPrefix(key, []byte(prefix)) {
-			return prefix, true
-		}
-	}
-	return "", false
 }
 
 func hasAnyBackupPrefix(key []byte, prefixes ...string) bool {
@@ -152,14 +182,6 @@ func sqsScopeFromDirectSegment(key []byte, prefix string) (Scope, bool, error) {
 	return decodedScope("sqs", encoded)
 }
 
-func sqsScopeFromGenericKey(key []byte, prefix string) (Scope, bool, error) {
-	encoded, err := parseSQSGenericKey(key, prefix)
-	if err != nil {
-		return Scope{}, false, err
-	}
-	return decodedScope("sqs", encoded)
-}
-
 func decodedScope(adapter, encoded string) (Scope, bool, error) {
 	name, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil || len(name) == 0 {
@@ -176,12 +198,21 @@ func parsedS3Scope(name string, ok bool, key []byte) (Scope, bool, error) {
 }
 
 func isRedisBackupKey(key []byte) bool {
+	if hasAnyBackupPrefix(key,
+		RedisHashMetaDeltaPrefix,
+		ListMetaDeltaPrefix,
+		ListClaimPrefix,
+		RedisSetMetaDeltaPrefix,
+		RedisZSetMetaDeltaPrefix,
+		RedisZSetScorePrefix,
+	) {
+		return false
+	}
 	prefixes := [...]string{
-		RedisHashMetaDeltaPrefix, RedisHashMetaPrefix, RedisHashFieldPrefix,
-		ListMetaDeltaPrefix, ListMetaPrefix, ListItemPrefix, ListClaimPrefix,
-		RedisSetMetaDeltaPrefix, RedisSetMetaPrefix, RedisSetMemberPrefix,
-		RedisZSetMetaDeltaPrefix, RedisZSetMetaPrefix, RedisZSetMemberPrefix,
-		RedisZSetScorePrefix, RedisZSetLegacyBlobPrefix,
+		RedisHashMetaPrefix, RedisHashFieldPrefix,
+		ListMetaPrefix, ListItemPrefix,
+		RedisSetMetaPrefix, RedisSetMemberPrefix,
+		RedisZSetMetaPrefix, RedisZSetMemberPrefix, RedisZSetLegacyBlobPrefix,
 		RedisStreamMetaPrefix, RedisStreamEntryPrefix,
 		RedisStringPrefix, RedisHLLPrefix, RedisTTLPrefix,
 	}
@@ -240,6 +271,143 @@ func (d *LiveDecoder) Finalize() (DecodeCounters, error) {
 		return DecodeCounters{}, err
 	}
 	return d.d.counters, nil
+}
+
+// FinalizedScopeCounts replaces streamed counts for adapters whose encoders
+// make relational keep/drop decisions during Finalize. The encoder counts are
+// authoritative because orphan and stale records are only known after the
+// complete adapter state has been assembled.
+func (d *LiveDecoder) FinalizedScopeCounts(streamed map[Scope]uint64) (map[Scope]uint64, error) {
+	if d == nil || d.d == nil || !d.finalized {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live decoder is not finalized")
+	}
+	return finalizedScopeCounts(d.d, streamed), nil
+}
+
+// LiveScopeCounter classifies live backup key/value pairs using the same
+// adapter state as the decoder, but in count-only mode. Server-side baseline
+// scans use it so BeginBackup.expected_keys uses the same retained-record
+// denominator that the live producer validates after decoder finalization.
+type LiveScopeCounter struct {
+	d        *dispatcher
+	streamed map[Scope]uint64
+}
+
+func NewLiveScopeCounter(adapters AdapterSet) (*LiveScopeCounter, error) {
+	d, err := newDispatcher(DecodeOptions{Adapters: adapters, countOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	return &LiveScopeCounter{d: d, streamed: make(map[Scope]uint64)}, nil
+}
+
+func (c *LiveScopeCounter) Add(key, value []byte) error {
+	needsValue, err := c.AddKey(key)
+	if err != nil {
+		return err
+	}
+	if !needsValue {
+		return nil
+	}
+	return c.AddValue(key, value)
+}
+
+// AddKey records a key observed by a count-only baseline scan. It returns true
+// when the caller must also provide the value through AddValue for metadata
+// needed by retained-count finalization.
+func (c *LiveScopeCounter) AddKey(key []byte) (bool, error) {
+	if c == nil || c.d == nil {
+		return false, errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	scope, scoped, err := ScopeForKey(key)
+	if err != nil {
+		return false, err
+	}
+	if !scoped {
+		return false, nil
+	}
+	c.streamed[scope]++
+	if liveScopeCounterNeedsValue(key) {
+		return true, nil
+	}
+	return false, c.d.route(key, nil)
+}
+
+func (c *LiveScopeCounter) AddValue(key, value []byte) error {
+	if c == nil || c.d == nil {
+		return errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	return c.d.route(key, value)
+}
+
+func (c *LiveScopeCounter) RetainedCounts() (map[Scope]uint64, error) {
+	if c == nil || c.d == nil {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "live scope counter is unavailable")
+	}
+	return finalizedScopeCounts(c.d, c.streamed), nil
+}
+
+func liveScopeCounterNeedsValue(key []byte) bool {
+	switch {
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix):
+		return true
+	case hasAnyBackupPrefix(key, S3BucketMetaPrefix, S3ObjectManifestPrefix):
+		return true
+	case hasAnyBackupPrefix(key, SQSQueueMetaPrefix, SQSQueueGenPrefix):
+		return true
+	default:
+		adapter, ok := AdapterForKey(key)
+		return ok && adapter == adapterRedis
+	}
+}
+
+func finalizedScopeCounts(d *dispatcher, streamed map[Scope]uint64) map[Scope]uint64 {
+	out := make(map[Scope]uint64, len(streamed))
+	for scope, count := range streamed {
+		if count > 0 && !adapterFinalizesScopeCounts(scope.Adapter) {
+			out[scope] = count
+		}
+	}
+	d.addFinalizedScopeCounts(out)
+	return out
+}
+
+func adapterFinalizesScopeCounts(adapter string) bool {
+	switch adapter {
+	case adapterDynamoDB, adapterS3, adapterRedis, adapterSQS:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *dispatcher) addFinalizedScopeCounts(out map[Scope]uint64) {
+	if d.ddb != nil {
+		for name, count := range d.ddb.RetainedRecordCounts() {
+			addPositiveScopeCount(out, Scope{Adapter: adapterDynamoDB, Name: name}, count)
+		}
+	}
+	if d.s3 != nil {
+		for name, count := range d.s3.RetainedRecordCounts() {
+			addPositiveScopeCount(out, Scope{Adapter: adapterS3, Name: name}, count)
+		}
+	}
+	if d.redis != nil {
+		addPositiveScopeCount(out, Scope{Adapter: adapterRedis, Name: "db_0"}, d.redis.RetainedRecordCount())
+	}
+	if d.sqs != nil {
+		for name, count := range d.sqs.RetainedRecordCounts() {
+			addPositiveScopeCount(out, Scope{Adapter: adapterSQS, Name: name}, count)
+		}
+	}
+}
+
+func addPositiveScopeCount(out map[Scope]uint64, scope Scope, count uint64) {
+	if count == 0 {
+		delete(out, scope)
+		return
+	}
+	out[scope] = count
 }
 
 func (s Scope) String() string {

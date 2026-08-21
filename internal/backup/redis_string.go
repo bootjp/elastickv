@@ -151,8 +151,10 @@ const (
 // Handle* methods are NOT goroutine-safe; the decoder pipeline is
 // inherently sequential per scope, so a mutex would only add cost.
 type RedisDB struct {
-	outRoot string
-	dbIndex int
+	outRoot   string
+	dbIndex   int
+	countOnly bool
+	finalized bool
 
 	// kindByKey records the Redis type each user key was first seen as.
 	// Populated by HandleString and HandleHLL; consulted by HandleTTL.
@@ -289,6 +291,12 @@ type RedisDB struct {
 	// can distinguish "snapshot exceeded the buffer budget" from
 	// "TTL records remained unmatched after the entire scan".
 	pendingTTLOverflow int
+
+	// simpleRecordCount and ttlRecordCount track live-backup source records
+	// that remain represented after adapter finalization. Wide-column records
+	// are counted from their finalized state maps.
+	simpleRecordCount uint64
+	ttlRecordCount    uint64
 }
 
 // defaultPendingTTLBytesCap caps pendingTTL at 1 GiB cumulative
@@ -364,6 +372,11 @@ func (r *RedisDB) WithPendingTTLByteCap(capacity int) *RedisDB {
 	return r
 }
 
+func (r *RedisDB) WithCountOnly(on bool) *RedisDB {
+	r.countOnly = on
+	return r
+}
+
 // WithWarnSink wires a structured-warning sink. The sink is called with
 // stable event names ("redis_orphan_ttl", etc.) and key=value pairs.
 func (r *RedisDB) WithWarnSink(fn func(event string, fields ...any)) *RedisDB {
@@ -388,10 +401,13 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 	if newFormat {
 		r.inlineTTLOwned[string(userKey)] = struct{}{}
 	}
-	if expireAtMs == 0 {
-		return nil
+	if expireAtMs != 0 {
+		if err := r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs); err != nil {
+			return err
+		}
 	}
-	return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
+	r.simpleRecordCount++
+	return nil
 }
 
 // HandleHLL processes one !redis|hll|<userKey> record. Legacy values are raw
@@ -411,10 +427,13 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	if newFormat {
 		r.inlineTTLOwned[string(userKey)] = struct{}{}
 	}
-	if expireAtMs == 0 {
-		return nil
+	if expireAtMs != 0 {
+		if err := r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs); err != nil {
+			return err
+		}
 	}
-	return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
+	r.simpleRecordCount++
+	return nil
 }
 
 // HandleTTL processes one !redis|ttl|<userKey> record. Routing
@@ -451,9 +470,9 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	switch r.kindByKey[string(userKey)] {
 	case redisKindHLL:
 		if _, ok := r.inlineTTLOwned[string(userKey)]; ok {
-			return nil
+			return r.retainTTLRecord(nil)
 		}
-		return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
+		return r.retainTTLRecord(r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs))
 	case redisKindString:
 		// New-format strings carry TTL inline in the magic-prefix
 		// header; HandleString already wrote the entry to
@@ -462,19 +481,26 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		// legacy strings (no inline TTL) reach the appendTTL call.
 		// Codex P1 round 5.
 		if _, ok := r.inlineTTLOwned[string(userKey)]; ok {
-			return nil
+			return r.retainTTLRecord(nil)
 		}
-		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
+		return r.retainTTLRecord(r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs))
 	case redisKindHash, redisKindList, redisKindSet, redisKindZSet, redisKindStream:
 		// Wide-column types fold TTL into the per-key JSON record
 		// (`expire_at_ms` field) so a restorer can replay the
 		// content + EXPIRE in one shot from the per-key file.
 		r.inlineWideColumnTTL(r.kindByKey[string(userKey)], userKey, expireAtMs)
-		return nil
+		return r.retainTTLRecord(nil)
 	case redisKindUnknown:
-		return r.parkUnknownTTL(userKey, expireAtMs)
+		return r.retainTTLRecord(r.parkUnknownTTL(userKey, expireAtMs))
 	}
 	return nil
+}
+
+func (r *RedisDB) retainTTLRecord(err error) error {
+	if err == nil {
+		r.ttlRecordCount++
+	}
+	return err
 }
 
 // inlineWideColumnTTL sets expireAtMs/hasTTL on the per-key state
@@ -539,6 +565,7 @@ func (r *RedisDB) inlineZSetTTL(userKey []byte, expireAtMs uint64) {
 
 func (r *RedisDB) inlineStreamTTL(userKey []byte, expireAtMs uint64) {
 	st := r.streamState(userKey)
+	st.externalTTL = true
 	if st.inlineTTLOwned {
 		return
 	}
@@ -664,7 +691,10 @@ func (r *RedisDB) Finalize() error {
 	// record was dropped, or a `!redis|ttl|` entry written for a
 	// key whose type prefix we don't recognise (a future Redis
 	// type added on the live side without a backup-encoder update).
-	r.orphanTTLCount += len(r.pendingTTL)
+	if !r.finalized {
+		r.orphanTTLCount += len(r.pendingTTL)
+		r.finalized = true
+	}
 	// Codex P2 (PR #790 r13): also warn on pendingTTLOverflow even
 	// when orphanTTLCount is zero. Overflow entries fail-closed at
 	// parkUnknownTTL with ErrPendingTTLBufferFull and never reach
@@ -686,6 +716,68 @@ func (r *RedisDB) Finalize() error {
 		r.warn("redis_orphan_ttl", fields...)
 	}
 	return firstErr
+}
+
+// RetainedRecordCount reports Redis source records represented by the native
+// dump after finalization. Derivable indexes are excluded by ScopeForKey;
+// orphan TTLs and meta-less stream records are removed here.
+func (r *RedisDB) RetainedRecordCount() uint64 {
+	count := r.simpleRecordCount + r.ttlRecordCount
+	count = subtractRecordCount(count, r.effectiveOrphanTTLCount())
+	for _, st := range r.hashes {
+		count += boolRecordCount(st.metaSeen) + uint64(len(st.fields))
+	}
+	for _, st := range r.lists {
+		count += boolRecordCount(st.metaSeen) + uint64(len(st.items))
+	}
+	for _, st := range r.sets {
+		count += boolRecordCount(st.metaSeen) + uint64(len(st.members))
+	}
+	for _, st := range r.zsets {
+		count += boolRecordCount(st.metaSeen)
+		if st.sawWide {
+			count += uint64(len(st.members))
+		} else {
+			count += boolRecordCount(st.legacySeen)
+		}
+	}
+	for _, st := range r.streams {
+		if st.metaSeen {
+			count += 1 + uint64(len(st.entries))
+		} else if st.externalTTL {
+			count = subtractRecordCount(count, 1)
+		}
+	}
+	return count
+}
+
+func (r *RedisDB) effectiveOrphanTTLCount() uint64 {
+	count := nonNegativeRecordCount(r.orphanTTLCount)
+	if !r.finalized {
+		count += uint64(len(r.pendingTTL))
+	}
+	return count
+}
+
+func nonNegativeRecordCount(count int) uint64 {
+	if count <= 0 {
+		return 0
+	}
+	return uint64(count) //nolint:gosec // Positive int is representable by uint64 on supported platforms.
+}
+
+func boolRecordCount(on bool) uint64 {
+	if on {
+		return 1
+	}
+	return 0
+}
+
+func subtractRecordCount(count, dropped uint64) uint64 {
+	if dropped >= count {
+		return 0
+	}
+	return count - dropped
 }
 
 // dbDir returns the per-encoder root, e.g. "<outRoot>/redis/db_0/".
@@ -718,6 +810,9 @@ func (r *RedisDB) dbDir() string {
 // that survives `find -name '*.json'` scrutiny.
 func flushWideColumnDir[T any](r *RedisDB, states map[string]T, subdir string, flushOne func(dir, userKey string, st T) error) error {
 	if len(states) == 0 {
+		return nil
+	}
+	if r.countOnly {
 		return nil
 	}
 	dir := filepath.Join(r.dbDir(), subdir)
@@ -853,6 +948,9 @@ func lstatRefuseSymlink(path string) error {
 }
 
 func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
+	if r.countOnly {
+		return nil
+	}
 	encoded := EncodeSegment(userKey)
 	if err := r.recordIfFallback(encoded, userKey); err != nil {
 		return err
@@ -869,6 +967,9 @@ func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 }
 
 func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, expireAtMs uint64) error {
+	if r.countOnly {
+		return nil
+	}
 	if *slot == nil {
 		// Route the parent directory through ensureDir so the
 		// shared assertNoSymlinkAncestors guard fires before we
@@ -914,6 +1015,9 @@ func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, e
 // Idempotent: a duplicate (encoded, original) pair is harmless because
 // LoadKeymap's "last record wins" behaviour leaves the same mapping.
 func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
+	if r.countOnly {
+		return nil
+	}
 	if !IsShaFallback(encoded) {
 		return nil
 	}
@@ -938,6 +1042,9 @@ func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
 // file is removed so dumps without any non-reversible keys carry no
 // spurious empty file (matches the s3 encoder's keymap policy).
 func (r *RedisDB) closeKeymap() error {
+	if r.countOnly {
+		return nil
+	}
 	if r.keymap == nil {
 		return nil
 	}
