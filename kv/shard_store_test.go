@@ -826,7 +826,7 @@ func TestShardStoreScanAtWithReadFence_FiltersByEachRouteBounds(t *testing.T) {
 	require.Equal(t, right, kvs[1].Key)
 }
 
-func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *testing.T) {
+func TestShardStoreScanAtWithReadFence_ServesExplicitGroupReverse(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -845,8 +845,13 @@ func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *t
 	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
 
-	_, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
-	require.ErrorIs(t, err, store.ErrNotSupported)
+	// An unbounded explicit-group reverse scan is served through the fenced
+	// route path rather than rejected. Rejecting it here only pushed callers
+	// back onto the unfenced ReverseScanGroupAt shortcut in the gRPC server.
+	unbounded, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, unbounded, 1)
+	require.Equal(t, right, unbounded[0].Key)
 
 	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
 	require.NoError(t, err)

@@ -421,10 +421,11 @@ func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end 
 	}
 	if reverse {
 		if groupID != 0 {
-			if routeScanBoundsPresent(routeStart, routeEnd) {
-				return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, readRouteVersion, routeStart, routeEnd)
-			}
-			return nil, errors.WithStack(store.ErrNotSupported)
+			// Unbounded group-scoped reverse scans are served here too, not
+			// short-circuited by the caller: routing them through the fenced
+			// path is what applies awaitReadRouteVersion above and the
+			// migration read fence to an explicitly selected group.
+			return s.scanRouteAtDirectionWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, readRouteVersion, routeStart, routeEnd)
 		}
 		return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, readRouteVersion, routeStart, routeEnd)
 	}
