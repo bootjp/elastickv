@@ -4,7 +4,7 @@ Status: Proposed
 Document type: Roadmap ownership index
 Author: bootjp
 Date: 2026-06-23
-Last audited: 2026-07-19 against `origin/main` and GitHub pull requests
+Last audited: 2026-08-22 against `origin/main` and GitHub pull requests
 
 ## 1. Scope
 
@@ -46,14 +46,14 @@ again before merge or deployment.
 | Learner membership primitive | `2026_04_26_implemented_raft_learner.md` | PR #1002 merged | Implemented on `main`; follower reads are separate |
 | Leader balance | `2026_06_11_implemented_leader_balance_scheduler.md` | PR #1012 merged | Implemented on `main`; data placement is separate |
 | Hotspot split M1 catalog and same-group split | `2026_02_18_implemented_hotspot_split_milestone1_pr.md` and `2026_02_18_partial_hotspot_shard_split.md` | PR #999 merged the catalog cleanup | Implemented M1; parent design remains partial |
-| Hotspot split M2 migration | `2026_06_11_proposed_hotspot_split_milestone2_migration.md` | PRs #1084, #1085, #1088, #1090, and #1096 open; supporting stack members have merged | In flight; not on `main` as a complete migration plane |
-| Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PRs #1097 and #1104 open | In flight; not implemented on `main` |
+| Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the lifecycle; PRs #1084, #1085, #1088, and #1090 open | In flight; not on `main` as a complete migration plane |
+| Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PR #1097 merged the detector core; PR #1104 open | In flight; not implemented on `main` |
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
-| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064 and #1103 merged; PRs #1095 and #1108 open | Group reservation and state-machine wiring are on `main`; ceiling FSM and durable routing remain in flight |
-| Shared Pebble block cache | PR #1082 | PR #1082 open | In flight; cache sharing only, not all resource-pool work |
-| Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; production multi-group soak evidence remains outstanding |
-| S3 Raft blob offload | `2026_04_25_proposed_s3_raft_blob_offload.md` | PRs #1057 and #1063 open | In flight; payload offload is not on `main` |
-| Live logical backup | `2026_04_29_proposed_logical_backup.md` | PR #1065 merged scan primitives; PRs #1056 and #1059 open | In flight; distinct from physical SST snapshot offload |
+| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, and #1108 merged; PR #1095 open | Group reservation, state-machine wiring, and durable leader routing are on `main`; the ceiling FSM remains in flight |
+| Shared Pebble block cache | PR #1082 | PR #1082 merged | Implemented on `main`; cache sharing only, not all resource-pool work |
+| Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; multi-group soak evidence landed with the design's §8 (`cmd/elastickv-raft-stream-soak`, `scripts/run-jepsen-raft-streaming-multigroup-soak.sh`, `docs/evidence/raft_streaming_multigroup_soak.json`) |
+| S3 Raft blob offload | `2026_04_25_partial_s3_raft_blob_offload.md` | PRs #1057 and #1063 merged the rollout scaffolding and blob fetch RPC | In flight; end-to-end payload offload is not yet on `main` |
+| Live logical backup | `2026_04_29_proposed_logical_backup.md` | PRs #1065 and #1059 merged the scan primitives and admin version API; PR #1056 open | In flight; distinct from physical SST snapshot offload |
 
 ## 4. 2026-06-12 requirement audit
 
@@ -85,7 +85,7 @@ placement or failover.
 | 2026-06-12 milestone | Disposition | Remaining ownership |
 |---|---|---|
 | M1 SST ingest snapshot transfer | Unimplemented and unowned | Write `*_proposed_pebble_sst_snapshot_transfer.md`; own checkpoint consistency, file manifest, integrity, transport, ingest, cleanup, and fallback |
-| M2 shared block cache | In flight | PR #1082 owns only process-wide cache sizing, lifetime, metrics, and tests |
+| M2 shared block cache | Implemented on `main` | PR #1082 owned only process-wide cache sizing, lifetime, metrics, and tests |
 | M2 per-shard Pebble tuning and write admission | Partially addressed operationally, but the proposed per-shard contract is unowned | Write `*_proposed_pebble_resource_governor.md`; own tuning scope, node-wide fairness, stall thresholds, admission errors, and adapter retry semantics |
 | M3 sharded retention scheduling | Existing compaction is implemented; jitter, node budget, and hot-key dynamic retention are unimplemented and unowned | Write `*_proposed_sharded_mvcc_retention.md`; preserve the hard retention contract and active timestamp pins |
 | M4 physical disaster-recovery snapshot offload | Unimplemented and unowned | Write `*_proposed_physical_snapshot_object_offload.md`; do not merge it into logical backup or S3 user-payload blob offload |
@@ -109,7 +109,7 @@ the general data-plane leader proxy has the proposed circuit breaker.
 |---|---|---|
 | Region/range balance scheduler | Unimplemented and unowned | `*_proposed_region_balance_scheduler.md`; depend on replica placement, multi-node bootstrap, and hotspot migration |
 | Range merge | Unimplemented and unowned | `*_proposed_range_merge.md`; split same-group and cross-group merge into reviewable milestones and define transaction drain/fencing |
-| Streaming transport multi-group soak | Implementation exists; evidence gap | Keep the transport contract in `2026_04_18_implemented_raft_grpc_streaming_transport.md`; add repeatable soak evidence without changing protocol semantics |
+| Streaming transport multi-group soak | Closed | `2026_04_18_implemented_raft_grpc_streaming_transport.md` §8 records the repeatable soak (`cmd/elastickv-raft-stream-soak` plus a fail-closed verifier over `docs/evidence/raft_streaming_multigroup_soak.json`); no protocol semantics changed |
 | Auto group lifecycle | Unimplemented and unowned | `*_proposed_auto_group_lifecycle.md`; depend on placement, migration, merge, and safe membership replacement |
 
 ## 6. Dependency order
