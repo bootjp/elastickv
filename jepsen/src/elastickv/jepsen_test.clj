@@ -6,6 +6,7 @@
             [elastickv.dynamodb-types-workload :as dynamodb-types-workload]
             [elastickv.s3-workload :as s3-workload]
             [elastickv.sqs-htfifo-workload :as sqs-htfifo-workload]
+            [elastickv.split-workload :as split-workload]
             [jepsen.cli :as cli]))
 
 (defn elastickv-test
@@ -28,6 +29,10 @@
   ([] (elastickv-zset-safety-test {}))
   ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
 
+(defn elastickv-split-test
+  ([] (elastickv-split-test {}))
+  ([opts] (split-workload/elastickv-split-test opts)))
+
 (def ^:private test-fns
   "Map of user-facing test names to their constructor fns. The first
   positional CLI arg selects which workload runs; if absent or unknown,
@@ -36,7 +41,8 @@
   {"elastickv-test"             elastickv-test
    "elastickv-zset-safety-test" elastickv-zset-safety-test
    "elastickv-dynamodb-test"    elastickv-dynamodb-test
-   "elastickv-s3-test"          elastickv-s3-test})
+   "elastickv-s3-test"          elastickv-s3-test
+   "elastickv-split-test"       elastickv-split-test})
 
 (defn elastickv-sqs-htfifo-test
   "HT-FIFO Jepsen test (PR 7b). Run via the workload's own -main:

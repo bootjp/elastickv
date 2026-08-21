@@ -48,6 +48,34 @@ func TestValidateFlags_AcceptsAllPresent(t *testing.T) {
 	require.NoError(t, validateFlags())
 }
 
+func TestValidateFlags_AcceptsAbandonOnly(t *testing.T) {
+	resetFlags(t)
+	*abandonJobID = 42
+	require.NoError(t, validateFlags())
+}
+
+func TestValidateFlags_RejectsAbandonWithSplitFlags(t *testing.T) {
+	resetFlags(t)
+	*abandonJobID = 42
+	*routeID = 7
+	err := validateFlags()
+	require.ErrorContains(t, err, "mutually exclusive")
+}
+
+func TestValidateFlags_AcceptsGetOnly(t *testing.T) {
+	resetFlags(t)
+	*getJobID = 42
+	require.NoError(t, validateFlags())
+}
+
+func TestValidateFlags_RejectsGetWithMutationFlags(t *testing.T) {
+	resetFlags(t)
+	*getJobID = 42
+	*abandonJobID = 42
+	err := validateFlags()
+	require.ErrorContains(t, err, "mutually exclusive")
+}
+
 // resetFlags reinitialises the package-level flag pointers around
 // each test so subtests don't leak state through them.  We rebind
 // the globals directly rather than re-parsing argv because the
@@ -58,12 +86,15 @@ func resetFlags(t *testing.T) {
 	// init).  errors.New rather than t.Fatalf so a future
 	// refactor that drops the package-level flags surfaces here
 	// rather than silently no-oping the resets.
-	if routeID == nil || splitKey == nil || expectedVersion == nil || address == nil {
+	if routeID == nil || splitKey == nil || expectedVersion == nil || targetGroupID == nil || abandonJobID == nil || getJobID == nil || address == nil {
 		t.Fatal(errors.New("package-level flag pointers were not initialised"))
 	}
 	*routeID = 0
 	*splitKey = ""
 	*expectedVersion = 0
+	*targetGroupID = 0
+	*abandonJobID = 0
+	*getJobID = 0
 	*address = "127.0.0.1:50051"
 	_ = flag.CommandLine // touch to avoid unused import on future trims
 }

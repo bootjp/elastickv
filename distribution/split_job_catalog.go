@@ -36,6 +36,7 @@ var (
 	ErrCatalogSplitJobConflict            = errors.New("catalog split job conflict")
 	ErrCatalogSplitJobTerminalRequired    = errors.New("catalog split job terminal state is required")
 	ErrSplitJobOverlap                    = errors.New("split job overlaps requested route")
+	ErrTooManyInFlightSplitJobs           = errors.New("too many in-flight split jobs")
 )
 
 // SplitJobPhase is the durable phase of a split migration job.
@@ -167,6 +168,7 @@ type SplitJob struct {
 	StartedAtMs                      int64
 	UpdatedAtMs                      int64
 	TerminalAtMs                     int64
+	CapabilityRegressed              bool
 }
 
 // CatalogNextSplitJobIDKey returns the reserved key used for split-job ID allocation.
@@ -588,12 +590,12 @@ func (p SplitJobPhase) retryable() bool {
 
 func (p SplitJobPhase) abandonable() bool {
 	switch p {
-	case SplitJobPhaseBackfill,
+	case SplitJobPhasePlanned,
+		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy:
 		return true
 	case SplitJobPhaseNone,
-		SplitJobPhasePlanned,
 		SplitJobPhaseCutover,
 		SplitJobPhaseCleanup,
 		SplitJobPhaseDone,
@@ -905,7 +907,13 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
 	}
+}
+
+// SplitJobToProto converts a catalog SplitJob into its wire representation.
+func SplitJobToProto(job SplitJob) *pb.SplitJob {
+	return splitJobToProto(job)
 }
 
 func splitJobToProto(job SplitJob) *pb.SplitJob {
@@ -944,6 +952,7 @@ func splitJobToProto(job SplitJob) *pb.SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
 	}
 }
 
@@ -1009,6 +1018,7 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		StartedAtMs:                      msg.GetStartedAtMs(),
 		UpdatedAtMs:                      msg.GetUpdatedAtMs(),
 		TerminalAtMs:                     msg.GetTerminalAtMs(),
+		CapabilityRegressed:              msg.GetCapabilityRegressed(),
 	}, nil
 }
 

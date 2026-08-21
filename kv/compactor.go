@@ -234,6 +234,13 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 	if !ok {
 		return nil
 	}
+	safeMinTS, err := migrationRetentionMinTS(ctx, runtime.Store, safeMinTS)
+	if err != nil {
+		return errors.Wrapf(err, "read migration retention pins for group %d", runtime.GroupID)
+	}
+	if safeMinTS <= retention.MinRetainedTS() {
+		return nil
+	}
 
 	compactCtx, cancel := c.compactContext(ctx, status)
 	defer cancel()
@@ -251,6 +258,23 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		"last_commit_ts", lastCommitTS,
 	)
 	return nil
+}
+
+func migrationRetentionMinTS(ctx context.Context, st store.MVCCStore, safeMinTS uint64) (uint64, error) {
+	reader, ok := st.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return safeMinTS, nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	for _, state := range states {
+		if state.Armed && state.RetentionPinTS > 0 && state.RetentionPinTS < safeMinTS {
+			safeMinTS = state.RetentionPinTS
+		}
+	}
+	return safeMinTS, nil
 }
 
 func (c *FSMCompactor) compactionRuntimeReady(runtime FSMCompactRuntime) (store.RetentionController, raftengine.Status, bool) {

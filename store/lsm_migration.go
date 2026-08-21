@@ -25,6 +25,9 @@ func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersi
 	if opts.MaxVersions <= 0 {
 		return ExportVersionsResult{Done: true}, nil
 	}
+	if readTSCompacted(exportRetentionReadTS(opts), s.effectiveMinRetainedTS()) {
+		return ExportVersionsResult{}, ErrReadTSCompacted
+	}
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {
@@ -551,4 +554,26 @@ func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64
 		return 0, err
 	}
 	return floor, nil
+}
+
+func (s *pebbleStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	floors, err := s.readMigrationHLCFloors()
+	if err != nil {
+		return false, err
+	}
+	if floors[jobID] != 0 {
+		return true, nil
+	}
+	acks, err := s.readMigrationImportAcks()
+	if err != nil {
+		return false, err
+	}
+	for id := range acks {
+		if id.jobID == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
 }

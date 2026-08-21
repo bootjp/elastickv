@@ -890,6 +890,18 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 	require.NoError(t, src.PutAt(ctx, []byte("key1"), []byte("val1-updated"), 20, 0))
 	require.NoError(t, src.DeleteAt(ctx, []byte("key2"), 15))
 	require.NoError(t, src.PutWithTTLAt(ctx, []byte("key3"), []byte("val3"), 30, 9999))
+	readyState := TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 12,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}
+	readyWriter, ok := src.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, readyWriter.ApplyTargetStagedReadiness(ctx, readyState))
 
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
@@ -927,6 +939,55 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 	assert.Equal(t, []byte("val3"), val)
 
 	assert.Equal(t, src.LastCommitTS(), dst.LastCommitTS())
+	readyReader, ok := dst.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := readyReader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{readyState}, states)
+}
+
+func TestPebbleStore_RestoreFromStreamingMVCCPreservesMigrationImportMetadata(t *testing.T) {
+	ctx := context.Background()
+	src := NewMVCCStore()
+	_, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("c1"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+
+	dir, err := os.MkdirTemp("", "pebble-migrate-import-metadata-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	dst, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer dst.Close()
+	require.NoError(t, dst.Restore(bytes.NewReader(snapshotBytes(t, snap))))
+
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("c1"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
 }
 
 func TestPebbleStore_RestoreFromStreamingMVCCPreservesMinRetainedTS(t *testing.T) {
@@ -975,6 +1036,17 @@ func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
 
 	// Pre-populate so we can verify the restore clears the data.
 	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v"), 42, 0))
+	readyWriter, ok := s.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, readyWriter.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 12,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
 	requirePebbleRetentionController(t, s).SetMinRetainedTS(21)
 	require.Equal(t, uint64(42), s.LastCommitTS())
 
@@ -986,6 +1058,11 @@ func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 	assert.Equal(t, uint64(0), s.LastCommitTS())
 	assert.Equal(t, uint64(0), requirePebbleRetentionController(t, s).MinRetainedTS())
+	readyReader, ok := s.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := readyReader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states)
 }
 
 // TestPebbleStore_Restore_TruncatedHeader verifies that a partial magic
