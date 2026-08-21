@@ -908,3 +908,24 @@ and benchmark evidence are maintained in
    group-0 engine remains wired as a leader view so read-only sidecar recovery
    cannot be served from a stale follower. Runtime wiring therefore
    does not require deleting group-0 state.
+
+## 10. Known Limitations
+
+1. **Phase-D timestamps do not track wall time (open).**
+   `RaftTSOAllocator.reserveContiguousPhaseDWindow` (`kv/tso_raft.go`) allocates
+   `base = floor + 1` while Phase D is active. It consults neither the wall
+   clock nor `HLC.PhysicalCeiling()`, so after an idle interval the next
+   allocation keeps the previous window's physical millisecond and that half
+   then advances by only 1 ms per 65,536 issued timestamps.
+
+   The contiguity is deliberate: `ValidateDurableTimestamp` accepts any value in
+   `(PhaseDFloor, AllocationFloor]`, and that check is only sound because every
+   integer in the range really was issued. Advancing the physical half with the
+   wall clock leaves gaps, so the invariant has to be replaced with tracking of
+   the committed allocation ranges — a change to the replicated TSO state
+   machine, which needs its own `*_proposed_*.md` proposal before implementation.
+
+   The drift is externally observable, not just internal: S3 stores the commit
+   timestamp in `LastModifiedHLC` and `hlcToTime` (`adapter/s3.go`) converts
+   those bits straight into the HTTP `Last-Modified` header, so a PUT that
+   follows an idle period reports a stale modification date.
