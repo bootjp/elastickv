@@ -2725,3 +2725,113 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
 }
+
+// Redis list-delta/claim and stream rows are placed by their raw key but are
+// treated as owned by the logical user key by route-bound scans and by
+// prefix-write floors. Point writes checked only the raw-key route, so a fenced
+// user key still accepted its auxiliary rows.
+func TestShardStorePointWriteChecksRedisAuxiliaryLogicalRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// Raw "!..." keys sort below "m" and land on the unfenced route.
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			// The logical user key "zulu" lands on the fenced route.
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	fenced := []byte("zulu")
+	unfenced := []byte("alpha")
+
+	tests := []struct {
+		name       string
+		key        []byte
+		commitTS   uint64
+		wantReject bool
+	}{
+		{
+			name:       "list delta under a fenced user key",
+			key:        store.ListMetaDeltaKey(fenced, 10, 0),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "list claim under a fenced user key",
+			key:        store.ListClaimKey(fenced, 1),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream meta under a fenced user key",
+			key:        store.StreamMetaKey(fenced),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream entry under a fenced user key",
+			key:        store.StreamEntryKey(fenced, 123, 4),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream entry above the fenced floor is admitted",
+			key:        store.StreamEntryKey(fenced, 123, 5),
+			commitTS:   101,
+			wantReject: false,
+		},
+		{
+			name:       "auxiliary row under an unfenced user key is admitted",
+			key:        store.ListMetaDeltaKey(unfenced, 10, 0),
+			commitTS:   100,
+			wantReject: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := st.PutAt(ctx, tt.key, []byte("v"), tt.commitTS, 0)
+			if tt.wantReject {
+				require.ErrorIs(t, err, store.ErrWriteConflict)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// The coordinator's admission check must reject the same rows, so a fenced user
+// key's auxiliary writes never reach Raft in the first place.
+func TestShardedCoordinatorRejectsRedisAuxiliaryWriteUnderLogicalFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	c := &ShardedCoordinator{engine: engine}
+
+	fenced := store.StreamEntryKey([]byte("zulu"), 123, 4)
+	require.ErrorIs(t,
+		c.ensureMutationsWriteAllowed([]*pb.Mutation{{Op: pb.Op_PUT, Key: fenced, Value: []byte("v")}}, 100),
+		store.ErrWriteConflict)
+	require.NoError(t,
+		c.ensureMutationsWriteAllowed([]*pb.Mutation{{Op: pb.Op_PUT, Key: fenced, Value: []byte("v")}}, 101))
+}

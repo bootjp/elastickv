@@ -2298,6 +2298,12 @@ func (c *ShardedCoordinator) ensurePointMutationWriteAllowed(key []byte, commitT
 	if c.engine == nil {
 		return nil
 	}
+	// Applied before the raw-route lookup below so a fenced user key rejects
+	// its list-delta/claim and stream rows even when the raw key's own route
+	// has no floor.
+	if err := ensureLogicalRouteWriteAllowed(c.engine, key, commitTS); err != nil {
+		return err
+	}
 	route, ok := c.engine.GetRoute(routeKey(key))
 	if !ok {
 		return nil

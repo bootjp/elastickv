@@ -3161,11 +3161,50 @@ func (s *ShardStore) writeGroupForKey(key []byte, commitTS uint64) (*ShardGroup,
 	if err := ensureRouteWriteAllowed(route, key, commitTS); err != nil {
 		return nil, err
 	}
+	if err := ensureLogicalRouteWriteAllowed(s.engine, key, commitTS); err != nil {
+		return nil, err
+	}
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g.Store == nil {
 		return nil, store.ErrNotSupported
 	}
 	return g, nil
+}
+
+// logicalRouteFloorKey returns the logical Redis user key whose route floor
+// also governs this raw key, or nil when the raw key already routes as itself.
+func logicalRouteFloorKey(key []byte) []byte {
+	logical := routeFilterKey(key)
+	if logical == nil || bytes.Equal(logical, routeKey(key)) {
+		return nil
+	}
+	return logical
+}
+
+// ensureLogicalRouteWriteAllowed applies the logical user key's write floor to
+// a Redis auxiliary row. List-delta/claim and stream rows are placed by their
+// raw key, but every other part of the system treats the user key as their
+// owner: route-bound scans classify them with routeFilterKey, and prefix-write
+// floors go through routesForRedisListPrefixWrite. Checking only the raw-key
+// route therefore let a fenced user key keep accepting its auxiliary writes,
+// which is the MinWriteTSExclusive bypass this closes.
+//
+// This deliberately does not change placement. Making routeKey apply the same
+// decoders would relocate existing rows to the user key's group, which is a
+// data-migration decision that needs its own design proposal.
+func ensureLogicalRouteWriteAllowed(engine *distribution.Engine, key []byte, commitTS uint64) error {
+	if engine == nil {
+		return nil
+	}
+	logical := logicalRouteFloorKey(key)
+	if logical == nil {
+		return nil
+	}
+	route, ok := engine.GetRoute(logical)
+	if !ok {
+		return nil
+	}
+	return ensureRouteWriteAllowed(route, key, commitTS)
 }
 
 func ensureRouteWriteAllowed(route distribution.Route, key []byte, commitTS uint64) error {
