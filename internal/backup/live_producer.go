@@ -24,8 +24,11 @@ const (
 	liveBackupRenewalDivisor      = 3
 	liveBackupPercentDivisor      = 100
 	integerSqrtRadix              = 2
-	allBackupAdapterCount         = 4
 )
+
+// allBackupAdapterCount must track AllAdapters(); beginBackupRequestIsScoped
+// compares against it to tell "every adapter" from a narrowed selection.
+var allBackupAdapterCount = len(liveBackupAdapterNames(AllAdapters()))
 
 // backupProtocolVersionScopedBaseline is the first admin backup protocol
 // version that honors BeginBackupRequest.adapters / .scopes.

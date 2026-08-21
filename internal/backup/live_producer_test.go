@@ -849,3 +849,18 @@ func TestRunLiveBackupRejectsScopedDumpOnLegacyServer(t *testing.T) {
 		})
 	}
 }
+
+// allBackupAdapterCount is derived rather than hardcoded so adding a fifth
+// logical-backup adapter cannot silently make every dump look "narrowed".
+func TestAllBackupAdapterCountTracksAllAdapters(t *testing.T) {
+	t.Parallel()
+
+	if allBackupAdapterCount != len(liveBackupAdapterNames(AllAdapters())) {
+		t.Fatalf("allBackupAdapterCount=%d, want %d",
+			allBackupAdapterCount, len(liveBackupAdapterNames(AllAdapters())))
+	}
+	req := &pb.BeginBackupRequest{Adapters: liveBackupAdapterNames(AllAdapters())}
+	if beginBackupRequestIsScoped(req) {
+		t.Fatal("a request naming every adapter must not count as scoped")
+	}
+}
