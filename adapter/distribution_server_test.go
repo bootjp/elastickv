@@ -1121,6 +1121,9 @@ type distributionCoordinatorStub struct {
 	asyncApplyDelay       time.Duration
 	dispatchCalls         int
 	vouchCalls            int
+	// dispatchErr, when set, fails every Dispatch so callers' retry and
+	// error-propagation paths can be exercised.
+	dispatchErr error
 }
 
 func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator {
@@ -1143,6 +1146,10 @@ func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributi
 func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if err := s.validateDispatch(reqs); err != nil {
 		return nil, err
+	}
+	if s.dispatchErr != nil {
+		s.dispatchCalls++
+		return nil, s.dispatchErr
 	}
 	s.dispatchCalls++
 	s.lastRequestedCommitTS = reqs.CommitTS

@@ -207,8 +207,7 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
 			return nil
-		}
-		if !isRetryableTransactWriteError(err) {
+		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {

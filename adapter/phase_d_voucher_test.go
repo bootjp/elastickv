@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -78,3 +79,53 @@ func TestDynamoDBCreateTablePhaseDBindsReadVoucher(t *testing.T) {
 }
 
 var _ kv.Coordinator = (*distributionCoordinatorStub)(nil)
+
+// createTableWithRetry must propagate a dispatch failure. The dispatch error
+// used to be scoped to its own if-statement, so the retry predicate below read
+// the outer (nil) err and CreateTable reported success for a table that was
+// never created.
+func TestDynamoDBCreateTablePropagatesNonRetryableDispatchError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newPhaseDVoucherCoordinator(st)
+	coord.dispatchErr = errors.New("permanent dispatch failure")
+	server := NewDynamoDBServer(nil, st, coord)
+
+	err := server.createTableWithRetry(ctx, "dispatch-failure", &dynamoTableSchema{
+		TableName:            "dispatch-failure",
+		AttributeDefinitions: map[string]string{"pk": "S"},
+		PrimaryKey:           dynamoKeySchema{HashKey: "pk"},
+		KeyEncodingVersion:   dynamoOrderedKeyEncodingV2,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "permanent dispatch failure")
+	// Non-retryable: exactly one attempt, no backoff burn.
+	require.Equal(t, 1, coord.dispatchCalls)
+
+	_, exists, loadErr := server.loadTableSchemaAt(ctx, "dispatch-failure", ^uint64(0))
+	require.NoError(t, loadErr)
+	require.False(t, exists)
+}
+
+// A retryable dispatch failure must still consume the retry budget and then
+// surface an error rather than reporting success.
+func TestDynamoDBCreateTableRetriesRetryableDispatchError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newPhaseDVoucherCoordinator(st)
+	coord.dispatchErr = store.ErrWriteConflict
+	server := NewDynamoDBServer(nil, st, coord)
+
+	err := server.createTableWithRetry(ctx, "retryable-failure", &dynamoTableSchema{
+		TableName:            "retryable-failure",
+		AttributeDefinitions: map[string]string{"pk": "S"},
+		PrimaryKey:           dynamoKeySchema{HashKey: "pk"},
+		KeyEncodingVersion:   dynamoOrderedKeyEncodingV2,
+	})
+	require.Error(t, err)
+	require.Greater(t, coord.dispatchCalls, 1)
+}
