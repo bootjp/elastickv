@@ -26,7 +26,7 @@ require (
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tidwall/redcon v1.6.2
+	github.com/tidwall/redcon v1.6.4
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/yuin/gopher-lua v1.1.2
 	go.etcd.io/etcd/client/pkg/v3 v3.7.0
