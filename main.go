@@ -2763,10 +2763,16 @@ func startRaftServers(
 }
 
 func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
+	var opts []adapter.InternalOption
 	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
-		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
+		opts = append(opts, adapter.WithInternalTimestampAllocator(alloc))
 	}
-	return nil
+	// Sharded deployments own a route table with migration write floors; the
+	// single-group coordinator has none and correctly leaves the gate unset.
+	if gate, ok := coordinate.(kv.MutationWriteGate); ok {
+		opts = append(opts, adapter.WithInternalWriteGate(gate))
+	}
+	return opts
 }
 
 func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {

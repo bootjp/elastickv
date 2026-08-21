@@ -2245,6 +2245,24 @@ func (c *ShardedCoordinator) ensureGroupedMutationsWriteAllowed(grouped map[uint
 	return nil
 }
 
+// MutationWriteGate rejects raw mutations whose commit timestamp lands at or
+// below the owning route's migration write floor. Follower-forwarded writes are
+// stamped on the leader, outside the coordinator that owns the route table, so
+// the leader-side RPC handler needs this to re-apply the same check.
+type MutationWriteGate interface {
+	EnsureMutationsWriteAllowed([]*pb.Mutation, uint64) error
+}
+
+var _ MutationWriteGate = (*ShardedCoordinator)(nil)
+
+// EnsureMutationsWriteAllowed exposes the route-floor check to the leader-side
+// Internal.Forward handler. It is the same predicate the local stamping path
+// applies, so a forwarded write cannot reach Raft under a floor that a
+// locally-stamped write would have been rejected by.
+func (c *ShardedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	return c.ensureMutationsWriteAllowed(muts, commitTS)
+}
+
 func (c *ShardedCoordinator) ensureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
 	if commitTS == 0 {
 		return nil
