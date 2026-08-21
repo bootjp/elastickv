@@ -25,7 +25,13 @@ import (
 )
 
 const (
-	backupProtocolVersionV1        uint32 = 1
+	backupProtocolVersionV1 uint32 = 1
+	// backupProtocolVersionV2 marks a node that honors the adapters/scopes
+	// filter on BeginBackup. It is advertised, never required of peers: the
+	// filter is computed entirely on the node that serves BeginBackup, so a
+	// mixed-version cluster stays usable. Producers gate on the version echoed
+	// in BeginBackupResponse instead.
+	backupProtocolVersionV2        uint32 = 2
 	backupTokenVersion             byte   = 2
 	backupTokenHeaderLen                  = 1 + 16 + 8 + 8 + 4
 	backupTokenMACLen                     = sha256.Size
@@ -71,6 +77,13 @@ type filteredBackupScanStore interface {
 		keyFilter kv.BackupKeyFilter,
 	) kv.BackupScanner
 }
+
+const (
+	backupAdapterDynamoDB = "dynamodb"
+	backupAdapterS3       = "s3"
+	backupAdapterRedis    = "redis"
+	backupAdapterSQS      = "sqs"
+)
 
 type backupBaselineSelection struct {
 	adapters logicalbackup.AdapterSet
@@ -136,7 +149,7 @@ func WithAdminBackupControl(
 		s.backupPeerProbe = peerProbe
 		s.backupLimiter = limiter
 		s.backupTokenKey = sha256.Sum256(tokenKey)
-		s.backupProtocolVersion = backupProtocolVersionV1
+		s.backupProtocolVersion = backupProtocolVersionV2
 	}
 }
 
@@ -200,9 +213,10 @@ type backupToken struct {
 }
 
 type backupSession struct {
-	routes   kv.BackupRouteSnapshot
-	readTS   uint64
-	deadline time.Time
+	routes    kv.BackupRouteSnapshot
+	readTS    uint64
+	deadline  time.Time
+	selection backupBaselineSelection
 }
 
 type preparedBackup struct {
@@ -258,15 +272,16 @@ func (s *AdminServer) BeginBackup(ctx context.Context, req *pb.BeginBackupReques
 		s.compensateBackupRelease(prepared.controlGroup, prepared.groups, prepared.pinID)
 		return nil, status.Errorf(codes.Internal, "encode backup token: %v", err)
 	}
-	s.rememberBackupSession(tok, prepared.routes)
+	s.rememberBackupSession(tok, prepared.routes, selection)
 
 	return &pb.BeginBackupResponse{
-		ReadTs:              prepared.readTS,
-		PinToken:            encodedToken,
-		TtlMsEffective:      uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
-		Shards:              backupShardResponses(prepared.groups, prepared.commits),
-		ExpectedKeys:        backupExpectedResponses(counts, appliedAtCount),
-		MaxActiveBackupPins: uint32(s.backupConfig.maxActivePins), //nolint:gosec // startup validation requires a positive int.
+		ReadTs:                prepared.readTS,
+		PinToken:              encodedToken,
+		TtlMsEffective:        uint64(prepared.ttl / time.Millisecond), //nolint:gosec // validated positive.
+		Shards:                backupShardResponses(prepared.groups, prepared.commits),
+		ExpectedKeys:          backupExpectedResponses(counts, appliedAtCount),
+		MaxActiveBackupPins:   uint32(s.backupConfig.maxActivePins), //nolint:gosec // startup validation requires a positive int.
+		BackupProtocolVersion: s.backupProtocolVersion,
 	}, nil
 }
 
@@ -532,9 +547,12 @@ func (s *AdminServer) ListAdaptersAndScopes(
 	if err != nil {
 		return nil, err
 	}
+	selection, err := s.backupSelectionForToken(tok)
+	if err != nil {
+		return nil, err
+	}
 	counts, _, err := s.scanBackupScopeCounts(
-		ctx, routes, tok.readTS, groups,
-		backupBaselineSelection{adapters: logicalbackup.AllAdapters()},
+		ctx, routes, tok.readTS, groups, selection,
 		func() error {
 			return s.requireLiveBackupSession(tok)
 		},
@@ -685,9 +703,7 @@ func selectedBackupScopes(scopes []*pb.BackupScope) (map[logicalbackup.Scope]boo
 		if scope == nil || scope.GetAdapter() == "" || scope.GetScope() == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "%s", "backup scope requires adapter and scope")
 		}
-		switch scope.GetAdapter() {
-		case "dynamodb", "s3", "redis", "sqs":
-		default:
+		if !isKnownBackupAdapter(scope.GetAdapter()) {
 			return nil, status.Errorf(codes.InvalidArgument, "unknown backup adapter %q", scope.GetAdapter())
 		}
 		selected[logicalbackup.Scope{Adapter: scope.GetAdapter(), Name: scope.GetScope()}] = true
@@ -709,7 +725,43 @@ func backupBaselineSelectionFromBeginRequest(req *pb.BeginBackupRequest) (backup
 			return backupBaselineSelection{}, status.Errorf(codes.InvalidArgument, "%s is excluded by adapters", scope.Adapter)
 		}
 	}
-	return backupBaselineSelection{adapters: adapters, scopes: scopes}, nil
+	return backupBaselineSelection{adapters: narrowBackupAdaptersToScopes(adapters, scopes), scopes: scopes}, nil
+}
+
+// narrowBackupAdaptersToScopes drops adapters that no requested scope names.
+// The CLI sends every adapter when --adapter is absent, so a scope-only dump
+// would otherwise keep classifying keys from adapters it will never stream --
+// and one malformed or future-format key in such an adapter aborts BeginBackup.
+func narrowBackupAdaptersToScopes(
+	adapters logicalbackup.AdapterSet,
+	scopes map[logicalbackup.Scope]bool,
+) logicalbackup.AdapterSet {
+	if len(scopes) == 0 {
+		return adapters
+	}
+	var scoped logicalbackup.AdapterSet
+	for scope := range scopes {
+		enableBackupAdapter(&scoped, scope.Adapter)
+	}
+	return logicalbackup.AdapterSet{
+		DynamoDB: adapters.DynamoDB && scoped.DynamoDB,
+		S3:       adapters.S3 && scoped.S3,
+		Redis:    adapters.Redis && scoped.Redis,
+		SQS:      adapters.SQS && scoped.SQS,
+	}
+}
+
+func enableBackupAdapter(set *logicalbackup.AdapterSet, name string) {
+	switch name {
+	case backupAdapterDynamoDB:
+		set.DynamoDB = true
+	case backupAdapterS3:
+		set.S3 = true
+	case backupAdapterRedis:
+		set.Redis = true
+	case backupAdapterSQS:
+		set.SQS = true
+	}
 }
 
 func backupAdaptersFromNames(names []string) (logicalbackup.AdapterSet, error) {
@@ -718,18 +770,10 @@ func backupAdaptersFromNames(names []string) (logicalbackup.AdapterSet, error) {
 	}
 	var out logicalbackup.AdapterSet
 	for _, name := range names {
-		switch name {
-		case "dynamodb":
-			out.DynamoDB = true
-		case "s3":
-			out.S3 = true
-		case "redis":
-			out.Redis = true
-		case "sqs":
-			out.SQS = true
-		default:
+		if !isKnownBackupAdapter(name) {
 			return logicalbackup.AdapterSet{}, status.Errorf(codes.InvalidArgument, "unknown backup adapter %q", name)
 		}
+		enableBackupAdapter(&out, name)
 	}
 	if out == (logicalbackup.AdapterSet{}) {
 		return logicalbackup.AdapterSet{}, status.Errorf(codes.InvalidArgument, "%s", "backup requires at least one adapter")
@@ -1230,6 +1274,36 @@ func (s *AdminServer) scanBackupScopeMetadata(
 	defer func() {
 		retErr = finishBackupScan(ctx, scanner, retErr)
 	}()
+	// Tracked separately from metadataKeys because the filtered scanner's
+	// predicate reads that map while the scan is running.
+	pending := make(map[string]struct{}, len(metadataKeys))
+	for key := range metadataKeys {
+		pending[key] = struct{}{}
+	}
+	if err := consumeBackupScopeMetadata(ctx, scanner, metadataKeys, pending, counter, requireLive); err != nil {
+		return err
+	}
+	// A key recorded by the key-only pass but absent from the value pass means
+	// the snapshot moved under us (lost pin, compaction race). Finalizing here
+	// would silently publish a baseline that omits a table/bucket/queue
+	// metadata record instead of reporting the shortfall.
+	if len(pending) > 0 {
+		return errors.Errorf(
+			"backup baseline metadata key disappeared between scan passes: %d missing (first %q)",
+			len(pending), sortedFirstKey(pending),
+		)
+	}
+	return requireBackupScopeScanLive(requireLive)
+}
+
+func consumeBackupScopeMetadata(
+	ctx context.Context,
+	scanner kv.BackupScanner,
+	metadataKeys map[string]struct{},
+	pending map[string]struct{},
+	counter *logicalbackup.LiveScopeCounter,
+	requireLive func() error,
+) error {
 	for {
 		if err := requireBackupScopeScanLive(requireLive); err != nil {
 			return err
@@ -1239,7 +1313,7 @@ func (s *AdminServer) scanBackupScopeMetadata(
 			return errors.Wrap(err, "scan backup baseline metadata")
 		}
 		if !ok {
-			break
+			return nil
 		}
 		if pair == nil {
 			return errors.New("backup metadata scanner returned a nil record")
@@ -1247,11 +1321,30 @@ func (s *AdminServer) scanBackupScopeMetadata(
 		if _, ok := metadataKeys[string(pair.Key)]; !ok {
 			continue
 		}
+		delete(pending, string(pair.Key))
 		if err := counter.AddValue(pair.Key, pair.Value); err != nil {
 			return errors.Wrap(err, "count retained backup baseline metadata")
 		}
 	}
-	return requireBackupScopeScanLive(requireLive)
+}
+
+func isKnownBackupAdapter(name string) bool {
+	switch name {
+	case backupAdapterDynamoDB, backupAdapterS3, backupAdapterRedis, backupAdapterSQS:
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedFirstKey(keys map[string]struct{}) string {
+	first := ""
+	for key := range keys {
+		if first == "" || key < first {
+			first = key
+		}
+	}
+	return first
 }
 
 func requireBackupScopeScanLive(requireLive func() error) error {
@@ -1275,7 +1368,11 @@ func (s *AdminServer) newBackupBaselineMetadataScanner(
 	return s.backupStore.NewBackupScannerAtSnapshot(routes, readTS, s.backupConfig.scanPageSize)
 }
 
-func (s *AdminServer) rememberBackupSession(tok backupToken, routes kv.BackupRouteSnapshot) {
+func (s *AdminServer) rememberBackupSession(
+	tok backupToken,
+	routes kv.BackupRouteSnapshot,
+	selection backupBaselineSelection,
+) {
 	now := s.nowSnapshot()
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
@@ -1283,7 +1380,28 @@ func (s *AdminServer) rememberBackupSession(tok backupToken, routes kv.BackupRou
 	if s.backupSessions == nil {
 		s.backupSessions = make(map[kv.BackupPinID]backupSession)
 	}
-	s.backupSessions[tok.pinID] = backupSession{routes: routes, readTS: tok.readTS, deadline: tok.deadline}
+	s.backupSessions[tok.pinID] = backupSession{
+		routes:    routes,
+		readTS:    tok.readTS,
+		deadline:  tok.deadline,
+		selection: selection,
+	}
+}
+
+// backupSelectionForToken returns the adapter/scope filter recorded by
+// BeginBackup. ListAdaptersAndScopes must reuse it instead of scanning every
+// adapter: an adapter the caller excluded is never streamed, so letting its
+// keys fail classification here would abort an otherwise valid filtered dump.
+func (s *AdminServer) backupSelectionForToken(tok backupToken) (backupBaselineSelection, error) {
+	now := s.nowSnapshot()
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	s.reapBackupSessionsLocked(now)
+	session, ok := s.backupSessions[tok.pinID]
+	if !ok || session.readTS != tok.readTS {
+		return backupBaselineSelection{}, status.Errorf(codes.FailedPrecondition, "%s", "backup scope selection is unavailable on this endpoint")
+	}
+	return session.selection, nil
 }
 
 func (s *AdminServer) backupRouteSnapshotForToken(tok backupToken) (kv.BackupRouteSnapshot, error) {

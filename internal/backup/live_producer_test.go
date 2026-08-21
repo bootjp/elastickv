@@ -104,8 +104,9 @@ func successfulLiveBackupRPC() *fakeLiveBackupRPC {
 	return &fakeLiveBackupRPC{
 		begin: &pb.BeginBackupResponse{
 			ReadTs: 42, PinToken: []byte("pin-token"), TtlMsEffective: 60_000, MaxActiveBackupPins: 4,
-			Shards:       []*pb.BackupShardApplied{{RaftGroupId: 1, AppliedIndex: 99}},
-			ExpectedKeys: []*pb.BackupExpectedKeys{{Adapter: "redis", Scope: "db_0", KeyCount: 1}},
+			BackupProtocolVersion: backupProtocolVersionScopedBaseline,
+			Shards:                []*pb.BackupShardApplied{{RaftGroupId: 1, AppliedIndex: 99}},
+			ExpectedKeys:          []*pb.BackupExpectedKeys{{Adapter: "redis", Scope: "db_0", KeyCount: 1}},
 		},
 		listed:  []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
 		records: []*pb.BackupKV{{Key: []byte(RedisStringPrefix + "hello"), Value: []byte("world")}},
@@ -783,5 +784,68 @@ func TestMinimumAcceptedLiveCount(t *testing.T) {
 	}
 	if got := integerSqrt(^uint64(0)); got != uint64(^uint32(0)) {
 		t.Fatalf("sqrt(max uint64)=%d, want %d", got, uint64(^uint32(0)))
+	}
+}
+
+func TestRunLiveBackupRejectsScopedDumpOnLegacyServer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		protocolVersion uint32
+		opts            LiveBackupOptions
+		wantErr         bool
+	}{
+		{
+			name:            "legacy server rejects an adapter-narrowed dump",
+			protocolVersion: 1,
+			opts:            LiveBackupOptions{Adapters: AdapterSet{Redis: true}},
+			wantErr:         true,
+		},
+		{
+			name:            "legacy server rejects a scope-narrowed dump",
+			protocolVersion: 1,
+			opts: LiveBackupOptions{
+				Adapters: AllAdapters(),
+				Scopes:   []Scope{{Adapter: adapterRedis, Name: "db_0"}},
+			},
+			wantErr: true,
+		},
+		{
+			name:            "legacy server still serves an unfiltered dump",
+			protocolVersion: 1,
+			opts:            LiveBackupOptions{Adapters: AllAdapters()},
+			wantErr:         false,
+		},
+		{
+			name:            "v2 server serves a narrowed dump",
+			protocolVersion: backupProtocolVersionScopedBaseline,
+			opts:            LiveBackupOptions{Adapters: AdapterSet{Redis: true}},
+			wantErr:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rpc := successfulLiveBackupRPC()
+			rpc.begin.BackupProtocolVersion = tt.protocolVersion
+			opts := tt.opts
+			opts.OutputRoot = filepath.Join(t.TempDir(), "dump")
+			opts.TTL = time.Minute
+
+			_, err := RunLiveBackup(context.Background(), rpc, opts)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("RunLiveBackup: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrLiveBackupScope) {
+				t.Fatalf("err=%v, want ErrLiveBackupScope", err)
+			}
+			assertLiveBackupEnded(t, rpc, "pin-token")
+			assertLiveBackupHasNoManifest(t, opts.OutputRoot)
+		})
 	}
 }

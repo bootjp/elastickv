@@ -24,7 +24,12 @@ const (
 	liveBackupRenewalDivisor      = 3
 	liveBackupPercentDivisor      = 100
 	integerSqrtRadix              = 2
+	allBackupAdapterCount         = 4
 )
+
+// backupProtocolVersionScopedBaseline is the first admin backup protocol
+// version that honors BeginBackupRequest.adapters / .scopes.
+const backupProtocolVersionScopedBaseline uint32 = 2
 
 var (
 	ErrCompactionDuringDump         = errors.New("backup: key shortfall while live pin was active")
@@ -160,11 +165,12 @@ func publishCompletedLiveBackup(
 func beginLiveBackup(ctx context.Context, rpc LiveBackupRPC, opts LiveBackupOptions) (*pb.BeginBackupResponse, error) {
 	timeout := effectiveTimeout(opts.BeginTimeout, defaultLiveBackupBeginTimeout)
 	beginCtx, cancel := context.WithTimeout(ctx, timeout)
-	begin, err := rpc.BeginBackup(beginCtx, &pb.BeginBackupRequest{
+	req := &pb.BeginBackupRequest{
 		TtlMs:    durationMillis(opts.TTL),
 		Adapters: liveBackupAdapterNames(opts.Adapters),
 		Scopes:   protoScopes(scopeSet(opts.Scopes)),
-	})
+	}
+	begin, err := rpc.BeginBackup(beginCtx, req)
 	cancel()
 	if err != nil {
 		return nil, errors.Wrap(err, "begin live backup")
@@ -172,7 +178,37 @@ func beginLiveBackup(ctx context.Context, rpc LiveBackupRPC, opts LiveBackupOpti
 	if err := validateBeginBackupResponse(begin); err != nil {
 		return nil, cleanupInvalidBeginResponse(rpc, begin, err)
 	}
+	if err := requireScopedBaselineSupport(req, begin); err != nil {
+		return nil, cleanupInvalidBeginResponse(rpc, begin, err)
+	}
 	return begin, nil
+}
+
+// requireScopedBaselineSupport fails closed when a narrowed dump reaches a
+// server that predates the adapters/scopes filter. Protobuf drops the unknown
+// request fields silently, so such a server answers with a full-cluster
+// baseline; accepting it would let the producer select extra baseline scopes
+// and publish a broader dump than the operator asked for.
+func requireScopedBaselineSupport(req *pb.BeginBackupRequest, resp *pb.BeginBackupResponse) error {
+	if !beginBackupRequestIsScoped(req) {
+		return nil
+	}
+	if resp.GetBackupProtocolVersion() >= backupProtocolVersionScopedBaseline {
+		return nil
+	}
+	return errors.Wrapf(ErrLiveBackupScope,
+		"server advertises backup protocol %d; scoped dumps need %d",
+		resp.GetBackupProtocolVersion(), backupProtocolVersionScopedBaseline)
+}
+
+// beginBackupRequestIsScoped reports whether the request narrows the baseline.
+// Sending every adapter and no scope is the CLI default and asks for nothing a
+// v1 server would not already produce.
+func beginBackupRequestIsScoped(req *pb.BeginBackupRequest) bool {
+	if len(req.GetScopes()) > 0 {
+		return true
+	}
+	return len(req.GetAdapters()) > 0 && len(req.GetAdapters()) < allBackupAdapterCount
 }
 
 func cleanupInvalidBeginResponse(rpc LiveBackupRPC, begin *pb.BeginBackupResponse, beginErr error) error {

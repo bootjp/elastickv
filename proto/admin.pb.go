@@ -1318,8 +1318,13 @@ type BeginBackupResponse struct {
 	Shards              []*BackupShardApplied  `protobuf:"bytes,4,rep,name=shards,proto3" json:"shards,omitempty"`
 	ExpectedKeys        []*BackupExpectedKeys  `protobuf:"bytes,5,rep,name=expected_keys,json=expectedKeys,proto3" json:"expected_keys,omitempty"`
 	MaxActiveBackupPins uint32                 `protobuf:"varint,6,opt,name=max_active_backup_pins,json=maxActiveBackupPins,proto3" json:"max_active_backup_pins,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// backup_protocol_version echoes the serving node's capability level so a
+	// producer can tell whether its adapters/scopes filter was honored. A v1
+	// server leaves this unset, which is how the client detects that its scoped
+	// request was silently ignored instead of accepting a broader baseline.
+	BackupProtocolVersion uint32 `protobuf:"varint,7,opt,name=backup_protocol_version,json=backupProtocolVersion,proto3" json:"backup_protocol_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *BeginBackupResponse) Reset() {
@@ -1390,6 +1395,13 @@ func (x *BeginBackupResponse) GetExpectedKeys() []*BackupExpectedKeys {
 func (x *BeginBackupResponse) GetMaxActiveBackupPins() uint32 {
 	if x != nil {
 		return x.MaxActiveBackupPins
+	}
+	return 0
+}
+
+func (x *BeginBackupResponse) GetBackupProtocolVersion() uint32 {
+	if x != nil {
+		return x.BackupProtocolVersion
 	}
 	return 0
 }
@@ -2261,14 +2273,15 @@ const file_admin_proto_rawDesc = "" +
 	"\x12BeginBackupRequest\x12\x15\n" +
 	"\x06ttl_ms\x18\x01 \x01(\x04R\x05ttlMs\x12\x1a\n" +
 	"\badapters\x18\x02 \x03(\tR\badapters\x12$\n" +
-	"\x06scopes\x18\x03 \x03(\v2\f.BackupScopeR\x06scopes\"\x91\x02\n" +
+	"\x06scopes\x18\x03 \x03(\v2\f.BackupScopeR\x06scopes\"\xc9\x02\n" +
 	"\x13BeginBackupResponse\x12\x17\n" +
 	"\aread_ts\x18\x01 \x01(\x04R\x06readTs\x12\x1b\n" +
 	"\tpin_token\x18\x02 \x01(\fR\bpinToken\x12(\n" +
 	"\x10ttl_ms_effective\x18\x03 \x01(\x04R\x0ettlMsEffective\x12+\n" +
 	"\x06shards\x18\x04 \x03(\v2\x13.BackupShardAppliedR\x06shards\x128\n" +
 	"\rexpected_keys\x18\x05 \x03(\v2\x13.BackupExpectedKeysR\fexpectedKeys\x123\n" +
-	"\x16max_active_backup_pins\x18\x06 \x01(\rR\x13maxActiveBackupPins\"H\n" +
+	"\x16max_active_backup_pins\x18\x06 \x01(\rR\x13maxActiveBackupPins\x126\n" +
+	"\x17backup_protocol_version\x18\a \x01(\rR\x15backupProtocolVersion\"H\n" +
 	"\x12RenewBackupRequest\x12\x1b\n" +
 	"\tpin_token\x18\x01 \x01(\fR\bpinToken\x12\x15\n" +
 	"\x06ttl_ms\x18\x02 \x01(\x04R\x05ttlMs\"\\\n" +

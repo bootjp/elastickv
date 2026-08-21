@@ -127,6 +127,9 @@ type backupTestStore struct {
 	validateErr  error
 	valueKeys    [][]byte
 	values       map[string][]byte
+	// dropValueKeys hides keys from the value pass only, simulating a key that
+	// vanished between the key-only baseline scan and the metadata scan.
+	dropValueKeys map[string]bool
 }
 
 func (s *backupTestStore) ValidateBackupSnapshotAt(context.Context, kv.BackupRouteSnapshot, uint64, int) error {
@@ -187,6 +190,9 @@ func (s *backupTestStore) newBackupScannerAtSnapshot(ts uint64, keyFilter kv.Bac
 			if !selected {
 				continue
 			}
+		}
+		if s.dropValueKeys[string(key)] {
+			continue
 		}
 		s.valueKeys = append(s.valueKeys, append([]byte(nil), key...))
 		value := s.values[string(key)]
@@ -1144,4 +1150,129 @@ func TestBeginBackupMapsForwardedCapacityReservationStatusToResourceExhausted(t 
 
 	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
+func TestBackupBaselineSelectionNarrowsAdaptersToScopes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		adapters []string
+		scopes   []*pb.BackupScope
+		want     logicalbackup.AdapterSet
+	}{
+		{
+			name: "no filter keeps every adapter",
+			want: logicalbackup.AllAdapters(),
+		},
+		{
+			name:   "scopes alone narrow the default all-adapter set",
+			scopes: []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+			want:   logicalbackup.AdapterSet{Redis: true},
+		},
+		{
+			name:     "explicit adapters intersect with scopes",
+			adapters: []string{"redis", "s3"},
+			scopes:   []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+			want:     logicalbackup.AdapterSet{Redis: true},
+		},
+		{
+			name:     "adapters without scopes are untouched",
+			adapters: []string{"redis", "s3"},
+			want:     logicalbackup.AdapterSet{Redis: true, S3: true},
+		},
+		{
+			name: "scopes across adapters keep both",
+			scopes: []*pb.BackupScope{
+				{Adapter: "redis", Scope: "db_0"},
+				{Adapter: "sqs", Scope: "jobs"},
+			},
+			want: logicalbackup.AdapterSet{Redis: true, SQS: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := backupBaselineSelectionFromBeginRequest(&pb.BeginBackupRequest{
+				Adapters: tt.adapters,
+				Scopes:   tt.scopes,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got.adapters)
+		})
+	}
+}
+
+func TestBeginBackupScopedDumpIgnoresUnrequestedAdapterKeys(t *testing.T) {
+	t.Parallel()
+
+	// A DynamoDB key the classifier cannot parse. A redis-scoped dump must
+	// never look at it, so BeginBackup has to succeed.
+	brokenKey := append(append([]byte(nil), logicalbackup.DDBTableMetaPrefix...), 0xff)
+	store := &backupTestStore{keys: [][]byte{brokenKey}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{
+		Scopes: []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, begin.GetExpectedKeys())
+}
+
+func TestBeginBackupAdvertisesScopedBaselineProtocol(t *testing.T) {
+	t.Parallel()
+
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, &backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	require.Equal(t, backupProtocolVersionV2, begin.GetBackupProtocolVersion())
+}
+
+func TestListAdaptersAndScopesReusesBeginSelection(t *testing.T) {
+	t.Parallel()
+
+	// Same broken DynamoDB key: the listing pass must honor the redis-only
+	// selection recorded by BeginBackup instead of rescanning all adapters.
+	brokenKey := append(append([]byte(nil), logicalbackup.DDBTableMetaPrefix...), 0xff)
+	store := &backupTestStore{keys: [][]byte{brokenKey}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+
+	listed, err := srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{
+		PinToken: begin.GetPinToken(),
+	})
+	require.NoError(t, err)
+	require.Empty(t, listed.GetScopes())
+}
+
+func TestBeginBackupFailsWhenBaselineMetadataKeyDisappears(t *testing.T) {
+	t.Parallel()
+
+	schemaKey := logicalbackup.EncodeDDBTableMetaKey("orders")
+	store := &backupTestStore{
+		keys:          [][]byte{schemaKey},
+		dropValueKeys: map[string]bool{string(schemaKey): true},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "disappeared between scan passes")
 }

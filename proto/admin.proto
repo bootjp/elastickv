@@ -194,6 +194,11 @@ message BeginBackupResponse {
   repeated BackupShardApplied shards = 4;
   repeated BackupExpectedKeys expected_keys = 5;
   uint32 max_active_backup_pins = 6;
+  // backup_protocol_version echoes the serving node's capability level so a
+  // producer can tell whether its adapters/scopes filter was honored. A v1
+  // server leaves this unset, which is how the client detects that its scoped
+  // request was silently ignored instead of accepting a broader baseline.
+  uint32 backup_protocol_version = 7;
 }
 
 message RenewBackupRequest {
