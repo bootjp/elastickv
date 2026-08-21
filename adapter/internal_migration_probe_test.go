@@ -152,3 +152,96 @@ func TestInternalIssueMigrationTimestampFollowsSourceLastCommit(t *testing.T) {
 	require.Equal(t, uint64(50), resp.GetLastCommitTs())
 	require.Greater(t, resp.GetTimestamp(), resp.GetLastCommitTs())
 }
+
+func TestInternalProbeSourceReadDrainIgnoresPostCutoverReads(t *testing.T) {
+	t.Parallel()
+
+	const cutoverTS = uint64(500)
+
+	tests := []struct {
+		name       string
+		pins       []uint64
+		drainMinTS uint64
+		wantReady  bool
+	}{
+		{
+			name:       "no active reads",
+			drainMinTS: cutoverTS,
+			wantReady:  true,
+		},
+		{
+			name:       "pre-cutover read still in flight",
+			pins:       []uint64{cutoverTS - 1},
+			drainMinTS: cutoverTS,
+			wantReady:  false,
+		},
+		{
+			name:       "read pinned exactly at the cutover",
+			pins:       []uint64{cutoverTS},
+			drainMinTS: cutoverTS,
+			wantReady:  false,
+		},
+		{
+			name:       "unrelated post-cutover reads do not block",
+			pins:       []uint64{cutoverTS + 1, cutoverTS + 9},
+			drainMinTS: cutoverTS,
+			wantReady:  true,
+		},
+		{
+			name:       "one pre-cutover read among newer ones still blocks",
+			pins:       []uint64{cutoverTS + 9, cutoverTS - 1},
+			drainMinTS: cutoverTS,
+			wantReady:  false,
+		},
+		{
+			name:       "missing drain floor falls back to requiring an empty tracker",
+			pins:       []uint64{cutoverTS + 1},
+			drainMinTS: 0,
+			wantReady:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			tracker := kv.NewActiveTimestampTracker()
+			internal := NewInternalWithEngine(nil, nil, nil, nil,
+				WithInternalStore(store.NewMVCCStore()),
+				WithInternalActiveTimestampTracker(tracker),
+			)
+			for _, ts := range tt.pins {
+				defer tracker.Pin(ts).Release()
+			}
+
+			got, err := internal.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{
+				JobId:                7,
+				Kind:                 pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED,
+				ReadDrainNotBeforeMs: time.Now().Add(-time.Second).UnixMilli(),
+				ReadDrainMinTs:       tt.drainMinTS,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantReady, got.GetReady())
+		})
+	}
+}
+
+func TestInternalProbeSourceReadDrainHonorsGracePeriod(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	internal := NewInternalWithEngine(nil, nil, nil, nil,
+		WithInternalStore(store.NewMVCCStore()),
+		WithInternalActiveTimestampTracker(kv.NewActiveTimestampTracker()),
+	)
+
+	got, err := internal.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{
+		JobId:                7,
+		Kind:                 pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED,
+		ReadDrainNotBeforeMs: time.Now().Add(time.Hour).UnixMilli(),
+		ReadDrainMinTs:       500,
+	})
+	require.NoError(t, err)
+	require.False(t, got.GetReady())
+}

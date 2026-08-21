@@ -182,8 +182,7 @@ func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMig
 		return i.probeMigrationRoute(req, false), nil
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED:
 		return &pb.ProbeMigrationStateResponse{
-			Ready: time.Now().UnixMilli() >= req.GetReadDrainNotBeforeMs() &&
-				(i.readTracker == nil || i.readTracker.Oldest() == 0),
+			Ready:          time.Now().UnixMilli() >= req.GetReadDrainNotBeforeMs() && i.sourceReadsDrained(req.GetReadDrainMinTs()),
 			CatalogVersion: i.migrationCatalogVersion(),
 		}, nil
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED:
@@ -193,6 +192,28 @@ func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMig
 	default:
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "unknown migration probe kind"))
 	}
+}
+
+// sourceReadsDrained reports whether every read that could still observe the
+// migrating range on this node has finished. The read tracker is process-wide,
+// so unrelated frontend reads would otherwise keep it non-empty forever on a
+// busy node. Reads issued after the source read fence armed carry a timestamp
+// above drainMinTS and are already rejected for the moving range, so only
+// older pins block the drain. A zero drainMinTS means the control plane did
+// not supply the fence point (pre-upgrade coordinator), so fall back to
+// requiring a fully empty tracker.
+func (i *Internal) sourceReadsDrained(drainMinTS uint64) bool {
+	if i.readTracker == nil {
+		return true
+	}
+	oldest := i.readTracker.Oldest()
+	if oldest == 0 {
+		return true
+	}
+	if drainMinTS == 0 {
+		return false
+	}
+	return oldest > drainMinTS
 }
 
 func (i *Internal) IssueMigrationTimestamp(ctx context.Context, _ *pb.IssueMigrationTimestampRequest) (*pb.IssueMigrationTimestampResponse, error) {

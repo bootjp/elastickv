@@ -389,6 +389,7 @@ func (s *DistributionServer) ackSplitJobSourceReadDrain(ctx context.Context, job
 		JobId:                job.JobID,
 		Kind:                 pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED,
 		ReadDrainNotBeforeMs: notBefore,
+		ReadDrainMinTs:       job.PromotionCompletedTS,
 	})
 	if err != nil {
 		return err

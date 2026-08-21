@@ -250,6 +250,10 @@ message ProbeMigrationStateRequest {
   bool track_writes = 11;
   uint64 retention_pin_ts = 12;
   int64 read_drain_not_before_ms = 13;
+  // Reads pinned at or below this HLC timestamp were admitted before the
+  // source read fence armed, so only those still block SOURCE_READ_DRAINED.
+  // Zero keeps the legacy behaviour of requiring an empty tracker.
+  uint64 read_drain_min_ts = 14;
 }
 
 message ProbeMigrationStateResponse {

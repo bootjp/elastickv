@@ -1753,8 +1753,12 @@ type ProbeMigrationStateRequest struct {
 	TrackWrites            bool                    `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
 	RetentionPinTs         uint64                  `protobuf:"varint,12,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
 	ReadDrainNotBeforeMs   int64                   `protobuf:"varint,13,opt,name=read_drain_not_before_ms,json=readDrainNotBeforeMs,proto3" json:"read_drain_not_before_ms,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Reads pinned at or below this HLC timestamp were admitted before the
+	// source read fence armed, so only those still block SOURCE_READ_DRAINED.
+	// Zero keeps the legacy behaviour of requiring an empty tracker.
+	ReadDrainMinTs uint64 `protobuf:"varint,14,opt,name=read_drain_min_ts,json=readDrainMinTs,proto3" json:"read_drain_min_ts,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateRequest) Reset() {
@@ -1874,6 +1878,13 @@ func (x *ProbeMigrationStateRequest) GetRetentionPinTs() uint64 {
 func (x *ProbeMigrationStateRequest) GetReadDrainNotBeforeMs() int64 {
 	if x != nil {
 		return x.ReadDrainNotBeforeMs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetReadDrainMinTs() uint64 {
+	if x != nil {
+		return x.ReadDrainMinTs
 	}
 	return 0
 }
@@ -2161,7 +2172,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
 	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
 	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
-	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xc3\x04\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xee\x04\n" +
 	"\x1aProbeMigrationStateRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
@@ -2177,7 +2188,8 @@ const file_internal_proto_rawDesc = "" +
 	" \x01(\bR\x0fsourceReadFence\x12!\n" +
 	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12(\n" +
 	"\x10retention_pin_ts\x18\f \x01(\x04R\x0eretentionPinTs\x126\n" +
-	"\x18read_drain_not_before_ms\x18\r \x01(\x03R\x14readDrainNotBeforeMs\"\x84\x01\n" +
+	"\x18read_drain_not_before_ms\x18\r \x01(\x03R\x14readDrainNotBeforeMs\x12)\n" +
+	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\"\x84\x01\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
