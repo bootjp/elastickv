@@ -249,7 +249,15 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix, end []byte) (int, bool) {
 	// Use a fresh readTS each iteration so we observe the committed state from
 	// the previous compaction pass and do not re-scan already-deleted delta keys.
-	readTS := snapshotTS(c.coord.Clock(), c.st)
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, c.coord, snapshotTS(c.coord.Clock(), c.st),
+		"redis delta compactor urgent: begin read timestamp")
+	if err != nil {
+		c.logger.WarnContext(ctx, "delta compactor urgent: timestamp allocation failed",
+			"type", req.typeName, "key", string(req.userKey), "error", err)
+		return 0, true
+	}
+	ctx = readTimestamp.WithDispatchVoucher(ctx)
+	readTS := readTimestamp.Timestamp()
 
 	// Scan one extra beyond MaxDeltaScanLimit to detect whether more remain.
 	kvs, err := c.st.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
@@ -305,9 +313,15 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 			"backoff_until", until)
 		return nil
 	}
-	readTS := snapshotTS(c.coord.Clock(), c.st)
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	readTimestamp, err := kv.BeginReadTimestampThrough(tickCtx, c.coord, snapshotTS(c.coord.Clock(), c.st),
+		"redis delta compactor: begin read timestamp")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	tickCtx = readTimestamp.WithDispatchVoucher(tickCtx)
+	readTS := readTimestamp.Timestamp()
 
 	combined := c.compactBackgroundHandlers(tickCtx, readTS)
 	if tickCtx.Err() == nil {
@@ -604,7 +618,7 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	_, err = c.coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	_, err = kv.DispatchWithReadTimestamp(ctx, c.coord, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,

@@ -90,6 +90,16 @@ func (c keyVizLabeledCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c keyVizLabeledCoordinator) Clock() *HLC { return c.inner.Clock() }
 
+func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
+	alloc, _ := TimestampAllocatorThrough(c.inner)
+	return alloc
+}
+
+func (c keyVizLabeledCoordinator) ConfiguredTimestampAllocator() TimestampAllocator {
+	alloc, _ := ConfiguredTimestampAllocatorThrough(c.inner)
+	return alloc
+}
+
 func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
 	ctx = contextWithKeyVizLabel(ctx, c.label)
 	if alloc, ok := c.inner.(TimestampAllocator); ok {
@@ -114,6 +124,20 @@ func (c keyVizLabeledCoordinator) RecoverHLCLease(ctx context.Context) error {
 		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
 	}
 	return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+}
+
+func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	voucher, ok := c.inner.(AppliedReadTimestampVoucher)
+	if !ok {
+		return errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
+}
+
+func (c keyVizLabeledCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if revoker, ok := c.inner.(AppliedReadTimestampVoucherRevoker); ok {
+		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+	}
 }
 
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

@@ -778,6 +778,23 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 	return errors.WithStack(err)
 }
 
+func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP]) error {
+	if len(elems) == 0 {
+		return nil
+	}
+	startTS := readTimestamp.Timestamp()
+	if startTS == ^uint64(0) {
+		startTS = 0
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems:   elems,
+	})
+	return errors.WithStack(err)
+}
+
 // readRedisStringAt reads a Redis string value, trying the prefixed key first
 // and falling back to the bare key for legacy data written before the
 // !redis|str| prefix migration. Returns the decoded user value and the
@@ -1278,14 +1295,15 @@ func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint6
 	return r.fetchListRange(ctx, key, meta, 0, meta.Len-1, readTS)
 }
 
-func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uint64, values []string) error {
+func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, values []string) error {
+	readTS := readTimestamp.Timestamp()
 	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
 
 	if len(values) == 0 {
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 
 	rawValues := make([][]byte, 0, len(values))
@@ -1302,7 +1320,8 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 		return err
 	}
 	elems = append(elems, ops...)
-	_, err = r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,

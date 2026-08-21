@@ -352,6 +352,29 @@ func TestRedisXAddDedupsLandedWireWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), meta.Length, "the generated XADD entry must not be appended twice")
 }
 
+func TestRedisXAddDedupPhaseDVouchesReuse(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newPhaseDDedupTestCoordinator(st, 1, false)
+	srv := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+	conn := &recordingConn{}
+
+	srv.xadd(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
+	}})
+
+	require.Empty(t, conn.err)
+	require.NotEmpty(t, conn.bulk)
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, uint64(2), coord.vouches.Load(), "first attempt and reused write set must each reserve a Phase-D dispatch voucher")
+}
+
 func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 	t.Parallel()
 

@@ -155,7 +155,11 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write legacy: begin read timestamp")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		plan, err := prepare(readTS)
 		if err != nil {
 			return nil, err
@@ -164,7 +168,7 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 			return plan, nil
 		}
 		plan.req.StartTS = readTS
-		if err = d.commitItemWrite(ctx, plan.req); err != nil {
+		if err = d.commitItemWrite(ctx, readTimestamp, plan.req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return nil, errors.WithStack(err)
 			}
@@ -204,6 +208,10 @@ type reusableItemWrite struct {
 	// — the write set was built once from attempt 1's read — so plan is also the
 	// correct value to return when the FSM dedup no-ops the apply (R1).
 	plan *itemWritePlan
+	// readTimestamp carries the Phase-D dispatch capability that validates the
+	// reused StartTS. Retaining only the numeric StartTS would leave retries
+	// unable to re-vouch the same applied read watermark.
+	readTimestamp kv.ReadTimestamp
 	// commitTS is the most recent dispatched commit_ts for this write set; the
 	// next retry passes it as PrevCommitTS so the FSM probes exactly the attempt
 	// that might have landed.
@@ -266,7 +274,11 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	tableName string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	readTS := d.nextTxnReadTS()
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write: begin read timestamp")
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	plan, err := prepare(readTS)
 	if err != nil {
 		return nil, nil, err
@@ -283,13 +295,14 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	}
 	plan.req.StartTS = readTS
 	plan.req.CommitTS = commitTS
-	if dispErr := d.commitItemWrite(ctx, plan.req); dispErr != nil {
+	if dispErr := d.commitItemWrite(ctx, readTimestamp, plan.req); dispErr != nil {
 		// dispErr is already wrapped by commitItemWrite; return it raw.
 		if isRetryableTransactWriteError(dispErr) {
 			return nil, &reusableItemWrite{
-				plan:     plan,
-				commitTS: commitTS,
-				probeKey: kv.PrimaryKeyForElems(plan.req.Elems),
+				plan:          plan,
+				readTimestamp: readTimestamp,
+				commitTS:      commitTS,
+				probeKey:      kv.PrimaryKeyForElems(plan.req.Elems),
 			}, dispErr
 		}
 		return nil, nil, dispErr
@@ -311,7 +324,7 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 	}
 	pending.plan.req.CommitTS = commitTS
 	pending.plan.req.PrevCommitTS = pending.commitTS
-	dispErr := d.commitItemWrite(ctx, pending.plan.req)
+	dispErr := d.commitItemWrite(ctx, pending.readTimestamp, pending.plan.req)
 	if dispErr == nil {
 		return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
 	}
@@ -433,8 +446,9 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 	}, nil
 }
 
-func (d *DynamoDBServer) commitItemWrite(ctx context.Context, req *kv.OperationGroup[kv.OP]) error {
-	_, err := d.coordinator.Dispatch(ctx, req)
+func (d *DynamoDBServer) commitItemWrite(ctx context.Context, readTimestamp kv.ReadTimestamp, req *kv.OperationGroup[kv.OP]) error {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req)
 	if err != nil {
 		return errors.WithStack(err)
 	}

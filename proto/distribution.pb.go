@@ -406,9 +406,22 @@ func (x *GetRouteResponse) GetRaftGroupId() uint64 {
 }
 
 type GetTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Count requests a consecutive timestamp window and defaults to one.
+	Count uint32 `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"`
+	// MinTimestamp requires the returned window base to be strictly greater
+	// than this value. It lets commit timestamp callers preserve startTS <
+	// commitTS across a follower-to-TSO-leader RPC.
+	MinTimestamp uint64 `protobuf:"varint,2,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	// ActivateCutover durably switches the dedicated TSO group into production
+	// issuance. Once committed, shadow clients return TSO timestamps instead of
+	// legacy HLC candidates, so a rolling cutover cannot reintroduce them.
+	ActivateCutover bool `protobuf:"varint,3,opt,name=activate_cutover,json=activateCutover,proto3" json:"activate_cutover,omitempty"`
+	// ActivatePhaseD closes the legacy compatibility window after every member
+	// understands the M7 FSM entry. It requires ActivateCutover and is one-way.
+	ActivatePhaseD bool `protobuf:"varint,4,opt,name=activate_phase_d,json=activatePhaseD,proto3" json:"activate_phase_d,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GetTimestampRequest) Reset() {
@@ -441,9 +454,53 @@ func (*GetTimestampRequest) Descriptor() ([]byte, []int) {
 	return file_distribution_proto_rawDescGZIP(), []int{2}
 }
 
+func (x *GetTimestampRequest) GetCount() uint32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+func (x *GetTimestampRequest) GetMinTimestamp() uint64 {
+	if x != nil {
+		return x.MinTimestamp
+	}
+	return 0
+}
+
+func (x *GetTimestampRequest) GetActivateCutover() bool {
+	if x != nil {
+		return x.ActivateCutover
+	}
+	return false
+}
+
+func (x *GetTimestampRequest) GetActivatePhaseD() bool {
+	if x != nil {
+		return x.ActivatePhaseD
+	}
+	return false
+}
+
 type GetTimestampResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// CommittedByDedicatedTSO distinguishes a durable TSO window from the
+	// legacy catalog timestamp response during rolling upgrades.
+	CommittedByDedicatedTso bool `protobuf:"varint,2,opt,name=committed_by_dedicated_tso,json=committedByDedicatedTso,proto3" json:"committed_by_dedicated_tso,omitempty"`
+	// Count echoes the number of consecutive timestamps reserved at timestamp.
+	Count uint32 `protobuf:"varint,3,opt,name=count,proto3" json:"count,omitempty"`
+	// PreviousAllocationFloor is the highest timestamp already reserved before
+	// this request. Shadow validation uses it to reject legacy candidates that
+	// overlap any earlier dedicated or shadow reservation.
+	PreviousAllocationFloor uint64 `protobuf:"varint,4,opt,name=previous_allocation_floor,json=previousAllocationFloor,proto3" json:"previous_allocation_floor,omitempty"`
+	// CutoverActive reports the durable group-0 cutover marker after applying
+	// this request. Shadow nodes switch to the returned TSO timestamp when true.
+	CutoverActive bool `protobuf:"varint,5,opt,name=cutover_active,json=cutoverActive,proto3" json:"cutover_active,omitempty"`
+	// PhaseDActive reports that legacy per-shard issuance has been retired.
+	PhaseDActive bool `protobuf:"varint,6,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
+	// PhaseDFloor is the allocation floor captured by the Phase-D marker.
+	PhaseDFloor   uint64 `protobuf:"varint,7,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -485,6 +542,160 @@ func (x *GetTimestampResponse) GetTimestamp() uint64 {
 	return 0
 }
 
+func (x *GetTimestampResponse) GetCommittedByDedicatedTso() bool {
+	if x != nil {
+		return x.CommittedByDedicatedTso
+	}
+	return false
+}
+
+func (x *GetTimestampResponse) GetCount() uint32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetPreviousAllocationFloor() uint64 {
+	if x != nil {
+		return x.PreviousAllocationFloor
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetCutoverActive() bool {
+	if x != nil {
+		return x.CutoverActive
+	}
+	return false
+}
+
+func (x *GetTimestampResponse) GetPhaseDActive() bool {
+	if x != nil {
+		return x.PhaseDActive
+	}
+	return false
+}
+
+func (x *GetTimestampResponse) GetPhaseDFloor() uint64 {
+	if x != nil {
+		return x.PhaseDFloor
+	}
+	return 0
+}
+
+type ValidateTimestampRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ValidateTimestampRequest) Reset() {
+	*x = ValidateTimestampRequest{}
+	mi := &file_distribution_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ValidateTimestampRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ValidateTimestampRequest) ProtoMessage() {}
+
+func (x *ValidateTimestampRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ValidateTimestampRequest.ProtoReflect.Descriptor instead.
+func (*ValidateTimestampRequest) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ValidateTimestampRequest) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+type ValidateTimestampResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Valid           bool                   `protobuf:"varint,1,opt,name=valid,proto3" json:"valid,omitempty"`
+	PhaseDActive    bool                   `protobuf:"varint,2,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
+	PhaseDFloor     uint64                 `protobuf:"varint,3,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
+	AllocationFloor uint64                 `protobuf:"varint,4,opt,name=allocation_floor,json=allocationFloor,proto3" json:"allocation_floor,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ValidateTimestampResponse) Reset() {
+	*x = ValidateTimestampResponse{}
+	mi := &file_distribution_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ValidateTimestampResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ValidateTimestampResponse) ProtoMessage() {}
+
+func (x *ValidateTimestampResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_distribution_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ValidateTimestampResponse.ProtoReflect.Descriptor instead.
+func (*ValidateTimestampResponse) Descriptor() ([]byte, []int) {
+	return file_distribution_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ValidateTimestampResponse) GetValid() bool {
+	if x != nil {
+		return x.Valid
+	}
+	return false
+}
+
+func (x *ValidateTimestampResponse) GetPhaseDActive() bool {
+	if x != nil {
+		return x.PhaseDActive
+	}
+	return false
+}
+
+func (x *ValidateTimestampResponse) GetPhaseDFloor() uint64 {
+	if x != nil {
+		return x.PhaseDFloor
+	}
+	return 0
+}
+
+func (x *ValidateTimestampResponse) GetAllocationFloor() uint64 {
+	if x != nil {
+		return x.AllocationFloor
+	}
+	return 0
+}
+
 type RouteDescriptor struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RouteId       uint64                 `protobuf:"varint,1,opt,name=route_id,json=routeId,proto3" json:"route_id,omitempty"`
@@ -500,7 +711,7 @@ type RouteDescriptor struct {
 
 func (x *RouteDescriptor) Reset() {
 	*x = RouteDescriptor{}
-	mi := &file_distribution_proto_msgTypes[4]
+	mi := &file_distribution_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -512,7 +723,7 @@ func (x *RouteDescriptor) String() string {
 func (*RouteDescriptor) ProtoMessage() {}
 
 func (x *RouteDescriptor) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[4]
+	mi := &file_distribution_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -525,7 +736,7 @@ func (x *RouteDescriptor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteDescriptor.ProtoReflect.Descriptor instead.
 func (*RouteDescriptor) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{4}
+	return file_distribution_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RouteDescriptor) GetRouteId() uint64 {
@@ -593,7 +804,7 @@ type SplitJobBracketProgress struct {
 
 func (x *SplitJobBracketProgress) Reset() {
 	*x = SplitJobBracketProgress{}
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -605,7 +816,7 @@ func (x *SplitJobBracketProgress) String() string {
 func (*SplitJobBracketProgress) ProtoMessage() {}
 
 func (x *SplitJobBracketProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[5]
+	mi := &file_distribution_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -618,7 +829,7 @@ func (x *SplitJobBracketProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitJobBracketProgress.ProtoReflect.Descriptor instead.
 func (*SplitJobBracketProgress) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{5}
+	return file_distribution_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *SplitJobBracketProgress) GetBracketId() uint64 {
@@ -718,7 +929,7 @@ type SplitJob struct {
 
 func (x *SplitJob) Reset() {
 	*x = SplitJob{}
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -730,7 +941,7 @@ func (x *SplitJob) String() string {
 func (*SplitJob) ProtoMessage() {}
 
 func (x *SplitJob) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[6]
+	mi := &file_distribution_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -743,7 +954,7 @@ func (x *SplitJob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitJob.ProtoReflect.Descriptor instead.
 func (*SplitJob) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{6}
+	return file_distribution_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SplitJob) GetJobId() uint64 {
@@ -985,7 +1196,7 @@ type ListRoutesRequest struct {
 
 func (x *ListRoutesRequest) Reset() {
 	*x = ListRoutesRequest{}
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -997,7 +1208,7 @@ func (x *ListRoutesRequest) String() string {
 func (*ListRoutesRequest) ProtoMessage() {}
 
 func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[7]
+	mi := &file_distribution_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1010,7 +1221,7 @@ func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesRequest.ProtoReflect.Descriptor instead.
 func (*ListRoutesRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{7}
+	return file_distribution_proto_rawDescGZIP(), []int{9}
 }
 
 type ListRoutesResponse struct {
@@ -1023,7 +1234,7 @@ type ListRoutesResponse struct {
 
 func (x *ListRoutesResponse) Reset() {
 	*x = ListRoutesResponse{}
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1035,7 +1246,7 @@ func (x *ListRoutesResponse) String() string {
 func (*ListRoutesResponse) ProtoMessage() {}
 
 func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[8]
+	mi := &file_distribution_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1048,7 +1259,7 @@ func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesResponse.ProtoReflect.Descriptor instead.
 func (*ListRoutesResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{8}
+	return file_distribution_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListRoutesResponse) GetCatalogVersion() uint64 {
@@ -1076,7 +1287,7 @@ type SplitRangeRequest struct {
 
 func (x *SplitRangeRequest) Reset() {
 	*x = SplitRangeRequest{}
-	mi := &file_distribution_proto_msgTypes[9]
+	mi := &file_distribution_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1088,7 +1299,7 @@ func (x *SplitRangeRequest) String() string {
 func (*SplitRangeRequest) ProtoMessage() {}
 
 func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[9]
+	mi := &file_distribution_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1101,7 +1312,7 @@ func (x *SplitRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeRequest.ProtoReflect.Descriptor instead.
 func (*SplitRangeRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{9}
+	return file_distribution_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SplitRangeRequest) GetExpectedCatalogVersion() uint64 {
@@ -1136,7 +1347,7 @@ type SplitRangeResponse struct {
 
 func (x *SplitRangeResponse) Reset() {
 	*x = SplitRangeResponse{}
-	mi := &file_distribution_proto_msgTypes[10]
+	mi := &file_distribution_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1148,7 +1359,7 @@ func (x *SplitRangeResponse) String() string {
 func (*SplitRangeResponse) ProtoMessage() {}
 
 func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[10]
+	mi := &file_distribution_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1161,7 +1372,7 @@ func (x *SplitRangeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SplitRangeResponse.ProtoReflect.Descriptor instead.
 func (*SplitRangeResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{10}
+	return file_distribution_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *SplitRangeResponse) GetCatalogVersion() uint64 {
@@ -1193,7 +1404,7 @@ type CatalogCapabilitiesRequest struct {
 
 func (x *CatalogCapabilitiesRequest) Reset() {
 	*x = CatalogCapabilitiesRequest{}
-	mi := &file_distribution_proto_msgTypes[11]
+	mi := &file_distribution_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1416,7 @@ func (x *CatalogCapabilitiesRequest) String() string {
 func (*CatalogCapabilitiesRequest) ProtoMessage() {}
 
 func (x *CatalogCapabilitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[11]
+	mi := &file_distribution_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1218,7 +1429,7 @@ func (x *CatalogCapabilitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogCapabilitiesRequest.ProtoReflect.Descriptor instead.
 func (*CatalogCapabilitiesRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{11}
+	return file_distribution_proto_rawDescGZIP(), []int{13}
 }
 
 type CatalogCapabilitiesResponse struct {
@@ -1233,7 +1444,7 @@ type CatalogCapabilitiesResponse struct {
 
 func (x *CatalogCapabilitiesResponse) Reset() {
 	*x = CatalogCapabilitiesResponse{}
-	mi := &file_distribution_proto_msgTypes[12]
+	mi := &file_distribution_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1245,7 +1456,7 @@ func (x *CatalogCapabilitiesResponse) String() string {
 func (*CatalogCapabilitiesResponse) ProtoMessage() {}
 
 func (x *CatalogCapabilitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[12]
+	mi := &file_distribution_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1258,7 +1469,7 @@ func (x *CatalogCapabilitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogCapabilitiesResponse.ProtoReflect.Descriptor instead.
 func (*CatalogCapabilitiesResponse) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{12}
+	return file_distribution_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CatalogCapabilitiesResponse) GetSupportedProtocolVersions() []uint32 {
@@ -1300,7 +1511,7 @@ type CatalogWatchRequest struct {
 
 func (x *CatalogWatchRequest) Reset() {
 	*x = CatalogWatchRequest{}
-	mi := &file_distribution_proto_msgTypes[13]
+	mi := &file_distribution_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1312,7 +1523,7 @@ func (x *CatalogWatchRequest) String() string {
 func (*CatalogWatchRequest) ProtoMessage() {}
 
 func (x *CatalogWatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[13]
+	mi := &file_distribution_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1325,7 +1536,7 @@ func (x *CatalogWatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogWatchRequest.ProtoReflect.Descriptor instead.
 func (*CatalogWatchRequest) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{13}
+	return file_distribution_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *CatalogWatchRequest) GetProtocolVersion() uint32 {
@@ -1360,7 +1571,7 @@ type CatalogDeltaMutation struct {
 
 func (x *CatalogDeltaMutation) Reset() {
 	*x = CatalogDeltaMutation{}
-	mi := &file_distribution_proto_msgTypes[14]
+	mi := &file_distribution_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1372,7 +1583,7 @@ func (x *CatalogDeltaMutation) String() string {
 func (*CatalogDeltaMutation) ProtoMessage() {}
 
 func (x *CatalogDeltaMutation) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[14]
+	mi := &file_distribution_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1385,7 +1596,7 @@ func (x *CatalogDeltaMutation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogDeltaMutation.ProtoReflect.Descriptor instead.
 func (*CatalogDeltaMutation) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{14}
+	return file_distribution_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CatalogDeltaMutation) GetOp() CatalogDeltaMutationOp {
@@ -1420,7 +1631,7 @@ type CatalogDeltaRecord struct {
 
 func (x *CatalogDeltaRecord) Reset() {
 	*x = CatalogDeltaRecord{}
-	mi := &file_distribution_proto_msgTypes[15]
+	mi := &file_distribution_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1432,7 +1643,7 @@ func (x *CatalogDeltaRecord) String() string {
 func (*CatalogDeltaRecord) ProtoMessage() {}
 
 func (x *CatalogDeltaRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[15]
+	mi := &file_distribution_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1445,7 +1656,7 @@ func (x *CatalogDeltaRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogDeltaRecord.ProtoReflect.Descriptor instead.
 func (*CatalogDeltaRecord) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{15}
+	return file_distribution_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CatalogDeltaRecord) GetPreviousVersion() uint64 {
@@ -1479,7 +1690,7 @@ type CatalogSnapshotReset struct {
 
 func (x *CatalogSnapshotReset) Reset() {
 	*x = CatalogSnapshotReset{}
-	mi := &file_distribution_proto_msgTypes[16]
+	mi := &file_distribution_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1491,7 +1702,7 @@ func (x *CatalogSnapshotReset) String() string {
 func (*CatalogSnapshotReset) ProtoMessage() {}
 
 func (x *CatalogSnapshotReset) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[16]
+	mi := &file_distribution_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1504,7 +1715,7 @@ func (x *CatalogSnapshotReset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogSnapshotReset.ProtoReflect.Descriptor instead.
 func (*CatalogSnapshotReset) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{16}
+	return file_distribution_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *CatalogSnapshotReset) GetVersion() uint64 {
@@ -1534,7 +1745,7 @@ type CatalogWatchEvent struct {
 
 func (x *CatalogWatchEvent) Reset() {
 	*x = CatalogWatchEvent{}
-	mi := &file_distribution_proto_msgTypes[17]
+	mi := &file_distribution_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1546,7 +1757,7 @@ func (x *CatalogWatchEvent) String() string {
 func (*CatalogWatchEvent) ProtoMessage() {}
 
 func (x *CatalogWatchEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_distribution_proto_msgTypes[17]
+	mi := &file_distribution_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1559,7 +1770,7 @@ func (x *CatalogWatchEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CatalogWatchEvent.ProtoReflect.Descriptor instead.
 func (*CatalogWatchEvent) Descriptor() ([]byte, []int) {
-	return file_distribution_proto_rawDescGZIP(), []int{17}
+	return file_distribution_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CatalogWatchEvent) GetPayload() isCatalogWatchEvent_Payload {
@@ -1613,10 +1824,27 @@ const file_distribution_proto_rawDesc = "" +
 	"\x10GetRouteResponse\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x02 \x01(\fR\x03end\x12\"\n" +
-	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\x15\n" +
-	"\x13GetTimestampRequest\"4\n" +
+	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\xa5\x01\n" +
+	"\x13GetTimestampRequest\x12\x14\n" +
+	"\x05count\x18\x01 \x01(\rR\x05count\x12#\n" +
+	"\rmin_timestamp\x18\x02 \x01(\x04R\fminTimestamp\x12)\n" +
+	"\x10activate_cutover\x18\x03 \x01(\bR\x0factivateCutover\x12(\n" +
+	"\x10activate_phase_d\x18\x04 \x01(\bR\x0eactivatePhaseD\"\xb4\x02\n" +
 	"\x14GetTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xe5\x01\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12;\n" +
+	"\x1acommitted_by_dedicated_tso\x18\x02 \x01(\bR\x17committedByDedicatedTso\x12\x14\n" +
+	"\x05count\x18\x03 \x01(\rR\x05count\x12:\n" +
+	"\x19previous_allocation_floor\x18\x04 \x01(\x04R\x17previousAllocationFloor\x12%\n" +
+	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\x12$\n" +
+	"\x0ephase_d_active\x18\x06 \x01(\bR\fphaseDActive\x12\"\n" +
+	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\"8\n" +
+	"\x18ValidateTimestampRequest\x12\x1c\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xa6\x01\n" +
+	"\x19ValidateTimestampResponse\x12\x14\n" +
+	"\x05valid\x18\x01 \x01(\bR\x05valid\x12$\n" +
+	"\x0ephase_d_active\x18\x02 \x01(\bR\fphaseDActive\x12\"\n" +
+	"\rphase_d_floor\x18\x03 \x01(\x04R\vphaseDFloor\x12)\n" +
+	"\x10allocation_floor\x18\x04 \x01(\x04R\x0fallocationFloor\"\xe5\x01\n" +
 	"\x0fRouteDescriptor\x12\x19\n" +
 	"\broute_id\x18\x01 \x01(\x04R\arouteId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +
@@ -1744,10 +1972,11 @@ const file_distribution_proto_rawDesc = "" +
 	"\x16CatalogDeltaMutationOp\x12)\n" +
 	"%CATALOG_DELTA_MUTATION_OP_UNSPECIFIED\x10\x00\x12$\n" +
 	" CATALOG_DELTA_MUTATION_OP_UPSERT\x10\x01\x12$\n" +
-	" CATALOG_DELTA_MUTATION_OP_DELETE\x10\x022\x87\x03\n" +
+	" CATALOG_DELTA_MUTATION_OP_DELETE\x10\x022\xd5\x03\n" +
 	"\fDistribution\x121\n" +
 	"\bGetRoute\x12\x10.GetRouteRequest\x1a\x11.GetRouteResponse\"\x00\x12=\n" +
-	"\fGetTimestamp\x12\x14.GetTimestampRequest\x1a\x15.GetTimestampResponse\"\x00\x127\n" +
+	"\fGetTimestamp\x12\x14.GetTimestampRequest\x1a\x15.GetTimestampResponse\"\x00\x12L\n" +
+	"\x11ValidateTimestamp\x12\x19.ValidateTimestampRequest\x1a\x1a.ValidateTimestampResponse\"\x00\x127\n" +
 	"\n" +
 	"ListRoutes\x12\x12.ListRoutesRequest\x1a\x13.ListRoutesResponse\"\x00\x127\n" +
 	"\n" +
@@ -1768,7 +1997,7 @@ func file_distribution_proto_rawDescGZIP() []byte {
 }
 
 var file_distribution_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_distribution_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_distribution_proto_goTypes = []any{
 	(RouteState)(0),                     // 0: RouteState
 	(SplitJobPhase)(0),                  // 1: SplitJobPhase
@@ -1779,20 +2008,22 @@ var file_distribution_proto_goTypes = []any{
 	(*GetRouteResponse)(nil),            // 6: GetRouteResponse
 	(*GetTimestampRequest)(nil),         // 7: GetTimestampRequest
 	(*GetTimestampResponse)(nil),        // 8: GetTimestampResponse
-	(*RouteDescriptor)(nil),             // 9: RouteDescriptor
-	(*SplitJobBracketProgress)(nil),     // 10: SplitJobBracketProgress
-	(*SplitJob)(nil),                    // 11: SplitJob
-	(*ListRoutesRequest)(nil),           // 12: ListRoutesRequest
-	(*ListRoutesResponse)(nil),          // 13: ListRoutesResponse
-	(*SplitRangeRequest)(nil),           // 14: SplitRangeRequest
-	(*SplitRangeResponse)(nil),          // 15: SplitRangeResponse
-	(*CatalogCapabilitiesRequest)(nil),  // 16: CatalogCapabilitiesRequest
-	(*CatalogCapabilitiesResponse)(nil), // 17: CatalogCapabilitiesResponse
-	(*CatalogWatchRequest)(nil),         // 18: CatalogWatchRequest
-	(*CatalogDeltaMutation)(nil),        // 19: CatalogDeltaMutation
-	(*CatalogDeltaRecord)(nil),          // 20: CatalogDeltaRecord
-	(*CatalogSnapshotReset)(nil),        // 21: CatalogSnapshotReset
-	(*CatalogWatchEvent)(nil),           // 22: CatalogWatchEvent
+	(*ValidateTimestampRequest)(nil),    // 9: ValidateTimestampRequest
+	(*ValidateTimestampResponse)(nil),   // 10: ValidateTimestampResponse
+	(*RouteDescriptor)(nil),             // 11: RouteDescriptor
+	(*SplitJobBracketProgress)(nil),     // 12: SplitJobBracketProgress
+	(*SplitJob)(nil),                    // 13: SplitJob
+	(*ListRoutesRequest)(nil),           // 14: ListRoutesRequest
+	(*ListRoutesResponse)(nil),          // 15: ListRoutesResponse
+	(*SplitRangeRequest)(nil),           // 16: SplitRangeRequest
+	(*SplitRangeResponse)(nil),          // 17: SplitRangeResponse
+	(*CatalogCapabilitiesRequest)(nil),  // 18: CatalogCapabilitiesRequest
+	(*CatalogCapabilitiesResponse)(nil), // 19: CatalogCapabilitiesResponse
+	(*CatalogWatchRequest)(nil),         // 20: CatalogWatchRequest
+	(*CatalogDeltaMutation)(nil),        // 21: CatalogDeltaMutation
+	(*CatalogDeltaRecord)(nil),          // 22: CatalogDeltaRecord
+	(*CatalogSnapshotReset)(nil),        // 23: CatalogSnapshotReset
+	(*CatalogWatchEvent)(nil),           // 24: CatalogWatchEvent
 }
 var file_distribution_proto_depIdxs = []int32{
 	0,  // 0: RouteDescriptor.state:type_name -> RouteState
@@ -1802,30 +2033,32 @@ var file_distribution_proto_depIdxs = []int32{
 	1,  // 4: SplitJob.abandon_from_phase:type_name -> SplitJobPhase
 	2,  // 5: SplitJob.cutover_read_fence_state:type_name -> SplitJobBarrierState
 	2,  // 6: SplitJob.target_staged_readiness_state:type_name -> SplitJobBarrierState
-	10, // 7: SplitJob.bracket_progress:type_name -> SplitJobBracketProgress
-	9,  // 8: ListRoutesResponse.routes:type_name -> RouteDescriptor
-	9,  // 9: SplitRangeResponse.left:type_name -> RouteDescriptor
-	9,  // 10: SplitRangeResponse.right:type_name -> RouteDescriptor
+	12, // 7: SplitJob.bracket_progress:type_name -> SplitJobBracketProgress
+	11, // 8: ListRoutesResponse.routes:type_name -> RouteDescriptor
+	11, // 9: SplitRangeResponse.left:type_name -> RouteDescriptor
+	11, // 10: SplitRangeResponse.right:type_name -> RouteDescriptor
 	4,  // 11: CatalogDeltaMutation.op:type_name -> CatalogDeltaMutationOp
-	9,  // 12: CatalogDeltaMutation.route:type_name -> RouteDescriptor
-	19, // 13: CatalogDeltaRecord.mutations:type_name -> CatalogDeltaMutation
-	9,  // 14: CatalogSnapshotReset.routes:type_name -> RouteDescriptor
-	21, // 15: CatalogWatchEvent.snapshot:type_name -> CatalogSnapshotReset
-	20, // 16: CatalogWatchEvent.delta:type_name -> CatalogDeltaRecord
+	11, // 12: CatalogDeltaMutation.route:type_name -> RouteDescriptor
+	21, // 13: CatalogDeltaRecord.mutations:type_name -> CatalogDeltaMutation
+	11, // 14: CatalogSnapshotReset.routes:type_name -> RouteDescriptor
+	23, // 15: CatalogWatchEvent.snapshot:type_name -> CatalogSnapshotReset
+	22, // 16: CatalogWatchEvent.delta:type_name -> CatalogDeltaRecord
 	5,  // 17: Distribution.GetRoute:input_type -> GetRouteRequest
 	7,  // 18: Distribution.GetTimestamp:input_type -> GetTimestampRequest
-	12, // 19: Distribution.ListRoutes:input_type -> ListRoutesRequest
-	14, // 20: Distribution.SplitRange:input_type -> SplitRangeRequest
-	16, // 21: Distribution.GetCatalogCapabilities:input_type -> CatalogCapabilitiesRequest
-	18, // 22: Distribution.WatchCatalog:input_type -> CatalogWatchRequest
-	6,  // 23: Distribution.GetRoute:output_type -> GetRouteResponse
-	8,  // 24: Distribution.GetTimestamp:output_type -> GetTimestampResponse
-	13, // 25: Distribution.ListRoutes:output_type -> ListRoutesResponse
-	15, // 26: Distribution.SplitRange:output_type -> SplitRangeResponse
-	17, // 27: Distribution.GetCatalogCapabilities:output_type -> CatalogCapabilitiesResponse
-	22, // 28: Distribution.WatchCatalog:output_type -> CatalogWatchEvent
-	23, // [23:29] is the sub-list for method output_type
-	17, // [17:23] is the sub-list for method input_type
+	9,  // 19: Distribution.ValidateTimestamp:input_type -> ValidateTimestampRequest
+	14, // 20: Distribution.ListRoutes:input_type -> ListRoutesRequest
+	16, // 21: Distribution.SplitRange:input_type -> SplitRangeRequest
+	18, // 22: Distribution.GetCatalogCapabilities:input_type -> CatalogCapabilitiesRequest
+	20, // 23: Distribution.WatchCatalog:input_type -> CatalogWatchRequest
+	6,  // 24: Distribution.GetRoute:output_type -> GetRouteResponse
+	8,  // 25: Distribution.GetTimestamp:output_type -> GetTimestampResponse
+	10, // 26: Distribution.ValidateTimestamp:output_type -> ValidateTimestampResponse
+	15, // 27: Distribution.ListRoutes:output_type -> ListRoutesResponse
+	17, // 28: Distribution.SplitRange:output_type -> SplitRangeResponse
+	19, // 29: Distribution.GetCatalogCapabilities:output_type -> CatalogCapabilitiesResponse
+	24, // 30: Distribution.WatchCatalog:output_type -> CatalogWatchEvent
+	24, // [24:31] is the sub-list for method output_type
+	17, // [17:24] is the sub-list for method input_type
 	17, // [17:17] is the sub-list for extension type_name
 	17, // [17:17] is the sub-list for extension extendee
 	0,  // [0:17] is the sub-list for field type_name
@@ -1836,7 +2069,7 @@ func file_distribution_proto_init() {
 	if File_distribution_proto != nil {
 		return
 	}
-	file_distribution_proto_msgTypes[17].OneofWrappers = []any{
+	file_distribution_proto_msgTypes[19].OneofWrappers = []any{
 		(*CatalogWatchEvent_Snapshot)(nil),
 		(*CatalogWatchEvent_Delta)(nil),
 	}
@@ -1846,7 +2079,7 @@ func file_distribution_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_distribution_proto_rawDesc), len(file_distribution_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

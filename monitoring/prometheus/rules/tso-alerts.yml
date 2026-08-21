@@ -1,0 +1,103 @@
+groups:
+  - name: elastickv-tso
+    rules:
+      - alert: ElasticKVTSOAllocationErrorRateHigh
+        expr: |
+          (
+            sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
+            /
+            clamp_min(sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
+          ) > 0.01
+          and
+          sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TSO allocation error rate exceeds 1 percent
+          description: Dedicated TSO reserve attempts have exceeded a 1 percent error rate for 10 minutes.
+
+      - alert: ElasticKVTSOAllocationErrorRateCritical
+        expr: |
+          (
+            sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
+            /
+            clamp_min(sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
+          ) > 0.10
+          and
+          sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TSO allocation error rate exceeds 10 percent
+          description: Dedicated TSO reserve attempts have exceeded a 10 percent error rate for 5 minutes; writes may be failing closed.
+
+      - alert: ElasticKVTSOAllocationLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (
+              rate(elastickv_tso_request_duration_seconds_bucket{operation="reserve",outcome="success"}[5m])
+            )
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TSO allocation p99 exceeds 50 milliseconds
+          description: Successful dedicated TSO reserve attempts have exceeded 50 ms p99 for 10 minutes.
+
+      - alert: ElasticKVTSOAllocationLatencyCritical
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (
+              rate(elastickv_tso_request_duration_seconds_bucket{operation="reserve",outcome="success"}[5m])
+            )
+          ) > 0.20
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TSO allocation p99 exceeds 200 milliseconds
+          description: Successful dedicated TSO reserve attempts have exceeded 200 ms p99 for 5 minutes.
+
+      - alert: ElasticKVTSOShadowOverlapDetected
+        expr: sum(increase(elastickv_tso_shadow_comparisons_total{result="legacy_overlap"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Legacy timestamps overlap the durable TSO floor
+          description: At least one shadow candidate was discarded in the last 15 minutes. Keep every node in shadow mode until this remains zero for a full 15-minute window.
+
+      - alert: ElasticKVTSOModeReloadRejected
+        expr: sum(increase(elastickv_tso_mode_reload_total{result=~"rejected|parse_error|read_error"}[10m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A runtime TSO mode reload was rejected
+          description: A node could not read or parse its mode file, or the requested transition violated the one-way phase order.
+
+      - alert: ElasticKVTSOModeDivergence
+        expr: count(count by (mode) (elastickv_tso_mode == 1)) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Cluster nodes remain in different TSO modes
+          description: More than one process-local TSO mode has remained active for 15 minutes. Finish the rolling transition or investigate a rejected reload.
+
+      - alert: ElasticKVTSOPhaseDWithoutCutover
+        expr: |
+          max(elastickv_tso_durable_state{marker="phase_d"})
+          >
+          max(elastickv_tso_durable_state{marker="cutover"})
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Durable TSO marker ordering is invalid
+          description: Phase D is visible without the prerequisite durable cutover marker. Stop rollout and inspect group-0 state.

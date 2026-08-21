@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -54,6 +55,18 @@ type dedupTestCoordinator struct {
 	beforeDispatch func(n int)
 }
 
+type phaseDDedupTestCoordinator struct {
+	*dedupTestCoordinator
+	alloc   *phaseDDedupAllocator
+	vouches atomic.Uint64
+}
+
+type phaseDDedupAllocator struct {
+	next          atomic.Uint64
+	validateCalls atomic.Uint64
+	phaseDFloor   uint64
+}
+
 func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bool) *dedupTestCoordinator {
 	return &dedupTestCoordinator{
 		occAdapterCoordinator: newOCCAdapterCoordinator(st),
@@ -61,6 +74,53 @@ func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bo
 		ambiguousLands:        lands,
 	}
 }
+
+func newPhaseDDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bool) *phaseDDedupTestCoordinator {
+	return &phaseDDedupTestCoordinator{
+		dedupTestCoordinator: newDedupTestCoordinator(st, ambiguousDispatch, lands),
+		alloc:                &phaseDDedupAllocator{phaseDFloor: 10},
+	}
+}
+
+func (c *phaseDDedupTestCoordinator) TimestampAllocator() kv.TimestampAllocator {
+	return c.alloc
+}
+
+func (c *phaseDDedupTestCoordinator) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	c.vouches.Add(1)
+	return nil
+}
+
+func (a *phaseDDedupAllocator) Next(ctx context.Context) (uint64, error) {
+	return a.NextAfter(ctx, 0)
+}
+
+func (a *phaseDDedupAllocator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	for {
+		cur := a.next.Load()
+		next := cur + 1
+		if next <= min {
+			next = min + 1
+		}
+		if a.next.CompareAndSwap(cur, next) {
+			return next, nil
+		}
+	}
+}
+
+func (a *phaseDDedupAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls.Add(1)
+	if timestamp == 0 {
+		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.phaseDFloor {
+		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *phaseDDedupAllocator) PhaseDActive() bool   { return true }
+func (a *phaseDDedupAllocator) PhaseDRequired() bool { return true }
 
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.dispatches++

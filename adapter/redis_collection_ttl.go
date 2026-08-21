@@ -148,6 +148,23 @@ func (r *RedisServer) dispatchCollectionExpire(
 	return true, r.dispatchElems(ctx, true, readTS, elems)
 }
 
+func (r *RedisServer) dispatchCollectionExpireReadTimestamp(
+	ctx context.Context,
+	key []byte,
+	readTimestamp kv.ReadTimestamp,
+	typ redisValueType,
+	expireAt time.Time,
+) (bool, error) {
+	readTS := readTimestamp.Timestamp()
+	ttlMs := redisExpireAtMillis(expireAt)
+	elems, ok, err := r.collectionExpireElems(ctx, key, readTS, typ, ttlMs)
+	if err != nil || !ok {
+		return ok, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)})
+	return true, r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+}
+
 func (r *RedisServer) collectionExpireElems(
 	ctx context.Context,
 	key []byte,

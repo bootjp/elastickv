@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -91,6 +92,9 @@ type fakeRawKVServer struct {
 	getResp    *pb.RawGetResponse
 	scanResp   *pb.RawScanAtResponse
 	latestResp *pb.RawLatestCommitTSResponse
+	// wantLatestGroupID, when non-zero, makes the fake reject a watermark
+	// request that is not pinned to the expected Raft group.
+	wantLatestGroupID uint64
 }
 
 func (f *fakeRawKVServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGetResponse, error) {
@@ -115,10 +119,13 @@ func (f *fakeRawKVServer) RawScanAt(_ context.Context, req *pb.RawScanAtRequest)
 	return &pb.RawScanAtResponse{}, nil
 }
 
-func (f *fakeRawKVServer) RawLatestCommitTS(context.Context, *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+func (f *fakeRawKVServer) RawLatestCommitTS(_ context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.latestCalls++
+	if f.wantLatestGroupID != 0 && req.GetGroupId() != f.wantLatestGroupID {
+		return nil, fmt.Errorf("watermark group_id=%d, want %d", req.GetGroupId(), f.wantLatestGroupID)
+	}
 	if f.latestResp != nil {
 		return f.latestResp, nil
 	}

@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Distribution_GetRoute_FullMethodName               = "/Distribution/GetRoute"
 	Distribution_GetTimestamp_FullMethodName           = "/Distribution/GetTimestamp"
+	Distribution_ValidateTimestamp_FullMethodName      = "/Distribution/ValidateTimestamp"
 	Distribution_ListRoutes_FullMethodName             = "/Distribution/ListRoutes"
 	Distribution_SplitRange_FullMethodName             = "/Distribution/SplitRange"
 	Distribution_GetCatalogCapabilities_FullMethodName = "/Distribution/GetCatalogCapabilities"
@@ -33,6 +34,7 @@ const (
 type DistributionClient interface {
 	GetRoute(ctx context.Context, in *GetRouteRequest, opts ...grpc.CallOption) (*GetRouteResponse, error)
 	GetTimestamp(ctx context.Context, in *GetTimestampRequest, opts ...grpc.CallOption) (*GetTimestampResponse, error)
+	ValidateTimestamp(ctx context.Context, in *ValidateTimestampRequest, opts ...grpc.CallOption) (*ValidateTimestampResponse, error)
 	ListRoutes(ctx context.Context, in *ListRoutesRequest, opts ...grpc.CallOption) (*ListRoutesResponse, error)
 	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
 	GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error)
@@ -61,6 +63,16 @@ func (c *distributionClient) GetTimestamp(ctx context.Context, in *GetTimestampR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetTimestampResponse)
 	err := c.cc.Invoke(ctx, Distribution_GetTimestamp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) ValidateTimestamp(ctx context.Context, in *ValidateTimestampRequest, opts ...grpc.CallOption) (*ValidateTimestampResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ValidateTimestampResponse)
+	err := c.cc.Invoke(ctx, Distribution_ValidateTimestamp_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +134,7 @@ type Distribution_WatchCatalogClient = grpc.ServerStreamingClient[CatalogWatchEv
 type DistributionServer interface {
 	GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error)
 	GetTimestamp(context.Context, *GetTimestampRequest) (*GetTimestampResponse, error)
+	ValidateTimestamp(context.Context, *ValidateTimestampRequest) (*ValidateTimestampResponse, error)
 	ListRoutes(context.Context, *ListRoutesRequest) (*ListRoutesResponse, error)
 	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
 	GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error)
@@ -141,6 +154,9 @@ func (UnimplementedDistributionServer) GetRoute(context.Context, *GetRouteReques
 }
 func (UnimplementedDistributionServer) GetTimestamp(context.Context, *GetTimestampRequest) (*GetTimestampResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTimestamp not implemented")
+}
+func (UnimplementedDistributionServer) ValidateTimestamp(context.Context, *ValidateTimestampRequest) (*ValidateTimestampResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ValidateTimestamp not implemented")
 }
 func (UnimplementedDistributionServer) ListRoutes(context.Context, *ListRoutesRequest) (*ListRoutesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRoutes not implemented")
@@ -207,6 +223,24 @@ func _Distribution_GetTimestamp_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DistributionServer).GetTimestamp(ctx, req.(*GetTimestampRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_ValidateTimestamp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ValidateTimestampRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).ValidateTimestamp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_ValidateTimestamp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).ValidateTimestamp(ctx, req.(*ValidateTimestampRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -290,6 +324,10 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTimestamp",
 			Handler:    _Distribution_GetTimestamp_Handler,
+		},
+		{
+			MethodName: "ValidateTimestamp",
+			Handler:    _Distribution_ValidateTimestamp_Handler,
 		},
 		{
 			MethodName: "ListRoutes",

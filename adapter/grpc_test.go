@@ -12,8 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/health"
+	"google.golang.org/grpc/status"
 )
 
 func TestRawKeyPairsPreservesNilAndEmptyKeys(t *testing.T) {
@@ -139,11 +141,39 @@ func TestGRPCServer_RawLatestCommitTS_EmptyKeyReturnsGlobalWatermark(t *testing.
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(77), resp.GetTs())
 	assert.True(t, resp.GetExists())
+	assert.Zero(t, resp.GetGroupId())
+	assert.False(t, resp.GetLeaderFenced())
 
 	// Non-empty key should still work as before.
 	resp, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k")})
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(77), resp.GetTs())
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupUsesLeaderFencedReader(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingRawGroupStore{
+		MVCCStore: store.NewMVCCStore(),
+		floorTS:   88,
+	}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{GroupId: 7})
+	require.NoError(t, err)
+	require.Equal(t, uint64(88), resp.GetTs())
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(7), resp.GetGroupId())
+	require.True(t, resp.GetLeaderFenced())
+	require.Equal(t, uint64(7), st.floorGroupID)
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupRequiresAwareStore(t *testing.T) {
+	t.Parallel()
+
+	s := NewGRPCServer(store.NewMVCCStore(), nil)
+	_, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{GroupId: 1})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 func TestGRPCServer_RawScanAt_RejectsOversizedLimit(t *testing.T) {
@@ -169,7 +199,14 @@ type recordingRawGroupStore struct {
 	keyScanGroup bool
 	fallbackGet  bool
 	fallbackScan bool
+	floorGroupID uint64
+	floorTS      uint64
 	reverseScan  bool
+}
+
+func (s *recordingRawGroupStore) GroupCommittedTimestampFloor(_ context.Context, groupID uint64) (uint64, error) {
+	s.floorGroupID = groupID
+	return s.floorTS, nil
 }
 
 func (s *recordingRawGroupStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -304,6 +341,27 @@ func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	require.Equal(t, uint64(42), st.scanGroupID)
 	require.Equal(t, []byte("a"), st.scanStart)
 	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyFallbackOmitsValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       9,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
 }
 
 func TestGRPCServer_RawScanAt_ReverseKeysOnlyUsesExplicitGroup(t *testing.T) {

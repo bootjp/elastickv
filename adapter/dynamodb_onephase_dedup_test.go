@@ -133,6 +133,23 @@ func TestItemWriteDedup_PriorAttemptDidNotLand_Applies(t *testing.T) {
 	require.Equal(t, 0, coord.probeNoOps, "nothing landed, so the probe must miss and the reuse applies")
 }
 
+func TestItemWriteDedup_PhaseDVouchesReuse(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newPhaseDDedupTestCoordinator(st, 1, false)
+	schema, server := newDedupItemWriteServer(st, coord, true)
+	seedDedupItem(t, st, schema, "1", "2")
+
+	plan, err := server.updateItemWithRetry(ctx, appendListInput())
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	require.Equal(t, []string{"1", "2", "3"}, readListValues(t, server, schema))
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, uint64(2), coord.vouches.Load(), "first attempt and reused write set must each reserve a Phase-D dispatch voucher")
+}
+
 // TestItemWriteDedup_SelfInflictedReuseConflict_ReturnsSuccess: attempt 1
 // pre-rejects, the reuse then LANDS but surfaces WriteConflict (self-inflicted
 // conflict under churn). The adapter-side self-conflict guard probes the reuse's

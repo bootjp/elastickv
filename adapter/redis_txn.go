@@ -499,16 +499,33 @@ func (r *RedisServer) redisReadFencedTimestamp(
 	groupKeys [][]byte,
 	selectTS func() uint64,
 ) (uint64, *kv.ActiveTimestampToken, error) {
-	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
+	readTimestamp, readPin, err := r.redisReadFencedReadTimestamp(ctx, groupKeys, selectTS, "redis read fence: begin read timestamp")
+	if err != nil {
 		return 0, nil, err
 	}
-	readTS := selectTS()
+	return readTimestamp.Timestamp(), readPin, nil
+}
+
+func (r *RedisServer) redisReadFencedReadTimestamp(
+	ctx context.Context,
+	groupKeys [][]byte,
+	selectTS func() uint64,
+	label string,
+) (kv.ReadTimestamp, *kv.ActiveTimestampToken, error) {
+	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
+		return kv.ReadTimestamp{}, nil, err
+	}
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, selectTS(), label)
+	if err != nil {
+		return kv.ReadTimestamp{}, nil, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	readPin := r.pinReadTS(readTS)
 	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
 		readPin.Release()
-		return 0, nil, err
+		return kv.ReadTimestamp{}, nil, err
 	}
-	return readTS, readPin, nil
+	return readTimestamp, readPin, nil
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -2062,7 +2079,7 @@ func (t *txnContext) commit(routeVersion redisReadFenceRouteVersion) error {
 		ReadKeys:             prepared.readKeys,
 		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
-	if _, err := t.server.coordinator.Dispatch(prepared.ctx, group); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(prepared.ctx, t.server.coordinator, group); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -2902,21 +2919,23 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 	err := r.retryRedisWrite(dispatchCtx, func() error {
 		routeVersion := r.redisReadFenceRouteVersion()
 		fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
-		startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
+		readTimestamp, readPin, err := r.redisReadFencedReadTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS, "redis exec: begin read timestamp")
 		if err != nil {
 			return err
 		}
 		defer readPin.Release()
+		attemptCtx := readTimestamp.WithDispatchVoucher(dispatchCtx)
+		startTS := readTimestamp.Timestamp()
 		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 			return err
 		}
 
-		txn, nextResults, err := r.applyExecQueueAtSnapshot(dispatchCtx, queue, startTS)
+		txn, nextResults, err := r.applyExecQueueAtSnapshot(attemptCtx, queue, startTS)
 		if err != nil {
 			return err
 		}
 
-		if err := txn.validateReadSet(dispatchCtx); err != nil {
+		if err := txn.validateReadSet(attemptCtx); err != nil {
 			return err
 		}
 		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
@@ -2959,6 +2978,7 @@ type reusableExecTxn struct {
 	observedRouteVersion uint64
 	readKeys             [][]byte
 	results              []redisResult
+	readTimestamp        kv.ReadTimestamp
 }
 
 // dispatchExecReuse runs one iteration of the option-2 reuse path for
@@ -2979,6 +2999,7 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	if err := r.ensureReusableExecRouteStable(pending); err != nil {
 		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
 	}
+	ctx = pending.readTimestamp.WithDispatchVoucher(ctx)
 	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
 	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
 	// at tla/hlc/MCHLC_gap.cfg). Clock().Next() bypasses the ceiling and
@@ -2989,7 +3010,7 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	if allocErr != nil {
 		return nil, false, errors.WithStack(allocErr)
 	}
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	_, dispErr := kv.DispatchWithReadTimestamp(ctx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:                true,
 		StartTS:              pending.startTS,
 		CommitTS:             commitTS,
@@ -3135,10 +3156,12 @@ func (r *RedisServer) prepareExecDispatchWithStableRoute(
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
 	routeVersion := r.redisReadFenceRouteVersion()
 	fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
-	startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
+	readTimestamp, readPin, err := r.redisReadFencedReadTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS, "redis exec: begin read timestamp")
 	if err != nil {
 		return nil, nil, err
 	}
+	dispatchCtx = readTimestamp.WithDispatchVoucher(dispatchCtx)
+	startTS := readTimestamp.Timestamp()
 	defer readPin.Release()
 	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 		return nil, nil, err
@@ -3174,7 +3197,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		ReadKeys:             prepared.readKeys,
 		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
-	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
+	if _, dispErr := kv.DispatchWithReadTimestamp(prepared.ctx, r.coordinator, group); dispErr != nil {
 		// Preserve the exact attempt for a forwarded conflict only after
 		// restoring its typed form. runTransactionWithDedup can then reuse this
 		// write set instead of replaying the EXEC body from a new snapshot.
@@ -3190,6 +3213,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 				observedRouteVersion: routeVersion.observedRouteVersion(),
 				readKeys:             prepared.readKeys,
 				results:              nextResults,
+				readTimestamp:        readTimestamp,
 			}, errors.WithStack(dispErr)
 		}
 		return nil, nil, errors.WithStack(dispErr)
@@ -3237,6 +3261,11 @@ func (r *RedisServer) txnStartTS() uint64 {
 		return 1
 	}
 	return maxTS
+}
+
+func (r *RedisServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, r.txnStartTS(), label)
+	return readTimestamp, errors.WithStack(err)
 }
 
 func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {

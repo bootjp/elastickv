@@ -73,8 +73,13 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.WithStack(err)
 		}
-		readTS := s.nextTxnReadTS(ctx)
-		meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs reaper queue: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		queueCtx := readTimestamp.WithDispatchVoucher(ctx)
+		readTS := readTimestamp.Timestamp()
+		meta, exists, err := s.loadQueueMetaAt(queueCtx, name, readTS)
 		if err != nil || !exists {
 			// Even when meta is gone (DeleteQueue), prior-generation
 			// orphans need reaping; reapTombstonedQueues (called
@@ -82,10 +87,10 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 			// the queue if loading itself failed (transient).
 			continue
 		}
-		if err := s.reapQueue(ctx, name, meta, readTS); err != nil {
+		if err := s.reapQueue(queueCtx, name, meta, readTS); err != nil {
 			slog.Warn("sqs reaper queue pass failed", "queue", name, "err", err)
 		}
-		if err := s.reapExpiredDedup(ctx, name, meta, readTS); err != nil {
+		if err := s.reapExpiredDedup(queueCtx, name, meta, readTS); err != nil {
 			slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
 		}
 	}
@@ -108,8 +113,13 @@ func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
 	upper := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
 	for {
-		readTS := s.nextTxnReadTS(ctx)
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs tombstone reaper: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		pageCtx := readTimestamp.WithDispatchVoucher(ctx)
+		readTS := readTimestamp.Timestamp()
+		page, err := s.store.ScanAt(pageCtx, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -129,7 +139,7 @@ func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
 			// non-canonical values to 1 so pre-PR-6a tombstones
 			// retain their byte-identical legacy reaper path.
 			partitionCount := decodeQueueTombstoneValue(kvp.Value)
-			s.reapTombstonedGeneration(ctx, queueName, gen, partitionCount, kvp.Key, readTS)
+			s.reapTombstonedGeneration(pageCtx, queueName, gen, partitionCount, kvp.Key, readTS)
 		}
 		if len(page) < sqsReaperPageLimit {
 			return nil
@@ -663,7 +673,7 @@ func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, meta *s
 	if err != nil {
 		return err
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil
 		}
@@ -717,7 +727,7 @@ func (s *SQSServer) dispatchOrphanByAgeDrop(ctx context.Context, byAgeKey []byte
 			{Op: kv.Del, Key: byAgeKey},
 		},
 	}
-	_, _ = s.coordinator.Dispatch(ctx, req)
+	_, _ = kv.DispatchWithReadTimestamp(ctx, s.coordinator, req)
 }
 
 // reapExpiredDedup walks every FIFO dedup record under the given
@@ -872,7 +882,7 @@ func (s *SQSServer) dispatchDedupDelete(ctx context.Context, key []byte, readTS 
 			{Op: kv.Del, Key: key},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil
 		}
