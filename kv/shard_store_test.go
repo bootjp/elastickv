@@ -2835,3 +2835,130 @@ func TestShardedCoordinatorRejectsRedisAuxiliaryWriteUnderLogicalFloor(t *testin
 	require.NoError(t,
 		c.ensureMutationsWriteAllowed([]*pb.Mutation{{Op: pb.Op_PUT, Key: fenced, Value: []byte("v")}}, 101))
 }
+
+// A tombstone on the primary route must hide the legacy wide-column value even
+// when a newer version sits above the read timestamp. The remote fallback probe
+// used to compare only the newest commit timestamp, so latest > ts read as "not
+// visible here", the point read fell through to the legacy route, and the
+// snapshot read between the tombstone and the newer write resurrected the old
+// value.
+func TestShardStorePointReadStopsLegacyFallbackOnRemoteTombstone(t *testing.T) {
+	t.Parallel()
+
+	const readTS = uint64(100)
+
+	tests := []struct {
+		name             string
+		versionVisible   bool
+		versionSupported bool
+		wantLegacyValue  bool
+	}{
+		{
+			name:             "leader reports a version visible at the read ts",
+			versionVisible:   true,
+			versionSupported: true,
+			wantLegacyValue:  false,
+		},
+		{
+			name:             "leader reports no version at or before the read ts",
+			versionVisible:   false,
+			versionSupported: true,
+			wantLegacyValue:  true,
+		},
+		{
+			// Pre-upgrade peer: the probe is unanswered, so the caller keeps
+			// the old latest-commit heuristic rather than treating the silence
+			// as "no version".
+			name:             "peer predating the probe falls back to the heuristic",
+			versionVisible:   false,
+			versionSupported: false,
+			wantLegacyValue:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := &fakeRawKVServer{
+				getResp: &pb.RawGetResponse{Exists: false},
+				latestResp: &pb.RawLatestCommitTSResponse{
+					// Newer than readTS, which is what defeats the heuristic.
+					Ts:                      readTS + 100,
+					Exists:                  true,
+					VersionVisible:          tt.versionVisible,
+					VersionVisibleSupported: tt.versionSupported,
+				},
+			}
+			addr, stop := startRawKVServer(t, fake)
+			t.Cleanup(stop)
+
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 5,
+				Routes: []distribution.RouteDescriptor{
+					// Raw "!hs|fld|..." keys sort below "m" and stay on group 2.
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+					// The logical user key "zulu" lives on group 1.
+					{RouteID: 2, Start: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+				},
+			}))
+
+			legacyStore := store.NewMVCCStore()
+			groups := map[uint64]*ShardGroup{
+				1: {Store: store.NewMVCCStore(), Engine: &stubFollowerEngine{leaderAddr: addr}},
+				2: {Store: legacyStore},
+			}
+			st := NewShardStore(engine, groups)
+			t.Cleanup(func() { _ = st.Close() })
+
+			ctx := context.Background()
+			fieldKey := store.HashFieldKey([]byte("zulu"), []byte("f"))
+			require.NoError(t, legacyStore.PutAt(ctx, fieldKey, []byte("legacy"), 1, 0))
+
+			got, err := st.GetAt(ctx, fieldKey, readTS)
+			if tt.wantLegacyValue {
+				require.NoError(t, err)
+				require.Equal(t, []byte("legacy"), got)
+				return
+			}
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
+}
+
+// The server half: a group-scoped presence probe is answered from the group's
+// own store, and requests that do not ask leave both response fields unset.
+func TestShardStoreVersionExistsAtOrBeforeGroupWithReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: store.NewMVCCStore()}})
+	t.Cleanup(func() { _ = st.Close() })
+
+	key := []byte("k")
+	require.NoError(t, st.PutAt(ctx, key, []byte("v"), 50, 0))
+
+	visible, ok, err := st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 1, 100, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, visible)
+
+	visible, ok, err = st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 1, 10, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, visible)
+
+	// Unknown group: authoritative "no version" rather than an unanswered probe.
+	visible, ok, err = st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 99, 100, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, visible)
+}

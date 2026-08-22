@@ -1121,3 +1121,101 @@ func TestGRPCServer_RawScanAt_GroupedReversePreservesCallerReadRouteVersion(t *t
 	require.NoError(t, err)
 	require.Equal(t, uint64(97), st.scanReadRouteVersion)
 }
+
+type recordingVersionPresenceStore struct {
+	store.MVCCStore
+
+	visible   bool
+	supported bool
+	calls     int
+	lastKey   []byte
+	lastGroup uint64
+	lastTS    uint64
+}
+
+func (s *recordingVersionPresenceStore) VersionExistsAtOrBeforeGroupWithReadFence(
+	_ context.Context, key []byte, groupID uint64, ts uint64, _ uint64,
+) (bool, bool, error) {
+	s.calls++
+	s.lastKey = append([]byte(nil), key...)
+	s.lastGroup = groupID
+	s.lastTS = ts
+	return s.visible, s.supported, nil
+}
+
+// version_visible_at_ts is optional: only a request that asks gets an answer,
+// and a store that cannot answer must not look like "no version exists".
+func TestGRPCServer_RawLatestCommitTS_VersionVisibleProbe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		visibleAtTS    uint64
+		storeVisible   bool
+		storeSupported bool
+		wantCalls      int
+		wantVisible    bool
+		wantSupported  bool
+	}{
+		{
+			name:        "no probe requested",
+			visibleAtTS: 0,
+			wantCalls:   0,
+		},
+		{
+			name:           "version visible at the read timestamp",
+			visibleAtTS:    100,
+			storeVisible:   true,
+			storeSupported: true,
+			wantCalls:      1,
+			wantVisible:    true,
+			wantSupported:  true,
+		},
+		{
+			name:           "no version at or before the read timestamp",
+			visibleAtTS:    100,
+			storeVisible:   false,
+			storeSupported: true,
+			wantCalls:      1,
+			wantVisible:    false,
+			wantSupported:  true,
+		},
+		{
+			name:           "store cannot answer authoritatively",
+			visibleAtTS:    100,
+			storeVisible:   false,
+			storeSupported: false,
+			wantCalls:      1,
+			wantVisible:    false,
+			wantSupported:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := &recordingVersionPresenceStore{
+				MVCCStore: store.NewMVCCStore(),
+				visible:   tt.storeVisible,
+				supported: tt.storeSupported,
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			s := NewGRPCServer(st, nil)
+
+			resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+				Key:                []byte("k"),
+				VersionVisibleAtTs: tt.visibleAtTS,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantVisible, resp.GetVersionVisible())
+			require.Equal(t, tt.wantSupported, resp.GetVersionVisibleSupported())
+			require.Equal(t, tt.wantCalls, st.calls)
+			if tt.wantCalls == 0 {
+				return
+			}
+			require.Equal(t, []byte("k"), st.lastKey)
+			require.Equal(t, tt.visibleAtTS, st.lastTS)
+		})
+	}
+}

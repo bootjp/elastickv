@@ -231,15 +231,89 @@ func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, k
 	return s.getGroupAt(ctx, g, key, ts, route.GroupID, readRouteVersion)
 }
 
+// routeHasLatestVersionVisibleAt reports whether this route can answer the read
+// itself, which is what stops the point-read fallback from trying the legacy
+// wide-column route. It tries three sources in order: an exact local check, an
+// exact probe on the route's leader, and only then the latest-commit heuristic.
+//
+// The heuristic is last because it is wrong in one specific case: a key with a
+// tombstone at or before ts and a newer version above it has latest > ts, so it
+// reports "not visible here", the caller falls through to the legacy route, and
+// a snapshot read between those two timestamps resurrects the legacy value the
+// tombstone should hide.
 func (s *ShardStore) routeHasLatestVersionVisibleAt(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, error) {
 	if exists, ok, err := s.routeHasVersionAtOrBefore(ctx, route, key, ts); ok || err != nil {
 		return exists, err
+	}
+	if visible, ok, err := s.routeHasVersionAtOrBeforeRemote(ctx, route, key, ts, readRouteVersion); ok || err != nil {
+		return visible, err
 	}
 	latest, exists, err := s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
 	if err != nil {
 		return false, err
 	}
 	return exists && latest <= ts, nil
+}
+
+// routeHasVersionAtOrBeforeRemote asks the route's leader the exact question a
+// non-leader replica cannot answer locally. The second bool reports whether the
+// peer answered at all: one that predates version_visible_at_ts leaves the
+// response fields unset, and the caller falls back to the heuristic rather than
+// silently treating "unknown" as "no version".
+func (s *ShardStore) routeHasVersionAtOrBeforeRemote(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, bool, error) {
+	if ts == 0 {
+		return false, false, nil
+	}
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil {
+		return false, false, nil
+	}
+	engine := engineForGroup(g)
+	if engine == nil {
+		return false, false, nil
+	}
+	addr := leaderAddrFromEngine(engine)
+	if addr == "" {
+		return false, false, nil
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return false, false, err
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
+	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(rpcCtx, &pb.RawLatestCommitTSRequest{
+		Key:                key,
+		ReadRouteVersion:   readRouteVersion,
+		GroupId:            route.GroupID,
+		VersionVisibleAtTs: ts,
+	})
+	if err != nil {
+		return false, false, errors.WithStack(err)
+	}
+	if !resp.GetVersionVisibleSupported() {
+		return false, false, nil
+	}
+	return resp.GetVersionVisible(), true, nil
+}
+
+// VersionExistsAtOrBeforeGroupWithReadFence serves the remote half of
+// routeHasVersionAtOrBeforeRemote. The second bool reports whether this node
+// could answer authoritatively; a replica that is no longer the group leader
+// says no rather than guessing.
+func (s *ShardStore) VersionExistsAtOrBeforeGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, ts uint64, readRouteVersion uint64) (bool, bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return false, false, err
+	}
+	route := distribution.Route{GroupID: groupID}
+	if groupID == 0 {
+		resolved, ok := s.engine.GetRoute(routeKey(key))
+		if !ok {
+			return false, true, nil
+		}
+		route = resolved
+	}
+	return s.routeHasVersionAtOrBefore(ctx, route, key, ts)
 }
 
 func (s *ShardStore) routeHasVersionAtOrBefore(ctx context.Context, route distribution.Route, key []byte, ts uint64) (bool, bool, error) {
