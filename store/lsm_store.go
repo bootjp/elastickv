@@ -1099,7 +1099,12 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	plain, err := s.decryptForKey(k, sv, sv.Value)
+	// Decrypt (authenticating the value header via the AAD) before branching,
+	// but leave the plaintext compressed until the version is known live: an
+	// expired or tombstoned row is discarded, and expanding it first costs up
+	// to maxSnapshotValueSize per read and turns malformed compressed bytes on
+	// a dead row into a read error instead of an absent key.
+	plain, flag, err := s.decryptAuthenticatedForKey(k, sv, sv.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -1109,7 +1114,7 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
 		return nil, ErrKeyNotFound
 	}
-	return plain, nil
+	return finishAuthenticatedValue(plain, flag)
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -1259,15 +1264,20 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	// per-value AAD authenticates the header bits we are about to
 	// branch on. See readVisibleVersion for the matching rationale:
 	// a flipped tombstone or lowered expireAt would otherwise force
-	// a silent skip on an encrypted entry.
-	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	// a silent skip on an encrypted entry. Decompression is deferred
+	// past the checks so a skipped version never pays the expansion.
+	plain, flag, err := s.decryptAuthenticatedForKey(iter.Key(), sv, sv.Value)
 	if err != nil {
 		return nil, err
 	}
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
+		value, finishErr := finishAuthenticatedValue(plain, flag)
+		if finishErr != nil {
+			return nil, finishErr
+		}
 		return &KVPair{
 			Key:   userKey,
-			Value: plain,
+			Value: value,
 		}, nil
 	}
 	return nil, nil

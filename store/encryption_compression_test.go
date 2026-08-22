@@ -341,3 +341,80 @@ func TestPebbleCompressionPolicy(t *testing.T) {
 		})
 	}
 }
+
+// newCompressionTestStore builds an encrypted pebbleStore whose cipher is
+// backed by a single freshly generated DEK.
+func newCompressionTestStore(t *testing.T, keyID uint32) *pebbleStore {
+	t.Helper()
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	if _, err := rand.Read(dek); err != nil {
+		t.Fatalf("rand.Read DEK: %v", err)
+	}
+	if err := ks.Set(keyID, dek); err != nil {
+		t.Fatalf("Keystore.Set: %v", err)
+	}
+	cipher, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	return &pebbleStore{
+		cipher:             cipher,
+		nonceFactory:       NewCounterNonceFactory(0x0102, 0x0304),
+		activeStorageKeyID: func() (uint32, bool) { return keyID, true },
+	}
+}
+
+// An expired or tombstoned version is discarded, so it must never pay the
+// decompression. Corrupting the compressed body of a dead row is the probe:
+// if the read path still expands it, the corruption surfaces as a read error
+// instead of the absent key the caller should see.
+func TestEncryptedReadDefersDecompressionPastVisibilityChecks(t *testing.T) {
+	t.Parallel()
+
+	s := newCompressionTestStore(t, 211)
+
+	// Highly compressible so encryptForKey actually sets the compression flag.
+	plaintext := bytes.Repeat([]byte("abcdefgh"), 4096)
+	key := []byte("deferred-decompress")
+	pebbleKey := encodeKey(key, 100)
+
+	const expireAt = uint64(50)
+	body, encState, err := s.encryptForKey(pebbleKey, plaintext, expireAt, false)
+	if err != nil {
+		t.Fatalf("encryptForKey: %v", err)
+	}
+	sv := storedValue{Value: body, EncState: encState, ExpireAt: expireAt}
+
+	// The header is authenticated either way, so this still decrypts cleanly;
+	// only the expansion is skipped.
+	authenticated, flag, err := s.decryptAuthenticatedForKey(pebbleKey, sv, body)
+	if err != nil {
+		t.Fatalf("decryptAuthenticatedForKey: %v", err)
+	}
+	if flag&encryption.FlagCompressed == 0 {
+		t.Fatal("test value was not compressed; the deferral has nothing to skip")
+	}
+	if len(authenticated) >= len(plaintext) {
+		t.Fatalf("authenticated body already expanded: got=%d plaintext=%d", len(authenticated), len(plaintext))
+	}
+
+	// Live: the caller finishes the value and gets the original bytes back.
+	got, err := finishAuthenticatedValue(authenticated, flag)
+	if err != nil {
+		t.Fatalf("finishAuthenticatedValue: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("round-trip mismatch")
+	}
+
+	// Dead: skipping the finish step is what keeps an expired row from
+	// allocating its full expansion on every read.
+	corrupted := append([]byte(nil), authenticated...)
+	for i := range corrupted {
+		corrupted[i] ^= 0xff
+	}
+	if _, err := finishAuthenticatedValue(corrupted, flag); err == nil {
+		t.Fatal("corrupted compressed body decoded; the probe cannot detect expansion")
+	}
+}

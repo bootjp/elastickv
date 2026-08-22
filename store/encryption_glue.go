@@ -434,18 +434,38 @@ func (s *pebbleStore) authenticateForKey(pebbleKey []byte, sv storedValue, body 
 }
 
 func (s *pebbleStore) decryptForKeyMode(pebbleKey []byte, sv storedValue, body []byte, decompress bool) ([]byte, error) {
+	plain, flag, err := s.decryptAuthenticatedForKey(pebbleKey, sv, body)
+	if err != nil {
+		return nil, err
+	}
+	if !decompress {
+		return plain, nil
+	}
+	return finishAuthenticatedValue(plain, flag)
+}
+
+// decryptAuthenticatedForKey performs the envelope decode and GCM open and
+// returns plaintext that is still compressed when the envelope carries the
+// compression flag, along with that flag.
+//
+// Splitting the expansion out lets a caller run the tombstone / expireAt
+// visibility checks on authenticated header bytes and then skip
+// finishAuthenticatedValue entirely for a version it is going to discard. The
+// AAD still covers the value header, so the security property that motivates
+// decrypting before branching is unchanged; only the decompression moves.
+func (s *pebbleStore) decryptAuthenticatedForKey(pebbleKey []byte, sv storedValue, body []byte) ([]byte, byte, error) {
 	if sv.EncState == encStateCleartext {
 		if err := s.rejectRebadgedEnvelope(pebbleKey, sv, body); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		return body, nil
+		return body, 0, nil
 	}
 	if s.cipher == nil {
-		return nil, errors.New("store: encrypted value present but no cipher configured")
+		return nil, 0, errors.New("store: encrypted value present but no cipher configured")
 	}
 	env, err := encryption.DecodeEnvelope(body)
 	if err != nil {
-		return nil, errors.Wrap(err, "store: decode envelope")
+		return nil, 0, errors.Wrap(err, "store: decode envelope")
 	}
 	var hdr [valueHeaderSize]byte
 	writeValueHeaderBytes(hdr[:], sv.Tombstone, sv.ExpireAt, sv.EncState)
@@ -453,17 +473,21 @@ func (s *pebbleStore) decryptForKeyMode(pebbleKey []byte, sv storedValue, body [
 	plain, err := s.cipher.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])
 	if err != nil {
 		if errors.Is(err, encryption.ErrIntegrity) {
-			return nil, errors.Wrap(
+			return nil, 0, errors.Wrap(
 				errors.WithSecondaryError(ErrEncryptedReadIntegrity, err),
 				"store: decrypt value")
 		}
-		return nil, errors.Wrap(err, "store: decrypt value")
+		return nil, 0, errors.Wrap(err, "store: decrypt value")
 	}
-	if decompress {
-		plain, err = decompressAuthenticatedValue(plain, env.Flag)
-		if err != nil {
-			return nil, err
-		}
+	return plain, env.Flag, nil
+}
+
+// finishAuthenticatedValue expands an authenticated plaintext and normalizes
+// the empty case. Only call it for a version that is actually being returned.
+func finishAuthenticatedValue(plain []byte, flag byte) ([]byte, error) {
+	plain, err := decompressAuthenticatedValue(plain, flag)
+	if err != nil {
+		return nil, err
 	}
 	// AES-GCM Open returns a nil dst slice for an empty plaintext;
 	// upstream callers (notably ExistsAt) distinguish "key absent"
