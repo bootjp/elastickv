@@ -33,6 +33,13 @@ type KeyVizSampler interface {
 	Snapshot(from, to time.Time) []keyviz.MatrixColumn
 }
 
+// AutoSplitRuntime is the atomic runtime control exposed by the authenticated
+// Admin service.
+type AutoSplitRuntime interface {
+	Enabled() bool
+	SetEnabled(enabled bool)
+}
+
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
 // standing up a real Raft cluster. Configuration is polled on each
@@ -77,7 +84,8 @@ type AdminServer struct {
 	// Nil means keyviz is disabled — the RPC returns Unavailable.
 	// Guarded by groupsMu (same lock as groups/now) so RegisterSampler
 	// pairs atomically with concurrent RPC reads.
-	sampler KeyVizSampler
+	sampler          KeyVizSampler
+	autoSplitRuntime AutoSplitRuntime
 
 	pb.UnimplementedAdminServer
 }
@@ -143,6 +151,32 @@ func (s *AdminServer) SetCapability(name string, enabled bool) {
 	s.groupsMu.Lock()
 	s.capabilities[name] = enabled
 	s.groupsMu.Unlock()
+}
+
+// RegisterAutoSplitRuntime wires the process-local automatic split switch.
+func (s *AdminServer) RegisterAutoSplitRuntime(runtime AutoSplitRuntime) {
+	s.groupsMu.Lock()
+	s.autoSplitRuntime = runtime
+	s.groupsMu.Unlock()
+}
+
+// SetAutoSplitEnabled atomically changes whether the scheduler may issue new
+// SplitRange calls. Detector observation continues while disabled.
+func (s *AdminServer) SetAutoSplitEnabled(
+	_ context.Context,
+	req *pb.SetAutoSplitEnabledRequest,
+) (*pb.SetAutoSplitEnabledResponse, error) {
+	if req == nil {
+		return nil, grpcStatusError(codes.InvalidArgument, "request is required")
+	}
+	s.groupsMu.RLock()
+	runtime := s.autoSplitRuntime
+	s.groupsMu.RUnlock()
+	if runtime == nil {
+		return nil, grpcStatusError(codes.Unavailable, "automatic splitting is not configured")
+	}
+	runtime.SetEnabled(req.GetEnabled())
+	return &pb.SetAutoSplitEnabledResponse{Enabled: runtime.Enabled()}, nil
 }
 
 // GetClusterOverview returns the local node identity, the current member
