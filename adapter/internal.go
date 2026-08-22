@@ -12,6 +12,14 @@ import (
 
 type InternalOption func(*Internal)
 
+// WithInternalWriteGate re-applies the coordinator's route-floor check to
+// writes that were forwarded here from a follower.
+func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
+	return func(i *Internal) {
+		i.writeGate = gate
+	}
+}
+
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
@@ -37,6 +45,7 @@ type Internal struct {
 	clock              *kv.HLC
 	tsAllocator        kv.TimestampAllocator
 	relay              *RedisPubSubRelay
+	writeGate          kv.MutationWriteGate
 
 	pb.UnimplementedInternalServer
 }
@@ -162,16 +171,32 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts != 0 {
-			continue
+		if r.Ts == 0 {
+			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
+			if err != nil {
+				return err
+			}
+			r.Ts = ts
 		}
-		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
-		if err != nil {
+		// The follower that forwarded this write could not run the route-floor
+		// check: its own stamping path bails out when the group engine is not
+		// leader, so the timestamp only exists once we assign it here. Without
+		// this the write would reach Raft through the bare TransactionManager
+		// below with no MinWriteTSExclusive check at all. Already-stamped
+		// requests are re-checked too, because the floor may have advanced
+		// since the sender stamped them.
+		if err := i.ensureRawWriteAllowed(r); err != nil {
 			return err
 		}
-		r.Ts = ts
 	}
 	return nil
+}
+
+func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
+	if i.writeGate == nil || r == nil {
+		return nil
+	}
+	return errors.WithStack(i.writeGate.EnsureMutationsWriteAllowed(r.Mutations, r.Ts))
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {

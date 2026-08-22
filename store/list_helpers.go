@@ -159,6 +159,31 @@ func ExtractListUserKeyFromClaimScanPrefix(key []byte) []byte {
 	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListClaimPrefix))
 }
 
+// ExtractListUserKeyFromDeltaScanKey extracts the logical user key from a
+// delta scan prefix, a full delta key, or a scan cursor within that prefix.
+// Unlike ExtractListUserKeyFromDeltaScanPrefix it tolerates trailing bytes,
+// because a resumed scan starts from a cursor inside the prefix rather than
+// from the prefix itself.
+func ExtractListUserKeyFromDeltaScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromClaimScanKey extracts the logical user key from a
+// claim scan prefix, a full claim key, or a scan cursor within that prefix.
+func ExtractListUserKeyFromClaimScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListClaimPrefix))
+}
+
+func extractListUserKeyFromScanKey(key []byte, prefix []byte) []byte {
+	trimmed, ok := bytes.CutPrefix(key, prefix)
+	if !ok {
+		return nil
+	}
+	// suffixLen 0: any bytes past the user key are scan-cursor tail, not a
+	// fixed encoded suffix, so only the length prefix has to be satisfied.
+	return extractListUserKeyFromLenPrefixedKey(trimmed, 0)
+}
+
 func extractListUserKeyFromLenPrefixedScanPrefix(key []byte, prefix []byte) []byte {
 	if !bytes.HasPrefix(key, prefix) {
 		return nil

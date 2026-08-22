@@ -322,12 +322,16 @@ func routeDescriptorFromProto(raw *pb.RouteDescriptor) (RouteDescriptor, error) 
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogWatchEventInvalid)
 	}
 	route := RouteDescriptor{
-		RouteID:       raw.GetRouteId(),
-		Start:         CloneBytes(raw.GetStart()),
-		End:           CloneBytes(raw.GetEnd()),
-		GroupID:       raw.GetRaftGroupId(),
-		State:         state,
-		ParentRouteID: raw.GetParentRouteId(),
+		RouteID:                raw.GetRouteId(),
+		Start:                  CloneBytes(raw.GetStart()),
+		End:                    CloneBytes(raw.GetEnd()),
+		GroupID:                raw.GetRaftGroupId(),
+		State:                  state,
+		ParentRouteID:          raw.GetParentRouteId(),
+		SplitAtHLC:             raw.GetSplitAtHlc(),
+		StagedVisibilityActive: raw.GetStagedVisibilityActive(),
+		MigrationJobID:         raw.GetMigrationJobId(),
+		MinWriteTSExclusive:    raw.GetMinWriteTsExclusive(),
 	}
 	if err := validateRouteDescriptor(route); err != nil {
 		return RouteDescriptor{}, err
