@@ -142,14 +142,14 @@ func (s *ShardStore) ValidateBackupSnapshotAt(ctx context.Context, snapshot Back
 		if !ok || group == nil || group.Store == nil {
 			return errors.Wrapf(ErrLeaderNotFound, "backup lock validation group %d is unavailable", groupID)
 		}
-		if err := s.validateBackupGroupLocksAt(ctx, group, ts, pageSize); err != nil {
+		if err := s.validateBackupGroupLocksAt(ctx, snapshot, group, ts, pageSize); err != nil {
 			return errors.Wrapf(err, "validate backup locks for group %d", groupID)
 		}
 	}
 	return nil
 }
 
-func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *ShardGroup, ts uint64, pageSize int) error {
+func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, snapshot BackupRouteSnapshot, group *ShardGroup, ts uint64, pageSize int) error {
 	cursor := txnLockKey(nil)
 	end := prefixScanEnd([]byte(txnLockPrefix))
 	for {
@@ -160,7 +160,7 @@ func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *Shar
 		if len(locks) == 0 {
 			return nil
 		}
-		plan, err := s.planBackupLockResolutionsAt(ctx, locks, ts)
+		plan, err := s.planBackupLockResolutionsAt(ctx, snapshot, locks, ts)
 		if err != nil {
 			return err
 		}
@@ -181,17 +181,17 @@ func (s *ShardStore) validateBackupGroupLocksAt(ctx context.Context, group *Shar
 	}
 }
 
-func (s *ShardStore) planBackupLockResolutionsAt(ctx context.Context, lockKVs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
+func (s *ShardStore) planBackupLockResolutionsAt(ctx context.Context, snapshot BackupRouteSnapshot, lockKVs []*store.KVPair, ts uint64) (*scanLockPlan, error) {
 	plan := newScanLockPlan(len(lockKVs))
 	for _, kvp := range lockKVs {
-		if err := s.planBackupLockResolutionAt(ctx, plan, kvp, ts); err != nil {
+		if err := s.planBackupLockResolutionAt(ctx, snapshot, plan, kvp, ts); err != nil {
 			return nil, err
 		}
 	}
 	return plan, nil
 }
 
-func (s *ShardStore) planBackupLockResolutionAt(ctx context.Context, plan *scanLockPlan, kvp *store.KVPair, ts uint64) error {
+func (s *ShardStore) planBackupLockResolutionAt(ctx context.Context, snapshot BackupRouteSnapshot, plan *scanLockPlan, kvp *store.KVPair, ts uint64) error {
 	if kvp == nil {
 		return nil
 	}
@@ -207,7 +207,7 @@ func (s *ShardStore) planBackupLockResolutionAt(ctx context.Context, plan *scanL
 		return errors.Wrapf(ErrTxnInvalidMeta, "missing txn primary key for key %s", string(userKey))
 	}
 	txnKey := lockTxnKey{startTS: lock.StartTS, primary: string(lock.PrimaryKey)}
-	state, err := s.cachedBackupLockTxnStatusAt(ctx, plan, lock, txnKey, ts)
+	state, err := s.cachedBackupLockTxnStatusAt(ctx, snapshot, plan, lock, txnKey, ts)
 	if err != nil {
 		return err
 	}
@@ -221,6 +221,7 @@ func (s *ShardStore) planBackupLockResolutionAt(ctx context.Context, plan *scanL
 
 func (s *ShardStore) cachedBackupLockTxnStatusAt(
 	ctx context.Context,
+	snapshot BackupRouteSnapshot,
 	plan *scanLockPlan,
 	lock txnLock,
 	txnKey lockTxnKey,
@@ -229,7 +230,7 @@ func (s *ShardStore) cachedBackupLockTxnStatusAt(
 	if state, ok := plan.statusCache[txnKey]; ok {
 		return state, nil
 	}
-	status, commitTS, err := s.primaryTxnRecordedStatusAt(ctx, lock.PrimaryKey, lock.StartTS, ts)
+	status, commitTS, err := s.primaryTxnRecordedStatusAt(ctx, snapshot, lock.PrimaryKey, lock.StartTS, ts)
 	if err != nil {
 		return lockTxnStatus{}, err
 	}
@@ -238,15 +239,21 @@ func (s *ShardStore) cachedBackupLockTxnStatusAt(
 	return state, nil
 }
 
-func (s *ShardStore) primaryTxnRecordedStatusAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (txnStatus, uint64, error) {
-	commitTS, committed, err := s.txnCommitTSAt(ctx, primaryKey, startTS, ts)
+func (s *ShardStore) primaryTxnRecordedStatusAt(
+	ctx context.Context,
+	snapshot BackupRouteSnapshot,
+	primaryKey []byte,
+	startTS uint64,
+	ts uint64,
+) (txnStatus, uint64, error) {
+	commitTS, committed, err := s.txnCommitTSAt(ctx, snapshot, primaryKey, startTS, ts)
 	if err != nil {
 		return txnStatusPending, 0, err
 	}
 	if committed && commitTS <= ts {
 		return txnStatusCommitted, commitTS, nil
 	}
-	rolledBack, err := s.hasTxnRollbackAt(ctx, primaryKey, startTS, ts)
+	rolledBack, err := s.hasTxnRollbackAt(ctx, snapshot, primaryKey, startTS, ts)
 	if err != nil {
 		return txnStatusPending, 0, err
 	}
@@ -256,8 +263,44 @@ func (s *ShardStore) primaryTxnRecordedStatusAt(ctx context.Context, primaryKey 
 	return txnStatusPending, 0, nil
 }
 
-func (s *ShardStore) txnCommitTSAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (uint64, bool, error) {
-	b, err := s.GetAt(ctx, txnCommitKey(primaryKey, startTS), ts)
+// capturedBackupGetAt reads key through the route that owned it at the captured
+// read timestamp, falling back to live routing when the snapshot has no route
+// covering it.
+//
+// Backup lock validation must not resolve a transaction's commit or rollback
+// record through live routing: the locks come from the captured route set, so
+// if the primary key's route moved after read_ts the live table points at the
+// new owner, the historical record is not there, and an already-resolved
+// transaction reads as pending -- failing BeginBackup on a clean snapshot.
+func (s *ShardStore) capturedBackupGetAt(
+	ctx context.Context,
+	snapshot BackupRouteSnapshot,
+	key []byte,
+	ts uint64,
+) ([]byte, error) {
+	rkey := routeKey(key)
+	for _, route := range snapshot.routes {
+		if !routeContainsKey(route, rkey) {
+			continue
+		}
+		g, ok := s.groupForID(route.GroupID)
+		if !ok || g == nil || g.Store == nil {
+			break
+		}
+		val, err := g.Store.GetAt(ctx, key, ts)
+		return val, errors.WithStack(err)
+	}
+	return s.GetAt(ctx, key, ts)
+}
+
+func (s *ShardStore) txnCommitTSAt(
+	ctx context.Context,
+	snapshot BackupRouteSnapshot,
+	primaryKey []byte,
+	startTS uint64,
+	ts uint64,
+) (uint64, bool, error) {
+	b, err := s.capturedBackupGetAt(ctx, snapshot, txnCommitKey(primaryKey, startTS), ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, false, nil
@@ -271,8 +314,14 @@ func (s *ShardStore) txnCommitTSAt(ctx context.Context, primaryKey []byte, start
 	return cts, true, nil
 }
 
-func (s *ShardStore) hasTxnRollbackAt(ctx context.Context, primaryKey []byte, startTS uint64, ts uint64) (bool, error) {
-	_, err := s.GetAt(ctx, txnRollbackKey(primaryKey, startTS), ts)
+func (s *ShardStore) hasTxnRollbackAt(
+	ctx context.Context,
+	snapshot BackupRouteSnapshot,
+	primaryKey []byte,
+	startTS uint64,
+	ts uint64,
+) (bool, error) {
+	_, err := s.capturedBackupGetAt(ctx, snapshot, txnRollbackKey(primaryKey, startTS), ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return false, nil

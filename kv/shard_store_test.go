@@ -2065,3 +2065,67 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
 }
+
+// Backup lock validation scans locks from the captured route set, so it must
+// resolve the transaction's commit record through that same captured route. If
+// the primary key's route moves after read_ts, resolving through live routing
+// looks in the new owner's group, misses the historical commit record, and
+// reports an already-committed transaction as pending -- failing BeginBackup on
+// a clean snapshot.
+func TestValidateBackupSnapshotAtResolvesStatusThroughCapturedRoute(t *testing.T) {
+	ctx := context.Background()
+
+	oldStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = oldStore.Close() })
+	newStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = newStore.Close() })
+
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		oldStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("moved-key")
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{
+		IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+				PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+			})},
+			{Op: pb.Op_PUT, Key: primary, Value: []byte("v")},
+		},
+	}))
+	// Record the commit decision directly so the lock row survives the scan.
+	// This is the shape the finding is about: validation still sees a lock and
+	// must consult the primary's commit record to learn it is already resolved.
+	require.NoError(t, oldStore.PutAt(ctx, txnCommitKey(primary, 30), encodeTxnCommitRecord(40), 40, 0))
+
+	// Live routing now sends the primary key to group 2, which holds none of
+	// the transaction's records; the captured snapshot still points at group 1.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: oldStore},
+		2: {Store: newStore},
+	})
+
+	captured := BackupRouteSnapshot{
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+		scanGroups: []uint64{1},
+	}
+
+	err := shards.ValidateBackupSnapshotAt(ctx, captured, 50, 16)
+	// This harness wires no proposer, so applying the resolution itself fails
+	// with ErrNotSupported. What matters is which way the status resolved: the
+	// transaction must be recognised as already committed rather than reported
+	// as still pending, which is what ErrTxnLocked would mean.
+	require.NotErrorIs(t, err, ErrTxnLocked,
+		"the committed transaction must resolve through the captured route, not the new owner")
+}
