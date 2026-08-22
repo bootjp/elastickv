@@ -879,8 +879,16 @@ func TestBackupTokenDeadlineRotatesAndFailsClosed(t *testing.T) {
 	require.NotEqual(t, begin.GetPinToken(), renewed.GetPinToken())
 
 	nowMS.Add((20 * time.Millisecond).Milliseconds())
-	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	// The superseded token is past its own deadline, but the live session for
+	// the same pin still is not. This is the lost-response retry: the client
+	// only has the old token, and refusing it would strand a backup whose pin
+	// is still live and still fencing retention. The renewal is accepted and
+	// hands back a current token.
+	retried, err := srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+	require.NoError(t, err)
+	require.NotEqual(t, begin.GetPinToken(), retried.GetPinToken())
+	// Data-plane calls still fail closed on the expired token: only renewal is
+	// retryable, and only while the session outlives the token.
 	_, err = srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{PinToken: begin.GetPinToken()})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, &backupTestStream{ctx: context.Background()})
@@ -979,4 +987,102 @@ func TestBeginBackupMapsForwardedCapacityReservationStatusToResourceExhausted(t 
 
 	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
+// EndBackup must refuse renewals from the moment it starts releasing. Leaving
+// the session live across the release proposals let an overlapping renewal
+// commit a fresh Pin behind the Release, so the pin stayed active until its
+// deadline and kept blocking compaction and capacity for an ended backup.
+func TestEndBackupRejectsOverlappingRenewal(t *testing.T) {
+	t.Parallel()
+
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, &backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	tok, err := srv.decodeBackupToken(begin.GetPinToken())
+	require.NoError(t, err)
+
+	// Stand where EndBackup stands once it has begun releasing.
+	srv.closeBackupSession(tok.pinID)
+
+	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+	require.Error(t, err, "a renewal must not extend a pin that EndBackup is releasing")
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	// The session is still closing, so a direct extend is refused too.
+	require.False(t, srv.extendBackupSession(tok))
+
+	_, err = srv.EndBackup(context.Background(), &pb.EndBackupRequest{PinToken: begin.GetPinToken()})
+	require.NoError(t, err)
+}
+
+func TestRequireRenewableBackupToken(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(2_000_000, 0)
+	pinID := kv.BackupPinID{1}
+
+	tests := []struct {
+		name    string
+		session *backupSession
+		tok     backupToken
+		wantErr bool
+	}{
+		{
+			name:    "unexpired token with no session",
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(time.Minute)},
+			wantErr: false,
+		},
+		{
+			name:    "expired token with no session",
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(-time.Minute)},
+			wantErr: true,
+		},
+		{
+			name:    "expired token but the live session outlives it",
+			session: &backupSession{readTS: 7, deadline: base.Add(time.Minute)},
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(-time.Minute)},
+			wantErr: false,
+		},
+		{
+			name:    "expired token and an equally expired session",
+			session: &backupSession{readTS: 7, deadline: base.Add(-time.Second)},
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(-time.Minute)},
+			wantErr: true,
+		},
+		{
+			name:    "expired token whose session belongs to another read timestamp",
+			session: &backupSession{readTS: 8, deadline: base.Add(time.Minute)},
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(-time.Minute)},
+			wantErr: true,
+		},
+		{
+			name:    "unexpired token on a closing session",
+			session: &backupSession{readTS: 7, deadline: base.Add(time.Minute), closing: true},
+			tok:     backupToken{pinID: pinID, readTS: 7, deadline: base.Add(time.Minute)},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := &AdminServer{}
+			srv.SetClock(func() time.Time { return base })
+			if tt.session != nil {
+				srv.backupSessions = map[kv.BackupPinID]backupSession{pinID: *tt.session}
+			}
+			err := srv.requireRenewableBackupToken(tt.tok)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
