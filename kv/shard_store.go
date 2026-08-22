@@ -995,8 +995,22 @@ func isBroadLegacyListDeltaScan(start []byte) bool {
 	return logicalUserKey == nil || !bytes.Equal(start, store.LegacyListMetaDeltaScanPrefix(logicalUserKey))
 }
 
+// isLegacyListDeltaScan reports whether start addresses the legacy list-delta
+// family at all, whether broad or scoped to a single user key.
+//
+// Route-group marking must cover both shapes. Redis cleanup and compaction build
+// their delete elems as {Op: Del, Key: pair.Key, GroupID: pair.RouteGroupID}; a
+// zero GroupID falls back to routing by the raw "!lst|meta|d|..." key rather
+// than the logical list key, so after a split the delete lands on the wrong
+// shard and the stale delta survives. Route *selection* still distinguishes the
+// two shapes -- see routesForInternalScanWithVersion, where an exact scan is
+// deliberately narrowed to the logical key's routes.
+func isLegacyListDeltaScan(start []byte) bool {
+	return bytes.HasPrefix(start, []byte(store.LegacyListMetaDeltaPrefix))
+}
+
 func shouldMarkRouteGroupOnScan(start []byte, explicitGroup bool, routeStart []byte, routeEnd []byte) bool {
-	return !explicitGroup && !routeScanBoundsPresent(routeStart, routeEnd) && isBroadLegacyListDeltaScan(start)
+	return !explicitGroup && !routeScanBoundsPresent(routeStart, routeEnd) && isLegacyListDeltaScan(start)
 }
 
 func scanRouteUserKey(start []byte) []byte {
@@ -1084,7 +1098,7 @@ func (s *ShardStore) scanRoutesAtWithReadFence(ctx context.Context, routes []dis
 		if err != nil {
 			return nil, err
 		}
-		if isBroadLegacyListDeltaScan(start) && !plan.routeFilterPresent {
+		if isLegacyListDeltaScan(start) && !plan.routeFilterPresent {
 			kvs = markScanRouteGroup(kvs, route.GroupID, true)
 		}
 		if clampToRoutes {
@@ -1435,7 +1449,7 @@ func (s *ShardStore) reverseScanRoutesAtWithReadFence(
 		if err != nil {
 			return nil, err
 		}
-		if isBroadLegacyListDeltaScan(start) && !plan.routeFilterPresent {
+		if isLegacyListDeltaScan(start) && !plan.routeFilterPresent {
 			kvs = markScanRouteGroup(kvs, route.GroupID, true)
 		}
 		out = mergeAndTrimScanResultsWithOptions(out, kvs, limit, true, plan.dedupeByKey)

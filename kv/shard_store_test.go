@@ -3432,3 +3432,32 @@ func TestShardStoreS3BucketAuxiliaryReverseScanHonorsStagedTombstone(t *testing.
 	require.NoError(t, err)
 	require.Empty(t, kvs)
 }
+
+// An exact per-user-key legacy delta scan must carry RouteGroupID too. Redis
+// cleanup and compaction build their deletes as {Del, pair.Key, GroupID:
+// pair.RouteGroupID}; a zero GroupID routes the delete by the raw
+// "!lst|meta|d|..." key instead of the logical list key, so after a split it
+// lands on the wrong shard and the stale delta survives.
+func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTwoRouteShardStoreForScanTest()
+	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+
+	// "right-list" sorts into the second route's group.
+	userKey := []byte("right-list")
+	key := legacyListMetaDeltaKey(userKey, 11, 1)
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, key, deltaValue, 1, 0))
+
+	scanStart := store.LegacyListMetaDeltaScanPrefix(userKey)
+	require.False(t, isBroadLegacyListDeltaScan(scanStart),
+		"this test is only meaningful for the exact-scan shape")
+
+	kvs, err := st.ScanAt(ctx, scanStart, store.PrefixScanEnd(scanStart), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, uint64(2), kvs[0].RouteGroupID,
+		"an exact legacy delta scan must still report the owning route group")
+}
