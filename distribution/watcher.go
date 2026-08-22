@@ -206,6 +206,15 @@ func (w *CatalogWatcher) notifyLatestSnapshotObserver(ctx context.Context) error
 		return nil
 	}
 	if snapshot.Version != engineVersion {
+		// Mid-catch-up: the persisted catalog is already ahead of what the
+		// engine is serving because this batch stopped short of it. Returning
+		// here left the observer unaware of the route table actually in effect
+		// until every remaining batch applied, so writes routed to
+		// newly-applied route IDs went unattributed in KeyViz/autosplit for the
+		// whole catch-up. Notify with the engine's applied routes instead.
+		if engineVersion > w.observedVersion {
+			w.notifySnapshotObserver(w.engine.AppliedCatalogSnapshot())
+		}
 		return nil
 	}
 	w.notifySnapshotObserver(snapshot)

@@ -600,13 +600,8 @@ func (s *Scheduler) finalizePendingCompounds(
 			break
 		}
 		pending := s.pendingCompounds[parentID]
-		intermediate, ok := findActiveRoute(snapshot.Routes, pending.intermediate.RouteID)
-		if !ok || !samePendingIntermediate(intermediate, pending) ||
-			len(snapshot.Routes)+1 > s.cfg.Detector.MaxRoutes {
-			delete(s.pendingCompounds, parentID)
-			s.cfg.Logger.WarnContext(ctx, "autosplit: dropping invalid compound finalization",
-				slog.Uint64("parent_route_id", parentID),
-				slog.Uint64("intermediate_route_id", pending.intermediate.RouteID))
+		intermediate, ok := s.resolvePendingCompound(ctx, parentID, pending, snapshot)
+		if !ok {
 			continue
 		}
 		pending.intermediate = intermediate
@@ -633,6 +628,64 @@ func (s *Scheduler) finalizePendingCompounds(
 		snapshot = refreshed
 	}
 	return snapshot, scheduled, failed, attempted, false
+}
+
+// resolvePendingCompound validates one pending entry immediately before it is
+// finalized, dropping it when this node no longer leads the intermediate
+// route's shard or when the route itself has moved on.
+func (s *Scheduler) resolvePendingCompound(
+	ctx context.Context,
+	parentID uint64,
+	pending pendingCompound,
+	snapshot distribution.CatalogSnapshot,
+) (distribution.RouteDescriptor, bool) {
+	if !s.leadsPendingCompoundGroup(pending) {
+		delete(s.pendingCompounds, parentID)
+		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping compound finalization without shard leadership",
+			slog.Uint64("parent_route_id", parentID),
+			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID),
+			slog.Uint64("group_id", pending.intermediate.GroupID))
+		return distribution.RouteDescriptor{}, false
+	}
+	intermediate, ok := findActiveRoute(snapshot.Routes, pending.intermediate.RouteID)
+	if !ok || !samePendingIntermediate(intermediate, pending) ||
+		len(snapshot.Routes)+1 > s.cfg.Detector.MaxRoutes {
+		delete(s.pendingCompounds, parentID)
+		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping invalid compound finalization",
+			slog.Uint64("parent_route_id", parentID),
+			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID))
+		return distribution.RouteDescriptor{}, false
+	}
+	return intermediate, true
+}
+
+// leadsPendingCompoundGroup rechecks shard leadership immediately before a
+// compound finalization.
+//
+// routesLedLocally already drops pending entries for groups this node no longer
+// leads, but it runs on its own cadence. Without this recheck a node that lost
+// leadership for the intermediate route's group since the last tick could still
+// finalize the second split, using evidence gathered under the previous shard
+// leader term -- and SplitRange itself only verifies catalog-key leadership, so
+// a catalog leader can mutate the catalog for a shard it no longer leads.
+//
+// The term comparison catches the lose-and-regain case: a different term means
+// the pending entry was recorded under a leadership that has since ended, so
+// its evidence no longer belongs to the current term.
+func (s *Scheduler) leadsPendingCompoundGroup(pending pendingCompound) bool {
+	if s.cfg.GroupLeadership == nil {
+		return true
+	}
+	groupID := pending.intermediate.GroupID
+	leader, term := s.cfg.GroupLeadership(groupID)
+	if !leader {
+		return false
+	}
+	previous, known := s.groupLeadership[groupID]
+	if known && previous.leader && term != 0 && previous.term != 0 && term != previous.term {
+		return false
+	}
+	return true
 }
 
 func findActiveRoute(routes []distribution.RouteDescriptor, routeID uint64) (distribution.RouteDescriptor, bool) {

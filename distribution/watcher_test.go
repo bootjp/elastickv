@@ -252,3 +252,58 @@ func (s *transientVersionReadStore) GetAt(ctx context.Context, key []byte, ts ui
 	}
 	return s.MVCCStore.GetAt(ctx, key, ts)
 }
+
+// A node catching up across more deltas than one batch advances the engine to
+// the batch's last version while the persisted catalog is already further
+// ahead. The observer must still hear about the route table the engine is
+// actually serving, otherwise writes routed to newly-applied route IDs go
+// unattributed in KeyViz/autosplit for the whole catch-up.
+func TestCatalogWatcherNotifiesAfterPartialDeltaBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	catalog := NewCatalogStore(store.NewMVCCStore())
+
+	routes := []RouteDescriptor{{
+		RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive,
+	}}
+	last, err := catalog.Save(ctx, 0, routes)
+	require.NoError(t, err)
+
+	// Three more catalog versions, each splitting off another route.
+	for i := uint64(2); i <= 4; i++ {
+		routes = append(routes, RouteDescriptor{
+			RouteID: i,
+			Start:   []byte{byte('a') + byte(i)},
+			End:     nil,
+			GroupID: i,
+			State:   RouteStateActive,
+		})
+		for j := range routes[:len(routes)-1] {
+			routes[j].End = routes[j+1].Start
+		}
+		last, err = catalog.Save(ctx, last.Version, routes)
+		require.NoError(t, err)
+	}
+	require.Equal(t, uint64(4), last.Version)
+
+	var observed []CatalogSnapshot
+	watcher := NewCatalogWatcher(
+		catalog,
+		NewEngine(),
+		// One delta per sync, so the engine trails the catalog while catching up.
+		WithCatalogWatcherBatchSize(1),
+		WithCatalogWatcherSnapshotObserver(func(snapshot CatalogSnapshot) {
+			observed = append(observed, snapshot)
+		}),
+	)
+
+	require.NoError(t, watcher.SyncOnce(ctx))
+	require.NotEmpty(t, observed, "a partial catch-up batch must still notify the observer")
+
+	first := observed[0]
+	require.Equal(t, watcher.engine.Version(), first.Version,
+		"the observer must see the version the engine is actually serving")
+	require.Less(t, first.Version, last.Version, "this case is only meaningful mid-catch-up")
+	require.NotEmpty(t, first.Routes)
+}

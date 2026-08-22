@@ -810,3 +810,58 @@ func (f *fakeRegistrar) RegisterRoute(routeID uint64, start, end []byte, groupID
 func (f *fakeRegistrar) RemoveRoute(routeID uint64) {
 	f.removed = append(f.removed, routeID)
 }
+
+// A node that lost shard leadership for the intermediate route's group between
+// ticks must not finalize the pending compound: routesLedLocally would drop the
+// entry, but it runs on its own cadence, and SplitRange only checks
+// catalog-key leadership, so the second split would land using evidence from
+// the prior shard leader term.
+func TestSchedulerSkipsCompoundFinalizationWithoutShardLeadership(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7, Routes: []distribution.RouteDescriptor{testRoute(10, 1, "m", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+	scheduler.wasLeader = true
+	scheduler.cfg.GroupLeadership = func(uint64) (bool, uint64) { return false, 0 }
+	scheduler.pendingCompounds[1] = pendingCompound{
+		parentRouteID: 1,
+		intermediate:  testRoute(10, 1, "m", "z"),
+		splitKey:      []byte{'m', 0},
+	}
+
+	_, err := scheduler.Tick(context.Background(), now)
+
+	require.NoError(t, err)
+	require.Empty(t, splitter.requests, "a non-leader must not finalize the compound split")
+	require.Empty(t, scheduler.pendingCompounds, "the stale pending entry must be dropped")
+}
+
+// Losing and regaining leadership between ticks changes the term; the pending
+// entry was recorded under the earlier one, so its evidence no longer belongs
+// to the current term.
+func TestSchedulerSkipsCompoundFinalizationAfterShardTermChange(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7, Routes: []distribution.RouteDescriptor{testRoute(10, 1, "m", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+	scheduler.wasLeader = true
+	scheduler.cfg.GroupLeadership = func(uint64) (bool, uint64) { return true, 9 }
+	scheduler.groupLeadership[1] = groupLeadershipState{leader: true, term: 8}
+	scheduler.pendingCompounds[1] = pendingCompound{
+		parentRouteID: 1,
+		intermediate:  testRoute(10, 1, "m", "z"),
+		splitKey:      []byte{'m', 0},
+	}
+
+	_, err := scheduler.Tick(context.Background(), now)
+
+	require.NoError(t, err)
+	require.Empty(t, splitter.requests, "a new shard leader term must not finalize the old term's compound")
+	require.Empty(t, scheduler.pendingCompounds)
+}

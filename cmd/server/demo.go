@@ -640,7 +640,15 @@ func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport 
 	}
 	pb.RegisterRawKVServer(s, gs)
 	pb.RegisterTransactionalKVServer(s, gs)
-	pb.RegisterInternalServer(s, adapter.NewInternalWithEngine(trx, engine, coordinator.Clock(), relay))
+	// Match the production wiring in main.internalTimestampOptions: the demo
+	// auto-split scheduler runs only on the catalog/Raft leader and reads that
+	// node's local sampler, so without this a write that entered through a
+	// follower and was committed here via Internal.Forward never reaches the
+	// evidence the scheduler splits on.
+	pb.RegisterInternalServer(s, adapter.NewInternalWithEngine(
+		trx, engine, coordinator.Clock(), relay,
+		adapter.WithInternalForwardWriteObserver(coordinator.ObserveForwardedRequests),
+	))
 	pb.RegisterDistributionServer(s, distServer)
 	internalraftadmin.RegisterOperationalServices(ctx, s, engine, []string{"RawKV"})
 	return s, gs
