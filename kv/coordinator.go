@@ -413,7 +413,12 @@ func LeaseReadGroupTargets(c Coordinator, targets []ReadFenceTarget) []ReadFence
 			continue
 		}
 		seen[gid] = struct{}{}
-		out = append(out, ReadFenceTarget{GroupID: gid, Key: target.Key})
+		// Emit the target unchanged. The id resolved above is only a dedup
+		// token: Coordinate returns a synthetic constant from
+		// EngineGroupIDForKey so single-group deployments collapse to one
+		// lease, and promoting that onto the target would hand a routing
+		// path an id no group map contains.
+		out = append(out, target)
 	}
 	return out
 }

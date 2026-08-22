@@ -2286,6 +2286,40 @@ func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
 	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
 
+// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
+// group-keyed read-fence path. Without them this wrapper silently fails the
+// kv.GroupLeaderRoutableCoordinator assertion in the Redis fence and every
+// target falls back to key resolution, which is exactly the collapse
+// kv.ReadFenceTarget exists to prevent -- and it would not show up in tests that
+// use an unwrapped coordinator.
+func (c startupGatedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return false
+	}
+	return router.IsLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return ""
+	}
+	return router.RaftLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	if lr, ok := c.inner.(interface {
+		LeaseReadForGroup(context.Context, uint64) (uint64, error)
+	}); ok {
+		return lr.LeaseReadForGroup(ctx, groupID) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+	}
+	// No group-keyed lease read underneath (single-group Coordinate). Fall back
+	// to the plain lease read rather than a key-resolved one: there is no key to
+	// resolve here, and the single group is the one being fenced anyway.
+	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
 func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	if router, ok := c.inner.(kv.GroupRoutableCoordinator); ok {
 		return router.EngineGroupIDForKey(key)

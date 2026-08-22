@@ -3122,3 +3122,29 @@ func TestLeaseReadGroupTargetsKeepsLegacyGroup(t *testing.T) {
 	require.Len(t, collapsed, 1,
 		"the key-only path collapses to one group; this is the gap targets close")
 }
+
+// syntheticGroupRouter mimics Coordinate: EngineGroupIDForKey returns a constant
+// that exists only to collapse single-group deployments to one lease. It is not
+// a real group id and no group map contains it.
+type syntheticGroupRouter struct {
+	Coordinator
+}
+
+func (syntheticGroupRouter) EngineGroupIDForKey([]byte) uint64 { return 1 }
+
+// A point key carries GroupID 0, meaning "resolve from Key". Dedup must not
+// stamp the resolved id onto it: on a single-group Coordinate that id is
+// synthetic, and a later group-routed lease read or leader check would look it
+// up in a group map that has never heard of it and fail closed with
+// ErrLeaderNotFound.
+func TestLeaseReadGroupTargetsKeepsKeyResolutionForPointKeys(t *testing.T) {
+	t.Parallel()
+
+	targets := []ReadFenceTarget{{Key: []byte("!redis|str|k")}}
+	got := LeaseReadGroupTargets(syntheticGroupRouter{}, targets)
+
+	require.Len(t, got, 1)
+	require.Zero(t, got[0].GroupID,
+		"a key-resolved target must stay key-resolved through dedup")
+	require.Equal(t, []byte("!redis|str|k"), got[0].Key)
+}
