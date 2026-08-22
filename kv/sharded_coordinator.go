@@ -2208,7 +2208,14 @@ func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation, l
 	if c == nil || c.sampler == nil || mut == nil {
 		return
 	}
-	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+	// Sample under the route key, not the raw storage key. routeID was resolved
+	// with routeKey and the sampler's sub-buckets are laid out on catalog route
+	// boundaries, which live in the normalized keyspace. Feeding the raw key
+	// here bucketed adapter traffic against the wrong bounds -- Redis user key
+	// "z" arrives as "!redis|str|z", which sorts before a route starting at
+	// "m", so every write clamped into the first sub-bucket and autosplit chose
+	// a boundary near the route start instead of the hot user key.
+	c.sampler.Observe(routeID, routeKey(mut.Key), keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
 }
 
 // ObserveForwardedRequests records committed leader-side sampling evidence for
@@ -2219,7 +2226,7 @@ func (c *ShardedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
 		return
 	}
 	for _, req := range reqs {
-		if req == nil {
+		if req == nil || !forwardedRequestRecordsUserWrites(req) {
 			continue
 		}
 		for _, mut := range req.Mutations {
@@ -2233,6 +2240,17 @@ func (c *ShardedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
 			c.observeMutation(routeID, mut, keyviz.LabelLegacy)
 		}
 	}
+}
+
+// forwardedRequestRecordsUserWrites reports whether a forwarded request carries
+// writes that should count as hot-key evidence.
+//
+// An ABORT cleanup still lists the user keys after the txn metadata so the FSM
+// can clear their intents, but those writes were rolled back. Counting them
+// would let a follower-routed transaction that aborts manufacture hot-key
+// evidence, and the autosplit scheduler would split on cleanup traffic.
+func forwardedRequestRecordsUserWrites(req *pb.Request) bool {
+	return req.GetPhase() != pb.Phase_ABORT
 }
 
 // observeRead records a single linearizable / lease read against the

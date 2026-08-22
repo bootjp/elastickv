@@ -1242,7 +1242,10 @@ func (c *Coordinate) ObserveForwardedRequests(reqs []*pb.Request) {
 		return
 	}
 	for _, req := range reqs {
-		if req == nil {
+		// Same abort-cleanup exclusion as the sharded observer: an ABORT still
+		// lists the user keys so the FSM can clear their intents, but those
+		// writes were rolled back and must not become hot-key evidence.
+		if req == nil || !forwardedRequestRecordsUserWrites(req) {
 			continue
 		}
 		for _, mut := range req.Mutations {

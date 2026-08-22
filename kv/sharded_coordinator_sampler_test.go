@@ -348,3 +348,73 @@ func TestShardedCoordinatorSkipsObserveForLeadershipChecks(t *testing.T) {
 
 	require.Empty(t, rec.snapshot(), "leadership checks must not produce read samples")
 }
+
+// An ABORT cleanup carries the user keys so the FSM can clear their intents,
+// but those writes were rolled back. Counting them lets a follower-routed
+// transaction that aborts manufacture hot-key evidence for the autosplit
+// scheduler.
+func TestShardedCoordinatorSkipsAbortCleanupInForwardedSampling(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil).WithSampler(rec)
+
+	coord.ObserveForwardedRequests([]*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_ABORT,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(TxnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("rolled-back")})},
+				{Op: pb.Op_DEL, Key: []byte("rolled-back")},
+			},
+		},
+	})
+	require.Empty(t, rec.snapshot(), "an aborted cleanup must not produce hot-key evidence")
+
+	// A committed forward on the same key still counts.
+	coord.ObserveForwardedRequests([]*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte("committed"), Value: []byte("v")},
+			},
+		},
+	})
+	require.Len(t, rec.snapshot(), 1)
+}
+
+// The sampler's sub-buckets are laid out on catalog route boundaries, which are
+// in the normalized keyspace, so an adapter-backed key must be sampled under
+// its route key rather than its raw storage key.
+func TestShardedCoordinatorSamplesNormalizedRouteKey(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil).WithSampler(rec)
+
+	raw := []byte("!redis|str|z")
+	coord.ObserveForwardedRequests([]*pb.Request{
+		{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: raw, Value: []byte("v")}}},
+	})
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 1)
+	require.Equal(t, RouteKey(raw), calls[0].key,
+		"sampler must see the route key so evidence and route descriptors share an ordering")
+	require.NotEqual(t, raw, calls[0].key)
+}
