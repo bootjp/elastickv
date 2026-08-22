@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,5 +197,93 @@ func TestRouteSnapshotFromSources_ConfigurationErrorFailsClosed(t *testing.T) {
 	}
 	if !errors.Is(err, boom) {
 		t.Errorf("error does not wrap the Configuration failure: %v", err)
+	}
+}
+
+// capturingLogHandler collects records so a test can assert on the
+// structured attributes of a specific log line. Parallel tests may log
+// into the same handler once it is installed as the default, so access
+// is mutex-guarded and lookups match on message.
+type capturingLogHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingLogHandler) Handle(_ context.Context, rec slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, rec.Clone())
+
+	return nil
+}
+
+func (h *capturingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+// attrFor returns the named attribute of the first record whose message
+// contains want.
+func (h *capturingLogHandler) attrFor(want, attr string) (slog.Value, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, rec := range h.records {
+		if !strings.Contains(rec.Message, want) {
+			continue
+		}
+		var found slog.Value
+		var ok bool
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == attr {
+				found, ok = a.Value, true
+
+				return false
+			}
+
+			return true
+		})
+
+		return found, ok
+	}
+
+	return slog.Value{}, false
+}
+
+// Activating V2 writes is an operationally significant, sticky state
+// change, so the log line has to name the active storage DEK it
+// activated against.
+func TestStorageEnvelopeV2ActivationLogsActiveKeyID(t *testing.T) {
+	const activeKeyID uint32 = 42
+
+	handler := &capturingLogHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = activeKeyID
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+
+	activated := tryActivateStorageEnvelopeV2Writes(
+		context.Background(),
+		func(context.Context) (admin.CapabilityFanoutResult, error) {
+			return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+				Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+			}}}, nil
+		},
+		wiring,
+	)
+	if !activated {
+		t.Fatal("tryActivateStorageEnvelopeV2Writes did not activate")
+	}
+
+	got, ok := handler.attrFor("enabled V2 storage envelope writes", "key_id")
+	if !ok {
+		t.Fatal("activation log is missing the key_id attribute")
+	}
+	if got.Uint64() != uint64(activeKeyID) {
+		t.Fatalf("activation log key_id = %d, want %d", got.Uint64(), activeKeyID)
 	}
 }

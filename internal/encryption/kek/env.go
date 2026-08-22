@@ -30,12 +30,15 @@ func NewEnvWrapper() (*EnvWrapper, error) {
 	if !ok {
 		return nil, errors.Errorf("kek: %s is not set", EnvVar)
 	}
+	// DecodeString hands back the bytes it decoded before the corruption
+	// alongside the error, so the wipe is registered before the error check
+	// -- a malformed value still leaves partial KEK material in raw.
 	raw, decodeErr := base64.StdEncoding.DecodeString(encoded)
+	defer clear(raw)
 	unsetErr := os.Unsetenv(EnvVar)
 	if decodeErr != nil {
 		return nil, errors.Wrapf(decodeErr, "kek: decode %s", EnvVar)
 	}
-	defer clear(raw)
 	if unsetErr != nil {
 		return nil, errors.Wrapf(unsetErr, "kek: unset %s", EnvVar)
 	}

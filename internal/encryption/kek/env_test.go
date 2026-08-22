@@ -32,12 +32,24 @@ func TestEnvWrapperRoundTripAndUnset(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The second case decodes cleanly up to the corruption, so DecodeString
+// returns partial KEK bytes alongside the error -- the path where the wipe
+// has to be registered before the error check. The wipe of a local slice is
+// not observable from a test; what is asserted here is that the partial-decode
+// input is rejected and still unsets the variable.
 func TestEnvWrapperInvalidInputStillUnsets(t *testing.T) {
-	t.Setenv(EnvVar, "not-base64")
-	_, err := NewEnvWrapper()
-	require.Error(t, err)
-	_, stillSet := os.LookupEnv(EnvVar)
-	require.False(t, stillSet)
+	for name, encoded := range map[string]string{
+		"not base64":     "not-base64",
+		"partial decode": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, fileKEKSize)) + "$$",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(EnvVar, encoded)
+			_, err := NewEnvWrapper()
+			require.Error(t, err)
+			_, stillSet := os.LookupEnv(EnvVar)
+			require.False(t, stillSet)
+		})
+	}
 }
 
 func TestEnvWrapperRejectsInvalidDEKLength(t *testing.T) {

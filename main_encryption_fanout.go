@@ -84,7 +84,8 @@ func tryActivateStorageEnvelopeV2Writes(
 	capabilityFanout adapter.CapabilityFanoutFn,
 	wiring encryptionWriteWiring,
 ) bool {
-	if _, bootstrapped := wiring.cache.ActiveStorageKeyID(); !bootstrapped {
+	keyID, bootstrapped := wiring.cache.ActiveStorageKeyID()
+	if !bootstrapped {
 		return false
 	}
 	result, err := capabilityFanout(ctx)
@@ -92,7 +93,8 @@ func tryActivateStorageEnvelopeV2Writes(
 		return false
 	}
 	wiring.activateStorageEnvelopeV2Writes()
-	slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation")
+	slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation",
+		slog.Uint64("key_id", uint64(keyID)))
 	return true
 }
 
