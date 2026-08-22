@@ -1669,3 +1669,64 @@ func TestZSetInlineMetaCompaction(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all delta keys must be removed after inline compaction")
 }
+
+func TestListInlineMetaCompaction(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	r := &RedisServer{store: st}
+	userKey := []byte("inline:list")
+
+	baseMeta := store.ListMeta{Head: 100, Len: 10, ExpireAt: 1234}
+	metaBytes, err := store.MarshalListMeta(baseMeta)
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), metaBytes, 1, 0))
+
+	const threshold = listInlineMetaCompactionThreshold
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 1, LenDelta: 1})
+	for i := range threshold - 1 {
+		ts := uint64(10 + i) //nolint:gosec // i is bounded by threshold.
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(userKey, ts, 0), delta, ts, 0))
+	}
+
+	readTS := st.LastCommitTS()
+	elems, compacted, err := r.listInlineMetaCompactionElems(ctx, userKey, readTS, store.ListMetaDelta{HeadDelta: 1, LenDelta: 1}, 1)
+	require.NoError(t, err)
+	require.False(t, compacted, "below threshold: should not compact")
+	require.Nil(t, elems)
+
+	const lastTS = uint64(10 + threshold - 1)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(userKey, lastTS, 0), delta, lastTS, 0))
+
+	readTS = st.LastCommitTS()
+	elems, compacted, err = r.listInlineMetaCompactionElems(ctx, userKey, readTS, store.ListMetaDelta{HeadDelta: -2, LenDelta: 3}, 1)
+	require.NoError(t, err)
+	require.True(t, compacted, "at threshold: should compact")
+
+	coord := newLocalAdapterCoordinator(st)
+	commitTS := coord.Clock().Next()
+	_, dispatchErr := coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  0,
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	require.NoError(t, dispatchErr)
+
+	afterTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.ListMetaKey(userKey), afterTS)
+	require.NoError(t, err)
+	got, err := store.UnmarshalListMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(100+threshold-2), got.Head)
+	require.Equal(t, int64(10+threshold+3), got.Len)
+	require.Equal(t, uint64(1234), got.ExpireAt)
+	require.Equal(t, got.Head+got.Len, got.Tail)
+
+	prefix := store.ListMetaDeltaScanPrefix(userKey)
+	scanEnd := store.PrefixScanEnd(prefix)
+	remaining, err := st.ScanAt(ctx, prefix, scanEnd, threshold+1, afterTS)
+	require.NoError(t, err)
+	require.Empty(t, remaining, "all list delta keys must be removed after inline compaction")
+}

@@ -214,7 +214,7 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 	}()
 	// Use per-key leadership so that in sharded deployments this node compacts
 	// keys for the shards it leads, not just those of the default Raft group.
-	if !c.coord.IsLeaderForKey(req.userKey) {
+	if !c.coord.IsLeaderForKey(redisUserRouteKey(req.userKey)) {
 		return
 	}
 	h := c.handlerByTypeName(req.typeName)
@@ -574,7 +574,7 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 		// In sharded deployments IsLeaderForKey returns false for keys whose
 		// shard this node does not lead. Skip those to avoid dispatching a
 		// transaction that the responsible leader will reject.
-		if !c.coord.IsLeaderForKey(userKey) {
+		if !c.coord.IsLeaderForKey(redisUserRouteKey(userKey)) {
 			continue
 		}
 		elems, buildErr := h.buildElems(ctx, userKey, deltaKVs, readTS)
@@ -986,10 +986,87 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, expireAt, metaKey, unmarshalDelta, marshalBase)
 }
 
-// zsetInlineMetaCompactionThreshold is the number of existing ZSetMetaDeltaKey
-// entries at which an inline compaction is triggered during a Lua ZSet delta commit.
-// Set to MaxDeltaScanLimit so compaction fires just before reads would fail.
-const zsetInlineMetaCompactionThreshold = store.MaxDeltaScanLimit
+const (
+	// Inline compaction fires at the read-side hard limit so a hot key is
+	// folded before the next delta write pushes it into ErrDeltaScanTruncated.
+	inlineMetaCompactionThreshold = store.MaxDeltaScanLimit
+	// zsetInlineMetaCompactionThreshold is kept for existing tests and call sites.
+	zsetInlineMetaCompactionThreshold = inlineMetaCompactionThreshold
+	listInlineMetaCompactionThreshold = inlineMetaCompactionThreshold
+)
+
+func (r *RedisServer) listInlineMetaCompactionElems(
+	ctx context.Context, key []byte, readTS uint64, additionalDelta store.ListMetaDelta, additionalDeltaEntries int,
+) ([]*kv.Elem[kv.OP], bool, error) {
+	prefix := store.ListMetaDeltaScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	deltaKVs, err := r.store.ScanAt(ctx, prefix, end, listInlineMetaCompactionThreshold+1, readTS)
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if len(deltaKVs)+additionalDeltaEntries <= store.MaxDeltaScanLimit {
+		return nil, false, nil
+	}
+
+	baseMeta, raw, err := r.loadListBaseMetaForInlineCompaction(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	expireAt, err := compactedMetaExpireAt(ctx, r.store, key, readTS, raw, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt, deltaKVs, prefix)
+	if err != nil {
+		return nil, false, err
+	}
+
+	elems, err := buildListInlineMetaCompactionElems(key, baseMeta, expireAt, additionalDelta, deltaKVs)
+	if err != nil {
+		return nil, false, err
+	}
+	return elems, true, nil
+}
+
+func (r *RedisServer) loadListBaseMetaForInlineCompaction(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, []byte, error) {
+	raw, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return store.ListMeta{}, nil, nil
+		}
+		return store.ListMeta{}, nil, errors.WithStack(err)
+	}
+	baseMeta, err := store.UnmarshalListMeta(raw)
+	if err != nil {
+		return store.ListMeta{}, nil, errors.WithStack(err)
+	}
+	return baseMeta, raw, nil
+}
+
+func buildListInlineMetaCompactionElems(
+	key []byte, baseMeta store.ListMeta, expireAt uint64, additionalDelta store.ListMetaDelta, deltaKVs []*store.KVPair,
+) ([]*kv.Elem[kv.OP], error) {
+	headDelta, lenDelta, err := sumListMetaDeltas(deltaKVs)
+	if err != nil {
+		return nil, err
+	}
+	newMeta := store.ListMeta{
+		Head:     baseMeta.Head + headDelta + additionalDelta.HeadDelta,
+		Len:      baseMeta.Len + lenDelta + additionalDelta.LenDelta,
+		ExpireAt: expireAt,
+	}
+	if newMeta.Len < 0 {
+		newMeta.Len = 0
+	}
+	newMeta.Tail = newMeta.Head + newMeta.Len
+
+	metaElem, err := listMetaElemForLen(store.ListMetaKey(key), newMeta)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
+	elems = append(elems, metaElem)
+	for _, d := range deltaKVs {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+	}
+	return elems, nil
+}
 
 // zsetInlineMetaCompactionElems checks whether ZSetMetaDeltaKeys for key have
 // accumulated past the inline threshold. When they have, it returns elems that

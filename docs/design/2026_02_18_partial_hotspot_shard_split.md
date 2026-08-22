@@ -4,10 +4,15 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (updated July 18, 2026):
+Current implementation status (updated August 22, 2026):
 
 - M1 durable route catalog, watcher refresh, and same-group manual
   `SplitRange` are implemented.
+- M2 has the SplitJob catalog substrate (`distribution/split_job_catalog.go`)
+  and codec/list/history tests, tracked in
+  [`2026_06_11_partial_hotspot_split_milestone2_migration.md`](2026_06_11_partial_hotspot_split_milestone2_migration.md);
+  the actual migration RPC, export/import, fence, cutover, promotion, and
+  cleanup workflow are still open.
 - Standalone M3 auto-split is implemented: keyviz supplies the sole load signal,
   and the detector/scheduler issues guarded same-group `SplitRange` operations.
   See

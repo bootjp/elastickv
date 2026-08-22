@@ -404,6 +404,52 @@ func (s *ShardStore) routesForReverseScan(start []byte, end []byte) ([]distribut
 	return s.routesForScan(start, end, true)
 }
 
+// ReadFenceGroupKeysForRange returns one representative routing key for each
+// Raft group that ScanAt can visit for [start, end). It uses the same route
+// expansion as ScanAt, so callers that take a snapshot outside ShardStore can
+// fence every intersecting group before reading.
+func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte {
+	if s == nil || s.engine == nil {
+		return nil
+	}
+	routes, clampToRoutes := s.routesForForwardScan(start, end)
+	keys := make([][]byte, 0, len(routes))
+	seenGroups := make(map[uint64]struct{}, len(routes))
+	for _, route := range routes {
+		if route.GroupID != 0 {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
+		}
+		keys = append(keys, scanReadFenceRouteKey(route, start, clampToRoutes))
+	}
+	return keys
+}
+
+// ReadFenceRouteVersion returns the route catalog version paired with
+// ReadFenceGroupKeysForRange so callers can discard reads whose route set
+// changed before the scan completed.
+func (s *ShardStore) ReadFenceRouteVersion() uint64 {
+	if s == nil || s.engine == nil {
+		return 0
+	}
+	return s.engine.Version()
+}
+
+func scanReadFenceRouteKey(route distribution.Route, start []byte, clampToRoutes bool) []byte {
+	if clampToRoutes {
+		return bytes.Clone(clampScanStart(start, route.Start))
+	}
+	if listRouteKey(start) != nil {
+		return bytes.Clone(start)
+	}
+	if len(route.Start) > 0 {
+		return bytes.Clone(route.Start)
+	}
+	return bytes.Clone(start)
+}
+
 func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkRoutes bool) ([]distribution.Route, bool) {
 	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
 		return s.engine.GetIntersectingRoutes(routeStart, routeEnd), false
@@ -418,7 +464,7 @@ func (s *ShardStore) routesForScan(start []byte, end []byte, useFilesystemChunkR
 	}
 	// For internal list keys, shard routing is based on the logical user key
 	// rather than the raw key prefix.
-	if userKey := store.ExtractListUserKey(start); userKey != nil {
+	if userKey := listRouteKey(start); userKey != nil {
 		route, ok := s.engine.GetRoute(userKey)
 		if !ok {
 			return []distribution.Route{}, false

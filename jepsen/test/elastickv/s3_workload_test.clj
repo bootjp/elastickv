@@ -21,6 +21,11 @@
                     :s3-port     9999})]
     (is (= 20 (:concurrency test-map)))))
 
+(deftest register-checker-races-knossos-analyzers
+  (let [linear-checker (get-in (workload/s3-register-checker)
+                               [:checkers :linear])]
+    (is (nil? (:algorithm linear-checker)))))
+
 (deftest host-override-uses-provided-host
   (let [test-map (workload/elastickv-s3-test
                    {:s3-host "127.0.0.1"
