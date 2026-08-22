@@ -111,7 +111,7 @@ func TestSnapshotOffloadCLIS3KMSRequiresAWSKMS(t *testing.T) {
 		"--data-dir", "data",
 		"--group-id", "1",
 	})
-	require.ErrorContains(t, err, "--s3-kms-key-id requires --s3-sse=aws:kms")
+	require.ErrorContains(t, err, "s3 KMS key id requires aws:kms encryption")
 }
 
 func seedCLISnapshot(t *testing.T, root string, payload []byte, index uint64, term uint64) string {

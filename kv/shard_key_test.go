@@ -151,6 +151,40 @@ func TestListAuxiliaryScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
 	require.Equal(t, []byte("alice"), routeStart)
 }
 
+func TestRouteKey_NormalizesRedisInternalEmptyUserKey(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range [][]byte{
+		[]byte("!redis|str|"),
+		[]byte("!redis|route|"),
+	} {
+		got := routeKey(raw)
+		require.NotNil(t, got)
+		require.Empty(t, got)
+	}
+}
+
+func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, userKey := range [][]byte{
+		[]byte("!sqs|foo"),
+		[]byte("!redis|str|foo"),
+	} {
+		t.Run(string(userKey), func(t *testing.T) {
+			t.Parallel()
+			for _, raw := range [][]byte{
+				store.ListMetaDeltaKey(userKey, 12, 0),
+				store.ListMetaDeltaScanPrefix(userKey),
+				store.ListClaimKey(userKey, 3),
+				store.ListClaimScanPrefix(userKey),
+			} {
+				require.Equal(t, userKey, routeKey(raw))
+			}
+		})
+	}
+}
+
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	t.Parallel()
 

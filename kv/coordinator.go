@@ -36,15 +36,24 @@ const dispatchLeaderRetryBudget = 5 * time.Second
 const dispatchLeaderRetryInterval = 25 * time.Millisecond
 
 // hlcPhysicalWindowMs is the duration in milliseconds that the Raft-agreed
-// physical ceiling extends ahead of the current wall clock. Modelled after
-// TiDB's TSO 3-second window: the leader commits ceiling = now + window, and
-// renews before the window expires. A new leader inherits the committed ceiling
-// so it never issues timestamps that collide with the previous leader's window.
-const hlcPhysicalWindowMs int64 = 3_000
+// physical ceiling extends ahead of the current wall clock. The leader commits
+// ceiling = now + window, and renews before the window expires. A new leader
+// inherits the committed ceiling so it never issues timestamps that collide with
+// the previous leader's window. Keep this comfortably above the renewal proposal
+// timeout so a renewal that spends a few seconds queued in Raft still lands with
+// a future ceiling.
+const hlcPhysicalWindowMs int64 = 10_000
 
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
 // Must be less than hlcPhysicalWindowMs to guarantee the window never expires.
 const hlcRenewalInterval = 1 * time.Second
+
+// hlcRenewalProposalTimeout bounds a single HLC lease-renewal proposal. This is
+// intentionally longer than hlcRenewalInterval: under write-heavy Redis proxy
+// traffic, a renewal can sit behind normal Raft proposals for more than one
+// second, and timing it out there causes avoidable fail-closed timestamp
+// refusals.
+const hlcRenewalProposalTimeout = dispatchLeaderRetryBudget
 
 // CoordinatorOption is a functional option for Coordinate constructors.
 type CoordinatorOption func(*Coordinate)
@@ -855,10 +864,11 @@ func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, ex
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new
 // physical ceiling to the Raft cluster while this node is the leader.
 //
-// The ceiling is set to now + hlcPhysicalWindowMs (3 s) and is renewed every
+// The ceiling is set to now + hlcPhysicalWindowMs (10 s) and is renewed every
 // hlcRenewalInterval (1 s), mirroring TiDB's TSO window strategy. Because the
-// window is always at least 2 s ahead of any real timestamp, a new leader will
-// never issue timestamps that overlap with the previous leader's window.
+// window is always well ahead of any real timestamp during healthy renewal, a
+// new leader will never issue timestamps that overlap with the previous
+// leader's window.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {

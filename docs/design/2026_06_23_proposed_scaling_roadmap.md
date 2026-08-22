@@ -100,7 +100,7 @@ memory each group's private cache/memtable pins.
 - **Range split — distribute a range across groups.** Same-group split
   shipped in M1 (`distribution/`). Cross-group migration (the part that
   actually relocates data and reduces per-node volume) is **PR #945**
-  (`docs/design/2026_06_11_proposed_hotspot_split_milestone2_migration.md`,
+  (`docs/design/2026_06_11_partial_hotspot_split_milestone2_migration.md`,
   branch `docs/hotspot-split-m2-proposal`): a resumable `SplitJob` with
   `PLANNED → BACKFILL → FENCE → DELTA_COPY → CUTOVER → CLEANUP → DONE` phases
   driven by a migrator on the default-group leader. M2 is the required
@@ -130,13 +130,13 @@ memory each group's private cache/memtable pins.
   apply-time hazard M2 §7.3 closes for split). Merge is strictly harder than
   split because it must *unify* two independent commit-timestamp streams, not
   bisect one.
-- **Blob offload — proposed.**
-  `docs/design/2026_04_25_proposed_s3_raft_blob_offload.md` keeps large object
+- **Blob offload — partial.**
+  `docs/design/2026_04_25_partial_s3_raft_blob_offload.md` keeps large object
   payloads out of the Raft log (chunkref through Raft, chunkblob via a
   peer-to-peer side channel with semi-synchronous quorum replication). This
   bounds WAL/snapshot growth to O(manifest), which is the data-volume lever
-  for the S3 surface specifically. Still proposed; the legacy `BlobKey`-on-Raft
-  path is what runs today.
+  for the S3 surface specifically. The chunkref/chunkblob substrate exists,
+  but production enablement still fails closed until the GC-readiness work lands.
 - **Shared Pebble cache / resource pools — M1 shipped, follow-ups remain.**
   The block-cache tax is closed by the process-wide `pebble.Cache` in
   `store/lsm_store.go`, so group count no longer multiplies block-cache memory.

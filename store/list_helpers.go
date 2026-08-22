@@ -131,26 +131,39 @@ func IsListClaimKey(key []byte) bool {
 
 // ExtractListUserKeyFromDelta extracts the logical user key from a list delta key.
 func ExtractListUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
-	end, ok := listUserKeyEnd(trimmed, deltaKeyTSSize+deltaKeySeqSize)
+	trimmed, ok := bytes.CutPrefix(key, []byte(ListMetaDeltaPrefix))
 	if !ok {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize:end]
+	return extractListUserKeyFromLenPrefixedKey(trimmed, deltaKeyTSSize+deltaKeySeqSize)
 }
 
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.
 func ExtractListUserKeyFromClaim(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
-	end, ok := listUserKeyEnd(trimmed, sortableInt64Bytes)
+	trimmed, ok := bytes.CutPrefix(key, []byte(ListClaimPrefix))
 	if !ok {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize:end]
+	return extractListUserKeyFromLenPrefixedKey(trimmed, sortableInt64Bytes)
+}
+
+// ExtractListUserKeyFromDeltaScanPrefix extracts the logical user key from the
+// exact prefix produced by ListMetaDeltaScanPrefix.
+func ExtractListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromClaimScanPrefix extracts the logical user key from the
+// exact prefix produced by ListClaimScanPrefix.
+func ExtractListUserKeyFromClaimScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListClaimPrefix))
 }
 
 // ExtractListUserKeyFromDeltaScanKey extracts the logical user key from a
 // delta scan prefix, a full delta key, or a scan cursor within that prefix.
+// Unlike ExtractListUserKeyFromDeltaScanPrefix it tolerates trailing bytes,
+// because a resumed scan starts from a cursor inside the prefix rather than
+// from the prefix itself.
 func ExtractListUserKeyFromDeltaScanKey(key []byte) []byte {
 	return extractListUserKeyFromScanKey(key, []byte(ListMetaDeltaPrefix))
 }
@@ -162,28 +175,41 @@ func ExtractListUserKeyFromClaimScanKey(key []byte) []byte {
 }
 
 func extractListUserKeyFromScanKey(key []byte, prefix []byte) []byte {
+	trimmed, ok := bytes.CutPrefix(key, prefix)
+	if !ok {
+		return nil
+	}
+	// suffixLen 0: any bytes past the user key are scan-cursor tail, not a
+	// fixed encoded suffix, so only the length prefix has to be satisfied.
+	return extractListUserKeyFromLenPrefixedKey(trimmed, 0)
+}
+
+func extractListUserKeyFromLenPrefixedScanPrefix(key []byte, prefix []byte) []byte {
 	if !bytes.HasPrefix(key, prefix) {
 		return nil
 	}
 	trimmed := key[len(prefix):]
-	end, ok := listUserKeyEnd(trimmed, 0)
-	if !ok {
+	if len(trimmed) < wideColKeyLenSize {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize:end]
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	if uint64(len(trimmed)) != uint64(wideColKeyLenSize)+uint64(ukLen) {
+		return nil
+	}
+	return trimmed[wideColKeyLenSize:]
 }
 
-func listUserKeyEnd(trimmed []byte, suffixLen int) (int, bool) {
+func extractListUserKeyFromLenPrefixedKey(trimmed []byte, suffixLen int) []byte {
 	if len(trimmed) < wideColKeyLenSize+suffixLen {
-		return 0, false
+		return nil
 	}
-	userKeyLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	requiredTail := uint64(wideColKeyLenSize) + uint64(suffixLen) //nolint:gosec // suffixLen is one of this file's fixed encoded suffix widths.
-	available := uint64(len(trimmed))
-	if requiredTail > available || uint64(userKeyLen) > available-requiredTail {
-		return 0, false
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	availableUserKeyBytes := len(trimmed) - wideColKeyLenSize - suffixLen
+	if int64(ukLen) > int64(availableUserKeyBytes) {
+		return nil
 	}
-	return wideColKeyLenSize + int(userKeyLen), true //nolint:gosec // userKeyLen is bounded by len(trimmed) above.
+	userEnd := int64(wideColKeyLenSize) + int64(ukLen)
+	return trimmed[wideColKeyLenSize:userEnd]
 }
 
 // PrefixScanEnd returns the exclusive end key for a prefix scan.

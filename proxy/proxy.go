@@ -432,7 +432,7 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 
 	// Async replay to secondary (bounded)
 	if p.dual.hasSecondaryWrite() {
-		p.dual.goAsync(func(ctx context.Context) {
+		p.dual.goTxnReplay(cmds, func(ctx context.Context) {
 			p.dual.writeSecondaryPipeline(ctx, cmds)
 		})
 	}

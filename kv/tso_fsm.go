@@ -1,0 +1,148 @@
+package kv
+
+import (
+	"encoding/binary"
+	"io"
+	"sync/atomic"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
+)
+
+const tsoSnapshotLen = 8
+const maxHLCPhysicalMillis = int64((uint64(1) << hlcPhysicalBits) - 1)
+
+var _ raftengine.StateMachine = (*TSOStateMachine)(nil)
+var _ raftengine.Snapshot = (*tsoSnapshot)(nil)
+var _ raftengine.VolatileEntryClassifier = (*TSOStateMachine)(nil)
+
+// TSOStateMachine is the minimal FSM for the dedicated timestamp-oracle Raft
+// group. It tracks only the Raft-agreed HLC physical ceiling; no KV state,
+// route catalog, or sidecar state is attached to group 0.
+type TSOStateMachine struct {
+	hlc       *HLC
+	ceilingMs atomic.Int64
+}
+
+// NewTSOStateMachine constructs the dedicated TSO FSM over the shared HLC.
+func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
+	return &TSOStateMachine{hlc: hlc}
+}
+
+func (f *TSOStateMachine) Apply(data []byte) any {
+	if len(data) == 0 || data[0] != raftEncodeHLCLease {
+		return nil
+	}
+	return f.applyHLCLease(data[1:])
+}
+
+func (f *TSOStateMachine) applyHLCLease(data []byte) any {
+	if len(data) != hlcLeasePayloadLen {
+		return errors.Newf("tso fsm: hlc lease: expected %d bytes, got %d", hlcLeasePayloadLen, len(data)) //nolint:wrapcheck // creating new error, nothing to wrap
+	}
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(data))
+	if err != nil {
+		return err
+	}
+	f.applyTSOCeiling(ceilingMs, false)
+	return nil
+}
+
+func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
+	return &tsoSnapshot{ceilingMs: f.committedCeiling()}, nil
+}
+
+func (f *TSOStateMachine) Restore(r io.Reader) error {
+	var buf [tsoSnapshotLen]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return errors.Wrap(err, "tso fsm: restore snapshot")
+	}
+	var extra [1]byte
+	n, err := r.Read(extra[:])
+	if err != nil && !errors.Is(err, io.EOF) {
+		return errors.Wrap(err, "tso fsm: restore snapshot")
+	}
+	if n != 0 {
+		return errors.New("tso fsm: restore snapshot: trailing bytes") //nolint:wrapcheck // creating new error, nothing to wrap
+	}
+	ceilingMs, err := decodeTSOCeiling(binary.BigEndian.Uint64(buf[:]))
+	if err != nil {
+		return errors.Wrap(err, "tso fsm: restore snapshot")
+	}
+	f.applyTSOCeiling(ceilingMs, true)
+	return nil
+}
+
+func decodeTSOCeiling(raw uint64) (int64, error) {
+	if raw > uint64(maxHLCPhysicalMillis) {
+		return 0, errors.Newf("tso fsm: hlc lease: physical ceiling %d exceeds max %d", raw, maxHLCPhysicalMillis) //nolint:wrapcheck // creating new error, nothing to wrap
+	}
+	return int64(raw), nil //nolint:gosec // raw is bounded by maxHLCPhysicalMillis.
+}
+
+func (f *TSOStateMachine) applyTSOCeiling(ceilingMs int64, restore bool) {
+	if ceilingMs <= 0 {
+		return
+	}
+	prevCeiling, advanced := f.advanceCommittedCeiling(ceilingMs)
+	if !advanced && !restore {
+		return
+	}
+	if f.hlc != nil {
+		floorCeiling := prevCeiling
+		if restore {
+			floorCeiling = ceilingMs
+		}
+		if floorCeiling > 0 {
+			f.hlc.Observe(tsoCeilingMaxTimestamp(floorCeiling))
+		}
+		f.hlc.SetPhysicalCeiling(ceilingMs)
+	}
+}
+
+func (f *TSOStateMachine) advanceCommittedCeiling(ceilingMs int64) (int64, bool) {
+	for {
+		prev := f.ceilingMs.Load()
+		if ceilingMs <= prev {
+			return prev, false
+		}
+		if f.ceilingMs.CompareAndSwap(prev, ceilingMs) {
+			return prev, true
+		}
+	}
+}
+
+func (f *TSOStateMachine) committedCeiling() int64 {
+	return f.ceilingMs.Load()
+}
+
+func tsoCeilingMaxTimestamp(ceilingMs int64) uint64 {
+	return (uint64(ceilingMs) << hlcLogicalBits) | hlcLogicalMask //nolint:gosec // ceilingMs is validated positive before conversion.
+}
+
+// IsVolatileOnlyPayload classifies HLC lease entries for the cold-start replay
+// gate. Re-applying them is monotonic and reconstructs the in-memory ceiling.
+func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
+	return len(payload) > 0 && payload[0] == raftEncodeHLCLease
+}
+
+type tsoSnapshot struct {
+	ceilingMs int64
+}
+
+func (s *tsoSnapshot) WriteTo(w io.Writer) (int64, error) {
+	var buf [tsoSnapshotLen]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(s.ceilingMs)) //nolint:gosec // ceilingMs is a Unix ms timestamp encoded as uint64.
+	n, err := w.Write(buf[:])
+	if err != nil {
+		return int64(n), errors.WithStack(err)
+	}
+	if n != tsoSnapshotLen {
+		return int64(n), errors.WithStack(io.ErrShortWrite)
+	}
+	return tsoSnapshotLen, nil
+}
+
+func (s *tsoSnapshot) Close() error {
+	return nil
+}

@@ -718,6 +718,73 @@ func (s *ShardStore) routesForReverseScan(start []byte, end []byte) ([]distribut
 	return s.routesForScan(start, end)
 }
 
+// ReadFenceGroupKeysForRange returns one representative routing key for each
+// Raft group that ScanAt can visit for [start, end). It uses the same route
+// expansion as ScanAt, so callers that take a snapshot outside ShardStore can
+// fence every intersecting group before reading.
+func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte {
+	if s == nil || s.engine == nil {
+		return nil
+	}
+	routes, clampToRoutes := s.routesForReadFence(start, end)
+	keys := make([][]byte, 0, len(routes))
+	seenGroups := make(map[uint64]struct{}, len(routes))
+	for _, route := range routes {
+		if route.GroupID != 0 {
+			if _, seen := seenGroups[route.GroupID]; seen {
+				continue
+			}
+			seenGroups[route.GroupID] = struct{}{}
+		}
+		keys = append(keys, scanReadFenceRouteKey(route, start, clampToRoutes))
+	}
+	return keys
+}
+
+// ReadFenceRouteVersion returns the route catalog version paired with
+// ReadFenceGroupKeysForRange so callers can discard reads whose route set
+// changed before the scan completed.
+func (s *ShardStore) ReadFenceRouteVersion() uint64 {
+	if s == nil || s.engine == nil {
+		return 0
+	}
+	return s.engine.Version()
+}
+
+// routesForReadFence expands the range the way ReadFenceGroupKeysForRange
+// needs, which is deliberately not identical to the scan path.
+//
+// routesForScan narrows a Redis wide-column scan to the single route owning
+// the family's logical user key. That is right for reading, because wide-column
+// keys are routed by routeKey and a catalog boundary is expected to land on a
+// user key. A fence cannot rest on that expectation: if a boundary ever does
+// fall inside the family's raw keyspace, the narrowed set omits a group and the
+// caller reads it unfenced -- a stale read. Fencing a superset only costs an
+// extra fence, so the fence keeps the raw intersection for wide-column ranges.
+//
+// List keys keep the logical expansion: their raw prefix sorts nowhere near the
+// user key, so a raw intersection there would fence unrelated groups rather
+// than the owning one.
+func (s *ShardStore) routesForReadFence(start []byte, end []byte) ([]distribution.Route, bool) {
+	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); ok {
+		return s.engine.GetIntersectingRoutes(start, end), len(start) > 0
+	}
+	return s.routesForForwardScan(start, end)
+}
+
+func scanReadFenceRouteKey(route distribution.Route, start []byte, clampToRoutes bool) []byte {
+	if clampToRoutes {
+		return bytes.Clone(clampScanStart(start, route.Start))
+	}
+	if listRouteKey(start) != nil {
+		return bytes.Clone(start)
+	}
+	if len(route.Start) > 0 {
+		return bytes.Clone(route.Start)
+	}
+	return bytes.Clone(start)
+}
+
 func (s *ShardStore) routesForScan(start []byte, end []byte) ([]distribution.Route, bool) {
 	routes, clampToRoutes, _ := s.routesForScanWithVersion(start, end)
 	return routes, clampToRoutes
@@ -815,15 +882,18 @@ func (s *ShardStore) routesForEncodedScanWithVersion(start []byte, end []byte) (
 }
 
 func listScanUserKey(start []byte) []byte {
+	// Internal list keys route by their logical user key rather than their raw
+	// storage prefix. Well-formed full keys and exact scan prefixes are matched
+	// first, under the strict length checks listRouteKey applies. A resumed scan
+	// starts from a cursor inside the prefix, so only that case falls through to
+	// the permissive form that tolerates a trailing cursor tail.
+	if userKey := listRouteKey(start); userKey != nil {
+		return userKey
+	}
 	if userKey := store.ExtractListUserKeyFromDeltaScanKey(start); userKey != nil {
 		return userKey
 	}
-	if userKey := store.ExtractListUserKeyFromClaimScanKey(start); userKey != nil {
-		return userKey
-	}
-	// Internal list keys route by their logical user key rather than their raw
-	// storage prefix.
-	return store.ExtractListUserKey(start)
+	return store.ExtractListUserKeyFromClaimScanKey(start)
 }
 
 func (s *ShardStore) routesForFencedScanWithVersion(start []byte, end []byte, routeStart []byte, routeEnd []byte) ([]distribution.Route, bool, uint64) {
