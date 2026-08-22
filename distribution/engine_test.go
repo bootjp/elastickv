@@ -718,3 +718,107 @@ func TestEngineSnapshotAt_BareEngineHasNoHistory(t *testing.T) {
 		t.Fatal("bare engine has no history ring; SnapshotAt should always be false")
 	}
 }
+
+func TestResolveRoutesWithVersion_SharesOneSnapshot(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 7,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	resolved, version := e.ResolveRoutesWithVersion(
+		RouteQuery{Start: []byte("a"), Exact: true},
+		RouteQuery{Start: []byte("z"), Exact: true},
+		RouteQuery{Start: []byte(""), End: nil},
+	)
+	if version != 7 {
+		t.Fatalf("version=%d, want 7", version)
+	}
+	if len(resolved) != 3 {
+		t.Fatalf("len(resolved)=%d, want 3", len(resolved))
+	}
+	if len(resolved[0]) != 1 || resolved[0][0].GroupID != 1 {
+		t.Fatalf("exact lookup for \"a\" = %+v, want one route on group 1", resolved[0])
+	}
+	if len(resolved[1]) != 1 || resolved[1][0].GroupID != 2 {
+		t.Fatalf("exact lookup for \"z\" = %+v, want one route on group 2", resolved[1])
+	}
+	if len(resolved[2]) != 2 {
+		t.Fatalf("full-range lookup returned %d routes, want 2", len(resolved[2]))
+	}
+}
+
+func TestResolveRoutesWithVersion_MissingRouteYieldsEmpty(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	resolved, version := e.ResolveRoutesWithVersion(RouteQuery{Start: []byte("a"), Exact: true})
+	if version != 0 {
+		t.Fatalf("version=%d, want 0", version)
+	}
+	if len(resolved) != 1 || len(resolved[0]) != 0 {
+		t.Fatalf("resolved=%+v, want one empty result", resolved)
+	}
+}
+
+// A reader must never observe two keys resolved against different catalog
+// versions. Every snapshot below maps both keys to the same group, so a mixed
+// pair proves the lookups straddled an update.
+func TestResolveRoutesWithVersion_NeverStraddlesACatalogUpdate(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes:  []RouteDescriptor{{RouteID: 1, Start: []byte(""), GroupID: 1, State: RouteStateActive}},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	done := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for version := uint64(2); ; version++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			group := uint64(1)
+			if version%2 == 0 {
+				group = 2
+			}
+			_ = e.ApplySnapshot(CatalogSnapshot{
+				Version: version,
+				Routes:  []RouteDescriptor{{RouteID: 1, Start: []byte(""), GroupID: group, State: RouteStateActive}},
+			})
+		}
+	}()
+	defer func() {
+		close(done)
+		writer.Wait()
+	}()
+
+	for range 2000 {
+		resolved, _ := e.ResolveRoutesWithVersion(
+			RouteQuery{Start: []byte("a"), Exact: true},
+			RouteQuery{Start: []byte("z"), Exact: true},
+		)
+		if len(resolved[0]) != 1 || len(resolved[1]) != 1 {
+			t.Fatalf("resolved=%+v, want one route per query", resolved)
+		}
+		if resolved[0][0].GroupID != resolved[1][0].GroupID {
+			t.Fatalf("keys resolved against different snapshots: %d vs %d",
+				resolved[0][0].GroupID, resolved[1][0].GroupID)
+		}
+	}
+}

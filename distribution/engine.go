@@ -435,6 +435,47 @@ func (e *Engine) GetRouteWithVersion(key []byte) (Route, uint64, bool) {
 	return route, e.catalogVersion, true
 }
 
+// RouteQuery is one lookup for ResolveRoutesWithVersion. Exact resolves the
+// single route containing Start; otherwise every route intersecting
+// [Start, End) is returned.
+type RouteQuery struct {
+	Start []byte
+	End   []byte
+	Exact bool
+}
+
+// ResolveRoutesWithVersion answers every query from a single locked catalog
+// snapshot and returns the one version that produced all of them. Callers that
+// need more than one route candidate must use this instead of repeating
+// GetRouteWithVersion / GetIntersectingRoutesWithVersion: separate calls can
+// straddle a catalog update and pair a stale route with a newer version, which
+// turns that version into a fence the route actually read was never checked
+// against.
+func (e *Engine) ResolveRoutesWithVersion(queries ...RouteQuery) ([][]Route, uint64) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([][]Route, len(queries))
+	for i, q := range queries {
+		if q.Exact {
+			out[i] = e.exactRouteLocked(q.Start)
+			continue
+		}
+		out[i] = e.intersectingRoutesLocked(q.Start, q.End)
+	}
+	return out, e.catalogVersion
+}
+
+func (e *Engine) exactRouteLocked(key []byte) []Route {
+	idx := e.routeIndex(key)
+	if idx < 0 {
+		return nil
+	}
+	route := e.routes[idx]
+	route.Start = CloneBytes(route.Start)
+	route.End = CloneBytes(route.End)
+	return []Route{route}
+}
+
 // NextTimestamp returns a monotonic increasing timestamp.
 func (e *Engine) NextTimestamp() uint64 {
 	return e.ts.Add(1)
@@ -475,7 +516,10 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, uint64) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.intersectingRoutesLocked(start, end), e.catalogVersion
+}
 
+func (e *Engine) intersectingRoutesLocked(start, end []byte) []Route {
 	var result []Route
 	for i := range e.routes {
 		r := &e.routes[i]
@@ -501,7 +545,7 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 			Load:                   r.Load,
 		})
 	}
-	return result, e.catalogVersion
+	return result
 }
 
 func (e *Engine) routeIndex(key []byte) int {

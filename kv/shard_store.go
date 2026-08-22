@@ -277,22 +277,33 @@ func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, 
 
 func (s *ShardStore) pointReadRoutesWithVersion(key []byte) ([]distribution.Route, uint64) {
 	primaryKey := routeKey(key)
-	primary, version, ok := s.engine.GetRouteWithVersion(primaryKey)
-	if !ok {
-		return nil, version
-	}
-	routes := []distribution.Route{primary}
-
 	legacyKey := redisWideColumnLegacyPointRouteKey(key)
 	if legacyKey == nil || bytes.Equal(legacyKey, primaryKey) {
+		primary, version, ok := s.engine.GetRouteWithVersion(primaryKey)
+		if !ok {
+			return nil, version
+		}
+		return []distribution.Route{primary}, version
+	}
+
+	// Both candidates must come from one catalog snapshot. Resolving them with
+	// two GetRouteWithVersion calls let the primary route move in between: the
+	// request then carried the newer read_route_version while still naming the
+	// stale primary group, so the leader's fence passed after waiting for a
+	// version the route it actually read was never valid under.
+	resolved, version := s.engine.ResolveRoutesWithVersion(
+		distribution.RouteQuery{Start: primaryKey, Exact: true},
+		distribution.RouteQuery{Start: legacyKey, Exact: true},
+	)
+	if len(resolved[0]) == 0 {
+		return nil, version
+	}
+	primary := resolved[0][0]
+	routes := []distribution.Route{primary}
+	if len(resolved[1]) == 0 || resolved[1][0].GroupID == primary.GroupID {
 		return routes, version
 	}
-	legacy, legacyVersion, ok := s.engine.GetRouteWithVersion(legacyKey)
-	version = max(version, legacyVersion)
-	if !ok || legacy.GroupID == primary.GroupID {
-		return routes, version
-	}
-	return append(routes, legacy), version
+	return append(routes, resolved[1][0]), version
 }
 
 func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView) bool {
@@ -666,28 +677,23 @@ func (s *ShardStore) routesForRedisWideColumnScanWithVersion(start []byte, end [
 	if !ok {
 		return nil, 0, false
 	}
-	if !exact {
-		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
-		routes, version = s.appendRedisWideColumnLegacyScanRoutesWithVersion(routes, version, start, end)
-		return routes, version, true
+	// Same single-snapshot requirement as pointReadRoutesWithVersion: the
+	// primary and legacy candidates are resolved together so a catalog update
+	// between them cannot pair a stale route with a newer fence version.
+	queries := []distribution.RouteQuery{{Start: routeStart, End: routeEnd, Exact: exact}}
+	legacyStart, legacyEnd, hasLegacy := redisWideColumnLegacyScanRouteRange(start, end)
+	if hasLegacy {
+		queries = append(queries, distribution.RouteQuery{Start: legacyStart, End: legacyEnd})
 	}
-	route, version, ok := s.engine.GetRouteWithVersion(routeStart)
-	if !ok {
-		return []distribution.Route{}, version, true
+	resolved, version := s.engine.ResolveRoutesWithVersion(queries...)
+	routes := resolved[0]
+	if routes == nil {
+		routes = []distribution.Route{}
 	}
-	routes := []distribution.Route{route}
-	routes, version = s.appendRedisWideColumnLegacyScanRoutesWithVersion(routes, version, start, end)
+	if hasLegacy {
+		routes = appendDistinctRoutesByGroup(routes, resolved[1])
+	}
 	return routes, version, true
-}
-
-func (s *ShardStore) appendRedisWideColumnLegacyScanRoutesWithVersion(routes []distribution.Route, version uint64, start []byte, end []byte) ([]distribution.Route, uint64) {
-	legacyStart, legacyEnd, ok := redisWideColumnLegacyScanRouteRange(start, end)
-	if !ok {
-		return routes, version
-	}
-	legacyRoutes, legacyVersion := s.engine.GetIntersectingRoutesWithVersion(legacyStart, legacyEnd)
-	version = max(version, legacyVersion)
-	return appendDistinctRoutesByGroup(routes, legacyRoutes), version
 }
 
 func appendDistinctRoutesByGroup(routes []distribution.Route, candidates []distribution.Route) []distribution.Route {
