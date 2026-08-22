@@ -352,7 +352,15 @@ func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) Cap
 	// different full_node_id than the one the snapshot expected.
 	// Accepting the response would credit the expected member as
 	// verified despite no member-X ever answering. Fail closed.
-	if member.FullNodeID != 0 && report.GetFullNodeId() != 0 && report.GetFullNodeId() != member.FullNodeID {
+	//
+	// An unset id counts as a mismatch. A node with no sidecar answers
+	// GetCapability with full_node_id=0 and storage_envelope_v2_capable=true,
+	// so exempting zero let an unidentified responder hand its V2 capability
+	// to the member the snapshot expected. This path only gates activation on
+	// a cluster that already has an active storage DEK, where every correctly
+	// configured member reports a derived non-zero id, so a zero here means
+	// the expected member was never actually confirmed.
+	if member.FullNodeID != 0 && report.GetFullNodeId() != member.FullNodeID {
 		verdict.Err = pkgerrors.Wrapf(errCapabilityFanoutMismatchedResponder,
 			"%s: expected full_node_id=%d got %d", member.Address, member.FullNodeID, report.GetFullNodeId())
 		return verdict
