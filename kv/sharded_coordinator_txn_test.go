@@ -1031,3 +1031,44 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(
 			req.Phase)
 	}
 }
+
+// In partition-resolved keyspaces such as HT-FIFO SQS, routeKey collapses a
+// concrete partition key onto the global SQS route, so that route's write floor
+// is not the key's floor. rejectWriteFencedPointKey already exempts these keys;
+// the timestamp-floor precheck must match, or it rejects writes the fence
+// precheck deliberately lets through.
+func TestShardedCoordinatorFloorPrecheckSkipsResolverOwnedKeys(t *testing.T) {
+	t.Parallel()
+
+	const partitionKey = "!sqs|msg|data|p|queue|7"
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// The route routeKey() collapses partition keys onto, carrying a floor.
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	c := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+
+	// Without a resolver the floor applies, which is what makes the exemption
+	// below meaningful rather than vacuous.
+	require.ErrorIs(t,
+		c.rejectWriteTimestampFloorPointKey([]byte(partitionKey), 100),
+		ErrRouteWriteTimestampTooLow)
+
+	c.WithPartitionResolver(&fakePartitionResolver{
+		routes:           map[string]uint64{partitionKey: 1},
+		recognisedPrefix: []byte("!sqs|msg|data|p|"),
+	})
+
+	require.NoError(t,
+		c.rejectWriteTimestampFloorPointKey([]byte(partitionKey), 100),
+		"a resolver-owned key must not be judged by the route routeKey collapses it onto")
+
+	// A key the resolver does not own still gets the floor.
+	require.ErrorIs(t,
+		c.rejectWriteTimestampFloorPointKey([]byte("ordinary-key"), 100),
+		ErrRouteWriteTimestampTooLow)
+}

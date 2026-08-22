@@ -1296,6 +1296,15 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[O
 }
 
 func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
+	// Same exemption rejectWriteFencedPointKey applies, and for the same
+	// reason: in partition-resolved keyspaces such as HT-FIFO SQS, routeKey
+	// collapses a concrete partition key onto the global SQS route, so that
+	// route's floor is not this key's floor. Applying it here rejected writes
+	// the write-fence precheck deliberately lets through, and the Raft-side
+	// gate already covers these keys through the resolver's own routing.
+	if c.partitionResolverRecognisesPointKey(key) {
+		return nil
+	}
 	start, end, ok := s3BucketAuxiliaryRouteRange(key)
 	if ok {
 		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
