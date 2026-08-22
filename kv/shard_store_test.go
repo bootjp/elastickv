@@ -87,24 +87,60 @@ func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	require.Equal(t, itemKey, kvs[0].Key)
 }
 
-func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+// SplitRange normalizes every boundary through kv.RouteKey before storing it
+// (adapter/distribution_server.go), so a boundary governing a Redis wide-column
+// family is always a decoded user key -- never a raw !hs|fld|-prefixed byte
+// string. The fence must therefore cover the group owning the logical user key,
+// plus the legacy raw-prefix group when rows may still be routed that way
+// (redisWideColumnLegacyScanRouteRange contributes that second query).
+//
+// The earlier form of this test split at prefix+'m', a raw-prefixed boundary
+// SplitRange cannot produce, and asserted a raw range intersection. That
+// comparison puts raw storage bytes against decoded user-key boundaries and
+// selects the wrong owning route, so it did not describe a reachable state.
+func TestShardStoreReadFenceGroupKeysForRangeCoversOwningAndLegacyGroups(t *testing.T) {
 	t.Parallel()
 
-	userKey := []byte("hash:fence-routes")
-	prefix := store.HashFieldScanPrefix(userKey)
-	split := append(append([]byte(nil), prefix...), 'm')
+	for _, tc := range []struct {
+		name       string
+		userKey    string
+		wantOwner  uint64
+		wantGroups []uint64
+	}{
+		// "alpha" sorts below the boundary, so the owning group and the legacy
+		// raw-prefix group are the same one and collapse to a single fence key.
+		{name: "owner below boundary", userKey: "alpha", wantOwner: 1, wantGroups: []uint64{1}},
+		// "zebra" sorts above it while the raw !hs|fld| prefix sorts below, so
+		// the two queries land on different groups and both must be fenced.
+		{name: "owner above boundary", userKey: "zebra", wantOwner: 2, wantGroups: []uint64{2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte(""), split, 1)
-	engine.UpdateRoute(split, nil, 2)
-	st := NewShardStore(engine, map[uint64]*ShardGroup{
-		1: {},
-		2: {},
-	})
+			prefix := store.HashFieldScanPrefix([]byte(tc.userKey))
+			engine := distribution.NewEngine()
+			engine.UpdateRoute([]byte(""), []byte("m"), 1)
+			engine.UpdateRoute([]byte("m"), nil, 2)
+			st := NewShardStore(engine, map[uint64]*ShardGroup{
+				1: {},
+				2: {},
+			})
 
-	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+			routes, _ := st.routesForForwardScan(prefix, store.PrefixScanEnd(prefix))
+			gotGroups := make([]uint64, 0, len(routes))
+			for _, route := range routes {
+				gotGroups = append(gotGroups, route.GroupID)
+			}
+			require.Equal(t, tc.wantGroups, gotGroups)
+			require.Equal(t, tc.wantOwner, routes[0].GroupID,
+				"the logical user key's owner must be resolved first")
 
-	require.Equal(t, [][]byte{prefix, split}, got)
+			got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+			require.Len(t, got, len(tc.wantGroups))
+			require.Contains(t, got, prefix,
+				"the queried prefix must be fenced so groupForKey re-derives the owner")
+		})
+	}
 }
 
 func TestShardStoreReadFenceGroupKeysForListRangeUsesStorageRepresentative(t *testing.T) {

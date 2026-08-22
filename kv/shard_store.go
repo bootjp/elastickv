@@ -726,7 +726,7 @@ func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]by
 	if s == nil || s.engine == nil {
 		return nil
 	}
-	routes, clampToRoutes := s.routesForReadFence(start, end)
+	routes, clampToRoutes := s.routesForForwardScan(start, end)
 	keys := make([][]byte, 0, len(routes))
 	seenGroups := make(map[uint64]struct{}, len(routes))
 	for _, route := range routes {
@@ -749,27 +749,6 @@ func (s *ShardStore) ReadFenceRouteVersion() uint64 {
 		return 0
 	}
 	return s.engine.Version()
-}
-
-// routesForReadFence expands the range the way ReadFenceGroupKeysForRange
-// needs, which is deliberately not identical to the scan path.
-//
-// routesForScan narrows a Redis wide-column scan to the single route owning
-// the family's logical user key. That is right for reading, because wide-column
-// keys are routed by routeKey and a catalog boundary is expected to land on a
-// user key. A fence cannot rest on that expectation: if a boundary ever does
-// fall inside the family's raw keyspace, the narrowed set omits a group and the
-// caller reads it unfenced -- a stale read. Fencing a superset only costs an
-// extra fence, so the fence keeps the raw intersection for wide-column ranges.
-//
-// List keys keep the logical expansion: their raw prefix sorts nowhere near the
-// user key, so a raw intersection there would fence unrelated groups rather
-// than the owning one.
-func (s *ShardStore) routesForReadFence(start []byte, end []byte) ([]distribution.Route, bool) {
-	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); ok {
-		return s.engine.GetIntersectingRoutes(start, end), len(start) > 0
-	}
-	return s.routesForForwardScan(start, end)
 }
 
 func scanReadFenceRouteKey(route distribution.Route, start []byte, clampToRoutes bool) []byte {
