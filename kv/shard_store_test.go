@@ -3044,3 +3044,81 @@ func TestShardStoreVersionExistsAtOrBeforeGroupWithReadFence(t *testing.T) {
 	require.True(t, ok)
 	require.False(t, visible)
 }
+
+// fenceGroupRouter is a Coordinator that only implements the group routing the
+// fence dedup path uses, resolving exactly the way production does: normalize
+// the key first, then look the route up.
+type fenceGroupRouter struct {
+	Coordinator
+	engine *distribution.Engine
+}
+
+func (f *fenceGroupRouter) EngineGroupIDForKey(key []byte) uint64 {
+	route, ok := f.engine.GetRoute(routeKey(key))
+	if !ok {
+		return 0
+	}
+	return route.GroupID
+}
+
+// The fence's representative keys are re-normalized by every downstream
+// consumer (LeaseReadGroupKeys -> EngineGroupIDForKey -> ResolveGroup ->
+// routeKey). For a Redis wide-column range the owner key and the legacy
+// raw-prefix key both normalize to the same user key, so resolving groups from
+// bytes collapses the two into one and leaves the legacy group unfenced. The
+// group id has to survive on the target instead.
+func TestReadFenceTargetsSurviveGroupDedup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {}, 2: {}})
+
+	prefix := store.HashFieldScanPrefix([]byte("zebra"))
+	targets := st.ReadFenceTargetsForRange(prefix, store.PrefixScanEnd(prefix))
+	require.Len(t, targets, 2, "owner group plus legacy raw-prefix group")
+
+	carried := make([]uint64, 0, len(targets))
+	reResolved := make([]uint64, 0, len(targets))
+	for _, target := range targets {
+		carried = append(carried, target.GroupID)
+		route, ok := engine.GetRoute(routeKey(target.Key))
+		require.True(t, ok)
+		reResolved = append(reResolved, route.GroupID)
+	}
+
+	require.ElementsMatch(t, []uint64{2, 1}, carried,
+		"the fence must name both groups")
+	// Re-deriving from bytes is exactly what loses the legacy group; asserting
+	// it here pins why GroupID is carried rather than recomputed.
+	require.Equal(t, []uint64{2, 2}, reResolved,
+		"both representative keys normalize to the owner, so bytes alone are lossy")
+}
+
+// LeaseReadGroupTargets must keep both groups, where the key-only
+// LeaseReadGroupKeys collapses them.
+func TestLeaseReadGroupTargetsKeepsLegacyGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {}, 2: {}})
+	router := &fenceGroupRouter{engine: engine}
+
+	prefix := store.HashFieldScanPrefix([]byte("zebra"))
+	targets := st.ReadFenceTargetsForRange(prefix, store.PrefixScanEnd(prefix))
+
+	kept := LeaseReadGroupTargets(router, targets)
+	keptGroups := make([]uint64, 0, len(kept))
+	for _, target := range kept {
+		keptGroups = append(keptGroups, target.GroupID)
+	}
+	require.ElementsMatch(t, []uint64{2, 1}, keptGroups,
+		"both fenced groups must survive dedup")
+
+	collapsed := LeaseReadGroupKeys(router, st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix)))
+	require.Len(t, collapsed, 1,
+		"the key-only path collapses to one group; this is the gap targets close")
+}

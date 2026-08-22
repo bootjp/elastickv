@@ -1733,6 +1733,29 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte)
 	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
+// IsLeaderForGroup reports local leadership for an already-resolved group,
+// skipping the key -> route -> group derivation IsLeaderForKey performs. Read
+// fencing needs this: a fence target's group is known when the target is built,
+// and re-deriving it from the representative key can land on a different group
+// (see ReadFenceTarget).
+func (c *ShardedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return false
+	}
+	return isLeaderEngine(engineForGroup(g))
+}
+
+// RaftLeaderForGroup returns the Raft leader address for an already-resolved
+// group, the group-keyed counterpart of RaftLeaderForKey.
+func (c *ShardedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return ""
+	}
+	return leaderAddrFromEngine(engineForGroup(g))
+}
+
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 	g, ok := c.groupForKey(key)
 	if !ok {
@@ -1769,6 +1792,18 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	c.observeRead(ctx, routeID, key)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
+// LeaseReadForGroup establishes the lease freshness bound on an already-resolved
+// group. Read fencing knows the group when it builds a ReadFenceTarget, and
+// re-deriving it from the representative key can select a different group, so the
+// fence path uses this instead of LeaseReadForKey.
+func (c *ShardedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 

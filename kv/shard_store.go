@@ -718,16 +718,46 @@ func (s *ShardStore) routesForReverseScan(start []byte, end []byte) ([]distribut
 	return s.routesForScan(start, end)
 }
 
+// ReadFenceTarget names one Raft group a read fence must cover, together with
+// a representative key inside it.
+//
+// GroupID is carried explicitly rather than left to be re-derived from Key,
+// because that derivation is lossy. Redis wide-column rows can be reachable
+// through two routes: the logical owner of the decoded user key, and a legacy
+// route still holding rows under the raw !hs|fld| prefix. Their representative
+// keys both normalize through routeKey to the same user key, so a consumer that
+// re-resolves by bytes collapses the two groups into one and silently leaves the
+// legacy group unfenced. A zero GroupID means "resolve from Key" and is what
+// plain per-command keys use.
+type ReadFenceTarget struct {
+	GroupID uint64
+	Key     []byte
+}
+
 // ReadFenceGroupKeysForRange returns one representative routing key for each
-// Raft group that ScanAt can visit for [start, end). It uses the same route
-// expansion as ScanAt, so callers that take a snapshot outside ShardStore can
-// fence every intersecting group before reading.
+// Raft group that ScanAt can visit for [start, end).
+//
+// Prefer ReadFenceTargetsForRange: this form drops the group identity and is
+// kept for callers that only need the key bytes.
 func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte {
+	targets := s.ReadFenceTargetsForRange(start, end)
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.Key)
+	}
+	return keys
+}
+
+// ReadFenceTargetsForRange returns one target per Raft group that ScanAt can
+// visit for [start, end). It uses the same route expansion as ScanAt, so callers
+// that take a snapshot outside ShardStore can fence every intersecting group
+// before reading.
+func (s *ShardStore) ReadFenceTargetsForRange(start []byte, end []byte) []ReadFenceTarget {
 	if s == nil || s.engine == nil {
 		return nil
 	}
 	routes, clampToRoutes := s.routesForForwardScan(start, end)
-	keys := make([][]byte, 0, len(routes))
+	targets := make([]ReadFenceTarget, 0, len(routes))
 	seenGroups := make(map[uint64]struct{}, len(routes))
 	for _, route := range routes {
 		if route.GroupID != 0 {
@@ -736,9 +766,12 @@ func (s *ShardStore) ReadFenceGroupKeysForRange(start []byte, end []byte) [][]by
 			}
 			seenGroups[route.GroupID] = struct{}{}
 		}
-		keys = append(keys, scanReadFenceRouteKey(route, start, clampToRoutes))
+		targets = append(targets, ReadFenceTarget{
+			GroupID: route.GroupID,
+			Key:     scanReadFenceRouteKey(route, start, clampToRoutes),
+		})
 	}
-	return keys
+	return targets
 }
 
 // ReadFenceRouteVersion returns the route catalog version paired with

@@ -361,6 +361,63 @@ type RaftMembershipCoordinator interface {
 // work. Keys that cannot be routed (group ID 0) are never collapsed —
 // each is kept as its own representative so the lease check still runs
 // and surfaces the routing failure.
+// LeaseReadForGroupThrough runs the lease read against an already-resolved group
+// when the coordinator supports it, falling back to the key-resolved path.
+func LeaseReadForGroupThrough(c Coordinator, ctx context.Context, groupID uint64, key []byte) (uint64, error) {
+	if groupID != 0 {
+		if lr, ok := c.(interface {
+			LeaseReadForGroup(context.Context, uint64) (uint64, error)
+		}); ok {
+			idx, err := lr.LeaseReadForGroup(ctx, groupID)
+			return idx, errors.WithStack(err)
+		}
+	}
+	return LeaseReadForKeyThrough(c, ctx, key)
+}
+
+// GroupLeaderRoutableCoordinator is satisfied by coordinators that can answer
+// leadership for an already-resolved group id, so a read fence does not have to
+// re-derive the group from a representative key.
+type GroupLeaderRoutableCoordinator interface {
+	IsLeaderForGroup(groupID uint64) bool
+	RaftLeaderForGroup(groupID uint64) string
+}
+
+// LeaseReadGroupTargets collapses targets to one per Raft group, preferring the
+// group id a target already carries over re-deriving it from the key bytes. A
+// target with GroupID 0 falls back to key resolution, which is what plain
+// per-command keys need.
+//
+// The distinction matters for Redis wide-column ranges: the owner target and the
+// legacy raw-prefix target normalize to the same user key, so resolving both from
+// bytes would dedup them into a single group and leave the legacy group unfenced.
+func LeaseReadGroupTargets(c Coordinator, targets []ReadFenceTarget) []ReadFenceTarget {
+	router, ok := c.(GroupRoutableCoordinator)
+	if !ok {
+		return targets
+	}
+	out := make([]ReadFenceTarget, 0, len(targets))
+	seen := make(map[uint64]struct{}, len(targets))
+	for _, target := range targets {
+		gid := target.GroupID
+		if gid == 0 {
+			gid = router.EngineGroupIDForKey(target.Key)
+		}
+		if gid == 0 {
+			// Unroutable: keep it so the lease check runs and fails
+			// closed instead of silently skipping the shard.
+			out = append(out, target)
+			continue
+		}
+		if _, dup := seen[gid]; dup {
+			continue
+		}
+		seen[gid] = struct{}{}
+		out = append(out, ReadFenceTarget{GroupID: gid, Key: target.Key})
+	}
+	return out
+}
+
 func LeaseReadGroupKeys(c Coordinator, keys [][]byte) [][]byte {
 	router, ok := c.(GroupRoutableCoordinator)
 	if !ok {

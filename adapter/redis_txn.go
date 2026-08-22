@@ -46,6 +46,13 @@ type redisReadFenceRangeGroupKeyProvider interface {
 	ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte
 }
 
+// redisReadFenceRangeTargetProvider is the preferred provider: it keeps each
+// group's identity attached to its representative key, which the key-only form
+// loses (see kv.ReadFenceTarget).
+type redisReadFenceRangeTargetProvider interface {
+	ReadFenceTargetsForRange(start []byte, end []byte) []kv.ReadFenceTarget
+}
+
 type redisReadFenceRouteVersionProvider interface {
 	ReadFenceRouteVersion() uint64
 }
@@ -121,13 +128,31 @@ func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
 }
 
 func (r *RedisServer) redisTxnReadFenceKeysForRanges(userKey []byte, ranges []redisReadFenceRange) [][]byte {
-	keys := append([][]byte{}, redisTxnReadFencePointKeys(userKey)...)
+	return readFenceTargetKeys(r.redisTxnReadFenceTargetsForRanges(userKey, ranges))
+}
+
+// redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
+// keys carry no group id and are resolved from bytes; range-derived targets keep
+// the group the range expansion already resolved.
+func (r *RedisServer) redisTxnReadFenceTargetsForRanges(userKey []byte, ranges []redisReadFenceRange) []kv.ReadFenceTarget {
+	targets := make([]kv.ReadFenceTarget, 0, len(ranges)+1)
+	for _, key := range redisTxnReadFencePointKeys(userKey) {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
 	for _, readRange := range ranges {
-		rangeGroupKeys := r.redisReadFenceRangeGroupKeys(readRange.start, readRange.end)
-		if len(rangeGroupKeys) == 0 {
-			rangeGroupKeys = [][]byte{readRange.start}
+		rangeTargets := r.redisReadFenceRangeTargets(readRange.start, readRange.end)
+		if len(rangeTargets) == 0 {
+			rangeTargets = []kv.ReadFenceTarget{{Key: readRange.start}}
 		}
-		keys = append(keys, rangeGroupKeys...)
+		targets = append(targets, rangeTargets...)
+	}
+	return targets
+}
+
+func readFenceTargetKeys(targets []kv.ReadFenceTarget) [][]byte {
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.Key)
 	}
 	return keys
 }
@@ -199,15 +224,23 @@ func redisReadFenceRangesForPrefixes(prefixes [][]byte) []redisReadFenceRange {
 	return ranges
 }
 
-func (r *RedisServer) redisReadFenceRangeGroupKeys(start []byte, end []byte) [][]byte {
+func (r *RedisServer) redisReadFenceRangeTargets(start []byte, end []byte) []kv.ReadFenceTarget {
 	if r == nil || r.store == nil {
 		return nil
+	}
+	if provider, ok := r.store.(redisReadFenceRangeTargetProvider); ok {
+		return provider.ReadFenceTargetsForRange(start, end)
 	}
 	provider, ok := r.store.(redisReadFenceRangeGroupKeyProvider)
 	if !ok {
 		return nil
 	}
-	return provider.ReadFenceGroupKeysForRange(start, end)
+	keys := provider.ReadFenceGroupKeysForRange(start, end)
+	targets := make([]kv.ReadFenceTarget, 0, len(keys))
+	for _, key := range keys {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return targets
 }
 
 func (r *RedisServer) redisReadFenceRouteVersion() redisReadFenceRouteVersion {
@@ -244,10 +277,6 @@ func (v redisReadFenceRouteVersion) observedRouteVersion() uint64 {
 
 func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
 	return redisQueuedCommandReadFenceKeysForServer(nil, queue)
-}
-
-func (r *RedisServer) redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
-	return redisQueuedCommandReadFenceKeysForServer(r, queue)
 }
 
 func redisQueuedCommandReadFenceKeysForServer(r *RedisServer, queue []redcon.Command) [][]byte {
@@ -343,26 +372,77 @@ type redisTxnProxyRoute struct {
 	key           []byte
 }
 
-func (r *RedisServer) redisReadFenceGroupKeys(keys [][]byte) [][]byte {
+func (r *RedisServer) redisReadFenceGroupTargets(targets []kv.ReadFenceTarget) []kv.ReadFenceTarget {
 	if r == nil || r.coordinator == nil {
 		return nil
 	}
-	return kv.LeaseReadGroupKeys(r.coordinator, keys)
+	return kv.LeaseReadGroupTargets(r.coordinator, targets)
 }
 
 func (r *RedisServer) queuedCommandReadFenceGroupKeys(queue []redcon.Command) [][]byte {
-	return r.redisReadFenceGroupKeys(r.redisQueuedCommandReadFenceKeys(queue))
+	return readFenceTargetKeys(r.queuedCommandReadFenceGroupTargets(queue))
 }
 
-func (r *RedisServer) readFenceProxyKey(groupKeys [][]byte) ([]byte, bool, error) {
-	if r == nil || r.coordinator == nil || len(groupKeys) == 0 {
+// queuedCommandReadFenceGroupTargets collapses the queue's fence set to one
+// target per group, keeping each range-derived group id intact. It mirrors
+// redisQueuedCommandReadFenceKeysForServer exactly, including its per-key dedup,
+// and differs only in carrying the group id alongside each key.
+func (r *RedisServer) queuedCommandReadFenceGroupTargets(queue []redcon.Command) []kv.ReadFenceTarget {
+	seen := make(map[string]struct{}, len(queue))
+	targets := make([]kv.ReadFenceTarget, 0, len(queue))
+	appendTarget := func(target kv.ReadFenceTarget) {
+		keyID := string(target.Key)
+		if _, ok := seen[keyID]; ok {
+			return
+		}
+		seen[keyID] = struct{}{}
+		targets = append(targets, target)
+	}
+	for _, cmd := range queue {
+		for _, target := range r.commandReadFenceTargets(cmd) {
+			appendTarget(target)
+		}
+	}
+	return r.redisReadFenceGroupTargets(targets)
+}
+
+// commandReadFenceTargets is the target-carrying form of
+// redisCommandReadFenceKeysForServer.
+func (r *RedisServer) commandReadFenceTargets(cmd redcon.Command) []kv.ReadFenceTarget {
+	if len(cmd.Args) == 0 {
+		return nil
+	}
+	cmdName := strings.ToUpper(string(cmd.Args[0]))
+	meta, ok := redisCommandTable[cmdName]
+	if !ok {
+		return nil
+	}
+	targets := make([]kv.ReadFenceTarget, 0)
+	for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
+		if r == nil {
+			for _, key := range redisTxnReadFenceKeys(userKey) {
+				targets = append(targets, kv.ReadFenceTarget{Key: key})
+			}
+			continue
+		}
+		targets = append(targets, r.redisTxnReadFenceTargetsForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
+	}
+	for _, key := range redisCommandExactReadFenceKeys(cmd) {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return targets
+}
+
+func (r *RedisServer) readFenceProxyKeyForTargets(targets []kv.ReadFenceTarget) ([]byte, bool, error) {
+	if r == nil || r.coordinator == nil || len(targets) == 0 {
 		return nil, false, nil
 	}
 
 	var targetLeader string
 	var proxyKey []byte
-	for _, key := range groupKeys {
-		leader, localLeader, err := r.readFenceLeader(key)
+	for _, target := range targets {
+		key := target.Key
+		leader, localLeader, err := r.readFenceLeaderForTarget(target)
 		if err != nil {
 			return nil, false, err
 		}
@@ -380,12 +460,27 @@ func (r *RedisServer) readFenceProxyKey(groupKeys [][]byte) ([]byte, bool, error
 	return proxyKey, true, nil
 }
 
-func (r *RedisServer) readFenceLeader(key []byte) (string, bool, error) {
+// readFenceLeaderForTarget prefers the target's already-resolved group id.
+// Re-deriving the group from Key normalizes a raw wide-column prefix back to its
+// logical user key, which can name a different group than the one the fence set
+// out to cover.
+func (r *RedisServer) readFenceLeaderForTarget(target kv.ReadFenceTarget) (string, bool, error) {
+	if router, ok := r.coordinator.(kv.GroupLeaderRoutableCoordinator); ok && target.GroupID != 0 {
+		if router.IsLeaderForGroup(target.GroupID) {
+			return redisReadFenceLocalLeaderTarget, true, nil
+		}
+		return r.readFenceLeaderAddress(router.RaftLeaderForGroup(target.GroupID))
+	}
+	key := target.Key
 	localLeader := r.coordinator.IsLeaderForKey(key)
 	if localLeader {
 		return redisReadFenceLocalLeaderTarget, true, nil
 	}
 	leader := r.coordinator.RaftLeaderForKey(key)
+	return r.readFenceLeaderAddress(leader)
+}
+
+func (r *RedisServer) readFenceLeaderAddress(leader string) (string, bool, error) {
 	if leader == "" {
 		return "", false, ErrLeaderNotFound
 	}
@@ -419,18 +514,18 @@ func (r *RedisServer) transactionProxyRoute(queue []redcon.Command) (redisTxnPro
 	}
 
 	routeVersion := r.redisReadFenceRouteVersion()
-	groupKeys := r.queuedCommandReadFenceGroupKeys(queue)
+	fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
 	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
 		return redisTxnProxyRoute{}, err
 	}
-	if len(groupKeys) == 0 {
+	if len(fenceTargets) == 0 {
 		if !r.coordinator.IsLeader() {
 			return redisTxnProxyRoute{defaultLeader: true}, nil
 		}
 		return redisTxnProxyRoute{}, nil
 	}
 
-	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
+	proxyKey, ok, err := r.readFenceProxyKeyForTargets(fenceTargets)
 	if err != nil {
 		return redisTxnProxyRoute{}, err
 	}
@@ -456,33 +551,36 @@ func (r *RedisServer) retryTransactionProxyRoute(ctx context.Context, queue []re
 	return route, err
 }
 
-func (r *RedisServer) leaseRedisReadFenceGroups(ctx context.Context, groupKeys [][]byte) error {
+// leaseRedisReadFenceTargets establishes the lease bound on each fenced group,
+// using a target's carried group id when it has one so the legacy wide-column
+// group is not re-resolved into its logical owner.
+func (r *RedisServer) leaseRedisReadFenceTargets(ctx context.Context, targets []kv.ReadFenceTarget) error {
 	if r == nil || r.coordinator == nil {
 		return nil
 	}
-	if len(groupKeys) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
-	if len(groupKeys) == 1 {
-		_, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, groupKeys[0])
+	if len(targets) == 1 {
+		_, err := kv.LeaseReadForGroupThrough(r.coordinator, ctx, targets[0].GroupID, targets[0].Key)
 		return errors.WithStack(err)
 	}
 
 	leaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	errCh := make(chan error, len(groupKeys))
+	errCh := make(chan error, len(targets))
 	var wg sync.WaitGroup
 	var cancelOnce sync.Once
-	for _, key := range groupKeys {
+	for _, target := range targets {
 		wg.Add(1)
-		go func(k []byte) {
+		go func(t kv.ReadFenceTarget) {
 			defer wg.Done()
-			if _, err := kv.LeaseReadForKeyThrough(r.coordinator, leaseCtx, k); err != nil {
+			if _, err := kv.LeaseReadForGroupThrough(r.coordinator, leaseCtx, t.GroupID, t.Key); err != nil {
 				errCh <- errors.WithStack(err)
 				cancelOnce.Do(cancel)
 			}
-		}(key)
+		}(target)
 	}
 	wg.Wait()
 	close(errCh)
@@ -499,12 +597,24 @@ func (r *RedisServer) redisReadFencedTimestamp(
 	groupKeys [][]byte,
 	selectTS func() uint64,
 ) (uint64, *kv.ActiveTimestampToken, error) {
-	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
+	targets := make([]kv.ReadFenceTarget, 0, len(groupKeys))
+	for _, key := range groupKeys {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return r.redisReadFencedTimestampForTargets(ctx, targets, selectTS)
+}
+
+func (r *RedisServer) redisReadFencedTimestampForTargets(
+	ctx context.Context,
+	targets []kv.ReadFenceTarget,
+	selectTS func() uint64,
+) (uint64, *kv.ActiveTimestampToken, error) {
+	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
 		return 0, nil, err
 	}
 	readTS := selectTS()
 	readPin := r.pinReadTS(readTS)
-	if err := r.leaseRedisReadFenceGroups(ctx, groupKeys); err != nil {
+	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
 		readPin.Release()
 		return 0, nil, err
 	}
@@ -2901,8 +3011,8 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
 		routeVersion := r.redisReadFenceRouteVersion()
-		fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
-		startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
+		fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
+		startTS, readPin, err := r.redisReadFencedTimestampForTargets(dispatchCtx, fenceTargets, r.txnStartTS)
 		if err != nil {
 			return err
 		}
@@ -3134,8 +3244,8 @@ func (r *RedisServer) prepareExecDispatchWithStableRoute(
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
 	routeVersion := r.redisReadFenceRouteVersion()
-	fenceGroupKeys := r.queuedCommandReadFenceGroupKeys(queue)
-	startTS, readPin, err := r.redisReadFencedTimestamp(dispatchCtx, fenceGroupKeys, r.txnStartTS)
+	fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
+	startTS, readPin, err := r.redisReadFencedTimestampForTargets(dispatchCtx, fenceTargets, r.txnStartTS)
 	if err != nil {
 		return nil, nil, err
 	}
