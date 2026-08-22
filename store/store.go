@@ -32,6 +32,13 @@ var ErrValueTooLarge = errors.New("value too large")
 var ErrInvalidExportCursor = errors.New("invalid export cursor")
 var ErrImportBatchGap = errors.New("migration import batch gap")
 
+// ErrInvalidImportVersion marks a migration import version that is malformed
+// on its face (zero commit_ts, a tombstone carrying a value or expire_at).
+// It is a property of the request bytes, so every replica applying the same
+// Raft entry reaches the same verdict -- which is what lets kv/fsm classify
+// it as an ordinary apply error instead of halting the apply loop.
+var ErrInvalidImportVersion = errors.New("invalid migration import version")
+
 // validateValueSize returns ErrValueTooLarge when the value exceeds maxSnapshotValueSize.
 func validateValueSize(value []byte) error {
 	if len(value) > maxSnapshotValueSize {

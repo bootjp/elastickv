@@ -11,6 +11,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var ErrMigrationImportApply = errors.New("migration import: FSM apply failed; halting apply")
+
 // MarshalMigrationImportCommand encodes a target-group migration import batch
 // as a Raft FSM command. The target Internal RPC handler uses this instead of
 // mutating its local store directly so an acknowledged batch has been applied
@@ -32,7 +34,7 @@ func MarshalMigrationImportCommand(req *pb.ImportRangeVersionsRequest) ([]byte, 
 func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 	req := &pb.ImportRangeVersionsRequest{}
 	if err := proto.Unmarshal(data, req); err != nil {
-		return errors.WithStack(err)
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: decode migration import"))
 	}
 	result, err := f.store.ImportVersionsRaft(ctx, store.ImportVersionsOptions{
 		JobID:        req.GetJobId(),
@@ -43,16 +45,36 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 		Versions:     migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions()),
 	})
 	if err != nil {
-		return errors.WithStack(err)
+		if isMigrationImportOrdinaryApplyError(err) {
+			return errors.Wrap(err, "kv/fsm: apply migration import")
+		}
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: apply migration import"))
 	}
 	result.MaxImportedTS, err = f.migrationHLCFloorForApply(ctx, req, result)
 	if err != nil {
-		return errors.WithStack(err)
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: migration import hlc floor"))
 	}
 	if f.hlc != nil && result.MaxImportedTS > 0 {
 		f.hlc.Observe(result.MaxImportedTS)
 	}
 	return result
+}
+
+// isMigrationImportOrdinaryApplyError reports whether err is a verdict on the
+// request bytes rather than a failure of this replica's store. Only those may
+// be returned as an ordinary apply error: the engine advances setApplied past
+// a response that does not implement HaltApply, and every replica applying the
+// same entry decides an ordinary error identically, so the group stays in step.
+//
+// A store-side failure -- Pebble I/O, an encryption gate rejecting the write --
+// is per-replica. Letting it advance setApplied would leave the leader acking
+// the batch while the failed voter skips the imported versions for good, which
+// surfaces as missing data after failover or promotion. Those halt instead,
+// matching applyMigrationPromote.
+func isMigrationImportOrdinaryApplyError(err error) bool {
+	return errors.Is(err, store.ErrImportBatchGap) ||
+		errors.Is(err, store.ErrInvalidImportVersion) ||
+		errors.Is(err, store.ErrValueTooLarge)
 }
 
 func (f *kvFSM) migrationHLCFloorForApply(ctx context.Context, req *pb.ImportRangeVersionsRequest, result store.ImportVersionsResult) (uint64, error) {

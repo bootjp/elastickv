@@ -368,14 +368,14 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 
 func validateImportVersion(version MVCCVersion) error {
 	if version.CommitTS == 0 {
-		return errors.New("migration import version has zero commit_ts")
+		return errors.Wrap(ErrInvalidImportVersion, "migration import version has zero commit_ts")
 	}
 	if version.Tombstone {
 		if version.ExpireAt != 0 {
-			return errors.New("migration import tombstone carries expire_at")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries expire_at")
 		}
 		if len(version.Value) != 0 {
-			return errors.New("migration import tombstone carries value")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries value")
 		}
 		return nil
 	}
