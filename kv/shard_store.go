@@ -2811,6 +2811,13 @@ func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, 
 	out := make([]*store.KVPair, 0, min(limit, lockPageLimit))
 	cursor := start
 	scanned := 0
+	// The raw budget is deliberately larger than the accepted-lock budget. A
+	// route-bound scan walks a physical lock range that also holds locks for
+	// other logical routes, and counting those against `limit` let a page of
+	// unrelated locks fail the scan with ErrTxnLocked before a single relevant
+	// lock was seen. Only accepted locks signal a real conflict; this cap just
+	// keeps the paging bounded.
+	rawLimit := routeFilteredRawLockScanLimit(limit)
 	for {
 		lockKVs, nextCursor, done, err := scanTxnLockPageAt(ctx, st, cursor, end, ts)
 		if err != nil {
@@ -2826,8 +2833,8 @@ func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, 
 				return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
 			}
 		}
-		if scanned >= limit && !done {
-			return nil, errors.Wrapf(ErrTxnLocked, "scan lock budget exceeded for range [%q,%q)", string(start), string(end))
+		if scanned >= rawLimit && !done {
+			return nil, errors.Wrapf(ErrTxnLocked, "route-filtered lock scan budget exceeded for range [%q,%q)", string(start), string(end))
 		}
 		if done {
 			return out, nil
@@ -2836,8 +2843,22 @@ func scanTxnLockPagesAtWithRouteFilter(ctx context.Context, st store.MVCCStore, 
 	}
 }
 
+// routeFilteredRawLockScanLimit caps how many physical locks a route-bound scan
+// may page through while looking for locks that belong to its own route.
+func routeFilteredRawLockScanLimit(limit int) int {
+	if limit <= 0 {
+		return lockPageLimit
+	}
+	if limit > maxRouteFilteredLockScan/routeFilteredLockScanFactor {
+		return maxRouteFilteredLockScan
+	}
+	return limit * routeFilteredLockScanFactor
+}
+
 const lockPageLimit = 256
 const maxTxnLockScanResults = 1024
+const routeFilteredLockScanFactor = 8
+const maxRouteFilteredLockScan = 8192
 
 func boundedTxnLockScanLimit(limit int) int {
 	if limit < lockPageLimit {
