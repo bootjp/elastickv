@@ -326,3 +326,54 @@ func TestProposeWriterRegistrationBlockingOnCutover_LeaderUsesPropose(t *testing
 		t.Fatalf("ProposeAdmin calls = %d, want 0", proposer.proposeAdminCalls)
 	}
 }
+
+// A cluster without encryption still has a defaulted StateCache and a default
+// group store, so the interceptor must be gated on encryption actually being
+// configured. Otherwise its V2 capability probe runs on plain deployments and
+// AddVoter/AddLearner fail against nodes that have no sidecar.
+func TestNewEncryptionConfChangeInterceptorGatedOnEncryptionConfigured(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	cache := encryption.NewStateCache()
+
+	if got := newEncryptionConfChangeInterceptor(
+		false, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
+		allowStorageEnvelopeV2Capability,
+	); got != nil {
+		t.Fatalf("interceptor = %v, want nil when encryption is not configured", got)
+	}
+
+	if got := newEncryptionConfChangeInterceptor(
+		true, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
+		allowStorageEnvelopeV2Capability,
+	); got == nil {
+		t.Fatal("interceptor = nil, want a pre-register step when encryption is configured")
+	}
+
+	// The nil guards inside newEncryptionPreRegister still apply.
+	if got := newEncryptionConfChangeInterceptor(
+		true, nil, nil, nil, "", nil,
+	); got != nil {
+		t.Fatalf("interceptor = %v, want nil when the dependencies are missing", got)
+	}
+}
+
+func TestEncryptionWriteWiringEncryptionConfigured(t *testing.T) {
+	t.Parallel()
+
+	var off encryptionWriteWiring
+	if off.encryptionConfigured() {
+		t.Fatal("zero wiring reported encryption configured")
+	}
+	// The cache is always populated, so it must not be what decides.
+	defaulted := encryptionWriteWiring{cache: encryption.NewStateCache()}
+	if defaulted.encryptionConfigured() {
+		t.Fatal("a defaulted cache alone reported encryption configured")
+	}
+	on := encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: &encryption.Cipher{}}
+	if !on.encryptionConfigured() {
+		t.Fatal("wiring with a cipher did not report encryption configured")
+	}
+}

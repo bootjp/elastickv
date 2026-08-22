@@ -59,6 +59,27 @@ type storageEnvelopeV2CapabilityRPC func(context.Context, string) (*pb.Capabilit
 // group). A nil interceptor causes raftadmin.Server to skip the
 // pre-step, matching the pre-7c behavior on encryption-disabled
 // clusters.
+// newEncryptionConfChangeInterceptor installs the membership pre-step only when
+// encryption is actually configured. A cluster running without encryption still
+// gets a defaulted StateCache and a default group store, so gating on those
+// alone left the V2 capability probe running on plain deployments: every target
+// node there reports full_node_id=0 / encryption_capable=false, and
+// AddVoter/AddLearner failed even though the interceptor is meant to be inert.
+func newEncryptionConfChangeInterceptor(
+	encryptionConfigured bool,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	cache *encryption.StateCache,
+	sidecarPath string,
+	deriveNodeID func(raftID string) uint64,
+	capabilityProbes ...storageEnvelopeV2CapabilityProbe,
+) raftadmin.MembershipChangeInterceptor {
+	if !encryptionConfigured {
+		return nil
+	}
+	return newEncryptionPreRegister(coordinate, defaultGroup, cache, sidecarPath, deriveNodeID, capabilityProbes...)
+}
+
 func newEncryptionPreRegister(
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,

@@ -573,7 +573,8 @@ func run() error {
 	// *kv.ShardedCoordinator and *kv.ShardGroup are available. Returns
 	// nil when encryption is not wired (no StateCache or no default
 	// group), in which case raftadmin.Server skips the pre-step.
-	encryptionConfChangeInterceptor := newEncryptionPreRegister(
+	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
+		encWiring.encryptionConfigured(),
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
 	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(

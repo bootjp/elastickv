@@ -134,6 +134,15 @@ func (w encryptionWriteWiring) attachRaftEnvelopeGroup(groupID uint64, sg *kv.Sh
 //     legacy cleartext mode. When non-nil they are wired into every
 //     shard's PebbleStore; the gate still keeps writes cleartext
 //     until a Bootstrap + EnableStorageEnvelope has flipped the cache.
+//
+// encryptionConfigured reports whether this process actually has encryption
+// wired: buildEncryptionWriteWiring only builds a cipher when encryption is
+// enabled AND a KEK wrapper AND a sidecar path are all present. The cache is
+// always non-nil, so it cannot be used for this test.
+func (w encryptionWriteWiring) encryptionConfigured() bool {
+	return w.cipher != nil
+}
+
 type encryptionWriteWiring struct {
 	cache        *encryption.StateCache
 	cipher       *encryption.Cipher
