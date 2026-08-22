@@ -3388,3 +3388,47 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
 }
+
+// Reverse-scan counterpart of TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone.
+// A staged tombstone must hide the stale live row from the old raw route in both
+// scan directions, not just forward.
+func TestShardStoreS3BucketAuxiliaryReverseScanHonorsStagedTombstone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const migratedBucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(migratedBucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStart, End: routeEnd, GroupID: 2, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	deletedKey := s3keys.BucketMetaKey(migratedBucket)
+	visibleKey := s3keys.BucketMetaKey("bucket-z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, deletedKey, []byte("stale"), 10, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, visibleKey, []byte("visible"), 10, 0))
+	require.NoError(t, groups[2].Store.DeleteAt(ctx, distribution.MigrationStagedDataKey(9, deletedKey), 20))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+
+	// Reverse over the whole family: the tombstoned bucket must not appear.
+	kvs, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: visibleKey, Value: []byte("visible")}}, kvs)
+
+	// Reverse scoped to the tombstoned bucket alone.
+	kvs, err = st.ReverseScanAt(ctx, deletedKey, prefixScanEnd(deletedKey), 10, 30)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
