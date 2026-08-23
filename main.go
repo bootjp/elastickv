@@ -2169,6 +2169,13 @@ func configureCoordinatorTSOWithObserver(
 	if !dedicated {
 		return configureLegacyCoordinatorTSO(coordinate, mode)
 	}
+	// Let the state machine publish cutover / phase-D from its own apply and
+	// restore paths. Otherwise a replica that applies a marker but serves no
+	// allocations keeps reporting the pre-cutover values, and under the
+	// backward-compatible startup flags no mode-reload loop ever corrects it.
+	if tsoGroup != nil && tsoGroup.TSOState != nil && observer != nil {
+		tsoGroup.TSOState.SetDurableStateObserver(observer)
+	}
 	return configureDedicatedCoordinatorTSO(coordinate, tsoGroup, floorProvider, mode, observer)
 }
 

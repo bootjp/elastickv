@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -556,4 +557,89 @@ type shortTSOWriter struct{}
 
 func (shortTSOWriter) Write(p []byte) (int, error) {
 	return len(p) - 1, nil
+}
+
+type recordingDurableStateObserver struct {
+	mu    sync.Mutex
+	calls [][2]bool
+}
+
+func (o *recordingDurableStateObserver) ObserveTSODurableState(cutoverActive, phaseDActive bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, [2]bool{cutoverActive, phaseDActive})
+}
+
+func (o *recordingDurableStateObserver) last() ([2]bool, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.calls) == 0 {
+		return [2]bool{}, false
+	}
+
+	return o.calls[len(o.calls)-1], true
+}
+
+// A replica that applies the markers but never serves an allocation, and under
+// the backward-compatible startup flags never runs a mode-reload loop, has no
+// other path that would move these gauges off their pre-cutover values.
+func TestTSOStateMachinePublishesDurableStateOnApply(t *testing.T) {
+	t.Parallel()
+
+	observer := &recordingDurableStateObserver{}
+	fsm := NewTSOStateMachine(NewHLC(), WithTSODurableStateObserver(observer))
+
+	floor := uint64(1 << 20)
+	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(floor)))
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+
+	got, ok := observer.last()
+	require.True(t, ok, "applying the cutover marker must publish durable state")
+	require.Equal(t, [2]bool{true, false}, got)
+
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(floor)))
+	got, ok = observer.last()
+	require.True(t, ok)
+	require.Equal(t, [2]bool{true, true}, got, "phase-D apply must publish too")
+}
+
+// A replica that joins by snapshot never replays the marker entries.
+func TestTSOStateMachinePublishesDurableStateOnRestore(t *testing.T) {
+	t.Parallel()
+
+	source := NewTSOStateMachine(NewHLC())
+	floor := uint64(1 << 20)
+	require.Nil(t, source.Apply(marshalTSOAllocationFloor(floor)))
+	require.Nil(t, source.Apply(marshalTSOCutover()))
+	require.Nil(t, source.Apply(marshalTSOPhaseD(floor)))
+	snap, err := source.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	observer := &recordingDurableStateObserver{}
+	restored := NewTSOStateMachine(NewHLC(), WithTSODurableStateObserver(observer))
+	require.NoError(t, restored.Restore(io.NopCloser(&buf)))
+
+	got, ok := observer.last()
+	require.True(t, ok, "restoring a snapshot must publish durable state")
+	require.Equal(t, [2]bool{true, true}, got)
+}
+
+// The observer is installed after the group is built, so markers applied before
+// wiring must still be published at install time.
+func TestTSOStateMachineSetObserverPublishesExistingState(t *testing.T) {
+	t.Parallel()
+
+	fsm := NewTSOStateMachine(NewHLC())
+	require.Nil(t, fsm.Apply(marshalTSOAllocationFloor(1<<20)))
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+
+	observer := &recordingDurableStateObserver{}
+	fsm.SetDurableStateObserver(observer)
+
+	got, ok := observer.last()
+	require.True(t, ok, "installing the observer must publish current state")
+	require.Equal(t, [2]bool{true, false}, got)
 }

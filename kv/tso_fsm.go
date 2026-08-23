@@ -52,11 +52,75 @@ type TSOStateMachine struct {
 	cutoverActive   atomic.Bool
 	phaseDActive    atomic.Bool
 	phaseDFloor     atomic.Uint64
+	// observer publishes durable marker state from the apply and restore
+	// paths. Without it the gauges only move on a successful reservation or a
+	// runtime mode transition, so a replica that applies a marker but serves no
+	// allocations -- and, under the backward-compatible startup flags, runs no
+	// mode-reload loop -- keeps reporting cutover=0 / phase_d=0 indefinitely.
+	observer atomic.Pointer[tsoDurableStateObserverSlot]
+}
+
+// TSODurableStateObserver is the narrow slice of TSOObserver the state machine
+// needs. Keeping it separate lets the FSM publish without depending on the
+// allocation-latency surface.
+type TSODurableStateObserver interface {
+	ObserveTSODurableState(cutoverActive, phaseDActive bool)
+}
+
+type tsoDurableStateObserverSlot struct {
+	observer TSODurableStateObserver
+}
+
+// TSOStateMachineOption configures optional state-machine wiring.
+type TSOStateMachineOption func(*TSOStateMachine)
+
+// WithTSODurableStateObserver publishes cutover / phase-D gauges whenever the
+// markers are applied or restored.
+func WithTSODurableStateObserver(observer TSODurableStateObserver) TSOStateMachineOption {
+	return func(f *TSOStateMachine) {
+		if f == nil || observer == nil {
+			return
+		}
+		f.observer.Store(&tsoDurableStateObserverSlot{observer: observer})
+	}
+}
+
+// SetDurableStateObserver installs the observer after construction. Wiring
+// happens where the metrics registry is in scope rather than at the group
+// builder, which several test harnesses construct without one.
+func (f *TSOStateMachine) SetDurableStateObserver(observer TSODurableStateObserver) {
+	if f == nil || observer == nil {
+		return
+	}
+	f.observer.Store(&tsoDurableStateObserverSlot{observer: observer})
+	// Publish immediately: the markers may already have been applied or
+	// restored before the observer existed, which is precisely the stale-gauge
+	// case this addresses.
+	f.observeDurableState()
+}
+
+// observeDurableState publishes the current marker state. It is called on every
+// marker apply rather than only on transitions: the gauges are idempotent, the
+// markers are rare, and replaying an already-set marker after restart is
+// exactly when the gauge needs re-publishing.
+func (f *TSOStateMachine) observeDurableState() {
+	if f == nil {
+		return
+	}
+	slot := f.observer.Load()
+	if slot == nil || slot.observer == nil {
+		return
+	}
+	slot.observer.ObserveTSODurableState(f.cutoverActive.Load(), f.phaseDActive.Load())
 }
 
 // NewTSOStateMachine constructs the dedicated TSO FSM over the shared HLC.
-func NewTSOStateMachine(hlc *HLC) *TSOStateMachine {
-	return &TSOStateMachine{hlc: hlc}
+func NewTSOStateMachine(hlc *HLC, opts ...TSOStateMachineOption) *TSOStateMachine {
+	f := &TSOStateMachine{hlc: hlc}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 func (f *TSOStateMachine) Apply(data []byte) any {
@@ -145,6 +209,7 @@ func (f *TSOStateMachine) applyCutoverEntry(data []byte) any {
 	}
 	if f != nil {
 		f.cutoverActive.Store(true)
+		f.observeDurableState()
 	}
 	return nil
 }
@@ -173,6 +238,7 @@ func (f *TSOStateMachine) applyPhaseDEntry(data []byte) any {
 	}
 	f.phaseDFloor.Store(floor)
 	f.phaseDActive.Store(true)
+	f.observeDurableState()
 	return nil
 }
 
@@ -517,6 +583,9 @@ func (f *TSOStateMachine) restoreSnapshotState(
 			f.hlc.Observe(currentFloor)
 		}
 	}
+	// A replica that joins by snapshot never replays the marker entries, so the
+	// gauges have to be published here too.
+	f.observeDurableState()
 }
 
 func storeMaxInt64(value *atomic.Int64, candidate int64) {
