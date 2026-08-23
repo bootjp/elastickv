@@ -100,8 +100,9 @@ placement or failover.
 | M4 resolver work delegation | Unimplemented and unowned | Write `*_proposed_lock_resolver_delegation.md`; own snapshot assignment, leader-vouched decisions, duplicate work, failover, admission, and Raft apply boundaries |
 | M5 leader-proxy circuit breaker | Implemented on `main` | `2026_07_19_implemented_leader_proxy_circuit_breaker.md` (PR #1132, `56e36e94`) owns the data-plane breaker in `kv/leader_proxy_breaker.go` plus retry budget, leader-identity reset, half-open behavior, and adapter error mapping |
 
-The admin package's existing `ErrLeaderUnavailable` mapping is not evidence that
-the general data-plane leader proxy has the proposed circuit breaker.
+The admin package's existing `ErrLeaderUnavailable` mapping was never evidence
+for the data-plane breaker; that gap was closed separately by PR #1132, which
+added `kv/leader_proxy_breaker.go` and its adapter error mapping.
 
 ## 5. Additional gaps introduced by the 2026-06-23 roadmap
 
@@ -120,10 +121,13 @@ The next focused designs should be written and implemented in this order:
    without moving their mechanisms into this roadmap. The shared Pebble block
    cache is no longer in this list: PR #1082 merged and §3 records it as
    implemented on `main`.
-2. Catalog delta/watch, then catalog index and batched mutation.
+2. Catalog index, then batched mutation. Catalog delta/watch is no longer in
+   this list: PR #1117 merged and §4.1 records M1 as implemented on `main`.
 3. Follower reads and cross-shard transaction completion, both gated on the
    dedicated timestamp invariant where required.
-4. SST snapshot transfer, Pebble resource governance, and sharded retention.
+4. Pebble resource governance and sharded retention. SST ingest snapshot
+   transfer is no longer in this list: PR #1130 merged and §4.3 records M1 as
+   implemented on `main`.
 5. Region balance and range merge.
 6. WAN membership, regional timestamps, regional catalog, and cross-region
    failover in that order.
