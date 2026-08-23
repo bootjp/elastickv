@@ -587,68 +587,11 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
 		return err
 	}
-	// Staged rows first, and deliberately with appliedIndex 0.
-	//
-	// While a route has staged visibility a logical key can exist only under
-	// !dist|migstage|<job>|..., and a raw-prefix tombstone leaves that staged
-	// row as the winning visible version -- so a prefix delete would report
-	// success with the key still readable. ShardStore.DeletePrefixAtRaftAt
-	// already propagates to staged prefixes, but production builds each FSM
-	// directly over the per-group store (main.go's NewKvFSMWithHLC(st, ...)),
-	// never over ShardStore, so this apply path has to do it itself.
-	//
-	// Ordering is load-bearing: the raw delete bundles pendingApplyIdx into its
-	// batch, so it must be the last write. A crash before it replays the whole
-	// entry, and the staged tombstones are idempotent at the same commitTS.
-	// Doing the raw delete first would advance the applied index and let replay
-	// skip the staged half permanently.
-	for _, staged := range f.stagedVisibilityPrefixDeletes(prefix) {
-		if err := f.store.DeletePrefixAtRaftAt(ctx, staged.prefix, staged.excludePrefix, commitTS, 0); err != nil {
-			return errors.WithStack(err)
-		}
-	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
-}
-
-type fsmStagedPrefixDelete struct {
-	prefix        []byte
-	excludePrefix []byte
-}
-
-// stagedVisibilityPrefixDeletes returns the staged prefixes this shard group
-// must tombstone alongside a raw prefix delete. It mirrors
-// ShardStore.stagedVisibilityPrefixDeletes but is scoped to this FSM's own
-// group, which is the only store it can write.
-func (f *kvFSM) stagedVisibilityPrefixDeletes(prefix []byte) []fsmStagedPrefixDelete {
-	if f == nil || f.routes == nil {
-		return nil
-	}
-	snap, ok := f.routes.Current()
-	if !ok {
-		return nil
-	}
-	start, end := routePrefixRange(prefix)
-	routes := snap.IntersectingRoutes(start, end)
-	out := make([]fsmStagedPrefixDelete, 0, len(routes))
-	seen := make(map[string]struct{}, len(routes))
-	for _, route := range routes {
-		if route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
-			continue
-		}
-		stagedPrefix := distribution.MigrationStagedDataKey(route.MigrationJobID, prefix)
-		stagedExclude := distribution.MigrationStagedDataKey(route.MigrationJobID, txnCommonPrefix)
-		dedupeKey := string(stagedPrefix) + "\x00" + string(stagedExclude)
-		if _, dup := seen[dedupeKey]; dup {
-			continue
-		}
-		seen[dedupeKey] = struct{}{}
-		out = append(out, fsmStagedPrefixDelete{prefix: stagedPrefix, excludePrefix: stagedExclude})
-	}
-	return out
 }
 
 func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
