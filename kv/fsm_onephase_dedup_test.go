@@ -235,3 +235,72 @@ func TestOnePhaseDedup_OtherTxnVersionDoesNotMaskRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), val, "retry's write must be readable; exactness loss would have lost it")
 }
+
+// A key that exists only under the staged prefix stays the winning visible
+// version if a prefix delete tombstones the raw prefix alone, so prefix cleanup
+// reports success while the key is still readable. ShardStore propagates to the
+// staged prefix, but production builds the FSM over the per-group store, so the
+// apply path has to do it itself.
+func TestDelPrefix_TombstonesStagedRowsUnderStagedVisibility(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+	}})
+	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
+	fsm, ok := fsmIface.(*kvFSM)
+	require.True(t, ok)
+
+	key := []byte("list-item")
+	stagedKey := distribution.MigrationStagedDataKey(9, key)
+	// The row exists ONLY under the staged prefix, which is the case a raw
+	// tombstone cannot reach.
+	require.NoError(t, st.PutAt(ctx, stagedKey, []byte("v"), 20, 0))
+
+	require.NoError(t, fsm.handleDelPrefix(ctx, []byte("list-"), 30))
+
+	staged, err := st.GetAt(ctx, stagedKey, 40)
+	require.ErrorIs(t, err, store.ErrKeyNotFound,
+		"the staged row must be tombstoned by the prefix delete")
+	require.Nil(t, staged)
+}
+
+// The staged tombstone must not escape its own migration job or this shard
+// group: another job's staged rows under the same logical prefix are a
+// different route's data.
+func TestDelPrefix_LeavesOtherJobsStagedRowsIntact(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
+		RouteID:                1,
+		Start:                  []byte("a"),
+		End:                    []byte("z"),
+		GroupID:                1,
+		State:                  distribution.RouteStateActive,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+	}})
+	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
+	fsm, ok := fsmIface.(*kvFSM)
+	require.True(t, ok)
+
+	key := []byte("list-item")
+	otherJobKey := distribution.MigrationStagedDataKey(11, key)
+	require.NoError(t, st.PutAt(ctx, otherJobKey, []byte("v"), 20, 0))
+
+	require.NoError(t, fsm.handleDelPrefix(ctx, []byte("list-"), 30))
+
+	got, err := st.GetAt(ctx, otherJobKey, 40)
+	require.NoError(t, err, "a different migration job's staged rows must survive")
+	require.Equal(t, []byte("v"), got)
+}
