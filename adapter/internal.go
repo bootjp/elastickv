@@ -12,6 +12,20 @@ import (
 
 type InternalOption func(*Internal)
 
+// WithKVForwardRejected refuses Forward before it can propose.
+//
+// The dedicated TSO group runs TSOStateMachine, whose Apply halts on any tag it
+// does not recognise. TransactionManager.Commit encodes KV requests with the
+// 0x00 / 0x01 tags, so a single forwarded PUT reaching this group's Internal
+// server would commit an entry that permanently stops group-0 apply -- and with
+// it all centralized timestamp issuance. The registration loop wires an Internal
+// server for every runtime, so the refusal has to live here.
+func WithKVForwardRejected() InternalOption {
+	return func(i *Internal) {
+		i.kvForwardRejected = true
+	}
+}
+
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
@@ -37,6 +51,9 @@ type Internal struct {
 	clock              *kv.HLC
 	tsAllocator        kv.TimestampAllocator
 	relay              *RedisPubSubRelay
+	// kvForwardRejected marks a runtime whose state machine cannot apply KV
+	// entries -- the dedicated TSO group. See WithKVForwardRejected.
+	kvForwardRejected bool
 
 	pb.UnimplementedInternalServer
 }
@@ -44,10 +61,16 @@ type Internal struct {
 var _ pb.InternalServer = (*Internal)(nil)
 
 var ErrNotLeader = errors.New("not leader")
+var ErrKVForwardNotSupported = errors.New("kv forward not supported on this raft group")
 var ErrLeaderNotFound = errors.New("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	// Before the leader check, so a non-leader gets the accurate reason and a
+	// leader can never reach stampTimestamps and propose.
+	if i.kvForwardRejected {
+		return nil, errors.WithStack(ErrKVForwardNotSupported)
+	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}

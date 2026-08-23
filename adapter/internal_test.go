@@ -293,3 +293,38 @@ type internalLegacyRuntimeAllocator struct{}
 func (internalLegacyRuntimeAllocator) Next(context.Context) (uint64, error) {
 	return 0, errors.WithStack(kv.ErrTSOAllocatorRequired)
 }
+
+// The dedicated TSO group runs TSOStateMachine, whose Apply halts on any tag it
+// does not recognise. TransactionManager.Commit encodes KV requests with the
+// 0x00 / 0x01 tags, so one forwarded PUT reaching group 0's Internal server
+// would commit an entry that permanently stops group-0 apply and with it all
+// centralized timestamp issuance. Forward must refuse before proposing.
+func TestInternalForward_RejectedOnDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	resp, err := i.Forward(context.Background(), &pb.ForwardRequest{
+		Requests: []*pb.Request{{
+			IsTxn:     false,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}},
+	})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.Nil(t, resp)
+}
+
+// The guard must fire before the leader check so it cannot be masked by
+// ErrNotLeader, and so it is refused on every replica rather than only where a
+// leader would have proposed.
+func TestInternalForward_RejectionPrecedesLeaderCheck(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	_, err := i.Forward(context.Background(), &pb.ForwardRequest{})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.NotErrorIs(t, err, ErrNotLeader)
+}

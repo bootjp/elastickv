@@ -3060,12 +3060,18 @@ func startRaftServers(
 			coordinate.Clock(),
 			s3BlobPushBlocked,
 		)
+		internalOpts := internalTimestampOptions(coordinate)
+		if rt.spec.id == dedicatedTSORaftGroupID {
+			// Group 0 runs TSOStateMachine, which halts on KV tags; a
+			// forwarded PUT here would stop timestamp issuance for good.
+			internalOpts = append(internalOpts, adapter.WithKVForwardRejected())
+		}
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			internalTimestampOptions(coordinate)...,
+			internalOpts...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		registerAdminServerIfPresent(gs, adminServer)

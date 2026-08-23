@@ -385,13 +385,11 @@ func (s *Service) initializeRootOnce(ctx context.Context, mode uint32, uid uint3
 	if err != nil {
 		return err
 	}
-	_, err = s.dispatch.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems:    elems,
-		IsTxn:    true,
-		StartTS:  ts,
-		ReadKeys: readKeys,
-	})
-	return errors.Wrap(err, "filesystem initialize root dispatch")
+	// Through dispatchTxn, not Dispatch: root creation spans the inode, home,
+	// directory, and usage routes, so after cutover it needs the same Phase-D
+	// voucher as every other transactional path. Dispatching directly here
+	// bypassed it and failed root creation with ErrTSOTimestampPrePhaseD.
+	return errors.Wrap(s.dispatchTxn(ctx, ts, elems, readKeys), "filesystem initialize root")
 }
 
 func (s *Service) Resolve(ctx context.Context, parent uint64, name []byte) (uint64, error) {
