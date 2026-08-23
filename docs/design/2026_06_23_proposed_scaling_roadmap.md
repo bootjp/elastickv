@@ -47,12 +47,12 @@ again before merge or deployment.
 | Leader balance | `2026_06_11_implemented_leader_balance_scheduler.md` | PR #1012 merged | Implemented on `main`; data placement is separate |
 | Hotspot split M1 catalog and same-group split | `2026_02_18_implemented_hotspot_split_milestone1_pr.md` and `2026_02_18_partial_hotspot_shard_split.md` | PR #999 merged the catalog cleanup | Implemented M1; parent design remains partial |
 | Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the lifecycle; PRs #1084, #1085, #1088, and #1090 open | In flight; not on `main` as a complete migration plane |
-| Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PR #1097 merged the detector core; PR #1104 open | In flight; not implemented on `main` |
+| Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PRs #1097 and #1152 merged the detector core and the committed-window reader (`afec0597`, `distribution/autosplit/sampler_reader.go` plus the observe-only detector bridge); PR #1104 open | Partially implemented on `main`; M3-PR2b Top-K, the leadership watermark, and scheduler wiring remain open |
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
-| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, and #1108 merged; PR #1095 open | Group reservation, state-machine wiring, and durable leader routing are on `main`; the ceiling FSM remains in flight |
+| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, #1108, and #1150 merged (`0e85c822` added `kv/tso_fsm.go` with snapshot/restore of the physical ceiling); PR #1095 open | Group reservation, state-machine wiring, durable leader routing, and the ceiling state machine are on `main`; group-0 issuance and its operational exposure remain in flight |
 | Shared Pebble block cache | PR #1082 | PR #1082 merged | Implemented on `main`; cache sharing only, not all resource-pool work |
 | Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; multi-group soak evidence landed with the design's §8 (`cmd/elastickv-raft-stream-soak`, `scripts/run-jepsen-raft-streaming-multigroup-soak.sh`, `docs/evidence/raft_streaming_multigroup_soak.json`) |
-| S3 Raft blob offload | `2026_04_25_partial_s3_raft_blob_offload.md` | PRs #1057 and #1063 merged the rollout scaffolding and blob fetch RPC | In flight; end-to-end payload offload is not yet on `main` |
+| S3 Raft blob offload | `2026_04_25_partial_s3_raft_blob_offload.md` | PRs #1057 and #1063 merged the rollout scaffolding and blob fetch RPC; `77ea547d` merged the local offload decision, PUT/GET path, and peer replication/fetch; #1126 (`5eaaa05d`) merged follower repair and asynchronous backfill | Transport path is on `main`; the focused design names reference counting, GC readiness, and legacy migration as the remaining blockers |
 | Live logical backup | `2026_04_29_proposed_logical_backup.md` | PRs #1065 and #1059 merged the scan primitives and admin version API; PR #1056 open | In flight; distinct from physical SST snapshot offload |
 
 ## 4. 2026-06-12 requirement audit
@@ -61,7 +61,7 @@ again before merge or deployment.
 
 | 2026-06-12 milestone | Disposition | Remaining ownership |
 |---|---|---|
-| M1 versioned catalog delta and streaming watch | Unimplemented and unowned | Write `*_proposed_route_catalog_delta_watch.md`; own the durable delta log, retention fallback, atomic mirror publication, capability negotiation, and stream reconnect semantics |
+| M1 versioned catalog delta and streaming watch | Implemented on `main` | `2026_07_18_implemented_route_catalog_delta_watch.md` (PR #1117, `6c7a66e5`) owns the durable delta log, retention fallback, atomic mirror publication, capability negotiation, and stream reconnect semantics |
 | M2 indexed route engine and copy-on-write history | Unimplemented and unowned | Write `*_proposed_route_catalog_index.md`; own the primary index, group secondary index, immutable snapshot sharing, memory bound, and migration from the slice representation |
 | M3 batched catalog mutation | Unimplemented and unowned | Write `*_proposed_route_catalog_batching.md`; own batch conflict semantics, one-version publication, idempotency, limits, and interaction with the delta watch |
 
@@ -84,11 +84,11 @@ placement or failover.
 
 | 2026-06-12 milestone | Disposition | Remaining ownership |
 |---|---|---|
-| M1 SST ingest snapshot transfer | Unimplemented and unowned | Write `*_proposed_pebble_sst_snapshot_transfer.md`; own checkpoint consistency, file manifest, integrity, transport, ingest, cleanup, and fallback |
+| M1 SST ingest snapshot transfer | Implemented on `main` | `2026_07_19_implemented_pebble_sst_ingest_snapshot_transfer.md` (PR #1130, `910a97e0`) owns checkpoint consistency, file manifest, integrity, transport, ingest, cleanup, and fallback |
 | M2 shared block cache | Implemented on `main` | PR #1082 owned only process-wide cache sizing, lifetime, metrics, and tests |
 | M2 per-shard Pebble tuning and write admission | Partially addressed operationally, but the proposed per-shard contract is unowned | Write `*_proposed_pebble_resource_governor.md`; own tuning scope, node-wide fairness, stall thresholds, admission errors, and adapter retry semantics |
 | M3 sharded retention scheduling | Existing compaction is implemented; jitter, node budget, and hot-key dynamic retention are unimplemented and unowned | Write `*_proposed_sharded_mvcc_retention.md`; preserve the hard retention contract and active timestamp pins |
-| M4 physical disaster-recovery snapshot offload | Unimplemented and unowned | Write `*_proposed_physical_snapshot_object_offload.md`; do not merge it into logical backup or S3 user-payload blob offload |
+| M4 physical disaster-recovery snapshot offload | Partially implemented on `main` | `2026_07_19_partial_physical_snapshot_object_offload.md` (PR #1131, `764db2d8`) owns the export/restore substrate and records M0/M1 implemented; that owner still owns the pending M2/M3 object publication and runtime work. Keep it distinct from logical backup and S3 user-payload blob offload |
 
 ### 4.4 Coordinator and API gateway
 
@@ -98,7 +98,7 @@ placement or failover.
 | M2 follower and learner reads | Unimplemented and unowned | Write `*_proposed_follower_reads.md`; own leader-vouched read timestamps, apply watermarks, staleness/session contract, invalidation, routing, and Jepsen evidence |
 | M3 cross-shard 2PC completion | Partially implemented; no focused end-to-end owner | Write `*_proposed_cross_shard_transaction_completion.md`; start from the existing `ShardedCoordinator` 2PC and Composed-1 guard, then own unsupported router paths, read-only validation, recovery, and adapter coverage |
 | M4 resolver work delegation | Unimplemented and unowned | Write `*_proposed_lock_resolver_delegation.md`; own snapshot assignment, leader-vouched decisions, duplicate work, failover, admission, and Raft apply boundaries |
-| M5 leader-proxy circuit breaker | Unimplemented and unowned for the data plane | Write `*_proposed_leader_proxy_circuit_breaker.md`; own retry budget, leader-change reset, backoff, adapter errors, and election-storm behavior |
+| M5 leader-proxy circuit breaker | Implemented on `main` | `2026_07_19_implemented_leader_proxy_circuit_breaker.md` (PR #1132, `56e36e94`) owns the data-plane breaker in `kv/leader_proxy_breaker.go` plus retry budget, leader-identity reset, half-open behavior, and adapter error mapping |
 
 The admin package's existing `ErrLeaderUnavailable` mapping is not evidence that
 the general data-plane leader proxy has the proposed circuit breaker.
@@ -135,7 +135,14 @@ The next focused designs should be written and implemented in this order:
 This roadmap can be promoted from `proposed` only when every row is either:
 
 - implemented on `main` with its focused owner promoted to `implemented`, or
+- implemented on `main` where the row's canonical owner is a merged pull
+  request rather than a design document, evidenced by that merge commit, or
 - deliberately rejected with a recorded rationale in its focused owner.
 
-An open pull request, a code primitive, or a superseded roadmap paragraph is
-not sufficient evidence of completion.
+The second clause exists because a pull request has no lifecycle status to
+promote. The shared Pebble block cache row names PR #1082 as its only canonical
+owner and treats that work as complete, so under the first clause alone this
+roadmap could never become eligible for promotion no matter what else shipped.
+
+An *open* pull request, a code primitive, or a superseded roadmap paragraph is
+still not sufficient evidence of completion.
