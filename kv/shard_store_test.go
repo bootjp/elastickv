@@ -999,10 +999,13 @@ func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
 func TestShardStoreFilesystemGroupIDsReturnsPhysicalGroupsSorted(t *testing.T) {
 	t.Parallel()
 
+	// Real stores: FilesystemGroupIDs enumerates groups that can actually hold
+	// filesystem data, and store-less groups (the dedicated TSO group) are
+	// excluded. This case is about ordering.
 	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
-		9: {},
-		2: {},
-		5: {},
+		9: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		5: {Store: store.NewMVCCStore()},
 	})
 	require.Equal(t, []uint64{2, 5, 9}, st.FilesystemGroupIDs())
 }
@@ -1731,4 +1734,28 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte(""), []byte("z"), 1, true)
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
+}
+
+// The dedicated TSO group is registered in the ShardStore group map so leader
+// routing and lease renewal can reach it, but it opens no MVCC store. Every
+// scan against it returns ErrKeyNotFound, and the filesystem placement
+// collector treats that as a hard failure -- so it must not be enumerated as a
+// filesystem group at all.
+func TestFilesystemGroupIDsSkipsStorelessGroups(t *testing.T) {
+	t.Parallel()
+
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		0: {},                            // dedicated TSO group: no Store
+		1: {Store: store.NewMVCCStore()}, // data group
+		2: nil,                           // defensive: nil group
+	})
+
+	require.Equal(t, []uint64{1}, st.FilesystemGroupIDs())
+
+	// Scanning a store-less group is a no-op rather than an error, so
+	// enumerating it never broke collection -- it just cost one pointless scan
+	// per group per collection. Pinned here so the rationale is not overstated.
+	page, err := st.ScanGroupAt(context.Background(), 0, []byte("a"), []byte("b"), 10, 1)
+	require.NoError(t, err)
+	require.Empty(t, page)
 }

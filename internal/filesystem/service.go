@@ -2605,18 +2605,45 @@ func (s *Service) fenceReadSnapshot(ctx context.Context) error {
 	return nil
 }
 
+// dispatchTxn binds a Phase-D read voucher to the transaction's caller-supplied
+// start timestamp.
+//
+// The filesystem's snapshot is the applied LastCommitTS watermark, which can
+// legitimately sit below the Phase-D floor right after cutover. A cross-shard
+// filesystem transaction -- create, rename, truncate, and root initialization
+// all span inode, directory, home, usage, or chunk routes -- would then reach
+// ShardedCoordinator.validateCallerSuppliedTxnStart with no voucher and be
+// rejected with ErrTSOTimestampPrePhaseD.
+//
+// The voucher is taken here rather than at readTS because every transactional
+// path funnels through this one function, so no caller can miss it, and the
+// applied-watermark check only becomes more true with time: validating the same
+// timestamp later than the read cannot turn a valid snapshot into an invalid
+// one. Read-only paths keep using readTS and need no voucher.
 func (s *Service) dispatchTxn(
 	ctx context.Context,
 	startTS uint64,
 	elems []*kv.Elem[kv.OP],
 	readKeys [][]byte,
 ) error {
-	_, err := s.dispatch.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	reqs := &kv.OperationGroup[kv.OP]{
 		Elems:    elems,
 		IsTxn:    true,
 		StartTS:  startTS,
 		ReadKeys: readKeys,
-	})
+	}
+	coord, ok := s.dispatch.(kv.Coordinator)
+	if !ok {
+		_, err := s.dispatch.Dispatch(ctx, reqs)
+		return errors.Wrap(err, "filesystem dispatch txn")
+	}
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, coord, startTS,
+		"filesystem dispatch txn: begin read timestamp")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	reqs.StartTS = readTimestamp.Timestamp()
+	_, err = kv.DispatchWithReadTimestamp(readTimestamp.WithDispatchVoucher(ctx), coord, reqs)
 	return errors.Wrap(err, "filesystem dispatch txn")
 }
 

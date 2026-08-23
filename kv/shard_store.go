@@ -74,7 +74,15 @@ func (s *ShardStore) FilesystemGroupIDs() []uint64 {
 		return nil
 	}
 	groupIDs := make([]uint64, 0, len(s.groups))
-	for groupID := range s.groups {
+	for groupID, group := range s.groups {
+		// Skip store-less groups. The dedicated TSO group (0) is registered
+		// here so leader routing and lease renewal can reach it, but it opens
+		// no MVCC store and can never hold filesystem chunks. Scanning it is a
+		// no-op rather than an error, so this is not a correctness fix -- it
+		// removes one pointless scan per group per placement collection.
+		if group == nil || group.Store == nil {
+			continue
+		}
 		groupIDs = append(groupIDs, groupID)
 	}
 	slices.Sort(groupIDs)
