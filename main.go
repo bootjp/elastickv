@@ -3004,6 +3004,19 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	return opts
 }
 
+// internalOptionsForGroup builds the Internal server options for one runtime.
+//
+// Group 0 runs TSOStateMachine, whose Apply halts on the KV tags
+// TransactionManager.Commit emits, so a forwarded PUT reaching its Internal
+// server would stop group-0 apply and all centralized timestamp issuance.
+func internalOptionsForGroup(coordinate kv.Coordinator, groupID uint64) []adapter.InternalOption {
+	opts := internalTimestampOptions(coordinate)
+	if groupID == dedicatedTSORaftGroupID {
+		opts = append(opts, adapter.WithKVForwardRejected())
+	}
+	return opts
+}
+
 func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -3060,18 +3073,12 @@ func startRaftServers(
 			coordinate.Clock(),
 			s3BlobPushBlocked,
 		)
-		internalOpts := internalTimestampOptions(coordinate)
-		if rt.spec.id == dedicatedTSORaftGroupID {
-			// Group 0 runs TSOStateMachine, which halts on KV tags; a
-			// forwarded PUT here would stop timestamp issuance for good.
-			internalOpts = append(internalOpts, adapter.WithKVForwardRejected())
-		}
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			internalOpts...,
+			internalOptionsForGroup(coordinate, rt.spec.id)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		registerAdminServerIfPresent(gs, adminServer)
