@@ -152,7 +152,9 @@ The next focused designs should be written and implemented in this order:
 5. Pebble resource governance and sharded retention. These are independent of
    step 4: the predecessor's §5.3 records M4 as depending on M1 alone, and the
    focused offload owner names no dependency on either design.
-6. Replica placement, then region balance and range merge.
+6. Replica placement, then region balance. Range merge is not sequenced behind
+   placement: its row names no placement dependency, and only the region/range
+   balance scheduler does, so the two can proceed in parallel.
 7. WAN membership, regional timestamps, regional catalog, and cross-region
    failover in that order.
 8. Auto group lifecycle only after placement, migration, merge, and membership
