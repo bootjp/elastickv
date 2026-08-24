@@ -2275,7 +2275,14 @@ func (c *ShardedCoordinator) observeRead(ctx context.Context, routeID uint64, ke
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, key, keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
+	// Normalized for the same reason observeMutation normalizes: routeID was
+	// resolved through routeKey, and the sampler's sub-buckets are laid out on
+	// catalog route boundaries, which live in the normalized keyspace. A raw
+	// adapter key -- a DynamoDB item key, a Redis route wrapper -- sorts in a
+	// different keyspace than those boundaries, so read-heavy traffic bucketed
+	// against the wrong bounds and could pick a split boundary unrelated to the
+	// hot logical key.
+	c.sampler.Observe(routeID, routeKey(key), keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
 }
 
 func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label {

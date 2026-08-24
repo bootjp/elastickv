@@ -418,3 +418,32 @@ func TestShardedCoordinatorSamplesNormalizedRouteKey(t *testing.T) {
 		"sampler must see the route key so evidence and route descriptors share an ordering")
 	require.NotEqual(t, raw, calls[0].key)
 }
+
+// The read path must normalize exactly like the write path. routeAndGroupForKey
+// resolves the RouteID through routeKey, but observeRead used to record the raw
+// key, so a DynamoDB item key or Redis route wrapper was bucketed against
+// catalog boundaries in a different keyspace -- the same failure observeMutation
+// already documents, on reads instead of writes.
+func TestShardedCoordinatorSamplesNormalizedRouteKeyOnReads(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	rec := &recordingSampler{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil).WithSampler(rec)
+
+	raw := []byte("!redis|str|z")
+	coord.observeRead(context.Background(), 100, raw)
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 1)
+	require.Equal(t, keyviz.OpRead, calls[0].op)
+	require.Equal(t, RouteKey(raw), calls[0].key,
+		"read evidence must share an ordering with the route descriptors")
+	require.NotEqual(t, raw, calls[0].key)
+}
