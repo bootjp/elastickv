@@ -1939,7 +1939,30 @@ func (s *EncryptionAdminServer) requireRecoveryLeader(ctx context.Context) error
 	if view == nil {
 		view = s.leaderView
 	}
-	return requireEncryptionLeader(ctx, view)
+	if err := requireEncryptionLeader(ctx, view); err != nil {
+		return err
+	}
+	if view == nil {
+		return nil
+	}
+	// Leadership is not enough here. VerifyLeader confirms quorum through a
+	// ReadIndex round-trip but submits it with waitApplied=false, and
+	// handleReadStates completes such a request as soon as the index is known
+	// -- it never waits for this node's FSM to reach it. A leader that has
+	// committed a newer writer registration but has not applied it yet
+	// therefore passes, and the registry read below returns the older
+	// last_seen_local_epoch. A recovering caller with a rolled-back sidecar
+	// would then choose an epoch that is too low.
+	//
+	// LinearizableRead blocks until the returned index is safe to read from the
+	// local FSM, which is the barrier this projection needs. It is applied only
+	// to the recovery path; the other mutator RPCs keep the VerifyLeader-only
+	// posture through requireEncryptionLeader.
+	if _, err := view.LinearizableRead(ctx); err != nil {
+		return verifyLeaderErrorToStatus(err)
+	}
+
+	return nil
 }
 
 func requireEncryptionLeader(ctx context.Context, view raftengine.LeaderView) error {

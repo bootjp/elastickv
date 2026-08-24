@@ -1242,6 +1242,11 @@ type stubLeaderView struct {
 	state     raftengine.State
 	leader    raftengine.LeaderInfo
 	verifyErr error
+	// linearizableErr and linearizableCalls model the read-applied barrier.
+	// VerifyLeader alone confirms leadership without waiting for this node's
+	// FSM to catch up, so the recovery path has to take this second step.
+	linearizableErr   error
+	linearizableCalls *atomic.Int32
 }
 
 func (s stubLeaderView) State() raftengine.State       { return s.state }
@@ -1250,6 +1255,13 @@ func (s stubLeaderView) VerifyLeader(context.Context) error {
 	return s.verifyErr
 }
 func (s stubLeaderView) LinearizableRead(context.Context) (uint64, error) {
+	if s.linearizableCalls != nil {
+		s.linearizableCalls.Add(1)
+	}
+	if s.linearizableErr != nil {
+		return 0, s.linearizableErr
+	}
+
 	return 0, nil
 }
 
@@ -2979,4 +2991,62 @@ func TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex(t *testing.T) {
 // loop.
 func equalStrings(a, b []string) bool {
 	return slices.Equal(a, b)
+}
+
+// ResyncSidecar projects sidecar and registry state, so leadership alone is not
+// enough: Engine.VerifyLeader submits its ReadIndex with waitApplied=false and
+// handleReadStates completes it without waiting for the local FSM to reach that
+// index. A leader that has committed a newer writer registration but not applied
+// it would serve a stale last_seen_local_epoch, letting a recovering caller with
+// a rolled-back sidecar pick an epoch that is too low.
+func TestEncryptionAdmin_ResyncSidecar_TakesReadAppliedBarrier(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		RaftAppliedIndex: 17,
+		Active:           encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	var calls atomic.Int32
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:             raftengine.StateLeader,
+			linearizableCalls: &calls,
+		}),
+	)
+
+	if _, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: 5}); err != nil {
+		t.Fatalf("ResyncSidecar: %v", err)
+	}
+	if got := calls.Load(); got == 0 {
+		t.Fatal("LinearizableRead was never called; VerifyLeader alone does not wait for apply")
+	}
+}
+
+// A barrier failure must fail the RPC closed rather than serving a projection
+// from a possibly-behind FSM.
+func TestEncryptionAdmin_ResyncSidecar_FailsClosedWhenBarrierFails(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		RaftAppliedIndex: 17,
+		Active:           encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: "storage", Wrapped: []byte("ws")},
+			"4": {Purpose: "raft", Wrapped: []byte("wr")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:           raftengine.StateLeader,
+			linearizableErr: errors.New("read index not applied"),
+		}),
+	)
+
+	if _, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: 5}); err == nil {
+		t.Fatal("ResyncSidecar succeeded despite a failed read-applied barrier")
+	}
 }
