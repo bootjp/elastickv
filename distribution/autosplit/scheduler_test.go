@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1000,4 +1001,45 @@ func TestReconcileRemovesRetiredCoarsenedRoutes(t *testing.T) {
 
 	require.NotContains(t, registrar.virtual, uint64(2),
 		"a retired coarsened route must be removed, clearing its fold")
+}
+
+// Run must stamp a cycle with the time it actually starts processing, not the
+// ticker payload. The two diverge under a GC pause or CPU starvation, and
+// ensureLeadership stamps leaderStartedAt with whatever it receives -- a stale
+// value lets the evidence fence accept windows whose traffic predates this
+// node's leadership.
+//
+// Leadership is withheld on the first call so the reset happens on a
+// ticker-driven cycle, which is the branch that used the payload. The fixed
+// clock is far from the real fire time, so the two sources are trivially
+// distinguishable: the payload would stamp ~now.
+func TestSchedulerRunStampsTickerCyclesAtProcessingTime(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+	var calls atomic.Int32
+	s := NewScheduler(SchedulerConfig{
+		Enabled:      true,
+		EvalInterval: time.Millisecond,
+		// False on the very first cycle (the pre-loop call), true afterwards,
+		// so resetForLeadership runs from inside the ticker branch.
+		IsLeader: func() bool { return calls.Add(1) > 1 },
+		Now:      func() time.Time { return fixed },
+	}, &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{Version: 1}},
+		&fakeSplitter{}, &fakeSampler{step: time.Minute, history: 4, cols: nil}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.Run(ctx)
+	}()
+
+	// Scheduler has no mutex; Run owns its fields. Stop it before reading.
+	require.Eventually(t, func() bool { return calls.Load() > 3 }, time.Second, time.Millisecond)
+	cancel()
+	<-done
+
+	require.Equal(t, fixed, s.leaderStartedAt,
+		"a ticker-driven cycle must be stamped from the clock at processing time")
 }

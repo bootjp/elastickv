@@ -104,6 +104,10 @@ type SchedulerConfig struct {
 	Logger          *slog.Logger
 	Reconciler      *RouteReconciler
 	Observer        Observer
+	// Now supplies the wall clock a cycle is stamped with. Defaults to
+	// time.Now. It exists so tests can prove Run stamps cycles at processing
+	// time rather than with the ticker payload.
+	Now func() time.Time
 }
 
 // SchedulerResult describes one scheduler tick.
@@ -210,15 +214,31 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(s.cfg.EvalInterval)
 	defer ticker.Stop()
-	s.tickAndLog(ctx, time.Now())
+	s.tickAndLog(ctx, s.now())
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case now := <-ticker.C:
-			s.tickAndLog(ctx, now)
+		case <-ticker.C:
+			// The ticker payload is the scheduled fire time, not the time this
+			// goroutine actually resumed. A GC pause or CPU starvation can put
+			// them far apart, and ensureLeadership stamps leaderStartedAt with
+			// whatever it is given: a stale value lets the evidence fence
+			// accept windows whose traffic predates this node's leadership,
+			// which is exactly the confidence the fence exists to re-earn.
+			// The tick is a wake-up signal only.
+			s.tickAndLog(ctx, s.now())
 		}
 	}
+}
+
+// now reads the configured clock, defaulting to time.Now.
+func (s *Scheduler) now() time.Time {
+	if s != nil && s.cfg.Now != nil {
+		return s.cfg.Now()
+	}
+
+	return time.Now()
 }
 
 // Tick executes one scheduler cycle. Tests call this directly.
