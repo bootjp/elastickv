@@ -2274,11 +2274,22 @@ func configureDedicatedCoordinatorTSO(
 		return wiring, errors.Wrap(err, "configure dedicated tso allocator")
 	}
 	wiring.serverAllocator = local
-	coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
+	// The cutover state is wired unconditionally so a later Phase-D transition
+	// is visible, but the timestamp group is NOT pinned yet.
 	coordinate.WithTSOCutoverState(tsoGroup.TSOState)
 	if !dedicatedTSOAllocatorRequired(tsoGroup.TSOState, mode) {
 		return wiring, nil
 	}
+	// Pinned only once the dedicated allocator is actually in use. In legacy
+	// warm-up, persistence timestamps still come from the data groups' local
+	// HLC path, and timestampGroupConfigured narrows lease renewal
+	// (timestampLeaseRenewalGroupIDs), leadership (IsTimestampLeader), and
+	// recovery (hlcLeaseRecoveryTargets) to group 0 alone. Pinning before this
+	// point stopped renewing the data groups, so a group-0 quorum loss expired
+	// their ceilings and failed legacy writes with ErrCeilingExpired even
+	// though those groups were healthy -- contrary to the no-path-change
+	// warm-up contract in docs/design/2026_04_16_implemented_centralized_tso.md.
+	coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
 
 	routedOpts := dedicatedTSORoutingOptions(coordinate.Clock(), observer)
 	routed, err := kv.NewLeaderRoutedTSOAllocator(local, tsoGroup.Engine, routedOpts...)

@@ -397,3 +397,62 @@ func (e *mainTSOEngine) Configuration(context.Context) (raftengine.Configuration
 }
 
 func (e *mainTSOEngine) Close() error { return nil }
+
+// Legacy warm-up must not narrow timestamp leadership, lease renewal, or lease
+// recovery to group 0. In legacy mode persistence timestamps still come from
+// the data groups' local HLC path, so pinning the timestamp group stops
+// renewing those groups: a group-0 quorum loss then expires their ceilings and
+// legacy writes fail with ErrCeilingExpired while the data groups are healthy.
+// That contradicts the no-path-change warm-up contract.
+//
+// timestampLeaseRenewalGroupIDs is unexported; IsTimestampLeader is driven by
+// the same timestampGroupConfigured flag and is the observable proxy. Group 0
+// is a follower here and the data group is the leader, so the pinned and
+// unpinned answers differ.
+func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {
+			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
+			TSOState: fsm,
+		},
+		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+
+	require.Nil(t, wiring.routedAllocator,
+		"legacy mode must not stand up the routed allocator")
+	require.False(t, fsm.CutoverActive())
+	require.True(t, coord.IsTimestampLeader(),
+		"legacy warm-up must keep answering from the data groups, not group 0 alone")
+}
+
+// Once the dedicated allocator is actually required, the pin must apply.
+func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
+	setTSOModeFlags(t, true, false)
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {
+			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
+			TSOState: fsm,
+		},
+		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+
+	require.False(t, coord.IsTimestampLeader(),
+		"with the dedicated allocator active, leadership must come from group 0 only")
+}
