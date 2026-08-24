@@ -779,17 +779,21 @@ func (r *RouteReconciler) Reconcile(routes []distribution.RouteDescriptor) {
 	live := make(map[uint64]struct{}, len(routes))
 	for _, route := range routes {
 		live[route.RouteID] = struct{}{}
-		registered, ok := r.registered[route.RouteID]
-		next := registeredRouteFromDescriptor(route)
-		if ok && registered.equal(next) {
-			continue
-		}
-		if ok {
-			r.registrar.RemoveRoute(route.RouteID)
-		}
-		r.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID)
-		r.registered[route.RouteID] = next
 	}
+
+	r.releaseRetired(live)
+	for _, route := range routes {
+		r.syncRoute(route)
+	}
+}
+
+// releaseRetired frees slots held by routes the snapshot no longer contains,
+// before syncRoute registers replacements. A split near MaxTrackedRoutes
+// otherwise needs capacity+1 transiently -- both children are added while the
+// parent still holds its slot -- and RegisterRoute folds the surplus child into
+// the virtual aggregate even though removing the parent moments later leaves
+// room.
+func (r *RouteReconciler) releaseRetired(live map[uint64]struct{}) {
 	for routeID := range r.registered {
 		if _, ok := live[routeID]; ok {
 			continue
@@ -797,6 +801,27 @@ func (r *RouteReconciler) Reconcile(routes []distribution.RouteDescriptor) {
 		r.registrar.RemoveRoute(routeID)
 		delete(r.registered, routeID)
 	}
+}
+
+func (r *RouteReconciler) syncRoute(route distribution.RouteDescriptor) {
+	registered, ok := r.registered[route.RouteID]
+	next := registeredRouteFromDescriptor(route)
+	if ok && registered.equal(next) {
+		return
+	}
+	if ok {
+		r.registrar.RemoveRoute(route.RouteID)
+	}
+	if !r.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID) {
+		// Folded into the virtual aggregate because the sampler is full.
+		// Recording it as registered would make every later equal snapshot skip
+		// it, stranding that route's traffic in the aggregate for good; leaving
+		// it unrecorded retries once capacity frees up.
+		delete(r.registered, route.RouteID)
+
+		return
+	}
+	r.registered[route.RouteID] = next
 }
 
 func registeredRouteFromDescriptor(route distribution.RouteDescriptor) registeredRoute {

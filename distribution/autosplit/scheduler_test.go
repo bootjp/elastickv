@@ -3,6 +3,7 @@ package autosplit
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -864,4 +865,95 @@ func TestSchedulerSkipsCompoundFinalizationAfterShardTermChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, splitter.requests, "a new shard leader term must not finalize the old term's compound")
 	require.Empty(t, scheduler.pendingCompounds)
+}
+
+// capacityRegistrar refuses registrations once `capacity` individual slots are
+// held, mirroring MemSampler.RegisterRoute folding a route into the virtual
+// aggregate when MaxTrackedRoutes is reached.
+type capacityRegistrar struct {
+	capacity int
+	held     map[uint64]struct{}
+	refused  []uint64
+	order    []string
+}
+
+func newCapacityRegistrar(capacity int) *capacityRegistrar {
+	return &capacityRegistrar{capacity: capacity, held: map[uint64]struct{}{}}
+}
+
+func (c *capacityRegistrar) RegisterRoute(routeID uint64, _, _ []byte, _ uint64) bool {
+	c.order = append(c.order, fmt.Sprintf("register:%d", routeID))
+	if _, ok := c.held[routeID]; ok {
+		return true
+	}
+	if len(c.held) >= c.capacity {
+		c.refused = append(c.refused, routeID)
+
+		return false
+	}
+	c.held[routeID] = struct{}{}
+
+	return true
+}
+
+func (c *capacityRegistrar) RemoveRoute(routeID uint64) {
+	c.order = append(c.order, fmt.Sprintf("remove:%d", routeID))
+	delete(c.held, routeID)
+}
+
+// Splitting at capacity transiently needs capacity+1 slots if the retired
+// parent is released only after both children are registered. The surplus child
+// gets folded into the virtual aggregate, and recording it as registered makes
+// every later equal snapshot skip it -- stranding its traffic there for good.
+func TestReconcileReleasesRetiredRoutesBeforeRegisteringChildren(t *testing.T) {
+	t.Parallel()
+
+	// Capacity 3 is the interesting case: two routes now, and after the split
+	// exactly three (2, 3, 4). Releasing the parent first fits; registering the
+	// children first needs a transient fourth slot.
+	registrar := newCapacityRegistrar(3)
+	r := NewRouteReconciler(registrar)
+
+	parent := []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1},
+	}
+	r.Reconcile(parent)
+	require.Empty(t, registrar.refused, "the initial snapshot fits in capacity")
+
+	// Route 1 splits into 3 and 4; route 1 retires in the same snapshot.
+	split := []distribution.RouteDescriptor{
+		{RouteID: 3, Start: []byte("a"), End: []byte("f"), GroupID: 1},
+		{RouteID: 4, Start: []byte("f"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1},
+	}
+	r.Reconcile(split)
+
+	require.Empty(t, registrar.refused,
+		"the retired parent must be released before the children are registered")
+	require.Len(t, registrar.held, 3, "final membership fits capacity exactly")
+}
+
+// A refused registration must not be recorded, otherwise the next equal
+// snapshot short-circuits and never retries once capacity frees up.
+func TestReconcileRetriesRefusedRegistrationOnLaterSnapshot(t *testing.T) {
+	t.Parallel()
+
+	registrar := newCapacityRegistrar(1)
+	r := NewRouteReconciler(registrar)
+
+	routes := []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1},
+	}
+	r.Reconcile(routes)
+	require.Equal(t, []uint64{2}, registrar.refused, "capacity 1 must refuse the second route")
+
+	// Same snapshot again: the refused route must be attempted afresh, not
+	// skipped as already-registered.
+	registrar.refused = nil
+	registrar.capacity = 2
+	r.Reconcile(routes)
+	require.Empty(t, registrar.refused)
+	require.Len(t, registrar.held, 2, "the previously refused route must now be individual")
 }
