@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -518,4 +519,38 @@ func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []
 	var seq [4]byte
 	binary.BigEndian.PutUint32(seq[:], seqInTxn)
 	return append(key, seq[:]...)
+}
+
+// File chunk payloads live under !fs|chk| but route through a virtual
+// !fs|route|chk| key. "!fs|chk|" sorts below "!fs|route|chk|", so a
+// filesystem-chunk route's user bracket -- whose raw interval IS the virtual
+// route range -- never reaches the payloads. Without a dedicated bracket the
+// export found nothing, yet the migration completed and was promoted, losing
+// every chunk of the moved files on a cross-group split.
+func TestPlanMigrationBracketsCoversFilesystemChunkPayloads(t *testing.T) {
+	t.Parallel()
+
+	routeStart := fskeys.ChunkRouteKey(0, 1)
+	routeEnd := fskeys.ChunkRouteKey(0, 9)
+	brackets, err := PlanMigrationBrackets(routeStart, routeEnd)
+	require.NoError(t, err)
+
+	var chunk *MigrationBracket
+	for i := range brackets {
+		if brackets[i].Family == MigrationFamilyFilesystemChunk {
+			chunk = &brackets[i]
+
+			break
+		}
+	}
+	require.NotNil(t, chunk, "the plan must carry a filesystem chunk bracket")
+	require.Equal(t, fskeys.ChunkAllPrefix(), chunk.Start,
+		"the bracket must scan the raw chunk prefix, not the virtual route range")
+	require.True(t, chunk.RequiresRouteKeyCheck,
+		"raw chunk keys must still be filtered through the logical route")
+
+	// The gap this closes: the raw payload prefix sorts below the virtual route
+	// interval, so the user bracket's raw range cannot reach it.
+	require.Negative(t, bytes.Compare(fskeys.ChunkAllPrefix(), routeStart),
+		"chunk payloads sort below the virtual route interval")
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -53,6 +54,10 @@ const (
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
 	MigrationFamilyLegacyListMetaDelta
+	// MigrationFamilyFilesystemChunk is appended last on purpose: the values
+	// above are the migration wire contract, so inserting anywhere earlier
+	// would renumber families that peers already use.
+	MigrationFamilyFilesystemChunk
 )
 
 const (
@@ -477,6 +482,14 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyS3UploadPart, prefix: s3keys.UploadPartPrefix},
 		{family: MigrationFamilyS3Blob, prefix: s3keys.BlobPrefix},
 		{family: MigrationFamilyS3GCUpload, prefix: s3keys.GCUploadPrefix},
+		// File chunk payloads live under !fs|chk| but route through a virtual
+		// !fs|route|chk| key via fskeys.ExtractRouteKey. "!fs|chk|" sorts below
+		// "!fs|route|chk|", so the user bracket's raw interval never reaches
+		// them and, without this bracket, a cross-group split completed and
+		// promoted while every chunk of the moved files stayed behind. The
+		// default route-key check in migrationBracketRouteCheck applies the
+		// logical route filter to the raw scan.
+		{family: MigrationFamilyFilesystemChunk, prefix: string(fskeys.ChunkAllPrefix())},
 	}
 
 	out := make([]MigrationBracket, 0, len(defs))
