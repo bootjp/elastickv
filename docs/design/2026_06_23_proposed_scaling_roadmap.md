@@ -89,10 +89,10 @@ the existing catalog and must not absorb the three designs above.
 
 | 2026-06-12 milestone | Disposition | Remaining ownership |
 |---|---|---|
-| M1 WAN Raft tuning and region-aware membership | Unimplemented and unowned | Write `*_proposed_wan_raft_membership.md`; own topology, timing bounds, region identity, quorum failure modes, and rollout |
-| M2 region-local HLC | Unimplemented and unowned | Write `*_proposed_regional_timestamp_oracle.md`; reconcile regional issuance with the dedicated TSO invariant before choosing local ceilings or a global oracle |
-| M3 regional catalog mirror | Unimplemented and unowned | Write `*_proposed_regional_catalog_mirror.md`; depend on the catalog delta/watch design and define freshness and failover contracts |
-| M4 cross-region disaster recovery | Unimplemented and unowned | Write `*_proposed_cross_region_failover.md`; own authority, fencing, data completeness, operator approval, failback, and split-brain prevention |
+| M1 WAN Raft tuning and region-aware membership | Unimplemented and unowned | Write `*_proposed_wan_raft_membership.md`; own topology, timing bounds, region identity, quorum failure modes, and rollout. No prerequisite inside this subsystem: it makes Raft survive a cross-WAN partition and does not by itself enable cross-region writes |
+| M2 region-local HLC | Unimplemented and unowned | Write `*_proposed_regional_timestamp_oracle.md`; reconcile regional issuance with the dedicated TSO invariant before choosing local ceilings or a global oracle. Depends on the hotspot split M2 migration contract (`2026_06_11_partial_hotspot_split_milestone2_migration.md`) being implemented, because the monotone-merge primitive has to exist first; §3 records that plane as still in flight |
+| M3 regional catalog mirror | Unimplemented and unowned | Write `*_proposed_regional_catalog_mirror.md`; define freshness and failover contracts. Depends on the region-aware membership from M1, the per-region ceiling from M2, and the catalog delta/watch design (§4.1 M1, implemented) |
+| M4 cross-region disaster recovery | Unimplemented and unowned | Write `*_proposed_cross_region_failover.md`; own authority, fencing, data completeness, operator approval, failback, and split-brain prevention. Depends on M2 and M3 |
 
 Multi-node bootstrap is a prerequisite, not an implementation of multi-region
 placement or failover.
@@ -176,9 +176,9 @@ invented dependencies the rows do not state.
 10. Auto group lifecycle (§5), after placement (step 6), migration (step 1), and
     merge (step 5). It is **not** gated on the regional stack below: its row
     names only those prerequisites.
-11. WAN Raft tuning and region-aware membership (§4.2 M1), region-local HLC
-    (§4.2 M2), regional catalog mirror (§4.2 M3), and cross-region disaster
-    recovery (§4.2 M4), in that order among themselves.
+11. The regional stack (§4.2). Its ordering is not restated here: each row now
+    names its own prerequisites — M1 has none inside the subsystem, M2 waits on
+    the hotspot split M2 migration contract, M3 on M1 and M2, M4 on M2 and M3.
 
 ## 7. Completion rule
 
