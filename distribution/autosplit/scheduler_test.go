@@ -1043,3 +1043,51 @@ func TestSchedulerRunStampsTickerCyclesAtProcessingTime(t *testing.T) {
 	require.Equal(t, fixed, s.leaderStartedAt,
 		"a ticker-driven cycle must be stamped from the clock at processing time")
 }
+
+// The fence must be stamped from a clock read AFTER the leadership
+// observation. Reading it at the start of the cycle leaves a window where a
+// pause between the read and the observation stamps the fence before this node
+// became leader.
+//
+// The clock advances on each read, so the value the fence receives is only
+// equal to the post-observation read; a cycle-start read would be an earlier
+// value.
+func TestSchedulerStampsFenceAfterLeadershipObservation(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(1_700_000_000, 0)
+	var reads atomic.Int64
+	observedAt := make(chan time.Time, 1)
+
+	s := NewScheduler(SchedulerConfig{
+		Enabled:      true,
+		EvalInterval: time.Millisecond,
+		Now: func() time.Time {
+			// Each read is a distinct, increasing instant.
+			return base.Add(time.Duration(reads.Add(1)) * time.Second)
+		},
+		IsLeader: func() bool {
+			select {
+			case observedAt <- base.Add(time.Duration(reads.Load()) * time.Second):
+			default:
+			}
+
+			return true
+		},
+	}, &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{Version: 1}},
+		&fakeSplitter{}, &fakeSampler{step: time.Minute, history: 4}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.Run(ctx)
+	}()
+	require.Eventually(t, func() bool { return reads.Load() > 3 }, time.Second, time.Millisecond)
+	cancel()
+	<-done
+
+	atObservation := <-observedAt
+	require.Greater(t, s.leaderStartedAt, atObservation,
+		"the fence must come from a clock read taken after the leadership observation")
+}

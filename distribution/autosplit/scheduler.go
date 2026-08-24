@@ -136,6 +136,12 @@ type Scheduler struct {
 	catalogVersion   uint64
 	pendingCompounds map[uint64]pendingCompound
 	groupLeadership  map[uint64]groupLeadershipState
+	// fenceNow supplies the leadership fence timestamps. Run installs the real
+	// clock so a fence is stamped AFTER the leadership observation that
+	// produced it. A direct Tick call -- the test seam that drives an explicit
+	// timeline -- leaves this nil and the fences use the cycle time, so those
+	// tests stay deterministic.
+	fenceNow func() time.Time
 }
 
 type groupLeadershipState struct {
@@ -212,6 +218,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if s == nil || !s.cfg.Enabled {
 		return nil
 	}
+	s.fenceNow = s.now
 	ticker := time.NewTicker(s.cfg.EvalInterval)
 	defer ticker.Stop()
 	s.tickAndLog(ctx, s.now())
@@ -230,6 +237,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.tickAndLog(ctx, s.now())
 		}
 	}
+}
+
+// fenceAt returns the timestamp a leadership fence is stamped with. See
+// Scheduler.fenceNow for why the two paths differ.
+func (s *Scheduler) fenceAt(now time.Time) time.Time {
+	if s != nil && s.fenceNow != nil {
+		return s.fenceNow()
+	}
+
+	return now
 }
 
 // now reads the configured clock, defaulting to time.Now.
@@ -287,7 +304,12 @@ func (s *Scheduler) ensureLeadership(now time.Time) bool {
 		return false
 	}
 	if !s.wasLeader || (leaderTerm != 0 && leaderTerm != s.leaderTerm) {
-		s.resetForLeadership(now)
+		// Read AFTER the authoritative leadership observation above. Reading it
+		// earlier -- even at the start of the cycle -- leaves a window in which
+		// a pause between the read and the observation stamps the fence before
+		// this node actually became leader, letting a straddling evidence
+		// window count.
+		s.resetForLeadership(now, s.fenceAt(now))
 		s.wasLeader = true
 	}
 	s.leaderTerm = leaderTerm
@@ -927,6 +949,8 @@ func (s *Scheduler) locallyLedGroupState(
 	watermarkLoaded *bool,
 ) (groupLeadershipState, bool) {
 	leader, term := s.cfg.GroupLeadership(groupID)
+	// Read after the observation, for the same reason as ensureLeadership.
+	fenceAt := s.fenceAt(now)
 	previous, known := s.groupLeadership[groupID]
 	if !leader {
 		previous.leader = false
@@ -944,7 +968,7 @@ func (s *Scheduler) locallyLedGroupState(
 		previous = groupLeadershipState{
 			leader:    true,
 			term:      term,
-			startedAt: now,
+			startedAt: fenceAt,
 			watermark: *watermark,
 		}
 		s.dropPendingCompoundsForGroup(groupID)
@@ -964,11 +988,15 @@ func (s *Scheduler) dropPendingCompoundsForGroup(groupID uint64) {
 	}
 }
 
-func (s *Scheduler) resetForLeadership(now time.Time) {
+// resetForLeadership takes two clocks on purpose. now is the cycle time and
+// drives the sampler column lookup, which must stay aligned with the rest of
+// the cycle. fenceAt is the evidence fence and must not predate the leadership
+// observation that produced it.
+func (s *Scheduler) resetForLeadership(now, fenceAt time.Time) {
 	s.state = NewDetectorState()
 	s.pendingCompounds = make(map[uint64]pendingCompound)
 	s.catalogVersion = 0
-	s.leaderStartedAt = now
+	s.leaderStartedAt = fenceAt
 	s.leaderWatermark = s.freshestColumnAt(now)
 	s.cfg.Logger.Info("autosplit: leadership acquired; detector state reset",
 		slog.Time("leader_started_at", s.leaderStartedAt),
