@@ -31,9 +31,17 @@ authority. It does not claim that all mechanisms proposed on 2026-06-12 have
 been implemented or moved into focused designs.
 
 The 2026-06-12 document remains historical input. The requirement-by-
-requirement disposition in section 4 is authoritative. In particular,
-"superseded" means ownership moved here or to a focused owner; it does not mean
-"implemented".
+requirement disposition in section 4 is authoritative for the subsystem
+milestones it enumerates. In particular, "superseded" means ownership moved
+here or to a focused owner; it does not mean "implemented".
+
+Section 4 covers the subsystem milestone tables only. The cross-cutting
+contracts in
+[`2026_06_12_proposed_scaling_roadmap.md`](2026_06_12_proposed_scaling_roadmap.md)
+§7 — the shared `SetPhysicalCeiling` / `Observe` invariant, the per-feature
+capability gate, and the required observability keys and metric cardinality
+budget — are **not** superseded and remain normative. Every focused design
+written from this index inherits them, whether or not its row repeats them.
 
 ## 3. Current canonical owners
 
@@ -43,7 +51,7 @@ again before merge or deployment.
 | Scaling requirement | Canonical owner | Implementation evidence | Audited status |
 |---|---|---|---|
 | Multi-node, multi-group bootstrap | `2026_06_14_implemented_multinode_multigroup_bootstrap.md` | PR #1011 merged | Implemented on `main` |
-| Learner membership primitive | `2026_04_26_implemented_raft_learner.md` | PR #1002 merged | Implemented on `main`; follower reads are separate |
+| Learner membership primitive | `2026_04_26_implemented_raft_learner.md` | PR #676 (`51907e6b`) merged the `AddLearner` / `PromoteLearner` engine, admin, protobuf, CLI, and persistence surfaces; PR #1002 merged the later status promotion and cleanup | Implemented on `main`; follower reads are separate |
 | Leader balance | `2026_06_11_implemented_leader_balance_scheduler.md` | PR #1012 merged | Implemented on `main`; data placement is separate |
 | Hotspot split M1 catalog and same-group split | `2026_02_18_implemented_hotspot_split_milestone1_pr.md` and `2026_02_18_partial_hotspot_shard_split.md` | PR #999 merged the catalog cleanup | Implemented M1; parent design remains partial |
 | Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the lifecycle; PRs #1084, #1085, #1088, and #1090 open | In flight; not on `main` as a complete migration plane |
@@ -111,7 +119,7 @@ added `kv/leader_proxy_breaker.go` and its adapter error mapping.
 | Region/range balance scheduler | Unimplemented and unowned | `*_proposed_region_balance_scheduler.md`; depend on replica placement, multi-node bootstrap, and hotspot migration |
 | Range merge | Unimplemented and unowned | `*_proposed_range_merge.md`; split same-group and cross-group merge into reviewable milestones and define transaction drain/fencing |
 | Streaming transport multi-group soak | Closed | `2026_04_18_implemented_raft_grpc_streaming_transport.md` §8 records the repeatable soak (`cmd/elastickv-raft-stream-soak` plus a fail-closed verifier over `docs/evidence/raft_streaming_multigroup_soak.json`); no protocol semantics changed |
-| Auto group lifecycle | Unimplemented and unowned | `*_proposed_auto_group_lifecycle.md`; depend on placement, migration, merge, and safe membership replacement |
+| Auto group lifecycle | Orchestration unimplemented and unowned; the join/replacement substrate is implemented | `2026_07_18_implemented_raft_fresh_learner_join.md` (PR #1118, `6d8ee633`) and `2026_07_18_implemented_fenced_raft_member_replacement.md` (PR #1122, `5d4c5cad`) already own single-group fresh learner joining and resumable fenced same-ID voter replacement, and both explicitly leave automatic decisions and multi-group joining open. Write `*_proposed_auto_group_lifecycle.md` for the automatic creation/orchestration and multi-group extensions only — do not restate the shipped join/replacement mechanics — and depend on placement, migration, and merge |
 
 ## 6. Dependency order
 
@@ -125,9 +133,14 @@ The next focused designs should be written and implemented in this order:
    this list: PR #1117 merged and §4.1 records M1 as implemented on `main`.
 3. Follower reads and cross-shard transaction completion, both gated on the
    dedicated timestamp invariant where required.
-4. Pebble resource governance and sharded retention. SST ingest snapshot
-   transfer is no longer in this list: PR #1130 merged and §4.3 records M1 as
-   implemented on `main`.
+4. Pebble resource governance and sharded retention, then the remaining
+   physical snapshot offload milestones (M2/M3: the leader-only scheduler and
+   retention/GC) tracked in
+   [`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md).
+   SST ingest snapshot transfer is no longer in this list: PR #1130 merged and
+   §4.3 records M1 as implemented on `main`. Its removal is why the remaining
+   offload work is named here explicitly — it was previously reached only via
+   that prerequisite.
 5. Region balance and range merge.
 6. WAN membership, regional timestamps, regional catalog, and cross-region
    failover in that order.
