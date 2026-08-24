@@ -219,6 +219,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return nil
 	}
 	s.fenceNow = s.now
+	// Cleared on exit so a direct Tick after Run stops keeps the deterministic
+	// cycle-time contract; leaving it set would silently switch those callers
+	// onto the wall clock.
+	defer func() { s.fenceNow = nil }()
 	ticker := time.NewTicker(s.cfg.EvalInterval)
 	defer ticker.Stop()
 	s.tickAndLog(ctx, s.now())

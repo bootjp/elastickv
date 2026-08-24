@@ -1091,3 +1091,43 @@ func TestSchedulerStampsFenceAfterLeadershipObservation(t *testing.T) {
 	require.Greater(t, s.leaderStartedAt, atObservation,
 		"the fence must come from a clock read taken after the leadership observation")
 }
+
+// Run installs the wall clock as the fence source. It must clear it on exit, or
+// a direct Tick afterwards silently stamps fences from cfg.Now instead of the
+// cycle time it was given, breaking the deterministic contract that seam exists
+// to provide.
+func TestSchedulerDirectTickAfterRunUsesCycleTime(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(1_700_000_000, 0)
+	wall := base.Add(72 * time.Hour) // far from any cycle time the test passes
+	var cycles atomic.Int64
+	s := NewScheduler(SchedulerConfig{
+		Enabled:      true,
+		EvalInterval: time.Millisecond,
+		IsLeader:     func() bool { cycles.Add(1); return true },
+		Now:          func() time.Time { return wall },
+	}, &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{Version: 1}},
+		&fakeSplitter{}, &fakeSampler{step: time.Minute, history: 4}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.Run(ctx)
+	}()
+	// Poll an atomic rather than scheduler fields: Run owns those and reading
+	// them concurrently is a race.
+	require.Eventually(t, func() bool { return cycles.Load() > 1 }, time.Second, time.Millisecond)
+	cancel()
+	<-done
+
+	// Force a fresh leadership transition on the next direct Tick.
+	s.wasLeader = false
+	cycle := base.Add(5 * time.Minute)
+	_, err := s.Tick(context.Background(), cycle)
+	require.NoError(t, err)
+
+	require.Equal(t, cycle, s.leaderStartedAt,
+		"a direct Tick after Run must stamp the fence from the cycle time it was given")
+}
