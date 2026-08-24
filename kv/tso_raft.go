@@ -207,6 +207,9 @@ func (a *RaftTSOAllocator) reservePreparedLocalWindow(
 func (a *RaftTSOAllocator) reserveLocalWindow(n int, minimum uint64, phaseDContiguous bool) (uint64, uint64, error) {
 	if !phaseDContiguous {
 		if minimum > 0 {
+			if err := a.rejectMinimumBeyondCeiling(minimum); err != nil {
+				return 0, 0, err
+			}
 			a.clock.Observe(minimum)
 		}
 		base, err := a.clock.NextBatchFenced(n)
@@ -217,6 +220,32 @@ func (a *RaftTSOAllocator) reserveLocalWindow(n int, minimum uint64, phaseDConti
 		return base, end, nil
 	}
 	return a.reserveContiguousPhaseDWindow(n, minimum)
+}
+
+// rejectMinimumBeyondCeiling refuses a caller-supplied minimum whose physical
+// half is past the Raft-committed ceiling, before Observe can publish it.
+//
+// Observe is permanent. It advances h.last, and nextLocked derives newWall from
+// h.last, so a minimum beyond the ceiling makes rejectFencedPhysicalOverflow
+// fail every later fenced reservation with ErrCeilingExpired until a lease
+// renewal raises the ceiling or leadership changes. Distribution.GetTimestamp
+// forwards a caller's minimum straight into this path and
+// validateTSOMinimumWindow only checks arithmetic overflow, so one request with
+// a far-future minimum would otherwise stall issuance for every other caller.
+//
+// A zero ceiling means no lease has been committed yet; the fence is inactive
+// then, so there is nothing to validate against.
+func (a *RaftTSOAllocator) rejectMinimumBeyondCeiling(minimum uint64) error {
+	ceiling := a.clock.PhysicalCeiling()
+	if ceiling <= 0 {
+		return nil
+	}
+	physical := clampUint64ToInt64(minimum >> HLCLogicalBits)
+	if physical > ceiling {
+		return errors.Wrapf(ErrTSOTimestampInvalid,
+			"tso minimum %d has physical %d beyond committed ceiling %d", minimum, physical, ceiling)
+	}
+	return nil
 }
 
 func (a *RaftTSOAllocator) reserveContiguousPhaseDWindow(n int, floor uint64) (uint64, uint64, error) {

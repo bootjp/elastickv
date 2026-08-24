@@ -872,3 +872,61 @@ func (p *recordingTSOFloorProvider) setFloor(floor uint64) {
 	defer p.mu.Unlock()
 	p.floor = floor
 }
+
+// A caller-supplied minimum beyond the committed ceiling used to be published
+// through Observe before NextBatchFenced could reject it. Observe is permanent,
+// and nextLocked derives newWall from h.last, so one such request left every
+// later fenced reservation failing with ErrCeilingExpired until a lease renewal
+// raised the ceiling. Distribution.GetTimestamp forwards a caller's minimum
+// straight into this path, so any caller could stall issuance for all of them.
+func TestRaftTSOAllocatorRejectsMinimumBeyondCeilingWithoutStallingIssuance(t *testing.T) {
+	clock := NewHLC()
+	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
+	clock.SetPhysicalCeiling(ceilingMs)
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := NewRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock,
+		WithTSOCutoverFloorProvider(&recordingTSOFloorProvider{}))
+	require.NoError(t, err)
+
+	// Well past the committed ceiling.
+	beyond := uint64(ceilingMs+3_600_000) << hlcLogicalBits //nolint:gosec // future test HLC.
+
+	_, err = alloc.NextAfter(context.Background(), beyond)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, ErrCeilingExpired,
+		"the minimum must be refused on its own terms, not by the fence firing later")
+
+	// The load-bearing half: ordinary issuance must still work afterwards.
+	ts, err := alloc.Next(context.Background())
+	require.NoError(t, err, "a rejected minimum must not poison later reservations")
+	require.Positive(t, ts)
+}
+
+// A minimum inside the lease is still honoured.
+func TestRaftTSOAllocatorAcceptsMinimumWithinCeiling(t *testing.T) {
+	clock := NewHLC()
+	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
+	clock.SetPhysicalCeiling(ceilingMs)
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := NewRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock,
+		WithTSOCutoverFloorProvider(&recordingTSOFloorProvider{}))
+	require.NoError(t, err)
+
+	within := uint64(time.Now().Add(time.Second).UnixMilli()) << hlcLogicalBits //nolint:gosec // test HLC.
+	ts, err := alloc.NextAfter(context.Background(), within)
+	require.NoError(t, err)
+	require.Greater(t, ts, within)
+}
