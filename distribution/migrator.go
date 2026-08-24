@@ -58,6 +58,7 @@ const (
 	// above are the migration wire contract, so inserting anywhere earlier
 	// would renumber families that peers already use.
 	MigrationFamilyFilesystemChunk
+	MigrationFamilyFilesystemUsage
 )
 
 const (
@@ -151,6 +152,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	// route filters accept the row, so omitting this exported every chunk
 	// version twice under two bracket IDs.
 	fskeys.ChunkAllPrefix(),
+	fskeys.UsageRouteAllPrefix(),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -496,6 +498,14 @@ func migrationFamilyBrackets() []MigrationBracket {
 		// default route-key check in migrationBracketRouteCheck applies the
 		// logical route filter to the raw scan.
 		{family: MigrationFamilyFilesystemChunk, prefix: string(fskeys.ChunkAllPrefix())},
+		// Per-route usage counters are stored at !fs|usage|route|<encoded route>
+		// and normalize back to the embedded logical route key, so like chunks
+		// their raw key sits outside the user bracket's interval. Without this
+		// bracket the counter stayed on the source: after cutover the usage scan
+		// filtered that copy out because its logical owner had become the
+		// target, while target-side updates began from zero, so StatFS
+		// undercounted existing files and bytes.
+		{family: MigrationFamilyFilesystemUsage, prefix: string(fskeys.UsageRouteAllPrefix())},
 	}
 
 	out := make([]MigrationBracket, 0, len(defs))

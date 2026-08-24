@@ -575,3 +575,42 @@ func TestEveryFamilyBracketPrefixIsExcludedFromUserBracket(t *testing.T) {
 			bracket.Family, bracket.Start)
 	}
 }
+
+// Per-route usage counters live at !fs|usage|route|<encoded route> and
+// normalize back to the embedded logical route key, so their raw key sits
+// outside a user route's interval exactly like chunk payloads. Without a
+// bracket the counter stayed on the source: after cutover the usage scan
+// filtered that copy out because its logical owner had become the target,
+// while target-side updates began from zero, so StatFS undercounted.
+func TestPlanMigrationBracketsCoversFilesystemUsageCounters(t *testing.T) {
+	t.Parallel()
+
+	routeStart := []byte("a")
+	routeEnd := []byte("z")
+	brackets, err := PlanMigrationBrackets(routeStart, routeEnd)
+	require.NoError(t, err)
+
+	var usage *MigrationBracket
+	for i := range brackets {
+		if brackets[i].Family == MigrationFamilyFilesystemUsage {
+			usage = &brackets[i]
+
+			break
+		}
+	}
+	require.NotNil(t, usage, "the plan must carry a filesystem usage bracket")
+	require.Equal(t, fskeys.UsageRouteAllPrefix(), usage.Start,
+		"the bracket must scan the raw usage prefix, not the logical route range")
+	require.True(t, usage.RequiresRouteKeyCheck,
+		"raw usage keys must still be filtered through their embedded route")
+
+	// The gap this closes: the raw counter key sorts outside a user route
+	// interval, so the user bracket cannot reach it.
+	require.Negative(t, bytes.Compare(fskeys.UsageRouteAllPrefix(), routeStart),
+		"usage counters sort below a user route interval")
+
+	// And it must round-trip: a counter for a key inside the interval
+	// normalizes back into that interval, so the route filter keeps it.
+	counter := fskeys.UsageRouteKey([]byte("customers"))
+	require.Equal(t, []byte("customers"), fskeys.ExtractRouteKey(counter))
+}
