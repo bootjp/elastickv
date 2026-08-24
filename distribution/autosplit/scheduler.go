@@ -160,6 +160,13 @@ type RouteReconciler struct {
 	mu         sync.Mutex
 	registrar  RouteRegistrar
 	registered map[uint64]registeredRoute
+	// coarsened tracks routes MemSampler folded into its virtual aggregate.
+	// RegisterRoute refuses such a route on every later call regardless of
+	// capacity -- the virtualForRoute entry is sticky -- and only RemoveRoute
+	// clears it. They are therefore tracked separately so a retry can release
+	// the fold first, and so releaseRetired can still drop them when the route
+	// leaves the catalog.
+	coarsened map[uint64]struct{}
 }
 
 // NewRouteReconciler creates a catalog-to-sampler membership reconciler.
@@ -167,6 +174,7 @@ func NewRouteReconciler(registrar RouteRegistrar) *RouteReconciler {
 	return &RouteReconciler{
 		registrar:  registrar,
 		registered: make(map[uint64]registeredRoute),
+		coarsened:  make(map[uint64]struct{}),
 	}
 }
 
@@ -801,6 +809,16 @@ func (r *RouteReconciler) releaseRetired(live map[uint64]struct{}) {
 		r.registrar.RemoveRoute(routeID)
 		delete(r.registered, routeID)
 	}
+	// Coarsened routes hold a virtualForRoute entry rather than an individual
+	// slot. They still have to be removed when they leave the catalog, or the
+	// entry lingers and permanently refuses that route id.
+	for routeID := range r.coarsened {
+		if _, ok := live[routeID]; ok {
+			continue
+		}
+		r.registrar.RemoveRoute(routeID)
+		delete(r.coarsened, routeID)
+	}
 }
 
 func (r *RouteReconciler) syncRoute(route distribution.RouteDescriptor) {
@@ -809,18 +827,25 @@ func (r *RouteReconciler) syncRoute(route distribution.RouteDescriptor) {
 	if ok && registered.equal(next) {
 		return
 	}
-	if ok {
+	if _, folded := r.coarsened[route.RouteID]; folded {
+		// The sampler refuses a folded route on every call until the
+		// virtualForRoute entry is cleared, and only RemoveRoute clears it.
+		// Without this the "retry" below could never succeed.
+		r.registrar.RemoveRoute(route.RouteID)
+		delete(r.coarsened, route.RouteID)
+	} else if ok {
 		r.registrar.RemoveRoute(route.RouteID)
 	}
 	if !r.registrar.RegisterRoute(route.RouteID, route.Start, route.End, route.GroupID) {
-		// Folded into the virtual aggregate because the sampler is full.
-		// Recording it as registered would make every later equal snapshot skip
-		// it, stranding that route's traffic in the aggregate for good; leaving
-		// it unrecorded retries once capacity frees up.
+		// Folded into the virtual aggregate because the sampler is full. Track
+		// it so the next snapshot releases the fold and retries, and so
+		// releaseRetired can still drop it if the route leaves the catalog.
 		delete(r.registered, route.RouteID)
+		r.coarsened[route.RouteID] = struct{}{}
 
 		return
 	}
+	delete(r.coarsened, route.RouteID)
 	r.registered[route.RouteID] = next
 }
 

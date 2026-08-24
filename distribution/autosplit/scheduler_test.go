@@ -867,18 +867,29 @@ func TestSchedulerSkipsCompoundFinalizationAfterShardTermChange(t *testing.T) {
 	require.Empty(t, scheduler.pendingCompounds)
 }
 
-// capacityRegistrar refuses registrations once `capacity` individual slots are
-// held, mirroring MemSampler.RegisterRoute folding a route into the virtual
-// aggregate when MaxTrackedRoutes is reached.
+// capacityRegistrar models MemSampler.RegisterRoute, including the part that
+// matters most here: once a route is folded into the virtual aggregate the
+// virtualForRoute entry is STICKY (keyviz/sampler.go:1016), so every later
+// RegisterRoute refuses it regardless of free capacity, and only RemoveRoute
+// clears it (keyviz/sampler.go:1027).
+//
+// An earlier version of this fake simply granted the retry once capacity freed
+// up. That made a reconciler which never actually retried look correct, so the
+// stickiness is modelled deliberately.
 type capacityRegistrar struct {
 	capacity int
 	held     map[uint64]struct{}
+	virtual  map[uint64]struct{}
 	refused  []uint64
 	order    []string
 }
 
 func newCapacityRegistrar(capacity int) *capacityRegistrar {
-	return &capacityRegistrar{capacity: capacity, held: map[uint64]struct{}{}}
+	return &capacityRegistrar{
+		capacity: capacity,
+		held:     map[uint64]struct{}{},
+		virtual:  map[uint64]struct{}{},
+	}
 }
 
 func (c *capacityRegistrar) RegisterRoute(routeID uint64, _, _ []byte, _ uint64) bool {
@@ -886,7 +897,14 @@ func (c *capacityRegistrar) RegisterRoute(routeID uint64, _, _ []byte, _ uint64)
 	if _, ok := c.held[routeID]; ok {
 		return true
 	}
+	if _, ok := c.virtual[routeID]; ok {
+		// Sticky: refused until RemoveRoute clears the fold.
+		c.refused = append(c.refused, routeID)
+
+		return false
+	}
 	if len(c.held) >= c.capacity {
+		c.virtual[routeID] = struct{}{}
 		c.refused = append(c.refused, routeID)
 
 		return false
@@ -899,6 +917,7 @@ func (c *capacityRegistrar) RegisterRoute(routeID uint64, _, _ []byte, _ uint64)
 func (c *capacityRegistrar) RemoveRoute(routeID uint64) {
 	c.order = append(c.order, fmt.Sprintf("remove:%d", routeID))
 	delete(c.held, routeID)
+	delete(c.virtual, routeID)
 }
 
 // Splitting at capacity transiently needs capacity+1 slots if the retired
@@ -956,4 +975,29 @@ func TestReconcileRetriesRefusedRegistrationOnLaterSnapshot(t *testing.T) {
 	r.Reconcile(routes)
 	require.Empty(t, registrar.refused)
 	require.Len(t, registrar.held, 2, "the previously refused route must now be individual")
+}
+
+// A coarsened route that later leaves the catalog must still be removed.
+// releaseRetired only scanned r.registered, and a refused route was deleted
+// from it, so the sampler kept a virtualForRoute entry that permanently
+// refuses that route id.
+func TestReconcileRemovesRetiredCoarsenedRoutes(t *testing.T) {
+	t.Parallel()
+
+	registrar := newCapacityRegistrar(1)
+	r := NewRouteReconciler(registrar)
+
+	routes := []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1},
+	}
+	r.Reconcile(routes)
+	require.Equal(t, []uint64{2}, registrar.refused)
+	require.Contains(t, registrar.virtual, uint64(2), "route 2 is folded")
+
+	// Route 2 leaves the catalog entirely.
+	r.Reconcile([]distribution.RouteDescriptor{routes[0]})
+
+	require.NotContains(t, registrar.virtual, uint64(2),
+		"a retired coarsened route must be removed, clearing its fold")
 }
