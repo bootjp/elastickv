@@ -133,32 +133,52 @@ added `kv/leader_proxy_breaker.go` and its adapter error mapping.
 
 ## 6. Dependency order
 
-The next focused designs should be written and implemented in this order:
+Every entry below states its own prerequisites, taken from the rows in sections
+3 to 5. A numbered step is **not** a barrier for the steps after it: two items
+are ordered only where one names the other. Anything whose prerequisites are
+already satisfied may start immediately and in parallel with the rest.
+
+The list is written this way because sequencing items by position repeatedly
+invented dependencies the rows do not state.
+
+**Ready now — no unmet prerequisites, may proceed in parallel:**
 
 1. Finish the open hotspot split M2/M3, dedicated-TSO, and S3 offload stacks
    without moving their mechanisms into this roadmap. The shared Pebble block
    cache is no longer in this list: PR #1082 merged and §3 records it as
    implemented on `main`.
-2. Catalog index, then batched mutation. Catalog delta/watch is no longer in
-   this list: PR #1117 merged and §4.1 records M1 as implemented on `main`.
-3. Follower reads and cross-shard transaction completion, both gated on the
-   dedicated timestamp invariant where required.
-4. The remaining physical snapshot offload milestones (M2/M3: the leader-only
-   scheduler and retention/GC) tracked in
+2. Indexed route engine (§4.1 M2) and batched catalog mutation (§4.1 M3), which
+   are **parallel, not sequential**: the predecessor's §3.3 records M2 as
+   independent and M3 as depending only on M1's batched apply observation path,
+   and PR #1117 merged M1. Catalog delta/watch is therefore no longer in this
+   list either.
+3. The remaining physical snapshot offload milestones (§4.3 M4: the leader-only
+   scheduler and retention/GC) in
    [`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md).
    Their only prerequisite was SST ingest snapshot transfer, which PR #1130
-   merged and §4.3 records as implemented, so they are ready now and are listed
-   here rather than reached implicitly through that prerequisite.
-5. Pebble resource governance and sharded retention. These are independent of
-   step 4: the predecessor's §5.3 records M4 as depending on M1 alone, and the
+   merged and §4.3 records as implemented.
+4. Per-shard Pebble tuning and write admission (§4.3 M2) and sharded retention
+   scheduling (§4.3 M3). Independent of
+   step 3: the predecessor's §5.3 records M4 as depending on M1 alone, and the
    focused offload owner names no dependency on either design.
-6. Replica placement, then region balance. Range merge is not sequenced behind
-   placement: its row names no placement dependency, and only the region/range
-   balance scheduler does, so the two can proceed in parallel.
-7. WAN membership, regional timestamps, regional catalog, and cross-region
-   failover in that order.
-8. Auto group lifecycle only after placement, migration, merge, and membership
-   replacement are independently safe.
+5. Range merge (§5). Its row names no prerequisite that is still open.
+6. Replica placement (§5). Named as a prerequisite by region balance and by auto
+   group lifecycle, and owned by nothing else, so it gates those two.
+7. Lock-resolver delegation (§4.4 M4). The predecessor's §6.3 supplies its
+   per-group tick and asynchronous status-resolver prerequisites, both already
+   in place, so it is not gated on anything in this list.
+
+**Gated — each names what it waits for:**
+
+8. Follower reads and cross-shard transaction completion (§4.4), both gated on
+   the dedicated timestamp invariant where required.
+9. Region/range balance scheduler (§5), after replica placement (step 6).
+10. Auto group lifecycle (§5), after placement (step 6), migration (step 1), and
+    merge (step 5). It is **not** gated on the regional stack below: its row
+    names only those prerequisites.
+11. WAN Raft tuning and region-aware membership (§4.2 M1), region-local HLC
+    (§4.2 M2), regional catalog mirror (§4.2 M3), and cross-region disaster
+    recovery (§4.2 M4), in that order among themselves.
 
 ## 7. Completion rule
 
