@@ -145,6 +145,12 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.UploadPartPrefix),
 	[]byte(s3keys.BlobPrefix),
 	[]byte(s3keys.GCUploadPrefix),
+	// Every family bracket's prefix belongs here so the user bracket does not
+	// also export those rows. A filesystem-chunk route interval can span both
+	// the raw !fs|chk| key and its normalized !fs|route|chk| route, and both
+	// route filters accept the row, so omitting this exported every chunk
+	// version twice under two bracket IDs.
+	fskeys.ChunkAllPrefix(),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.

@@ -185,7 +185,12 @@ func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetR
 	if err != nil {
 		return nil, err
 	}
-	route, ok := snapshot.RouteOf(req.GetKey())
+	// Normalized exactly like GetRoute above. An internal storage key -- a
+	// filesystem chunk, a Redis collection row -- routes by its logical key,
+	// so looking the raw bytes up in the snapshot answers with the owner of
+	// the raw family prefix instead of the group that actually owned the key
+	// at that catalog version.
+	route, ok := snapshot.RouteOf(kv.RouteKey(req.GetKey()))
 	if !ok {
 		return &pb.GetRouteOwnershipResponse{
 			CatalogVersion: snapshot.Version(),

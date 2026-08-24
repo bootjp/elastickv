@@ -1372,3 +1372,36 @@ type recordingDistributionFilesystemObserver struct {
 func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
 	o.reasons = append(o.reasons, reason)
 }
+
+// GetRouteOwnership answers the historical owner of a key, so it has to
+// normalize the same way GetRoute does. An internal storage key -- here a
+// filesystem chunk -- routes by its logical !fs|route|chk| key, and the raw
+// !fs|chk| bytes sort into a different route entirely. Without normalization
+// the RPC reports the raw-prefix owner rather than the group that owned the
+// key at that catalog version.
+func TestDistributionServerGetRouteOwnership_NormalizesFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            fskeys.ChunkKey(home, inode, 99),
+		CatalogVersion: 3,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.Equal(t, uint64(2), resp.Route.RaftGroupId,
+		"the chunk must resolve to its logical route owner, not the raw-prefix owner")
+	require.Equal(t, uint64(2), resp.Route.RouteId)
+}

@@ -554,3 +554,24 @@ func TestPlanMigrationBracketsCoversFilesystemChunkPayloads(t *testing.T) {
 	require.Negative(t, bytes.Compare(fskeys.ChunkAllPrefix(), routeStart),
 		"chunk payloads sort below the virtual route interval")
 }
+
+// Invariant: every family bracket's scan prefix must also be excluded from the
+// user bracket. Both filters accept the same raw row otherwise -- the family
+// bracket by prefix and the user bracket by normalized route key -- so the rows
+// are exported and proposed through Raft twice under separate bracket IDs.
+//
+// This is written as an invariant rather than a per-family case because the
+// filesystem chunk family was added without its exclusion and nothing caught it.
+func TestEveryFamilyBracketPrefixIsExcludedFromUserBracket(t *testing.T) {
+	t.Parallel()
+
+	for _, bracket := range migrationFamilyBrackets() {
+		if bracket.DrainOnly {
+			continue
+		}
+		require.True(t, IsMigrationKnownInternalKey(bracket.Start),
+			"family %d prefix %q must be in migrationInternalFamilyPrefixes, "+
+				"otherwise the user bracket exports the same rows a second time",
+			bracket.Family, bracket.Start)
+	}
+}
