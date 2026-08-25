@@ -32,6 +32,17 @@ func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption 
 	}
 }
 
+// ForwardWriteObserver observes successfully committed leader-side forwarded
+// writes. It lets the autosplit sampler account for writes that entered through
+// followers without coupling adapter.Internal to keyviz.
+type ForwardWriteObserver func([]*pb.Request)
+
+func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOption {
+	return func(i *Internal) {
+		i.forwardWriteObserver = observer
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -53,7 +64,8 @@ type Internal struct {
 	relay              *RedisPubSubRelay
 	// kvForwardRejected marks a runtime whose state machine cannot apply KV
 	// entries -- the dedicated TSO group. See WithKVForwardRejected.
-	kvForwardRejected bool
+	kvForwardRejected    bool
+	forwardWriteObserver ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
 }
@@ -92,6 +104,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			Success:     false,
 			CommitIndex: 0,
 		}, errors.WithStack(err)
+	}
+	if i.forwardWriteObserver != nil {
+		i.forwardWriteObserver(req.GetRequests())
 	}
 
 	return &pb.ForwardResponse{

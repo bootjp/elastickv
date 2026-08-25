@@ -2,9 +2,9 @@ syntax = "proto3";
 
 option go_package = "github.com/bootjp/elastickv/proto";
 
-// Admin is the node-side read-only admin gRPC service consumed by
-// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
-// metadata unless the node was started with --adminInsecureNoAuth.
+// Admin is the node-side operator gRPC service consumed by cmd/elastickv-admin.
+// Every method requires "authorization: Bearer <token>" metadata unless the
+// node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
 service Admin {
   rpc GetClusterOverview (GetClusterOverviewRequest) returns (GetClusterOverviewResponse) {}
@@ -12,7 +12,16 @@ service Admin {
   rpc GetAdapterSummary (GetAdapterSummaryRequest) returns (GetAdapterSummaryResponse) {}
   rpc GetKeyVizMatrix (GetKeyVizMatrixRequest) returns (GetKeyVizMatrixResponse) {}
   rpc GetRouteDetail (GetRouteDetailRequest) returns (GetRouteDetailResponse) {}
+  rpc SetAutoSplitEnabled (SetAutoSplitEnabledRequest) returns (SetAutoSplitEnabledResponse) {}
   rpc StreamEvents (StreamEventsRequest) returns (stream StreamEventsEvent) {}
+}
+
+message SetAutoSplitEnabledRequest {
+  bool enabled = 1;
+}
+
+message SetAutoSplitEnabledResponse {
+  bool enabled = 1;
 }
 
 message NodeIdentity {
