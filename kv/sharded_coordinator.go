@@ -656,6 +656,13 @@ func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *Sharded
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	ownedGroups := map[uint64]*ShardGroup(nil)
+	if groups != nil {
+		ownedGroups = make(map[uint64]*ShardGroup, len(groups))
+		for gid, group := range groups {
+			ownedGroups[gid] = group
+		}
+	}
 	// Construct the coordinator before wrapping the per-shard
 	// Transactionals so each leaseRefreshingTxn can back-reference it
 	// for the §4.1 registration barrier (the gate is installed later
@@ -663,14 +670,14 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	c := &ShardedCoordinator{
 		engine:       engine,
 		router:       router,
-		groups:       groups,
+		groups:       ownedGroups,
 		defaultGroup: defaultGroup,
 		clock:        clock,
 		store:        st,
 		log:          slog.Default(),
 	}
 	var deregisters []func()
-	for gid, g := range groups {
+	for gid, g := range ownedGroups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
 		// per-shard lease. Leave nil transactions unchanged, and skip
 		// if already wrapped so repeat calls don't stack wrappers.
@@ -680,7 +687,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 				// supports repeat construction by not stacking
 				// wrappers): point the existing wrapper at the NEW
 				// coordinator so Commit consults the freshly-installed
-				// registration gate, not a stale one (codex P2).
+				// registration gate, not a stale one.
 				existing.coord = c
 			} else {
 				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
@@ -1718,6 +1725,24 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
+// LeadershipForKey reports local leadership and Raft term for key's group.
+func (c *ShardedCoordinator) LeadershipForKey(key []byte) (bool, uint64) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
+// GroupLeadership reports local leadership and Raft term for groupID.
+func (c *ShardedCoordinator) GroupLeadership(groupID uint64) (bool, uint64) {
+	g, ok := c.groups[groupID]
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
 func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
 	g, ok := c.groupForKey(key)
 	if !ok {
@@ -2181,10 +2206,52 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 // path allocation-free. Reads have their own observeReadKey helper
 // (LinearizableReadForKey / LeaseReadForKey).
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation, label keyviz.Label) {
-	if c.sampler == nil {
+	if c == nil || c.sampler == nil || mut == nil {
 		return
 	}
-	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+	// Sample under the route key, not the raw storage key. routeID was resolved
+	// with routeKey and the sampler's sub-buckets are laid out on catalog route
+	// boundaries, which live in the normalized keyspace. Feeding the raw key
+	// here bucketed adapter traffic against the wrong bounds -- Redis user key
+	// "z" arrives as "!redis|str|z", which sorts before a route starting at
+	// "m", so every write clamped into the first sub-bucket and autosplit chose
+	// a boundary near the route start instead of the hot user key.
+	c.sampler.Observe(routeID, routeKey(mut.Key), keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+}
+
+// ObserveForwardedRequests records committed leader-side sampling evidence for
+// writes that entered through a shard follower and were committed via
+// Internal.Forward on this shard leader.
+func (c *ShardedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	if c == nil || c.sampler == nil {
+		return
+	}
+	for _, req := range reqs {
+		if req == nil || !forwardedRequestRecordsUserWrites(req) {
+			continue
+		}
+		for _, mut := range req.Mutations {
+			if mut == nil || isTxnMetaKey(mut.Key) {
+				continue
+			}
+			routeID, _, ok := c.routeAndGroupForKey(mut.Key)
+			if !ok {
+				continue
+			}
+			c.observeMutation(routeID, mut, keyviz.LabelLegacy)
+		}
+	}
+}
+
+// forwardedRequestRecordsUserWrites reports whether a forwarded request carries
+// writes that should count as hot-key evidence.
+//
+// An ABORT cleanup still lists the user keys after the txn metadata so the FSM
+// can clear their intents, but those writes were rolled back. Counting them
+// would let a follower-routed transaction that aborts manufacture hot-key
+// evidence, and the autosplit scheduler would split on cleanup traffic.
+func forwardedRequestRecordsUserWrites(req *pb.Request) bool {
+	return req.GetPhase() != pb.Phase_ABORT
 }
 
 // observeRead records a single linearizable / lease read against the
@@ -2208,7 +2275,14 @@ func (c *ShardedCoordinator) observeRead(ctx context.Context, routeID uint64, ke
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, key, keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
+	// Normalized for the same reason observeMutation normalizes: routeID was
+	// resolved through routeKey, and the sampler's sub-buckets are laid out on
+	// catalog route boundaries, which live in the normalized keyspace. A raw
+	// adapter key -- a DynamoDB item key, a Redis route wrapper -- sorts in a
+	// different keyspace than those boundaries, so read-heavy traffic bucketed
+	// against the wrong bounds and could pick a split boundary unrelated to the
+	// hot logical key.
+	c.sampler.Observe(routeID, routeKey(key), keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
 }
 
 func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label {

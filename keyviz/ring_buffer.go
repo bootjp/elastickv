@@ -83,7 +83,16 @@ func cloneColumn(col MatrixColumn) MatrixColumn {
 			rows[i].MemberRoutes = append([]uint64(nil), row.MemberRoutes...)
 		}
 	}
-	return MatrixColumn{WindowStart: col.WindowStart, At: col.At, Rows: rows}
+	hotKeys := make([]KeyvizHotKeysSnapshot, len(col.HotKeys))
+	for i, snapshot := range col.HotKeys {
+		hotKeys[i] = cloneHotKeysSnapshot(snapshot)
+	}
+	return MatrixColumn{
+		WindowStart: col.WindowStart,
+		At:          col.At,
+		Rows:        rows,
+		HotKeys:     hotKeys,
+	}
 }
 
 // snapshotOrdered returns a chronologically ordered (oldest first)
