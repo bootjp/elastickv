@@ -2948,13 +2948,13 @@ func TestShardStorePointReadStopsLegacyFallbackOnRemoteTombstone(t *testing.T) {
 			wantLegacyValue:  true,
 		},
 		{
-			// Pre-upgrade peer: the probe is unanswered, so the caller keeps
-			// the old latest-commit heuristic rather than treating the silence
-			// as "no version".
-			name:             "peer predating the probe falls back to the heuristic",
+			// Pre-upgrade peer: the probe is unanswered, so the caller stops
+			// legacy fallback rather than using the unsafe latest-commit
+			// heuristic.
+			name:             "peer predating the probe stops legacy fallback",
 			versionVisible:   false,
 			versionSupported: false,
-			wantLegacyValue:  true,
+			wantLegacyValue:  false,
 		},
 	}
 

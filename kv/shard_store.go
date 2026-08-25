@@ -233,14 +233,10 @@ func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, k
 
 // routeHasLatestVersionVisibleAt reports whether this route can answer the read
 // itself, which is what stops the point-read fallback from trying the legacy
-// wide-column route. It tries three sources in order: an exact local check, an
-// exact probe on the route's leader, and only then the latest-commit heuristic.
-//
-// The heuristic is last because it is wrong in one specific case: a key with a
-// tombstone at or before ts and a newer version above it has latest > ts, so it
-// reports "not visible here", the caller falls through to the legacy route, and
-// a snapshot read between those two timestamps resurrects the legacy value the
-// tombstone should hide.
+// wide-column route. If the exact local/remote presence probe is unavailable,
+// stop the fallback anyway: the old latest-commit heuristic cannot distinguish
+// "no version" from "a tombstone at or before ts plus a newer future version",
+// which can resurrect legacy values during rolling upgrades.
 func (s *ShardStore) routeHasLatestVersionVisibleAt(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, error) {
 	if exists, ok, err := s.routeHasVersionAtOrBefore(ctx, route, key, ts); ok || err != nil {
 		return exists, err
@@ -248,17 +244,13 @@ func (s *ShardStore) routeHasLatestVersionVisibleAt(ctx context.Context, route d
 	if visible, ok, err := s.routeHasVersionAtOrBeforeRemote(ctx, route, key, ts, readRouteVersion); ok || err != nil {
 		return visible, err
 	}
-	latest, exists, err := s.latestCommitTSForRoute(ctx, route, key, readRouteVersion)
-	if err != nil {
-		return false, err
-	}
-	return exists && latest <= ts, nil
+	return true, nil
 }
 
 // routeHasVersionAtOrBeforeRemote asks the route's leader the exact question a
 // non-leader replica cannot answer locally. The second bool reports whether the
 // peer answered at all: one that predates version_visible_at_ts leaves the
-// response fields unset, and the caller falls back to the heuristic rather than
+// response fields unset, and the caller stops legacy fallback rather than
 // silently treating "unknown" as "no version".
 func (s *ShardStore) routeHasVersionAtOrBeforeRemote(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) (bool, bool, error) {
 	if ts == 0 {

@@ -164,7 +164,7 @@ func TestRouteKey_NormalizesRedisInternalEmptyUserKey(t *testing.T) {
 	}
 }
 
-func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
+func TestRouteKey_NormalizesRedisListAndStreamAuxiliaryKeys(t *testing.T) {
 	t.Parallel()
 
 	for _, userKey := range [][]byte{
@@ -178,8 +178,11 @@ func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
 				store.ListMetaDeltaScanPrefix(userKey),
 				store.ListClaimKey(userKey, 3),
 				store.ListClaimScanPrefix(userKey),
+				store.StreamMetaKey(userKey),
+				store.StreamEntryKey(userKey, 123, 4),
 			} {
 				require.Equal(t, userKey, routeKey(raw))
+				require.Equal(t, userKey, routeKey(txnLockKey(raw)))
 			}
 		})
 	}

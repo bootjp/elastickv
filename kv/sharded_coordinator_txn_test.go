@@ -107,6 +107,22 @@ func TestShardedCoordinatorDispatchNonTxn_RejectsRouteWriteTimestampFloor(t *tes
 	require.Empty(t, g1Txn.requests)
 }
 
+func TestNewShardedCoordinatorCopiesGroupMap(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	group := &ShardGroup{}
+	groups := map[uint64]*ShardGroup{1: group}
+
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil)
+	delete(groups, 1)
+	groups[2] = &ShardGroup{}
+
+	require.Same(t, group, coord.groups[1])
+	_, ok := coord.groups[2]
+	require.False(t, ok)
+}
+
 func TestShardedCoordinatorDelPrefixBroadcast_UsesConfiguredAllShardGroups(t *testing.T) {
 	t.Parallel()
 

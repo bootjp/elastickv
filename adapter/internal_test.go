@@ -5,11 +5,40 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+func TestInternalForwardObservesCommittedWrites(t *testing.T) {
+	t.Parallel()
+
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte("hot"),
+			Value: []byte("value"),
+		}},
+	}}
+	txn := &forwardObserverTxn{}
+	var observed []*pb.Request
+	internal := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil, WithInternalForwardWriteObserver(func(reqs []*pb.Request) {
+		observed = reqs
+	}))
+
+	resp, err := internal.Forward(context.Background(), &pb.ForwardRequest{Requests: reqs})
+
+	require.NoError(t, err)
+	require.True(t, resp.Success)
+	require.Equal(t, uint64(9), resp.CommitIndex)
+	require.Len(t, observed, 1)
+	require.Same(t, reqs[0], observed[0])
+	require.Len(t, txn.reqs, 1)
+	require.Same(t, reqs[0], txn.reqs[0])
+	require.Equal(t, uint64(1), reqs[0].Ts)
+}
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {
 	t.Parallel()
@@ -348,4 +377,89 @@ func TestStampRawTimestamps_WithoutWriteGate(t *testing.T) {
 
 	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
 	require.NotZero(t, reqs[0].Ts)
+}
+
+func TestStampTxnTimestamps_AppliesRouteFloorToForwardedCommitWrites(t *testing.T) {
+	t.Parallel()
+
+	rejected := errors.New("route min_write_ts_exclusive rejects commit_ts")
+	gate := &recordingWriteGate{floor: 100, rejectErr: rejected}
+	i := &Internal{writeGate: gate}
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}}
+
+	commitTS, err := i.stampTxnTimestamps(context.Background(), reqs)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), commitTS)
+	require.Equal(t, 1, gate.calls)
+	require.Equal(t, uint64(101), gate.lastTS)
+	require.Equal(t, 1, gate.lastMuts, "txn metadata is not a user write and must not be gated")
+
+	gate.floor = 101
+	_, err = i.stampTxnTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, rejected)
+}
+
+func TestStampTxnTimestamps_DoesNotGatePrepareOrAbortCleanup(t *testing.T) {
+	t.Parallel()
+
+	rejected := errors.New("route min_write_ts_exclusive rejects commit_ts")
+	gate := &recordingWriteGate{floor: 0, rejectErr: rejected}
+	i := &Internal{writeGate: gate}
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_PREPARE,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z")})},
+				{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+			},
+		},
+		{
+			IsTxn: true,
+			Phase: pb.Phase_ABORT,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z"), CommitTS: 11})},
+				{Op: pb.Op_DEL, Key: []byte("z")},
+			},
+		},
+	}
+
+	commitTS, err := i.stampTxnTimestamps(context.Background(), reqs)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(11), commitTS)
+	require.Zero(t, gate.calls)
+}
+
+type forwardObserverLeader struct{}
+
+func (forwardObserverLeader) State() raftengine.State { return raftengine.StateLeader }
+func (forwardObserverLeader) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
+}
+func (forwardObserverLeader) VerifyLeader(context.Context) error               { return nil }
+func (forwardObserverLeader) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
+
+type forwardObserverTxn struct {
+	reqs []*pb.Request
+}
+
+func (t *forwardObserverTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
+	t.reqs = reqs
+	return &kv.TransactionResponse{CommitIndex: 9}, nil
+}
+
+func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
 }

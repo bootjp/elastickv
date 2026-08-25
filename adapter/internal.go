@@ -26,6 +26,17 @@ func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption 
 	}
 }
 
+// ForwardWriteObserver observes successfully committed leader-side forwarded
+// writes. It lets the autosplit sampler account for writes that entered through
+// followers without coupling adapter.Internal to keyviz.
+type ForwardWriteObserver func([]*pb.Request)
+
+func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOption {
+	return func(i *Internal) {
+		i.forwardWriteObserver = observer
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:             leader,
@@ -40,12 +51,13 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
-	writeGate          kv.MutationWriteGate
+	leader               raftengine.LeaderView
+	transactionManager   kv.Transactional
+	clock                *kv.HLC
+	tsAllocator          kv.TimestampAllocator
+	relay                *RedisPubSubRelay
+	writeGate            kv.MutationWriteGate
+	forwardWriteObserver ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
 }
@@ -78,6 +90,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			Success:     false,
 			CommitIndex: 0,
 		}, errors.WithStack(err)
+	}
+	if i.forwardWriteObserver != nil {
+		i.forwardWriteObserver(req.GetRequests())
 	}
 
 	return &pb.ForwardResponse{
@@ -219,7 +234,48 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	commitTS, err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := i.ensureTxnWritesAllowed(reqs, commitTS); err != nil {
+		return 0, err
+	}
+	return commitTS, nil
+}
+
+func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {
+	if i.writeGate == nil || commitTS == 0 {
+		return nil
+	}
+	for _, r := range reqs {
+		if r == nil || !r.IsTxn {
+			continue
+		}
+		if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE {
+			continue
+		}
+		muts := forwardedTxnUserMutations(r.Mutations)
+		if len(muts) == 0 {
+			continue
+		}
+		if err := i.writeGate.EnsureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnUserMutations(muts []*pb.Mutation) []*pb.Mutation {
+	out := make([]*pb.Mutation, 0, len(muts))
+	metaPrefix := []byte(kv.TxnMetaPrefix)
+	for _, mut := range muts {
+		if mut == nil || bytes.HasPrefix(mut.Key, metaPrefix) {
+			continue
+		}
+		out = append(out, mut)
+	}
+	return out
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {

@@ -4,7 +4,7 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (updated July 23, 2026):
+Current implementation status (updated August 22, 2026):
 
 - M1 durable route catalog, watcher refresh, and same-group manual
   `SplitRange` are implemented.
@@ -13,13 +13,14 @@ Current implementation status (updated July 23, 2026):
   [`2026_06_11_partial_hotspot_split_milestone2_migration.md`](2026_06_11_partial_hotspot_split_milestone2_migration.md);
   the actual migration RPC, export/import, fence, cutover, promotion, and
   cleanup workflow are still open.
-- The old in-memory `RecordAccess` / midpoint `splitRange` path has been
-  removed by the M3-PR1a slice, `RouteDescriptor.SplitAtHLC` and the v2
-  route codec shipped in M3-PR1b, and the pure detector core shipped in
-  [`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md);
-  runtime scheduler wiring remains open.
+- Standalone M3 auto-split is implemented: keyviz supplies the sole load signal,
+  and the detector/scheduler issues guarded same-group `SplitRange` operations.
+  See
+  [`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
+- There is no data movement workflow to relocate part of a split range to another Raft group.
 
-So practical “hotspot splitting” is currently not connected end-to-end.
+Same-group hotspot splitting is connected end-to-end. Cross-group relocation
+still depends on the M2 movement workflow and the M3-PR4 target policy.
 
 For a current runtime/component snapshot, see `docs/architecture_overview.md`.
 
@@ -304,11 +305,11 @@ Add RPCs:
 2. Hotspot detector
 3. Auto-split scheduler (cooldown/hysteresis)
 
-Status: partial. M3-PR1a removed the dead engine-local `RecordAccess` /
-`splitRange` path, M3-PR1b shipped the `SplitAtHLC` route-codec field, and
-M3-PR2a shipped the pure autosplit detector core. Observe-mode integration and
-scheduler wiring remain open in
-[`2026_06_11_partial_hotspot_split_milestone3_automation.md`](2026_06_11_partial_hotspot_split_milestone3_automation.md).
+Status: implemented for standalone same-group automation. Detector, scheduler,
+compound isolation, cooldown/hysteresis, leadership fencing, runtime control,
+metrics, and three-node end-to-end coverage are complete in
+[`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
+Cross-group target selection remains the post-M2 M3-PR4 follow-on.
 
 ### Milestone 4: Hardening
 

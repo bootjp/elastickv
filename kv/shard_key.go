@@ -98,6 +98,9 @@ func normalizeRouteKey(key []byte) []byte {
 	if user := listRouteKey(key); user != nil {
 		return user
 	}
+	if user := redisStreamRouteKey(key); user != nil {
+		return user
+	}
 	if user := redisRouteKey(key); user != nil {
 		return user
 	}

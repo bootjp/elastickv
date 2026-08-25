@@ -476,6 +476,30 @@ func (e *Engine) exactRouteLocked(key []byte) []Route {
 	return []Route{route}
 }
 
+// AppliedCatalogSnapshot returns the routes the engine is currently serving,
+// paired with the catalog version they were applied at. It is the engine's own
+// view rather than the persisted catalog's, which is what a caller mid-catch-up
+// needs: the store may already be several delta batches ahead.
+//
+// ReadTS is left zero because these routes come from applied deltas, not from a
+// point-in-time catalog read.
+func (e *Engine) AppliedCatalogSnapshot() CatalogSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	routes := make([]RouteDescriptor, 0, len(e.routes))
+	for i := range e.routes {
+		r := &e.routes[i]
+		routes = append(routes, RouteDescriptor{
+			RouteID: r.RouteID,
+			Start:   CloneBytes(r.Start),
+			End:     CloneBytes(r.End),
+			GroupID: r.GroupID,
+			State:   r.State,
+		})
+	}
+	return CatalogSnapshot{Version: e.catalogVersion, Routes: routes}
+}
+
 // NextTimestamp returns a monotonic increasing timestamp.
 func (e *Engine) NextTimestamp() uint64 {
 	return e.ts.Add(1)
