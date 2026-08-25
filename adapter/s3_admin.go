@@ -351,7 +351,8 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -471,7 +472,8 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 	// AdminCreateBucket racing the delete is rejected by OCC.
 	// retryS3Mutation handles ErrWriteConflict / ErrTxnLocked
 	// by re-running this whole closure.
-	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(name)}},

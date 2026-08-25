@@ -121,6 +121,25 @@ func TestS3AdminCreateBucketPhaseDBindsReadVoucher(t *testing.T) {
 	require.Equal(t, uint64(1), coord.lastStartTS)
 }
 
+func TestS3AdminPutBucketAclPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedS3BucketForReadVoucherTest(t, ctx, st, "admin-acl-voucher-bucket")
+
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	err := server.AdminPutBucketAcl(ctx, fullAdminBucketsPrincipal(), "admin-acl-voucher-bucket", s3AclPublicRead)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, coord.vouchCalls, "admin put bucket acl must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
 func TestS3AdminPutObjectPhaseDBindsReadVoucher(t *testing.T) {
 	t.Parallel()
 
@@ -187,6 +206,25 @@ func TestS3AdminDeleteObjectPhaseDBindsReadVoucher(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, 1, coord.vouchCalls, "admin delete object must carry the applied-read voucher into dispatch")
+	require.Equal(t, uint64(1), coord.lastStartTS)
+}
+
+func TestS3AdminDeleteBucketPhaseDBindsReadVoucher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedS3BucketForReadVoucherTest(t, ctx, st, "admin-delete-voucher-bucket")
+
+	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
+	coord := newDistributionCoordinatorStub(st, true)
+	coord.allocator = allocator
+	server := NewS3Server(nil, "", st, coord, nil)
+
+	err := server.AdminDeleteBucket(ctx, fullAdminBucketsPrincipal(), "admin-delete-voucher-bucket")
+
+	require.NoError(t, err)
+	require.Equal(t, 1, coord.vouchCalls, "admin delete bucket must carry the applied-read voucher into dispatch")
 	require.Equal(t, uint64(1), coord.lastStartTS)
 }
 
@@ -260,16 +298,7 @@ func seedS3ObjectForReadVoucherTest(t *testing.T, ctx context.Context, st store.
 	t.Helper()
 
 	const generation = uint64(1)
-	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{
-		BucketName:   bucket,
-		Generation:   generation,
-		CreatedAtHLC: 1,
-		Region:       s3DefaultRegion,
-		Owner:        "AKIA_FULL",
-		Acl:          s3AclPrivate,
-	})
-	require.NoError(t, err)
-	require.NoError(t, st.PutAt(ctx, s3keys.BucketMetaKey(bucket), bucketMeta, 1, 0))
+	seedS3BucketForReadVoucherTest(t, ctx, st, bucket)
 
 	manifest, err := encodeS3ObjectManifest(&s3ObjectManifest{
 		UploadID:        "upload",
@@ -280,6 +309,21 @@ func seedS3ObjectForReadVoucherTest(t *testing.T, ctx context.Context, st store.
 	})
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(ctx, s3keys.ObjectManifestKey(bucket, generation, key), manifest, 1, 0))
+}
+
+func seedS3BucketForReadVoucherTest(t *testing.T, ctx context.Context, st store.MVCCStore, bucket string) {
+	t.Helper()
+
+	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{
+		BucketName:   bucket,
+		Generation:   1,
+		CreatedAtHLC: 1,
+		Region:       s3DefaultRegion,
+		Owner:        "AKIA_FULL",
+		Acl:          s3AclPrivate,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, s3keys.BucketMetaKey(bucket), bucketMeta, 1, 0))
 }
 
 type recordingS3DispatchCoordinator struct {

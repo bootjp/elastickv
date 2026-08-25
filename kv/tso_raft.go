@@ -207,7 +207,7 @@ func (a *RaftTSOAllocator) reservePreparedLocalWindow(
 func (a *RaftTSOAllocator) reserveLocalWindow(n int, minimum uint64, phaseDContiguous bool) (uint64, uint64, error) {
 	if !phaseDContiguous {
 		if minimum > 0 {
-			if err := a.rejectMinimumBeyondCeiling(minimum); err != nil {
+			if err := a.rejectMinimumWindowBeyondCeiling(minimum, n); err != nil {
 				return 0, 0, err
 			}
 			a.clock.Observe(minimum)
@@ -219,62 +219,59 @@ func (a *RaftTSOAllocator) reserveLocalWindow(n int, minimum uint64, phaseDConti
 		end := base + positiveIntToUint64(n) - 1
 		return base, end, nil
 	}
-	return a.reserveContiguousPhaseDWindow(n, minimum)
+	return a.reservePhaseDWindow(n, minimum)
 }
 
-// rejectMinimumBeyondCeiling refuses a caller-supplied minimum whose physical
-// half is past the Raft-committed ceiling, before Observe can publish it.
+// rejectMinimumWindowBeyondCeiling refuses a caller-supplied minimum whose next
+// allocation window cannot fit under the Raft-committed ceiling, before Observe
+// can publish it.
 //
 // Observe is permanent. It advances h.last, and nextLocked derives newWall from
 // h.last, so a minimum beyond the ceiling makes rejectFencedPhysicalOverflow
 // fail every later fenced reservation with ErrCeilingExpired until a lease
-// renewal raises the ceiling or leadership changes. Distribution.GetTimestamp
-// forwards a caller's minimum straight into this path and
-// validateTSOMinimumWindow only checks arithmetic overflow, so one request with
-// a far-future minimum would otherwise stall issuance for every other caller.
+// renewal raises the ceiling or leadership changes. The same poison happens
+// when minimum's physical half equals the ceiling but the requested batch rolls
+// logical bits into the next millisecond. Distribution.GetTimestamp forwards a
+// caller's minimum straight into this path and validateTSOMinimumWindow only
+// checks arithmetic overflow, so one request with a far-future minimum would
+// otherwise stall issuance for every other caller.
 //
 // A zero ceiling means no lease has been committed yet; the fence is inactive
 // then, so there is nothing to validate against.
-func (a *RaftTSOAllocator) rejectMinimumBeyondCeiling(minimum uint64) error {
+func (a *RaftTSOAllocator) rejectMinimumWindowBeyondCeiling(minimum uint64, n int) error {
 	ceiling := a.clock.PhysicalCeiling()
 	if ceiling <= 0 {
 		return nil
 	}
+	if err := validateTSOMinimumWindow(minimum, n); err != nil {
+		return err
+	}
 	physical := clampUint64ToInt64(minimum >> HLCLogicalBits)
-	if physical > ceiling {
+	nextPhysical := physical
+	baseLogical := (minimum & hlcLogicalMask) + 1
+	if baseLogical+positiveIntToUint64(n)-1 > hlcLogicalMask {
+		nextPhysical++
+	}
+	if nextPhysical > ceiling {
 		return errors.Wrapf(ErrTSOTimestampInvalid,
-			"tso minimum %d has physical %d beyond committed ceiling %d", minimum, physical, ceiling)
+			"tso minimum %d with batch %d rolls to physical %d beyond committed ceiling %d",
+			minimum, n, nextPhysical, ceiling)
 	}
 	return nil
 }
 
-func (a *RaftTSOAllocator) reserveContiguousPhaseDWindow(n int, floor uint64) (uint64, uint64, error) {
+func (a *RaftTSOAllocator) reservePhaseDWindow(n int, floor uint64) (uint64, uint64, error) {
 	if err := validateTSOMinimumWindow(floor, n); err != nil {
 		return 0, 0, err
 	}
-	base := floor + 1
-	end := base + positiveIntToUint64(n) - 1
-	if err := a.validateContiguousPhaseDWindow(end); err != nil {
-		return 0, 0, err
+	a.clock.Observe(floor)
+	base, err := a.clock.NextBatchFenced(n)
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "tso reserve phase-D window")
 	}
+	end := base + positiveIntToUint64(n) - 1
 	a.clock.Observe(end)
 	return base, end, nil
-}
-
-func (a *RaftTSOAllocator) validateContiguousPhaseDWindow(end uint64) error {
-	ceiling := a.clock.PhysicalCeiling()
-	if ceiling <= 0 {
-		return nil
-	}
-	if time.Now().UnixMilli() >= ceiling {
-		a.clock.nextFencedRejections.Add(1)
-		return errors.Wrap(ErrCeilingExpired, "tso reserve contiguous phase-D window")
-	}
-	if end>>hlcLogicalBits > uint64(ceiling) {
-		a.clock.nextFencedRejections.Add(1)
-		return errors.Wrap(ErrCeilingExpired, "tso contiguous phase-D window exceeds ceiling")
-	}
-	return nil
 }
 
 func (a *RaftTSOAllocator) commitPhaseDReservation(

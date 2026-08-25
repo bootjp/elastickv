@@ -273,9 +273,9 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), end+1), ErrTSOTimestampInvalid)
 }
 
-func TestRaftTSOAllocatorPhaseDReservationsStayContiguousAcrossWallClockJump(t *testing.T) {
+func TestRaftTSOAllocatorPhaseDReservationsFollowWallClockJump(t *testing.T) {
 	clock := NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(2 * testTSOFutureCeiling).UnixMilli())
+	clock.SetPhysicalCeiling(time.Now().Add(3 * testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
 	engine := &recordingTSOEngine{
 		state:  raftengine.StateLeader,
@@ -298,11 +298,14 @@ func TestRaftTSOAllocatorPhaseDReservationsStayContiguousAcrossWallClockJump(t *
 	require.Equal(t, firstEnd, fsm.AllocationFloor())
 	require.Equal(t, first.Base-1, fsm.PhaseDFloor())
 
-	clock.Observe(uint64(time.Now().Add(testTSOFutureCeiling).UnixMilli()) << hlcLogicalBits) //nolint:gosec // test HLC timestamp is positive.
+	jumpedWall := (firstEnd >> hlcLogicalBits) + 1_000
+	clock.SetPhysicalCeiling(time.Now().Add(24 * time.Hour).UnixMilli())
+	clock.Observe(jumpedWall << hlcLogicalBits)
 	second, err := alloc.ReserveBatchAfter(context.Background(), testTSOBatchSize, 0, false, false)
 	require.NoError(t, err)
 	secondEnd := second.Base + positiveIntToUint64(second.Count) - 1
-	require.Equal(t, firstEnd+1, second.Base)
+	require.Greater(t, second.Base, firstEnd+1)
+	require.GreaterOrEqual(t, second.Base>>hlcLogicalBits, jumpedWall)
 	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), second.Base))
 	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), secondEnd))
 	require.ErrorIs(t, alloc.ValidateDurableTimestamp(context.Background(), secondEnd+1), ErrTSOTimestampInvalid)
@@ -906,6 +909,34 @@ func TestRaftTSOAllocatorRejectsMinimumBeyondCeilingWithoutStallingIssuance(t *t
 	// The load-bearing half: ordinary issuance must still work afterwards.
 	ts, err := alloc.Next(context.Background())
 	require.NoError(t, err, "a rejected minimum must not poison later reservations")
+	require.Positive(t, ts)
+}
+
+func TestRaftTSOAllocatorRejectsMinimumWindowRolloverAtCeilingWithoutStallingIssuance(t *testing.T) {
+	clock := NewHLC()
+	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
+	clock.SetPhysicalCeiling(ceilingMs)
+	fsm := NewTSOStateMachine(clock)
+	engine := &recordingTSOEngine{
+		state:  raftengine.StateLeader,
+		leader: raftengine.LeaderInfo{Address: "self"},
+		term:   1,
+		apply:  applyTSOTestFSM(fsm),
+	}
+	alloc, err := NewRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock,
+		WithTSOCutoverFloorProvider(&recordingTSOFloorProvider{}))
+	require.NoError(t, err)
+
+	// Physical time equals the ceiling, but the logical half is exhausted.
+	// The next allocation would roll into ceiling+1 and must be rejected
+	// before Observe can publish this minimum into the HLC.
+	minimum := (uint64(ceilingMs) << hlcLogicalBits) | hlcLogicalMask //nolint:gosec // future test HLC.
+	_, err = alloc.NextAfter(context.Background(), minimum)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, ErrCeilingExpired)
+
+	ts, err := alloc.Next(context.Background())
+	require.NoError(t, err, "a rejected logical rollover must not poison later reservations")
 	require.Positive(t, ts)
 }
 

@@ -434,6 +434,41 @@ func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
 		"legacy warm-up must keep answering from the data groups, not group 0 alone")
 }
 
+func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	*tsoModeFile = path
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {
+			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
+			TSOState: fsm,
+		},
+		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+
+	require.NotNil(t, wiring.runtimeController,
+		"mode-file legacy still needs the runtime controller for later reloads")
+	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
+	require.True(t, coord.IsTimestampLeader(),
+		"legacy mode file must not narrow timestamp leadership to group 0")
+	_, active := kv.TimestampAllocatorThrough(coord)
+	require.False(t, active,
+		"legacy mode file should keep persistence writes on the data-group HLC path")
+	_, configured := kv.ConfiguredTimestampAllocatorThrough(coord)
+	require.True(t, configured,
+		"long-lived internal servers must retain the dynamic allocator for later reloads")
+}
+
 // Once the dedicated allocator is actually required, the pin must apply.
 func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
 	setTSOModeFlags(t, true, false)

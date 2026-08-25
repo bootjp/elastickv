@@ -92,9 +92,9 @@ groups:
 
       - alert: ElasticKVTSOPhaseDWithoutCutover
         expr: |
-          max(elastickv_tso_durable_state{marker="phase_d"})
+          max by (node_id, node_address) (elastickv_tso_durable_state{marker="phase_d"})
           >
-          max(elastickv_tso_durable_state{marker="cutover"})
+          max by (node_id, node_address) (elastickv_tso_durable_state{marker="cutover"})
         for: 1m
         labels:
           severity: critical

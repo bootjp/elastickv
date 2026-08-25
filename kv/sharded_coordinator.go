@@ -1294,14 +1294,40 @@ func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context,
 }
 
 func (c *ShardedCoordinator) prepareTxnCommitTimestamp(ctx context.Context, startTS, commitTS uint64, elems []*Elem[OP]) (uint64, error) {
+	callerSuppliedCommitTS := commitTS != 0
 	resolved, err := c.resolveTxnCommitTS(ctx, startTS, commitTS)
 	if err != nil {
 		return 0, err
+	}
+	if callerSuppliedCommitTS {
+		if err := c.validateCallerSuppliedTxnCommit(ctx, resolved); err != nil {
+			return 0, err
+		}
+		if c.clock != nil {
+			// Only publish caller-provided CommitTS after Phase-D validation.
+			// Observe is permanent, so an invalid future commit timestamp must
+			// not poison later local HLC issuance.
+			c.clock.Observe(resolved)
+		}
 	}
 	if err := ValidateElemCommitTSPatches(elems, resolved); err != nil {
 		return 0, err
 	}
 	return resolved, nil
+}
+
+func (c *ShardedCoordinator) validateCallerSuppliedTxnCommit(ctx context.Context, commitTS uint64) error {
+	validator, _, required, err := phaseDTimestampValidator(c.tsAllocator)
+	if err != nil {
+		return errors.Wrap(err, "caller-supplied commit timestamp validator is unavailable")
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(ctx, commitTS); err != nil {
+		return errors.Wrap(err, "validate caller-supplied commit timestamp")
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) validateCrossShardReadTimestamp(
@@ -1395,10 +1421,6 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, co
 			return 0, err
 		}
 		commitTS = next
-	} else if c.clock != nil {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
 	}
 	if commitTS == 0 || commitTS <= startTS {
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)

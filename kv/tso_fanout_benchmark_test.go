@@ -35,7 +35,7 @@ func runTSOWriteFanoutBenchmark(b *testing.B, writers, fanout, batchSize int, rt
 		b.Fatal(err)
 	}
 	latencies := make([]int64, b.N)
-	var next atomic.Uint64
+	var next atomic.Int64
 	var firstErr atomic.Pointer[benchmarkTSOError]
 	ctx := context.Background()
 	b.ResetTimer()
@@ -56,14 +56,14 @@ func runTSOWriteFanoutWorker(
 	allocator TimestampAllocator,
 	fanout int,
 	latencies []int64,
-	next *atomic.Uint64,
+	next *atomic.Int64,
 	firstErr *atomic.Pointer[benchmarkTSOError],
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
 	for {
 		index := next.Add(1) - 1
-		if index >= uint64(len(latencies)) { //nolint:gosec // benchmark sizes are non-negative.
+		if index < 0 || index >= int64(len(latencies)) {
 			return
 		}
 		opStarted := time.Now()
@@ -121,6 +121,9 @@ func (a *benchmarkTSOAllocator) Next(ctx context.Context) (uint64, error) {
 }
 
 func (a *benchmarkTSOAllocator) NextBatch(ctx context.Context, n int) (uint64, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("batch size must be positive: %d", n)
+	}
 	timer := time.NewTimer(a.rtt)
 	defer timer.Stop()
 	select {
@@ -129,8 +132,9 @@ func (a *benchmarkTSOAllocator) NextBatch(ctx context.Context, n int) (uint64, e
 	case <-timer.C:
 	}
 	a.refills.Add(1)
-	end := a.next.Add(uint64(n))    //nolint:gosec // benchmark batch sizes are positive.
-	return end - uint64(n) + 1, nil //nolint:gosec // benchmark batch sizes are positive.
+	batch := uint64(n)
+	end := a.next.Add(batch)
+	return end - batch + 1, nil
 }
 
 func (a *benchmarkTSOAllocator) IsLeader() bool { return false }

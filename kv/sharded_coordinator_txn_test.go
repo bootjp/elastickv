@@ -296,6 +296,29 @@ func TestShardedCoordinatorDispatchTxn_PhaseDAcceptsBoundAppliedWatermark(t *tes
 	require.Equal(t, uint64(3), alloc.validateCalls.Load(), "voucher must be bound and single-use")
 }
 
+func TestShardedCoordinatorDispatchTxn_PhaseDRejectsInvalidCallerCommitTS(t *testing.T) {
+	t.Parallel()
+
+	coord, g1Txn, g2Txn, alloc := newPhaseDCrossShardCoordinator(t, ErrTSOTimestampInvalid)
+	readTimestamp := ReadTimestamp{timestamp: 99, voucher: newAppliedReadDispatchVoucher()}
+	_, err := DispatchWithReadTimestamp(readTimestamp.WithDispatchVoucher(context.Background()), coord, &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  readTimestamp.Timestamp(),
+		CommitTS: 101,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+		},
+	})
+
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+	require.Equal(t, uint64(101), alloc.validated.Load())
+	require.Zero(t, coord.Clock().Current(), "invalid caller CommitTS must be rejected before HLC Observe")
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+}
+
 func TestDispatchWithReadTimestampVouchesEveryBoundDispatch(t *testing.T) {
 	t.Parallel()
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
