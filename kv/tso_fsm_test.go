@@ -496,7 +496,7 @@ func TestTSOStateMachineDrainsHeaderlessLegacyKVFSMSnapshot(t *testing.T) {
 	require.Zero(t, targetClock.Current())
 }
 
-func TestTSOStateMachineDrainsLongHeaderlessLegacyKVFSMSnapshot(t *testing.T) {
+func TestTSOStateMachineRejectsUnknownLongHeaderlessSnapshotPayload(t *testing.T) {
 	t.Parallel()
 
 	legacy := bytes.Repeat([]byte("legacy-kvfsm-headerless-body"), 2)
@@ -504,7 +504,7 @@ func TestTSOStateMachineDrainsLongHeaderlessLegacyKVFSMSnapshot(t *testing.T) {
 
 	targetClock := NewHLC()
 	target := NewTSOStateMachine(targetClock)
-	require.NoError(t, target.Restore(bytes.NewReader(legacy)))
+	require.ErrorIs(t, target.Restore(bytes.NewReader(legacy)), ErrTSOStateMachineInvalidEntry)
 	require.Zero(t, targetClock.PhysicalCeiling())
 	require.Zero(t, targetClock.Current())
 }

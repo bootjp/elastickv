@@ -497,11 +497,11 @@ func hasLegacyKVFSMSnapshotHeader(br *bufio.Reader) (bool, error) {
 }
 
 func hasHeaderlessLegacyKVFSMSnapshotPayload(br *bufio.Reader) (bool, error) {
-	peeked, err := br.Peek(tsoSnapshotV4Len + 1)
+	peeked, err := br.Peek(len(hlcSnapshotMagic))
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return false, errors.Wrap(err, "tso fsm snapshot: peek headerless legacy payload")
 	}
-	return len(peeked) > tsoSnapshotV4Len, nil
+	return isLegacyKVFSMStoreSnapshot(peeked), nil
 }
 
 func isLegacyKVFSMStoreSnapshot(peeked []byte) bool {

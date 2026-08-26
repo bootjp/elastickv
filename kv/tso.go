@@ -104,9 +104,12 @@ type AppliedReadTimestampVoucherRef struct {
 
 // ReadTimestamp is the adapter-side result of beginning a transaction snapshot.
 // When it represents an applied pre-Phase-D watermark, it also carries a
-// process-local capability that can reserve exactly one coordinator voucher per
-// DispatchWithReadTimestamp call. The capability cannot be constructed outside
-// this package because both the timestamp and voucher state are private.
+// process-local capability. The ReadTimestamp is intentionally reusable by
+// adapter helpers that perform several writes against the same audited read
+// boundary: each DispatchWithReadTimestamp call mints a distinct one-use
+// coordinator voucher, and unused prepared vouchers are revoked after that
+// dispatch attempt. The capability cannot be constructed outside this package
+// because both the timestamp and voucher state are private.
 type ReadTimestamp struct {
 	timestamp uint64
 	voucher   *appliedReadDispatchVoucher
@@ -126,9 +129,7 @@ func (t ReadTimestamp) voucherRef() (AppliedReadTimestampVoucherRef, bool) {
 var nextAppliedReadDispatchVoucherID atomic.Uint64
 
 type appliedReadDispatchVoucher struct {
-	mu       sync.Mutex
-	prepared uint64
-	ref      AppliedReadTimestampVoucherRef
+	ref AppliedReadTimestampVoucherRef
 }
 
 type appliedReadDispatchVoucherContextKey struct{}
@@ -151,10 +152,11 @@ func appliedReadTimestampVoucherRefFromContext(ctx context.Context, timestamp ui
 	return readTimestamp.voucherRef()
 }
 
-// DispatchWithReadTimestamp dispatches an OCC operation under the applied-read
-// capability bound by ReadTimestamp.WithDispatchVoucher. Each dispatch reserves
-// one token tied to that bound capability immediately before dispatching, so a
-// same-valued StartTS from another request cannot consume it.
+// DispatchWithReadTimestamp dispatches an OCC operation under the reusable
+// applied-read capability bound by ReadTimestamp.WithDispatchVoucher. Each call
+// reserves one distinct token tied to that bound capability immediately before
+// dispatching, so a same-valued StartTS from another request cannot consume it
+// and overlapping dispatches cannot revoke each other's authorization.
 func DispatchWithReadTimestamp(
 	ctx context.Context,
 	coord Coordinator,
@@ -191,8 +193,6 @@ func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
 }
 
 func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (ReadTimestamp, func(), error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	voucher, ok := coord.(AppliedReadTimestampVoucher)
 	if !ok {
 		return ReadTimestamp{}, nil, errors.WithStack(ErrTSOProtocolUnsupported)
@@ -201,7 +201,6 @@ func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64
 	if err := voucher.VouchAppliedReadTimestamp(timestamp, preparedVoucher.ref); err != nil {
 		return ReadTimestamp{}, nil, errors.WithStack(err)
 	}
-	v.prepared++
 	revoke := func() {}
 	if revoker, ok := coord.(AppliedReadTimestampVoucherRevoker); ok {
 		ref := preparedVoucher.ref

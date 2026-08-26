@@ -63,7 +63,7 @@ Implemented:
     unwired and return `FailedPrecondition`. During upgrade replay, valid
     encryption control entries committed by the earlier compatibility FSM are
     decoded and deterministically rejected without halting the TSO apply loop;
-   malformed control entries still halt fail-closed.
+    malformed control entries still halt fail-closed.
 11. `RaftTSOAllocator` verifies group-0 leadership and commits every returned
     window's inclusive end before exposing it. On the first request of every
     leader term it obtains a strict, leader-fenced maximum `LastCommitTS` from
