@@ -140,6 +140,14 @@ func (c keyVizLabeledCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, r
 	}
 }
 
+func (c keyVizLabeledCoordinator) SupportsAppliedReadTimestampVoucher() bool {
+	if support, ok := c.inner.(AppliedReadTimestampVoucherSupport); ok {
+		return support.SupportsAppliedReadTimestampVoucher()
+	}
+	_, ok := c.inner.(AppliedReadTimestampVoucher)
+	return ok
+}
+
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
 		idx, err := lr.LeaseRead(ctx)

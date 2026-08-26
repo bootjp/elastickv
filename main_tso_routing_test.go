@@ -183,7 +183,7 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	require.IsType(t, startupGatedCoordinator{}, got)
 	_, err := got.Next(context.Background())
 	require.Error(t, err)
-	require.Len(t, internalTimestampOptions(gated), 1)
+	require.Len(t, internalTimestampOptions(gated), 2)
 
 	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
 	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
@@ -194,10 +194,30 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	configured, ok := kv.ConfiguredTimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
 	require.Same(t, runtimeAllocator, configured)
-	require.Len(t, internalTimestampOptions(runtimeGated), 1)
+	require.Len(t, internalTimestampOptions(runtimeGated), 2)
 
 	legacy := startupGatedCoordinator{inner: newMainTSOCoordinator(kv.NewHLC(), nil)}
-	require.Empty(t, internalTimestampOptions(legacy))
+	require.Len(t, internalTimestampOptions(legacy), 1)
+}
+
+func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *testing.T) {
+	t.Parallel()
+	allocator := &mainTimestampAllocator{next: 123}
+	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
+	observing := &mainForwardObservingCoordinator{ShardedCoordinator: inner}
+	gated := startupGatedCoordinator{inner: observing}
+	opts := internalTimestampOptions(gated)
+	require.Len(t, opts, 2)
+
+	txn := &mainForwardTxn{}
+	internal := adapter.NewInternalWithEngine(txn, &mainTSOEngine{state: raftengine.StateLeader}, nil, nil, opts...)
+	reqs := []*pb.Request{{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+	resp, err := internal.Forward(context.Background(), &pb.ForwardRequest{Requests: reqs})
+	require.NoError(t, err)
+	require.True(t, resp.GetSuccess())
+	require.Equal(t, uint64(1), observing.observed.Load())
 }
 
 func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
@@ -223,7 +243,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 
 	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
 	opts := internalTimestampOptions(gated)
-	require.Len(t, opts, 1)
+	require.Len(t, opts, 2)
 
 	txn := &mainForwardTxn{}
 	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)
@@ -341,6 +361,17 @@ func (a *mainTimestampAllocator) Next(context.Context) (uint64, error) {
 
 type mainForwardTxn struct {
 	requests []*pb.Request
+}
+
+type mainForwardObservingCoordinator struct {
+	*kv.ShardedCoordinator
+	observed atomic.Uint64
+}
+
+func (c *mainForwardObservingCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	for range reqs {
+		c.observed.Add(1)
+	}
 }
 
 func (t *mainForwardTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {

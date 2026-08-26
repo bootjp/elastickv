@@ -2427,6 +2427,8 @@ func (s *ShardStore) authoritativeGroupLastCommitTS(ctx context.Context, groupID
 	if isLeaderEngine(engine) {
 		if ts, err := s.GroupCommittedTimestampFloor(ctx, groupID); err == nil {
 			return ts, nil
+		} else if isLeaderEngine(engine) {
+			return 0, errors.Wrapf(err, "tso commit floor: group %d local leader fence", groupID)
 		}
 		// Leadership may have changed between State and ReadIndex. Resolve the
 		// newly published leader below instead of trusting the local watermark.

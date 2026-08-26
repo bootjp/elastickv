@@ -90,6 +90,12 @@ type AppliedReadTimestampVoucherRevoker interface {
 	RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef)
 }
 
+// AppliedReadTimestampVoucherSupport lets coordinator decorators expose whether
+// the inner coordinator can actually consume prepared vouchers.
+type AppliedReadTimestampVoucherSupport interface {
+	SupportsAppliedReadTimestampVoucher() bool
+}
+
 // AppliedReadTimestampVoucherRef is an opaque process-local dispatch
 // capability. Only this package can mint a non-zero ref.
 type AppliedReadTimestampVoucherRef struct {
@@ -405,10 +411,18 @@ func validateAppliedReadTimestamp(
 	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return false, errors.Wrap(err, label)
 	}
-	if _, ok := coord.(AppliedReadTimestampVoucher); !ok {
+	if !supportsAppliedReadTimestampVoucher(coord) {
 		return false, errors.Wrap(ErrTSOProtocolUnsupported, label+": applied read voucher unavailable")
 	}
 	return true, nil
+}
+
+func supportsAppliedReadTimestampVoucher(coord Coordinator) bool {
+	if support, ok := coord.(AppliedReadTimestampVoucherSupport); ok {
+		return support.SupportsAppliedReadTimestampVoucher()
+	}
+	_, ok := coord.(AppliedReadTimestampVoucher)
+	return ok
 }
 
 func phaseDTimestampValidator(alloc TimestampAllocator) (DurableTimestampValidator, TSOPhaseDState, bool, error) {

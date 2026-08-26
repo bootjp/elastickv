@@ -406,6 +406,20 @@ func TestBeginReadTimestampThroughFindsAllocatorBehindKeyVizDecorator(t *testing
 	require.Equal(t, uint64(1), alloc.validateCalls.Load())
 }
 
+func TestBeginReadTimestampThroughRejectsDecoratorWithoutInnerVoucher(t *testing.T) {
+	alloc := &phaseDTestAllocator{
+		next:           testTSOInitialBase,
+		phaseDActive:   true,
+		phaseDRequired: true,
+		validateErr:    ErrTSOTimestampPrePhaseD,
+	}
+	coord := WithKeyVizLabel(&noVoucherTSOCoordinator{alloc: alloc, clock: NewHLC()}, keyviz.LabelRedis)
+
+	_, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test decorated read timestamp")
+	require.ErrorIs(t, err, ErrTSOProtocolUnsupported)
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
 func TestKeyVizLabeledCoordinatorRecoversExpiredHLCCeiling(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()
@@ -683,6 +697,33 @@ type fakeTSOCoordinator struct {
 	recoverCalls    atomic.Uint64
 	recoverHLCLease func(context.Context) error
 }
+
+type noVoucherTSOCoordinator struct {
+	alloc TimestampAllocator
+	clock *HLC
+}
+
+func (c *noVoucherTSOCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
+	return nil, errors.New("dispatch not implemented")
+}
+
+func (c *noVoucherTSOCoordinator) IsLeader() bool { return true }
+
+func (c *noVoucherTSOCoordinator) VerifyLeader(context.Context) error { return nil }
+
+func (c *noVoucherTSOCoordinator) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
+
+func (c *noVoucherTSOCoordinator) RaftLeader() string { return "" }
+
+func (c *noVoucherTSOCoordinator) IsLeaderForKey([]byte) bool { return true }
+
+func (c *noVoucherTSOCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
+
+func (c *noVoucherTSOCoordinator) RaftLeaderForKey([]byte) string { return "" }
+
+func (c *noVoucherTSOCoordinator) Clock() *HLC { return c.clock }
+
+func (c *noVoucherTSOCoordinator) TimestampAllocator() TimestampAllocator { return c.alloc }
 
 func (f *fakeTSOCoordinator) IsLeader() bool {
 	return f.leader.Load()

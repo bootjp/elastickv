@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,15 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func testPhysicalHLC(t *testing.T, physical int64, logical uint64) uint64 {
+	t.Helper()
+	require.GreaterOrEqual(t, physical, int64(0))
+	require.LessOrEqual(t, logical, hlcLogicalMask)
+	physicalUint, err := strconv.ParseUint(strconv.FormatInt(physical, 10), 10, 64)
+	require.NoError(t, err)
+	return (physicalUint << hlcLogicalBits) | logical
+}
 
 func TestRaftTSOAllocatorCommitsWindowEndBeforeReturning(t *testing.T) {
 	clock := NewHLC()
@@ -898,7 +908,7 @@ func TestRaftTSOAllocatorRejectsMinimumBeyondCeilingWithoutStallingIssuance(t *t
 	require.NoError(t, err)
 
 	// Well past the committed ceiling.
-	beyond := uint64(ceilingMs+3_600_000) << hlcLogicalBits //nolint:gosec // future test HLC.
+	beyond := testPhysicalHLC(t, ceilingMs+3_600_000, 0)
 
 	_, err = alloc.NextAfter(context.Background(), beyond)
 	require.Error(t, err)
@@ -930,7 +940,7 @@ func TestRaftTSOAllocatorRejectsMinimumWindowRolloverAtCeilingWithoutStallingIss
 	// Physical time equals the ceiling, but the logical half is exhausted.
 	// The next allocation would roll into ceiling+1 and must be rejected
 	// before Observe can publish this minimum into the HLC.
-	minimum := (uint64(ceilingMs) << hlcLogicalBits) | hlcLogicalMask //nolint:gosec // future test HLC.
+	minimum := testPhysicalHLC(t, ceilingMs, hlcLogicalMask)
 	_, err = alloc.NextAfter(context.Background(), minimum)
 	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
 	require.NotErrorIs(t, err, ErrCeilingExpired)

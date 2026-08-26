@@ -536,6 +536,8 @@ func (c *ShardedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref Ap
 	c.appliedReadVouchers[key] = uses - 1
 }
 
+func (c *ShardedCoordinator) SupportsAppliedReadTimestampVoucher() bool { return true }
+
 func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
 	if c == nil {
 		return false

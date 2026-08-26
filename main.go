@@ -2569,6 +2569,7 @@ var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucher = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucherRevoker = (*startupGatedCoordinator)(nil)
+var _ kv.AppliedReadTimestampVoucherSupport = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2700,6 +2701,20 @@ func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref
 func (c startupGatedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref kv.AppliedReadTimestampVoucherRef) {
 	if revoker, ok := c.inner.(kv.AppliedReadTimestampVoucherRevoker); ok {
 		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+	}
+}
+
+func (c startupGatedCoordinator) SupportsAppliedReadTimestampVoucher() bool {
+	if support, ok := c.inner.(kv.AppliedReadTimestampVoucherSupport); ok {
+		return support.SupportsAppliedReadTimestampVoucher()
+	}
+	_, ok := c.inner.(kv.AppliedReadTimestampVoucher)
+	return ok
+}
+
+func (c startupGatedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	if observer, ok := c.inner.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
+		observer.ObserveForwardedRequests(reqs)
 	}
 }
 

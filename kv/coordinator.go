@@ -285,6 +285,7 @@ type Coordinate struct {
 var _ Coordinator = (*Coordinate)(nil)
 var _ AppliedReadTimestampVoucher = (*Coordinate)(nil)
 var _ AppliedReadTimestampVoucherRevoker = (*Coordinate)(nil)
+var _ AppliedReadTimestampVoucherSupport = (*Coordinate)(nil)
 
 // VouchAppliedReadTimestamp is a no-op for the single-group coordinator. The
 // sharded coordinator consumes vouchers before cross-group StartTS validation.
@@ -294,6 +295,8 @@ func (c *Coordinate) VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVouch
 
 // RevokeAppliedReadTimestamp is a no-op for the single-group coordinator.
 func (c *Coordinate) RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) {}
+
+func (c *Coordinate) SupportsAppliedReadTimestampVoucher() bool { return true }
 
 type samplerRouteResolveFunc func(key []byte) (uint64, bool)
 
