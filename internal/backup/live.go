@@ -355,10 +355,22 @@ func liveScopeCounterNeedsValue(key []byte) bool {
 		return true
 	case hasAnyBackupPrefix(key, SQSQueueMetaPrefix, SQSQueueGenPrefix):
 		return true
+	case redisLiveScopeCounterNeedsValue(key):
+		return true
 	default:
-		adapter, ok := AdapterForKey(key)
-		return ok && adapter == adapterRedis
+		return false
 	}
+}
+
+func redisLiveScopeCounterNeedsValue(key []byte) bool {
+	return hasAnyBackupPrefix(key,
+		RedisTTLPrefix,
+		RedisHashMetaPrefix,
+		ListMetaPrefix,
+		RedisSetMetaPrefix,
+		RedisZSetMetaPrefix,
+		RedisStreamMetaPrefix,
+	)
 }
 
 func finalizedScopeCounts(d *dispatcher, streamed map[Scope]uint64) map[Scope]uint64 {

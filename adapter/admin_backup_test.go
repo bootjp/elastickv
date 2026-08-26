@@ -501,6 +501,79 @@ func TestBeginBackupExpectedKeysAvoidMaterializingBlobValues(t *testing.T) {
 	require.Equal(t, [][]byte{bucketKey, manifestKey}, store.valueKeys)
 }
 
+func TestBeginBackupExpectedKeysAvoidMaterializingRedisPayloadValues(t *testing.T) {
+	t.Parallel()
+	stringKey := redisStrKey([]byte("str"))
+	hllKey := redisHLLKey([]byte("hll"))
+	ttlKey := redisTTLKey([]byte("str"))
+	hashMetaKey := kvstore.HashMetaKey([]byte("hash"))
+	hashFieldKey := kvstore.HashFieldKey([]byte("hash"), []byte("field"))
+	listMetaKey := kvstore.ListMetaKey([]byte("list"))
+	listItemKey := kvstore.ListItemKey([]byte("list"), 1)
+	setMetaKey := kvstore.SetMetaKey([]byte("set"))
+	setMemberKey := kvstore.SetMemberKey([]byte("set"), []byte("member"))
+	zsetLegacyKey := redisZSetKey([]byte("zset"))
+	zsetMetaKey := kvstore.ZSetMetaKey([]byte("zset"))
+	zsetMemberKey := kvstore.ZSetMemberKey([]byte("zset"), []byte("member"))
+	streamMetaKey := kvstore.StreamMetaKey([]byte("stream"))
+	streamEntryKey := kvstore.StreamEntryKey([]byte("stream"), 1, 0)
+	listMeta, err := kvstore.MarshalListMeta(kvstore.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	streamMeta, err := kvstore.MarshalStreamMeta(kvstore.StreamMeta{Length: 1, LastMs: 1})
+	require.NoError(t, err)
+	store := &backupTestStore{
+		keys: [][]byte{
+			stringKey,
+			hllKey,
+			ttlKey,
+			hashMetaKey,
+			hashFieldKey,
+			listMetaKey,
+			listItemKey,
+			setMetaKey,
+			setMemberKey,
+			zsetLegacyKey,
+			zsetMetaKey,
+			zsetMemberKey,
+			streamMetaKey,
+			streamEntryKey,
+		},
+		values: map[string][]byte{
+			string(stringKey):      bytes.Repeat([]byte("s"), 1<<20),
+			string(hllKey):         bytes.Repeat([]byte("h"), 1<<20),
+			string(ttlKey):         encodeRedisTTL(time.Now().Add(time.Hour)),
+			string(hashMetaKey):    kvstore.MarshalHashMeta(kvstore.HashMeta{Len: 1}),
+			string(hashFieldKey):   bytes.Repeat([]byte("f"), 1<<20),
+			string(listMetaKey):    listMeta,
+			string(listItemKey):    bytes.Repeat([]byte("l"), 1<<20),
+			string(setMetaKey):     kvstore.MarshalSetMeta(kvstore.SetMeta{Len: 1}),
+			string(zsetLegacyKey):  bytes.Repeat([]byte("z"), 1<<20),
+			string(zsetMetaKey):    kvstore.MarshalZSetMeta(kvstore.ZSetMeta{Len: 1}),
+			string(zsetMemberKey):  kvstore.MarshalZSetScore(1),
+			string(streamMetaKey):  streamMeta,
+			string(streamEntryKey): bytes.Repeat([]byte("x"), 1<<20),
+		},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+	require.Len(t, begin.GetExpectedKeys(), 1)
+	require.Equal(t, "redis", begin.GetExpectedKeys()[0].GetAdapter())
+	require.Equal(t, "db_0", begin.GetExpectedKeys()[0].GetScope())
+	require.EqualValues(t, 13, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{
+		ttlKey,
+		hashMetaKey,
+		listMetaKey,
+		setMetaKey,
+		zsetMetaKey,
+		streamMetaKey,
+	}, store.valueKeys)
+}
+
 func TestBeginBackupBaselineSkipsUnselectedAdapterValues(t *testing.T) {
 	t.Parallel()
 	schemaKey := logicalbackup.EncodeDDBTableMetaKey("orders")

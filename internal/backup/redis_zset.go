@@ -182,6 +182,12 @@ func (r *RedisDB) HandleZSetMember(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetKey, "member key: %q", key)
 	}
+	if r.countOnly {
+		st := r.zsetState(userKey)
+		r.markZSetWide(st)
+		st.members[string(member)] = 0
+		return nil
+	}
 	if len(value) != redisZSetScoreSize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetMember,
 			"length %d != %d", len(value), redisZSetScoreSize)
@@ -273,6 +279,13 @@ func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 	userKey, ok := parseZSetLegacyBlobKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob, "key: %q", key)
+	}
+	if r.countOnly {
+		st := r.zsetState(userKey)
+		if !st.sawWide {
+			st.legacySeen = true
+		}
+		return nil
 	}
 	entries, err := decodeZSetLegacyBlobValue(value)
 	if err != nil {

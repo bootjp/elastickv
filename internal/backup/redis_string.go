@@ -390,6 +390,10 @@ func (r *RedisDB) WithWarnSink(fn func(event string, fields ...any)) *RedisDB {
 // the TTL — if any — to strings_ttl.jsonl.
 func (r *RedisDB) HandleString(userKey, value []byte) error {
 	r.kindByKey[string(userKey)] = redisKindString
+	if r.countOnly {
+		r.simpleRecordCount++
+		return nil
+	}
 	newFormat := isNewRedisStrFormat(value)
 	userValue, expireAtMs, err := decodeRedisStringValue(value)
 	if err != nil {
@@ -416,6 +420,10 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 // any embedded TTL written to hll_ttl.jsonl.
 func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	r.kindByKey[string(userKey)] = redisKindHLL
+	if r.countOnly {
+		r.simpleRecordCount++
+		return nil
+	}
 	newFormat := isNewRedisHLLFormat(value)
 	sketch, expireAtMs, err := decodeRedisHLLValue(value)
 	if err != nil {

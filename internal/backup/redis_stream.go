@@ -154,6 +154,11 @@ func (r *RedisDB) HandleStreamEntry(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamKey, "entry key: %q", key)
 	}
+	if r.countOnly {
+		st := r.streamState(userKey)
+		st.entries = append(st.entries, redisStreamEntry{ms: ms, seq: seq})
+		return nil
+	}
 	fields, err := decodeStreamEntryValue(value)
 	if err != nil {
 		return err
