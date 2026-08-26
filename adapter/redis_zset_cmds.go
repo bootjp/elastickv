@@ -1220,10 +1220,11 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 }
 
 // bzpopminWideScoreCandidateAt probes the score index and reports whether that
-// probe is authoritative for BZPOPMIN. A visible zset meta row or any visible
-// meta delta means the wide-column score index owns the ordering, except for
-// same-score ties where Pebble's MVCC suffix can sort prefix-related members
-// after longer members.
+// probe is authoritative for BZPOPMIN. A visible base zset meta row means the
+// wide-column score index owns the ordering, except for same-score ties where
+// Pebble's MVCC suffix can sort prefix-related members after longer members.
+// Delta-only metadata is not enough: older member-only wide zsets can acquire
+// a metadata delta plus a partial score index through a later ZADD.
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
 	meta, err := r.bzpopminMetaProbeAt(ctx, key, readTS)
 	if err != nil {
@@ -1237,28 +1238,44 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	}
 	candidate, scoreTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
 	if candidate != nil {
-		scoreIndexAuthoritative := meta.exists || meta.truncated
+		scoreIndexAuthoritative := meta.baseExists || meta.truncated
 		candidate.isLast = scoreIndexAuthoritative && !meta.truncated && meta.len == 1
 		return candidate, scoreIndexAuthoritative && !scoreTie, nil
 	}
-	return nil, meta.exists && !meta.truncated && meta.len == 0, nil
+	return nil, meta.baseExists && !meta.truncated && meta.len == 0, nil
 }
 
 type bzpopminMetaProbe struct {
-	len       int64
-	exists    bool
-	truncated bool
+	len        int64
+	baseExists bool
+	truncated  bool
 }
 
 func (r *RedisServer) bzpopminMetaProbeAt(ctx context.Context, key []byte, readTS uint64) (bzpopminMetaProbe, error) {
 	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
-	if err == nil {
-		return bzpopminMetaProbe{len: metaLen, exists: metaExists}, nil
-	}
-	if !errors.Is(err, ErrDeltaScanTruncated) {
+	if err != nil && !errors.Is(err, ErrDeltaScanTruncated) {
 		return bzpopminMetaProbe{}, err
 	}
-	return bzpopminMetaProbe{truncated: true}, nil
+	baseExists, baseErr := r.zsetBaseMetaExistsAt(ctx, key, readTS)
+	if baseErr != nil {
+		return bzpopminMetaProbe{}, baseErr
+	}
+	return bzpopminMetaProbe{
+		len:        metaLen,
+		baseExists: metaExists && baseExists,
+		truncated:  errors.Is(err, ErrDeltaScanTruncated),
+	}, nil
+}
+
+func (r *RedisServer) zsetBaseMetaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	_, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	return true, nil
 }
 
 func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpopminCandidate, bool) {

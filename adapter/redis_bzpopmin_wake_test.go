@@ -120,6 +120,35 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
+			name: "mixed partial score index with metadata delta uses lower member row",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetMemberRowsOnlyForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "low-unindexed", Score: 1},
+					{Member: "high-indexed", Score: 5},
+				})
+				ctx := context.Background()
+				require.NoError(t, st.PutAt(
+					ctx,
+					store.ZSetScoreKey(key, 5, []byte("high-indexed")),
+					[]byte{},
+					readTS,
+					0,
+				))
+				require.NoError(t, st.PutAt(
+					ctx,
+					store.ZSetMetaDeltaKey(key, readTS, 0),
+					store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+					readTS,
+					0,
+				))
+			},
+			wantMember: "low-unindexed",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
+		},
+		{
 			name: "mixed partial score index keeps indexed candidate non-last",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				seedZSetMemberRowsOnlyForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{

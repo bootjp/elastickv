@@ -502,6 +502,12 @@ func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
 	require.Less(t, uint64(hlcPhysicalWindowMs), defaultTxnLockTTLms)
 }
 
+func TestHLCLeaseRenewalCadencePreservesLogicalCapacity(t *testing.T) {
+	t.Parallel()
+	require.LessOrEqual(t, hlcRenewalInterval, time.Second,
+		"each renewal exposes one 16-bit logical window; a longer cadence lowers timestamp allocation capacity")
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeers(t *testing.T) {
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)

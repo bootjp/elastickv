@@ -49,7 +49,7 @@ const hlcPhysicalWindowMs int64 = 20_000
 // hlcRenewalInterval controls how often the leader proposes a new ceiling.
 // Keep the renewal interval and proposal timeout below the physical window;
 // this provides timing margin but cannot prevent expiry after repeated failures.
-const hlcRenewalInterval = 2 * time.Second
+const hlcRenewalInterval = time.Second
 
 // hlcRenewalProposalTimeout bounds a single HLC lease-renewal proposal. This is
 // intentionally longer than hlcRenewalInterval: under write-heavy Redis proxy
