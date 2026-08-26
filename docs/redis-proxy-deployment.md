@@ -426,7 +426,7 @@ groups:
 | Read timeout | Redis: 3s, ElasticKV: 3s | Default backend read timeout. Async secondary replays override the per-call read timeout with the remaining queue deadline; blocking commands add a 10s read grace to their requested wait |
 | Write timeout | 3s | Backend write timeout |
 | Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
-| Async blocking replay concurrency cap | 64 | Command-derived maximum for mutating blocking-command replays after normal writes reserve pool capacity |
+| Async blocking replay concurrency cap | 32 | Command-derived maximum for mutating blocking-command replays after normal writes reserve pool capacity |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |
 | PubSub compare window | 2s | Message matching window |
 | PubSub sweep interval | 500ms | Expired message scan interval |

@@ -71,7 +71,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
 		},
 		{
-			name: "score tie uses score index member ordering",
+			name: "score tie falls back to member ordering",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
 					{Member: "aa", Score: 1},
@@ -82,7 +82,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
 		},
 		{
 			name: "single score entry",
@@ -212,6 +212,40 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[1].start)
 		})
 	}
+}
+
+func TestRedis_BZPopMinCandidateSelectionPebbleTieOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	readTS := uint64(10)
+	key := []byte("zset-bzpopmin-pebble-tie")
+	base, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, base.Close())
+	})
+	seedZSetScoreRowsForTest(t, base, key, readTS, []redisZSetEntry{
+		{Member: "aa", Score: 1},
+		{Member: "ab", Score: 1},
+		{Member: "a", Score: 1},
+		{Member: "b", Score: 2},
+	})
+	rec := &bzpopminRecordingStore{MVCCStore: base}
+	server := &RedisServer{store: rec}
+
+	candidate, err := server.bzpopminCandidateAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.NotNil(t, candidate)
+	require.Equal(t, "a", candidate.entry.Member)
+	require.InDelta(t, 1.0, candidate.entry.Score, 1e-9)
+	require.True(t, candidate.isWide)
+	require.False(t, candidate.isLast)
+	require.Len(t, rec.scans, 4)
+	require.Equal(t, store.ZSetMetaDeltaScanPrefix(key), rec.scans[0].start)
+	require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[1].start)
+	require.Equal(t, store.ZSetMemberScanPrefix(key), rec.scans[2].start)
+	require.Equal(t, store.ZSetMemberScanPrefix(key), rec.scans[3].start)
+	require.Equal(t, maxWideScanLimit, rec.scans[3].limit)
 }
 
 func seedZSetMemberRowsForBZPopMinTest(

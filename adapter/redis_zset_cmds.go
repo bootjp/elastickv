@@ -1221,17 +1221,13 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 
 // bzpopminWideScoreCandidateAt probes the score index and reports whether that
 // probe is authoritative for BZPOPMIN. A visible zset meta row or any visible
-// meta delta means the wide-column score index owns the ordering, so the first
-// score key is final without loading all member rows.
+// meta delta means the wide-column score index owns the ordering, except for
+// same-score ties where Pebble's MVCC suffix can sort prefix-related members
+// after longer members.
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
-	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
-	metaTruncated := false
+	meta, err := r.bzpopminMetaProbeAt(ctx, key, readTS)
 	if err != nil {
-		if !errors.Is(err, ErrDeltaScanTruncated) {
-			return nil, false, err
-		}
-		metaTruncated = true
-		metaLen = 0
+		return nil, false, err
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
@@ -1239,27 +1235,50 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
-	candidate := bzpopminScoreCandidateFromKVs(key, scoreKVs)
+	candidate, scoreTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
 	if candidate != nil {
-		scoreIndexAuthoritative := metaExists || metaTruncated
-		candidate.isLast = scoreIndexAuthoritative && !metaTruncated && metaLen == 1
-		return candidate, scoreIndexAuthoritative, nil
+		scoreIndexAuthoritative := meta.exists || meta.truncated
+		candidate.isLast = scoreIndexAuthoritative && !meta.truncated && meta.len == 1
+		return candidate, scoreIndexAuthoritative && !scoreTie, nil
 	}
-	return nil, metaExists && !metaTruncated && metaLen == 0, nil
+	return nil, meta.exists && !meta.truncated && meta.len == 0, nil
 }
 
-func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) *bzpopminCandidate {
+type bzpopminMetaProbe struct {
+	len       int64
+	exists    bool
+	truncated bool
+}
+
+func (r *RedisServer) bzpopminMetaProbeAt(ctx context.Context, key []byte, readTS uint64) (bzpopminMetaProbe, error) {
+	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
+	if err == nil {
+		return bzpopminMetaProbe{len: metaLen, exists: metaExists}, nil
+	}
+	if !errors.Is(err, ErrDeltaScanTruncated) {
+		return bzpopminMetaProbe{}, err
+	}
+	return bzpopminMetaProbe{truncated: true}, nil
+}
+
+func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpopminCandidate, bool) {
+	var first *redisZSetEntry
 	for _, kv := range scoreKVs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
 		if !ok {
 			continue
 		}
-		return &bzpopminCandidate{
-			entry:  redisZSetEntry{Member: string(member), Score: score},
-			isWide: true,
+		entry := redisZSetEntry{Member: string(member), Score: score}
+		if first == nil {
+			first = &entry
+			continue
 		}
+		return &bzpopminCandidate{entry: *first, isWide: true}, first.Score == score
 	}
-	return nil
+	if first == nil {
+		return nil, false
+	}
+	return &bzpopminCandidate{entry: *first, isWide: true}, false
 }
 
 func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {

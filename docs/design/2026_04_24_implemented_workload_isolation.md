@@ -24,8 +24,9 @@ Implementation status:
   gated `EVAL`/`EVALSHA` path.
 - Shipped: Layer 3 per-peer Redis connection admission in
   `adapter/redis_peer_limiter.go`, wired through `RedisServer.Run` accept and
-  close hooks. Default cap is 128 per peer IP: 64 ElasticKV command-pool slots
-  plus 64 dedicated headroom for Pub/Sub and detached sockets. It is
+  close hooks. Default cap is 512 per peer IP: two proxy replicas at 192
+  ElasticKV command-pool slots each, plus 128 dedicated headroom for Pub/Sub
+  and detached sockets. It is
   configurable via `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
   `WithRedisPerPeerConnectionLimit`. The redis-proxy deployment can raise the
   cap explicitly on ElasticKV nodes before increasing the proxy's ElasticKV
