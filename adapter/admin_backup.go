@@ -217,6 +217,11 @@ type backupSession struct {
 	readTS    uint64
 	deadline  time.Time
 	selection backupBaselineSelection
+	// closing is set before EndBackup proposes its release entries. A renewal
+	// that commits after those releases would leave the pin active until its
+	// deadline, still blocking compaction and capacity for a backup that has
+	// already ended, so renewals are refused from that point on.
+	closing bool
 }
 
 type preparedBackup struct {
@@ -454,7 +459,7 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireUnexpiredBackupToken(tok); err != nil {
+	if err := s.requireRenewableBackupToken(tok); err != nil {
 		return nil, err
 	}
 	if _, err := s.backupRouteSnapshotForToken(tok); err != nil {
@@ -470,7 +475,7 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 		s.forgetBackupSession(tok.pinID)
 		return nil, status.Errorf(codes.Unavailable, "renew backup pin: %v", err)
 	}
-	if err := s.requireUnexpiredBackupToken(tok); err != nil {
+	if err := s.requireRenewableBackupToken(tok); err != nil {
 		s.compensateBackupRelease(groups[0], groups, tok.pinID)
 		s.forgetBackupSession(tok.pinID)
 		return nil, err
@@ -507,6 +512,10 @@ func (s *AdminServer) EndBackup(ctx context.Context, req *pb.EndBackupRequest) (
 	if err != nil {
 		return nil, err
 	}
+	// Refuse renewals before any release is proposed. Marking this only after
+	// the proposals left a window where an overlapping renewal could commit a
+	// fresh Pin behind the Release and keep the pin alive past EndBackup.
+	s.closeBackupSession(tok.pinID)
 	defer s.forgetBackupSession(tok.pinID)
 	groups, err := s.backupGroupsForToken(tok)
 	if err != nil {
@@ -1436,7 +1445,7 @@ func (s *AdminServer) extendBackupSession(tok backupToken) bool {
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
 	session, ok := s.backupSessions[tok.pinID]
-	if !ok || session.readTS != tok.readTS {
+	if !ok || session.closing || session.readTS != tok.readTS {
 		return false
 	}
 	if tok.deadline.After(session.deadline) {
@@ -1444,6 +1453,48 @@ func (s *AdminServer) extendBackupSession(tok backupToken) bool {
 		s.backupSessions[tok.pinID] = session
 	}
 	return true
+}
+
+// closeBackupSession marks a session as releasing so no renewal can extend the
+// pin from here on. EndBackup calls it before proposing its release entries:
+// leaving the session live across those proposals let an overlapping renewal
+// commit a fresh Pin after the Release, and EndBackup then forgot the session
+// without issuing another release.
+func (s *AdminServer) closeBackupSession(pinID kv.BackupPinID) {
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	session, ok := s.backupSessions[pinID]
+	if !ok {
+		return
+	}
+	session.closing = true
+	s.backupSessions[pinID] = session
+}
+
+// requireRenewableBackupToken gates RenewBackup.
+//
+// It refuses a pin that EndBackup has started releasing, and it accepts a token
+// whose own deadline has passed when the live session for the same pin is still
+// within its later deadline. That second case is the lost-response retry: a
+// renewal that committed but whose reply never arrived leaves the client
+// holding only the old token, and rejecting it would strand the backup without
+// a current token even though its pin is still live and still fencing
+// retention.
+func (s *AdminServer) requireRenewableBackupToken(tok backupToken) error {
+	now := s.nowSnapshot()
+	s.backupStateMu.Lock()
+	session, ok := s.backupSessions[tok.pinID]
+	s.backupStateMu.Unlock()
+	if ok && session.closing {
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin is being released")
+	}
+	if !tok.deadline.IsZero() && now.Before(tok.deadline) {
+		return nil
+	}
+	if !ok || session.readTS != tok.readTS || !now.Before(session.deadline) {
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	}
+	return nil
 }
 
 func (s *AdminServer) forgetBackupSession(pinID kv.BackupPinID) {

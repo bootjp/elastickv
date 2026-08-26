@@ -426,3 +426,67 @@ func newBackupTestFSMWithGroup(t *testing.T, tracker *ActiveTimestampTracker, gr
 	require.True(t, ok)
 	return fsm
 }
+
+// The cold-start volatile-replay path classifies backup payloads as volatile so
+// a post-snapshot pin/release is reconstructed. That is only safe because a
+// backup entry the FSM cannot apply still returns a HaltApply response, which
+// the engine inspects before its duplicate early-return. These cases pin that
+// contract: classification stays true (the entry is delivered, not dropped),
+// and Apply reports a halt rather than a silent no-op.
+func TestBackupPayloadsHaltApplyWhenUnapplicable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		fsm     func(t *testing.T) *kvFSM
+		payload []byte
+	}{
+		{
+			name: "malformed backup payload",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				return newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+			},
+			payload: []byte{raftEncodeBackup, 0xff},
+		},
+		{
+			name: "unknown future backup subtype",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				return newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+			},
+			// 0x7f is not one of the pin/extend/release/reserve/unreserve subtypes.
+			payload: append([]byte{raftEncodeBackup, 0x7f}, make([]byte, backupPinIDBytes)...),
+		},
+		{
+			name: "backup entry with no tracker wired",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()).(*kvFSM)
+				require.True(t, ok)
+				return fsm
+			},
+			payload: EncodeBackupPinEntry(BackupPinEntry{
+				PinID:    backupTrackerTestPinID(9),
+				ReadTS:   42,
+				Deadline: time.Now().Add(time.Hour),
+			}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fsm := tt.fsm(t)
+
+			require.True(t, fsm.IsVolatileOnlyPayload(tt.payload),
+				"the entry must still be delivered to Apply, not dropped as a duplicate")
+
+			resp := fsm.Apply(tt.payload)
+			halter, ok := resp.(interface{ HaltApply() error })
+			require.True(t, ok, "Apply must return a HaltApply response, got %T", resp)
+			require.Error(t, halter.HaltApply(),
+				"an unapplicable backup entry must halt the apply loop instead of advancing past it")
+		})
+	}
+}
