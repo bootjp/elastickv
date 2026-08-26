@@ -880,7 +880,7 @@ func TestStreamBackupFailsClosedWithoutPinnedRouteSnapshot(t *testing.T) {
 
 func TestListBackupScopesReportsScannerCloseError(t *testing.T) {
 	t.Parallel()
-	store := &backupTestStore{keys: [][]byte{[]byte(logicalbackup.RedisStringPrefix + "key")}}
+	store := &backupTestStore{keys: [][]byte{logicalbackup.EncodeDDBTableMetaKey("orders")}}
 	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
 	proposer := newBackupTestProposer()
 	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
