@@ -44,9 +44,23 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
+	return isReusableRedisTxnErr(err) || isRedisComposedRouteErr(err)
+}
+
+func isReusableRedisTxnErr(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
 		wireRedisTxnErrKind(err) == redisTxnWireErrLocked
+}
+
+func isRedisComposedRouteErr(err error) bool {
+	if errors.Is(err, kv.ErrComposed1Violation) ||
+		errors.Is(err, kv.ErrComposed1VersionGCd) {
+		return true
+	}
+	parsed := parseWireRedisTxnErr(err)
+	return errors.Is(parsed, kv.ErrComposed1Violation) ||
+		errors.Is(parsed, kv.ErrComposed1VersionGCd)
 }
 
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
@@ -66,13 +80,13 @@ const (
 
 // parseWireRedisTxnErr restores transaction error typing after an internal
 // leader redirect crosses gRPC. Forward currently returns transaction failures
-// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked chain.
-// Match only the exact server-generated key error envelope and normalize the
-// storage key before rebuilding the typed error. Wire write conflicts are not
-// generally retryable: a lost forwarding response can turn an already-applied
-// write into a later self-conflict. Reuse-aware callers explicitly normalize
-// them before retrying; all other callers return the normalized error without
-// replaying the operation or exposing the internal key layout.
+// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked /
+// Composed-1 sentinel chain. Match only known server-generated envelopes.
+// Wire write conflicts are not generally retryable: a lost forwarding response
+// can turn an already-applied write into a later self-conflict. Reuse-aware
+// callers explicitly normalize them before retrying; all other callers return
+// the normalized error without replaying the operation or exposing the internal
+// key layout.
 func wireRedisTxnStatus(err error) (*status.Status, bool) {
 	type grpcStatusCarrier interface {
 		GRPCStatus() *status.Status
@@ -94,6 +108,31 @@ func parseWireRedisTxnErr(err error) error {
 		return nil
 	}
 	msg := st.Message()
+	if parsed := parseWireRedisTxnKeyErr(msg); parsed != nil {
+		return parsed
+	}
+	if isWireComposedRouteMessage(msg, kv.ErrComposed1Violation) {
+		return errors.WithStack(kv.ErrComposed1Violation)
+	}
+	if isWireComposedRouteMessage(msg, kv.ErrComposed1VersionGCd) {
+		return errors.WithStack(kv.ErrComposed1VersionGCd)
+	}
+	return nil
+}
+
+func isWireComposedRouteMessage(msg string, sentinel error) bool {
+	sentinelMsg := sentinel.Error()
+	if msg == sentinelMsg {
+		return true
+	}
+	if !strings.HasSuffix(msg, ": "+sentinelMsg) {
+		return false
+	}
+	return strings.HasPrefix(msg, "observed-version v=") ||
+		strings.HasPrefix(msg, "current-version v=")
+}
+
+func parseWireRedisTxnKeyErr(msg string) error {
 	if !strings.HasPrefix(msg, "key: ") {
 		return nil
 	}
@@ -274,14 +313,14 @@ func normalizeRetryableRedisTxnKey(key []byte) []byte {
 	if userKey := redisTxnWideFenceUserKey(key); userKey != nil {
 		return userKey
 	}
-	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
-		return store.ExtractListUserKey(key)
-	}
 	if store.IsListMetaDeltaKey(key) {
 		return store.ExtractListUserKeyFromDelta(key)
 	}
 	if store.IsListClaimKey(key) {
 		return store.ExtractListUserKeyFromClaim(key)
+	}
+	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
+		return store.ExtractListUserKey(key)
 	}
 	if wideKey, ok := normalizeWideColumnKey(key); ok {
 		return wideKey

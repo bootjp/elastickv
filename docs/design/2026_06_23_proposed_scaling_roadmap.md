@@ -63,14 +63,14 @@ again before merge or deployment.
 | Learner membership primitive | `2026_04_26_implemented_raft_learner.md` | PR #676 (`51907e6b`) merged the `AddLearner` / `PromoteLearner` engine, admin, protobuf, CLI, and persistence surfaces; PR #1002 merged the later status promotion and cleanup | Implemented on `main`; follower reads are separate |
 | Leader balance | `2026_06_11_implemented_leader_balance_scheduler.md` | PR #1012 merged | Implemented on `main`; data placement is separate |
 | Hotspot split M1 catalog and same-group split | `2026_02_18_implemented_hotspot_split_milestone1_pr.md` and `2026_02_18_partial_hotspot_shard_split.md` | The durable catalog, engine snapshots, split admin API, watcher, and M1 integration coverage landed as an earlier series; PR #999 (`a28afa25`, "Clean up hotspot split catalog path") is cleanup and status promotion only, not that implementation. The focused owner is the evidence of record — an auditor should start there, not from #999 | Implemented M1; parent design remains partial |
-| Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the lifecycle; PRs #1084, #1085, #1088, and #1090 open | In flight; not on `main` as a complete migration plane |
+| Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the durable `SplitJob` catalog and codec substrate; PRs #1084, #1085, #1088, and #1090 open | The catalog substrate is on `main`; `StartSplitMigration`, the migrator FSM, fencing, cutover, promotion, and cleanup remain in flight, so this is not a complete migration plane |
 | Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PRs #1097 and #1152 merged the detector core and the committed-window reader (`afec0597`, `distribution/autosplit/sampler_reader.go` plus the observe-only detector bridge); PR #1104 open | Partially implemented on `main`; M3-PR2b Top-K, the leadership watermark, and scheduler wiring remain open |
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
-| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, #1108, and #1150 merged (`0e85c822` added `kv/tso_fsm.go` with snapshot/restore of the physical ceiling); PR #1095 open | Group reservation, state-machine wiring, durable leader routing, and the ceiling state machine are on `main`; group-0 issuance and its operational exposure remain in flight |
+| Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, #1108, and #1150 merged the reservation, configuration scaffolding, and ceiling state machine (`0e85c822` added `kv/tso_fsm.go` with snapshot/restore of the physical ceiling); PR #1095 open | Group reservation/scaffolding and the ceiling FSM are on `main`; production group-0 issuance, TSO-leader redirect/routing, and operational exposure remain in flight |
 | Shared Pebble block cache | PR #1082 | PR #1082 merged | Implemented on `main`; cache sharing only, not all resource-pool work |
 | Raft gRPC streaming transport | `2026_04_18_implemented_raft_grpc_streaming_transport.md` | PR #1006 merged; PR #1048 merged the kill switch | Implemented on `main`; multi-group soak evidence landed with the design's §8 (`cmd/elastickv-raft-stream-soak`, `scripts/run-jepsen-raft-streaming-multigroup-soak.sh`, `docs/evidence/raft_streaming_multigroup_soak.json`) |
 | S3 Raft blob offload | `2026_04_25_partial_s3_raft_blob_offload.md` | PRs #1057 and #1063 merged the rollout scaffolding and blob fetch RPC; `77ea547d` merged the local offload decision, PUT/GET path, and peer replication/fetch; #1126 (`5eaaa05d`) merged follower repair and asynchronous backfill | Transport path is on `main`; the focused design names reference counting, GC readiness, and legacy migration as the remaining blockers |
-| Live logical backup | `2026_04_29_proposed_logical_backup.md` | PRs #1065 and #1059 merged the scan primitives and admin version API; PR #1056 open | In flight; distinct from physical SST snapshot offload |
+| Live logical backup | `2026_04_29_proposed_logical_backup.md` | PRs #1065 and #1059 merged scan primitives; PR #1056 and PR #1128 are open for the live pin, admin, and producer stack | In flight; distinct from physical SST snapshot offload |
 
 ## 4. 2026-06-12 requirement audit
 
@@ -105,16 +105,16 @@ placement or failover.
 | M2 shared block cache | Implemented on `main` | PR #1082 owned only process-wide cache sizing, lifetime, metrics, and tests |
 | M2 per-shard Pebble tuning and write admission | Partially addressed operationally, but the proposed per-shard contract is unowned | Write `*_proposed_pebble_resource_governor.md`; own tuning scope, node-wide fairness, stall thresholds, admission errors, and adapter retry semantics |
 | M3 sharded retention scheduling | Existing compaction is implemented; jitter, node budget, and hot-key dynamic retention are unimplemented and unowned | Write `*_proposed_sharded_mvcc_retention.md`; preserve the hard retention contract and active timestamp pins |
-| M4 physical disaster-recovery snapshot offload | Partially implemented on `main` | `2026_07_19_partial_physical_snapshot_object_offload.md` (PR #1131, `764db2d8`) owns the export/restore substrate and records M0/M1 implemented; that owner still owns the pending M2/M3 object publication and runtime work. Keep it distinct from logical backup and S3 user-payload blob offload |
+| M4 physical disaster-recovery snapshot offload | Partially implemented on `main` | `2026_07_19_partial_physical_snapshot_object_offload.md` (PR #1131, `764db2d8`) owns the export/restore substrate and records M0/M1 implemented; that owner still owns the pending leader-only scheduler, retention/GC readiness, and operational validation. Keep it distinct from logical backup and S3 user-payload blob offload |
 
 ### 4.4 Coordinator and API gateway
 
 | 2026-06-12 milestone | Disposition | Remaining ownership |
 |---|---|---|
 | M1 timestamp issuance decoupling | Partially implemented and in flight | `2026_04_16_partial_centralized_tso.md`, PR #998, and the #1064/#1095/#1103/#1108 stack own this work |
-| M2 follower and learner reads | Unimplemented and unowned | Write `*_proposed_follower_reads.md`; own leader-vouched read timestamps, apply watermarks, staleness/session contract, invalidation, routing, and Jepsen evidence |
-| M3 cross-shard 2PC completion | Partially implemented; no focused end-to-end owner | Write `*_proposed_cross_shard_transaction_completion.md`; start from the existing `ShardedCoordinator` 2PC and Composed-1 guard, then own unsupported router paths, read-only validation, recovery, and adapter coverage |
-| M4 resolver work delegation | Unimplemented and unowned | Write `*_proposed_lock_resolver_delegation.md`; own snapshot assignment, leader-vouched decisions, duplicate work, failover, admission, and Raft apply boundaries |
+| M2 follower and learner reads | Unimplemented and unowned | Write `*_proposed_follower_reads.md`; own leader-vouched read timestamps, apply watermarks, staleness/session contract, invalidation, routing, and Jepsen evidence. Multi-node groups and the learner primitive are already available; this row is not gated on dedicated TSO unless the focused design adds cross-shard or session-global timestamp semantics |
+| M3 cross-shard 2PC completion | Partially implemented; no focused end-to-end owner | Write `*_proposed_cross_shard_transaction_completion.md`; start from the existing `ShardedCoordinator` 2PC and Composed-1 guard, then own unsupported router paths, read-only validation, recovery, and adapter coverage. Gate completion on the dedicated timestamp invariant and globally comparable issuance path |
+| M4 resolver work delegation | Unimplemented and unowned | Write `*_proposed_lock_resolver_delegation.md`; own snapshot assignment, leader-vouched decisions, duplicate work, failover, admission, and Raft apply boundaries. It also needs a focused per-group HLC tick capability and preflight contract, such as `cap_per_group_hlc_v1`, before resolver work can move away from process-local ticking |
 | M5 leader-proxy circuit breaker | Implemented on `main` | `2026_07_19_implemented_leader_proxy_circuit_breaker.md` (PR #1132, `56e36e94`) owns the data-plane breaker in `kv/leader_proxy_breaker.go` plus retry budget, leader-identity reset, half-open behavior, and adapter error mapping |
 
 The admin package's existing `ErrLeaderUnavailable` mapping was never evidence
@@ -126,10 +126,10 @@ added `kv/leader_proxy_breaker.go` and its adapter error mapping.
 | Gap | Disposition | Required owner |
 |---|---|---|
 | Replica placement | Unimplemented and unowned | `*_proposed_replica_placement.md`; own creation and reshaping of Raft replica sets — which members a group has and where. Listed as its own row because both the region/range balance scheduler and auto group lifecycle name it as a prerequisite and nothing else owns it. Hotspot migration cannot substitute: it moves ownership to an already suitably placed group |
-| Region/range balance scheduler | Unimplemented and unowned | `*_proposed_region_balance_scheduler.md`; depend on the replica placement row above, multi-node bootstrap, and hotspot migration |
-| Range merge | Unimplemented and unowned | `*_proposed_range_merge.md`; split same-group and cross-group merge into reviewable milestones and define transaction drain/fencing |
+| Region/range balance scheduler | Unimplemented and unowned | `*_proposed_region_balance_scheduler.md`; depend on the replica placement row above, multi-node bootstrap, and the hotspot split M2 migration plane |
+| Range merge | Unimplemented and unowned | `*_proposed_range_merge.md`; split same-group and cross-group merge into reviewable milestones. Same-group merge can own local transaction drain/fencing first; cross-group merge additionally waits for the hotspot split M2 migration plane and the Composed-1 cross-group commit guard/drain protocol |
 | Streaming transport multi-group soak | Closed | `2026_04_18_implemented_raft_grpc_streaming_transport.md` §8 records the repeatable soak (`cmd/elastickv-raft-stream-soak` plus a fail-closed verifier over `docs/evidence/raft_streaming_multigroup_soak.json`); no protocol semantics changed |
-| Auto group lifecycle | Orchestration unimplemented and unowned; the join/replacement substrate is implemented | `2026_07_18_implemented_raft_fresh_learner_join.md` (PR #1118, `6d8ee633`) and `2026_07_18_implemented_fenced_raft_member_replacement.md` (PR #1122, `5d4c5cad`) already own single-group fresh learner joining and resumable fenced same-ID voter replacement, and both explicitly leave automatic decisions and multi-group joining open. Write `*_proposed_auto_group_lifecycle.md` for the automatic creation/orchestration and multi-group extensions only — do not restate the shipped join/replacement mechanics — and depend on placement, migration, and merge |
+| Auto group lifecycle | Orchestration unimplemented and unowned; the join/replacement substrate is implemented | `2026_07_18_implemented_raft_fresh_learner_join.md` (PR #1118, `6d8ee633`) and `2026_07_18_implemented_fenced_raft_member_replacement.md` (PR #1122, `5d4c5cad`) already own single-group fresh learner joining and resumable fenced same-ID voter replacement, and both explicitly leave automatic decisions and multi-group joining open. Write `*_proposed_auto_group_lifecycle.md` for the automatic creation/orchestration and multi-group extensions only — do not restate the shipped join/replacement mechanics — and depend on replica placement, the hotspot split M2 migration plane, and the range-merge milestones it chooses to automate |
 
 ## 6. Dependency order
 
@@ -143,42 +143,69 @@ invented dependencies the rows do not state.
 
 **Ready now — no unmet prerequisites, may proceed in parallel:**
 
-1. Finish the open hotspot split M2/M3, dedicated-TSO, and S3 offload stacks
-   without moving their mechanisms into this roadmap. The shared Pebble block
-   cache is no longer in this list: PR #1082 merged and §3 records it as
-   implemented on `main`.
-2. Indexed route engine (§4.1 M2) and batched catalog mutation (§4.1 M3), which
+1. Hotspot split M2 migration plane (§3): the open #1084/#1085/#1088/#1090
+   stack owns `StartSplitMigration`, the migrator FSM, fencing, cutover,
+   promotion, and cleanup. It is a root prerequisite for later cross-group range
+   movement, not implemented by this roadmap.
+2. Hotspot split M3 automation slices whose inputs are already on `main` (§3):
+   detector core and committed-window reader landed; the remaining Top-K,
+   leadership watermark, and scheduler wiring may proceed, while scheduler
+   actions that move data wait on the M2 migration plane.
+3. Dedicated TSO group-0 issuance, routing, and exposure (§3, §4.4 M1): proceed
+   as its own open stack. It gates cross-shard transaction completion but not
+   follower reads.
+4. Live logical backup pin, admin, and producer stack (§3): scan primitives are
+   on `main`; PR #1056 and PR #1128 own the remaining live stack.
+5. S3 Raft blob offload follow-ups (§3): reference counting, GC readiness, and
+   legacy migration remain in the focused S3 owner.
+6. Indexed route engine (§4.1 M2) and batched catalog mutation (§4.1 M3), which
    are **parallel, not sequential**: the predecessor's §3.3 records M2 as
    independent and M3 as depending only on M1's batched apply observation path,
    and PR #1117 merged M1. Catalog delta/watch is therefore no longer in this
    list either.
-3. The remaining physical snapshot offload milestones (§4.3 M4: the leader-only
-   scheduler and retention/GC) in
+7. The remaining physical snapshot offload milestones (§4.3 M4: the leader-only
+   scheduler, retention/GC readiness, and operational validation) in
    [`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md).
    Their only prerequisite was SST ingest snapshot transfer, which PR #1130
    merged and §4.3 records as implemented.
-4. Per-shard Pebble tuning and write admission (§4.3 M2) and sharded retention
+8. Per-shard Pebble tuning and write admission (§4.3 M2) and sharded retention
    scheduling (§4.3 M3). Independent of
-   step 3: the predecessor's §5.3 records M4 as depending on M1 alone, and the
+   step 7: the predecessor's §5.3 records M4 as depending on M1 alone, and the
    focused offload owner names no dependency on either design.
-5. Range merge (§5). Its row names no prerequisite that is still open.
-6. Replica placement (§5). Named as a prerequisite by region balance and by auto
-   group lifecycle, and owned by nothing else, so it gates those two.
-7. Lock-resolver delegation (§4.4 M4). The predecessor's §6.3 supplies its
-   per-group tick and asynchronous status-resolver prerequisites, both already
-   in place, so it is not gated on anything in this list.
+9. Same-group range merge (§5), after the focused range-merge design defines
+   local drain and fencing. Cross-group merge is separate and gated below.
+10. Replica placement (§5). Named as a prerequisite by region balance and by
+    auto group lifecycle, and owned by nothing else, so it gates those two.
+11. Follower and learner reads (§4.4 M2). Multi-node groups and the learner
+    primitive are on `main`; this is not waiting for dedicated TSO unless the
+    focused design adds cross-shard or session-global timestamp semantics.
+12. WAN Raft tuning and region-aware membership (§4.2 M1). Multi-node bootstrap
+    is on `main`, and this row has no unmet prerequisite inside the regional
+    subsystem.
 
 **Gated — each names what it waits for:**
 
-8. Follower reads and cross-shard transaction completion (§4.4), both gated on
-   the dedicated timestamp invariant where required.
-9. Region/range balance scheduler (§5), after replica placement (step 6).
-10. Auto group lifecycle (§5), after placement (step 6), migration (step 1), and
-    merge (step 5). It is **not** gated on the regional stack below: its row
-    names only those prerequisites.
-11. The regional stack (§4.2). Its ordering is not restated here: each row now
-    names its own prerequisites — M1 has none inside the subsystem, M2 waits on
-    the hotspot split M2 migration contract, M3 on M1 and M2, M4 on M2 and M3.
+13. Cross-group range merge (§5), after the hotspot split M2 migration plane
+    and the Composed-1 cross-group commit guard/drain protocol required by the
+    range-merge owner.
+14. Region/range balance scheduler (§5), after replica placement, multi-node
+    bootstrap, and the hotspot split M2 migration plane.
+15. Auto group lifecycle (§5), after replica placement, the hotspot split M2
+    migration plane, and the range-merge milestones it chooses to automate. It
+    is **not** gated on the regional stack below: its row names only those
+    prerequisites.
+16. Cross-shard transaction completion (§4.4 M3), after the dedicated timestamp
+    invariant/group-0 issuance and the read-only validation, recovery, and
+    router owner.
+17. Lock-resolver delegation (§4.4 M4), after a focused design/implementation
+    provides per-group HLC tick capability/preflight (`cap_per_group_hlc_v1` or
+    equivalent) and safe status-resolver routing. The current process-local
+    ticker is not enough.
+18. Region-local HLC (§4.2 M2), after the hotspot split M2 migration plane and
+    the dedicated/global timestamp decision.
+19. Regional catalog mirror (§4.2 M3), after regional M1, regional M2, and
+    catalog delta/watch.
+20. Cross-region disaster recovery (§4.2 M4), after regional M2 and M3.
 
 ## 7. Completion rule
 

@@ -315,6 +315,57 @@ func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T
 	require.NotZero(t, got)
 }
 
+func TestShardedCoordinator_RecoverHLCLease_SlowTargetDoesNotBlockSuccessfulPeer(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	eng1.proposeHook = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- coord.RecoverHLCLease(context.Background())
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-entered:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return eng2.proposeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, err := clock.NextFenced()
+		return err == nil
+	}, time.Second, 10*time.Millisecond,
+		"a delayed first target must not stop another target from advancing the recovery ceiling")
+
+	select {
+	case err := <-errCh:
+		require.Failf(t, "RecoverHLCLease returned before all attempts finished", "err=%v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-errCh)
+}
+
 func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
