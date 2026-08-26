@@ -56,7 +56,22 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
 		},
 		{
-			name: "score tie falls back to member ordering",
+			name: "large wide score index avoids member scan",
+			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
+				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
+					{Member: "later", Score: 3},
+					{Member: "middle", Score: 2},
+					{Member: "first", Score: 1},
+				})
+			},
+			wantMember: "first",
+			wantScore:  1,
+			wantWide:   true,
+			wantLast:   false,
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
+		},
+		{
+			name: "score tie uses score index member ordering",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				seedZSetScoreRowsForTest(t, st, key, readTS, []redisZSetEntry{
 					{Member: "aa", Score: 1},
@@ -67,7 +82,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 			wantScore:  1,
 			wantWide:   true,
 			wantLast:   false,
-			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit, 1, maxWideScanLimit},
+			wantScans:  []int{store.MaxDeltaScanLimit + 1, bzpopminScoreScanLimit},
 		},
 		{
 			name: "single score entry",
@@ -85,7 +100,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 		{
 			name: "mixed partial score index uses lower member row",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
-				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+				seedZSetMemberRowsOnlyForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
 					{Member: "low-unindexed", Score: 1},
 					{Member: "high-indexed", Score: 5},
 				})
@@ -107,7 +122,7 @@ func TestRedis_BZPopMinCandidateSelection(t *testing.T) {
 		{
 			name: "mixed partial score index keeps indexed candidate non-last",
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
-				seedZSetMemberRowsForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
+				seedZSetMemberRowsOnlyForBZPopMinTest(t, st, key, readTS, []redisZSetEntry{
 					{Member: "low-indexed", Score: 1},
 					{Member: "high-unindexed", Score: 5},
 				})
@@ -207,6 +222,25 @@ func seedZSetMemberRowsForBZPopMinTest(
 	entries []redisZSetEntry,
 ) {
 	t.Helper()
+	seedZSetMemberRowsOnlyForBZPopMinTest(t, st, key, commitTS, entries)
+	ctx := context.Background()
+	require.NoError(t, st.PutAt(
+		ctx,
+		store.ZSetMetaKey(key),
+		store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(entries))}),
+		commitTS,
+		0,
+	))
+}
+
+func seedZSetMemberRowsOnlyForBZPopMinTest(
+	t *testing.T,
+	st store.MVCCStore,
+	key []byte,
+	commitTS uint64,
+	entries []redisZSetEntry,
+) {
+	t.Helper()
 	ctx := context.Background()
 	for _, entry := range entries {
 		require.NoError(t, st.PutAt(
@@ -217,13 +251,6 @@ func seedZSetMemberRowsForBZPopMinTest(
 			0,
 		))
 	}
-	require.NoError(t, st.PutAt(
-		ctx,
-		store.ZSetMetaKey(key),
-		store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(entries))}),
-		commitTS,
-		0,
-	))
 }
 
 func seedLegacyZSetForBZPopMinTest(

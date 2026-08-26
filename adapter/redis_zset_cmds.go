@@ -1019,6 +1019,14 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, false)
+}
+
+func (r *RedisServer) elasticKVZRemFast(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, true)
+}
+
+func (r *RedisServer) zremWithTypeProbe(conn redcon.Conn, cmd redcon.Command, fastMiss bool) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1027,7 +1035,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		typ, err := r.zremTypeAt(ctx, cmd.Args[1], readTS, fastMiss)
 		if err != nil {
 			return err
 		}
@@ -1054,6 +1062,28 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zremTypeAt(ctx context.Context, key []byte, readTS uint64, fastMiss bool) (redisValueType, error) {
+	if !fastMiss {
+		return r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	}
+	typ, err := r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+	if err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.legacyZSetTypeAt(ctx, key, readTS)
+}
+
+func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	exists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		return redisTypeNone, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, redisTypeZSet)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
@@ -1156,11 +1186,11 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 }
 
 func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
-	scoreCandidate, scoreIndexComplete, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
+	scoreCandidate, scoreDecisionFinal, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
-	if scoreIndexComplete {
+	if scoreDecisionFinal {
 		return scoreCandidate, nil
 	}
 	memberCandidate, err := r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
@@ -1189,14 +1219,19 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 	return left.Member < right.Member
 }
 
+// bzpopminWideScoreCandidateAt probes the score index and reports whether that
+// probe is authoritative for BZPOPMIN. A visible zset meta row or any visible
+// meta delta means the wide-column score index owns the ordering, so the first
+// score key is final without loading all member rows.
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
 	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
+	metaTruncated := false
 	if err != nil {
 		if !errors.Is(err, ErrDeltaScanTruncated) {
 			return nil, false, err
 		}
+		metaTruncated = true
 		metaLen = 0
-		metaExists = false
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
@@ -1204,47 +1239,27 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
-	candidate, hasTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
-	if hasTie {
-		return nil, false, nil
-	}
+	candidate := bzpopminScoreCandidateFromKVs(key, scoreKVs)
 	if candidate != nil {
-		scoreIndexComplete := metaExists && metaLen > 0 && int64(len(scoreKVs)) == metaLen
-		candidate.isLast = scoreIndexComplete && metaLen == 1
-		return candidate, scoreIndexComplete, nil
+		scoreIndexAuthoritative := metaExists || metaTruncated
+		candidate.isLast = scoreIndexAuthoritative && !metaTruncated && metaLen == 1
+		return candidate, scoreIndexAuthoritative, nil
 	}
-	return nil, metaExists && metaLen == 0, nil
+	return nil, metaExists && !metaTruncated && metaLen == 0, nil
 }
 
-func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpopminCandidate, bool) {
-	var firstScore float64
-	var candidate *bzpopminCandidate
+func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) *bzpopminCandidate {
 	for _, kv := range scoreKVs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
 		if !ok {
 			continue
 		}
-		if candidate == nil {
-			firstScore = score
-			candidate = &bzpopminCandidate{
-				entry:  redisZSetEntry{Member: string(member), Score: score},
-				isWide: true,
-			}
-			continue
+		return &bzpopminCandidate{
+			entry:  redisZSetEntry{Member: string(member), Score: score},
+			isWide: true,
 		}
-		if zsetScoresEqual(firstScore, score) {
-			return nil, true
-		}
-		break
 	}
-	return candidate, false
-}
-
-func zsetScoresEqual(left, right float64) bool {
-	if left == 0 && right == 0 {
-		return true
-	}
-	return math.Float64bits(left) == math.Float64bits(right)
+	return nil
 }
 
 func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {

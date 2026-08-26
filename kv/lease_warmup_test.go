@@ -339,6 +339,57 @@ func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T
 	require.NotZero(t, got)
 }
 
+func TestShardedCoordinator_RecoverHLCLease_SlowTargetDoesNotBlockSuccessfulPeer(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	eng1.proposeHook = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- coord.RecoverHLCLease(context.Background())
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-entered:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return eng2.proposeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, err := clock.NextFenced()
+		return err == nil
+	}, time.Second, 10*time.Millisecond,
+		"a delayed first target must not stop another target from advancing the recovery ceiling")
+
+	select {
+	case err := <-errCh:
+		require.Failf(t, "RecoverHLCLease returned before all attempts finished", "err=%v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-errCh)
+}
+
 func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -451,7 +502,7 @@ func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
 	require.Less(t, uint64(hlcPhysicalWindowMs), defaultTxnLockTTLms)
 }
 
-func TestShardedCoordinator_RenewHLCLeases_OverlapsInFlightGroup(t *testing.T) {
+func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeers(t *testing.T) {
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
 	entered := make(chan struct{}, 2)
@@ -470,25 +521,30 @@ func TestShardedCoordinator_RenewHLCLeases_OverlapsInFlightGroup(t *testing.T) {
 		"precondition: the first round must fully finish for the non-blocked group")
 
 	second := coord.renewHLCLeases(context.Background())
-	<-entered
-
 	require.Eventually(t, func() bool {
-		return eng1.proposeCalls.Load() == 2 && eng2.proposeCalls.Load() == 2
+		return eng2.proposeCalls.Load() == 2
 	}, time.Second, 10*time.Millisecond,
-		"the next renewal round should launch for both the slow group and its peer")
-	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
-		"a slow in-flight group still needs a fresher renewal proposal on the next tick")
+		"other led groups must still renew while one group is in flight")
+	requireRenewalDone(t, second)
+	select {
+	case <-entered:
+		t.Fatal("slow in-flight group launched an overlapping renewal")
+	default:
+	}
+	require.Equal(t, int32(1), eng1.proposeCalls.Load(),
+		"a slow in-flight group should be skipped until the previous renewal finishes")
 	require.Equal(t, int32(2), eng2.proposeCalls.Load(),
 		"other led groups must still renew while one group is in flight")
 
 	close(release)
 	requireRenewalDone(t, first)
-	requireRenewalDone(t, second)
 
 	third := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, third)
-	require.Equal(t, int32(3), eng1.proposeCalls.Load(),
-		"the group remains eligible for later renewal after overlapping proposals finish")
+	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
+		"the group remains eligible for later renewal after the previous proposal finishes")
+	require.Equal(t, int32(3), eng2.proposeCalls.Load(),
+		"other groups remain independently eligible on later renewal ticks")
 }
 
 func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testing.T) {

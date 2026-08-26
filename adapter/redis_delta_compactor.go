@@ -214,7 +214,7 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 	}()
 	// Use per-key leadership so that in sharded deployments this node compacts
 	// keys for the shards it leads, not just those of the default Raft group.
-	if !c.coord.IsLeaderForKey(req.userKey) {
+	if !c.coord.IsLeaderForKey(redisUserRouteKey(req.userKey)) {
 		return
 	}
 	h := c.handlerByTypeName(req.typeName)
@@ -574,7 +574,7 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 		// In sharded deployments IsLeaderForKey returns false for keys whose
 		// shard this node does not lead. Skip those to avoid dispatching a
 		// transaction that the responsible leader will reject.
-		if !c.coord.IsLeaderForKey(userKey) {
+		if !c.coord.IsLeaderForKey(redisUserRouteKey(userKey)) {
 			continue
 		}
 		elems, buildErr := h.buildElems(ctx, userKey, deltaKVs, readTS)

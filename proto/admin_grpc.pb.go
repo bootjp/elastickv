@@ -19,21 +19,22 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Admin_GetClusterOverview_FullMethodName = "/Admin/GetClusterOverview"
-	Admin_GetRaftGroups_FullMethodName      = "/Admin/GetRaftGroups"
-	Admin_GetAdapterSummary_FullMethodName  = "/Admin/GetAdapterSummary"
-	Admin_GetKeyVizMatrix_FullMethodName    = "/Admin/GetKeyVizMatrix"
-	Admin_GetRouteDetail_FullMethodName     = "/Admin/GetRouteDetail"
-	Admin_StreamEvents_FullMethodName       = "/Admin/StreamEvents"
+	Admin_GetClusterOverview_FullMethodName  = "/Admin/GetClusterOverview"
+	Admin_GetRaftGroups_FullMethodName       = "/Admin/GetRaftGroups"
+	Admin_GetAdapterSummary_FullMethodName   = "/Admin/GetAdapterSummary"
+	Admin_GetKeyVizMatrix_FullMethodName     = "/Admin/GetKeyVizMatrix"
+	Admin_GetRouteDetail_FullMethodName      = "/Admin/GetRouteDetail"
+	Admin_SetAutoSplitEnabled_FullMethodName = "/Admin/SetAutoSplitEnabled"
+	Admin_StreamEvents_FullMethodName        = "/Admin/StreamEvents"
 )
 
 // AdminClient is the client API for Admin service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Admin is the node-side read-only admin gRPC service consumed by
-// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
-// metadata unless the node was started with --adminInsecureNoAuth.
+// Admin is the node-side operator gRPC service consumed by cmd/elastickv-admin.
+// Every method requires "authorization: Bearer <token>" metadata unless the
+// node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
 type AdminClient interface {
 	GetClusterOverview(ctx context.Context, in *GetClusterOverviewRequest, opts ...grpc.CallOption) (*GetClusterOverviewResponse, error)
@@ -41,6 +42,7 @@ type AdminClient interface {
 	GetAdapterSummary(ctx context.Context, in *GetAdapterSummaryRequest, opts ...grpc.CallOption) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(ctx context.Context, in *GetKeyVizMatrixRequest, opts ...grpc.CallOption) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(ctx context.Context, in *GetRouteDetailRequest, opts ...grpc.CallOption) (*GetRouteDetailResponse, error)
+	SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitEnabledRequest, opts ...grpc.CallOption) (*SetAutoSplitEnabledResponse, error)
 	StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error)
 }
 
@@ -102,6 +104,16 @@ func (c *adminClient) GetRouteDetail(ctx context.Context, in *GetRouteDetailRequ
 	return out, nil
 }
 
+func (c *adminClient) SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitEnabledRequest, opts ...grpc.CallOption) (*SetAutoSplitEnabledResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetAutoSplitEnabledResponse)
+	err := c.cc.Invoke(ctx, Admin_SetAutoSplitEnabled_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *adminClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[0], Admin_StreamEvents_FullMethodName, cOpts...)
@@ -125,9 +137,9 @@ type Admin_StreamEventsClient = grpc.ServerStreamingClient[StreamEventsEvent]
 // All implementations must embed UnimplementedAdminServer
 // for forward compatibility.
 //
-// Admin is the node-side read-only admin gRPC service consumed by
-// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
-// metadata unless the node was started with --adminInsecureNoAuth.
+// Admin is the node-side operator gRPC service consumed by cmd/elastickv-admin.
+// Every method requires "authorization: Bearer <token>" metadata unless the
+// node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
 type AdminServer interface {
 	GetClusterOverview(context.Context, *GetClusterOverviewRequest) (*GetClusterOverviewResponse, error)
@@ -135,6 +147,7 @@ type AdminServer interface {
 	GetAdapterSummary(context.Context, *GetAdapterSummaryRequest) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(context.Context, *GetKeyVizMatrixRequest) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error)
+	SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error)
 	StreamEvents(*StreamEventsRequest, grpc.ServerStreamingServer[StreamEventsEvent]) error
 	mustEmbedUnimplementedAdminServer()
 }
@@ -160,6 +173,9 @@ func (UnimplementedAdminServer) GetKeyVizMatrix(context.Context, *GetKeyVizMatri
 }
 func (UnimplementedAdminServer) GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRouteDetail not implemented")
+}
+func (UnimplementedAdminServer) SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetAutoSplitEnabled not implemented")
 }
 func (UnimplementedAdminServer) StreamEvents(*StreamEventsRequest, grpc.ServerStreamingServer[StreamEventsEvent]) error {
 	return status.Error(codes.Unimplemented, "method StreamEvents not implemented")
@@ -275,6 +291,24 @@ func _Admin_GetRouteDetail_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Admin_SetAutoSplitEnabled_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetAutoSplitEnabledRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).SetAutoSplitEnabled(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_SetAutoSplitEnabled_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).SetAutoSplitEnabled(ctx, req.(*SetAutoSplitEnabledRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Admin_StreamEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(StreamEventsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -312,6 +346,10 @@ var Admin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRouteDetail",
 			Handler:    _Admin_GetRouteDetail_Handler,
+		},
+		{
+			MethodName: "SetAutoSplitEnabled",
+			Handler:    _Admin_SetAutoSplitEnabled_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

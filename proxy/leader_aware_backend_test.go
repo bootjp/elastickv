@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -330,6 +331,48 @@ func TestLeaderAwareRedisBackend_ScriptNotLeaderRefreshesWithoutReplay(t *testin
 	require.Equal(t, nodeB.addr, backend.CurrentLeader())
 	require.Equal(t, int64(1), nodeA.commands.Load(), "script reaches the stale leader once")
 	require.Equal(t, int64(0), nodeB.commands.Load(), "script must not be replayed after refresh")
+}
+
+func TestLeaderAwareRedisBackend_DoWithReadTimeoutWaitsForInitialLeaderDiscovery(t *testing.T) {
+	node := newFakeElasticKVNode(t)
+	node.SetLeader(node.addr)
+	gate := make(chan struct{})
+	node.SetInfoGate(gate)
+
+	backend := NewLeaderAwareRedisBackendWithInterval(
+		[]string{node.addr},
+		"elastickv",
+		DefaultBackendOptions(),
+		time.Hour, 500*time.Millisecond,
+		testLogger,
+	)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	result := make(chan *redis.Cmd, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		result <- backend.DoWithReadTimeout(ctx, 100*time.Millisecond, "SET", "k", "v")
+	}()
+
+	require.Eventually(t, func() bool {
+		return node.infoCalls.Load() > 0
+	}, time.Second, 10*time.Millisecond)
+	select {
+	case cmd := <-result:
+		require.Failf(t, "command returned before leader discovery completed", "err=%v", cmd.Err())
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(gate)
+	select {
+	case cmd := <-result:
+		require.NoError(t, cmd.Err())
+	case <-time.After(2 * time.Second):
+		t.Fatal("command did not finish after leader discovery completed")
+	}
+	require.Equal(t, node.addr, backend.CurrentLeader())
+	require.Equal(t, int64(1), node.commands.Load())
 }
 
 func TestLeaderAwareRedisBackend_DoesNotRetryScriptNotLeaderRedisError(t *testing.T) {

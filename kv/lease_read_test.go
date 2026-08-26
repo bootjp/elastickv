@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -198,8 +199,12 @@ func applyHLCLeaseEntryToClock(t testing.TB, clock *HLC) func([]byte) {
 		if len(data) != hlcLeaseEntryLen || data[0] != raftEncodeHLCLease {
 			return
 		}
-		ceilingMs := int64(binary.BigEndian.Uint64(data[1:])) //nolint:gosec // encoded from a positive Unix ms timestamp.
-		clock.SetPhysicalCeiling(ceilingMs)
+		rawCeilingMs := binary.BigEndian.Uint64(data[1:])
+		if rawCeilingMs > uint64(math.MaxInt64) {
+			t.Error("invalid HLC lease ceiling")
+			return
+		}
+		clock.SetPhysicalCeiling(int64(rawCeilingMs))
 	}
 }
 

@@ -190,6 +190,21 @@ func TestVerifyComposed1_ObservedVersionZeroSkipsGate(t *testing.T) {
 	}
 }
 
+func TestVerifyComposed1_EncodedObservedVersionZeroRunsGate(t *testing.T) {
+	t.Parallel()
+
+	e := distribution.NewEngineWithDefaultRoute()
+	applyComposed1Snapshot(t, e, 1, []distribution.RouteDescriptor{
+		{RouteID: 100, Start: []byte(""), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, e, 1)
+
+	err := fsm.verifyComposed1(commitTxnRequest(ObservedRouteVersionZero, "k"))
+	require.ErrorIs(t, err, ErrComposed1Violation,
+		"an explicitly pinned version-0 observation must run the Composed-1 gate instead of being mistaken for the unpinned zero sentinel")
+	require.Contains(t, err.Error(), "current-version")
+}
+
 // TestVerifyComposed1_NilRouteHistorySkipsGate documents the
 // unwired-FSM default: a kvFSM constructed without WithRouteHistory
 // has routes=nil and the gate short-circuits.  Matches the

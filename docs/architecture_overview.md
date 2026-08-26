@@ -170,8 +170,8 @@ sequenceDiagram
   participant H as "HLC (all nodes)"
   participant Tx as "Txn / MVCC read-write path"
 
-  loop "every hlcRenewalInterval (=2s; <20s)"
-    L->>RG: "Propose HLC lease (now + hlcPhysicalWindowMs)"
+	  loop "every hlcRenewalInterval (=2s; <20s)"
+	    L->>RG: "Propose HLC lease (now + hlcPhysicalWindowMs)"
     RG-->>F: "Apply HLC lease entry"
     F->>H: "SetPhysicalCeiling(ms)"
   end

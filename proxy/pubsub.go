@@ -470,7 +470,7 @@ func (s *pubsubSession) execTxn() {
 	s.writeMu.Unlock()
 
 	if s.proxy.dual.hasSecondaryWrite() {
-		s.proxy.dual.goAsync(func(ctx context.Context) {
+		s.proxy.dual.goTxnReplay(cmds, func(ctx context.Context) {
 			s.proxy.dual.writeSecondaryPipeline(ctx, cmds)
 		})
 	}

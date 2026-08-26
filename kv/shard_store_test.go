@@ -86,6 +86,52 @@ func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	require.Equal(t, itemKey, kvs[0].Key)
 }
 
+func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("hash:fence-routes")
+	prefix := store.HashFieldScanPrefix(userKey)
+	split := append(append([]byte(nil), prefix...), 'm')
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), split, 1)
+	engine.UpdateRoute(split, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	})
+
+	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+
+	require.Equal(t, [][]byte{prefix, split}, got)
+}
+
+func TestShardStoreReadFenceGroupKeysForListRangeUsesStorageRepresentative(t *testing.T) {
+	t.Parallel()
+
+	for _, userKey := range [][]byte{
+		[]byte("!sqs|foo"),
+		[]byte("!redis|str|foo"),
+	} {
+		t.Run(string(userKey), func(t *testing.T) {
+			t.Parallel()
+			prefix := store.ListMetaDeltaScanPrefix(userKey)
+			engine := distribution.NewEngine()
+			engine.UpdateRoute([]byte(""), userKey, 1)
+			engine.UpdateRoute(userKey, nil, 2)
+			st := NewShardStore(engine, map[uint64]*ShardGroup{
+				1: {},
+				2: {},
+			})
+
+			got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+
+			require.Equal(t, [][]byte{prefix}, got)
+			require.Equal(t, userKey, routeKey(got[0]))
+		})
+	}
+}
+
 func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	t.Parallel()
 

@@ -481,14 +481,51 @@ func (b *LeaderAwareRedisBackend) doWithTimeoutOnce(ctx context.Context, timeout
 		cmd.SetErr(ErrNoLeaderBackend)
 		return cmd
 	}
-	return cli.WithTimeout(effectiveBlockingReadTimeout(timeout)).Do(ctx, args...)
+	return redisClientWithBlockingReadTimeout(cli, timeout).Do(ctx, args...)
+}
+
+func (b *LeaderAwareRedisBackend) DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	cmd := b.doWithReadTimeoutOnce(ctx, timeout, args...)
+	switch {
+	case isElasticKVNotLeaderError(cmd.Err()):
+		b.RefreshLeaderNow(ctx)
+	case isLeaderRefreshTransportError(cmd.Err()):
+		b.TriggerRefresh()
+	}
+	return cmd
+}
+
+func (b *LeaderAwareRedisBackend) doWithReadTimeoutOnce(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd {
+	cli := b.currentClientOrRefresh(ctx)
+	if cli == nil {
+		cmd := redis.NewCmd(ctx, args...)
+		cmd.SetErr(ErrNoLeaderBackend)
+		return cmd
+	}
+	return redisClientWithReadTimeout(cli, timeout).Do(ctx, args...)
 }
 
 // Pipeline forwards a batch to the current leader.
 func (b *LeaderAwareRedisBackend) Pipeline(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, 0, cmds)
+}
+
+// PipelineWithTimeout forwards a batch with a per-call socket timeout override.
+func (b *LeaderAwareRedisBackend) PipelineWithTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, effectiveBlockingReadTimeout(timeout), cmds)
+}
+
+func (b *LeaderAwareRedisBackend) PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
+	return b.pipeline(ctx, timeout, cmds)
+}
+
+func (b *LeaderAwareRedisBackend) pipeline(ctx context.Context, readTimeout time.Duration, cmds [][]any) ([]*redis.Cmd, error) {
 	cli := b.currentClientOrRefresh(ctx)
 	if cli == nil {
 		return nil, ErrNoLeaderBackend
+	}
+	if readTimeout > 0 {
+		cli = redisClientWithReadTimeout(cli, readTimeout)
 	}
 	pipe := cli.Pipeline()
 	results := make([]*redis.Cmd, len(cmds))
