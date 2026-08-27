@@ -383,7 +383,10 @@ func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.Transact
 // phaseDForwardAllocator is the receiver-side view of the dedicated TSO: it
 // allocates above a floor and rejects anything at or below it as pre-Phase-D.
 type phaseDForwardAllocator struct {
-	floor         uint64
+	floor uint64
+	// ceiling stands in for the allocation floor: anything beyond it has not
+	// been issued by group 0 yet. Zero means unbounded.
+	ceiling       uint64
 	next          uint64
 	validateCalls int
 }
@@ -404,7 +407,7 @@ func (a *phaseDForwardAllocator) NextAfter(_ context.Context, minTS uint64) (uin
 
 func (a *phaseDForwardAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
 	a.validateCalls++
-	if timestamp == 0 {
+	if timestamp == 0 || (a.ceiling != 0 && timestamp > a.ceiling) {
 		return kv.ErrTSOTimestampInvalid
 	}
 	if timestamp <= a.floor {
@@ -447,7 +450,9 @@ func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T)
 }
 
 // The same for a commit timestamp that arrived already set in the transaction
-// meta: it is the timestamp every mutation in the batch is persisted under.
+// meta: it is the timestamp every mutation in the batch is persisted under. The
+// start timestamp here is post-Phase-D, so this is a current transaction and not
+// the legacy-resolution replay carved out below.
 func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testing.T) {
 	t.Parallel()
 
@@ -466,11 +471,11 @@ func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testi
 		}}
 	}
 
-	_, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(50), 10)
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(50), 150)
 	require.Error(t, err)
 	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 
-	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(101), 10)
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(101), 150)
 	require.NoError(t, err)
 	require.Equal(t, uint64(101), commitTS)
 }
@@ -484,4 +489,65 @@ func TestForwardedTimestamps_UnvalidatedWithoutPhaseD(t *testing.T) {
 	reqs := []*pb.Request{{Ts: 7, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
 	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
 	require.Equal(t, uint64(7), reqs[0].Ts)
+}
+
+// A cross-shard transaction that began before the Phase-D marker can still have
+// unresolved intents when the marker applies. Resolving them replays the commit
+// timestamp the primary already recorded (LockResolver.resolveExpiredLock ->
+// applyTxnResolution), and on a follower that replay travels through
+// Internal.Forward. Rejecting it would leave the transaction partially resolved
+// with its secondary keys locked, and the rollout does not require draining
+// transactions before activating Phase D.
+func TestFillForwardedTxnCommitTS_AllowsPrePhaseDResolutionReplay(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	resolution := func(commitTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}}
+	}
+
+	// Both halves predate Phase D: the whole transaction belongs to the legacy
+	// era, so group 0 can never re-issue either value.
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), resolution(60), 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+
+	// A post-Phase-D transaction may not claim a pre-Phase-D commit timestamp.
+	_, err = i.fillForwardedTxnCommitTS(context.Background(), resolution(60), 150)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+}
+
+// The carve-out is only for timestamps below the Phase-D floor. A commit
+// timestamp beyond the allocation floor is the value this check exists to
+// reject, and a pre-Phase-D start timestamp must not launder it.
+func TestFillForwardedTxnCommitTS_StillRejectsUnallocatedCommitTS(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 5_000}),
+		}},
+	}}
+
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }

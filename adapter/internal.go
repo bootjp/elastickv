@@ -298,11 +298,13 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		if err != nil {
 			return 0, err
 		}
-	} else if err := kv.ValidateDurablePersistenceTimestamp(
-		ctx, i.tsAllocator, commitTS, "fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
+		ctx, i.tsAllocator, startTS, commitTS, "fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
 		// A commit timestamp that arrived already set in the transaction meta
 		// is the timestamp every mutation in this batch is persisted under, and
-		// it never passed through the coordinator's own validation.
+		// it never passed through the coordinator's own validation. A legacy
+		// transaction still being resolved replays a pre-Phase-D pair, which the
+		// validator admits; see ValidateForwardedTxnCommitTimestamp.
 		return 0, errors.WithStack(err)
 	}
 

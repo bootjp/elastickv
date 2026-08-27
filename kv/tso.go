@@ -326,6 +326,48 @@ func ValidateDurablePersistenceTimestamp(ctx context.Context, alloc TimestampAll
 	return nil
 }
 
+// ValidateForwardedTxnCommitTimestamp validates the commit timestamp of a
+// forwarded transaction whose caller already stamped it.
+//
+// It is ValidateDurablePersistenceTimestamp with one carve-out: a commit
+// timestamp that predates Phase D is accepted when the transaction's own start
+// timestamp predates Phase D too.
+//
+// That case is a legacy transaction still being resolved. A cross-shard
+// transaction that began before the Phase-D marker can have unresolved intents
+// when the marker applies, and resolving them replays the commit timestamp the
+// primary already recorded (LockResolver.resolveExpiredLock ->
+// applyTxnResolution). On a follower that replay travels through
+// Internal.Forward, so rejecting it would leave the transaction partially
+// resolved with its secondary keys locked, and the rollout does not require
+// draining transactions before activating Phase D.
+//
+// The carve-out cannot be used to claim a timestamp group 0 has not issued yet,
+// which is what the check exists to prevent: both values sit at or below the
+// Phase-D floor, and group 0 only ever issues above it. A timestamp beyond the
+// allocation floor fails with a plain ErrTSOTimestampInvalid and is still
+// rejected here.
+func ValidateForwardedTxnCommitTimestamp(
+	ctx context.Context,
+	alloc TimestampAllocator,
+	startTS uint64,
+	commitTS uint64,
+	label string,
+) error {
+	err := ValidateDurablePersistenceTimestamp(ctx, alloc, commitTS, label)
+	if err == nil || !errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return err
+	}
+	if startTS == 0 {
+		return err
+	}
+	startErr := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
+	if startErr != nil && errors.Is(startErr, ErrTSOTimestampPrePhaseD) {
+		return nil
+	}
+	return err
+}
+
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
 	if provider, ok := coord.(ConfiguredTimestampAllocatorProvider); ok {
 		alloc := provider.ConfiguredTimestampAllocator()
