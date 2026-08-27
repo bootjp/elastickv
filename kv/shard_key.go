@@ -171,6 +171,32 @@ func normalizeRouteFilterKey(key []byte) []byte {
 	return normalizeRouteKey(key)
 }
 
+// legacyPointRouteKey returns the raw physical key as a second route candidate
+// for families whose logical placement changed, so a point read consults where
+// an older writer put the value as well as where a new one would.
+//
+// This is the routing counterpart of the legacy candidate the scan path already
+// adds through redisWideColumnLegacyScanRouteRange. Streams need it for the same
+// reason wide-column families do: normalizeRouteKey now places stream writes on
+// the logical user-key route, so metadata written before that normalization sits
+// on the physical !stream|meta| route, which a split can separate from the user
+// key. A point read that consults only the logical route reports an existing
+// stream as missing -- and because the caller then never scans, the legacy
+// candidate the scan path carries is never reached.
+//
+// It is deliberately not redisWideColumnLegacyPointRouteKey: that one answers a
+// different question -- whether a scan row is a physical form that needs a
+// canonicalizing point read -- and streams have no such physical form.
+func legacyPointRouteKey(key []byte) []byte {
+	if embedded, ok := txnRouteKey(key); ok {
+		key = embedded
+	}
+	if redisWideColumnRouteKey(key) == nil && redisStreamRouteKey(key) == nil {
+		return nil
+	}
+	return key
+}
+
 func redisWideColumnLegacyPointRouteKey(key []byte) []byte {
 	if embedded, ok := txnRouteKey(key); ok {
 		key = embedded

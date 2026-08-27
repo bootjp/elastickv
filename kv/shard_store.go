@@ -343,7 +343,7 @@ func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, key []byte, 
 
 func (s *ShardStore) pointReadRoutesWithVersion(key []byte) ([]distribution.Route, uint64) {
 	primaryKey := routeKey(key)
-	legacyKey := redisWideColumnLegacyPointRouteKey(key)
+	legacyKey := legacyPointRouteKey(key)
 	if legacyKey == nil || bytes.Equal(legacyKey, primaryKey) {
 		primary, version, ok := s.engine.GetRouteWithVersion(primaryKey)
 		if !ok {
@@ -1702,11 +1702,14 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterProxyPage(
 	if err != nil {
 		return nil, nil, err
 	}
-	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
-	if err != nil {
-		return nil, nil, err
-	}
-	return filtered, kvs, nil
+	// Not canonicalized here. proxyRawScanAt reaches a peer's RawScan, which
+	// serves it through ShardStore.ScanAtWithReadFence and canonicalizes the
+	// page there; the canonical row keeps its physical key, so a second pass
+	// would re-read every row -- over the network this time, one fenced RPC
+	// each. Every peer that can serve this range runs this same code: the
+	// canonicalization does not exist on main at all, so there is no older
+	// binary that would return uncanonicalized rows.
+	return filterTxnInternalKVs(kvs), kvs, nil
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
@@ -1973,10 +1976,9 @@ func (s *ShardStore) scanRouteAtForwardProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
-	if err != nil {
-		return scanRoutePage{}, err
-	}
+	// Already canonicalized by the peer that served it; see
+	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage.
+	kvs := filterTxnInternalKVs(raw)
 	return scanRoutePage{
 		kvs:        kvs,
 		advanceKey: lastKVKey(raw),
@@ -2126,10 +2128,9 @@ func (s *ShardStore) scanRouteAtReverseProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
-	if err != nil {
-		return scanRoutePage{}, err
-	}
+	// Already canonicalized by the peer that served it; see
+	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage.
+	kvs := filterTxnInternalKVs(raw)
 	return scanRoutePage{
 		kvs:        kvs,
 		advanceKey: lastKVKey(raw),

@@ -3360,3 +3360,142 @@ func TestScanAtCanonicalizesWideColumnRowsOnce(t *testing.T) {
 	require.Equal(t, int64(len(fields)), counting.gets.Load(),
 		"the reverse path had the same redundant outer pass")
 }
+
+// normalizeRouteKey places stream writes on the logical user-key route, so
+// metadata written before that normalization sits on the physical !stream|meta|
+// route. A split can put the two on different groups, and a point read that
+// consults only the logical route reports an existing stream as missing -- after
+// which the caller never scans, so the legacy candidate the scan path carries is
+// never reached and commands re-initialize fresh metadata over live entries.
+func TestGetAtReadsLegacyStreamRouteDuringRollingUpgrade(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("z-stream")
+	metaKey := store.StreamMetaKey(userKey)
+	// The physical key and the logical user key land on different routes.
+	require.NotEqual(t, RouteKey(metaKey), metaKey)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// The raw !stream| prefix sorts below "z", so the physical key is on
+			// the lower route and the user key on the upper one.
+			{RouteID: 1, Start: []byte(""), End: userKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: userKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
+	})
+	st := NewShardStore(engine, groups)
+
+	// Written by a node that predates the stream route normalization.
+	require.NoError(t, groups[1].Store.PutAt(ctx, metaKey, []byte("legacy-meta"), 10, 0))
+
+	got, err := st.GetAt(ctx, metaKey, 20)
+	require.NoError(t, err, "the stream must not read as missing")
+	require.Equal(t, []byte("legacy-meta"), got)
+}
+
+// A stream entry key gets the same treatment, and the logical route still wins
+// once a value is there.
+func TestGetAtPrefersLogicalStreamRouteWhenBothExist(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("z-stream")
+	entryKey := store.StreamEntryKey(userKey, 123, 4)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: userKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: userKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
+	})
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, entryKey, []byte("legacy"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, entryKey, []byte("current"), 11, 0))
+
+	got, err := st.GetAt(ctx, entryKey, 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("current"), got)
+}
+
+// The canonicalization predicate answers a different question -- whether a scan
+// row is a physical form needing a point read -- and streams have no such form,
+// so it must stay wide-column only even though the route candidate now covers
+// both.
+func TestLegacyPointRouteKeyIsNotTheCanonicalizationPredicate(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	streamKey := store.StreamMetaKey(userKey)
+	require.NotNil(t, legacyPointRouteKey(streamKey))
+	require.Nil(t, redisWideColumnLegacyPointRouteKey(streamKey))
+
+	hashKey := store.HashFieldKey(userKey, []byte("f"))
+	require.NotNil(t, legacyPointRouteKey(hashKey))
+	require.NotNil(t, redisWideColumnLegacyPointRouteKey(hashKey))
+
+	require.Nil(t, legacyPointRouteKey([]byte("plain")))
+}
+
+// A proxied page is served by a peer's RawScan, which runs it through that
+// peer's ShardStore.ScanAtWithReadFence and canonicalizes it there. The
+// canonical row keeps its physical key, so canonicalizing again locally re-reads
+// every row -- and on this path each of those reads is itself a fenced RPC back
+// to the peer.
+func TestScanAtDoesNotRecanonicalizeProxiedPages(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	rows := make([]*pb.RawKVPair, 0, 3)
+	for _, field := range [][]byte{[]byte("f1"), []byte("f2"), []byte("f3")} {
+		rows = append(rows, &pb.RawKVPair{Key: store.HashFieldKey(userKey, field), Value: []byte("v")})
+	}
+	fake := &fakeRawKVServer{scanResp: &pb.RawScanAtResponse{Kv: rows}}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore(), Engine: &stubFollowerEngine{leaderAddr: addr}},
+	})
+	t.Cleanup(func() { _ = st.Close() })
+
+	start := store.HashFieldScanPrefix(userKey)
+	kvs, err := st.ScanAt(context.Background(), start, prefixScanEnd(start), 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, len(rows))
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Zero(t, fake.getCalls,
+		"the peer already canonicalized the page; re-reading each row is one extra RPC per row")
+}
