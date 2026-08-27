@@ -1519,3 +1519,47 @@ func containsDirent(entries []Dirent, name []byte) bool {
 	}
 	return false
 }
+
+// Root initialization runs against a store that has never committed anything,
+// so LastCommitTS() reports the zero watermark. kv.BeginReadTimestampThrough
+// rejects a zero read timestamp outright once Phase-D is required, so a zero
+// start timestamp leaving dispatchTxn means the filesystem cannot bring up its
+// root inode on an otherwise valid empty cluster.
+func TestDispatchTxnNormalizesEmptyStoreReadTimestamp(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	inner := &testCoordinator{st: st}
+	rec := &recordingCoordinator{inner: inner}
+	svc, err := NewService(st, rec, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+
+	require.Zero(t, st.LastCommitTS(), "the fixture must start from the empty watermark")
+	require.NoError(t, svc.initializeRootOnce(ctx, testDirMode, 0, 0))
+
+	require.NotEmpty(t, rec.requests)
+	root := rec.requests[0]
+	require.True(t, root.IsTxn)
+	require.NotZero(t, root.StartTS,
+		"a zero start timestamp is rejected by Phase-D and also hands start-timestamp"+
+			" selection to the coordinator, which defeats the OCC read-set check")
+	require.Equal(t, uint64(emptyStoreReadTS), root.StartTS)
+
+	// The root really was created, so the normalized snapshot is a usable one.
+	meta, err := svc.inodeAt(ctx, RootInode, st.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, RootInode, meta.Inode)
+}
+
+// A non-empty watermark must pass through untouched: the normalization exists
+// only for the empty-store sentinel.
+func TestDispatchTxnKeepsNonEmptyReadTimestamp(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, uint64(emptyStoreReadTS), normalizeEmptyStoreReadTS(0))
+	for _, ts := range []uint64{1, 2, 1 << 20, ^uint64(0)} {
+		require.Equal(t, ts, normalizeEmptyStoreReadTS(ts))
+	}
+}

@@ -2624,6 +2624,7 @@ func (s *Service) dispatchTxn(
 	elems []*kv.Elem[kv.OP],
 	readKeys [][]byte,
 ) error {
+	startTS = normalizeEmptyStoreReadTS(startTS)
 	reqs := &kv.OperationGroup[kv.OP]{
 		Elems:    elems,
 		IsTxn:    true,
@@ -2643,6 +2644,31 @@ func (s *Service) dispatchTxn(
 	reqs.StartTS = readTimestamp.Timestamp()
 	_, err = kv.DispatchWithReadTimestamp(readTimestamp.WithDispatchVoucher(ctx), coord, reqs)
 	return errors.Wrap(err, "filesystem dispatch txn")
+}
+
+// emptyStoreReadTS stands in for the zero applied watermark a store that has
+// never committed anything reports.
+const emptyStoreReadTS = 1
+
+// normalizeEmptyStoreReadTS lifts the empty-store watermark off zero.
+//
+// LastCommitTS() reports 0 for a store with no committed versions, which is
+// exactly the state a cluster is in when the filesystem creates its root inode.
+// Phase-D rejects a zero read timestamp outright, so passing it through fails
+// root initialization on an otherwise valid empty cluster.
+//
+// Reading at 1 is the same empty snapshot -- no committed version can be
+// visible at either value, because commit timestamps are HLC values whose
+// physical half is a Unix millisecond. What it does change is that the start
+// timestamp stays caller-supplied: leaving it at zero would instead make the
+// coordinator allocate a fresh one at dispatch time, and a root creation that
+// committed in between would then carry a commit timestamp *below* that start
+// timestamp and slip past the OCC read-set check.
+func normalizeEmptyStoreReadTS(ts uint64) uint64 {
+	if ts == 0 {
+		return emptyStoreReadTS
+	}
+	return ts
 }
 
 func validateName(name []byte) error {
