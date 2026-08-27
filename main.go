@@ -2353,8 +2353,12 @@ func configureDedicatedCoordinatorTSO(
 	}
 	wiring.serverAllocator = local
 	// The cutover state is wired unconditionally so a later Phase-D transition
-	// is visible, but the timestamp group is NOT pinned yet.
+	// is visible, but the timestamp group is NOT pinned yet. The candidate is
+	// recorded alongside it so that a Phase-D marker applied after startup --
+	// from a --tsoModeFile reload or from another node -- pins group 0 without
+	// the process having to mutate the coordinator at runtime.
 	coordinate.WithTSOCutoverState(tsoGroup.TSOState)
+	coordinate.WithTimestampGroupCandidate(dedicatedTSORaftGroupID)
 	if !dedicatedTSORuntimeRequired(tsoGroup.TSOState, mode) {
 		return wiring, nil
 	}

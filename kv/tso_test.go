@@ -782,3 +782,94 @@ func (f *renewingTSOCoordinator) RecoverHLCLease(context.Context) error {
 	f.clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	return nil
 }
+
+// mutableTSOCutoverState is the durable, consensus-owned group-0 migration
+// state as the coordinator sees it. The marker can be applied long after
+// startup -- by a --tsoModeFile reload or by another node -- so the flag flips
+// while the coordinator is already serving.
+type mutableTSOCutoverState struct {
+	cutover atomic.Bool
+	phaseD  atomic.Bool
+}
+
+func (s *mutableTSOCutoverState) CutoverActive() bool { return s.cutover.Load() }
+func (s *mutableTSOCutoverState) PhaseDActive() bool  { return s.phaseD.Load() }
+
+// A deployment that starts in legacy warm-up never calls WithTimestampGroup:
+// pinning up front would narrow lease renewal to group 0 while persistence
+// timestamps still come from the data groups. When the Phase-D marker lands
+// afterwards, the coordinator must pin group 0 anyway. Leaving it unpinned made
+// shouldRenewHLCGroup retire every data group with no timestamp group to renew
+// instead, so every ceiling expired and issuance failed with ErrCeilingExpired.
+func TestShardedCoordinatorPinsCandidateTimestampGroupOnPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	state := &mutableTSOCutoverState{}
+	groups := map[uint64]*ShardGroup{
+		0: {Engine: stubLeaderEngine{}},
+		1: {Engine: stubLeaderEngine{}},
+		2: {Engine: stubLeaderEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
+		WithAllShardGroups(1, 2).
+		WithTSOCutoverState(state).
+		WithTimestampGroupCandidate(0)
+
+	// Legacy warm-up: the data groups still own renewal and the reserved group
+	// must not be treated as the timestamp leader.
+	require.Equal(t, []uint64{1, 2}, coord.timestampLeaseRenewalGroupIDs())
+	require.True(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.True(t, coord.shouldRenewHLCGroup(2, groups[2]))
+
+	// The marker applies while the process is running.
+	state.cutover.Store(true)
+	state.phaseD.Store(true)
+
+	require.Equal(t, []uint64{0}, coord.timestampLeaseRenewalGroupIDs(),
+		"group 0 must own renewal once Phase D is active")
+	require.True(t, coord.shouldRenewHLCGroup(0, groups[0]),
+		"the timestamp group must keep renewing its own ceiling")
+	require.False(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.False(t, coord.shouldRenewHLCGroup(2, groups[2]))
+
+	targets := coord.hlcLeaseRecoveryTargets()
+	require.Len(t, targets, 1)
+	require.Equal(t, uint64(0), targets[0].gid)
+}
+
+// Without a candidate there is no group to hand renewal to, so retiring the
+// data groups would leave nothing renewing any ceiling at all. Keep renewing
+// rather than expiring the whole cluster.
+func TestShardedCoordinatorKeepsRenewingWithoutTimestampGroupUnderPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	state := &mutableTSOCutoverState{}
+	state.cutover.Store(true)
+	state.phaseD.Store(true)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: stubLeaderEngine{}},
+		2: {Engine: stubLeaderEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
+		WithTSOCutoverState(state)
+
+	require.True(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.True(t, coord.shouldRenewHLCGroup(2, groups[2]))
+}
+
+// WithTimestampGroup keeps pinning immediately, candidate or not.
+func TestShardedCoordinatorExplicitTimestampGroupStillPinsWithoutPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		0: {Engine: stubLeaderEngine{}},
+		1: {Engine: &stubFollowerEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).WithTimestampGroup(0)
+
+	require.Equal(t, []uint64{0}, coord.timestampLeaseRenewalGroupIDs())
+	require.True(t, coord.IsTimestampLeader())
+}

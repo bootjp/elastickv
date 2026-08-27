@@ -386,6 +386,14 @@ type ShardedCoordinator struct {
 	// behavior where any locally-led shard group can issue TSO timestamps.
 	timestampGroup           uint64
 	timestampGroupConfigured bool
+	// timestampGroupCandidate is the group WithTimestampGroup would pin once
+	// the dedicated allocator takes over. It is recorded at startup even while
+	// the deployment is still in legacy warm-up so that a Phase-D marker
+	// applied later -- through the durable, consensus-owned cutover state
+	// rather than a process-local mode flag -- can pin it without a racy
+	// runtime mutation. See effectiveTimestampGroup.
+	timestampGroupCandidate    uint64
+	timestampGroupCandidateSet bool
 	// tsoCutoverState is consensus-owned group-0 migration state. Phase D uses
 	// it to retire data-shard HLC renewal and reject legacy cross-shard startTS.
 	tsoCutoverState interface {
@@ -568,7 +576,44 @@ func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Cont
 func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
 	c.timestampGroup = groupID
 	c.timestampGroupConfigured = true
+	c.timestampGroupCandidate = groupID
+	c.timestampGroupCandidateSet = true
 	return c
+}
+
+// WithTimestampGroupCandidate records the group that owns timestamp issuance
+// once the dedicated allocator takes over, without pinning it yet.
+//
+// A deployment can start in legacy warm-up and advance to Phase D later, either
+// by reloading --tsoModeFile or by another node proposing the marker. The
+// warm-up contract forbids pinning up front: while persistence timestamps still
+// come from the data groups' local HLC path, narrowing lease renewal to the
+// timestamp group would let a group-0 quorum loss expire healthy data groups'
+// ceilings. But leaving the group unknown is worse once Phase D activates --
+// shouldRenewHLCGroup then retires every data group and finds no timestamp
+// group to renew instead, so every ceiling expires and issuance fails with
+// ErrCeilingExpired. Recording the candidate here lets effectiveTimestampGroup
+// pin it exactly when PhaseDActive flips, with no runtime mutation of the
+// coordinator.
+func (c *ShardedCoordinator) WithTimestampGroupCandidate(groupID uint64) *ShardedCoordinator {
+	c.timestampGroupCandidate = groupID
+	c.timestampGroupCandidateSet = true
+	return c
+}
+
+// effectiveTimestampGroup reports the group that currently owns HLC lease
+// renewal, leadership, and recovery, and whether one is pinned at all.
+func (c *ShardedCoordinator) effectiveTimestampGroup() (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	if c.timestampGroupConfigured {
+		return c.timestampGroup, true
+	}
+	if c.timestampGroupCandidateSet && c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		return c.timestampGroupCandidate, true
+	}
+	return 0, false
 }
 
 // WithTSOCutoverState wires the durable group-0 migration state. The state is
@@ -1826,8 +1871,8 @@ func (c *ShardedCoordinator) IsTimestampLeader() bool {
 	if c == nil {
 		return false
 	}
-	if c.timestampGroupConfigured {
-		return isLeaderEngine(engineForGroup(c.groups[c.timestampGroup]))
+	if groupID, ok := c.effectiveTimestampGroup(); ok {
+		return isLeaderEngine(engineForGroup(c.groups[groupID]))
 	}
 	for _, groupID := range c.timestampBridgeCandidateGroupIDs() {
 		if isLeaderEngine(engineForGroup(c.groups[groupID])) {
@@ -2632,8 +2677,8 @@ func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
 	if c == nil {
 		return nil
 	}
-	if c.timestampGroupConfigured {
-		return []uint64{c.timestampGroup}
+	if groupID, ok := c.effectiveTimestampGroup(); ok {
+		return []uint64{groupID}
 	}
 	return c.timestampBridgeCandidateGroupIDs()
 }
@@ -2672,9 +2717,14 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 }
 
 func (c *ShardedCoordinator) shouldRenewHLCGroup(gid uint64, group *ShardGroup) bool {
-	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() &&
-		(!c.timestampGroupConfigured || gid != c.timestampGroup) {
-		return false
+	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		timestampGroup, ok := c.effectiveTimestampGroup()
+		// With no timestamp group to fall back on, retiring every data group
+		// would leave nothing renewing any ceiling at all. Keep renewing rather
+		// than expiring the whole cluster.
+		if ok && gid != timestampGroup {
+			return false
+		}
 	}
 	return shardGroupAcceptingWrites(group)
 }
@@ -2790,12 +2840,12 @@ func (c *ShardedCoordinator) hlcLeaseRecoveryTargets() []hlcLeaseRecoveryTarget 
 	if c == nil {
 		return nil
 	}
-	if c.timestampGroupConfigured {
-		group := c.groups[c.timestampGroup]
+	if timestampGroup, ok := c.effectiveTimestampGroup(); ok {
+		group := c.groups[timestampGroup]
 		if !shardGroupAcceptingWrites(group) {
 			return nil
 		}
-		return []hlcLeaseRecoveryTarget{{gid: c.timestampGroup, group: group}}
+		return []hlcLeaseRecoveryTarget{{gid: timestampGroup, group: group}}
 	}
 	ids := c.timestampBridgeCandidateGroupIDs()
 	targets := make([]hlcLeaseRecoveryTarget, 0, len(ids))
